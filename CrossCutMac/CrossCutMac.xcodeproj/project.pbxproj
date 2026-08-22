@@ -1,0 +1,481 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		3542E216A753B615C38AA1A3 /* EditConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = C058354DD2B1876E0B582A3B /* EditConfiguration.swift */; };
+		3C2AB4E5CE835B22E4D66BB3 /* EngineLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D92C8043F6391380DC44260C /* EngineLocator.swift */; };
+		42DFE733282C5F2918E7A9B5 /* EngineRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D449324FA3FF25DCC007C805 /* EngineRunner.swift */; };
+		6F20D98ABC69516E9ADC177D /* MemberAnchorEditorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0E5A0B8BF1A4C3F6B9035B7 /* MemberAnchorEditorSheet.swift */; };
+		A21482360ED0C650B4FB5D74 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5553292F7C883447094A43 /* ContentView.swift */; };
+		A94D1375D222565CCCA5EC14 /* EngineEvent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C3A3264DA982BBBCC932417 /* EngineEvent.swift */; };
+		C382BE3917C384935B13571B /* CrossCutMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 864D44BA55B50B30ECEBF325 /* CrossCutMacApp.swift */; };
+		EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BC05A356C48CF84522C559B /* EngineContractTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		676DBC66FD95B0B698E78A75 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FABA87751728C36AAFFF9A38 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0BE09098EB7C1F7DBD2F7A0B;
+			remoteInfo = CrossCutMac;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		0BC05A356C48CF84522C559B /* EngineContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineContractTests.swift; sourceTree = "<group>"; };
+		1C3A3264DA982BBBCC932417 /* EngineEvent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineEvent.swift; sourceTree = "<group>"; };
+		257CCFDE2BF4D34FB8E9739F /* CrossCutMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CrossCutMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		688B1C8EAA79375E043C7069 /* CrossCutMacTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CrossCutMacTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		864D44BA55B50B30ECEBF325 /* CrossCutMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrossCutMacApp.swift; sourceTree = "<group>"; };
+		8B5553292F7C883447094A43 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		C058354DD2B1876E0B582A3B /* EditConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditConfiguration.swift; sourceTree = "<group>"; };
+		D449324FA3FF25DCC007C805 /* EngineRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineRunner.swift; sourceTree = "<group>"; };
+		D92C8043F6391380DC44260C /* EngineLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EngineLocator.swift; sourceTree = "<group>"; };
+		F0E5A0B8BF1A4C3F6B9035B7 /* MemberAnchorEditorSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemberAnchorEditorSheet.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		24B9DF779CA6FD1CA5D90FD9 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				0BC05A356C48CF84522C559B /* EngineContractTests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		4D10AB1D45DFF20C88D79D72 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				8B5553292F7C883447094A43 /* ContentView.swift */,
+				F0E5A0B8BF1A4C3F6B9035B7 /* MemberAnchorEditorSheet.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		76079E2ED034BFD21943930B /* App */ = {
+			isa = PBXGroup;
+			children = (
+				864D44BA55B50B30ECEBF325 /* CrossCutMacApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		9B18811FD343751DFC9C1F10 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				257CCFDE2BF4D34FB8E9739F /* CrossCutMac.app */,
+				688B1C8EAA79375E043C7069 /* CrossCutMacTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		B836663BBB5E70E3C22DB697 /* Engine */ = {
+			isa = PBXGroup;
+			children = (
+				1C3A3264DA982BBBCC932417 /* EngineEvent.swift */,
+				D92C8043F6391380DC44260C /* EngineLocator.swift */,
+				D449324FA3FF25DCC007C805 /* EngineRunner.swift */,
+			);
+			path = Engine;
+			sourceTree = "<group>";
+		};
+		DCF30E67FA9BC479BBEB3573 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				76079E2ED034BFD21943930B /* App */,
+				B836663BBB5E70E3C22DB697 /* Engine */,
+				FBAFB4E58B776A99C1E5A557 /* Models */,
+				4D10AB1D45DFF20C88D79D72 /* Views */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		F235911E5E51C51AA7C8D654 = {
+			isa = PBXGroup;
+			children = (
+				DCF30E67FA9BC479BBEB3573 /* Sources */,
+				24B9DF779CA6FD1CA5D90FD9 /* Tests */,
+				9B18811FD343751DFC9C1F10 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		FBAFB4E58B776A99C1E5A557 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				C058354DD2B1876E0B582A3B /* EditConfiguration.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0BE09098EB7C1F7DBD2F7A0B /* CrossCutMac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FA07E17AC4CFA99977E5E9D4 /* Build configuration list for PBXNativeTarget "CrossCutMac" */;
+			buildPhases = (
+				E38EBD203D63567D053AF541 /* Sources */,
+				6CE204F6FF97D129C4D7118B /* Bundle Python Engine */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CrossCutMac;
+			packageProductDependencies = (
+			);
+			productName = CrossCutMac;
+			productReference = 257CCFDE2BF4D34FB8E9739F /* CrossCutMac.app */;
+			productType = "com.apple.product-type.application";
+		};
+		807358E0948AC94786C10742 /* CrossCutMacTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 56DF1A31256B6C8496CCA1C2 /* Build configuration list for PBXNativeTarget "CrossCutMacTests" */;
+			buildPhases = (
+				82579F81FB573BBE9BB02FA4 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E674A0BACA607FED9E018AEC /* PBXTargetDependency */,
+			);
+			name = CrossCutMacTests;
+			packageProductDependencies = (
+			);
+			productName = CrossCutMacTests;
+			productReference = 688B1C8EAA79375E043C7069 /* CrossCutMacTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FABA87751728C36AAFFF9A38 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = C9DAAC85AE5363A0BBAD9863 /* Build configuration list for PBXProject "CrossCutMac" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F235911E5E51C51AA7C8D654;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0BE09098EB7C1F7DBD2F7A0B /* CrossCutMac */,
+				807358E0948AC94786C10742 /* CrossCutMacTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		6CE204F6FF97D129C4D7118B /* Bundle Python Engine */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle Python Engine";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nengine_source=\"${SRCROOT}/../engine\"\nengine_destination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/engine\"\n\ncase \"${engine_destination}\" in\n  \"${TARGET_BUILD_DIR}/\"*) ;;\n  *) echo \"Refusing to clean unexpected engine destination: ${engine_destination}\" >&2; exit 1 ;;\nesac\n\ntest -f \"${engine_source}/crosscut_cli.py\"\ntest -f \"${engine_source}/crosscut/__init__.py\"\ntest -f \"${engine_source}/crosscut/models/face_detection_yunet_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.yunet\"\ntest -f \"${engine_source}/crosscut/models/face_recognition_sface_2021dec.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-sface\"\ntest -f \"${engine_source}/crosscut/models/person_detection_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/pose_estimation_mediapipe_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/human_segmentation_pphumanseg_2023mar.onnx\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-mediapipe-pose\"\ntest -f \"${engine_source}/crosscut/models/LICENSE.opencv-zoo-pphumanseg\"\ntest -f \"${engine_source}/crosscut/models/PROVENANCE.pose.md\"\n\n/bin/rm -rf \"${engine_destination}\"\n/bin/mkdir -p \"${engine_destination}/crosscut\"\n/bin/cp \"${engine_source}/crosscut_cli.py\" \"${engine_destination}/crosscut_cli.py\"\n/bin/cp \"${engine_source}/crosscut/\"*.py \"${engine_destination}/crosscut/\"\n/bin/cp -R \"${engine_source}/crosscut/models\" \"${engine_destination}/crosscut/\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		82579F81FB573BBE9BB02FA4 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EDD03429C42F9605138F2F1C /* EngineContractTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E38EBD203D63567D053AF541 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A21482360ED0C650B4FB5D74 /* ContentView.swift in Sources */,
+				C382BE3917C384935B13571B /* CrossCutMacApp.swift in Sources */,
+				3542E216A753B615C38AA1A3 /* EditConfiguration.swift in Sources */,
+				A94D1375D222565CCCA5EC14 /* EngineEvent.swift in Sources */,
+				3C2AB4E5CE835B22E4D66BB3 /* EngineLocator.swift in Sources */,
+				42DFE733282C5F2918E7A9B5 /* EngineRunner.swift in Sources */,
+				6F20D98ABC69516E9ADC177D /* MemberAnchorEditorSheet.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		E674A0BACA607FED9E018AEC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0BE09098EB7C1F7DBD2F7A0B /* CrossCutMac */;
+			targetProxy = 676DBC66FD95B0B698E78A75 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		32C964A7EDA2FE94549391CB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.luna021839.crosscut.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CrossCutMac.app/Contents/MacOS/CrossCutMac";
+			};
+			name = Release;
+		};
+		65E94581BCAF4B08C2B323A2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "CrossCut";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSHighResolutionCapable = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.luna021839.crosscut;
+				PRODUCT_MODULE_NAME = CrossCutMac;
+				PRODUCT_NAME = CrossCutMac;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		8819369FD409C1B93665C59B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.luna021839.crosscut.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CrossCutMac.app/Contents/MacOS/CrossCutMac";
+			};
+			name = Debug;
+		};
+		CD9AFBF125B2472418C0CB7E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Release;
+		};
+		E2C62F8E206C02BEC66E337A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				COPY_PHASE_STRIP = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEPLOYMENT_POSTPROCESSING = YES;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "CrossCut";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSHighResolutionCapable = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.luna021839.crosscut;
+				PRODUCT_MODULE_NAME = CrossCutMac;
+				PRODUCT_NAME = CrossCutMac;
+				SDKROOT = macosx;
+				STRIP_INSTALLED_PRODUCT = YES;
+				STRIP_STYLE = debugging;
+			};
+			name = Release;
+		};
+		ECF7981F45D33AEE229DB9B6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		56DF1A31256B6C8496CCA1C2 /* Build configuration list for PBXNativeTarget "CrossCutMacTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8819369FD409C1B93665C59B /* Debug */,
+				32C964A7EDA2FE94549391CB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C9DAAC85AE5363A0BBAD9863 /* Build configuration list for PBXProject "CrossCutMac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				ECF7981F45D33AEE229DB9B6 /* Debug */,
+				CD9AFBF125B2472418C0CB7E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FA07E17AC4CFA99977E5E9D4 /* Build configuration list for PBXNativeTarget "CrossCutMac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				65E94581BCAF4B08C2B323A2 /* Debug */,
+				E2C62F8E206C02BEC66E337A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = FABA87751728C36AAFFF9A38 /* Project object */;
+}

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ive-crosscut"
+version = "0.1.0"
+description = "Deterministic analysis engine for IVE group and member cross-edits"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "opencv-contrib-python>=4.10",
+]
+
+[tool.setuptools]
+packages = ["crosscut"]
+
+[tool.setuptools.package-data]
+crosscut = ["models/*"]
