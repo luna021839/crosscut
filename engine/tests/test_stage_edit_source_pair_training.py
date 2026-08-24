@@ -142,6 +142,8 @@ class StageEditSourcePairReferenceTrainingTests(unittest.TestCase):
         self.assertEqual(4, materialized.group_count)
         self.assertEqual(2, materialized.opening_selection_excluded_count)
         self.assertEqual(2, materialized.unconfirmed_selection_excluded_count)
+        self.assertEqual(0, materialized.same_source_selection_excluded_count)
+        self.assertEqual(0, materialized.priorless_selection_excluded_count)
         self.assertEqual(
             (("SONG-A", 2), ("SONG-B", 2)),
             materialized.per_song_group_counts,
@@ -164,6 +166,56 @@ class StageEditSourcePairReferenceTrainingTests(unittest.TestCase):
         # and the outgoing observation is B at this exact switch token (0.55).
         self.assertEqual("B", second_switch.outgoing_source_id)
         self.assertAlmostEqual(0.55, second_switch.outgoing.face_scale)
+
+    def test_first_confirmed_source_bootstraps_unknown_prior_without_pair_label(
+        self,
+    ) -> None:
+        base = _example("SONG-A", "reference-a")
+        no_prior = replace(
+            base,
+            targets=replace(
+                base.targets,
+                targets=(StageEditTarget(), *base.targets.targets[1:]),
+            ),
+        )
+
+        materialized = materialize_stage_edit_source_pair_training_corpus(
+            _corpus((no_prior,))
+        )
+
+        self.assertEqual(1, materialized.priorless_selection_excluded_count)
+        self.assertEqual(1, materialized.group_count)
+        self.assertEqual(
+            "reference-a:source-pair:000003",
+            materialized.groups[0].group_id,
+        )
+        self.assertEqual("B", materialized.groups[0].outgoing_source_id)
+
+    def test_confirmed_same_source_boundary_is_excluded_without_moving_prior(
+        self,
+    ) -> None:
+        example = _example("SONG-A", "reference-a")
+        targets = list(example.targets.targets)
+        targets[1] = StageEditTarget(cut=1.0, selected_source_id="A")
+        targets[2] = StageEditTarget(cut=1.0, selected_source_id="B")
+        same_source = replace(
+            example,
+            targets=StageEditTargetSequence(
+                example.reference_id,
+                tuple(targets),
+            ),
+        )
+
+        materialized = materialize_stage_edit_source_pair_training_corpus(
+            _corpus((same_source,))
+        )
+
+        self.assertEqual(1, materialized.same_source_selection_excluded_count)
+        self.assertEqual(2, materialized.group_count)
+        first_switch = materialized.groups[0]
+        self.assertEqual("reference-a:source-pair:000002", first_switch.group_id)
+        self.assertEqual("A", first_switch.outgoing_source_id)
+        self.assertEqual("B", first_switch.chosen_incoming_source_id)
 
     def test_schema_names_and_missing_mask_drive_observation(self) -> None:
         candidate = _candidate("A", 0.90, face_scale_missing=True)
@@ -191,20 +243,6 @@ class StageEditSourcePairReferenceTrainingTests(unittest.TestCase):
                     ),
                 ),
                 "length mismatch",
-            )
-        )
-        no_prior_targets = (
-            StageEditTarget(),
-            *base.targets.targets[1:],
-        )
-        cases.append(
-            (
-                "prior",
-                replace(
-                    base,
-                    targets=replace(base.targets, targets=no_prior_targets),
-                ),
-                "no prior source",
             )
         )
         duplicate_tokens = list(base.sequence.tokens)

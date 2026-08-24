@@ -38,9 +38,10 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_SOURCE_PAIR_TRAINING_SCHEMA_VERSION = 1
+STAGE_EDIT_SOURCE_PAIR_TRAINING_SCHEMA_VERSION = 3
 STAGE_EDIT_SOURCE_PAIR_TRAINING_CONTRACT = (
-    "confirmed_nonopening_same_token_source_pair_reference_training_v1"
+    "confirmed_nonopening_actual_switch_same_token_source_pair_reference_"
+    "training_with_priorless_bootstrap_v3"
 )
 STAGE_EDIT_SOURCE_PAIR_HANDCRAFTED_BASELINE_CONTRACT = (
     "semimarkov_boundary_continuity_handcrafted_snapshot_v1"
@@ -283,6 +284,8 @@ class StageEditSourcePairTrainingCorpus:
     input_reference_count: int
     opening_selection_excluded_count: int
     unconfirmed_selection_excluded_count: int
+    same_source_selection_excluded_count: int
+    priorless_selection_excluded_count: int
     content_sha256: str
     contract: str = STAGE_EDIT_SOURCE_PAIR_TRAINING_CONTRACT
     schema_version: int = STAGE_EDIT_SOURCE_PAIR_TRAINING_SCHEMA_VERSION
@@ -360,6 +363,8 @@ class StageEditSourcePairTrainingCorpus:
             "input_reference_count",
             "opening_selection_excluded_count",
             "unconfirmed_selection_excluded_count",
+            "same_source_selection_excluded_count",
+            "priorless_selection_excluded_count",
         ):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -414,6 +419,12 @@ class StageEditSourcePairTrainingCorpus:
             "unconfirmed_selection_excluded_count": (
                 self.unconfirmed_selection_excluded_count
             ),
+            "same_source_selection_excluded_count": (
+                self.same_source_selection_excluded_count
+            ),
+            "priorless_selection_excluded_count": (
+                self.priorless_selection_excluded_count
+            ),
             "groups": [
                 _group_payload(group, song_id=song_by_group[group.group_id])
                 for group in self.groups
@@ -448,6 +459,8 @@ def materialize_stage_edit_source_pair_training_corpus(
     group_song_ids: list[tuple[str, str]] = []
     opening_excluded = 0
     unconfirmed_excluded = 0
+    same_source_excluded = 0
+    priorless_excluded = 0
     per_song: dict[str, int] = {}
     per_reference: dict[str, int] = {}
     ordered_examples = sorted(
@@ -522,9 +535,23 @@ def materialize_stage_edit_source_pair_training_corpus(
                 unconfirmed_excluded += 1
                 continue
             if prior_source_id is None:
-                raise StageEditSourcePairTrainingError(
-                    f"reference {reference_id} confirmed switch has no prior source"
+                # Some reference timelines begin before the first source
+                # attribution can be confirmed. The first later confirmed
+                # source establishes causal state, but its unknown outgoing
+                # side cannot supervise a pair transition.
+                _all, bootstrap_eligible = _eligible_candidates_at_token(
+                    token,
+                    schema=schema,
+                    reference_id=reference_id,
+                    token_index=token_index,
                 )
+                if selected_source_id not in bootstrap_eligible:
+                    raise StageEditSourcePairTrainingError(
+                        f"reference {reference_id} bootstrap source is not eligible"
+                    )
+                prior_source_id = selected_source_id
+                priorless_excluded += 1
+                continue
             _all_candidates, eligible = _eligible_candidates_at_token(
                 token,
                 schema=schema,
@@ -541,9 +568,13 @@ def materialize_stage_edit_source_pair_training_corpus(
                     f"reference {reference_id} chosen source is not eligible"
                 )
             if selected_source_id == prior_source_id:
-                raise StageEditSourcePairTrainingError(
-                    f"reference {reference_id} confirmed source event does not switch"
-                )
+                # A confirmed edit boundary can coincide with a camera cut
+                # inside the already selected source. It carries no incoming
+                # source-ranking label, and the production decoder cannot
+                # choose the exact outgoing source at a switch. Exclude it
+                # without changing the last confirmed source identity.
+                same_source_excluded += 1
+                continue
             # The decoder rejects a consecutive reuse of the outgoing exact
             # source before continuity scoring.  Keeping that impossible
             # candidate in the rank group would make both training and the
@@ -597,6 +628,8 @@ def materialize_stage_edit_source_pair_training_corpus(
         "token_schema_fingerprint": schema.fingerprint,
         "opening_selection_excluded_count": opening_excluded,
         "unconfirmed_selection_excluded_count": unconfirmed_excluded,
+        "same_source_selection_excluded_count": same_source_excluded,
+        "priorless_selection_excluded_count": priorless_excluded,
         "groups": [
             _group_payload(group, song_id=song_by_group[group.group_id])
             for group in ordered
@@ -614,6 +647,8 @@ def materialize_stage_edit_source_pair_training_corpus(
         input_reference_count=len(examples),
         opening_selection_excluded_count=opening_excluded,
         unconfirmed_selection_excluded_count=unconfirmed_excluded,
+        same_source_selection_excluded_count=same_source_excluded,
+        priorless_selection_excluded_count=priorless_excluded,
         content_sha256=_canonical_sha256(payload),
     )
 
