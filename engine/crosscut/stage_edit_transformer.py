@@ -1522,7 +1522,9 @@ def stage_edit_loss(
         supervision.source_targets,
         reduction="none",
     )
-    listwise_loss = _masked_mean(listwise_values, supervision.source_mask)
+    listwise_loss = _reference_balanced_masked_mean(
+        listwise_values, supervision.source_mask
+    )
 
     positive = mx.take_along_axis(
         output.source_selection_logits,
@@ -1540,8 +1542,18 @@ def stage_edit_loss(
     explicit_pairwise_values = nn.softplus(
         contract.pairwise_margin - positive[..., None] + negative
     )
-    explicit_pairwise_loss = _masked_mean(
-        explicit_pairwise_values, supervision.pairwise_source_mask
+    explicit_pairwise_weights = supervision.pairwise_source_mask.astype(
+        explicit_pairwise_values.dtype
+    )
+    explicit_pairwise_count = explicit_pairwise_weights.sum(axis=-1)
+    explicit_pairwise_group_loss = (
+        explicit_pairwise_values * explicit_pairwise_weights
+    ).sum(axis=-1) / mx.maximum(explicit_pairwise_count, 1.0)
+    explicit_pairwise_group_mask = mx.logical_and(
+        supervision.source_mask, explicit_pairwise_count > 0
+    )
+    explicit_pairwise_loss = _reference_balanced_masked_mean(
+        explicit_pairwise_group_loss, explicit_pairwise_group_mask
     )
 
     selected_one_hot = mx.arange(output.source_selection_logits.shape[-1]) == (

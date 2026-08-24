@@ -21,6 +21,7 @@ from crosscut.stage_edit_transformer import (
     STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
     SourceCandidateToken,
     StageEditLossContract,
+    StageEditModelOutput,
     StageEditSequence,
     StageEditTarget,
     StageEditTargetSequence,
@@ -717,6 +718,299 @@ class StageEditMLXTests(unittest.TestCase):
                 float(unweighted[name].item()),
                 places=6,
             )
+
+    def test_hybrid_source_losses_are_reference_balanced(self) -> None:
+        def example(
+            sequence_id: str,
+            *,
+            token_count: int,
+            include_third_source: bool,
+        ) -> tuple[StageEditSequence, StageEditTargetSequence]:
+            candidates = (
+                _candidate("A", 0.2),
+                _candidate("B", 0.4),
+            ) + ((_candidate("C", 0.6),) if include_third_source else ())
+            rejected = tuple(candidate.source_id for candidate in candidates[1:])
+            return (
+                StageEditSequence(
+                    sequence_id,
+                    tuple(
+                        _token(index * 0.5, candidates=candidates)
+                        for index in range(token_count)
+                    ),
+                ),
+                StageEditTargetSequence(
+                    sequence_id,
+                    tuple(
+                        StageEditTarget(
+                            selected_source_id="A",
+                            rejected_source_ids=rejected,
+                        )
+                        for _ in range(token_count)
+                    ),
+                ),
+            )
+
+        class FixedSourceLogitModel:
+            def __call__(self, batch):
+                batch_size, length, max_sources = batch.source_candidate_mask.shape
+                logits = np.full(
+                    (batch_size, length, max_sources),
+                    MASKED_SOURCE_LOGIT,
+                    dtype=np.float32,
+                )
+                for batch_index, sequence_id in enumerate(batch.sequence_ids):
+                    scores = (
+                        {"A": 2.0, "B": 0.0, "C": -1.0}
+                        if sequence_id == "dominant"
+                        else {"A": 0.0, "B": 2.0, "C": -2.0}
+                    )
+                    for time_index, source_ids in enumerate(
+                        batch.source_ids[batch_index]
+                    ):
+                        for source_index, source_id in enumerate(source_ids):
+                            if source_id is not None:
+                                logits[batch_index, time_index, source_index] = scores[
+                                    source_id
+                                ]
+                effective_mask = mx.logical_and(
+                    batch.source_candidate_mask, batch.hard_source_gate_mask
+                )
+                return StageEditModelOutput(
+                    cut_timing_logits=mx.zeros((batch_size, length)),
+                    source_selection_logits=mx.array(logits),
+                    duration_bucket_logits=mx.zeros(
+                        (batch_size, length, self_config.duration_bucket_count)
+                    ),
+                    transition_logits=mx.zeros(
+                        (batch_size, length, self_config.transition_count)
+                    ),
+                    crop=mx.zeros((batch_size, length, 4)),
+                    effective_source_mask=effective_mask,
+                )
+
+        self_config = self.config
+        dominant_once = example(
+            "dominant", token_count=1, include_third_source=True
+        )
+        dominant_repeated = example(
+            "dominant", token_count=7, include_third_source=True
+        )
+        other = example("other", token_count=1, include_third_source=False)
+        contract = StageEditLossContract(source_objective="hybrid")
+
+        def source_components(examples):
+            sequences, targets = zip(*examples, strict=True)
+            batch = tensorize_stage_edit_batch(
+                sequences, SCHEMA, self.config, device=mx.cpu
+            )
+            supervision = tensorize_stage_edit_supervision(
+                targets, batch, SCHEMA, device=mx.cpu
+            )
+            _, components = stage_edit_loss(
+                FixedSourceLogitModel(), batch, supervision, contract
+            )
+            mx.eval(components["source_listwise"], components["source_pairwise"])
+            return batch, supervision, components
+
+        with mx.stream(mx.cpu):
+            _, _, once = source_components((dominant_once, other))
+            repeated_batch, repeated_supervision, repeated = source_components(
+                (dominant_repeated, other)
+            )
+            _, eligible = stage_edit_loss(
+                FixedSourceLogitModel(),
+                repeated_batch,
+                repeated_supervision,
+                StageEditLossContract(source_objective="eligible_all_pairwise"),
+            )
+            mx.eval(eligible["source_pairwise"])
+
+        for component in ("source_listwise", "source_pairwise"):
+            self.assertAlmostEqual(
+                float(once[component].item()),
+                float(repeated[component].item()),
+                places=6,
+            )
+        # Every effective negative was explicitly rejected.  Explicit pairwise
+        # and eligible-all therefore have the same group-then-reference mean,
+        # even though references and groups have unequal negative counts.
+        self.assertAlmostEqual(
+            float(repeated["source_pairwise"].item()),
+            float(eligible["source_pairwise"].item()),
+            places=6,
+        )
+
+    def test_source_target_slots_follow_candidate_ids_after_shuffle(self) -> None:
+        candidates = (
+            _candidate("A", 0.2),
+            _candidate("B", 0.4),
+            _candidate("C", 0.6),
+        )
+        sequences = (
+            StageEditSequence(
+                "ordered", (_token(0.0, candidates=candidates),)
+            ),
+            StageEditSequence(
+                "shuffled",
+                (
+                    _token(
+                        0.0,
+                        candidates=(candidates[2], candidates[0], candidates[1]),
+                    ),
+                ),
+            ),
+        )
+        targets = tuple(
+            StageEditTargetSequence(
+                sequence.sequence_id,
+                (
+                    StageEditTarget(
+                        selected_source_id="C",
+                        rejected_source_ids=("A", "B"),
+                    ),
+                ),
+            )
+            for sequence in sequences
+        )
+        with mx.stream(mx.cpu):
+            batch = tensorize_stage_edit_batch(
+                sequences, SCHEMA, self.config, device=mx.cpu
+            )
+            supervision = tensorize_stage_edit_supervision(
+                targets, batch, SCHEMA, device=mx.cpu
+            )
+            mx.eval(
+                supervision.source_targets,
+                supervision.rejected_source_targets,
+                supervision.pairwise_source_mask,
+            )
+        self.assertEqual(("A", "B", "C"), batch.source_ids[0][0][:3])
+        self.assertEqual(("C", "A", "B"), batch.source_ids[1][0][:3])
+        np.testing.assert_array_equal(
+            np.asarray(supervision.source_targets)[:, 0], np.asarray([2, 0])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(supervision.rejected_source_targets)[:, 0, :2],
+            np.asarray([[0, 1], [1, 2]]),
+        )
+        self.assertTrue(
+            np.asarray(supervision.pairwise_source_mask)[:, 0, :2].all()
+        )
+
+    def test_tiny_source_rule_receives_gradient_and_learns_shuffled_targets(
+        self,
+    ) -> None:
+        candidates_by_token = (
+            (
+                _candidate("B", 0.1),
+                _candidate("A", 0.9),
+                _candidate("C", 0.4),
+            ),
+            (
+                _candidate("C", 0.8),
+                _candidate("A", 0.2),
+                _candidate("B", 0.5),
+            ),
+            (
+                _candidate("A", 0.3),
+                _candidate("B", 0.7),
+                _candidate("C", 0.1),
+            ),
+        )
+        selected_ids = ("A", "C", "B")
+        sequence = StageEditSequence(
+            "tiny-rule",
+            tuple(
+                _token(index * 0.5, candidates=candidates)
+                for index, candidates in enumerate(candidates_by_token)
+            ),
+        )
+        targets = StageEditTargetSequence(
+            sequence.sequence_id,
+            tuple(
+                StageEditTarget(selected_source_id=selected_source_id)
+                for selected_source_id in selected_ids
+            ),
+        )
+        self_config = self.config
+
+        class TinySourceRule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scorer = nn.Linear(1, 1)
+                self.scorer.weight = -mx.ones_like(self.scorer.weight)
+                self.scorer.bias = mx.zeros_like(self.scorer.bias)
+
+            def __call__(self, batch):
+                batch_size, length, _ = batch.source_candidate_mask.shape
+                effective_mask = mx.logical_and(
+                    batch.source_candidate_mask, batch.hard_source_gate_mask
+                )
+                source_logits = self.scorer(
+                    batch.source_features[..., :1]
+                ).squeeze(-1)
+                source_logits = mx.where(
+                    effective_mask,
+                    source_logits,
+                    mx.array(MASKED_SOURCE_LOGIT, dtype=source_logits.dtype),
+                )
+                return StageEditModelOutput(
+                    cut_timing_logits=mx.zeros((batch_size, length)),
+                    source_selection_logits=source_logits,
+                    duration_bucket_logits=mx.zeros(
+                        (batch_size, length, self_config.duration_bucket_count)
+                    ),
+                    transition_logits=mx.zeros(
+                        (batch_size, length, self_config.transition_count)
+                    ),
+                    crop=mx.zeros((batch_size, length, 4)),
+                    effective_source_mask=effective_mask,
+                )
+
+        contract = StageEditLossContract(
+            source_objective="listwise",
+            cut_weight=0.0,
+            source_pairwise_weight=0.0,
+            duration_weight=0.0,
+            transition_weight=0.0,
+            crop_weight=0.0,
+        )
+        with mx.stream(mx.cpu):
+            batch = tensorize_stage_edit_batch(
+                (sequence,), SCHEMA, self.config, device=mx.cpu
+            )
+            supervision = tensorize_stage_edit_supervision(
+                (targets,), batch, SCHEMA, device=mx.cpu
+            )
+            model = TinySourceRule()
+            loss_and_grad = nn.value_and_grad(
+                model,
+                lambda trained_model: stage_edit_loss(
+                    trained_model, batch, supervision, contract
+                )[0],
+            )
+            initial_loss, gradients = loss_and_grad(model)
+            first_gradient = tree_flatten(gradients)[0][1]
+            gradient_size = mx.sum(mx.abs(first_gradient))
+            mx.eval(initial_loss, gradient_size)
+            optimizer = optim.AdamW(learning_rate=0.1, weight_decay=0.0)
+            for _ in range(40):
+                loss, gradients = loss_and_grad(model)
+                optimizer.update(model, gradients)
+                mx.eval(loss, model.parameters(), optimizer.state)
+            output = model(batch)
+            final_loss = stage_edit_loss(model, batch, supervision, contract)[0]
+            mx.eval(output.source_selection_logits, final_loss)
+
+        self.assertGreater(float(gradient_size.item()), 0.0)
+        self.assertLess(float(final_loss.item()), float(initial_loss.item()))
+        predicted = np.argmax(
+            np.asarray(output.source_selection_logits)[0, : len(selected_ids)],
+            axis=-1,
+        )
+        expected = np.asarray(supervision.source_targets)[0, : len(selected_ids)]
+        np.testing.assert_array_equal(predicted, expected)
 
     def test_eligible_all_pairwise_uses_every_hard_gated_negative(self) -> None:
         targets = StageEditTargetSequence(
