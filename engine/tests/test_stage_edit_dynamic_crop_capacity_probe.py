@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -37,7 +38,10 @@ from crosscut.stage_edit_dynamic_crop_capacity_probe import (
     build_dynamic_crop_capacity_selection as _build_dynamic_crop_capacity_selection,
     default_dynamic_crop_v2_probe_candidates,
     _atomic_exclusive_write,
+    _load_fold_evaluation,
+    _load_selection_dataset,
     _publish_supervised_mlx_smoke_evidence,
+    _validate_schedule,
     _validate_mlx_smoke_evidence_root,
     load_dynamic_crop_capacity_selection as _load_dynamic_crop_capacity_selection,
     write_dynamic_crop_capacity_selection as _write_dynamic_crop_capacity_selection,
@@ -67,6 +71,7 @@ from crosscut.stage_edit_transformer import (
     PRODUCTION_TRAINING_REPORT_FILENAME,
     PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
     PRODUCTION_TRAINING_RUN_KIND,
+    STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
     StageEditLossContract,
     StageEditTransformerConfig,
 )
@@ -859,6 +864,202 @@ def _smoke(
     )
 
 
+def _full_dynamic_validation_metrics(metric_value: float) -> dict:
+    coordinate = {
+        "label_count": 20,
+        "mean_absolute_error": metric_value,
+        "p95_absolute_error": metric_value,
+    }
+    return {
+        "schema_version": DYNAMIC_CROP_V2_SCHEMA_VERSION,
+        "model_contract": DYNAMIC_CROP_V2_MODEL_CONTRACT,
+        "target_contract": DYNAMIC_CROP_V2_TARGET_CONTRACT,
+        "loss_contract": DYNAMIC_CROP_V2_LOSS_CONTRACT,
+        "total_loss": metric_value,
+        "loss_components": {
+            "base_total": metric_value,
+            "base_cut": metric_value,
+            "base_source_listwise": metric_value,
+            "base_source_pairwise": metric_value,
+            "base_duration": metric_value,
+            "base_transition": metric_value,
+            "base_crop": metric_value,
+            "dynamic_crop_values": metric_value,
+            "dynamic_crop_times": metric_value,
+            "dynamic_crop_presence": metric_value,
+            "dynamic_crop_motion": metric_value,
+            "dynamic_crop_total": metric_value,
+            "total": metric_value,
+        },
+        "trajectory": {
+            "track_label_count": 10,
+            "keyframe_label_count": 20,
+            "coordinates": {
+                "zoom": dict(coordinate),
+                "center_x": dict(coordinate),
+                "center_y": dict(coordinate),
+                "roll_degrees": dict(coordinate),
+            },
+            "normalized_time_mae": metric_value,
+            "presence": {
+                "label_count": 80,
+                "precision": 0.8,
+                "recall": 0.8,
+                "f1": 0.8,
+                "keyframe_count_exact_accuracy": 0.6,
+            },
+            "motion": {"label_count": 10, "accuracy": 0.7},
+            "renderer_decode": {
+                "attempt_count": 10,
+                "eligible_count": 9,
+                "eligible_rate": 0.9,
+                "minimum_safe_zoom_projection_count": 0,
+                "rejection_reasons": {"unsafe_fixture": 1},
+            },
+        },
+        "legacy_static_crop_head_used_for_trajectory": False,
+        "production_activation_authorized": False,
+    }
+
+
+def _fixture_phase_learning_rate(
+    phase_step: int,
+    *,
+    peak: float,
+    total_steps: int,
+    warmup_steps: int,
+) -> float:
+    schedule_index = phase_step - 1
+    if schedule_index < warmup_steps:
+        start = peak * 0.1
+        return start + (peak - start) * schedule_index / warmup_steps
+    decay_steps = total_steps - warmup_steps
+    decay_index = schedule_index - warmup_steps
+    end = peak * float(PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"])
+    return end + 0.5 * (peak - end) * (
+        1.0 + math.cos(math.pi * decay_index / decay_steps)
+    )
+
+
+def _fixture_finetune_learning_rate(phase_step: int) -> float:
+    return _fixture_phase_learning_rate(
+        phase_step,
+        peak=float(PROBE_TRAINING_SCHEDULE["learning_rate"]),
+        total_steps=int(PROBE_TRAINING_SCHEDULE["finetune_steps_planned"]),
+        warmup_steps=int(PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"]),
+    )
+
+
+def _fixture_source_pretraining(
+    training_songs: tuple[str, ...],
+    training_refs: tuple[str, ...],
+) -> tuple[list[dict], dict]:
+    references_by_song = {
+        song_id: tuple(
+            sorted(set(REFERENCES[song_id]) & set(training_refs))
+        )
+        for song_id in training_songs
+    }
+    song_visits = {song_id: 0 for song_id in training_songs}
+    per_song_counts = {song_id: 0 for song_id in training_songs}
+    per_reference_counts = {reference_id: 0 for reference_id in training_refs}
+    reference_song_ids = {
+        reference_id: song_id
+        for song_id, references in references_by_song.items()
+        for reference_id in references
+    }
+    history = []
+    source_steps = int(PROBE_TRAINING_SCHEDULE["source_pretraining_steps"])
+    for phase_step in range(1, source_steps + 1):
+        song_id = training_songs[(phase_step - 1) % len(training_songs)]
+        references = references_by_song[song_id]
+        reference_id = references[song_visits[song_id] % len(references)]
+        song_visits[song_id] += 1
+        per_song_counts[song_id] += 1
+        per_reference_counts[reference_id] += 1
+        history.append(
+            {
+                "source_pretrain_step": phase_step,
+                "optimizer_step": 500 + phase_step,
+                "actual_learning_rate": _fixture_phase_learning_rate(
+                    phase_step,
+                    peak=float(
+                        PROBE_TRAINING_SCHEDULE[
+                            "source_pretraining_peak_learning_rate"
+                        ]
+                    ),
+                    total_steps=source_steps,
+                    warmup_steps=int(
+                        PROBE_TRAINING_SCHEDULE[
+                            "source_pretraining_warmup_steps"
+                        ]
+                    ),
+                ),
+                "song_id": song_id,
+                "reference_id": reference_id,
+                "group_id": f"{reference_id}:confirmed-source:1",
+                "anchor_token_index": 1,
+                "source_only_loss": 1.0,
+                "gradient_norm_before_clip": 1.0,
+                "checkpoint_selection_eligible": False,
+            }
+        )
+    sampling = {
+        "contract": "deterministic_song_reference_group_round_robin_v1",
+        "opening_source_excluded_count": len(training_refs),
+        "unconfirmed_source_label_excluded_count": 0,
+        "confirmed_source_event_count": len(training_refs),
+        "reference_song_ids": reference_song_ids,
+        "per_reference_confirmed_group_counts": {
+            reference_id: 1 for reference_id in training_refs
+        },
+        "per_song_sampled_counts": per_song_counts,
+        "per_reference_sampled_counts": per_reference_counts,
+    }
+    return history, sampling
+
+
+def _full_training_history(
+    *,
+    dynamic_validation_metrics: dict,
+    validation_selection: dict,
+) -> list[dict]:
+    history = []
+    for epoch in range(1, 31):
+        first_step = (epoch - 1) * 4 + 1
+        last_step = epoch * 4
+        steps = list(range(first_step, last_step + 1))
+        history.append(
+            {
+                "epoch": epoch,
+                "optimizer_step": 1000 + last_step,
+                "finetune_optimizer_step_first": first_step,
+                "finetune_optimizer_step_last": last_step,
+                "finetune_optimizer_steps": steps,
+                "finetune_actual_learning_rates": [
+                    _fixture_finetune_learning_rate(step) for step in steps
+                ],
+                "training_song_reference_validation_total_loss": (
+                    dynamic_validation_metrics["total_loss"]
+                ),
+                "training_song_reference_validation_selection_score": (
+                    validation_selection["score"]
+                ),
+                "training_song_reference_validation_selection_contract": (
+                    STAGE_EDIT_VALIDATION_SELECTION_CONTRACT
+                ),
+                "training_song_reference_validation_dynamic_crop_v2": (
+                    dynamic_validation_metrics
+                ),
+                "checkpoint_selection_eligible_after_burn_in": (
+                    last_step >= 60
+                ),
+                "training_song_reference_validation_improved": epoch == 15,
+            }
+        )
+    return history
+
+
 def _fold(
     root: Path,
     candidate: DynamicCropCapacityCandidate,
@@ -878,7 +1079,7 @@ def _fold(
         checkpoint_id,
         DEFAULT_STAGE_EDIT_SCHEMA,
         candidate.model_config,
-        training_steps=10,
+        training_steps=1060,
         weights_trained=True,
         dynamic_crop_config=DynamicCropHeadV2Config(),
     )
@@ -904,6 +1105,42 @@ def _fold(
     base_effective["cut_positive_weight"] = 2.0
     dynamic_effective = asdict(candidate.dynamic_crop_loss_contract)
     dynamic_effective["base"]["cut_positive_weight"] = 2.0
+    source_effective = dict(base_effective)
+    source_effective.update(
+        {
+            "source_objective": "eligible_all_hybrid",
+            "cut_weight": 0.0,
+            "cut_positive_weight": 1.0,
+            "duration_weight": 0.0,
+            "transition_weight": 0.0,
+            "crop_weight": 0.0,
+        }
+    )
+    source_pretraining_history, source_sampling = _fixture_source_pretraining(
+        training_songs, training_refs
+    )
+    dynamic_validation_metrics = _full_dynamic_validation_metrics(metric_value)
+    validation_selection = {
+        "contract": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
+        "selectable": True,
+        "score": 0.5,
+        "weights": {
+            "cut_auroc": 0.45,
+            "source_mrr": 0.45,
+            "bounded_inverse_total_loss": 0.10,
+        },
+        "components": {
+            "cut_auroc": 0.5,
+            "source_mrr": 0.5,
+            "total_loss": metric_value,
+            "bounded_inverse_total_loss": 1.0 / (1.0 + metric_value),
+        },
+        "formula": "fixture",
+    }
+    selected_validation_metrics = {
+        "total_loss": metric_value,
+        "dynamic_crop_v2": dynamic_validation_metrics,
+    }
     freeze = {
         "schema_version": 1,
         "contract": "stage_edit_model_config_checkpoint_and_threshold_freeze_v1",
@@ -913,6 +1150,12 @@ def _fold(
         ),
         "checkpoint_id": checkpoint_id,
         "checkpoint_weight_sha256": weight_sha,
+        "selected_training_step": 1060,
+        "selected_finetune_optimizer_step": 60,
+        "minimum_checkpoint_selection_finetune_steps": 60,
+        "selected_after_checkpoint_burn_in": True,
+        "validation_selection": validation_selection,
+        "selected_validation_metrics": selected_validation_metrics,
         "training_song_ids": list(training_songs),
         "training_reference_ids": list(training_refs),
         "validation_reference_ids": list(internal_validation_refs),
@@ -935,8 +1178,23 @@ def _fold(
         "cut_pretraining_warmup_steps": PROBE_TRAINING_SCHEDULE[
             "cut_pretraining_warmup_steps"
         ],
+        "source_pretraining_steps": PROBE_TRAINING_SCHEDULE[
+            "source_pretraining_steps"
+        ],
+        "source_pretraining_peak_learning_rate": PROBE_TRAINING_SCHEDULE[
+            "source_pretraining_peak_learning_rate"
+        ],
+        "source_pretraining_window_length": PROBE_TRAINING_SCHEDULE[
+            "source_pretraining_window_length"
+        ],
+        "source_pretraining_warmup_steps": PROBE_TRAINING_SCHEDULE[
+            "source_pretraining_warmup_steps"
+        ],
         "finetune_warmup_steps": PROBE_TRAINING_SCHEDULE[
             "finetune_warmup_steps"
+        ],
+        "finetune_steps_planned": PROBE_TRAINING_SCHEDULE[
+            "finetune_steps_planned"
         ],
         "minimum_learning_rate_ratio": PROBE_TRAINING_SCHEDULE[
             "minimum_learning_rate_ratio"
@@ -968,12 +1226,15 @@ def _fold(
         },
         "checkpoint": {
             "checkpoint_id": checkpoint_id,
+            "training_steps": 1060,
             "weight_sha256": weight_sha,
             "production_activation_authorized": False,
         },
         "selection_freeze_evidence": {
             "path": str(freeze_path.resolve()),
+            "filename": freeze_path.name,
             "file_sha256": _hash_file(freeze_path),
+            "content_sha256": _canonical_hash(freeze),
             "written_before_heldout_forward": True,
         },
         "structured_head_coverage_gate": {"passed": True},
@@ -983,13 +1244,76 @@ def _fold(
             "early_stopping_patience": PROBE_TRAINING_SCHEDULE[
                 "early_stopping_patience"
             ],
+            "early_stopping_patience_unit": PROBE_TRAINING_SCHEDULE[
+                "early_stopping_patience_unit"
+            ],
             "batch_size": PROBE_TRAINING_SCHEDULE["batch_size"],
             "learning_rate": PROBE_TRAINING_SCHEDULE["learning_rate"],
             "weight_decay": PROBE_TRAINING_SCHEDULE["weight_decay"],
             "gradient_clip_norm": PROBE_TRAINING_SCHEDULE["gradient_clip_norm"],
             "learning_rate_schedule": schedule,
+            "completed_epochs": 30,
+            "optimizer_steps": 1120,
+            "cut_pretraining_optimizer_steps": 500,
+            "source_pretraining_optimizer_steps": 500,
+            "multi_head_finetuning_optimizer_steps": 120,
+            "source_head_update_steps": 620,
+            "minimum_finetune_optimizer_steps": 120,
+            "minimum_checkpoint_selection_finetune_steps": 60,
+            "finetune_optimizer_initial_step": 0,
+            "finetune_optimizer_state_final_step": 120,
+            "finetune_optimizer_state_reset_after_cut_pretraining": True,
+            "cut_pretraining_optimizer_initial_step": 0,
+            "cut_pretraining_optimizer_state_final_step": 500,
+            "source_pretraining_optimizer_initial_step": 0,
+            "source_pretraining_optimizer_state_final_step": 500,
+            "source_pretraining_optimizer_state_reset_after_cut_pretraining": True,
+            "finetune_optimizer_state_reset_after_cut_and_source_pretraining": True,
+            "checkpoint_writes_before_joint_finetuning": 0,
+            "finetune_steps_without_improvement_at_stop": 60,
+            "early_stopping_triggered": False,
+            "training_stop_reason": "planned_finetune_steps_completed",
+            "finetune_schedule_completion_fraction": 1.0,
+            "best_epoch": 15,
+            "best_training_step": 1060,
+            "best_finetune_optimizer_step": 60,
+            "best_validation_selection_score": 0.5,
+            "best_validation_selection_evidence": validation_selection,
+            "selected_checkpoint_validation_metrics": (
+                selected_validation_metrics
+            ),
             "effective_loss_contract": base_effective,
             "effective_dynamic_crop_loss_contract": dynamic_effective,
+            "cut_pretraining": {
+                "enabled": True,
+                "partition": "training_references_only",
+                "balanced_anchor_positive_count_per_step": 1,
+                "balanced_anchor_negative_count_per_step": 1,
+                "other_head_losses_zero_weighted": True,
+                "source_head_losses_zero_weighted": True,
+                "checkpoint_selection_eligible": False,
+                "positive_weight": 1.0,
+                "minimum_step_contract": 500,
+                "validation_labels_consumed": False,
+                "heldout_labels_consumed": False,
+            },
+            "source_pretraining": {
+                "enabled": True,
+                "partition": "training_references_only",
+                "confirmed_event_contract": (
+                    "target_cut_equals_one_and_selected_source_id_v1"
+                ),
+                "opening_source_selection_excluded": True,
+                "loss_contract": source_effective,
+                "listwise_loss_enabled": True,
+                "eligible_all_pairwise_loss_enabled": True,
+                "other_head_losses_zero_weighted": True,
+                "checkpoint_selection_eligible": False,
+                "minimum_step_contract": 500,
+                "validation_labels_consumed": False,
+                "heldout_labels_consumed": False,
+                "sampling": source_sampling,
+            },
             "unseen_song_used_for_model_selection": False,
         },
         "held_out_evaluation": {
@@ -1004,20 +1328,13 @@ def _fold(
                 "passed": True,
                 "thresholds": ProductionQualityThresholds().to_dict(),
             },
-            "dynamic_crop_v2_metrics": {
-                "schema_version": DYNAMIC_CROP_V2_SCHEMA_VERSION,
-                "model_contract": DYNAMIC_CROP_V2_MODEL_CONTRACT,
-                "target_contract": DYNAMIC_CROP_V2_TARGET_CONTRACT,
-                "loss_contract": DYNAMIC_CROP_V2_LOSS_CONTRACT,
-                "loss_components": {
-                    "base_total": metric_value,
-                    "dynamic_crop_values": metric_value,
-                    "dynamic_crop_times": metric_value,
-                    "dynamic_crop_presence": metric_value,
-                    "dynamic_crop_motion": metric_value,
-                },
-            },
+            "dynamic_crop_v2_metrics": dynamic_validation_metrics,
         },
+        "source_pretraining_history": source_pretraining_history,
+        "history": _full_training_history(
+            dynamic_validation_metrics=dynamic_validation_metrics,
+            validation_selection=validation_selection,
+        ),
     }
     report_path = fold_root / PRODUCTION_TRAINING_REPORT_FILENAME
     report_path.write_text(json.dumps(report), encoding="utf-8")
@@ -1078,6 +1395,143 @@ class DynamicCropCapacityProbeTests(unittest.TestCase):
     def test_fold_evaluation_has_no_public_scalar_constructor(self) -> None:
         with self.assertRaises(TypeError):
             FoldEvaluation(candidate_id="a" * 64)  # type: ignore[call-arg]
+
+    def test_schedule_requires_exact_120_steps_and_60_step_burn_in(self) -> None:
+        candidate = _candidate("small", 32)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dataset_path = _dataset(root)
+            evidence_path = _fold(
+                root, candidate, BANG_BANG, dataset_path, 1.0
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            report = json.loads(
+                Path(evidence["production_training_report"]["path"])
+                .read_text(encoding="utf-8")
+            )
+
+        incomplete = json.loads(json.dumps(report))
+        incomplete["optimization"][
+            "multi_head_finetuning_optimizer_steps"
+        ] = 119
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "exact 120-step"
+        ):
+            _validate_schedule(incomplete)
+
+        before_burn_in = json.loads(json.dumps(report))
+        before_burn_in["optimization"]["best_finetune_optimizer_step"] = 59
+        before_burn_in["optimization"]["best_training_step"] = 559
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "60-step burn-in"
+        ):
+            _validate_schedule(before_burn_in)
+
+        cut_source_leak = json.loads(json.dumps(report))
+        cut_source_leak["optimization"]["cut_pretraining"][
+            "source_head_losses_zero_weighted"
+        ] = False
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError,
+            "cut-only pretraining could influence source/checkpoint",
+        ):
+            _validate_schedule(cut_source_leak)
+
+    def test_schedule_requires_actual_lr_and_full_dynamic_history(self) -> None:
+        candidate = _candidate("small", 32)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dataset_path = _dataset(root)
+            evidence_path = _fold(
+                root, candidate, BANG_BANG, dataset_path, 1.0
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            report = json.loads(
+                Path(evidence["production_training_report"]["path"])
+                .read_text(encoding="utf-8")
+            )
+
+        wrong_lr = json.loads(json.dumps(report))
+        wrong_lr["history"][0]["finetune_actual_learning_rates"][0] *= 2.0
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "actual finetune learning-rate"
+        ):
+            _validate_schedule(wrong_lr)
+
+        wrong_source_lr = json.loads(json.dumps(report))
+        wrong_source_lr["source_pretraining_history"][0][
+            "actual_learning_rate"
+        ] *= 2.0
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "source actual learning-rate"
+        ):
+            _validate_schedule(wrong_source_lr)
+
+        reused_optimizer = json.loads(json.dumps(report))
+        reused_optimizer["optimization"][
+            "source_pretraining_optimizer_initial_step"
+        ] = 500
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "exact 120-step"
+        ):
+            _validate_schedule(reused_optimizer)
+
+        truncated_metrics = json.loads(json.dumps(report))
+        del truncated_metrics["history"][0][
+            "training_song_reference_validation_dynamic_crop_v2"
+        ]["trajectory"]
+        with self.assertRaisesRegex(
+            DynamicCropCapacityProbeError, "keys are not exact"
+        ):
+            _validate_schedule(truncated_metrics)
+
+    def test_selection_freeze_metrics_must_match_selected_report_evidence(
+        self,
+    ) -> None:
+        candidate = _candidate("small", 32)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            dataset_path = _dataset(root)
+            evidence_path = _fold(
+                root, candidate, BANG_BANG, dataset_path, 1.0
+            )
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            report_path = Path(evidence["production_training_report"]["path"])
+            freeze_path = Path(evidence["selection_freeze"]["path"])
+            metadata_path = Path(evidence["checkpoint_metadata"]["path"])
+            weights_path = Path(evidence["checkpoint_weights"]["path"])
+
+            freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+            freeze["selected_validation_metrics"]["dynamic_crop_v2"][
+                "total_loss"
+            ] = 2.0
+            freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["selection_freeze_evidence"]["file_sha256"] = _hash_file(
+                freeze_path
+            )
+            report["selection_freeze_evidence"]["content_sha256"] = (
+                _canonical_hash(freeze)
+            )
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            rebound = write_fold_run_evidence(
+                root,
+                candidate_id=candidate.candidate_id,
+                validation_song_id=BANG_BANG,
+                dataset_manifest_path=dataset_path,
+                production_training_report_path=report_path,
+                selection_freeze_path=freeze_path,
+                checkpoint_metadata_path=metadata_path,
+                checkpoint_weights_path=weights_path,
+            )
+            dataset = _load_selection_dataset(dataset_path)
+            with self.assertRaisesRegex(
+                DynamicCropCapacityProbeError, "selection freeze provenance"
+            ):
+                _load_fold_evaluation(
+                    rebound, candidate=candidate, dataset=dataset
+                )
 
     def test_incomplete_reference_dataset_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

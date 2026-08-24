@@ -31,6 +31,11 @@ from crosscut.stage_edit_head_materializer import (
 from crosscut.stage_edit_production_training import (
     ProductionQualityThresholds,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
+    _HierarchicalSourceWindowSampler,
+    _balanced_cut_windows,
+    _cut_only_pretraining_loss_contract,
+    _source_only_pretraining_loss_contract,
+    _source_pretraining_inventory,
     _structured_head_coverage_gate,
     evaluate_stage_edit_production_quality,
     prepare_stage_edit_production_input_sequences,
@@ -50,6 +55,7 @@ from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     SourceCandidateToken,
     StageEditSequence,
+    StageEditLossContract,
     StageEditTarget,
     StageEditTargetSequence,
     StageEditToken,
@@ -444,6 +450,113 @@ def _dynamic_crop_corpus(
     )
 
 
+def _source_balance_example(
+    song: str,
+    reference: str,
+    event_count: int,
+) -> ReferenceTrainingExample:
+    base = _training_example(song, reference)
+    template = base.sequence.tokens[0]
+    tokens = tuple(
+        replace(template, master_time_seconds=index * 0.5)
+        for index in range(event_count + 1)
+    )
+    targets = [
+        StageEditTarget(
+            cut=None,
+            selected_source_id="A",
+            rejected_source_ids=("B",),
+        )
+    ]
+    targets.extend(
+        StageEditTarget(
+            cut=1.0,
+            selected_source_id="A" if index % 2 else "B",
+            rejected_source_ids=("B",) if index % 2 else ("A",),
+        )
+        for index in range(1, event_count + 1)
+    )
+    return replace(
+        base,
+        sequence=StageEditSequence(reference, tokens),
+        targets=StageEditTargetSequence(reference, tuple(targets)),
+    )
+
+
+class StageEditSourcePretrainingTests(unittest.TestCase):
+    def test_sampler_balances_song_then_reference_then_group(self) -> None:
+        examples = (
+            _source_balance_example("SONG-A", "dominant-70", 70),
+            _source_balance_example("SONG-A", "sparse-1", 1),
+            _source_balance_example("SONG-B", "medium-3", 3),
+            _source_balance_example("SONG-B", "medium-2", 2),
+        )
+        inventory = _source_pretraining_inventory(
+            examples,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            window_length=32,
+        )
+        self.assertEqual(4, inventory.opening_source_excluded_count)
+        self.assertEqual(70, inventory.per_reference_confirmed_group_counts["dominant-70"])
+        self.assertEqual(1, inventory.per_reference_confirmed_group_counts["sparse-1"])
+
+        first = _HierarchicalSourceWindowSampler(inventory.windows, seed=91)
+        second = _HierarchicalSourceWindowSampler(inventory.windows, seed=91)
+        first_trace = [first.sample().group_id for _ in range(400)]
+        second_trace = [second.sample().group_id for _ in range(400)]
+        self.assertEqual(first_trace, second_trace)
+        self.assertEqual({"SONG-A": 200, "SONG-B": 200}, first.per_song_sampled_counts)
+        self.assertEqual(
+            {
+                "dominant-70": 100,
+                "medium-2": 100,
+                "medium-3": 100,
+                "sparse-1": 100,
+            },
+            first.per_reference_sampled_counts,
+        )
+        dominant_group_counts = {
+            group_id: first_trace.count(group_id)
+            for group_id in set(first_trace)
+            if group_id.startswith("dominant-70:")
+        }
+        self.assertLessEqual(
+            max(dominant_group_counts.values())
+            - min(dominant_group_counts.values()),
+            1,
+        )
+
+    def test_cut_only_cannot_update_source_and_source_only_is_exact(self) -> None:
+        contract = StageEditLossContract()
+        cut_only = _cut_only_pretraining_loss_contract(contract)
+        self.assertEqual(0.0, cut_only.source_listwise_weight)
+        self.assertEqual(0.0, cut_only.source_pairwise_weight)
+        self.assertEqual(1.0, cut_only.cut_weight)
+
+        examples = (_training_example("SONG", "reference"),)
+        positive, negative = _balanced_cut_windows(
+            examples,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            window_length=32,
+        )
+        self.assertTrue(
+            all(
+                target.selected_source_id is None
+                for window in (*positive, *negative)
+                for target in window.targets.targets
+            )
+        )
+
+        source_only = _source_only_pretraining_loss_contract(contract)
+        self.assertEqual("eligible_all_hybrid", source_only.source_objective)
+        self.assertGreater(source_only.source_listwise_weight, 0.0)
+        self.assertGreater(source_only.source_pairwise_weight, 0.0)
+        self.assertEqual(0.0, source_only.cut_weight)
+        self.assertEqual(0.0, source_only.duration_weight)
+        self.assertEqual(0.0, source_only.transition_weight)
+        self.assertEqual(0.0, source_only.crop_weight)
+
+
 @unittest.skipUnless(mlx_runtime_version() is not None, "MLX is optional")
 class StageEditProductionTrainingSmokeTests(unittest.TestCase):
     def test_exact_saved_checkpoint_needs_song_gate_and_explicit_authorization(self) -> None:
@@ -513,6 +626,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 batch_size=1,
                 learning_rate=1.0e-3,
                 cut_pretrain_steps=0,
+                source_pretrain_steps=500,
+                minimum_finetune_optimizer_steps=1,
+                minimum_checkpoint_selection_finetune_steps=1,
                 seed=19,
                 device=mx.cpu,
                 dynamic_crop_corpus=_dynamic_crop_corpus(examples),
@@ -539,6 +655,12 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 selection_freeze[
                     "style_or_attitude_configuration_mutable_after_freeze"
                 ]
+            )
+            self.assertTrue(
+                selection_freeze["selected_after_checkpoint_burn_in"]
+            )
+            self.assertGreaterEqual(
+                selection_freeze["selected_finetune_optimizer_step"], 1
             )
             readiness = stage_edit_readiness_report(checkpoint)
             self.assertTrue(readiness.learned_inference_ready)
@@ -648,9 +770,110 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             self.assertFalse(
                 report["optimization"]["unseen_song_used_for_model_selection"]
             )
+            optimization = report["optimization"]
+            self.assertEqual(2, optimization["multi_head_finetuning_optimizer_steps"])
+            self.assertEqual(500, optimization["source_pretraining_optimizer_steps"])
+            self.assertEqual(502, optimization["source_head_update_steps"])
+            self.assertEqual(
+                0, optimization["source_pretraining_optimizer_initial_step"]
+            )
+            self.assertEqual(
+                500,
+                optimization["source_pretraining_optimizer_state_final_step"],
+            )
+            self.assertTrue(
+                optimization[
+                    "source_pretraining_optimizer_state_reset_after_cut_pretraining"
+                ]
+            )
+            self.assertTrue(
+                optimization[
+                    "finetune_optimizer_state_reset_after_cut_and_source_pretraining"
+                ]
+            )
+            self.assertEqual(0, optimization["checkpoint_writes_before_joint_finetuning"])
+            source_sampling = optimization["source_pretraining"]["sampling"]
+            self.assertEqual(4, source_sampling["confirmed_source_event_count"])
+            self.assertEqual(
+                500, sum(source_sampling["per_reference_sampled_counts"].values())
+            )
+            self.assertEqual(500, len(report["source_pretraining_history"]))
+            self.assertAlmostEqual(
+                3.0e-5,
+                report["source_pretraining_history"][0][
+                    "actual_learning_rate"
+                ],
+                places=10,
+            )
+            self.assertEqual(
+                1,
+                report["source_pretraining_history"][0]["source_pretrain_step"],
+            )
+            self.assertEqual(
+                500,
+                report["source_pretraining_history"][-1]["source_pretrain_step"],
+            )
+            self.assertEqual(
+                500,
+                report["source_pretraining_history"][-1]["optimizer_step"],
+            )
+            self.assertEqual(502, report["history"][0]["optimizer_step"])
+            self.assertTrue(
+                all(
+                    not record["checkpoint_selection_eligible"]
+                    for record in report["source_pretraining_history"]
+                )
+            )
+            self.assertEqual(0, optimization["finetune_optimizer_initial_step"])
+            self.assertEqual(2, optimization["finetune_optimizer_state_final_step"])
+            self.assertTrue(
+                optimization[
+                    "finetune_optimizer_state_reset_after_cut_pretraining"
+                ]
+            )
+            self.assertFalse(optimization["early_stopping_triggered"])
+            self.assertEqual(
+                "planned_finetune_steps_completed",
+                optimization["training_stop_reason"],
+            )
+            self.assertEqual(
+                "finetune_optimizer_steps",
+                optimization["early_stopping_patience_unit"],
+            )
+            self.assertEqual([1, 2], report["history"][0]["finetune_optimizer_steps"])
+            self.assertEqual(
+                2,
+                len(report["history"][0]["finetune_actual_learning_rates"]),
+            )
+            history_dynamic = report["history"][0][
+                "training_song_reference_validation_dynamic_crop_v2"
+            ]
+            self.assertEqual(2, history_dynamic["schema_version"])
+            self.assertEqual(
+                history_dynamic,
+                optimization["selected_checkpoint_validation_metrics"][
+                    "dynamic_crop_v2"
+                ],
+            )
             self.assertTrue(
                 report["checkpoint"]["production_activation_authorized"]
             )
+            with self.assertRaisesRegex(
+                ValueError, "planned multi-head finetuning.*floor"
+            ):
+                train_production_stage_edit(
+                    corpus,
+                    checkpoint_directory=Path(directory) / "undertrained",
+                    held_out_song_ids=("XOXZ",),
+                    model_config=config,
+                    epochs=1,
+                    early_stopping_patience=1,
+                    batch_size=1,
+                    cut_pretrain_steps=0,
+                    source_pretrain_steps=0,
+                    device=mx.cpu,
+                    quality_thresholds=thresholds,
+                )
             missing_snapshot_examples = list(examples)
             missing_snapshot_examples[0] = replace(
                 missing_snapshot_examples[0],
@@ -674,6 +897,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     epochs=1,
                     early_stopping_patience=1,
                     batch_size=1,
+                    source_pretrain_steps=0,
+                    minimum_finetune_optimizer_steps=1,
+                    minimum_checkpoint_selection_finetune_steps=1,
                     device=mx.cpu,
                     quality_thresholds=thresholds,
                 )
@@ -686,6 +912,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     epochs=1,
                     early_stopping_patience=1,
                     batch_size=1,
+                    source_pretrain_steps=0,
+                    minimum_finetune_optimizer_steps=1,
+                    minimum_checkpoint_selection_finetune_steps=1,
                     device=mx.cpu,
                     quality_thresholds=thresholds,
                 )

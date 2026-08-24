@@ -1069,6 +1069,227 @@ class _BalancedCutWindow:
     anchor_token_index: int
 
 
+@dataclass(frozen=True, slots=True)
+class _SourcePretrainingWindow:
+    sequence: StageEditSequence
+    targets: StageEditTargetSequence
+    song_id: str
+    reference_id: str
+    group_id: str
+    anchor_token_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SourcePretrainingInventory:
+    windows: tuple[_SourcePretrainingWindow, ...]
+    opening_source_excluded_count: int
+    unconfirmed_source_label_excluded_count: int
+    per_reference_confirmed_group_counts: Mapping[str, int]
+    reference_song_ids: Mapping[str, str]
+
+
+def _stable_sampler_order(
+    values: Sequence[Any],
+    *,
+    seed: int,
+    scope: str,
+) -> tuple[Any, ...]:
+    ordered = sorted(values, key=str)
+    digest = hashlib.sha256(f"{seed}:{scope}".encode("utf-8")).digest()
+    random.Random(int.from_bytes(digest[:8], "big")).shuffle(ordered)
+    return tuple(ordered)
+
+
+class _HierarchicalSourceWindowSampler:
+    """Deterministic song -> reference -> source-event round robin."""
+
+    def __init__(
+        self,
+        windows: Sequence[_SourcePretrainingWindow],
+        *,
+        seed: int,
+    ) -> None:
+        nested: dict[str, dict[str, list[_SourcePretrainingWindow]]] = {}
+        for window in windows:
+            nested.setdefault(window.song_id, {}).setdefault(
+                window.reference_id, []
+            ).append(window)
+        if not nested:
+            raise ValueError("source pretraining requires confirmed source events")
+        self._song_order = _stable_sampler_order(
+            tuple(nested), seed=seed, scope="source-pretrain:songs"
+        )
+        self._reference_orders = {
+            song_id: _stable_sampler_order(
+                tuple(references),
+                seed=seed,
+                scope=f"source-pretrain:references:{song_id}",
+            )
+            for song_id, references in nested.items()
+        }
+        self._group_orders = {
+            (song_id, reference_id): _stable_sampler_order(
+                tuple(groups),
+                seed=seed,
+                scope=(
+                    "source-pretrain:groups:"
+                    f"{song_id}:{reference_id}"
+                ),
+            )
+            for song_id, references in nested.items()
+            for reference_id, groups in references.items()
+        }
+        self._song_visit_counts = {song_id: 0 for song_id in nested}
+        self._reference_visit_counts = {
+            key: 0 for key in self._group_orders
+        }
+        self._per_song_sampled_counts = {song_id: 0 for song_id in nested}
+        self._per_reference_sampled_counts = {
+            reference_id: 0
+            for references in nested.values()
+            for reference_id in references
+        }
+        self._sample_count = 0
+
+    def sample(self) -> _SourcePretrainingWindow:
+        song_id = self._song_order[self._sample_count % len(self._song_order)]
+        song_visit = self._song_visit_counts[song_id]
+        references = self._reference_orders[song_id]
+        reference_id = references[song_visit % len(references)]
+        reference_key = (song_id, reference_id)
+        reference_visit = self._reference_visit_counts[reference_key]
+        groups = self._group_orders[reference_key]
+        window = groups[reference_visit % len(groups)]
+
+        self._sample_count += 1
+        self._song_visit_counts[song_id] += 1
+        self._reference_visit_counts[reference_key] += 1
+        self._per_song_sampled_counts[song_id] += 1
+        self._per_reference_sampled_counts[reference_id] += 1
+        return window
+
+    @property
+    def per_song_sampled_counts(self) -> dict[str, int]:
+        return dict(sorted(self._per_song_sampled_counts.items()))
+
+    @property
+    def per_reference_sampled_counts(self) -> dict[str, int]:
+        return dict(sorted(self._per_reference_sampled_counts.items()))
+
+
+def _source_pretraining_inventory(
+    examples: Sequence[ReferenceTrainingExample],
+    *,
+    schema: StageEditTokenSchema,
+    window_length: int,
+) -> _SourcePretrainingInventory:
+    """Keep only confirmed, non-opening editorial source switches."""
+
+    if window_length < 2:
+        raise ValueError("source pretraining window must contain >= 2 tokens")
+    windows: list[_SourcePretrainingWindow] = []
+    opening_source_excluded_count = 0
+    unconfirmed_source_label_excluded_count = 0
+    reference_song_ids: dict[str, str] = {}
+    per_reference_confirmed_group_counts: dict[str, int] = {}
+    prepared_sequences = prepare_stage_edit_production_input_sequences(
+        examples, schema=schema
+    )
+    for example, prepared in zip(examples, prepared_sequences, strict=True):
+        if len(prepared.tokens) != len(example.targets.targets):
+            raise ValueError("source pretraining sequence/target length mismatch")
+        song_id = str(example.song_id or "").strip()
+        for anchor_index, target in enumerate(example.targets.targets):
+            if anchor_index == 0 and target.selected_source_id is not None:
+                opening_source_excluded_count += 1
+                continue
+            if target.selected_source_id is None:
+                continue
+            if target.cut != 1.0:
+                unconfirmed_source_label_excluded_count += 1
+                continue
+            if not song_id:
+                raise ValueError(
+                    "confirmed source pretraining events require explicit song ids"
+                )
+            observed_song = reference_song_ids.setdefault(
+                example.reference_id, song_id
+            )
+            if observed_song != song_id:
+                raise ValueError("source pretraining reference spans multiple songs")
+            start = max(0, anchor_index - window_length + 1)
+            group_id = (
+                f"{example.reference_id}:confirmed-source:{anchor_index}"
+            )
+            token_values = tuple(prepared.tokens[start : anchor_index + 1])
+            target_values = tuple(
+                StageEditTarget() for _ in token_values[:-1]
+            ) + (
+                StageEditTarget(
+                    selected_source_id=target.selected_source_id,
+                    rejected_source_ids=target.rejected_source_ids,
+                ),
+            )
+            identifier = f"{prepared.sequence_id}:{group_id}"
+            windows.append(
+                _SourcePretrainingWindow(
+                    sequence=StageEditSequence(identifier, token_values),
+                    targets=StageEditTargetSequence(identifier, target_values),
+                    song_id=song_id,
+                    reference_id=example.reference_id,
+                    group_id=group_id,
+                    anchor_token_index=anchor_index,
+                )
+            )
+            per_reference_confirmed_group_counts[example.reference_id] = (
+                per_reference_confirmed_group_counts.get(example.reference_id, 0)
+                + 1
+            )
+    if not windows:
+        raise ValueError(
+            "source pretraining requires confirmed non-opening editorial switches"
+        )
+    return _SourcePretrainingInventory(
+        windows=tuple(windows),
+        opening_source_excluded_count=opening_source_excluded_count,
+        unconfirmed_source_label_excluded_count=(
+            unconfirmed_source_label_excluded_count
+        ),
+        per_reference_confirmed_group_counts=dict(
+            sorted(per_reference_confirmed_group_counts.items())
+        ),
+        reference_song_ids=dict(sorted(reference_song_ids.items())),
+    )
+
+
+def _cut_only_pretraining_loss_contract(
+    effective_loss_contract: StageEditLossContract,
+) -> StageEditLossContract:
+    return replace(
+        effective_loss_contract,
+        cut_positive_weight=1.0,
+        source_listwise_weight=0.0,
+        source_pairwise_weight=0.0,
+        duration_weight=0.0,
+        transition_weight=0.0,
+        crop_weight=0.0,
+    )
+
+
+def _source_only_pretraining_loss_contract(
+    effective_loss_contract: StageEditLossContract,
+) -> StageEditLossContract:
+    return replace(
+        effective_loss_contract,
+        source_objective="eligible_all_hybrid",
+        cut_weight=0.0,
+        cut_positive_weight=1.0,
+        duration_weight=0.0,
+        transition_weight=0.0,
+        crop_weight=0.0,
+    )
+
+
 def _balanced_cut_windows(
     examples: Sequence[ReferenceTrainingExample],
     *,
@@ -1176,7 +1397,7 @@ def train_production_stage_edit(
     schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
     model_config: StageEditTransformerConfig | None = None,
     epochs: int = 30,
-    early_stopping_patience: int = 6,
+    early_stopping_patience: int = 24,
     batch_size: int = 2,
     learning_rate: float = 1.0e-4,
     weight_decay: float = 1.0e-3,
@@ -1186,8 +1407,14 @@ def train_production_stage_edit(
     cut_pretrain_learning_rate: float = 3.0e-4,
     cut_pretrain_window_length: int = 32,
     cut_pretrain_warmup_steps: int = 50,
+    source_pretrain_steps: int = 500,
+    source_pretrain_learning_rate: float = 3.0e-4,
+    source_pretrain_window_length: int = 32,
+    source_pretrain_warmup_steps: int = 50,
     finetune_warmup_steps: int = 8,
     minimum_learning_rate_ratio: float = 0.10,
+    minimum_finetune_optimizer_steps: int = 120,
+    minimum_checkpoint_selection_finetune_steps: int = 60,
     seed: int = 20260824,
     device: Any = None,
     loss_contract: StageEditLossContract = StageEditLossContract(),
@@ -1203,17 +1430,45 @@ def train_production_stage_edit(
     _require_mlx()
     if epochs < 1 or early_stopping_patience < 1 or batch_size < 1:
         raise ValueError("epochs, patience, and batch size must be positive")
+    for value, name in (
+        (minimum_finetune_optimizer_steps, "minimum_finetune_optimizer_steps"),
+        (
+            minimum_checkpoint_selection_finetune_steps,
+            "minimum_checkpoint_selection_finetune_steps",
+        ),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if (
+        minimum_checkpoint_selection_finetune_steps
+        > minimum_finetune_optimizer_steps
+    ):
+        raise ValueError(
+            "checkpoint selection burn-in cannot exceed the finetune step floor"
+        )
     if cut_pretrain_steps not in (0,) and cut_pretrain_steps < 500:
         raise ValueError("cut pretraining must be disabled or run for >= 500 steps")
+    if source_pretrain_steps not in (0,) and source_pretrain_steps < 500:
+        raise ValueError(
+            "source pretraining must be disabled or run for >= 500 steps"
+        )
     if cut_pretrain_window_length < 2:
         raise ValueError("cut pretraining window length must be >= 2")
+    if source_pretrain_window_length < 2:
+        raise ValueError("source pretraining window length must be >= 2")
     if cut_pretrain_steps and not 0 <= cut_pretrain_warmup_steps < cut_pretrain_steps:
         raise ValueError("cut pretraining warmup must be shorter than pretraining")
+    if (
+        source_pretrain_steps
+        and not 0 <= source_pretrain_warmup_steps < source_pretrain_steps
+    ):
+        raise ValueError("source pretraining warmup must be shorter than pretraining")
     if finetune_warmup_steps < 0:
         raise ValueError("finetune warmup cannot be negative")
     for value, name, allow_zero in (
         (learning_rate, "learning_rate", False),
         (cut_pretrain_learning_rate, "cut_pretrain_learning_rate", False),
+        (source_pretrain_learning_rate, "source_pretrain_learning_rate", False),
         (weight_decay, "weight_decay", True),
         (gradient_clip_norm, "gradient_clip_norm", False),
     ):
@@ -1229,6 +1484,14 @@ def train_production_stage_edit(
         held_out_song_ids=held_out_song_ids,
         required_training_song_ids=required_training_song_ids,
     )
+    finetune_batches_per_epoch = len(_batches(split.train, batch_size))
+    finetune_steps_planned = epochs * finetune_batches_per_epoch
+    if finetune_steps_planned < minimum_finetune_optimizer_steps:
+        raise ValueError(
+            "planned multi-head finetuning is below the explicit optimizer-step "
+            f"floor: planned={finetune_steps_planned}, "
+            f"minimum={minimum_finetune_optimizer_steps}"
+        )
     training_cut_positive_count = sum(
         target.cut == 1.0
         for example in split.train
@@ -1252,6 +1515,13 @@ def train_production_stage_edit(
             cut_imbalance_contract["applied_positive_weight"]
         ),
     )
+    if source_pretrain_steps and (
+        effective_loss_contract.source_listwise_weight <= 0.0
+        or effective_loss_contract.source_pairwise_weight <= 0.0
+    ):
+        raise ValueError(
+            "source pretraining requires positive listwise and pairwise weights"
+        )
     effective_dynamic_crop_loss_contract = replace(
         dynamic_crop_loss_contract,
         base=replace(
@@ -1336,14 +1606,36 @@ def train_production_stage_edit(
     active_device = device if device is not None else mx.default_device()
     history: list[dict[str, Any]] = []
     cut_pretraining_history: list[dict[str, Any]] = []
+    source_pretraining_history: list[dict[str, Any]] = []
     optimizer_steps = 0
     cut_pretraining_optimizer_steps = 0
+    source_pretraining_optimizer_steps = 0
+    finetune_optimizer_steps = 0
     best_epoch = 0
     best_step = 0
+    best_finetune_optimizer_step = 0
     best_validation_loss = math.inf
     best_validation_selection_score = -math.inf
     best_validation_selection_evidence: Mapping[str, Any] | None = None
-    epochs_without_improvement = 0
+    finetune_steps_without_improvement = 0
+    early_stopping_triggered = False
+    training_stop_reason = "planned_finetune_steps_completed"
+    finetune_optimizer_initial_step = 0
+    finetune_optimizer_state_final_step = 0
+    cut_pretraining_optimizer_initial_step = 0
+    cut_pretraining_optimizer_state_final_step = 0
+    source_pretraining_optimizer_initial_step = 0
+    source_pretraining_optimizer_state_final_step = 0
+    source_pretraining_sampling_evidence: dict[str, Any] = {
+        "contract": "deterministic_song_reference_group_round_robin_v1",
+        "opening_source_excluded_count": 0,
+        "unconfirmed_source_label_excluded_count": 0,
+        "confirmed_source_event_count": 0,
+        "reference_song_ids": {},
+        "per_reference_confirmed_group_counts": {},
+        "per_song_sampled_counts": {},
+        "per_reference_sampled_counts": {},
+    }
     saved_metadata = None
     clipping_supported = hasattr(optim, "clip_grad_norm")
 
@@ -1355,14 +1647,8 @@ def train_production_stage_edit(
             else StageEditTransformer(config)
         )
 
-        cut_only_loss_contract = replace(
-            effective_loss_contract,
-            cut_positive_weight=1.0,
-            source_listwise_weight=0.0,
-            source_pairwise_weight=0.0,
-            duration_weight=0.0,
-            transition_weight=0.0,
-            crop_weight=0.0,
+        cut_only_loss_contract = _cut_only_pretraining_loss_contract(
+            effective_loss_contract
         )
         if cut_pretrain_steps:
             positive_windows, negative_windows = _balanced_cut_windows(
@@ -1380,6 +1666,13 @@ def train_production_stage_edit(
                 learning_rate=pretrain_schedule,
                 weight_decay=weight_decay,
             )
+            cut_pretraining_optimizer_initial_step = int(
+                pretrain_optimizer.state["step"].item()
+            )
+            if cut_pretraining_optimizer_initial_step != 0:
+                raise RuntimeError(
+                    "fresh cut-only optimizer did not start at step zero"
+                )
 
             def cut_pretrain_loss(
                 trained_model: Any,
@@ -1450,8 +1743,151 @@ def train_production_stage_edit(
                             ),
                         }
                     )
+            cut_pretraining_optimizer_state_final_step = int(
+                pretrain_optimizer.state["step"].item()
+            )
+            if (
+                cut_pretraining_optimizer_state_final_step
+                != cut_pretraining_optimizer_steps
+            ):
+                raise RuntimeError(
+                    "cut-only optimizer state step differs from history"
+                )
 
-        finetune_steps_planned = epochs * len(_batches(split.train, batch_size))
+        source_only_loss_contract = _source_only_pretraining_loss_contract(
+            effective_loss_contract
+        )
+        if source_pretrain_steps:
+            source_inventory = _source_pretraining_inventory(
+                split.train,
+                schema=schema,
+                window_length=source_pretrain_window_length,
+            )
+            source_sampler = _HierarchicalSourceWindowSampler(
+                source_inventory.windows,
+                seed=seed ^ 0x50A7CE,
+            )
+            source_pretrain_schedule = _warmup_cosine_schedule(
+                peak_learning_rate=source_pretrain_learning_rate,
+                total_steps=source_pretrain_steps,
+                warmup_steps=source_pretrain_warmup_steps,
+                minimum_learning_rate_ratio=minimum_learning_rate_ratio,
+            )
+            source_pretrain_optimizer = optim.AdamW(
+                learning_rate=source_pretrain_schedule,
+                weight_decay=weight_decay,
+            )
+            source_pretraining_optimizer_initial_step = int(
+                source_pretrain_optimizer.state["step"].item()
+            )
+            if source_pretraining_optimizer_initial_step != 0:
+                raise RuntimeError(
+                    "fresh source-only optimizer did not start at step zero"
+                )
+
+            def source_pretrain_loss(
+                trained_model: Any,
+                batch: Any,
+                supervision: Any,
+            ) -> Any:
+                return stage_edit_loss(
+                    trained_model,
+                    batch,
+                    supervision,
+                    source_only_loss_contract,
+                )[0]
+
+            source_pretrain_loss_and_grad = nn.value_and_grad(
+                model, source_pretrain_loss
+            )
+            for source_pretrain_step in range(1, source_pretrain_steps + 1):
+                window = source_sampler.sample()
+                source_pretrain_batch = tensorize_stage_edit_batch(
+                    (window.sequence,),
+                    schema,
+                    config,
+                    device=active_device,
+                )
+                source_pretrain_supervision = tensorize_stage_edit_supervision(
+                    (window.targets,),
+                    source_pretrain_batch,
+                    schema,
+                    device=active_device,
+                )
+                model.train()
+                source_loss, gradients = source_pretrain_loss_and_grad(
+                    model,
+                    source_pretrain_batch,
+                    source_pretrain_supervision,
+                )
+                if clipping_supported:
+                    gradients, gradient_norm = optim.clip_grad_norm(
+                        gradients, gradient_clip_norm
+                    )
+                else:
+                    gradient_norm = mx.array(float("nan"))
+                source_pretrain_optimizer.update(model, gradients)
+                optimizer_steps += 1
+                source_pretraining_optimizer_steps += 1
+                mx.eval(
+                    source_loss,
+                    gradient_norm,
+                    model.parameters(),
+                    source_pretrain_optimizer.state,
+                )
+                source_pretraining_history.append(
+                    {
+                        "source_pretrain_step": source_pretrain_step,
+                        "optimizer_step": optimizer_steps,
+                        "actual_learning_rate": float(
+                            source_pretrain_optimizer.learning_rate.item()
+                        ),
+                        "song_id": window.song_id,
+                        "reference_id": window.reference_id,
+                        "group_id": window.group_id,
+                        "anchor_token_index": window.anchor_token_index,
+                        "source_only_loss": float(source_loss.item()),
+                        "gradient_norm_before_clip": float(
+                            gradient_norm.item()
+                        ),
+                        "checkpoint_selection_eligible": False,
+                    }
+                )
+            source_pretraining_optimizer_state_final_step = int(
+                source_pretrain_optimizer.state["step"].item()
+            )
+            if (
+                source_pretraining_optimizer_state_final_step
+                != source_pretraining_optimizer_steps
+            ):
+                raise RuntimeError(
+                    "source-only optimizer state step differs from history"
+                )
+            source_pretraining_sampling_evidence = {
+                "contract": (
+                    "deterministic_song_reference_group_round_robin_v1"
+                ),
+                "opening_source_excluded_count": (
+                    source_inventory.opening_source_excluded_count
+                ),
+                "unconfirmed_source_label_excluded_count": (
+                    source_inventory.unconfirmed_source_label_excluded_count
+                ),
+                "confirmed_source_event_count": len(source_inventory.windows),
+                "reference_song_ids": dict(
+                    source_inventory.reference_song_ids
+                ),
+                "per_reference_confirmed_group_counts": dict(
+                    source_inventory.per_reference_confirmed_group_counts
+                ),
+                "per_song_sampled_counts": (
+                    source_sampler.per_song_sampled_counts
+                ),
+                "per_reference_sampled_counts": (
+                    source_sampler.per_reference_sampled_counts
+                ),
+            }
+
         finetune_warmup = min(
             finetune_warmup_steps, max(finetune_steps_planned - 1, 0)
         )
@@ -1465,6 +1901,11 @@ def train_production_stage_edit(
             learning_rate=finetune_schedule,
             weight_decay=weight_decay,
         )
+        finetune_optimizer_initial_step = int(optimizer.state["step"].item())
+        if finetune_optimizer_initial_step != 0:
+            raise RuntimeError(
+                "fresh multi-head optimizer did not start at phase-local step zero"
+            )
 
         if dynamic_crop_v2_enabled:
             def loss_function(
@@ -1523,6 +1964,8 @@ def train_production_stage_edit(
         for epoch in range(1, epochs + 1):
             epoch_losses: list[float] = []
             epoch_gradient_norms: list[float] = []
+            epoch_finetune_optimizer_steps: list[int] = []
+            epoch_actual_learning_rates: list[float] = []
             model.train()
             ordered = _stable_epoch_order(split.train, seed=seed, epoch=epoch)
             for examples in _batches(ordered, batch_size):
@@ -1560,9 +2003,14 @@ def train_production_stage_edit(
                     gradient_norm = mx.array(float("nan"))
                 optimizer.update(model, gradients)
                 optimizer_steps += 1
+                finetune_optimizer_steps += 1
                 mx.eval(loss, gradient_norm, model.parameters(), optimizer.state)
                 epoch_losses.append(float(loss.item()))
                 epoch_gradient_norms.append(float(gradient_norm.item()))
+                epoch_finetune_optimizer_steps.append(finetune_optimizer_steps)
+                epoch_actual_learning_rates.append(
+                    float(optimizer.learning_rate.item())
+                )
 
             validation_base_metrics = evaluate_stage_edit_model(
                 model,
@@ -1592,8 +2040,13 @@ def train_production_stage_edit(
             validation_selection_score = _finite_metric(
                 validation_selection.get("score")
             )
+            checkpoint_selection_eligible = bool(
+                finetune_optimizer_steps
+                >= minimum_checkpoint_selection_finetune_steps
+            )
             improved = bool(
-                validation_selection.get("selectable")
+                checkpoint_selection_eligible
+                and validation_selection.get("selectable")
                 and validation_selection_score is not None
                 and (
                     validation_selection_score
@@ -1613,6 +2066,16 @@ def train_production_stage_edit(
                 {
                     "epoch": epoch,
                     "optimizer_step": optimizer_steps,
+                    "finetune_optimizer_step_first": (
+                        epoch_finetune_optimizer_steps[0]
+                    ),
+                    "finetune_optimizer_step_last": (
+                        epoch_finetune_optimizer_steps[-1]
+                    ),
+                    "finetune_optimizer_steps": epoch_finetune_optimizer_steps,
+                    "finetune_actual_learning_rates": (
+                        epoch_actual_learning_rates
+                    ),
                     "training_loss_mean": (
                         sum(epoch_losses) / len(epoch_losses)
                     ),
@@ -1634,6 +2097,14 @@ def train_production_stage_edit(
                     "training_song_reference_validation_selection_contract": (
                         STAGE_EDIT_VALIDATION_SELECTION_CONTRACT
                     ),
+                    "training_song_reference_validation_dynamic_crop_v2": (
+                        validation_dynamic_metrics
+                        if dynamic_crop_v2_enabled
+                        else None
+                    ),
+                    "checkpoint_selection_eligible_after_burn_in": (
+                        checkpoint_selection_eligible
+                    ),
                     "training_song_reference_validation_improved": improved,
                 }
             )
@@ -1647,7 +2118,8 @@ def train_production_stage_edit(
                 best_validation_selection_evidence = validation_selection
                 best_epoch = epoch
                 best_step = optimizer_steps
-                epochs_without_improvement = 0
+                best_finetune_optimizer_step = finetune_optimizer_steps
+                finetune_steps_without_improvement = 0
                 checkpoint_id = (
                     f"production-{corpus.data_id[:16]}-seed{seed}-"
                     f"step{optimizer_steps}"
@@ -1685,9 +2157,34 @@ def train_production_stage_edit(
                         metadata,
                     )
             else:
-                epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stopping_patience:
+                eligible_epoch_steps = max(
+                    0,
+                    epoch_finetune_optimizer_steps[-1]
+                    - max(
+                        epoch_finetune_optimizer_steps[0],
+                        minimum_checkpoint_selection_finetune_steps,
+                    )
+                    + 1,
+                )
+                finetune_steps_without_improvement += eligible_epoch_steps
+            if (
+                finetune_optimizer_steps >= minimum_finetune_optimizer_steps
+                and finetune_steps_without_improvement
+                >= early_stopping_patience
+                and finetune_optimizer_steps < finetune_steps_planned
+            ):
+                early_stopping_triggered = True
+                training_stop_reason = (
+                    "phase_local_early_stopping_after_finetune_step_floor"
+                )
                 break
+        finetune_optimizer_state_final_step = int(
+            optimizer.state["step"].item()
+        )
+        if finetune_optimizer_state_final_step != finetune_optimizer_steps:
+            raise RuntimeError(
+                "multi-head optimizer state step differs from phase-local history"
+            )
 
     if (
         saved_metadata is None
@@ -1773,6 +2270,17 @@ def train_production_stage_edit(
                 ),
                 "checkpoint_id": loaded_metadata.checkpoint_id,
                 "checkpoint_weight_sha256": loaded_metadata.weight_sha256,
+                "selected_training_step": best_step,
+                "selected_finetune_optimizer_step": (
+                    best_finetune_optimizer_step
+                ),
+                "minimum_checkpoint_selection_finetune_steps": (
+                    minimum_checkpoint_selection_finetune_steps
+                ),
+                "selected_after_checkpoint_burn_in": (
+                    best_finetune_optimizer_step
+                    >= minimum_checkpoint_selection_finetune_steps
+                ),
                 "validation_selection": dict(
                     best_validation_selection_evidence
                 ),
@@ -1969,12 +2477,21 @@ def train_production_stage_edit(
             "cut_pretraining_optimizer_steps": (
                 cut_pretraining_optimizer_steps
             ),
-            "multi_head_finetuning_optimizer_steps": (
-                optimizer_steps - cut_pretraining_optimizer_steps
+            "source_pretraining_optimizer_steps": (
+                source_pretraining_optimizer_steps
             ),
-                "learning_rate": learning_rate,
+            "multi_head_finetuning_optimizer_steps": (
+                finetune_optimizer_steps
+            ),
+            "source_head_update_steps": (
+                source_pretraining_optimizer_steps + finetune_optimizer_steps
+            ),
+            "learning_rate": learning_rate,
             "learning_rate_schedule": {
-                "contract": "independent_warmup_cosine_pretrain_and_finetune_v1",
+                "contract": (
+                    "independent_warmup_cosine_cut_source_and_joint_"
+                    "with_step_floor_v3"
+                ),
                 "cut_pretraining_steps": cut_pretrain_steps,
                 "cut_pretraining_peak_learning_rate": (
                     cut_pretrain_learning_rate
@@ -1982,6 +2499,18 @@ def train_production_stage_edit(
                 "cut_pretraining_window_length": cut_pretrain_window_length,
                 "cut_pretraining_warmup_steps": (
                     cut_pretrain_warmup_steps if cut_pretrain_steps else 0
+                ),
+                "source_pretraining_steps": source_pretrain_steps,
+                "source_pretraining_peak_learning_rate": (
+                    source_pretrain_learning_rate
+                ),
+                "source_pretraining_window_length": (
+                    source_pretrain_window_length
+                ),
+                "source_pretraining_warmup_steps": (
+                    source_pretrain_warmup_steps
+                    if source_pretrain_steps
+                    else 0
                 ),
                 "finetune_steps_planned": finetune_steps_planned,
                 "finetune_warmup_steps": finetune_warmup,
@@ -1997,10 +2526,33 @@ def train_production_stage_edit(
                     1 if cut_pretrain_steps else 0
                 ),
                 "other_head_losses_zero_weighted": True,
+                "source_head_losses_zero_weighted": True,
+                "checkpoint_selection_eligible": False,
                 "positive_weight": 1.0,
                 "minimum_step_contract": 500,
                 "validation_labels_consumed": False,
                 "heldout_labels_consumed": False,
+            },
+            "source_pretraining": {
+                "enabled": bool(source_pretrain_steps),
+                "partition": "training_references_only",
+                "confirmed_event_contract": (
+                    "target_cut_equals_one_and_selected_source_id_v1"
+                ),
+                "opening_source_selection_excluded": True,
+                "loss_contract": asdict(source_only_loss_contract),
+                "listwise_loss_enabled": bool(
+                    source_only_loss_contract.source_listwise_weight
+                ),
+                "eligible_all_pairwise_loss_enabled": bool(
+                    source_only_loss_contract.source_pairwise_weight
+                ),
+                "other_head_losses_zero_weighted": True,
+                "checkpoint_selection_eligible": False,
+                "minimum_step_contract": 500,
+                "validation_labels_consumed": False,
+                "heldout_labels_consumed": False,
+                "sampling": source_pretraining_sampling_evidence,
             },
             "weight_decay": weight_decay,
             "gradient_clip_norm": gradient_clip_norm,
@@ -2012,8 +2564,60 @@ def train_production_stage_edit(
             ),
             "gradient_clipping_supported": clipping_supported,
             "early_stopping_patience": early_stopping_patience,
+            "early_stopping_patience_unit": "finetune_optimizer_steps",
+            "minimum_finetune_optimizer_steps": (
+                minimum_finetune_optimizer_steps
+            ),
+            "minimum_checkpoint_selection_finetune_steps": (
+                minimum_checkpoint_selection_finetune_steps
+            ),
+            "finetune_optimizer_initial_step": (
+                finetune_optimizer_initial_step
+            ),
+            "finetune_optimizer_state_final_step": (
+                finetune_optimizer_state_final_step
+            ),
+            "finetune_optimizer_state_reset_after_cut_pretraining": (
+                finetune_optimizer_initial_step == 0
+                and finetune_optimizer_state_final_step
+                == finetune_optimizer_steps
+            ),
+            "cut_pretraining_optimizer_initial_step": (
+                cut_pretraining_optimizer_initial_step
+            ),
+            "cut_pretraining_optimizer_state_final_step": (
+                cut_pretraining_optimizer_state_final_step
+            ),
+            "source_pretraining_optimizer_initial_step": (
+                source_pretraining_optimizer_initial_step
+            ),
+            "source_pretraining_optimizer_state_final_step": (
+                source_pretraining_optimizer_state_final_step
+            ),
+            "source_pretraining_optimizer_state_reset_after_cut_pretraining": (
+                source_pretraining_optimizer_initial_step == 0
+                and source_pretraining_optimizer_state_final_step
+                == source_pretraining_optimizer_steps
+            ),
+            "finetune_optimizer_state_reset_after_cut_and_source_pretraining": (
+                finetune_optimizer_initial_step == 0
+                and finetune_optimizer_state_final_step
+                == finetune_optimizer_steps
+            ),
+            "checkpoint_writes_before_joint_finetuning": 0,
+            "finetune_steps_without_improvement_at_stop": (
+                finetune_steps_without_improvement
+            ),
+            "early_stopping_triggered": early_stopping_triggered,
+            "training_stop_reason": training_stop_reason,
+            "finetune_schedule_completion_fraction": (
+                finetune_optimizer_steps / finetune_steps_planned
+            ),
             "best_epoch": best_epoch,
             "best_training_step": best_step,
+            "best_finetune_optimizer_step": (
+                best_finetune_optimizer_step
+            ),
             "best_validation_total_loss": best_validation_loss,
             "best_validation_selection_score": (
                 best_validation_selection_score
@@ -2045,6 +2649,7 @@ def train_production_stage_edit(
             "quality_gate": quality_gate.to_dict(),
         },
         "cut_pretraining_history": cut_pretraining_history,
+        "source_pretraining_history": source_pretraining_history,
         "history": history,
     }
     checkpoint_root.mkdir(parents=True, exist_ok=True)

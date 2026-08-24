@@ -119,7 +119,8 @@ EXPECTED_MLX_DEVICE = {
 PROBE_TRAINING_SCHEDULE: Mapping[str, Any] = {
     "seed": 20260824,
     "requested_epochs": 30,
-    "early_stopping_patience": 6,
+    "early_stopping_patience": 24,
+    "early_stopping_patience_unit": "finetune_optimizer_steps",
     "batch_size": 2,
     "learning_rate": 1.0e-4,
     "weight_decay": 1.0e-3,
@@ -128,9 +129,18 @@ PROBE_TRAINING_SCHEDULE: Mapping[str, Any] = {
     "cut_pretraining_peak_learning_rate": 3.0e-4,
     "cut_pretraining_window_length": 32,
     "cut_pretraining_warmup_steps": 50,
+    "source_pretraining_steps": 500,
+    "source_pretraining_peak_learning_rate": 3.0e-4,
+    "source_pretraining_window_length": 32,
+    "source_pretraining_warmup_steps": 50,
     "finetune_warmup_steps": 8,
     "minimum_learning_rate_ratio": 0.10,
-    "schedule_contract": "independent_warmup_cosine_pretrain_and_finetune_v1",
+    "minimum_finetune_optimizer_steps": 120,
+    "minimum_checkpoint_selection_finetune_steps": 60,
+    "finetune_steps_planned": 120,
+    "schedule_contract": (
+        "independent_warmup_cosine_cut_source_and_joint_with_step_floor_v3"
+    ),
 }
 
 
@@ -882,6 +892,352 @@ def write_fold_run_evidence(
     )
 
 
+def _expected_phase_learning_rate(
+    phase_step: int,
+    *,
+    peak_learning_rate: float,
+    total_steps: int,
+    warmup_steps: int,
+    minimum_learning_rate_ratio: float,
+) -> float:
+    """Mirror the pinned MLX schedule using one-indexed optimizer steps."""
+
+    schedule_index = phase_step - 1
+    if phase_step < 1 or schedule_index >= total_steps:
+        raise DynamicCropCapacityProbeError(
+            "phase learning-rate history step is outside the schedule"
+        )
+    if schedule_index < warmup_steps:
+        start = peak_learning_rate * 0.1
+        return start + (peak_learning_rate - start) * (
+            schedule_index / warmup_steps
+        )
+    decay_steps = max(total_steps - warmup_steps, 1)
+    decay_index = schedule_index - warmup_steps
+    end = peak_learning_rate * minimum_learning_rate_ratio
+    return end + 0.5 * (peak_learning_rate - end) * (
+        1.0 + math.cos(math.pi * decay_index / decay_steps)
+    )
+
+
+def _validate_full_dynamic_validation_metrics(
+    value: object,
+    label: str,
+) -> dict[str, Any]:
+    metrics = _mapping(value, label)
+    _exact_keys(
+        metrics,
+        {
+            "schema_version",
+            "target_contract",
+            "model_contract",
+            "loss_contract",
+            "total_loss",
+            "loss_components",
+            "trajectory",
+            "legacy_static_crop_head_used_for_trajectory",
+            "production_activation_authorized",
+        },
+        label,
+    )
+    if (
+        metrics.get("schema_version") != DYNAMIC_CROP_V2_SCHEMA_VERSION
+        or metrics.get("model_contract") != DYNAMIC_CROP_V2_MODEL_CONTRACT
+        or metrics.get("target_contract") != DYNAMIC_CROP_V2_TARGET_CONTRACT
+        or metrics.get("loss_contract") != DYNAMIC_CROP_V2_LOSS_CONTRACT
+        or metrics.get("legacy_static_crop_head_used_for_trajectory") is not False
+        or metrics.get("production_activation_authorized") is not False
+    ):
+        raise DynamicCropCapacityProbeError(
+            f"{label} Dynamic Crop v2 contract differs"
+        )
+    _finite_nonnegative(metrics.get("total_loss"), f"{label} total loss")
+    loss_components = _mapping(
+        metrics.get("loss_components"), f"{label} loss components"
+    )
+    _exact_keys(
+        loss_components,
+        {
+            "base_total",
+            "base_cut",
+            "base_source_listwise",
+            "base_source_pairwise",
+            "base_duration",
+            "base_transition",
+            "base_crop",
+            "dynamic_crop_values",
+            "dynamic_crop_times",
+            "dynamic_crop_presence",
+            "dynamic_crop_motion",
+            "dynamic_crop_total",
+            "total",
+        },
+        f"{label} loss components",
+    )
+    for name, component in loss_components.items():
+        _finite_nonnegative(component, f"{label} loss component {name}")
+    trajectory = _mapping(metrics.get("trajectory"), f"{label} trajectory")
+    _exact_keys(
+        trajectory,
+        {
+            "track_label_count",
+            "keyframe_label_count",
+            "coordinates",
+            "normalized_time_mae",
+            "presence",
+            "motion",
+            "renderer_decode",
+        },
+        f"{label} trajectory",
+    )
+    coordinates = _mapping(
+        trajectory.get("coordinates"), f"{label} trajectory coordinates"
+    )
+    if set(coordinates) != {"zoom", "center_x", "center_y", "roll_degrees"}:
+        raise DynamicCropCapacityProbeError(
+            f"{label} trajectory coordinate metrics are incomplete"
+        )
+    for name, coordinate in coordinates.items():
+        _exact_keys(
+            _mapping(coordinate, f"{label} {name} coordinate"),
+            {"label_count", "mean_absolute_error", "p95_absolute_error"},
+            f"{label} {name} coordinate",
+        )
+    _exact_keys(
+        _mapping(trajectory.get("presence"), f"{label} presence"),
+        {
+            "label_count",
+            "precision",
+            "recall",
+            "f1",
+            "keyframe_count_exact_accuracy",
+        },
+        f"{label} presence",
+    )
+    _exact_keys(
+        _mapping(trajectory.get("motion"), f"{label} motion"),
+        {"label_count", "accuracy"},
+        f"{label} motion",
+    )
+    _exact_keys(
+        _mapping(
+            trajectory.get("renderer_decode"), f"{label} renderer decode"
+        ),
+        {
+            "attempt_count",
+            "eligible_count",
+            "eligible_rate",
+            "minimum_safe_zoom_projection_count",
+            "rejection_reasons",
+        },
+        f"{label} renderer decode",
+    )
+    return metrics
+
+
+def _validate_source_pretraining_evidence(
+    report: Mapping[str, Any],
+    optimization: Mapping[str, Any],
+    *,
+    cut_steps: int,
+    source_steps: int,
+) -> None:
+    source = _mapping(
+        optimization.get("source_pretraining"), "source pretraining"
+    )
+    source_loss = _mapping(
+        source.get("loss_contract"), "source-only loss contract"
+    )
+    if (
+        source.get("enabled") is not True
+        or source.get("partition") != "training_references_only"
+        or source.get("confirmed_event_contract")
+        != "target_cut_equals_one_and_selected_source_id_v1"
+        or source.get("opening_source_selection_excluded") is not True
+        or source.get("listwise_loss_enabled") is not True
+        or source.get("eligible_all_pairwise_loss_enabled") is not True
+        or source.get("other_head_losses_zero_weighted") is not True
+        or source.get("checkpoint_selection_eligible") is not False
+        or source.get("minimum_step_contract") != 500
+        or source.get("validation_labels_consumed") is not False
+        or source.get("heldout_labels_consumed") is not False
+        or source_loss.get("source_objective") != "eligible_all_hybrid"
+        or source_loss.get("cut_weight") != 0.0
+        or source_loss.get("duration_weight") != 0.0
+        or source_loss.get("transition_weight") != 0.0
+        or source_loss.get("crop_weight") != 0.0
+        or _finite_nonnegative(
+            source_loss.get("source_listwise_weight"),
+            "source-only listwise weight",
+        )
+        <= 0.0
+        or _finite_nonnegative(
+            source_loss.get("source_pairwise_weight"),
+            "source-only pairwise weight",
+        )
+        <= 0.0
+    ):
+        raise DynamicCropCapacityProbeError(
+            "source-only warmup loss/selection contract differs"
+        )
+
+    sampling = _mapping(source.get("sampling"), "source sampling evidence")
+    split = _mapping(report.get("split"), "report split")
+    training_references = set(split.get("training_reference_ids") or ())
+    training_songs = set(split.get("training_song_ids") or ())
+    reference_song_ids = _mapping(
+        sampling.get("reference_song_ids"), "source reference-song ids"
+    )
+    group_counts = _mapping(
+        sampling.get("per_reference_confirmed_group_counts"),
+        "source confirmed group counts",
+    )
+    per_song_counts = _mapping(
+        sampling.get("per_song_sampled_counts"),
+        "source per-song sampled counts",
+    )
+    per_reference_counts = _mapping(
+        sampling.get("per_reference_sampled_counts"),
+        "source per-reference sampled counts",
+    )
+    if (
+        sampling.get("contract")
+        != "deterministic_song_reference_group_round_robin_v1"
+        or set(reference_song_ids) != training_references
+        or set(group_counts) != training_references
+        or set(per_reference_counts) != training_references
+        or set(per_song_counts) != training_songs
+        or set(reference_song_ids.values()) != training_songs
+    ):
+        raise DynamicCropCapacityProbeError(
+            "source hierarchical sampling identity differs"
+        )
+    for value, label in (
+        (
+            sampling.get("opening_source_excluded_count"),
+            "opening source exclusion count",
+        ),
+        (
+            sampling.get("unconfirmed_source_label_excluded_count"),
+            "unconfirmed source exclusion count",
+        ),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DynamicCropCapacityProbeError(f"{label} is invalid")
+    confirmed_count = sampling.get("confirmed_source_event_count")
+    if (
+        isinstance(confirmed_count, bool)
+        or not isinstance(confirmed_count, int)
+        or confirmed_count < 1
+        or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            for count in group_counts.values()
+        )
+        or sum(group_counts.values()) != confirmed_count
+        or any(song_id not in training_songs for song_id in reference_song_ids.values())
+    ):
+        raise DynamicCropCapacityProbeError(
+            "source confirmed editorial group evidence differs"
+        )
+    for counts, label in (
+        (per_song_counts, "source per-song sampled counts"),
+        (per_reference_counts, "source per-reference sampled counts"),
+    ):
+        if any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            for count in counts.values()
+        ) or sum(counts.values()) != source_steps:
+            raise DynamicCropCapacityProbeError(f"{label} are invalid")
+    if max(per_song_counts.values()) - min(per_song_counts.values()) > 1:
+        raise DynamicCropCapacityProbeError(
+            "source song sampling is not balanced"
+        )
+    for song_id in training_songs:
+        reference_counts = [
+            per_reference_counts[reference_id]
+            for reference_id, observed_song_id in reference_song_ids.items()
+            if observed_song_id == song_id
+        ]
+        if (
+            not reference_counts
+            or max(reference_counts) - min(reference_counts) > 1
+            or sum(reference_counts) != per_song_counts[song_id]
+        ):
+            raise DynamicCropCapacityProbeError(
+                "source reference sampling is not balanced within song"
+            )
+
+    history = report.get("source_pretraining_history")
+    if not isinstance(history, list) or len(history) != source_steps:
+        raise DynamicCropCapacityProbeError(
+            "source pretraining history does not cover all 500 steps"
+        )
+    observed_song_counts = {song_id: 0 for song_id in training_songs}
+    observed_reference_counts = {
+        reference_id: 0 for reference_id in training_references
+    }
+    for phase_step, raw_record in enumerate(history, start=1):
+        record = _mapping(raw_record, f"source pretraining step {phase_step}")
+        song_id = record.get("song_id")
+        reference_id = record.get("reference_id")
+        if (
+            record.get("source_pretrain_step") != phase_step
+            or record.get("optimizer_step") != cut_steps + phase_step
+            or record.get("checkpoint_selection_eligible") is not False
+            or not isinstance(song_id, str)
+            or song_id not in training_songs
+            or not isinstance(reference_id, str)
+            or reference_id not in training_references
+            or reference_song_ids.get(reference_id) != song_id
+            or not isinstance(record.get("group_id"), str)
+            or not record.get("group_id")
+            or isinstance(record.get("anchor_token_index"), bool)
+            or not isinstance(record.get("anchor_token_index"), int)
+            or record.get("anchor_token_index") < 1
+        ):
+            raise DynamicCropCapacityProbeError(
+                "source pretraining phase-local history is incomplete"
+            )
+        observed_song_counts[song_id] += 1
+        observed_reference_counts[reference_id] += 1
+        actual_rate = _finite_nonnegative(
+            record.get("actual_learning_rate"),
+            f"source actual learning rate at step {phase_step}",
+        )
+        expected_rate = _expected_phase_learning_rate(
+            phase_step,
+            peak_learning_rate=float(
+                PROBE_TRAINING_SCHEDULE[
+                    "source_pretraining_peak_learning_rate"
+                ]
+            ),
+            total_steps=source_steps,
+            warmup_steps=int(
+                PROBE_TRAINING_SCHEDULE["source_pretraining_warmup_steps"]
+            ),
+            minimum_learning_rate_ratio=float(
+                PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+            ),
+        )
+        if not math.isclose(
+            actual_rate, expected_rate, rel_tol=1.0e-5, abs_tol=1.0e-12
+        ):
+            raise DynamicCropCapacityProbeError(
+                "source actual learning-rate history differs"
+            )
+    if (
+        observed_song_counts != per_song_counts
+        or observed_reference_counts != per_reference_counts
+    ):
+        raise DynamicCropCapacityProbeError(
+            "source sampling counts differ from phase history"
+        )
+
+
 def _validate_schedule(report: Mapping[str, Any]) -> None:
     optimization = _mapping(report.get("optimization"), "optimization")
     schedule = _mapping(optimization.get("learning_rate_schedule"), "learning-rate schedule")
@@ -889,6 +1245,9 @@ def _validate_schedule(report: Mapping[str, Any]) -> None:
         "seed": optimization.get("seed"),
         "requested_epochs": optimization.get("requested_epochs"),
         "early_stopping_patience": optimization.get("early_stopping_patience"),
+        "early_stopping_patience_unit": optimization.get(
+            "early_stopping_patience_unit"
+        ),
         "batch_size": optimization.get("batch_size"),
         "learning_rate": optimization.get("learning_rate"),
         "weight_decay": optimization.get("weight_decay"),
@@ -897,12 +1256,241 @@ def _validate_schedule(report: Mapping[str, Any]) -> None:
         "cut_pretraining_peak_learning_rate": schedule.get("cut_pretraining_peak_learning_rate"),
         "cut_pretraining_window_length": schedule.get("cut_pretraining_window_length"),
         "cut_pretraining_warmup_steps": schedule.get("cut_pretraining_warmup_steps"),
+        "source_pretraining_steps": schedule.get("source_pretraining_steps"),
+        "source_pretraining_peak_learning_rate": schedule.get(
+            "source_pretraining_peak_learning_rate"
+        ),
+        "source_pretraining_window_length": schedule.get(
+            "source_pretraining_window_length"
+        ),
+        "source_pretraining_warmup_steps": schedule.get(
+            "source_pretraining_warmup_steps"
+        ),
         "finetune_warmup_steps": schedule.get("finetune_warmup_steps"),
         "minimum_learning_rate_ratio": schedule.get("minimum_learning_rate_ratio"),
+        "minimum_finetune_optimizer_steps": optimization.get(
+            "minimum_finetune_optimizer_steps"
+        ),
+        "minimum_checkpoint_selection_finetune_steps": optimization.get(
+            "minimum_checkpoint_selection_finetune_steps"
+        ),
+        "finetune_steps_planned": schedule.get("finetune_steps_planned"),
         "schedule_contract": schedule.get("contract"),
     }
     if observed != dict(PROBE_TRAINING_SCHEDULE):
         raise DynamicCropCapacityProbeError("fold training seed/schedule differs")
+
+    cut_steps = int(PROBE_TRAINING_SCHEDULE["cut_pretraining_steps"])
+    source_steps = int(PROBE_TRAINING_SCHEDULE["source_pretraining_steps"])
+    finetune_steps = int(PROBE_TRAINING_SCHEDULE["finetune_steps_planned"])
+    cut_pretraining = _mapping(
+        optimization.get("cut_pretraining"), "cut pretraining"
+    )
+    if (
+        cut_pretraining.get("enabled") is not True
+        or cut_pretraining.get("partition") != "training_references_only"
+        or cut_pretraining.get("balanced_anchor_positive_count_per_step") != 1
+        or cut_pretraining.get("balanced_anchor_negative_count_per_step") != 1
+        or cut_pretraining.get("other_head_losses_zero_weighted") is not True
+        or cut_pretraining.get("source_head_losses_zero_weighted") is not True
+        or cut_pretraining.get("checkpoint_selection_eligible") is not False
+        or cut_pretraining.get("positive_weight") != 1.0
+        or cut_pretraining.get("minimum_step_contract") != 500
+        or cut_pretraining.get("validation_labels_consumed") is not False
+        or cut_pretraining.get("heldout_labels_consumed") is not False
+    ):
+        raise DynamicCropCapacityProbeError(
+            "cut-only pretraining could influence source/checkpoint selection"
+        )
+    _validate_source_pretraining_evidence(
+        report,
+        optimization,
+        cut_steps=cut_steps,
+        source_steps=source_steps,
+    )
+    epochs = int(PROBE_TRAINING_SCHEDULE["requested_epochs"])
+    burn_in = int(
+        PROBE_TRAINING_SCHEDULE[
+            "minimum_checkpoint_selection_finetune_steps"
+        ]
+    )
+    if finetune_steps % epochs:
+        raise DynamicCropCapacityProbeError(
+            "pinned finetune steps are not epoch divisible"
+        )
+    steps_per_epoch = finetune_steps // epochs
+    if (
+        optimization.get("completed_epochs") != epochs
+        or optimization.get("cut_pretraining_optimizer_steps") != cut_steps
+        or optimization.get("source_pretraining_optimizer_steps")
+        != source_steps
+        or optimization.get("multi_head_finetuning_optimizer_steps")
+        != finetune_steps
+        or optimization.get("source_head_update_steps")
+        != source_steps + finetune_steps
+        or optimization.get("optimizer_steps")
+        != cut_steps + source_steps + finetune_steps
+        or optimization.get("cut_pretraining_optimizer_initial_step") != 0
+        or optimization.get("cut_pretraining_optimizer_state_final_step")
+        != cut_steps
+        or optimization.get("source_pretraining_optimizer_initial_step") != 0
+        or optimization.get("source_pretraining_optimizer_state_final_step")
+        != source_steps
+        or optimization.get(
+            "source_pretraining_optimizer_state_reset_after_cut_pretraining"
+        )
+        is not True
+        or optimization.get("finetune_optimizer_initial_step") != 0
+        or optimization.get("finetune_optimizer_state_final_step")
+        != finetune_steps
+        or optimization.get(
+            "finetune_optimizer_state_reset_after_cut_pretraining"
+        )
+        is not True
+        or optimization.get(
+            "finetune_optimizer_state_reset_after_cut_and_source_pretraining"
+        )
+        is not True
+        or optimization.get("checkpoint_writes_before_joint_finetuning") != 0
+        or optimization.get("early_stopping_triggered") is not False
+        or optimization.get("training_stop_reason")
+        != "planned_finetune_steps_completed"
+        or optimization.get("finetune_schedule_completion_fraction") != 1.0
+    ):
+        raise DynamicCropCapacityProbeError(
+            "fold did not complete the exact 120-step multi-head schedule"
+        )
+
+    history = report.get("history")
+    if not isinstance(history, list) or len(history) != epochs:
+        raise DynamicCropCapacityProbeError(
+            "fold training history does not cover every scheduled epoch"
+        )
+    for epoch, raw_record in enumerate(history, start=1):
+        record = _mapping(raw_record, f"training history epoch {epoch}")
+        first_step = (epoch - 1) * steps_per_epoch + 1
+        last_step = epoch * steps_per_epoch
+        expected_steps = list(range(first_step, last_step + 1))
+        actual_steps = record.get("finetune_optimizer_steps")
+        actual_rates = record.get("finetune_actual_learning_rates")
+        if (
+            record.get("epoch") != epoch
+            or record.get("optimizer_step")
+            != cut_steps + source_steps + last_step
+            or record.get("finetune_optimizer_step_first") != first_step
+            or record.get("finetune_optimizer_step_last") != last_step
+            or actual_steps != expected_steps
+            or not isinstance(actual_rates, list)
+            or len(actual_rates) != steps_per_epoch
+            or record.get("checkpoint_selection_eligible_after_burn_in")
+            is not (last_step >= burn_in)
+        ):
+            raise DynamicCropCapacityProbeError(
+                "fold phase-local optimizer-step history is incomplete"
+            )
+        for phase_step, raw_rate in zip(
+            expected_steps, actual_rates, strict=True
+        ):
+            actual_rate = _finite_nonnegative(
+                raw_rate, f"finetune actual learning rate at step {phase_step}"
+            )
+            expected_rate = _expected_phase_learning_rate(
+                phase_step,
+                peak_learning_rate=float(
+                    PROBE_TRAINING_SCHEDULE["learning_rate"]
+                ),
+                total_steps=finetune_steps,
+                warmup_steps=int(
+                    PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"]
+                ),
+                minimum_learning_rate_ratio=float(
+                    PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+                ),
+            )
+            if not math.isclose(
+                actual_rate, expected_rate, rel_tol=1.0e-5, abs_tol=1.0e-12
+            ):
+                raise DynamicCropCapacityProbeError(
+                    "fold actual finetune learning-rate history differs"
+                )
+        dynamic_validation = _validate_full_dynamic_validation_metrics(
+            record.get(
+                "training_song_reference_validation_dynamic_crop_v2"
+            ),
+            f"training history epoch {epoch} dynamic validation",
+        )
+        if record.get(
+            "training_song_reference_validation_total_loss"
+        ) != dynamic_validation.get("total_loss"):
+            raise DynamicCropCapacityProbeError(
+                "checkpoint score history did not consume Dynamic Crop total loss"
+            )
+
+    best_epoch = optimization.get("best_epoch")
+    best_finetune_step = optimization.get("best_finetune_optimizer_step")
+    best_training_step = optimization.get("best_training_step")
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or isinstance(best_finetune_step, bool)
+        or not isinstance(best_finetune_step, int)
+        or best_finetune_step < burn_in
+        or best_finetune_step > finetune_steps
+        or best_finetune_step != best_epoch * steps_per_epoch
+        or best_training_step
+        != cut_steps + source_steps + best_finetune_step
+    ):
+        raise DynamicCropCapacityProbeError(
+            "selected checkpoint is outside the 60-step burn-in envelope"
+        )
+    best_record = _mapping(history[best_epoch - 1], "selected history record")
+    if best_record.get("training_song_reference_validation_improved") is not True:
+        raise DynamicCropCapacityProbeError(
+            "selected checkpoint history record is not marked improved"
+        )
+    selected_metrics = _mapping(
+        optimization.get("selected_checkpoint_validation_metrics"),
+        "selected checkpoint validation metrics",
+    )
+    selected_dynamic = _validate_full_dynamic_validation_metrics(
+        selected_metrics.get("dynamic_crop_v2"),
+        "selected checkpoint dynamic validation",
+    )
+    if (
+        selected_dynamic
+        != best_record.get(
+            "training_song_reference_validation_dynamic_crop_v2"
+        )
+        or selected_metrics.get("total_loss")
+        != selected_dynamic.get("total_loss")
+    ):
+        raise DynamicCropCapacityProbeError(
+            "selected dynamic validation metrics differ from checkpoint history"
+        )
+    best_selection = _mapping(
+        optimization.get("best_validation_selection_evidence"),
+        "best validation selection evidence",
+    )
+    if (
+        best_selection.get("score")
+        != best_record.get(
+            "training_song_reference_validation_selection_score"
+        )
+        or best_selection.get("contract")
+        != best_record.get(
+            "training_song_reference_validation_selection_contract"
+        )
+        or optimization.get("best_validation_selection_score")
+        != best_selection.get("score")
+        or _mapping(
+            best_selection.get("components"),
+            "best validation selection components",
+        ).get("total_loss")
+        != selected_dynamic.get("total_loss")
+    ):
+        raise DynamicCropCapacityProbeError(
+            "selected checkpoint score evidence differs from history"
+        )
 
 
 def _validate_effective_losses(report: Mapping[str, Any], candidate: DynamicCropCapacityCandidate) -> None:
@@ -1019,12 +1607,15 @@ def _load_fold_evaluation(
     ):
         raise DynamicCropCapacityProbeError("whole-song fold/reference completeness failed")
 
+    optimization = _mapping(report.get("optimization"), "optimization")
+    _validate_schedule(report)
     checkpoint = _mapping(report.get("checkpoint"), "report checkpoint")
     heldout = _mapping(report.get("held_out_evaluation"), "heldout evaluation")
     quality = _mapping(heldout.get("quality_gate"), "heldout quality gate")
     coverage = _mapping(report.get("structured_head_coverage_gate"), "structured coverage gate")
     if (
         checkpoint.get("checkpoint_id") != metadata.checkpoint_id
+        or checkpoint.get("training_steps") != metadata.training_steps
         or checkpoint.get("weight_sha256") != metadata.weight_sha256
         or checkpoint.get("production_activation_authorized") is not False
         or heldout.get("checkpoint_id") != metadata.checkpoint_id
@@ -1039,16 +1630,38 @@ def _load_fold_evaluation(
         or coverage.get("passed") is not True
     ):
         raise DynamicCropCapacityProbeError("fold heldout/quality gate failed")
+    if metadata.training_steps != optimization.get("best_training_step"):
+        raise DynamicCropCapacityProbeError(
+            "saved checkpoint training step differs from selection evidence"
+        )
 
     report_freeze = _mapping(report.get("selection_freeze_evidence"), "freeze evidence")
     if (
         report_freeze.get("path") != str(freeze_path)
+        or report_freeze.get("filename") != freeze_path.name
         or report_freeze.get("file_sha256") != _file_sha256(freeze_path)
+        or report_freeze.get("content_sha256") != _sha256(freeze)
         or report_freeze.get("written_before_heldout_forward") is not True
+        or freeze.get("schema_version") != 1
+        or freeze.get("contract")
+        != "stage_edit_model_config_checkpoint_and_threshold_freeze_v1"
         or freeze.get("model_config") != candidate.model_config.to_dict()
         or freeze.get("model_config_fingerprint_sha256") != _sha256(candidate.model_config.to_dict())
         or freeze.get("checkpoint_id") != metadata.checkpoint_id
         or freeze.get("checkpoint_weight_sha256") != metadata.weight_sha256
+        or freeze.get("selected_training_step")
+        != optimization.get("best_training_step")
+        or freeze.get("selected_finetune_optimizer_step")
+        != optimization.get("best_finetune_optimizer_step")
+        or freeze.get("minimum_checkpoint_selection_finetune_steps")
+        != PROBE_TRAINING_SCHEDULE[
+            "minimum_checkpoint_selection_finetune_steps"
+        ]
+        or freeze.get("selected_after_checkpoint_burn_in") is not True
+        or freeze.get("validation_selection")
+        != optimization.get("best_validation_selection_evidence")
+        or freeze.get("selected_validation_metrics")
+        != optimization.get("selected_checkpoint_validation_metrics")
         or freeze.get("training_song_ids") != list(training_songs)
         or tuple(sorted(freeze.get("training_reference_ids") or ())) != train_refs
         or tuple(sorted(freeze.get("validation_reference_ids") or ())) != internal_validation_refs
@@ -1058,9 +1671,8 @@ def _load_fold_evaluation(
         or freeze.get("style_or_attitude_configuration_mutable_after_freeze") is not False
     ):
         raise DynamicCropCapacityProbeError("selection freeze provenance failed")
-    _validate_schedule(report)
     _validate_effective_losses(report, candidate)
-    if _mapping(report.get("optimization"), "optimization").get("unseen_song_used_for_model_selection") is not False:
+    if optimization.get("unseen_song_used_for_model_selection") is not False:
         raise DynamicCropCapacityProbeError("heldout influenced model selection")
     dynamic_metrics = _mapping(heldout.get("dynamic_crop_v2_metrics"), "dynamic heldout metrics")
     if (
