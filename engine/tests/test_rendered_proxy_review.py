@@ -151,6 +151,48 @@ class RenderedProxyReviewTests(unittest.TestCase):
             transitions=(RenderTransition(tier=tier, reason=reason),),
         )
 
+    def _source_run_plan(
+        self,
+        frame_counts: tuple[int, ...],
+        source_indices: tuple[int, ...],
+    ) -> RenderPlan:
+        self.assertEqual(len(frame_counts), len(source_indices))
+        self.assertGreater(len(frame_counts), 0)
+        master_start = 0.0
+        segments: list[RenderSegment] = []
+        for frame_count, source_index in zip(
+            frame_counts,
+            source_indices,
+            strict=True,
+        ):
+            duration = frame_count / 30.0
+            segments.append(
+                RenderSegment(
+                    source_index,
+                    master_start,
+                    duration,
+                    master_start,
+                )
+            )
+            master_start += duration
+        return RenderPlan(
+            sources=tuple(
+                Path(f"source-{index}.mp4")
+                for index in range(max(source_indices) + 1)
+            ),
+            segments=tuple(segments),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("source-run-proxy.mp4"),
+            width=854,
+            height=480,
+            fps=30.0,
+            transitions=tuple(
+                RenderTransition(tier="C", reason="synthetic_cross_source")
+                for _ in range(len(segments) - 1)
+            ),
+        )
+
     def _review_frames(
         self,
         plan: RenderPlan,
@@ -158,6 +200,7 @@ class RenderedProxyReviewTests(unittest.TestCase):
         *,
         geometry_provider=None,
         professional_reference_profile=None,
+        config: ProxyReviewConfig | None = None,
     ):
         capture = _FakeProxyCapture(
             frames,
@@ -174,6 +217,7 @@ class RenderedProxyReviewTests(unittest.TestCase):
         ):
             review = review_rendered_proxy(
                 plan,
+                config=config,
                 geometry_provider=provider,
                 professional_reference_profile=(
                     professional_reference_profile
@@ -207,8 +251,228 @@ class RenderedProxyReviewTests(unittest.TestCase):
             ProxyReviewConfig(maximum_color_shock=1.1)
         with self.assertRaisesRegex(ValueError, "tolerance multiplier"):
             ProxyReviewConfig(dissolve_endpoint_tolerance_multiplier=1.26)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            ProxyReviewConfig(minimum_source_look_output_frames=0)
+        with self.assertRaisesRegex(ValueError, "fixed at 256"):
+            ProxyReviewConfig(perceptual_analysis_width=320)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            ProxyReviewConfig(rapid_chroma_step=0.0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            ProxyReviewConfig(maximum_source_luma_median_span=0.0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            ProxyReviewConfig(maximum_source_chroma_median_span=0.0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            ProxyReviewConfig(
+                maximum_rapid_high_quality_shock_fraction=0.0
+            )
         with self.assertRaisesRegex(ValueError, "bounds"):
             OutputSubjectGeometry(face_bbox_xywh=(0.8, 0.2, 0.4, 0.3))
+
+    def test_perceptual_source_admission_passes_consistent_well_covered_runs(
+        self,
+    ) -> None:
+        plan = self._source_run_plan(
+            (12, 12, 12, 12, 12),
+            (0, 1, 0, 1, 0),
+        )
+        frames: list[np.ndarray] = []
+        for run_index in range(5):
+            base = 62 if run_index % 2 == 0 else 67
+            frames.extend(
+                self._textured_frames(
+                    12,
+                    color=(base, base, base),
+                    start_shift=run_index * 12,
+                )
+            )
+
+        review = self._review_frames(plan, frames)
+
+        admission = review.payload["perceptual_source_admission"]
+        self.assertTrue(admission["admission"]["passed"])
+        self.assertEqual(admission["admission"]["reason_codes"], [])
+        self.assertEqual(
+            admission["source_median_consistency"][
+                "adequately_observed_source_count"
+            ],
+            2,
+        )
+        rapid = admission["rapid_quality_alternation"]
+        self.assertTrue(rapid["gate_applicable"])
+        self.assertEqual(rapid["observed_rapid_source_switch_boundary_count"], 4)
+        self.assertEqual(rapid["high_quality_shock_count"], 0)
+        self.assertEqual(
+            review.payload["perceptual_source_admission_penalty_points"],
+            0.0,
+        )
+        self.assertTrue(review.passed)
+
+    def test_perceptual_source_admission_fails_and_targets_worst_source_pair(
+        self,
+    ) -> None:
+        plan = self._source_run_plan((12, 12), (0, 1))
+        frames = self._textured_frames(12, color=(40, 40, 40))
+        frames.extend(
+            self._textured_frames(
+                12,
+                color=(92, 92, 92),
+                start_shift=12,
+            )
+        )
+
+        review = self._review_frames(plan, frames)
+
+        admission = review.payload["perceptual_source_admission"]
+        self.assertFalse(admission["admission"]["passed"])
+        self.assertIn(
+            "perceptual_source_luma_median_span",
+            admission["admission"]["reason_codes"],
+        )
+        source = admission["source_median_consistency"]
+        self.assertGreater(source["luma_median_span"], 0.14)
+        self.assertEqual(
+            source["worst_source_pairs"]["luma"]["source_indices"],
+            [0, 1],
+        )
+        self.assertEqual(
+            source["worst_source_pair_boundary_indices"]["luma"],
+            [0],
+        )
+        self.assertIn(0, admission["admission"]["repair_target_boundary_indices"])
+        self.assertGreater(
+            review.payload["perceptual_source_admission_penalty_points"],
+            0.0,
+        )
+        self.assertFalse(review.passed)
+
+    def test_perceptual_source_admission_fails_rapid_quality_shock_boundaries(
+        self,
+    ) -> None:
+        plan = self._source_run_plan(
+            (12, 12, 12, 12, 12),
+            (0, 1, 0, 1, 0),
+        )
+        frames: list[np.ndarray] = []
+        for run_index in range(5):
+            base = 55 if run_index % 2 == 0 else 78
+            frames.extend(
+                self._textured_frames(
+                    12,
+                    color=(base, base, base),
+                    start_shift=run_index * 12,
+                )
+            )
+
+        review = self._review_frames(plan, frames)
+
+        admission = review.payload["perceptual_source_admission"]
+        self.assertFalse(admission["admission"]["passed"])
+        self.assertNotIn(
+            "perceptual_source_luma_median_span",
+            admission["admission"]["reason_codes"],
+        )
+        self.assertIn(
+            "perceptual_rapid_quality_alternation",
+            admission["admission"]["reason_codes"],
+        )
+        rapid = admission["rapid_quality_alternation"]
+        self.assertEqual(rapid["high_quality_shock_boundary_indices"], [0, 1, 2, 3])
+        self.assertEqual(
+            admission["admission"]["repair_target_boundary_indices"],
+            [0, 1, 2, 3],
+        )
+        self.assertFalse(review.passed)
+
+    def test_perceptual_source_admission_fails_closed_on_source_coverage(
+        self,
+    ) -> None:
+        plan = self._source_run_plan((18, 6), (0, 1))
+        frames = self._textured_frames(18, color=(60, 60, 60))
+        frames.extend(
+            self._textured_frames(
+                6,
+                color=(62, 62, 62),
+                start_shift=18,
+            )
+        )
+
+        review = self._review_frames(plan, frames)
+
+        admission = review.payload["perceptual_source_admission"]
+        self.assertFalse(admission["admission"]["passed"])
+        self.assertEqual(
+            admission["source_median_consistency"][
+                "insufficient_source_indices"
+            ],
+            [1],
+        )
+        self.assertIn(
+            "perceptual_source_scalar_coverage_incomplete",
+            admission["admission"]["reason_codes"],
+        )
+        self.assertEqual(
+            review.payload["perceptual_source_admission_penalty_points"],
+            20.0,
+        )
+        self.assertFalse(review.passed)
+
+    def test_perceptual_rapid_runs_split_on_discontinuous_source_clock(
+        self,
+    ) -> None:
+        plan = RenderPlan(
+            sources=(Path("source-0.mp4"), Path("source-1.mp4")),
+            segments=(
+                RenderSegment(0, 0.0, 2.0, 0.0),
+                RenderSegment(0, 10.0, 2.0, 2.0),
+                RenderSegment(1, 0.0, 1.0, 4.0),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("discontinuous-source-clock-proxy.mp4"),
+            width=854,
+            height=480,
+            fps=30.0,
+            transitions=(
+                RenderTransition(
+                    tier="C",
+                    reason="same_source_internal_camera_cut",
+                ),
+                RenderTransition(tier="C", reason="synthetic_cross_source"),
+            ),
+        )
+        frames = self._textured_frames(120, color=(55, 55, 55))
+        frames.extend(
+            self._textured_frames(
+                30,
+                color=(78, 78, 78),
+                start_shift=120,
+            )
+        )
+
+        review = self._review_frames(
+            plan,
+            frames,
+            config=ProxyReviewConfig(
+                minimum_rapid_source_switch_boundary_count=1,
+            ),
+        )
+
+        rapid = review.payload["perceptual_source_admission"][
+            "rapid_quality_alternation"
+        ]
+        self.assertEqual(rapid["source_run_count"], 3)
+        self.assertEqual(
+            rapid["expected_rapid_source_switch_boundary_count"],
+            1,
+        )
+        self.assertEqual(
+            rapid["boundaries"][0]["boundary_index"],
+            1,
+        )
+        self.assertAlmostEqual(
+            rapid["boundaries"][0]["outgoing_duration_seconds"],
+            2.0,
+        )
 
     def test_one_sided_and_group_face_geometry_is_not_fabricated_as_maximum(self) -> None:
         self.assertEqual(
@@ -545,6 +809,12 @@ class RenderedProxyReviewTests(unittest.TestCase):
                 plan,
                 frames,
                 professional_reference_profile=profile,
+                config=ProxyReviewConfig(
+                    minimum_source_look_output_frames=6,
+                    maximum_source_sharpness_log_median_span=5.0,
+                    maximum_source_luma_median_span=1.0,
+                    maximum_source_chroma_median_span=1.0,
+                ),
             )
 
         self.assertFalse(
