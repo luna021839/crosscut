@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import MappingProxyType
 import tempfile
@@ -261,6 +262,18 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                         "source_pretraining_warmup_steps",
                     ),
                     (
+                        "--dynamic-crop-v3-prior-pretrain-steps",
+                        "dynamic_crop_v3_prior_pretraining_steps",
+                    ),
+                    (
+                        "--dynamic-crop-v3-prior-pretrain-learning-rate",
+                        "dynamic_crop_v3_prior_pretraining_peak_learning_rate",
+                    ),
+                    (
+                        "--dynamic-crop-v3-prior-pretrain-warmup-steps",
+                        "dynamic_crop_v3_prior_pretraining_warmup_steps",
+                    ),
+                    (
                         "--minimum-finetune-optimizer-steps",
                         "minimum_finetune_optimizer_steps",
                     ),
@@ -463,6 +476,26 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
     def test_completed_fold_writes_nonselecting_v3_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
+            cut_steps = int(
+                launcher.PROBE_TRAINING_SCHEDULE["cut_pretraining_steps"]
+            )
+            source_steps = int(
+                launcher.PROBE_TRAINING_SCHEDULE["source_pretraining_steps"]
+            )
+            prior_steps = int(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_steps"
+                ]
+            )
+            finetune_steps = int(
+                launcher.PROBE_TRAINING_SCHEDULE["finetune_steps_planned"]
+            )
+            retention_steps = int(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_retention_finetune_steps"
+                ]
+            )
+            total_steps = cut_steps + source_steps + prior_steps + finetune_steps
             candidate = launcher.default_dynamic_crop_v3_capacity_candidates()[0]
             heldout = launcher.SELECTION_SONG_IDS[2]
             checkpoint = root / launcher._run_id(candidate, heldout)
@@ -479,7 +512,9 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                 "checkpoint-v3-fixture",
                 DEFAULT_STAGE_EDIT_SCHEMA,
                 candidate.model_config,
-                training_steps=1120,
+                training_steps=(
+                    cut_steps + source_steps + prior_steps + retention_steps
+                ),
                 weights_trained=True,
                 training_data_id="v3-fixture-data",
             )
@@ -490,6 +525,164 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
             )
             base = asdict(candidate.base_loss_contract)
             dynamic_loss = asdict(candidate.dynamic_crop_loss_contract)
+            training_songs = tuple(launcher.SELECTION_SONG_IDS[:2])
+            references_by_training_song = {
+                song: (f"{song}-ref-a", f"{song}-ref-b")
+                for song in training_songs
+            }
+            validation_references = tuple(
+                min(
+                    references_by_training_song[song],
+                    key=lambda reference: hashlib.sha256(
+                        f"{song}\0{reference}".encode("utf-8")
+                    ).hexdigest(),
+                )
+                for song in training_songs
+            )
+            training_references = tuple(
+                reference
+                for song in training_songs
+                for reference in references_by_training_song[song]
+                if reference not in validation_references
+            )
+            training_reference_song_ids = {
+                reference: song
+                for song in training_songs
+                for reference in references_by_training_song[song]
+                if reference in training_references
+            }
+            candidate_steps = tuple(
+                launcher.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            )
+            candidate_digests = {
+                step: hashlib.sha256(f"candidate-{step}".encode()).hexdigest()
+                for step in candidate_steps
+            }
+            candidate_evaluations = []
+            for index, step in enumerate(candidate_steps):
+                dynamic_metrics = {
+                    "schema_version": DYNAMIC_CROP_V3_SCHEMA_VERSION,
+                    "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
+                    "target_contract": DYNAMIC_CROP_V3_TARGET_CONTRACT,
+                    "output_contract": DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+                    "legacy_v2_checkpoint_or_output_used": False,
+                    "legacy_static_crop_head_used_for_trajectory": False,
+                    "trajectory": {
+                        "aggregate_normalized_improvement_over_static_prior": (
+                            0.02 - index * 0.001
+                        ),
+                        "target_source_slot_mismatch_count": 0,
+                        "renderer_decode": {
+                            "attempt_count": 1,
+                            "eligible_count": 1,
+                            "eligible_rate": 1.0,
+                            "minimum_safe_zoom_projection_count": 0,
+                        },
+                    },
+                }
+                validation_metrics = {
+                    "cut": {"auroc": 0.8},
+                    "source": {"mean_reciprocal_rank": 0.7},
+                    "total_loss": 1.0,
+                    "dynamic_crop_v3": dynamic_metrics,
+                }
+                selection_evidence = (
+                    launcher._stage_edit_validation_selection_with_dynamic_crop_v3(
+                        launcher.stage_edit_validation_selection_score(
+                            validation_metrics
+                        ),
+                        dynamic_metrics,
+                    )
+                )
+                candidate_evaluations.append({
+                    "candidate_step": step,
+                    "value_bias_sha256": candidate_digests[step],
+                    "training_partition_only_updates": True,
+                    "validation_gradients_computed": False,
+                    "heldout_forward_performed": False,
+                    "selection": selection_evidence,
+                    "validation_metrics": validation_metrics,
+                })
+            selected_candidate = candidate_evaluations[0]
+            invariant_digests = {
+                key: hashlib.sha256(key.encode()).hexdigest()
+                for key in (
+                    "base_parameter_tree_sha256",
+                    "context_weight_sha256",
+                    "source_head_parameter_tree_sha256",
+                    "context_non_value_bias_sha256",
+                )
+            }
+            prior_before_digests = {
+                **invariant_digests,
+                "context_value_bias_sha256": hashlib.sha256(
+                    b"initial-value-bias"
+                ).hexdigest(),
+            }
+            prior_after_digests = {
+                **invariant_digests,
+                "context_value_bias_sha256": candidate_digests[
+                    candidate_steps[0]
+                ],
+            }
+            peak = float(launcher.PROBE_TRAINING_SCHEDULE["learning_rate"])
+            warmup = int(
+                launcher.PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"]
+            )
+            minimum = peak * float(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "minimum_learning_rate_ratio"
+                ]
+            )
+            decay_steps = finetune_steps - warmup
+            learning_rates = []
+            for schedule_index in range(finetune_steps):
+                if schedule_index < warmup:
+                    learning_rates.append(
+                        peak * 0.1
+                        + (peak - peak * 0.1) * schedule_index / warmup
+                    )
+                else:
+                    local = min(schedule_index - warmup, decay_steps)
+                    learning_rates.append(
+                        minimum
+                        + (peak - minimum)
+                        * 0.5
+                        * (1.0 + math.cos(math.pi * local / decay_steps))
+                    )
+            prior_peak = float(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+                ]
+            )
+            prior_warmup = int(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_warmup_steps"
+                ]
+            )
+            prior_minimum = prior_peak * float(
+                launcher.PROBE_TRAINING_SCHEDULE[
+                    "minimum_learning_rate_ratio"
+                ]
+            )
+            prior_decay = prior_steps - prior_warmup
+            prior_learning_rates = []
+            for schedule_index in range(prior_steps):
+                if schedule_index < prior_warmup:
+                    prior_learning_rates.append(
+                        prior_peak * 0.1
+                        + (prior_peak - prior_peak * 0.1)
+                        * schedule_index
+                        / prior_warmup
+                    )
+                else:
+                    local = min(schedule_index - prior_warmup, prior_decay)
+                    prior_learning_rates.append(
+                        prior_minimum
+                        + (prior_peak - prior_minimum)
+                        * 0.5
+                        * (1.0 + math.cos(math.pi * local / prior_decay))
+                    )
             report = {
                 "schema_version": PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
                 "run_kind": PRODUCTION_TRAINING_RUN_KIND,
@@ -509,32 +702,224 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                     ),
                 },
                 "split": {
-                    "training_song_ids": list(launcher.SELECTION_SONG_IDS[:2]),
+                    "training_song_ids": list(training_songs),
                     "held_out_song_ids": [launcher.SELECTION_SONG_IDS[2]],
                     "held_out_used_for_model_selection": False,
-                    "training_reference_ids": [],
-                    "validation_reference_ids": [],
+                    "training_reference_ids": list(training_references),
+                    "validation_reference_ids": list(validation_references),
                     "held_out_reference_ids": [],
                 },
                 "optimization": {
-                    "source_pretraining_optimizer_steps": 500,
+                    "optimizer_steps": total_steps,
+                    "source_pretraining_optimizer_steps": source_steps,
+                    "dynamic_crop_v3_prior_pretraining_optimizer_steps": (
+                        prior_steps
+                    ),
                     "learning_rate_schedule": {
-                        "source_pretraining_steps": 500,
-                        "source_pretraining_peak_learning_rate": 3.0e-4,
-                        "source_pretraining_window_length": 32,
-                        "source_pretraining_warmup_steps": 50,
+                        **dict(launcher.PROBE_TRAINING_SCHEDULE),
+                        "contract": launcher.PROBE_TRAINING_SCHEDULE[
+                            "schedule_contract"
+                        ],
                     },
-                    "minimum_finetune_optimizer_steps": 120,
-                    "minimum_checkpoint_selection_finetune_steps": 60,
+                    "minimum_finetune_optimizer_steps": (
+                        launcher.PROBE_TRAINING_SCHEDULE[
+                            "minimum_finetune_optimizer_steps"
+                        ]
+                    ),
+                    "minimum_checkpoint_selection_finetune_steps": (
+                        launcher.PROBE_TRAINING_SCHEDULE[
+                            "minimum_checkpoint_selection_finetune_steps"
+                        ]
+                    ),
+                    "best_finetune_optimizer_step": retention_steps,
+                    "best_training_step": (
+                        cut_steps + source_steps + prior_steps + retention_steps
+                    ),
+                    "dynamic_crop_v3_prior_optimizer_initial_step": 0,
+                    "dynamic_crop_v3_prior_optimizer_state_final_step": (
+                        prior_steps
+                    ),
+                    "dynamic_crop_v3_prior_optimizer_state_reset_after_source_pretraining": (
+                        True
+                    ),
+                    "finetune_optimizer_state_reset_after_dynamic_crop_v3_prior_pretraining": (
+                        True
+                    ),
+                    "finetune_retention_optimizer_state_final_step": (
+                        retention_steps
+                    ),
+                    "finetune_joint_optimizer_initial_step": 0,
+                    "finetune_optimizer_reset_at_dynamic_crop_v3_prior_release": (
+                        True
+                    ),
+                    "finetune_optimizer_state_final_step": (
+                        finetune_steps - retention_steps
+                    ),
+                    "checkpoint_writes_before_joint_finetuning": 0,
+                    "dynamic_crop_v3_prior_pretraining": {
+                        "enabled": True,
+                        "partition": "training_references_only",
+                        "optimizer_weight_decay": 0.0,
+                        "checkpoint_selection_eligible_during_warmup": False,
+                        "checkpoint_write_before_joint_finetuning": False,
+                        "validation_labels_consumed_for_gradients": False,
+                        "heldout_labels_consumed": False,
+                        "sampling": {
+                            "partition": "training_references_only",
+                            "validation_labels_consumed": False,
+                            "heldout_labels_consumed": False,
+                            "reference_song_ids": {
+                                **training_reference_song_ids,
+                            },
+                            "per_song_sampled_counts": {
+                                training_songs[0]: prior_steps // 2,
+                                training_songs[1]: prior_steps // 2,
+                            },
+                            "per_reference_sampled_counts": {
+                                training_references[0]: prior_steps // 2,
+                                training_references[1]: prior_steps // 2,
+                            },
+                        },
+                        "component_scale": {
+                            "validation_labels_consumed": False,
+                            "heldout_labels_consumed": False,
+                        },
+                        "parameter_invariance": {
+                            "all_declared_invariant_groups_byte_identical": True,
+                            "context_value_bias_changed": True,
+                            "before": prior_before_digests,
+                            "after": prior_after_digests,
+                            "invariant_parameter_groups": [
+                                "base_parameter_tree_sha256",
+                                "context_weight_sha256",
+                                "source_head_parameter_tree_sha256",
+                                "context_non_value_bias_sha256",
+                            ],
+                        },
+                        "candidate_selection": {
+                            "contract": (
+                                launcher.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+                            ),
+                            "predeclared_candidate_steps": list(candidate_steps),
+                            "selection_rule": (
+                                "highest_finite_selectable_existing_validation_"
+                                "score_then_lower_candidate_step_on_exact_tie"
+                            ),
+                            "training_partition_only_gradients": True,
+                            "validation_reference_ids": list(
+                                validation_references
+                            ),
+                            "validation_gradients_computed": False,
+                            "heldout_forward_performed": False,
+                            "retention_authorized": True,
+                            "candidate_evaluations": candidate_evaluations,
+                            "selected_candidate_step": candidate_steps[0],
+                            "selected_candidate_value_bias_sha256": (
+                                candidate_digests[candidate_steps[0]]
+                            ),
+                            "selection": selected_candidate["selection"],
+                            "validation_metrics": selected_candidate[
+                                "validation_metrics"
+                            ],
+                        },
+                        "retention": {
+                            "retention_finetune_step_count": retention_steps,
+                            "required_retention_finetune_step_count": (
+                                retention_steps
+                            ),
+                            "all_dynamic_head_parameters_byte_identical": True,
+                            "optimizer_state_reset_before_dynamic_head_release": (
+                                True
+                            ),
+                            "retention_optimizer_state_final_step": (
+                                retention_steps
+                            ),
+                            "released_joint_optimizer_initial_step": 0,
+                            "released_joint_optimizer_state_final_step": (
+                                finetune_steps - retention_steps
+                            ),
+                            "released_joint_optimizer_schedule_offset_steps": (
+                                retention_steps
+                            ),
+                            "validation_gradients_computed": False,
+                            "heldout_forward_performed": False,
+                            "warmup_head_digests": {
+                                key: prior_after_digests[key]
+                                for key in (
+                                    "context_weight_sha256",
+                                    "source_head_parameter_tree_sha256",
+                                    "context_non_value_bias_sha256",
+                                    "context_value_bias_sha256",
+                                )
+                            },
+                            "retained_head_digests": {
+                                key: prior_after_digests[key]
+                                for key in (
+                                    "context_weight_sha256",
+                                    "source_head_parameter_tree_sha256",
+                                    "context_non_value_bias_sha256",
+                                    "context_value_bias_sha256",
+                                )
+                            },
+                        },
+                    },
                     "unseen_song_used_for_model_selection": False,
                     "effective_loss_contract": base,
                     "effective_dynamic_crop_v3_loss_contract": dynamic_loss,
                     "effective_dynamic_crop_loss_contract_version": 3,
                 },
+                "dynamic_crop_v3_prior_pretraining_history": [
+                    {
+                        "prior_pretrain_step": step,
+                        "optimizer_step": cut_steps + source_steps + step,
+                        "song_id": (
+                            training_songs[0] if step % 2 else training_songs[1]
+                        ),
+                        "reference_id": (
+                            training_references[0]
+                            if step % 2
+                            else training_references[1]
+                        ),
+                        "actual_learning_rate": prior_learning_rates[step - 1],
+                        "checkpoint_selection_eligible": False,
+                        "predeclared_candidate_snapshot": (
+                            step in candidate_steps
+                        ),
+                        "candidate_value_bias_sha256": (
+                            candidate_digests[step]
+                            if step in candidate_steps
+                            else None
+                        ),
+                        "validation_labels_consumed": False,
+                        "heldout_labels_consumed": False,
+                    }
+                    for step in range(1, prior_steps + 1)
+                ],
+                "history": [
+                    {
+                        "finetune_optimizer_steps": list(
+                            range(1, finetune_steps + 1)
+                        ),
+                        "finetune_phase_local_optimizer_steps": [
+                            *range(1, retention_steps + 1),
+                            *range(
+                                1,
+                                finetune_steps - retention_steps + 1,
+                            ),
+                        ],
+                        "finetune_optimizer_reset_before_steps": [
+                            retention_steps + 1
+                        ],
+                        "dynamic_crop_v3_prior_retention_finetune_steps": (
+                            list(range(1, retention_steps + 1))
+                        ),
+                        "finetune_actual_learning_rates": learning_rates,
+                    }
+                ],
                 "held_out_evaluation": {
                     "passed": True,
                     "quality_gate": {"passed": True},
-                    "training_song_ids": list(launcher.SELECTION_SONG_IDS[:2]),
+                    "training_song_ids": list(training_songs),
                     "held_out_song_ids": [launcher.SELECTION_SONG_IDS[2]],
                     "held_out_reference_count": 0,
                     "checkpoint_id": metadata.checkpoint_id,
@@ -575,8 +960,16 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                     "checkpoint_weight_sha256": weight_hash,
                     "minimum_checkpoint_selection_finetune_steps": 60,
                     "selected_after_checkpoint_burn_in": True,
-                    "training_reference_ids": [],
-                    "validation_reference_ids": [],
+                    "selected_training_step": metadata.training_steps,
+                    "selected_finetune_optimizer_step": retention_steps,
+                    "dynamic_crop_v3_prior_selected_candidate_step": (
+                        candidate_steps[0]
+                    ),
+                    "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256": (
+                        candidate_digests[candidate_steps[0]]
+                    ),
+                    "training_reference_ids": list(training_references),
+                    "validation_reference_ids": list(validation_references),
                 },
             )
             preflight = launcher.DynamicCropV3CapacityFoldPreflight(
@@ -586,11 +979,14 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                 candidate_id=candidate.candidate_id,
                 capacity_smoke_path=smoke,
                 held_out_song_id=heldout,
-                training_song_ids=tuple(launcher.SELECTION_SONG_IDS[:2]),
+                training_song_ids=training_songs,
                 checkpoint_directory=checkpoint,
                 evidence_directory=evidence,
                 selection_dataset_manifest_path=selection,
-                reference_ids_by_song={},
+                reference_ids_by_song={
+                    **references_by_training_song,
+                    heldout: (),
+                },
                 train_cli_args=(),
                 command_argv=(),
                 free_bytes=1,

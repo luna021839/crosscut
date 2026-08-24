@@ -307,6 +307,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-pretrain-window-length", type=int, default=32)
     parser.add_argument("--source-pretrain-warmup-steps", type=int, default=50)
+    parser.add_argument(
+        "--dynamic-crop-v3-prior-pretrain-steps",
+        type=int,
+        default=0,
+        help=(
+            "Training-only song/reference-balanced normalized-coordinate "
+            "prior steps. Production v3 schedules enable 500; v2 rejects "
+            "any nonzero value."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-crop-v3-prior-pretrain-learning-rate",
+        type=float,
+        default=3.0e-4,
+    )
+    parser.add_argument(
+        "--dynamic-crop-v3-prior-pretrain-warmup-steps",
+        type=int,
+        default=50,
+    )
     parser.add_argument("--finetune-warmup-steps", type=int, default=8)
     parser.add_argument(
         "--minimum-finetune-optimizer-steps", type=int, default=120
@@ -611,6 +631,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_pretrain_learning_rate=args.source_pretrain_learning_rate,
         source_pretrain_window_length=args.source_pretrain_window_length,
         source_pretrain_warmup_steps=args.source_pretrain_warmup_steps,
+        dynamic_crop_v3_prior_pretrain_steps=(
+            args.dynamic_crop_v3_prior_pretrain_steps
+        ),
+        dynamic_crop_v3_prior_pretrain_learning_rate=(
+            args.dynamic_crop_v3_prior_pretrain_learning_rate
+        ),
+        dynamic_crop_v3_prior_pretrain_warmup_steps=(
+            args.dynamic_crop_v3_prior_pretrain_warmup_steps
+        ),
         finetune_warmup_steps=args.finetune_warmup_steps,
         minimum_finetune_optimizer_steps=args.minimum_finetune_optimizer_steps,
         minimum_checkpoint_selection_finetune_steps=(

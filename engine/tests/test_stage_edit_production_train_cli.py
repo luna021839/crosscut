@@ -248,6 +248,12 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
                         str(root / "crop-manifest.json"),
                         "--dynamic-crop-version",
                         "3",
+                        "--dynamic-crop-v3-prior-pretrain-steps",
+                        "500",
+                        "--dynamic-crop-v3-prior-pretrain-learning-rate",
+                        "0.0003",
+                        "--dynamic-crop-v3-prior-pretrain-warmup-steps",
+                        "50",
                         "--checkpoint-dir",
                         str(checkpoint),
                     ]
@@ -268,6 +274,16 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
             )
             self.assertEqual(500, kwargs["source_pretrain_steps"])
             self.assertEqual(32, kwargs["source_pretrain_window_length"])
+            self.assertEqual(
+                500, kwargs["dynamic_crop_v3_prior_pretrain_steps"]
+            )
+            self.assertEqual(
+                3.0e-4,
+                kwargs["dynamic_crop_v3_prior_pretrain_learning_rate"],
+            )
+            self.assertEqual(
+                50, kwargs["dynamic_crop_v3_prior_pretrain_warmup_steps"]
+            )
             self.assertEqual(120, kwargs["minimum_finetune_optimizer_steps"])
             self.assertEqual(
                 60,

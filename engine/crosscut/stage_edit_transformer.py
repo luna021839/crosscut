@@ -3007,16 +3007,44 @@ def stage_edit_readiness_report(
             dynamic_crop_version=dynamic_crop_version,
             checkpoint_metadata_filename=metadata_path.name,
         )
+    is_production_promotion_report = False
     try:
         report_payload = json.loads(report_path.read_text(encoding="utf-8"))
-        report_errors = _production_training_report_errors(
-            report_payload,
-            metadata=metadata,
-            actual_weight_sha256=(
-                metadata.weight_sha256 if valid_weights else None
-            ),
-            checkpoint_format=checkpoint_format,
+        # Final-fit promotion is a separate evidence schema.  Dispatch only on
+        # its exact run kind so the historical per-fold production validator
+        # retains all of its song-heldout/checkpoint-selection semantics.
+        from .stage_edit_dynamic_crop_v3_production_promotion import (
+            PRODUCTION_PROMOTION_RUN_KIND,
+            production_promotion_report_errors,
         )
+
+        if (
+            isinstance(report_payload, Mapping)
+            and report_payload.get("run_kind") == PRODUCTION_PROMOTION_RUN_KIND
+        ):
+            is_production_promotion_report = True
+            if checkpoint_format != "dynamic_crop_v3":
+                report_errors = (
+                    "production promotion reports require Dynamic Crop v3",
+                )
+            else:
+                report_errors = production_promotion_report_errors(
+                    report_payload,
+                    metadata=metadata,
+                    actual_weight_sha256=(
+                        metadata.weight_sha256 if valid_weights else None
+                    ),
+                    checkpoint_directory=source.resolve(),
+                )
+        else:
+            report_errors = _production_training_report_errors(
+                report_payload,
+                metadata=metadata,
+                actual_weight_sha256=(
+                    metadata.weight_sha256 if valid_weights else None
+                ),
+                checkpoint_format=checkpoint_format,
+            )
     except (OSError, json.JSONDecodeError) as exc:
         report_errors = (f"production training report cannot be read: {exc}",)
     if report_errors:
@@ -3032,14 +3060,21 @@ def stage_edit_readiness_report(
             dynamic_crop_version=dynamic_crop_version,
             checkpoint_metadata_filename=metadata_path.name,
         )
+    if is_production_promotion_report:
+        readiness_reason = (
+            "weight integrity and frozen forward-only non-blind external "
+            "evaluation of the exact promoted final-fit weight are valid"
+        )
+    else:
+        readiness_reason = (
+            "weight integrity, dense production supervision, and independent "
+            "song-level held-out quality evidence are valid"
+        )
     return StageEditReadinessReport(
         architecture_available=True,
         learned_inference_ready=True,
         status="production_checkpoint_ready",
-        reason=(
-            "weight integrity, dense production supervision, and independent "
-            "song-level held-out quality evidence are valid"
-        ),
+        reason=readiness_reason,
         mlx_version=version,
         checkpoint_path=str(source.resolve()),
         training_steps=metadata.training_steps,

@@ -28,6 +28,7 @@ import json
 import math
 import os
 from pathlib import Path
+import stat as stat_module
 import re
 from typing import Any, Mapping
 
@@ -628,7 +629,27 @@ def _validate_v3_training_report_declarations(
     *,
     metadata: StageEditDynamicCropCheckpointMetadataV3,
     weight_sha256: str,
+    checkpoint_directory: Path | None = None,
 ) -> None:
+    # A promoted all-reference final-fit weight cannot truthfully satisfy the
+    # per-fold report's "same weight had one held-out song" contract.  Admit
+    # only the alternate exact run kind through its own strict validator;
+    # every other report continues through the unchanged fold declarations.
+    from .stage_edit_dynamic_crop_v3_production_promotion import (
+        PRODUCTION_PROMOTION_RUN_KIND,
+        production_promotion_report_errors,
+    )
+
+    if report.get("run_kind") == PRODUCTION_PROMOTION_RUN_KIND:
+        errors = production_promotion_report_errors(
+            report,
+            metadata=metadata,
+            actual_weight_sha256=weight_sha256,
+            checkpoint_directory=checkpoint_directory,
+        )
+        if errors:
+            raise StageEditProductionRegistryNotReadyError("; ".join(errors))
+        return
     checkpoint = report.get("checkpoint")
     model = report.get("model")
     data = report.get("data")
@@ -1266,6 +1287,7 @@ def load_registered_stage_edit_production_bundle(
             training_report,
             metadata=metadata,
             weight_sha256=evidence["weights"][1],
+            checkpoint_directory=checkpoint,
         )
 
     readiness = stage_edit_readiness_report(checkpoint)
@@ -1561,6 +1583,7 @@ def register_stage_edit_production_bundle(
             training_report,
             metadata=metadata,
             weight_sha256=weights_sha,
+            checkpoint_directory=checkpoint,
         )
         if not (
             readiness.dynamic_crop_version == 3
@@ -1702,15 +1725,73 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryError(
             f"stale production registry temporary file: {temporary}"
         )
+    installed_new_record = False
+    installed_record_identity: tuple[int, int, int] | None = None
     try:
         with temporary.open("xb") as handle:
             handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged_stat = temporary.lstat()
+        staged_identity = (
+            staged_stat.st_dev,
+            staged_stat.st_ino,
+            staged_stat.st_size,
+        )
         temporary.replace(destination)
+        installed_new_record = True
+        installed_stat = destination.lstat()
+        installed_record_identity = (
+            installed_stat.st_dev,
+            installed_stat.st_ino,
+            installed_stat.st_size,
+        )
+        if installed_record_identity != staged_identity:
+            raise StageEditProductionRegistryError(
+                "new production registry identity changed during installation"
+            )
+        parent_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        # Re-read every evidence path through the public loader before
+        # returning.  If replay fails, remove only the exact bytes installed
+        # by this call so a caller can retry safely; never touch a pre-existing
+        # registry.
+        load_registered_stage_edit_production_bundle(destination)
+    except BaseException:
+        if (
+            installed_new_record
+            and installed_record_identity is not None
+        ):
+            try:
+                observed_before = destination.lstat()
+                observed_identity = (
+                    observed_before.st_dev,
+                    observed_before.st_ino,
+                    observed_before.st_size,
+                )
+                observed_bytes = destination.read_bytes()
+                observed_after = destination.lstat()
+                if (
+                    stat_module.S_ISREG(observed_before.st_mode)
+                    and observed_identity == installed_record_identity
+                    and observed_identity
+                    == (
+                        observed_after.st_dev,
+                        observed_after.st_ino,
+                        observed_after.st_size,
+                    )
+                    and observed_bytes == encoded
+                ):
+                    destination.unlink()
+            except OSError:
+                pass
+        raise
     finally:
         if temporary.exists() and not temporary.is_symlink():
             temporary.unlink()
-    # Re-read every evidence path through the public loader before returning.
-    load_registered_stage_edit_production_bundle(destination)
     return destination
 
 

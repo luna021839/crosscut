@@ -20,8 +20,9 @@ from pathlib import Path
 import random
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from .stage_edit_dynamic_crop_capacity_probe import (
-    PROBE_TRAINING_SCHEDULE,
     SELECTION_SONG_IDS,
 )
 from .stage_edit_dynamic_crop_capacity_fold_launcher import (
@@ -38,10 +39,14 @@ from .stage_edit_dynamic_crop_head_v3 import (
     StageEditTransformerDynamicCropV3,
     load_stage_edit_dynamic_crop_checkpoint_v3,
     new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
+    renderer_safe_values_from_raw_v3,
     save_stage_edit_dynamic_crop_checkpoint_v3,
     stage_edit_dynamic_crop_v3_loss,
     stage_edit_dynamic_crop_v3_parameter_count,
     tensorize_stage_edit_dynamic_crop_supervision_v3,
+)
+from .stage_edit_dynamic_crop_v3_capacity_smoke import (
+    V3_PROBE_TRAINING_SCHEDULE as PROBE_TRAINING_SCHEDULE,
 )
 from .stage_edit_dynamic_crop_training_v3 import (
     StageEditDynamicCropTrainingCorpusV3,
@@ -214,6 +219,7 @@ def train_dynamic_crop_v3_final_fit(
     base_loss_contract: StageEditLossContract,
     dynamic_crop_loss_contract: DynamicCropV3LossContract,
     frozen_training_schedule: Mapping[str, Any],
+    frozen_dynamic_crop_v3_prior_candidate_step: int,
     frozen_cut_probability_threshold: float,
     frozen_quality_thresholds: Mapping[str, Any],
     release_freeze_path: Path,
@@ -225,6 +231,15 @@ def train_dynamic_crop_v3_final_fit(
 
     production._require_mlx()
     schedule = _validate_schedule(frozen_training_schedule)
+    prior_candidate_step = frozen_dynamic_crop_v3_prior_candidate_step
+    if (
+        isinstance(prior_candidate_step, bool)
+        or prior_candidate_step
+        not in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+    ):
+        raise DynamicCropV3FinalFitError(
+            "frozen Dynamic Crop v3 prior candidate milestone differs"
+        )
     threshold = _finite_probability(
         frozen_cut_probability_threshold,
         "frozen cut probability threshold",
@@ -368,10 +383,17 @@ def train_dynamic_crop_v3_final_fit(
     optimizer_steps = 0
     cut_steps = 0
     source_steps = 0
+    prior_steps = 0
     finetune_steps = 0
     cut_history: list[dict[str, Any]] = []
     source_history: list[dict[str, Any]] = []
+    prior_history: list[dict[str, Any]] = []
     finetune_history: list[dict[str, Any]] = []
+    prior_evidence: dict[str, Any] | None = None
+    retention_restore_steps = 0
+    retention_optimizer_state_final_step = 0
+    released_joint_optimizer_initial_step = 0
+    retention_boundary_head_digests: dict[str, str] | None = None
     clipping_supported = hasattr(production.optim, "clip_grad_norm")
 
     def dynamic_sequences_for(batch_examples: Sequence[Any]) -> tuple[Any, ...]:
@@ -549,6 +571,247 @@ def train_dynamic_crop_v3_final_fit(
         if int(source_optimizer.state["step"].item()) != source_steps:
             raise RuntimeError("final-fit source optimizer step differs")
 
+        prior_inventory = production._dynamic_crop_v3_prior_inventory(
+            examples, dynamic_crop_corpus
+        )
+        prior_sampler = production._HierarchicalDynamicCropV3PriorSampler(
+            prior_inventory.tracks,
+            seed=int(schedule["seed"]) ^ 0xD1A5C0,
+        )
+        values_stop = 8 * 4
+        before_prior_digests = (
+            production._dynamic_crop_v3_prior_parameter_digests(model)
+        )
+        prior_module = production._DynamicCropV3PriorBiasModule(
+            model.dynamic_crop_context_head.bias[:values_stop]
+        )
+        initial_values_mx = renderer_safe_values_from_raw_v3(
+            prior_module.value_bias
+        )
+        production.mx.eval(initial_values_mx)
+        component_scale = production._dynamic_crop_v3_prior_component_scale_evidence(
+            prior_inventory,
+            np.asarray(initial_values_mx, dtype=np.float64),
+            effective_dynamic_loss,
+        )
+        prior_schedule = production._warmup_cosine_schedule(
+            peak_learning_rate=float(
+                schedule[
+                    "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+                ]
+            ),
+            total_steps=int(
+                schedule["dynamic_crop_v3_prior_pretraining_steps"]
+            ),
+            warmup_steps=int(
+                schedule[
+                    "dynamic_crop_v3_prior_pretraining_warmup_steps"
+                ]
+            ),
+            minimum_learning_rate_ratio=float(
+                schedule["minimum_learning_rate_ratio"]
+            ),
+        )
+        prior_optimizer = production.optim.AdamW(
+            learning_rate=prior_schedule,
+            weight_decay=0.0,
+        )
+        if int(prior_optimizer.state["step"].item()) != 0:
+            raise RuntimeError(
+                "fresh final-fit v3 prior optimizer did not start at zero"
+            )
+
+        def prior_loss(trained_prior: Any, target_values: Any) -> Any:
+            return production._dynamic_crop_v3_prior_normalized_mae(
+                trained_prior, target_values
+            )
+
+        prior_loss_and_grad = production.nn.value_and_grad(
+            prior_module, prior_loss
+        )
+        prior_candidate_snapshots: dict[int, Any] = {}
+        prior_candidate_digests: dict[int, str] = {}
+        for phase_step in range(
+            1,
+            int(schedule["dynamic_crop_v3_prior_pretraining_steps"]) + 1,
+        ):
+            track = prior_sampler.sample()
+            target_values = production.mx.array(
+                np.asarray(track.values, dtype=np.float32)
+            )
+            loss, gradients = prior_loss_and_grad(
+                prior_module, target_values
+            )
+            if clipping_supported:
+                gradients, gradient_norm = production.optim.clip_grad_norm(
+                    gradients, float(schedule["gradient_clip_norm"])
+                )
+            else:
+                gradient_norm = production.mx.array(float("nan"))
+            prior_optimizer.update(prior_module, gradients)
+            optimizer_steps += 1
+            prior_steps += 1
+            production.mx.eval(
+                loss,
+                gradient_norm,
+                prior_module.parameters(),
+                prior_optimizer.state,
+            )
+            candidate_digest = None
+            if phase_step in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
+                snapshot = production.mx.array(
+                    np.array(prior_module.value_bias, copy=True)
+                )
+                production.mx.eval(snapshot)
+                prior_candidate_snapshots[phase_step] = snapshot
+                candidate_digest = production._parameter_tree_sha256(
+                    {"bias": snapshot.reshape((values_stop,))}
+                )
+                prior_candidate_digests[phase_step] = candidate_digest
+            prior_history.append(
+                {
+                    "phase_step": phase_step,
+                    "optimizer_step": optimizer_steps,
+                    "actual_learning_rate": float(
+                        prior_optimizer.learning_rate.item()
+                    ),
+                    "song_id": track.song_id,
+                    "reference_id": track.reference_id,
+                    "sequence_id": track.sequence_id,
+                    "token_index": track.token_index,
+                    "keyframe_count": len(track.values),
+                    "gate_aligned_normalized_coordinate_mae": float(
+                        loss.item()
+                    ),
+                    "gradient_norm_before_clip": float(
+                        gradient_norm.item()
+                    ),
+                    "checkpoint_selection_performed": False,
+                    "predeclared_candidate_snapshot": (
+                        phase_step
+                        in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+                    ),
+                    "candidate_value_bias_sha256": candidate_digest,
+                    "validation_labels_consumed": False,
+                    "heldout_labels_consumed": False,
+                }
+            )
+        if int(prior_optimizer.state["step"].item()) != prior_steps:
+            raise RuntimeError("final-fit v3 prior optimizer step differs")
+        if set(prior_candidate_snapshots) != set(
+            production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+        ):
+            raise RuntimeError("final-fit v3 prior candidate snapshots differ")
+        retained_non_value_bias = model.dynamic_crop_context_head.bias[
+            values_stop:
+        ]
+        selected_prior_bias = prior_candidate_snapshots[prior_candidate_step]
+        model.dynamic_crop_context_head.bias = production.mx.concatenate(
+            (
+                selected_prior_bias.reshape((values_stop,)),
+                retained_non_value_bias,
+            )
+        )
+        production.mx.eval(model.dynamic_crop_context_head.bias)
+        after_prior_digests = (
+            production._dynamic_crop_v3_prior_parameter_digests(model)
+        )
+        invariant_keys = (
+            "base_parameter_tree_sha256",
+            "context_weight_sha256",
+            "source_head_parameter_tree_sha256",
+            "context_non_value_bias_sha256",
+        )
+        invariant = all(
+            before_prior_digests[key] == after_prior_digests[key]
+            for key in invariant_keys
+        )
+        value_changed = (
+            before_prior_digests["context_value_bias_sha256"]
+            != after_prior_digests["context_value_bias_sha256"]
+        )
+        if not invariant or not value_changed:
+            raise RuntimeError("final-fit v3 prior parameter scope drifted")
+        if (
+            after_prior_digests["context_value_bias_sha256"]
+            != prior_candidate_digests[prior_candidate_step]
+        ):
+            raise RuntimeError("final-fit frozen v3 prior digest drifted")
+        prior_evidence = {
+            "contract": (
+                "all_reference_predeclared_bias_milestones_frozen_loso_"
+                "candidate_no_reselection_v1"
+            ),
+            "partition": "all_references_fixed_after_loso_selection",
+            "objective": (
+                "renderer_range_normalized_coordinate_mae_exactly_aligned_"
+                "with_loso_gate_v1"
+            ),
+            "optimizer_weight_decay": 0.0,
+            "optimizer_initial_step": 0,
+            "optimizer_state_final_step": prior_steps,
+            "checkpoint_selection_performed": False,
+            "validation_metrics_computed": False,
+            "heldout_metrics_computed": False,
+            "predeclared_candidate_steps": list(
+                production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            ),
+            "candidate_selection_contract": (
+                production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+            ),
+            "candidate_snapshots": [
+                {
+                    "candidate_step": step,
+                    "value_bias_sha256": prior_candidate_digests[step],
+                    "training_only_updates": True,
+                }
+                for step in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            ],
+            "frozen_selected_candidate_step": prior_candidate_step,
+            "frozen_selected_candidate_value_bias_sha256": (
+                prior_candidate_digests[prior_candidate_step]
+            ),
+            "final_fit_data_used_for_candidate_selection": False,
+            "sampling": {
+                "contract": (
+                    "deterministic_song_reference_trajectory_round_robin_v1"
+                ),
+                "per_song_sampled_counts": (
+                    prior_sampler.per_song_sampled_counts
+                ),
+                "per_reference_sampled_counts": (
+                    prior_sampler.per_reference_sampled_counts
+                ),
+                "reference_song_ids": dict(
+                    prior_inventory.reference_song_ids
+                ),
+                "per_reference_track_counts": dict(
+                    prior_inventory.per_reference_track_counts
+                ),
+                "references_without_tracks": list(
+                    prior_inventory.references_without_tracks
+                ),
+            },
+            "component_scale": component_scale,
+            "parameter_invariance": {
+                "before": before_prior_digests,
+                "after": after_prior_digests,
+                "invariant_parameter_groups": list(invariant_keys),
+                "all_declared_invariant_groups_byte_identical": invariant,
+                "context_value_bias_changed": value_changed,
+                "context_value_bias_row_count": values_stop,
+            },
+        }
+        retained_context_weight = production.mx.array(
+            np.array(model.dynamic_crop_context_head.weight, copy=True)
+        )
+        retained_context_bias = production.mx.array(
+            np.array(model.dynamic_crop_context_head.bias, copy=True)
+        )
+        retained_source_weight = production.mx.array(
+            np.array(model.dynamic_crop_source_head.weight, copy=True)
+        )
+
         planned_finetune_steps = int(schedule["finetune_steps_planned"])
         warmup_steps = min(
             int(schedule["finetune_warmup_steps"]),
@@ -587,10 +850,18 @@ def train_dynamic_crop_v3_final_fit(
 
         joint_loss_and_grad = production.nn.value_and_grad(model, joint_loss)
         epoch = 0
+        retention_steps = int(
+            schedule["dynamic_crop_v3_prior_retention_finetune_steps"]
+        )
+        joint_optimizer_reset = False
         while finetune_steps < planned_finetune_steps:
             epoch += 1
             losses: list[float] = []
             gradient_norms: list[float] = []
+            epoch_retention_steps: list[int] = []
+            epoch_phase_local_optimizer_steps: list[int] = []
+            epoch_optimizer_reset_before_steps: list[int] = []
+            epoch_actual_learning_rates: list[float] = []
             ordered = production._stable_epoch_order(
                 examples,
                 seed=int(schedule["seed"]),
@@ -601,6 +872,54 @@ def train_dynamic_crop_v3_final_fit(
             ):
                 if finetune_steps >= planned_finetune_steps:
                     break
+                if finetune_steps == retention_steps and not joint_optimizer_reset:
+                    retention_optimizer_state_final_step = int(
+                        joint_optimizer.state["step"].item()
+                    )
+                    if retention_optimizer_state_final_step != retention_steps:
+                        raise RuntimeError(
+                            "final-fit prior retention optimizer step differs"
+                        )
+                    boundary_digests = (
+                        production._dynamic_crop_v3_prior_parameter_digests(
+                            model
+                        )
+                    )
+                    retained_head_keys = (
+                        "context_weight_sha256",
+                        "source_head_parameter_tree_sha256",
+                        "context_non_value_bias_sha256",
+                        "context_value_bias_sha256",
+                    )
+                    retention_boundary_head_digests = {
+                        key: boundary_digests[key]
+                        for key in retained_head_keys
+                    }
+                    if any(
+                        retention_boundary_head_digests[key]
+                        != after_prior_digests[key]
+                        for key in retained_head_keys
+                    ):
+                        raise RuntimeError(
+                            "final-fit v3 prior drifted before joint release"
+                        )
+                    joint_optimizer = production.optim.AdamW(
+                        learning_rate=production._offset_learning_rate_schedule(
+                            joint_schedule, retention_steps
+                        ),
+                        weight_decay=float(schedule["weight_decay"]),
+                    )
+                    released_joint_optimizer_initial_step = int(
+                        joint_optimizer.state["step"].item()
+                    )
+                    if released_joint_optimizer_initial_step != 0:
+                        raise RuntimeError(
+                            "final-fit released joint optimizer is not fresh"
+                        )
+                    joint_optimizer_reset = True
+                    epoch_optimizer_reset_before_steps.append(
+                        finetune_steps + 1
+                    )
                 batch = tensorize_stage_edit_batch(
                     production.prepare_stage_edit_production_input_sequences(
                         batch_examples, schema=DEFAULT_STAGE_EDIT_SCHEMA
@@ -626,6 +945,21 @@ def train_dynamic_crop_v3_final_fit(
                 loss, gradients = joint_loss_and_grad(
                     model, batch, supervision, dynamic_supervision
                 )
+                next_finetune_step = finetune_steps + 1
+                retain_prior = next_finetune_step <= retention_steps
+                if retain_prior:
+                    if not isinstance(gradients, Mapping):
+                        raise RuntimeError(
+                            "final-fit v3 gradients are not name-addressable"
+                        )
+                    gradients = dict(gradients)
+                    for head_name in (
+                        "dynamic_crop_context_head",
+                        "dynamic_crop_source_head",
+                    ):
+                        gradients[head_name] = production._zero_gradient_tree(
+                            gradients[head_name]
+                        )
                 if clipping_supported:
                     gradients, gradient_norm = production.optim.clip_grad_norm(
                         gradients, float(schedule["gradient_clip_norm"])
@@ -633,6 +967,14 @@ def train_dynamic_crop_v3_final_fit(
                 else:
                     gradient_norm = production.mx.array(float("nan"))
                 joint_optimizer.update(model, gradients)
+                if retain_prior:
+                    model.dynamic_crop_context_head.weight = (
+                        retained_context_weight
+                    )
+                    model.dynamic_crop_context_head.bias = retained_context_bias
+                    model.dynamic_crop_source_head.weight = retained_source_weight
+                    retention_restore_steps += 1
+                    epoch_retention_steps.append(next_finetune_step)
                 optimizer_steps += 1
                 finetune_steps += 1
                 production.mx.eval(
@@ -640,6 +982,12 @@ def train_dynamic_crop_v3_final_fit(
                     gradient_norm,
                     model.parameters(),
                     joint_optimizer.state,
+                )
+                epoch_phase_local_optimizer_steps.append(
+                    int(joint_optimizer.state["step"].item())
+                )
+                epoch_actual_learning_rates.append(
+                    float(joint_optimizer.learning_rate.item())
                 )
                 losses.append(float(loss.item()))
                 gradient_norms.append(float(gradient_norm.item()))
@@ -651,12 +999,77 @@ def train_dynamic_crop_v3_final_fit(
                     "gradient_norm_mean_before_clip": (
                         sum(gradient_norms) / len(gradient_norms)
                     ),
+                    "dynamic_crop_v3_prior_retention_finetune_steps": (
+                        epoch_retention_steps
+                    ),
+                    "phase_local_optimizer_steps": (
+                        epoch_phase_local_optimizer_steps
+                    ),
+                    "optimizer_reset_before_finetune_steps": (
+                        epoch_optimizer_reset_before_steps
+                    ),
+                    "actual_learning_rates": epoch_actual_learning_rates,
                     "checkpoint_selection_performed": False,
                     "validation_labels_consumed": False,
                 }
             )
-        if int(joint_optimizer.state["step"].item()) != finetune_steps:
+        expected_active_joint_steps = finetune_steps - retention_steps
+        if (
+            not joint_optimizer_reset
+            or released_joint_optimizer_initial_step != 0
+            or int(joint_optimizer.state["step"].item())
+            != expected_active_joint_steps
+            or retention_restore_steps != retention_steps
+            or retention_boundary_head_digests is None
+        ):
             raise RuntimeError("final-fit joint optimizer step differs")
+        retained_head_digests = (
+            production._dynamic_crop_v3_prior_parameter_digests(model)
+        )
+        # The released joint phase may now change the heads; the exact retention
+        # proof is the restored step count plus the fresh optimizer boundary.
+        assert prior_evidence is not None
+        prior_evidence = {
+            **prior_evidence,
+            "retention": {
+                "retention_finetune_step_count": retention_restore_steps,
+                "retention_optimizer_state_final_step": (
+                    retention_optimizer_state_final_step
+                ),
+                "released_joint_optimizer_initial_step": (
+                    released_joint_optimizer_initial_step
+                ),
+                "released_joint_optimizer_state_final_step": int(
+                    joint_optimizer.state["step"].item()
+                ),
+                "optimizer_state_reset_before_dynamic_head_release": True,
+                "released_joint_optimizer_schedule_offset_steps": (
+                    retention_steps
+                ),
+                "warmup_head_digests": {
+                    key: after_prior_digests[key]
+                    for key in (
+                        "context_weight_sha256",
+                        "source_head_parameter_tree_sha256",
+                        "context_non_value_bias_sha256",
+                        "context_value_bias_sha256",
+                    )
+                },
+                "retention_boundary_head_digests": (
+                    retention_boundary_head_digests
+                ),
+                "all_dynamic_head_parameters_byte_identical_at_release": True,
+                "post_joint_head_digests": {
+                    key: retained_head_digests[key]
+                    for key in (
+                        "context_weight_sha256",
+                        "source_head_parameter_tree_sha256",
+                        "context_non_value_bias_sha256",
+                        "context_value_bias_sha256",
+                    )
+                },
+            },
+        }
 
         checkpoint_id = (
             f"v3-final-fit-{corpus.data_id[:16]}-"
@@ -723,6 +1136,7 @@ def train_dynamic_crop_v3_final_fit(
             "base_loss_contract": asdict(base_loss_contract),
             "dynamic_crop_loss_contract": asdict(dynamic_crop_loss_contract),
             "training_schedule": schedule,
+            "dynamic_crop_v3_prior_candidate_step": prior_candidate_step,
             "cut_probability_threshold": threshold,
             "quality_thresholds": quality_thresholds,
             "decisions_frozen_before_final_fit": True,
@@ -731,6 +1145,7 @@ def train_dynamic_crop_v3_final_fit(
             "optimizer_steps": optimizer_steps,
             "cut_pretraining_optimizer_steps": cut_steps,
             "source_pretraining_optimizer_steps": source_steps,
+            "dynamic_crop_v3_prior_pretraining_optimizer_steps": prior_steps,
             "finetune_optimizer_steps": finetune_steps,
             "checkpoint_selection_performed": False,
             "validation_metrics_computed": False,
@@ -745,6 +1160,8 @@ def train_dynamic_crop_v3_final_fit(
             "supervision_gate": supervision_gate.to_dict(),
             "cut_pretraining_history": cut_history,
             "source_pretraining_history": source_history,
+            "dynamic_crop_v3_prior_pretraining": prior_evidence,
+            "dynamic_crop_v3_prior_pretraining_history": prior_history,
             "finetune_history": finetune_history,
         },
         "checkpoint": {
@@ -911,6 +1328,7 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         "base_loss_contract",
         "dynamic_crop_loss_contract",
         "training_schedule",
+        "dynamic_crop_v3_prior_candidate_step",
         "cut_probability_threshold",
         "quality_thresholds",
         "decisions_frozen_before_final_fit",
@@ -920,6 +1338,11 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         or set(frozen) != frozen_keys
         or _canonical_sha256(frozen.get("training_schedule"))
         != _canonical_sha256(dict(PROBE_TRAINING_SCHEDULE))
+        or isinstance(
+            frozen.get("dynamic_crop_v3_prior_candidate_step"), bool
+        )
+        or frozen.get("dynamic_crop_v3_prior_candidate_step")
+        not in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
         or not isinstance(frozen.get("quality_thresholds"), Mapping)
         or not frozen.get("quality_thresholds")
         or frozen.get("decisions_frozen_before_final_fit") is not True
@@ -955,13 +1378,112 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         )
     cut_steps = PROBE_TRAINING_SCHEDULE["cut_pretraining_steps"]
     source_steps = PROBE_TRAINING_SCHEDULE["source_pretraining_steps"]
+    prior_steps = PROBE_TRAINING_SCHEDULE[
+        "dynamic_crop_v3_prior_pretraining_steps"
+    ]
     finetune_steps = PROBE_TRAINING_SCHEDULE["finetune_steps_planned"]
+    prior = training.get("dynamic_crop_v3_prior_pretraining")
+    prior_history = training.get("dynamic_crop_v3_prior_pretraining_history")
+    finetune_history = training.get("finetune_history")
+    if not isinstance(prior, Mapping):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior evidence is missing"
+        )
+    sampling = prior.get("sampling")
+    invariance = prior.get("parameter_invariance")
+    retention = prior.get("retention")
+    candidate_snapshots = prior.get("candidate_snapshots")
+    frozen_prior_step = frozen.get("dynamic_crop_v3_prior_candidate_step")
+    expected_reference_song_ids = {
+        reference_id: song_id
+        for song_id in SELECTION_SONG_IDS
+        for reference_id in references_by_song[song_id]
+    }
+    candidate_digest_by_step: dict[int, str] = {}
+    if not isinstance(candidate_snapshots, list) or len(candidate_snapshots) != len(
+        production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior candidate snapshots differ"
+        )
+    for expected_step, raw_candidate in zip(
+        production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS,
+        candidate_snapshots,
+        strict=True,
+    ):
+        if not isinstance(raw_candidate, Mapping):
+            raise DynamicCropV3FinalFitError(
+                "final-fit v3 prior candidate snapshot is invalid"
+            )
+        digest = raw_candidate.get("value_bias_sha256")
+        if (
+            raw_candidate.get("candidate_step") != expected_step
+            or raw_candidate.get("training_only_updates") is not True
+            or not _is_sha256(digest)
+        ):
+            raise DynamicCropV3FinalFitError(
+                "final-fit v3 prior candidate snapshot differs"
+            )
+        candidate_digest_by_step[expected_step] = str(digest)
     if (
         training.get("cut_pretraining_optimizer_steps") != cut_steps
         or training.get("source_pretraining_optimizer_steps") != source_steps
+        or training.get("dynamic_crop_v3_prior_pretraining_optimizer_steps")
+        != prior_steps
         or training.get("finetune_optimizer_steps") != finetune_steps
         or training.get("optimizer_steps")
-        != cut_steps + source_steps + finetune_steps
+        != cut_steps + source_steps + prior_steps + finetune_steps
+        or not isinstance(prior_history, list)
+        or len(prior_history) != prior_steps
+        or not isinstance(finetune_history, list)
+        or not finetune_history
+        or prior.get("optimizer_weight_decay") != 0.0
+        or prior.get("optimizer_initial_step") != 0
+        or prior.get("optimizer_state_final_step") != prior_steps
+        or prior.get("checkpoint_selection_performed") is not False
+        or prior.get("validation_metrics_computed") is not False
+        or prior.get("heldout_metrics_computed") is not False
+        or prior.get("predeclared_candidate_steps")
+        != list(production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
+        or prior.get("candidate_selection_contract")
+        != production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+        or prior.get("frozen_selected_candidate_step") != frozen_prior_step
+        or prior.get("frozen_selected_candidate_value_bias_sha256")
+        != candidate_digest_by_step.get(frozen_prior_step)
+        or prior.get("final_fit_data_used_for_candidate_selection") is not False
+        or not isinstance(sampling, Mapping)
+        or not isinstance(invariance, Mapping)
+        or invariance.get("all_declared_invariant_groups_byte_identical")
+        is not True
+        or invariance.get("context_value_bias_changed") is not True
+        or not isinstance(invariance.get("after"), Mapping)
+        or invariance.get("after", {}).get("context_value_bias_sha256")
+        != candidate_digest_by_step.get(frozen_prior_step)
+        or not isinstance(retention, Mapping)
+        or retention.get("retention_finetune_step_count")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("retention_optimizer_state_final_step")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("released_joint_optimizer_initial_step") != 0
+        or retention.get("released_joint_optimizer_state_final_step")
+        != finetune_steps
+        - PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("optimizer_state_reset_before_dynamic_head_release")
+        is not True
+        or retention.get("released_joint_optimizer_schedule_offset_steps")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get(
+            "all_dynamic_head_parameters_byte_identical_at_release"
+        )
+        is not True
         or training.get("checkpoint_selection_performed") is not False
         or training.get("validation_metrics_computed") is not False
         or training.get("heldout_metrics_computed") is not False
@@ -974,6 +1496,279 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
     ):
         raise DynamicCropV3FinalFitError(
             "final-fit optimizer or checkpoint contract differs"
+        )
+    invariant_parameter_groups = (
+        "base_parameter_tree_sha256",
+        "context_weight_sha256",
+        "source_head_parameter_tree_sha256",
+        "context_non_value_bias_sha256",
+    )
+    all_prior_parameter_groups = (
+        *invariant_parameter_groups,
+        "context_value_bias_sha256",
+    )
+    invariance_before = invariance.get("before")
+    invariance_after = invariance.get("after")
+    if (
+        not isinstance(invariance_before, Mapping)
+        or not isinstance(invariance_after, Mapping)
+        or set(invariance_before) != set(all_prior_parameter_groups)
+        or set(invariance_after) != set(all_prior_parameter_groups)
+        or invariance.get("invariant_parameter_groups")
+        != list(invariant_parameter_groups)
+        or any(
+            not _is_sha256(invariance_before.get(key))
+            or not _is_sha256(invariance_after.get(key))
+            for key in all_prior_parameter_groups
+        )
+        or any(
+            invariance_before.get(key) != invariance_after.get(key)
+            for key in invariant_parameter_groups
+        )
+        or invariance_before.get("context_value_bias_sha256")
+        == invariance_after.get("context_value_bias_sha256")
+        or invariance_after.get("context_value_bias_sha256")
+        != candidate_digest_by_step.get(frozen_prior_step)
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior parameter digests differ"
+        )
+    retained_head_groups = (
+        "context_weight_sha256",
+        "source_head_parameter_tree_sha256",
+        "context_non_value_bias_sha256",
+        "context_value_bias_sha256",
+    )
+    warmup_head_digests = retention.get("warmup_head_digests")
+    retention_boundary_head_digests = retention.get(
+        "retention_boundary_head_digests"
+    )
+    post_joint_head_digests = retention.get("post_joint_head_digests")
+    if (
+        not isinstance(warmup_head_digests, Mapping)
+        or not isinstance(retention_boundary_head_digests, Mapping)
+        or not isinstance(post_joint_head_digests, Mapping)
+        or set(warmup_head_digests) != set(retained_head_groups)
+        or set(retention_boundary_head_digests) != set(retained_head_groups)
+        or set(post_joint_head_digests) != set(retained_head_groups)
+        or any(
+            not _is_sha256(warmup_head_digests.get(key))
+            or not _is_sha256(retention_boundary_head_digests.get(key))
+            or not _is_sha256(post_joint_head_digests.get(key))
+            for key in retained_head_groups
+        )
+        or any(
+            warmup_head_digests.get(key)
+            != retention_boundary_head_digests.get(key)
+            or warmup_head_digests.get(key) != invariance_after.get(key)
+            for key in retained_head_groups
+        )
+        or warmup_head_digests.get("context_value_bias_sha256")
+        != candidate_digest_by_step.get(frozen_prior_step)
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior retention digests differ"
+        )
+    assert isinstance(prior_history, list)
+    observed_song_samples: dict[str, int] = {}
+    observed_reference_samples: dict[str, int] = {}
+    observed_prior_learning_rates: list[float] = []
+    for step, raw_record in enumerate(prior_history, start=1):
+        if not isinstance(raw_record, Mapping):
+            raise DynamicCropV3FinalFitError(
+                "final-fit v3 prior history differs"
+            )
+        song_id = str(raw_record.get("song_id") or "")
+        reference_id = str(raw_record.get("reference_id") or "")
+        is_candidate = step in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+        if (
+            raw_record.get("phase_step") != step
+            or raw_record.get("optimizer_step")
+            != cut_steps + source_steps + step
+            or raw_record.get("checkpoint_selection_performed") is not False
+            or raw_record.get("validation_labels_consumed") is not False
+            or raw_record.get("heldout_labels_consumed") is not False
+            or raw_record.get("predeclared_candidate_snapshot") is not is_candidate
+            or (
+                raw_record.get("candidate_value_bias_sha256")
+                != candidate_digest_by_step[step]
+                if is_candidate
+                else raw_record.get("candidate_value_bias_sha256") is not None
+            )
+            or not song_id
+            or not reference_id
+            or expected_reference_song_ids.get(reference_id) != song_id
+            or isinstance(raw_record.get("actual_learning_rate"), bool)
+            or not isinstance(
+                raw_record.get("actual_learning_rate"), (int, float)
+            )
+            or not math.isfinite(
+                float(raw_record.get("actual_learning_rate"))
+            )
+            or float(raw_record.get("actual_learning_rate")) <= 0.0
+        ):
+            raise DynamicCropV3FinalFitError(
+                "final-fit v3 prior history differs"
+            )
+        observed_song_samples[song_id] = observed_song_samples.get(song_id, 0) + 1
+        observed_reference_samples[reference_id] = (
+            observed_reference_samples.get(reference_id, 0) + 1
+        )
+        observed_prior_learning_rates.append(
+            float(raw_record["actual_learning_rate"])
+        )
+    if (
+        set(observed_song_samples) != set(SELECTION_SONG_IDS)
+        or set(observed_reference_samples) != set(flattened_references)
+        or observed_song_samples != sampling.get("per_song_sampled_counts")
+        or observed_reference_samples
+        != sampling.get("per_reference_sampled_counts")
+        or sampling.get("reference_song_ids")
+        != expected_reference_song_ids
+        or max(observed_song_samples.values())
+        - min(observed_song_samples.values())
+        > 1
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior sampling differs from all references"
+        )
+    prior_peak_learning_rate = float(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+        ]
+    )
+    prior_warmup_steps = int(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_warmup_steps"
+        ]
+    )
+    prior_minimum_rate = prior_peak_learning_rate * float(
+        PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+    )
+    prior_decay_steps = prior_steps - prior_warmup_steps
+
+    def expected_prior_learning_rate(schedule_index: int) -> float:
+        if schedule_index < prior_warmup_steps:
+            start = prior_peak_learning_rate * 0.1
+            return start + (prior_peak_learning_rate - start) * (
+                schedule_index / prior_warmup_steps
+            )
+        local = min(schedule_index - prior_warmup_steps, prior_decay_steps)
+        cosine = 0.5 * (
+            1.0 + math.cos(math.pi * local / prior_decay_steps)
+        )
+        return prior_minimum_rate + (
+            prior_peak_learning_rate - prior_minimum_rate
+        ) * cosine
+
+    if any(
+        not math.isclose(
+            observed,
+            expected_prior_learning_rate(step - 1),
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-12,
+        )
+        for step, observed in enumerate(
+            observed_prior_learning_rates, start=1
+        )
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior learning-rate history differs"
+        )
+    observed_phase_local_steps: list[int] = []
+    observed_reset_before_steps: list[int] = []
+    observed_retention_steps: list[int] = []
+    observed_learning_rates: list[float] = []
+    assert isinstance(finetune_history, list)
+    for raw_epoch in finetune_history:
+        if not isinstance(raw_epoch, Mapping):
+            raise DynamicCropV3FinalFitError(
+                "final-fit optimizer reset history differs"
+            )
+        if (
+            raw_epoch.get("checkpoint_selection_performed") is not False
+            or raw_epoch.get("validation_labels_consumed") is not False
+        ):
+            raise DynamicCropV3FinalFitError(
+                "final-fit optimizer reset history selected on labels"
+            )
+        for destination, key in (
+            (observed_phase_local_steps, "phase_local_optimizer_steps"),
+            (
+                observed_reset_before_steps,
+                "optimizer_reset_before_finetune_steps",
+            ),
+            (
+                observed_retention_steps,
+                "dynamic_crop_v3_prior_retention_finetune_steps",
+            ),
+        ):
+            values = raw_epoch.get(key)
+            if not isinstance(values, list) or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in values
+            ):
+                raise DynamicCropV3FinalFitError(
+                    "final-fit optimizer reset history differs"
+                )
+            destination.extend(values)
+        learning_rates = raw_epoch.get("actual_learning_rates")
+        if not isinstance(learning_rates, list) or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in learning_rates
+        ):
+            raise DynamicCropV3FinalFitError(
+                "final-fit learning-rate history differs"
+            )
+        observed_learning_rates.extend(float(value) for value in learning_rates)
+    expected_retention_steps = PROBE_TRAINING_SCHEDULE[
+        "dynamic_crop_v3_prior_retention_finetune_steps"
+    ]
+    peak_learning_rate = float(PROBE_TRAINING_SCHEDULE["learning_rate"])
+    warmup_steps = int(PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"])
+    minimum_rate = peak_learning_rate * float(
+        PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+    )
+    decay_steps = finetune_steps - warmup_steps
+
+    def expected_learning_rate(schedule_index: int) -> float:
+        if schedule_index < warmup_steps:
+            start = peak_learning_rate * 0.1
+            return start + (peak_learning_rate - start) * (
+                schedule_index / warmup_steps
+            )
+        local = min(schedule_index - warmup_steps, decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * local / decay_steps))
+        return minimum_rate + (peak_learning_rate - minimum_rate) * cosine
+
+    expected_learning_rates = [
+        expected_learning_rate(step - 1)
+        for step in range(1, finetune_steps + 1)
+    ]
+    if (
+        observed_phase_local_steps
+        != [
+            *range(1, expected_retention_steps + 1),
+            *range(1, finetune_steps - expected_retention_steps + 1),
+        ]
+        or observed_reset_before_steps != [expected_retention_steps + 1]
+        or observed_retention_steps
+        != list(range(1, expected_retention_steps + 1))
+        or len(observed_learning_rates) != finetune_steps
+        or any(
+            not math.isclose(observed, expected, rel_tol=1.0e-6, abs_tol=1.0e-12)
+            for observed, expected in zip(
+                observed_learning_rates,
+                expected_learning_rates,
+                strict=True,
+            )
+        )
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit optimizer reset history differs"
         )
     return payload
 

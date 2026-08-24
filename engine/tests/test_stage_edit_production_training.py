@@ -48,9 +48,11 @@ from crosscut.stage_edit_production_training import (
     ProductionQualityThresholds,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
     _HierarchicalSourceWindowSampler,
+    _HierarchicalDynamicCropV3PriorSampler,
     _balanced_cut_windows,
     _cut_only_pretraining_loss_contract,
     _dynamic_crop_v3_validation_selection_evidence,
+    _dynamic_crop_v3_prior_inventory,
     _require_unambiguous_checkpoint_namespace,
     _source_only_pretraining_loss_contract,
     _source_pretraining_inventory,
@@ -628,6 +630,45 @@ def _source_balance_example(
 
 
 class StageEditSourcePretrainingTests(unittest.TestCase):
+    def test_dynamic_crop_v3_prior_sampler_balances_song_then_reference(self) -> None:
+        examples = tuple(
+            _training_example(song, reference)
+            for song, reference in (
+                ("SONG-A", "a-dominant"),
+                ("SONG-A", "a-sparse"),
+                ("SONG-B", "b-one"),
+                ("SONG-B", "b-two"),
+            )
+        )
+        inventory = _dynamic_crop_v3_prior_inventory(
+            examples, _dynamic_crop_corpus_v3(examples)
+        )
+        first = _HierarchicalDynamicCropV3PriorSampler(
+            inventory.tracks, seed=87
+        )
+        second = _HierarchicalDynamicCropV3PriorSampler(
+            inventory.tracks, seed=87
+        )
+        first_trace = [first.sample() for _ in range(400)]
+        second_trace = [second.sample() for _ in range(400)]
+        self.assertEqual(
+            [(item.reference_id, item.token_index) for item in first_trace],
+            [(item.reference_id, item.token_index) for item in second_trace],
+        )
+        self.assertEqual(
+            {"SONG-A": 200, "SONG-B": 200},
+            first.per_song_sampled_counts,
+        )
+        self.assertEqual(
+            {
+                "a-dominant": 100,
+                "a-sparse": 100,
+                "b-one": 100,
+                "b-two": 100,
+            },
+            first.per_reference_sampled_counts,
+        )
+
     def test_sampler_balances_song_then_reference_then_group(self) -> None:
         examples = (
             _source_balance_example("SONG-A", "dominant-70", 70),
@@ -772,6 +813,9 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 learning_rate=3.0e-3,
                 cut_pretrain_steps=0,
                 source_pretrain_steps=0,
+                dynamic_crop_v3_prior_pretrain_steps=500,
+                dynamic_crop_v3_prior_pretrain_learning_rate=3.0e-4,
+                dynamic_crop_v3_prior_pretrain_warmup_steps=50,
                 finetune_warmup_steps=0,
                 minimum_finetune_optimizer_steps=1,
                 minimum_checkpoint_selection_finetune_steps=1,
@@ -875,6 +919,92 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 report["held_out_evaluation"][
                     "heldout_dynamic_crop_metrics_used_for_checkpoint_selection"
                 ]
+            )
+            prior = report["optimization"][
+                "dynamic_crop_v3_prior_pretraining"
+            ]
+            self.assertEqual(
+                500,
+                report["optimization"][
+                    "dynamic_crop_v3_prior_pretraining_optimizer_steps"
+                ],
+            )
+            self.assertEqual(
+                500,
+                len(report["dynamic_crop_v3_prior_pretraining_history"]),
+            )
+            self.assertTrue(
+                prior["parameter_invariance"][
+                    "all_declared_invariant_groups_byte_identical"
+                ]
+            )
+            self.assertTrue(
+                prior["parameter_invariance"]["context_value_bias_changed"]
+            )
+            candidate = prior["candidate_selection"]
+            self.assertEqual(
+                [50, 100, 200, 300, 400, 500],
+                candidate["predeclared_candidate_steps"],
+            )
+            self.assertEqual(6, len(candidate["candidate_evaluations"]))
+            selectable_candidates = [
+                item
+                for item in candidate["candidate_evaluations"]
+                if item["selection"]["selectable"]
+            ]
+            expected_selected = max(
+                selectable_candidates,
+                key=lambda item: (
+                    item["selection"]["score"],
+                    -item["candidate_step"],
+                ),
+            )
+            self.assertEqual(
+                expected_selected["candidate_step"],
+                candidate["selected_candidate_step"],
+            )
+            self.assertEqual(
+                expected_selected["value_bias_sha256"],
+                candidate["selected_candidate_value_bias_sha256"],
+            )
+            candidate_gate = candidate["selection"][
+                "dynamic_crop_v3_selection_gate"
+            ]
+            self.assertTrue(candidate["retention_authorized"])
+            self.assertTrue(candidate_gate["selectable"])
+            self.assertGreater(candidate_gate["score_component"], 0.0)
+            self.assertFalse(candidate["validation_gradients_computed"])
+            self.assertFalse(candidate["heldout_forward_performed"])
+            retention = prior["retention"]
+            self.assertTrue(
+                retention["all_dynamic_head_parameters_byte_identical"]
+            )
+            self.assertTrue(
+                retention["optimizer_state_reset_before_dynamic_head_release"]
+            )
+            self.assertEqual(0, retention["released_joint_optimizer_initial_step"])
+            self.assertEqual(
+                [2],
+                [
+                    step
+                    for epoch in report["history"]
+                    for step in epoch["finetune_optimizer_reset_before_steps"]
+                ],
+            )
+            self.assertEqual(
+                [1, 1, 2, 3, 4, 5, 6, 7],
+                [
+                    step
+                    for epoch in report["history"]
+                    for step in epoch["finetune_phase_local_optimizer_steps"]
+                ],
+            )
+            self.assertIn(
+                report["optimization"]["best_checkpoint_origin"],
+                {
+                    "training_only_bias_prior_retained_to_burn_in",
+                    "joint_finetuning",
+                },
             )
 
     def test_exact_saved_checkpoint_needs_song_gate_and_explicit_authorization(self) -> None:

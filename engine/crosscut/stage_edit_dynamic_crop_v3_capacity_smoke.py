@@ -127,6 +127,19 @@ V3_CAPACITY_SMOKE_TARGET_CONTRACT = (
 V3_CAPACITY_SMOKE_EVENT_PREFIX = "STAGEEDIT_V3_MLX_SMOKE_EVENT="
 V3_CAPACITY_SMOKE_NONCE_ENV = "STAGEEDIT_V3_MLX_SMOKE_RUN_NONCE"
 V3_CAPACITY_SMOKE_ARTIFACT_FAMILY = "dynamic_crop_v3_capacity_smoke"
+V3_PROBE_TRAINING_SCHEDULE: Mapping[str, Any] = MappingProxyType(
+    {
+        **dict(PROBE_TRAINING_SCHEDULE),
+        "dynamic_crop_v3_prior_pretraining_steps": 500,
+        "dynamic_crop_v3_prior_pretraining_peak_learning_rate": 3.0e-4,
+        "dynamic_crop_v3_prior_pretraining_warmup_steps": 50,
+        "dynamic_crop_v3_prior_retention_finetune_steps": 60,
+        "schedule_contract": (
+            "independent_warmup_cosine_cut_source_v3_prior_and_joint_"
+            "with_retained_selection_burn_in_v4"
+        ),
+    }
+)
 V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE: Mapping[str, Any] = (
     MappingProxyType(
         {
@@ -1885,6 +1898,7 @@ __all__ = [
     "V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE",
     "V3_CAPACITY_SMOKE_ARTIFACT_PREFIX",
     "V3_CAPACITY_SMOKE_SCHEMA_VERSION",
+    "V3_PROBE_TRAINING_SCHEDULE",
     "default_dynamic_crop_v3_capacity_candidates",
     "load_dynamic_crop_v3_capacity_smoke",
     "main",

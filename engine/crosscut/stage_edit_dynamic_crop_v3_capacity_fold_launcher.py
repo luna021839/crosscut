@@ -18,13 +18,13 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import stage_edit_dynamic_crop_capacity_fold_launcher as v2_launcher
 from .stage_edit_dynamic_crop_capacity_probe import (
-    PROBE_TRAINING_SCHEDULE,
     SELECTION_SONG_IDS,
     _atomic_exclusive_write,
 )
@@ -43,6 +43,7 @@ from .stage_edit_dynamic_crop_v3_capacity_smoke import (
     DynamicCropV3CapacityCandidate,
     V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE,
     V3_CAPACITY_SMOKE_ARTIFACT_PREFIX,
+    V3_PROBE_TRAINING_SCHEDULE as PROBE_TRAINING_SCHEDULE,
     V3_CAPACITY_SMOKE_RUNNER_CONTRACT,
     V3_CAPACITY_SMOKE_SOURCE_RELATIVE_PATHS,
     _validate_capacity_smoke_code_provenance,
@@ -50,7 +51,13 @@ from .stage_edit_dynamic_crop_v3_capacity_smoke import (
     load_dynamic_crop_v3_capacity_smoke,
 )
 from .stage_edit_production_train_cli import main as production_train_main
-from .stage_edit_production_training import STAGE_EDIT_SELECTION_FREEZE_FILENAME
+from .stage_edit_production_training import (
+    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT,
+    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS,
+    STAGE_EDIT_SELECTION_FREEZE_FILENAME,
+    _stage_edit_validation_selection_with_dynamic_crop_v3,
+)
+from .stage_edit_training import stage_edit_validation_selection_score
 from .stage_edit_transformer import (
     PRODUCTION_CHECKPOINT_SCOPE,
     PRODUCTION_TRAINING_REPORT_FILENAME,
@@ -486,7 +493,30 @@ def _build_train_cli_args(
         )
     except (OSError, ValueError) as exc:
         raise DynamicCropV3CapacityFoldLauncherError(str(exc)) from exc
-    args.extend(("--dynamic-crop-version", "3"))
+    args.extend(
+        (
+            "--dynamic-crop-v3-prior-pretrain-steps",
+            str(
+                PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_steps"
+                ]
+            ),
+            "--dynamic-crop-v3-prior-pretrain-learning-rate",
+            str(
+                PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+                ]
+            ),
+            "--dynamic-crop-v3-prior-pretrain-warmup-steps",
+            str(
+                PROBE_TRAINING_SCHEDULE[
+                    "dynamic_crop_v3_prior_pretraining_warmup_steps"
+                ]
+            ),
+            "--dynamic-crop-version",
+            "3",
+        )
+    )
     contract = candidate.contract_dict()
     if (
         args.count("--dynamic-crop-version") != 1
@@ -508,6 +538,15 @@ def _build_train_cli_args(
         "--source-pretrain-learning-rate": "source_pretraining_peak_learning_rate",
         "--source-pretrain-window-length": "source_pretraining_window_length",
         "--source-pretrain-warmup-steps": "source_pretraining_warmup_steps",
+        "--dynamic-crop-v3-prior-pretrain-steps": (
+            "dynamic_crop_v3_prior_pretraining_steps"
+        ),
+        "--dynamic-crop-v3-prior-pretrain-learning-rate": (
+            "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+        ),
+        "--dynamic-crop-v3-prior-pretrain-warmup-steps": (
+            "dynamic_crop_v3_prior_pretraining_warmup_steps"
+        ),
         "--minimum-finetune-optimizer-steps": "minimum_finetune_optimizer_steps",
         "--minimum-checkpoint-selection-finetune-steps": (
             "minimum_checkpoint_selection_finetune_steps"
@@ -1135,10 +1174,23 @@ def _validate_completed_v3_fold(
         )
     split = _mapping(report.get("split"), "v3 report split")
     expected_training = list(preflight.training_song_ids)
-    expected_training_references = sorted(
+    expected_all_training_references = sorted(
         reference
         for song in preflight.training_song_ids
         for reference in preflight.reference_ids_by_song.get(song, ())
+    )
+    expected_validation_references = sorted(
+        min(
+            preflight.reference_ids_by_song.get(song, ()),
+            key=lambda reference: hashlib.sha256(
+                f"{song}\0{reference}".encode("utf-8")
+            ).hexdigest(),
+        )
+        for song in preflight.training_song_ids
+    )
+    expected_training_references = sorted(
+        set(expected_all_training_references)
+        - set(expected_validation_references)
     )
     expected_heldout_references = sorted(
         preflight.reference_ids_by_song.get(preflight.held_out_song_id, ())
@@ -1151,9 +1203,11 @@ def _validate_completed_v3_fold(
         split.get("training_song_ids") != expected_training
         or split.get("held_out_song_ids") != [preflight.held_out_song_id]
         or split.get("held_out_used_for_model_selection") is not False
+        or observed_train_references != expected_training_references
+        or observed_validation_references != expected_validation_references
         or set(observed_train_references) & set(observed_validation_references)
         or sorted((*observed_train_references, *observed_validation_references))
-        != expected_training_references
+        != expected_all_training_references
         or sorted(split.get("held_out_reference_ids") or ())
         != expected_heldout_references
     ):
@@ -1175,6 +1229,34 @@ def _validate_completed_v3_fold(
         != PROBE_TRAINING_SCHEDULE["source_pretraining_window_length"]
         or schedule.get("source_pretraining_warmup_steps")
         != PROBE_TRAINING_SCHEDULE["source_pretraining_warmup_steps"]
+        or optimization.get(
+            "dynamic_crop_v3_prior_pretraining_optimizer_steps"
+        )
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_steps"
+        ]
+        or schedule.get("dynamic_crop_v3_prior_pretraining_steps")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_steps"
+        ]
+        or schedule.get(
+            "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+        )
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+        ]
+        or schedule.get(
+            "dynamic_crop_v3_prior_pretraining_warmup_steps"
+        )
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_warmup_steps"
+        ]
+        or schedule.get("dynamic_crop_v3_prior_retention_finetune_steps")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or schedule.get("contract")
+        != PROBE_TRAINING_SCHEDULE["schedule_contract"]
         or optimization.get("minimum_finetune_optimizer_steps")
         != PROBE_TRAINING_SCHEDULE["minimum_finetune_optimizer_steps"]
         or optimization.get("minimum_checkpoint_selection_finetune_steps")
@@ -1185,6 +1267,545 @@ def _validate_completed_v3_fold(
     ):
         raise DynamicCropV3CapacityFoldLauncherError(
             "v3 source-pretrain/finetune schedule differs"
+        )
+    cut_steps = int(PROBE_TRAINING_SCHEDULE["cut_pretraining_steps"])
+    source_steps = int(PROBE_TRAINING_SCHEDULE["source_pretraining_steps"])
+    prior_steps = int(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_steps"
+        ]
+    )
+    finetune_steps = int(PROBE_TRAINING_SCHEDULE["finetune_steps_planned"])
+    best_finetune_step = optimization.get("best_finetune_optimizer_step")
+    if (
+        optimization.get("optimizer_steps")
+        != cut_steps + source_steps + prior_steps + finetune_steps
+        or optimization.get("dynamic_crop_v3_prior_optimizer_initial_step")
+        != 0
+        or optimization.get(
+            "dynamic_crop_v3_prior_optimizer_state_final_step"
+        )
+        != prior_steps
+        or optimization.get(
+            "dynamic_crop_v3_prior_optimizer_state_reset_after_source_pretraining"
+        )
+        is not True
+        or optimization.get(
+            "finetune_optimizer_state_reset_after_dynamic_crop_v3_prior_pretraining"
+        )
+        is not True
+        or optimization.get(
+            "finetune_retention_optimizer_state_final_step"
+        )
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or optimization.get("finetune_joint_optimizer_initial_step") != 0
+        or optimization.get(
+            "finetune_optimizer_reset_at_dynamic_crop_v3_prior_release"
+        )
+        is not True
+        or optimization.get("finetune_optimizer_state_final_step")
+        != finetune_steps
+        - PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or optimization.get("checkpoint_writes_before_joint_finetuning") != 0
+        or isinstance(best_finetune_step, bool)
+        or not isinstance(best_finetune_step, int)
+        or best_finetune_step
+        < PROBE_TRAINING_SCHEDULE[
+            "minimum_checkpoint_selection_finetune_steps"
+        ]
+        or optimization.get("best_training_step")
+        != cut_steps + source_steps + prior_steps + best_finetune_step
+        or metadata.training_steps != optimization.get("best_training_step")
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior/global optimizer-step evidence differs"
+        )
+    prior = _mapping(
+        optimization.get("dynamic_crop_v3_prior_pretraining"),
+        "v3 prior pretraining",
+    )
+    sampling = _mapping(prior.get("sampling"), "v3 prior sampling")
+    component_scale = _mapping(
+        prior.get("component_scale"), "v3 prior component scale"
+    )
+    invariance = _mapping(
+        prior.get("parameter_invariance"), "v3 prior invariance"
+    )
+    candidate_selection = _mapping(
+        prior.get("candidate_selection"), "v3 prior candidate selection"
+    )
+    retention = _mapping(prior.get("retention"), "v3 prior retention")
+    warmup_selection = _mapping(
+        candidate_selection.get("selection"), "v3 prior validation selection"
+    )
+    warmup_gate = _mapping(
+        warmup_selection.get("dynamic_crop_v3_selection_gate"),
+        "v3 prior validation gate",
+    )
+    candidate_evaluations = candidate_selection.get("candidate_evaluations")
+    selected_candidate_step = candidate_selection.get(
+        "selected_candidate_step"
+    )
+    selected_candidate_digest = candidate_selection.get(
+        "selected_candidate_value_bias_sha256"
+    )
+    candidate_validation_reference_ids = candidate_selection.get(
+        "validation_reference_ids"
+    )
+    invariance_before = invariance.get("before")
+    invariance_after = invariance.get("after")
+    invariant_parameter_groups = (
+        "base_parameter_tree_sha256",
+        "context_weight_sha256",
+        "source_head_parameter_tree_sha256",
+        "context_non_value_bias_sha256",
+    )
+    all_prior_parameter_groups = (
+        *invariant_parameter_groups,
+        "context_value_bias_sha256",
+    )
+    if (
+        prior.get("enabled") is not True
+        or prior.get("partition") != "training_references_only"
+        or prior.get("optimizer_weight_decay") != 0.0
+        or prior.get("checkpoint_selection_eligible_during_warmup") is not False
+        or prior.get("checkpoint_write_before_joint_finetuning") is not False
+        or prior.get("validation_labels_consumed_for_gradients") is not False
+        or prior.get("heldout_labels_consumed") is not False
+        or sampling.get("partition") != "training_references_only"
+        or sampling.get("validation_labels_consumed") is not False
+        or sampling.get("heldout_labels_consumed") is not False
+        or component_scale.get("validation_labels_consumed") is not False
+        or component_scale.get("heldout_labels_consumed") is not False
+        or invariance.get(
+            "all_declared_invariant_groups_byte_identical"
+        )
+        is not True
+        or invariance.get("context_value_bias_changed") is not True
+        or candidate_selection.get("training_partition_only_gradients")
+        is not True
+        or candidate_selection.get("contract")
+        != DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+        or candidate_selection.get("predeclared_candidate_steps")
+        != list(DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
+        or candidate_selection.get("selection_rule")
+        != (
+            "highest_finite_selectable_existing_validation_score_"
+            "then_lower_candidate_step_on_exact_tie"
+        )
+        or candidate_selection.get("validation_gradients_computed") is not False
+        or candidate_selection.get("heldout_forward_performed") is not False
+        or not isinstance(candidate_validation_reference_ids, list)
+        or any(
+            not isinstance(reference_id, str) or not reference_id
+            for reference_id in candidate_validation_reference_ids
+        )
+        or sorted(candidate_validation_reference_ids)
+        != observed_validation_references
+        or len(candidate_validation_reference_ids)
+        != len(set(candidate_validation_reference_ids))
+        or candidate_selection.get("retention_authorized") is not True
+        or not isinstance(candidate_evaluations, list)
+        or len(candidate_evaluations)
+        != len(DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
+        or isinstance(selected_candidate_step, bool)
+        or selected_candidate_step not in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+        or not _is_sha256(selected_candidate_digest)
+        or warmup_selection.get("selectable") is not True
+        or warmup_gate.get("selectable") is not True
+        or not isinstance(warmup_gate.get("score_component"), (int, float))
+        or isinstance(warmup_gate.get("score_component"), bool)
+        or not math.isfinite(float(warmup_gate.get("score_component")))
+        or warmup_gate.get("score_component") <= 0.0
+        or retention.get("retention_finetune_step_count")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("required_retention_finetune_step_count")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("all_dynamic_head_parameters_byte_identical")
+        is not True
+        or retention.get("optimizer_state_reset_before_dynamic_head_release")
+        is not True
+        or retention.get("retention_optimizer_state_final_step")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("released_joint_optimizer_initial_step") != 0
+        or retention.get("released_joint_optimizer_state_final_step")
+        != finetune_steps
+        - PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("released_joint_optimizer_schedule_offset_steps")
+        != PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+        or retention.get("validation_gradients_computed") is not False
+        or retention.get("heldout_forward_performed") is not False
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 train-only prior warmup evidence differs"
+        )
+    if (
+        not isinstance(invariance_before, Mapping)
+        or not isinstance(invariance_after, Mapping)
+        or set(invariance_before) != set(all_prior_parameter_groups)
+        or set(invariance_after) != set(all_prior_parameter_groups)
+        or invariance.get("invariant_parameter_groups")
+        != list(invariant_parameter_groups)
+        or any(
+            not _is_sha256(invariance_before.get(key))
+            or not _is_sha256(invariance_after.get(key))
+            for key in all_prior_parameter_groups
+        )
+        or any(
+            invariance_before.get(key) != invariance_after.get(key)
+            for key in invariant_parameter_groups
+        )
+        or invariance_before.get("context_value_bias_sha256")
+        == invariance_after.get("context_value_bias_sha256")
+        or invariance_after.get("context_value_bias_sha256")
+        != selected_candidate_digest
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior parameter invariance digests differ"
+        )
+    retained_head_groups = (
+        "context_weight_sha256",
+        "source_head_parameter_tree_sha256",
+        "context_non_value_bias_sha256",
+        "context_value_bias_sha256",
+    )
+    warmup_head_digests = retention.get("warmup_head_digests")
+    retained_head_digests = retention.get("retained_head_digests")
+    if (
+        not isinstance(warmup_head_digests, Mapping)
+        or not isinstance(retained_head_digests, Mapping)
+        or set(warmup_head_digests) != set(retained_head_groups)
+        or set(retained_head_digests) != set(retained_head_groups)
+        or any(
+            not _is_sha256(warmup_head_digests.get(key))
+            or not _is_sha256(retained_head_digests.get(key))
+            for key in retained_head_groups
+        )
+        or any(
+            warmup_head_digests.get(key) != retained_head_digests.get(key)
+            or warmup_head_digests.get(key) != invariance_after.get(key)
+            for key in retained_head_groups
+        )
+        or retained_head_digests.get("context_value_bias_sha256")
+        != selected_candidate_digest
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior retention byte digests differ"
+        )
+    assert isinstance(candidate_evaluations, list)
+    selectable_candidate_records: list[tuple[float, int, dict[str, Any]]] = []
+    candidate_digest_by_step: dict[int, str] = {}
+    for expected_step, raw_candidate in zip(
+        DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS,
+        candidate_evaluations,
+        strict=True,
+    ):
+        candidate_record = _mapping(
+            raw_candidate, f"v3 prior candidate {expected_step}"
+        )
+        candidate_step = candidate_record.get("candidate_step")
+        candidate_digest = candidate_record.get("value_bias_sha256")
+        selection = _mapping(
+            candidate_record.get("selection"),
+            f"v3 prior candidate {expected_step} selection",
+        )
+        validation_metrics = _mapping(
+            candidate_record.get("validation_metrics"),
+            f"v3 prior candidate {expected_step} validation metrics",
+        )
+        dynamic_metrics = _mapping(
+            validation_metrics.get("dynamic_crop_v3"),
+            f"v3 prior candidate {expected_step} dynamic metrics",
+        )
+        recomputed_selection = (
+            _stage_edit_validation_selection_with_dynamic_crop_v3(
+                stage_edit_validation_selection_score(validation_metrics),
+                dynamic_metrics,
+            )
+        )
+        gate = _mapping(
+            selection.get("dynamic_crop_v3_selection_gate"),
+            f"v3 prior candidate {expected_step} gate",
+        )
+        score = selection.get("score")
+        score_is_finite = bool(
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(float(score))
+        )
+        if (
+            candidate_step != expected_step
+            or not _is_sha256(candidate_digest)
+            or candidate_record.get("training_partition_only_updates") is not True
+            or candidate_record.get("validation_gradients_computed") is not False
+            or candidate_record.get("heldout_forward_performed") is not False
+            or selection != recomputed_selection
+            or gate.get("heldout_metrics_consumed") is not False
+        ):
+            raise DynamicCropV3CapacityFoldLauncherError(
+                "v3 prior candidate evidence differs"
+            )
+        candidate_digest_by_step[expected_step] = str(candidate_digest)
+        if selection.get("selectable") is True:
+            gate_component = gate.get("score_component")
+            if (
+                gate.get("selectable") is not True
+                or not score_is_finite
+                or not isinstance(gate_component, (int, float))
+                or isinstance(gate_component, bool)
+                or not math.isfinite(float(gate_component))
+                or float(gate_component) <= 0.0
+            ):
+                raise DynamicCropV3CapacityFoldLauncherError(
+                    "v3 selectable prior candidate gate differs"
+                )
+            selectable_candidate_records.append(
+                (float(score), expected_step, candidate_record)
+            )
+    if not selectable_candidate_records:
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior candidate set has no selectable milestone"
+        )
+    expected_selected = max(
+        selectable_candidate_records,
+        key=lambda item: (item[0], -item[1]),
+    )
+    if (
+        selected_candidate_step != expected_selected[1]
+        or selected_candidate_digest
+        != candidate_digest_by_step[expected_selected[1]]
+        or warmup_selection != expected_selected[2].get("selection")
+        or candidate_selection.get("validation_metrics")
+        != expected_selected[2].get("validation_metrics")
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior candidate selection is not the deterministic maximum"
+        )
+    prior_history = report.get("dynamic_crop_v3_prior_pretraining_history")
+    if not isinstance(prior_history, list) or len(prior_history) != prior_steps:
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior pretraining history is incomplete"
+        )
+    observed_song_samples: dict[str, int] = {}
+    observed_reference_samples: dict[str, int] = {}
+    observed_prior_learning_rates: list[float] = []
+    for step, raw_record in enumerate(prior_history, start=1):
+        record = _mapping(raw_record, f"v3 prior history step {step}")
+        song_id = str(record.get("song_id") or "")
+        reference_id = str(record.get("reference_id") or "")
+        is_candidate_step = step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+        if (
+            record.get("prior_pretrain_step") != step
+            or record.get("optimizer_step")
+            != cut_steps + source_steps + step
+            or record.get("checkpoint_selection_eligible") is not False
+            or record.get("validation_labels_consumed") is not False
+            or record.get("heldout_labels_consumed") is not False
+            or record.get("predeclared_candidate_snapshot")
+            is not is_candidate_step
+            or (
+                record.get("candidate_value_bias_sha256")
+                != candidate_digest_by_step[step]
+                if is_candidate_step
+                else record.get("candidate_value_bias_sha256") is not None
+            )
+            or not song_id
+            or not reference_id
+            or isinstance(record.get("actual_learning_rate"), bool)
+            or not isinstance(record.get("actual_learning_rate"), (int, float))
+            or not math.isfinite(float(record.get("actual_learning_rate")))
+            or float(record.get("actual_learning_rate")) <= 0.0
+        ):
+            raise DynamicCropV3CapacityFoldLauncherError(
+                "v3 prior history step differs"
+            )
+        observed_song_samples[song_id] = (
+            observed_song_samples.get(song_id, 0) + 1
+        )
+        observed_reference_samples[reference_id] = (
+            observed_reference_samples.get(reference_id, 0) + 1
+        )
+        observed_prior_learning_rates.append(
+            float(record["actual_learning_rate"])
+        )
+    expected_reference_song_ids = {
+        reference_id: song_id
+        for song_id in preflight.training_song_ids
+        for reference_id in preflight.reference_ids_by_song.get(song_id, ())
+        if reference_id in observed_train_references
+    }
+    if (
+        observed_song_samples != sampling.get("per_song_sampled_counts")
+        or observed_reference_samples
+        != sampling.get("per_reference_sampled_counts")
+        or set(observed_song_samples) != set(preflight.training_song_ids)
+        or set(observed_reference_samples) != set(observed_train_references)
+        or sampling.get("reference_song_ids")
+        != expected_reference_song_ids
+        or max(observed_song_samples.values())
+        - min(observed_song_samples.values())
+        > 1
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior song/reference sampling evidence differs"
+        )
+    prior_peak_learning_rate = float(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+        ]
+    )
+    prior_warmup_steps = int(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_pretraining_warmup_steps"
+        ]
+    )
+    prior_minimum_rate = prior_peak_learning_rate * float(
+        PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+    )
+    prior_decay_steps = prior_steps - prior_warmup_steps
+
+    def expected_prior_learning_rate(schedule_index: int) -> float:
+        if schedule_index < prior_warmup_steps:
+            start = prior_peak_learning_rate * 0.1
+            return start + (prior_peak_learning_rate - start) * (
+                schedule_index / prior_warmup_steps
+            )
+        local = min(schedule_index - prior_warmup_steps, prior_decay_steps)
+        cosine = 0.5 * (
+            1.0 + math.cos(math.pi * local / prior_decay_steps)
+        )
+        return prior_minimum_rate + (
+            prior_peak_learning_rate - prior_minimum_rate
+        ) * cosine
+
+    if any(
+        not math.isclose(
+            observed,
+            expected_prior_learning_rate(step - 1),
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-12,
+        )
+        for step, observed in enumerate(
+            observed_prior_learning_rates, start=1
+        )
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 prior learning-rate history differs"
+        )
+    finetune_history = report.get("history")
+    if not isinstance(finetune_history, list) or not finetune_history:
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 finetune optimizer history is incomplete"
+        )
+    observed_finetune_steps: list[int] = []
+    observed_phase_local_steps: list[int] = []
+    observed_reset_before_steps: list[int] = []
+    observed_retention_steps: list[int] = []
+    observed_learning_rates: list[float] = []
+    for epoch_index, raw_epoch in enumerate(finetune_history, start=1):
+        epoch_record = _mapping(
+            raw_epoch, f"v3 finetune history epoch {epoch_index}"
+        )
+        for destination, key in (
+            (observed_finetune_steps, "finetune_optimizer_steps"),
+            (
+                observed_phase_local_steps,
+                "finetune_phase_local_optimizer_steps",
+            ),
+            (
+                observed_reset_before_steps,
+                "finetune_optimizer_reset_before_steps",
+            ),
+            (
+                observed_retention_steps,
+                "dynamic_crop_v3_prior_retention_finetune_steps",
+            ),
+        ):
+            values = epoch_record.get(key)
+            if not isinstance(values, list) or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in values
+            ):
+                raise DynamicCropV3CapacityFoldLauncherError(
+                    f"v3 finetune history {key} differs"
+                )
+            destination.extend(values)
+        raw_learning_rates = epoch_record.get(
+            "finetune_actual_learning_rates"
+        )
+        if not isinstance(raw_learning_rates, list) or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in raw_learning_rates
+        ):
+            raise DynamicCropV3CapacityFoldLauncherError(
+                "v3 finetune learning-rate history differs"
+            )
+        observed_learning_rates.extend(float(value) for value in raw_learning_rates)
+    expected_retention_steps = int(
+        PROBE_TRAINING_SCHEDULE[
+            "dynamic_crop_v3_prior_retention_finetune_steps"
+        ]
+    )
+    expected_phase_local_steps = [
+        *range(1, expected_retention_steps + 1),
+        *range(1, finetune_steps - expected_retention_steps + 1),
+    ]
+    peak_learning_rate = float(PROBE_TRAINING_SCHEDULE["learning_rate"])
+    warmup_steps = int(PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"])
+    minimum_rate = peak_learning_rate * float(
+        PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+    )
+    decay_steps = finetune_steps - warmup_steps
+
+    def expected_learning_rate(schedule_index: int) -> float:
+        if schedule_index < warmup_steps:
+            start = peak_learning_rate * 0.1
+            return start + (peak_learning_rate - start) * (
+                schedule_index / warmup_steps
+            )
+        local = min(schedule_index - warmup_steps, decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * local / decay_steps))
+        return minimum_rate + (peak_learning_rate - minimum_rate) * cosine
+
+    expected_learning_rates = [
+        expected_learning_rate(step - 1)
+        for step in range(1, finetune_steps + 1)
+    ]
+    if (
+        observed_finetune_steps != list(range(1, finetune_steps + 1))
+        or observed_phase_local_steps != expected_phase_local_steps
+        or observed_reset_before_steps != [expected_retention_steps + 1]
+        or observed_retention_steps
+        != list(range(1, expected_retention_steps + 1))
+        or len(observed_learning_rates) != finetune_steps
+        or any(
+            not math.isclose(observed, expected, rel_tol=1.0e-6, abs_tol=1.0e-12)
+            for observed, expected in zip(
+                observed_learning_rates,
+                expected_learning_rates,
+                strict=True,
+            )
+        )
+    ):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 finetune optimizer reset history differs"
         )
     observed_dynamic_loss = _mapping(
         optimization.get("effective_dynamic_crop_v3_loss_contract"),
@@ -1264,6 +1885,15 @@ def _validate_completed_v3_fold(
             "minimum_checkpoint_selection_finetune_steps"
         ]
         or freeze.get("selected_after_checkpoint_burn_in") is not True
+        or freeze.get("selected_training_step") != metadata.training_steps
+        or freeze.get("selected_finetune_optimizer_step")
+        != best_finetune_step
+        or freeze.get("dynamic_crop_v3_prior_selected_candidate_step")
+        != selected_candidate_step
+        or freeze.get(
+            "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256"
+        )
+        != selected_candidate_digest
         or sorted(freeze.get("training_reference_ids") or ())
         != observed_train_references
         or sorted(freeze.get("validation_reference_ids") or ())

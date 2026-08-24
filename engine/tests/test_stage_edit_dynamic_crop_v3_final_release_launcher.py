@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -10,9 +12,9 @@ from unittest.mock import patch
 
 from crosscut import stage_edit_dynamic_crop_v3_final_release_launcher as release
 from crosscut import stage_edit_dynamic_crop_v3_final_fit as final_fit
-from crosscut.stage_edit_dynamic_crop_capacity_probe import (
-    PROBE_TRAINING_SCHEDULE,
-    SELECTION_SONG_IDS,
+from crosscut.stage_edit_dynamic_crop_capacity_probe import SELECTION_SONG_IDS
+from crosscut.stage_edit_dynamic_crop_v3_capacity_smoke import (
+    V3_PROBE_TRAINING_SCHEDULE as PROBE_TRAINING_SCHEDULE,
 )
 from crosscut.stage_edit_dynamic_crop_head_v3 import (
     DynamicCropHeadV3Config,
@@ -48,11 +50,17 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
         plan_path = root / "capacity-plan.json"
         plan_path.write_text("{}", encoding="utf-8")
         thresholds = (0.30, 0.55, 0.42)
+        prior_candidate_steps = (50, 200, 200)
         receipt_payloads = {}
         receipt_paths = []
         reports = {}
         selections = {}
-        for song, threshold in zip(SELECTION_SONG_IDS, thresholds, strict=True):
+        for song, threshold, prior_candidate_step in zip(
+            SELECTION_SONG_IDS,
+            thresholds,
+            prior_candidate_steps,
+            strict=True,
+        ):
             slug = song.lower()
             receipt_path = root / f"{slug}-receipt.json"
             report_path = root / f"{slug}-report.json"
@@ -71,6 +79,9 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 "selected_probability_threshold": threshold,
                 "selected_before_heldout_forward": True,
             }
+            prior_digest = hashlib.sha256(
+                f"{song}-{prior_candidate_step}".encode()
+            ).hexdigest()
             reports[report_path.resolve()] = {
                 "held_out_evaluation": {
                     "passed": True,
@@ -89,6 +100,19 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 },
                 "optimization": {
                     "unseen_song_used_for_model_selection": False,
+                    "dynamic_crop_v3_prior_pretraining": {
+                        "candidate_selection": {
+                            "contract": (
+                                release.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+                            ),
+                            "predeclared_candidate_steps": list(
+                                release.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+                            ),
+                            "retention_authorized": True,
+                            "selected_candidate_step": prior_candidate_step,
+                            "selected_candidate_value_bias_sha256": prior_digest,
+                        }
+                    },
                 },
                 "cut_threshold_freeze": threshold_freeze,
             }
@@ -97,6 +121,12 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 "heldout_used_for_model_or_threshold_selection": False,
                 "cut_threshold_freeze": threshold_freeze,
                 "selected_finetune_optimizer_step": 80,
+                "dynamic_crop_v3_prior_selected_candidate_step": (
+                    prior_candidate_step
+                ),
+                "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256": (
+                    prior_digest
+                ),
             }
             receipt_payloads[receipt_path.resolve()] = {
                 "candidate_id": candidate.candidate_id,
@@ -183,6 +213,109 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
         return path
 
     def _receipt_replay_fixture(self, root: Path):
+        cut_steps = int(PROBE_TRAINING_SCHEDULE["cut_pretraining_steps"])
+        source_steps = int(PROBE_TRAINING_SCHEDULE["source_pretraining_steps"])
+        prior_steps = int(
+            PROBE_TRAINING_SCHEDULE[
+                "dynamic_crop_v3_prior_pretraining_steps"
+            ]
+        )
+        finetune_steps = int(
+            PROBE_TRAINING_SCHEDULE["finetune_steps_planned"]
+        )
+        retention_steps = int(
+            PROBE_TRAINING_SCHEDULE[
+                "dynamic_crop_v3_prior_retention_finetune_steps"
+            ]
+        )
+        total_steps = cut_steps + source_steps + prior_steps + finetune_steps
+        prior_candidate_steps = tuple(
+            release.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+        )
+        selected_prior_candidate_step = 200
+        prior_candidate_digests = {
+            step: hashlib.sha256(f"candidate-{step}".encode()).hexdigest()
+            for step in prior_candidate_steps
+        }
+        invariant_digests = {
+            key: hashlib.sha256(key.encode()).hexdigest()
+            for key in (
+                "base_parameter_tree_sha256",
+                "context_weight_sha256",
+                "source_head_parameter_tree_sha256",
+                "context_non_value_bias_sha256",
+            )
+        }
+        prior_before_digests = {
+            **invariant_digests,
+            "context_value_bias_sha256": hashlib.sha256(
+                b"initial-value-bias"
+            ).hexdigest(),
+        }
+        prior_after_digests = {
+            **invariant_digests,
+            "context_value_bias_sha256": prior_candidate_digests[
+                selected_prior_candidate_step
+            ],
+        }
+        retained_head_keys = (
+            "context_weight_sha256",
+            "source_head_parameter_tree_sha256",
+            "context_non_value_bias_sha256",
+            "context_value_bias_sha256",
+        )
+        peak = float(PROBE_TRAINING_SCHEDULE["learning_rate"])
+        warmup = int(PROBE_TRAINING_SCHEDULE["finetune_warmup_steps"])
+        minimum = peak * float(
+            PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+        )
+        decay_steps = finetune_steps - warmup
+        learning_rates = []
+        for schedule_index in range(finetune_steps):
+            if schedule_index < warmup:
+                learning_rates.append(
+                    peak * 0.1
+                    + (peak - peak * 0.1) * schedule_index / warmup
+                )
+            else:
+                local = min(schedule_index - warmup, decay_steps)
+                learning_rates.append(
+                    minimum
+                    + (peak - minimum)
+                    * 0.5
+                    * (1.0 + math.cos(math.pi * local / decay_steps))
+                )
+        prior_peak = float(
+            PROBE_TRAINING_SCHEDULE[
+                "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+            ]
+        )
+        prior_warmup = int(
+            PROBE_TRAINING_SCHEDULE[
+                "dynamic_crop_v3_prior_pretraining_warmup_steps"
+            ]
+        )
+        prior_minimum = prior_peak * float(
+            PROBE_TRAINING_SCHEDULE["minimum_learning_rate_ratio"]
+        )
+        prior_decay = prior_steps - prior_warmup
+        prior_learning_rates = []
+        for schedule_index in range(prior_steps):
+            if schedule_index < prior_warmup:
+                prior_learning_rates.append(
+                    prior_peak * 0.1
+                    + (prior_peak - prior_peak * 0.1)
+                    * schedule_index
+                    / prior_warmup
+                )
+            else:
+                local = min(schedule_index - prior_warmup, prior_decay)
+                prior_learning_rates.append(
+                    prior_minimum
+                    + (prior_peak - prior_minimum)
+                    * 0.5
+                    * (1.0 + math.cos(math.pi * local / prior_decay))
+                )
         checkpoint = root / "checkpoint"
         evidence = root / "evidence"
         evidence.mkdir()
@@ -208,7 +341,7 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
             "synthetic-final-fit",
             DEFAULT_STAGE_EDIT_SCHEMA,
             config,
-            training_steps=1120,
+            training_steps=total_steps,
             weights_trained=True,
             training_data_id="synthetic-final-fit-data",
         )
@@ -221,6 +354,29 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
             song: [f"{song}-ref-{index}" for index in range(5)]
             for song in SELECTION_SONG_IDS
         }
+        reference_sample_counts = {
+            f"{song}-ref-{index}": (
+                34
+                if song == SELECTION_SONG_IDS[0] and index < 2
+                else 33
+                if song == SELECTION_SONG_IDS[0]
+                else 34
+                if song == SELECTION_SONG_IDS[1] and index < 2
+                else 33
+                if song == SELECTION_SONG_IDS[1]
+                else 34
+                if index == 0
+                else 33
+            )
+            for song in SELECTION_SONG_IDS
+            for index in range(5)
+        }
+        sampled_tracks = [
+            (song, reference_id)
+            for song in SELECTION_SONG_IDS
+            for reference_id in references_by_song[song]
+            for _ in range(reference_sample_counts[reference_id])
+        ]
         activation = {
             "contract": DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
             "enabled": True,
@@ -259,15 +415,149 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 "base_loss_contract": asdict(base_loss),
                 "dynamic_crop_loss_contract": asdict(dynamic_loss),
                 "training_schedule": dict(PROBE_TRAINING_SCHEDULE),
+                "dynamic_crop_v3_prior_candidate_step": (
+                    selected_prior_candidate_step
+                ),
                 "cut_probability_threshold": 0.5,
                 "quality_thresholds": quality_thresholds,
                 "decisions_frozen_before_final_fit": True,
             },
             "training": {
-                "optimizer_steps": 1120,
-                "cut_pretraining_optimizer_steps": 500,
-                "source_pretraining_optimizer_steps": 500,
-                "finetune_optimizer_steps": 120,
+                "optimizer_steps": total_steps,
+                "cut_pretraining_optimizer_steps": cut_steps,
+                "source_pretraining_optimizer_steps": source_steps,
+                "dynamic_crop_v3_prior_pretraining_optimizer_steps": (
+                    prior_steps
+                ),
+                "finetune_optimizer_steps": finetune_steps,
+                "dynamic_crop_v3_prior_pretraining": {
+                    "optimizer_weight_decay": 0.0,
+                    "optimizer_initial_step": 0,
+                    "optimizer_state_final_step": prior_steps,
+                    "checkpoint_selection_performed": False,
+                    "validation_metrics_computed": False,
+                    "heldout_metrics_computed": False,
+                    "predeclared_candidate_steps": list(prior_candidate_steps),
+                    "candidate_selection_contract": (
+                        release.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+                    ),
+                    "candidate_snapshots": [
+                        {
+                            "candidate_step": step,
+                            "value_bias_sha256": prior_candidate_digests[step],
+                            "training_only_updates": True,
+                        }
+                        for step in prior_candidate_steps
+                    ],
+                    "frozen_selected_candidate_step": (
+                        selected_prior_candidate_step
+                    ),
+                    "frozen_selected_candidate_value_bias_sha256": (
+                        prior_candidate_digests[selected_prior_candidate_step]
+                    ),
+                    "final_fit_data_used_for_candidate_selection": False,
+                    "sampling": {
+                        "per_song_sampled_counts": {
+                            SELECTION_SONG_IDS[0]: 167,
+                            SELECTION_SONG_IDS[1]: 167,
+                            SELECTION_SONG_IDS[2]: 166,
+                        },
+                        "per_reference_sampled_counts": reference_sample_counts,
+                        "reference_song_ids": {
+                            reference_id: song
+                            for song in SELECTION_SONG_IDS
+                            for reference_id in references_by_song[song]
+                        },
+                    },
+                    "parameter_invariance": {
+                        "all_declared_invariant_groups_byte_identical": True,
+                        "context_value_bias_changed": True,
+                        "before": prior_before_digests,
+                        "after": prior_after_digests,
+                        "invariant_parameter_groups": [
+                            "base_parameter_tree_sha256",
+                            "context_weight_sha256",
+                            "source_head_parameter_tree_sha256",
+                            "context_non_value_bias_sha256",
+                        ],
+                    },
+                    "retention": {
+                        "retention_finetune_step_count": retention_steps,
+                        "retention_optimizer_state_final_step": (
+                            retention_steps
+                        ),
+                        "released_joint_optimizer_initial_step": 0,
+                        "released_joint_optimizer_state_final_step": (
+                            finetune_steps - retention_steps
+                        ),
+                        "optimizer_state_reset_before_dynamic_head_release": (
+                            True
+                        ),
+                        "released_joint_optimizer_schedule_offset_steps": (
+                            retention_steps
+                        ),
+                        "all_dynamic_head_parameters_byte_identical_at_release": (
+                            True
+                        ),
+                        "warmup_head_digests": {
+                            key: prior_after_digests[key]
+                            for key in retained_head_keys
+                        },
+                        "retention_boundary_head_digests": {
+                            key: prior_after_digests[key]
+                            for key in retained_head_keys
+                        },
+                        "post_joint_head_digests": {
+                            key: hashlib.sha256(
+                                f"post-joint-{key}".encode()
+                            ).hexdigest()
+                            for key in retained_head_keys
+                        },
+                    },
+                },
+                "dynamic_crop_v3_prior_pretraining_history": [
+                    {
+                        "phase_step": step,
+                        "optimizer_step": cut_steps + source_steps + step,
+                        "song_id": song,
+                        "reference_id": reference_id,
+                        "actual_learning_rate": prior_learning_rates[step - 1],
+                        "checkpoint_selection_performed": False,
+                        "validation_labels_consumed": False,
+                        "heldout_labels_consumed": False,
+                        "predeclared_candidate_snapshot": (
+                            step in prior_candidate_steps
+                        ),
+                        "candidate_value_bias_sha256": (
+                            prior_candidate_digests[step]
+                            if step in prior_candidate_steps
+                            else None
+                        ),
+                    }
+                    for step, (song, reference_id) in enumerate(
+                        sampled_tracks, start=1
+                    )
+                ],
+                "finetune_history": [
+                    {
+                        "phase_local_optimizer_steps": [
+                            *range(1, retention_steps + 1),
+                            *range(
+                                1,
+                                finetune_steps - retention_steps + 1,
+                            ),
+                        ],
+                        "optimizer_reset_before_finetune_steps": [
+                            retention_steps + 1
+                        ],
+                        "dynamic_crop_v3_prior_retention_finetune_steps": (
+                            list(range(1, retention_steps + 1))
+                        ),
+                        "actual_learning_rates": learning_rates,
+                        "checkpoint_selection_performed": False,
+                        "validation_labels_consumed": False,
+                    }
+                ],
                 "checkpoint_selection_performed": False,
                 "validation_metrics_computed": False,
                 "heldout_metrics_computed": False,
@@ -320,6 +610,9 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 for song in SELECTION_SONG_IDS
             ],
             "training_schedule": dict(PROBE_TRAINING_SCHEDULE),
+            "frozen_dynamic_crop_v3_prior_candidate_step": (
+                selected_prior_candidate_step
+            ),
             "frozen_cut_probability_threshold": 0.5,
             "quality_thresholds": quality_thresholds,
         }
@@ -390,6 +683,13 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
             )
             self.assertEqual(result["capacity_plan_path"], plan.resolve())
             self.assertEqual(result["frozen_cut_probability_threshold"], 0.42)
+            self.assertEqual(
+                result["fold_dynamic_crop_v3_prior_selected_candidate_steps"],
+                [50, 200, 200],
+            )
+            self.assertEqual(
+                result["frozen_dynamic_crop_v3_prior_candidate_step"], 200
+            )
             self.assertEqual(
                 {fold["validation_song_id"] for fold in result["folds"]},
                 set(SELECTION_SONG_IDS),
@@ -499,6 +799,7 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
                 "candidate_id": candidate.candidate_id,
                 "candidate_contract": candidate.contract_dict(),
                 "training_schedule": dict(PROBE_TRAINING_SCHEDULE),
+                "frozen_dynamic_crop_v3_prior_candidate_step": 200,
                 "frozen_cut_probability_threshold": 0.42,
                 "quality_thresholds": {"cut_auroc_minimum": 0.5},
                 "professional_montage_profile": {

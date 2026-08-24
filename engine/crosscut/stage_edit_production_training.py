@@ -27,6 +27,8 @@ from pathlib import Path
 import random
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
@@ -47,11 +49,14 @@ from .stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
     DYNAMIC_CROP_V3_SCHEMA_VERSION,
     DYNAMIC_CROP_V3_TARGET_CONTRACT,
+    DYNAMIC_CROP_V3_MAX_KEYFRAMES,
     DynamicCropV3LossContract,
     StageEditTransformerDynamicCropV3,
     evaluate_stage_edit_dynamic_crop_v3,
     load_stage_edit_dynamic_crop_checkpoint_v3,
     new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
+    renderer_range_normalized_values_v3,
+    renderer_safe_values_from_raw_v3,
     save_stage_edit_dynamic_crop_checkpoint_v3,
     stage_edit_dynamic_crop_v3_loss,
     stage_edit_dynamic_crop_v3_parameter_count,
@@ -121,10 +126,12 @@ try:  # Optional outside Apple-silicon production hosts.
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
+    from mlx.utils import tree_flatten
 except ImportError as exc:  # pragma: no cover - non-Apple portability.
     mx = None
     nn = None
     optim = None
+    tree_flatten = None
     _MLX_IMPORT_ERROR: ImportError | None = exc
 else:
     _MLX_IMPORT_ERROR = None
@@ -141,6 +148,11 @@ STAGE_EDIT_SELECTION_FREEZE_FILENAME = (
 )
 DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
     "dynamic_crop_v3_renderer_exact_static_prior_improvement_gate_v1"
+)
+DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS = (50, 100, 200, 300, 400, 500)
+DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT = (
+    "predeclared_train_only_optimizer_milestones_existing_exact_validation_"
+    "highest_score_lower_step_tiebreak_v1"
 )
 
 
@@ -1590,6 +1602,307 @@ def _source_pretraining_inventory(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _DynamicCropV3PriorTrack:
+    song_id: str
+    reference_id: str
+    sequence_id: str
+    token_index: int
+    values: tuple[tuple[float, float, float, float], ...]
+    normalized_times: tuple[float, ...]
+    motion_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DynamicCropV3PriorInventory:
+    tracks: tuple[_DynamicCropV3PriorTrack, ...]
+    per_reference_track_counts: Mapping[str, int]
+    references_without_tracks: tuple[str, ...]
+    reference_song_ids: Mapping[str, str]
+
+
+class _HierarchicalDynamicCropV3PriorSampler:
+    """Deterministic song -> reference -> trajectory round robin."""
+
+    def __init__(
+        self,
+        tracks: Sequence[_DynamicCropV3PriorTrack],
+        *,
+        seed: int,
+    ) -> None:
+        nested: dict[str, dict[str, list[_DynamicCropV3PriorTrack]]] = {}
+        for track in tracks:
+            nested.setdefault(track.song_id, {}).setdefault(
+                track.reference_id, []
+            ).append(track)
+        if not nested:
+            raise ValueError("Dynamic Crop v3 prior warmup needs trajectory labels")
+        self._song_order = _stable_sampler_order(
+            tuple(nested), seed=seed, scope="dynamic-crop-v3-prior:songs"
+        )
+        self._reference_orders = {
+            song_id: _stable_sampler_order(
+                tuple(references),
+                seed=seed,
+                scope=f"dynamic-crop-v3-prior:references:{song_id}",
+            )
+            for song_id, references in nested.items()
+        }
+        self._track_orders = {
+            (song_id, reference_id): _stable_sampler_order(
+                tuple(values),
+                seed=seed,
+                scope=(
+                    "dynamic-crop-v3-prior:tracks:"
+                    f"{song_id}:{reference_id}"
+                ),
+            )
+            for song_id, references in nested.items()
+            for reference_id, values in references.items()
+        }
+        self._song_visits = {song_id: 0 for song_id in nested}
+        self._reference_visits = {key: 0 for key in self._track_orders}
+        self._per_song_sampled_counts = {song_id: 0 for song_id in nested}
+        self._per_reference_sampled_counts = {
+            reference_id: 0
+            for references in nested.values()
+            for reference_id in references
+        }
+        self._sample_count = 0
+
+    def sample(self) -> _DynamicCropV3PriorTrack:
+        song_id = self._song_order[self._sample_count % len(self._song_order)]
+        song_visit = self._song_visits[song_id]
+        references = self._reference_orders[song_id]
+        reference_id = references[song_visit % len(references)]
+        key = (song_id, reference_id)
+        reference_visit = self._reference_visits[key]
+        tracks = self._track_orders[key]
+        track = tracks[reference_visit % len(tracks)]
+        self._sample_count += 1
+        self._song_visits[song_id] += 1
+        self._reference_visits[key] += 1
+        self._per_song_sampled_counts[song_id] += 1
+        self._per_reference_sampled_counts[reference_id] += 1
+        return track
+
+    @property
+    def per_song_sampled_counts(self) -> dict[str, int]:
+        return dict(sorted(self._per_song_sampled_counts.items()))
+
+    @property
+    def per_reference_sampled_counts(self) -> dict[str, int]:
+        return dict(sorted(self._per_reference_sampled_counts.items()))
+
+
+def _dynamic_crop_v3_prior_inventory(
+    examples: Sequence[ReferenceTrainingExample],
+    corpus: StageEditDynamicCropTrainingCorpusV3,
+) -> _DynamicCropV3PriorInventory:
+    """Extract only training-reference trajectories for the low-capacity prior."""
+
+    tracks: list[_DynamicCropV3PriorTrack] = []
+    per_reference_track_counts: dict[str, int] = {}
+    references_without_tracks: list[str] = []
+    reference_song_ids: dict[str, str] = {}
+    for example in examples:
+        song_id = str(example.song_id or "").strip()
+        if not song_id:
+            raise ValueError("Dynamic Crop v3 prior tracks require song ids")
+        reference_song_ids[example.reference_id] = song_id
+        sequence = corpus.sequence_for(example.sequence.sequence_id)
+        reference_count = 0
+        for token_index, target in enumerate(sequence.targets):
+            if target is None:
+                continue
+            values = tuple(
+                (
+                    float(item.zoom),
+                    float(item.center_x),
+                    float(item.center_y),
+                    float(item.roll_degrees),
+                )
+                for item in target.keyframes
+            )
+            if not 1 <= len(values) <= DYNAMIC_CROP_V3_MAX_KEYFRAMES:
+                raise ValueError("Dynamic Crop v3 prior target count is invalid")
+            duration = float(target.shot_duration_seconds)
+            normalized_times = tuple(
+                float(item.time_seconds) / duration
+                for item in target.keyframes
+            )
+            tracks.append(
+                _DynamicCropV3PriorTrack(
+                    song_id=song_id,
+                    reference_id=example.reference_id,
+                    sequence_id=example.sequence.sequence_id,
+                    token_index=token_index,
+                    values=values,
+                    normalized_times=normalized_times,
+                    motion_label=str(target.motion_label),
+                )
+            )
+            reference_count += 1
+        if reference_count:
+            per_reference_track_counts[example.reference_id] = reference_count
+        else:
+            references_without_tracks.append(example.reference_id)
+    if not tracks:
+        raise ValueError("Dynamic Crop v3 prior warmup has no training tracks")
+    return _DynamicCropV3PriorInventory(
+        tracks=tuple(tracks),
+        per_reference_track_counts=dict(
+            sorted(per_reference_track_counts.items())
+        ),
+        references_without_tracks=tuple(sorted(references_without_tracks)),
+        reference_song_ids=dict(sorted(reference_song_ids.items())),
+    )
+
+
+_DynamicCropV3PriorModuleBase = nn.Module if nn is not None else object
+
+
+class _DynamicCropV3PriorBiasModule(_DynamicCropV3PriorModuleBase):
+    """A detached 8x4 copy so no production-model parameter can drift."""
+
+    def __init__(self, value_bias: Any) -> None:
+        _require_mlx()
+        super().__init__()
+        self.value_bias = mx.array(value_bias).reshape(
+            (DYNAMIC_CROP_V3_MAX_KEYFRAMES, 4)
+        )
+
+
+def _dynamic_crop_v3_prior_normalized_mae(
+    module: _DynamicCropV3PriorBiasModule,
+    target_values: Any,
+) -> Any:
+    """The exact normalized coordinate MAE consumed by the >0 gate."""
+
+    predicted = renderer_range_normalized_values_v3(
+        renderer_safe_values_from_raw_v3(module.value_bias)
+    )
+    targets = renderer_range_normalized_values_v3(target_values)
+    count = int(target_values.shape[0])
+    return mx.abs(predicted[:count] - targets).mean()
+
+
+def _parameter_tree_sha256(tree: Any) -> str:
+    if tree_flatten is None:
+        raise RuntimeError("MLX tree utilities are unavailable")
+    digest = hashlib.sha256()
+    for name, value in sorted(tree_flatten(tree), key=lambda item: item[0]):
+        array = np.ascontiguousarray(np.asarray(value))
+        digest.update(str(name).encode("utf-8"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(json.dumps(list(array.shape)).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _zero_gradient_tree(tree: Any) -> Any:
+    if isinstance(tree, Mapping):
+        return {key: _zero_gradient_tree(value) for key, value in tree.items()}
+    if isinstance(tree, tuple):
+        return tuple(_zero_gradient_tree(value) for value in tree)
+    if isinstance(tree, list):
+        return [_zero_gradient_tree(value) for value in tree]
+    return mx.zeros_like(tree)
+
+
+def _dynamic_crop_v3_prior_parameter_digests(
+    model: StageEditTransformerDynamicCropV3,
+) -> dict[str, str]:
+    values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+    bias = model.dynamic_crop_context_head.bias
+    return {
+        "base_parameter_tree_sha256": _parameter_tree_sha256(
+            model.base.parameters()
+        ),
+        "context_weight_sha256": _parameter_tree_sha256(
+            {"weight": model.dynamic_crop_context_head.weight}
+        ),
+        "source_head_parameter_tree_sha256": _parameter_tree_sha256(
+            model.dynamic_crop_source_head.parameters()
+        ),
+        "context_non_value_bias_sha256": _parameter_tree_sha256(
+            {"bias": bias[values_stop:]}
+        ),
+        "context_value_bias_sha256": _parameter_tree_sha256(
+            {"bias": bias[:values_stop]}
+        ),
+    }
+
+
+def _dynamic_crop_v3_prior_component_scale_evidence(
+    inventory: _DynamicCropV3PriorInventory,
+    initial_values: np.ndarray,
+    contract: DynamicCropV3LossContract,
+) -> dict[str, Any]:
+    residuals: list[float] = []
+    time_residuals: list[float] = []
+    keyframe_count = 0
+    for track in inventory.tracks:
+        count = len(track.values)
+        targets = np.asarray(track.values, dtype=np.float64)
+        scales = np.asarray((0.18, 0.04, 0.04, 1.60))
+        normalized_residual = np.abs(
+            (initial_values[:count] - targets) / scales
+        )
+        residuals.extend(normalized_residual.reshape(-1).tolist())
+        expected_times = (
+            np.arange(count, dtype=np.float64) / count
+            if count > 1
+            else np.zeros(1, dtype=np.float64)
+        )
+        time_residuals.extend(
+            np.abs(
+                expected_times
+                - np.asarray(track.normalized_times, dtype=np.float64)
+            ).tolist()
+        )
+        keyframe_count += count
+    value_residual = np.asarray(residuals, dtype=np.float64)
+    time_residual = np.asarray(time_residuals, dtype=np.float64)
+
+    def smooth_l1(values: np.ndarray) -> float:
+        absolute = np.abs(values)
+        return float(
+            np.mean(
+                np.where(absolute < 1.0, 0.5 * absolute * absolute, absolute - 0.5)
+            )
+        )
+
+    value_smooth_l1 = smooth_l1(value_residual)
+    time_smooth_l1 = smooth_l1(time_residual)
+    weighted_value = contract.value_weight * value_smooth_l1
+    weighted_count = contract.count_weight * math.log(
+        DYNAMIC_CROP_V3_MAX_KEYFRAMES
+    )
+    weighted_time = contract.time_weight * time_smooth_l1
+    weighted_motion = contract.motion_weight * math.log(2.0)
+    return {
+        "contract": "training_only_v3_initial_component_scale_evidence_v1",
+        "training_track_count": len(inventory.tracks),
+        "training_keyframe_count": keyframe_count,
+        "training_coordinate_scalar_count": int(value_residual.size),
+        "gate_aligned_initial_normalized_coordinate_mae": float(
+            value_residual.mean()
+        ),
+        "initial_value_smooth_l1_unweighted": value_smooth_l1,
+        "initial_value_smooth_l1_weighted": weighted_value,
+        "initial_uniform_count_cross_entropy_weighted": weighted_count,
+        "initial_uniform_time_smooth_l1_weighted": weighted_time,
+        "initial_motion_binary_cross_entropy_weighted": weighted_motion,
+        "count_to_value_weighted_loss_ratio": (
+            weighted_count / weighted_value if weighted_value > 0.0 else None
+        ),
+        "base_loss_weight": contract.base_loss_weight,
+        "validation_labels_consumed": False,
+        "heldout_labels_consumed": False,
+    }
+
+
 def _cut_only_pretraining_loss_contract(
     effective_loss_contract: StageEditLossContract,
 ) -> StageEditLossContract:
@@ -1697,6 +2010,16 @@ def _warmup_cosine_schedule(
     return optim.join_schedules((warmup, decay), (warmup_steps,))
 
 
+def _offset_learning_rate_schedule(schedule: Any, offset_steps: int) -> Any:
+    if offset_steps < 0:
+        raise ValueError("learning-rate schedule offset cannot be negative")
+
+    def shifted(step: Any) -> Any:
+        return schedule(step + offset_steps)
+
+    return shifted
+
+
 def prepare_stage_edit_production_input_sequences(
     examples: Sequence[ReferenceTrainingExample],
     *,
@@ -1739,6 +2062,9 @@ def train_production_stage_edit(
     source_pretrain_learning_rate: float = 3.0e-4,
     source_pretrain_window_length: int = 32,
     source_pretrain_warmup_steps: int = 50,
+    dynamic_crop_v3_prior_pretrain_steps: int = 0,
+    dynamic_crop_v3_prior_pretrain_learning_rate: float = 3.0e-4,
+    dynamic_crop_v3_prior_pretrain_warmup_steps: int = 50,
     finetune_warmup_steps: int = 8,
     minimum_learning_rate_ratio: float = 0.10,
     minimum_finetune_optimizer_steps: int = 120,
@@ -1787,6 +2113,23 @@ def train_production_stage_edit(
         raise ValueError(
             "source pretraining must be disabled or run for >= 500 steps"
         )
+    if (
+        dynamic_crop_v3_prior_pretrain_steps not in (0,)
+        and dynamic_crop_v3_prior_pretrain_steps < 500
+    ):
+        raise ValueError(
+            "Dynamic Crop v3 prior pretraining must be disabled or run for "
+            ">= 500 steps"
+        )
+    if (
+        dynamic_crop_v3_prior_pretrain_steps
+        and dynamic_crop_v3_prior_pretrain_steps
+        < max(DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
+    ):
+        raise ValueError(
+            "Dynamic Crop v3 prior pretraining must reach every predeclared "
+            "candidate milestone"
+        )
     if cut_pretrain_window_length < 2:
         raise ValueError("cut pretraining window length must be >= 2")
     if source_pretrain_window_length < 2:
@@ -1798,12 +2141,26 @@ def train_production_stage_edit(
         and not 0 <= source_pretrain_warmup_steps < source_pretrain_steps
     ):
         raise ValueError("source pretraining warmup must be shorter than pretraining")
+    if (
+        dynamic_crop_v3_prior_pretrain_steps
+        and not 0
+        <= dynamic_crop_v3_prior_pretrain_warmup_steps
+        < dynamic_crop_v3_prior_pretrain_steps
+    ):
+        raise ValueError(
+            "Dynamic Crop v3 prior warmup must be shorter than pretraining"
+        )
     if finetune_warmup_steps < 0:
         raise ValueError("finetune warmup cannot be negative")
     for value, name, allow_zero in (
         (learning_rate, "learning_rate", False),
         (cut_pretrain_learning_rate, "cut_pretrain_learning_rate", False),
         (source_pretrain_learning_rate, "source_pretrain_learning_rate", False),
+        (
+            dynamic_crop_v3_prior_pretrain_learning_rate,
+            "dynamic_crop_v3_prior_pretrain_learning_rate",
+            False,
+        ),
         (weight_decay, "weight_decay", True),
         (gradient_clip_norm, "gradient_clip_norm", False),
     ):
@@ -1825,6 +2182,10 @@ def train_production_stage_edit(
     ):
         raise TypeError(
             "dynamic crop corpus must be an explicit v2 or v3 training corpus"
+        )
+    if dynamic_crop_v3_prior_pretrain_steps and not dynamic_crop_v3_enabled:
+        raise ValueError(
+            "Dynamic Crop v3 prior pretraining requires a v3 corpus"
         )
     dynamic_crop_version = (
         3 if dynamic_crop_v3_enabled else 2 if dynamic_crop_v2_enabled else None
@@ -1971,13 +2332,16 @@ def train_production_stage_edit(
     history: list[dict[str, Any]] = []
     cut_pretraining_history: list[dict[str, Any]] = []
     source_pretraining_history: list[dict[str, Any]] = []
+    dynamic_crop_v3_prior_pretraining_history: list[dict[str, Any]] = []
     optimizer_steps = 0
     cut_pretraining_optimizer_steps = 0
     source_pretraining_optimizer_steps = 0
+    dynamic_crop_v3_prior_pretraining_optimizer_steps = 0
     finetune_optimizer_steps = 0
     best_epoch = 0
     best_step = 0
     best_finetune_optimizer_step = 0
+    best_checkpoint_origin: str | None = None
     best_validation_loss = math.inf
     best_validation_selection_score = -math.inf
     best_validation_selection_evidence: Mapping[str, Any] | None = None
@@ -1986,10 +2350,28 @@ def train_production_stage_edit(
     training_stop_reason = "planned_finetune_steps_completed"
     finetune_optimizer_initial_step = 0
     finetune_optimizer_state_final_step = 0
+    finetune_retention_optimizer_state_final_step = 0
+    finetune_joint_optimizer_initial_step = 0
+    finetune_optimizer_reset_at_dynamic_crop_v3_prior_release = False
     cut_pretraining_optimizer_initial_step = 0
     cut_pretraining_optimizer_state_final_step = 0
     source_pretraining_optimizer_initial_step = 0
     source_pretraining_optimizer_state_final_step = 0
+    dynamic_crop_v3_prior_optimizer_initial_step = 0
+    dynamic_crop_v3_prior_optimizer_state_final_step = 0
+    dynamic_crop_v3_prior_candidate_selection: dict[str, Any] | None = None
+    dynamic_crop_v3_prior_candidate_snapshots: dict[int, Any] = {}
+    dynamic_crop_v3_prior_before_digests: dict[str, str] | None = None
+    dynamic_crop_v3_prior_values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+    dynamic_crop_v3_prior_component_scale_evidence: dict[str, Any] | None = None
+    dynamic_crop_v3_prior_parameter_invariance: dict[str, Any] | None = None
+    dynamic_crop_v3_prior_sampling_evidence: dict[str, Any] | None = None
+    dynamic_crop_v3_prior_retention_finetune_steps = 0
+    dynamic_crop_v3_prior_retention_restore_steps = 0
+    dynamic_crop_v3_prior_retention_evidence: dict[str, Any] | None = None
+    retained_dynamic_crop_v3_context_weight = None
+    retained_dynamic_crop_v3_context_bias = None
+    retained_dynamic_crop_v3_source_weight = None
     source_pretraining_sampling_evidence: dict[str, Any] = {
         "contract": "deterministic_song_reference_group_round_robin_v1",
         "opening_source_excluded_count": 0,
@@ -2259,6 +2641,168 @@ def train_production_stage_edit(
                 ),
             }
 
+        if dynamic_crop_v3_prior_pretrain_steps:
+            assert dynamic_crop_v3_enabled
+            assert isinstance(model, StageEditTransformerDynamicCropV3)
+            assert isinstance(
+                dynamic_crop_corpus, StageEditDynamicCropTrainingCorpusV3
+            )
+            prior_inventory = _dynamic_crop_v3_prior_inventory(
+                split.train, dynamic_crop_corpus
+            )
+            prior_sampler = _HierarchicalDynamicCropV3PriorSampler(
+                prior_inventory.tracks,
+                seed=seed ^ 0xD1A5C0,
+            )
+            values_stop = dynamic_crop_v3_prior_values_stop
+            before_digests = _dynamic_crop_v3_prior_parameter_digests(model)
+            dynamic_crop_v3_prior_before_digests = before_digests
+            prior_module = _DynamicCropV3PriorBiasModule(
+                model.dynamic_crop_context_head.bias[:values_stop]
+            )
+            initial_values_mx = renderer_safe_values_from_raw_v3(
+                prior_module.value_bias
+            )
+            mx.eval(initial_values_mx)
+            dynamic_crop_v3_prior_component_scale_evidence = (
+                _dynamic_crop_v3_prior_component_scale_evidence(
+                    prior_inventory,
+                    np.asarray(initial_values_mx, dtype=np.float64),
+                    effective_dynamic_crop_v3_loss_contract,
+                )
+            )
+            prior_schedule = _warmup_cosine_schedule(
+                peak_learning_rate=(
+                    dynamic_crop_v3_prior_pretrain_learning_rate
+                ),
+                total_steps=dynamic_crop_v3_prior_pretrain_steps,
+                warmup_steps=dynamic_crop_v3_prior_pretrain_warmup_steps,
+                minimum_learning_rate_ratio=minimum_learning_rate_ratio,
+            )
+            prior_optimizer = optim.AdamW(
+                learning_rate=prior_schedule,
+                weight_decay=0.0,
+            )
+            dynamic_crop_v3_prior_optimizer_initial_step = int(
+                prior_optimizer.state["step"].item()
+            )
+            if dynamic_crop_v3_prior_optimizer_initial_step != 0:
+                raise RuntimeError(
+                    "fresh Dynamic Crop v3 prior optimizer did not start at zero"
+                )
+
+            def prior_loss(
+                trained_prior: _DynamicCropV3PriorBiasModule,
+                target_values: Any,
+            ) -> Any:
+                return _dynamic_crop_v3_prior_normalized_mae(
+                    trained_prior, target_values
+                )
+
+            prior_loss_and_grad = nn.value_and_grad(prior_module, prior_loss)
+            for prior_step in range(1, dynamic_crop_v3_prior_pretrain_steps + 1):
+                track = prior_sampler.sample()
+                target_values = mx.array(
+                    np.asarray(track.values, dtype=np.float32)
+                )
+                loss, gradients = prior_loss_and_grad(
+                    prior_module, target_values
+                )
+                if clipping_supported:
+                    gradients, gradient_norm = optim.clip_grad_norm(
+                        gradients, gradient_clip_norm
+                    )
+                else:
+                    gradient_norm = mx.array(float("nan"))
+                prior_optimizer.update(prior_module, gradients)
+                optimizer_steps += 1
+                dynamic_crop_v3_prior_pretraining_optimizer_steps += 1
+                mx.eval(
+                    loss,
+                    gradient_norm,
+                    prior_module.parameters(),
+                    prior_optimizer.state,
+                )
+                candidate_digest = None
+                if prior_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
+                    snapshot = mx.array(
+                        np.array(prior_module.value_bias, copy=True)
+                    )
+                    mx.eval(snapshot)
+                    dynamic_crop_v3_prior_candidate_snapshots[prior_step] = (
+                        snapshot
+                    )
+                    candidate_digest = _parameter_tree_sha256(
+                        {"bias": snapshot.reshape((values_stop,))}
+                    )
+                dynamic_crop_v3_prior_pretraining_history.append(
+                    {
+                        "prior_pretrain_step": prior_step,
+                        "optimizer_step": optimizer_steps,
+                        "actual_learning_rate": float(
+                            prior_optimizer.learning_rate.item()
+                        ),
+                        "song_id": track.song_id,
+                        "reference_id": track.reference_id,
+                        "sequence_id": track.sequence_id,
+                        "token_index": track.token_index,
+                        "keyframe_count": len(track.values),
+                        "gate_aligned_normalized_coordinate_mae": float(
+                            loss.item()
+                        ),
+                        "gradient_norm_before_clip": float(
+                            gradient_norm.item()
+                        ),
+                        "checkpoint_selection_eligible": False,
+                        "predeclared_candidate_snapshot": (
+                            prior_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+                        ),
+                        "candidate_value_bias_sha256": candidate_digest,
+                        "validation_labels_consumed": False,
+                        "heldout_labels_consumed": False,
+                    }
+                )
+            dynamic_crop_v3_prior_optimizer_state_final_step = int(
+                prior_optimizer.state["step"].item()
+            )
+            if (
+                dynamic_crop_v3_prior_optimizer_state_final_step
+                != dynamic_crop_v3_prior_pretraining_optimizer_steps
+            ):
+                raise RuntimeError(
+                    "Dynamic Crop v3 prior optimizer state differs from history"
+                )
+            if set(dynamic_crop_v3_prior_candidate_snapshots) != set(
+                DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            ):
+                raise RuntimeError(
+                    "Dynamic Crop v3 prior candidate snapshots are incomplete"
+                )
+            dynamic_crop_v3_prior_sampling_evidence = {
+                "contract": (
+                    "deterministic_song_reference_trajectory_round_robin_v1"
+                ),
+                "partition": "training_references_only",
+                "trajectory_count": len(prior_inventory.tracks),
+                "per_reference_track_counts": dict(
+                    prior_inventory.per_reference_track_counts
+                ),
+                "references_without_tracks": list(
+                    prior_inventory.references_without_tracks
+                ),
+                "reference_song_ids": dict(
+                    prior_inventory.reference_song_ids
+                ),
+                "per_song_sampled_counts": (
+                    prior_sampler.per_song_sampled_counts
+                ),
+                "per_reference_sampled_counts": (
+                    prior_sampler.per_reference_sampled_counts
+                ),
+                "validation_labels_consumed": False,
+                "heldout_labels_consumed": False,
+            }
+
         finetune_warmup = min(
             finetune_warmup_steps, max(finetune_steps_planned - 1, 0)
         )
@@ -2352,14 +2896,296 @@ def train_production_stage_edit(
             else None
         )
 
+        if dynamic_crop_v3_prior_pretrain_steps:
+            assert dynamic_crop_v3_enabled
+            assert isinstance(model, StageEditTransformerDynamicCropV3)
+            assert dynamic_crop_v3_prior_before_digests is not None
+            warmup_validation_base = evaluate_stage_edit_model(
+                model,
+                validation_batch,
+                validation_supervision,
+                loss_contract=effective_loss_contract,
+            )
+            retained_non_value_bias = model.dynamic_crop_context_head.bias[
+                dynamic_crop_v3_prior_values_stop:
+            ]
+            candidate_evaluations: list[dict[str, Any]] = []
+            selectable_candidates: list[
+                tuple[float, int, Any, dict[str, Any], dict[str, Any]]
+            ] = []
+            for candidate_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
+                candidate_bias = dynamic_crop_v3_prior_candidate_snapshots[
+                    candidate_step
+                ]
+                model.dynamic_crop_context_head.bias = mx.concatenate(
+                    (
+                        candidate_bias.reshape(
+                            (dynamic_crop_v3_prior_values_stop,)
+                        ),
+                        retained_non_value_bias,
+                    )
+                )
+                mx.eval(model.dynamic_crop_context_head.bias)
+                warmup_validation_dynamic = (
+                    evaluate_stage_edit_dynamic_crop_v3(
+                        model,
+                        validation_batch,
+                        validation_supervision,
+                        validation_dynamic_supervision,
+                        contract=effective_dynamic_crop_v3_loss_contract,
+                    )
+                )
+                warmup_validation_metrics = {
+                    **warmup_validation_base,
+                    "total_loss": warmup_validation_dynamic["total_loss"],
+                    "dynamic_crop_v3": warmup_validation_dynamic,
+                }
+                warmup_base_selection = stage_edit_validation_selection_score(
+                    warmup_validation_metrics
+                )
+                warmup_selection = (
+                    _stage_edit_validation_selection_with_dynamic_crop_v3(
+                        warmup_base_selection,
+                        warmup_validation_dynamic,
+                    )
+                )
+                warmup_selection_score = _finite_metric(
+                    warmup_selection.get("score")
+                )
+                candidate_digest = _parameter_tree_sha256(
+                    {
+                        "bias": candidate_bias.reshape(
+                            (dynamic_crop_v3_prior_values_stop,)
+                        )
+                    }
+                )
+                candidate_evaluations.append(
+                    {
+                        "candidate_step": candidate_step,
+                        "value_bias_sha256": candidate_digest,
+                        "training_partition_only_updates": True,
+                        "validation_gradients_computed": False,
+                        "heldout_forward_performed": False,
+                        "selection": dict(warmup_selection),
+                        "validation_metrics": warmup_validation_metrics,
+                    }
+                )
+                if (
+                    warmup_selection.get("selectable") is True
+                    and warmup_selection_score is not None
+                ):
+                    selectable_candidates.append(
+                        (
+                            warmup_selection_score,
+                            candidate_step,
+                            candidate_bias,
+                            dict(warmup_selection),
+                            warmup_validation_metrics,
+                        )
+                    )
+            selected_candidate = (
+                max(
+                    selectable_candidates,
+                    key=lambda item: (item[0], -item[1]),
+                )
+                if selectable_candidates
+                else None
+            )
+            retention_authorized = selected_candidate is not None
+            if selected_candidate is not None:
+                (
+                    _selected_score,
+                    selected_candidate_step,
+                    selected_candidate_bias,
+                    warmup_selection,
+                    warmup_validation_metrics,
+                ) = selected_candidate
+            else:
+                selected_candidate_step = max(
+                    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+                )
+                selected_candidate_bias = (
+                    dynamic_crop_v3_prior_candidate_snapshots[
+                        selected_candidate_step
+                    ]
+                )
+                failed_record = next(
+                    record
+                    for record in candidate_evaluations
+                    if record["candidate_step"] == selected_candidate_step
+                )
+                warmup_selection = dict(failed_record["selection"])
+                warmup_validation_metrics = dict(
+                    failed_record["validation_metrics"]
+                )
+            model.dynamic_crop_context_head.bias = mx.concatenate(
+                (
+                    selected_candidate_bias.reshape(
+                        (dynamic_crop_v3_prior_values_stop,)
+                    ),
+                    retained_non_value_bias,
+                )
+            )
+            mx.eval(model.dynamic_crop_context_head.bias)
+            after_digests = _dynamic_crop_v3_prior_parameter_digests(model)
+            invariant_keys = (
+                "base_parameter_tree_sha256",
+                "context_weight_sha256",
+                "source_head_parameter_tree_sha256",
+                "context_non_value_bias_sha256",
+            )
+            invariant = all(
+                dynamic_crop_v3_prior_before_digests[key]
+                == after_digests[key]
+                for key in invariant_keys
+            )
+            value_bias_changed = (
+                dynamic_crop_v3_prior_before_digests[
+                    "context_value_bias_sha256"
+                ]
+                != after_digests["context_value_bias_sha256"]
+            )
+            if not invariant or not value_bias_changed:
+                raise RuntimeError(
+                    "Dynamic Crop v3 prior warmup parameter scope drifted"
+                )
+            selected_candidate_digest = _parameter_tree_sha256(
+                {
+                    "bias": selected_candidate_bias.reshape(
+                        (dynamic_crop_v3_prior_values_stop,)
+                    )
+                }
+            )
+            if (
+                selected_candidate_digest
+                != after_digests["context_value_bias_sha256"]
+            ):
+                raise RuntimeError(
+                    "selected Dynamic Crop v3 candidate digest drifted"
+                )
+            dynamic_crop_v3_prior_parameter_invariance = {
+                "contract": (
+                    "only_dynamic_crop_context_bias_value_rows_mutable_v1"
+                ),
+                "before": dynamic_crop_v3_prior_before_digests,
+                "after": after_digests,
+                "invariant_parameter_groups": list(invariant_keys),
+                "all_declared_invariant_groups_byte_identical": invariant,
+                "context_value_bias_changed": value_bias_changed,
+                "context_value_bias_row_count": (
+                    dynamic_crop_v3_prior_values_stop
+                ),
+                "base_parameter_gradients_computed": False,
+                "source_head_gradients_computed": False,
+                "context_weight_gradients_computed": False,
+                "count_time_motion_bias_gradients_computed": False,
+            }
+            if retention_authorized:
+                batches_per_epoch = finetune_batches_per_epoch
+                dynamic_crop_v3_prior_retention_finetune_steps = (
+                    math.ceil(
+                        minimum_checkpoint_selection_finetune_steps
+                        / batches_per_epoch
+                    )
+                    * batches_per_epoch
+                )
+            else:
+                dynamic_crop_v3_prior_retention_finetune_steps = 0
+            retained_dynamic_crop_v3_context_weight = mx.array(
+                np.array(
+                    model.dynamic_crop_context_head.weight,
+                    copy=True,
+                )
+            )
+            retained_dynamic_crop_v3_context_bias = mx.array(
+                np.array(
+                    model.dynamic_crop_context_head.bias,
+                    copy=True,
+                )
+            )
+            retained_dynamic_crop_v3_source_weight = mx.array(
+                np.array(
+                    model.dynamic_crop_source_head.weight,
+                    copy=True,
+                )
+            )
+            dynamic_crop_v3_prior_candidate_selection = {
+                "contract": DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT,
+                "predeclared_candidate_steps": list(
+                    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+                ),
+                "selection_rule": (
+                    "highest_finite_selectable_existing_validation_score_"
+                    "then_lower_candidate_step_on_exact_tie"
+                ),
+                "training_partition_only_gradients": True,
+                "validation_reference_ids": [
+                    example.reference_id for example in split.validation
+                ],
+                "validation_gradients_computed": False,
+                "heldout_forward_performed": False,
+                "candidate_evaluations": candidate_evaluations,
+                "selected_candidate_step": selected_candidate_step,
+                "selected_candidate_value_bias_sha256": (
+                    selected_candidate_digest
+                ),
+                "selection": dict(warmup_selection),
+                "validation_metrics": warmup_validation_metrics,
+                "retention_authorized": retention_authorized,
+                "checkpoint_written_before_joint_finetuning": False,
+                "checkpoint_write_requires_existing_finetune_burn_in": True,
+                "retention_finetune_steps": (
+                    dynamic_crop_v3_prior_retention_finetune_steps
+                ),
+            }
+
         for epoch in range(1, epochs + 1):
             epoch_losses: list[float] = []
             epoch_gradient_norms: list[float] = []
             epoch_finetune_optimizer_steps: list[int] = []
+            epoch_phase_local_optimizer_steps: list[int] = []
+            epoch_optimizer_reset_before_steps: list[int] = []
             epoch_actual_learning_rates: list[float] = []
+            epoch_dynamic_crop_v3_prior_retention_steps: list[int] = []
             model.train()
             ordered = _stable_epoch_order(split.train, seed=seed, epoch=epoch)
             for examples in _batches(ordered, batch_size):
+                if (
+                    dynamic_crop_v3_prior_retention_finetune_steps
+                    and finetune_optimizer_steps
+                    == dynamic_crop_v3_prior_retention_finetune_steps
+                    and not finetune_optimizer_reset_at_dynamic_crop_v3_prior_release
+                ):
+                    finetune_retention_optimizer_state_final_step = int(
+                        optimizer.state["step"].item()
+                    )
+                    if (
+                        finetune_retention_optimizer_state_final_step
+                        != dynamic_crop_v3_prior_retention_finetune_steps
+                    ):
+                        raise RuntimeError(
+                            "prior-retention optimizer step differs at release"
+                        )
+                    optimizer = optim.AdamW(
+                        learning_rate=_offset_learning_rate_schedule(
+                            finetune_schedule,
+                            dynamic_crop_v3_prior_retention_finetune_steps,
+                        ),
+                        weight_decay=weight_decay,
+                    )
+                    finetune_joint_optimizer_initial_step = int(
+                        optimizer.state["step"].item()
+                    )
+                    if finetune_joint_optimizer_initial_step != 0:
+                        raise RuntimeError(
+                            "released joint optimizer did not start fresh"
+                        )
+                    finetune_optimizer_reset_at_dynamic_crop_v3_prior_release = (
+                        True
+                    )
+                    epoch_optimizer_reset_before_steps.append(
+                        finetune_optimizer_steps + 1
+                    )
                 batch = tensorize_stage_edit_batch(
                     prepare_stage_edit_production_input_sequences(
                         examples, schema=schema
@@ -2392,6 +3218,33 @@ def train_production_stage_edit(
                 loss, gradients = loss_and_grad(
                     model, batch, supervision, dynamic_supervision
                 )
+                next_finetune_step = finetune_optimizer_steps + 1
+                retain_dynamic_crop_v3_prior = bool(
+                    dynamic_crop_v3_prior_candidate_selection
+                    and dynamic_crop_v3_prior_candidate_selection.get(
+                        "retention_authorized"
+                    )
+                    is True
+                    and next_finetune_step
+                    <= dynamic_crop_v3_prior_retention_finetune_steps
+                )
+                if retain_dynamic_crop_v3_prior:
+                    if not isinstance(gradients, Mapping):
+                        raise RuntimeError(
+                            "Dynamic Crop v3 gradients are not name-addressable"
+                        )
+                    gradients = dict(gradients)
+                    for head_name in (
+                        "dynamic_crop_context_head",
+                        "dynamic_crop_source_head",
+                    ):
+                        if head_name not in gradients:
+                            raise RuntimeError(
+                                "Dynamic Crop v3 prior retention head is missing"
+                            )
+                        gradients[head_name] = _zero_gradient_tree(
+                            gradients[head_name]
+                        )
                 if clipping_supported:
                     gradients, gradient_norm = optim.clip_grad_norm(
                         gradients, gradient_clip_norm
@@ -2399,15 +3252,93 @@ def train_production_stage_edit(
                 else:  # Pinned production MLX supports clipping.
                     gradient_norm = mx.array(float("nan"))
                 optimizer.update(model, gradients)
+                if retain_dynamic_crop_v3_prior:
+                    assert retained_dynamic_crop_v3_context_weight is not None
+                    assert retained_dynamic_crop_v3_context_bias is not None
+                    assert retained_dynamic_crop_v3_source_weight is not None
+                    model.dynamic_crop_context_head.weight = (
+                        retained_dynamic_crop_v3_context_weight
+                    )
+                    model.dynamic_crop_context_head.bias = (
+                        retained_dynamic_crop_v3_context_bias
+                    )
+                    model.dynamic_crop_source_head.weight = (
+                        retained_dynamic_crop_v3_source_weight
+                    )
+                    dynamic_crop_v3_prior_retention_restore_steps += 1
+                    epoch_dynamic_crop_v3_prior_retention_steps.append(
+                        next_finetune_step
+                    )
                 optimizer_steps += 1
                 finetune_optimizer_steps += 1
                 mx.eval(loss, gradient_norm, model.parameters(), optimizer.state)
+                epoch_phase_local_optimizer_steps.append(
+                    int(optimizer.state["step"].item())
+                )
                 epoch_losses.append(float(loss.item()))
                 epoch_gradient_norms.append(float(gradient_norm.item()))
                 epoch_finetune_optimizer_steps.append(finetune_optimizer_steps)
                 epoch_actual_learning_rates.append(
                     float(optimizer.learning_rate.item())
                 )
+
+            if (
+                dynamic_crop_v3_prior_candidate_selection
+                and dynamic_crop_v3_prior_candidate_selection.get(
+                    "retention_authorized"
+                )
+                is True
+                and finetune_optimizer_steps
+                == dynamic_crop_v3_prior_retention_finetune_steps
+            ):
+                assert isinstance(model, StageEditTransformerDynamicCropV3)
+                assert dynamic_crop_v3_prior_parameter_invariance is not None
+                retained_digests = _dynamic_crop_v3_prior_parameter_digests(
+                    model
+                )
+                warmup_digests = dynamic_crop_v3_prior_parameter_invariance[
+                    "after"
+                ]
+                retained_keys = (
+                    "context_weight_sha256",
+                    "source_head_parameter_tree_sha256",
+                    "context_non_value_bias_sha256",
+                    "context_value_bias_sha256",
+                )
+                heads_identical = all(
+                    retained_digests[key] == warmup_digests[key]
+                    for key in retained_keys
+                )
+                if not heads_identical:
+                    raise RuntimeError(
+                        "Dynamic Crop v3 warmup prior drifted before burn-in"
+                    )
+                dynamic_crop_v3_prior_retention_evidence = {
+                    "contract": (
+                        "warmup_dynamic_heads_byte_retained_until_joint_"
+                        "selection_burn_in_v1"
+                    ),
+                    "retention_finetune_step_count": (
+                        dynamic_crop_v3_prior_retention_restore_steps
+                    ),
+                    "required_retention_finetune_step_count": (
+                        dynamic_crop_v3_prior_retention_finetune_steps
+                    ),
+                    "warmup_head_digests": {
+                        key: warmup_digests[key] for key in retained_keys
+                    },
+                    "retained_head_digests": {
+                        key: retained_digests[key] for key in retained_keys
+                    },
+                    "all_dynamic_head_parameters_byte_identical": (
+                        heads_identical
+                    ),
+                    "dynamic_head_gradients_zeroed": True,
+                    "adamw_parameter_decay_restored": True,
+                    "optimizer_reset_required_before_dynamic_head_release": True,
+                    "validation_gradients_computed": False,
+                    "heldout_forward_performed": False,
+                }
 
             validation_base_metrics = evaluate_stage_edit_model(
                 model,
@@ -2491,8 +3422,17 @@ def train_production_stage_edit(
                         epoch_finetune_optimizer_steps[-1]
                     ),
                     "finetune_optimizer_steps": epoch_finetune_optimizer_steps,
+                    "finetune_phase_local_optimizer_steps": (
+                        epoch_phase_local_optimizer_steps
+                    ),
+                    "finetune_optimizer_reset_before_steps": (
+                        epoch_optimizer_reset_before_steps
+                    ),
                     "finetune_actual_learning_rates": (
                         epoch_actual_learning_rates
+                    ),
+                    "dynamic_crop_v3_prior_retention_finetune_steps": (
+                        epoch_dynamic_crop_v3_prior_retention_steps
                     ),
                     "training_loss_mean": (
                         sum(epoch_losses) / len(epoch_losses)
@@ -2539,6 +3479,20 @@ def train_production_stage_edit(
                         checkpoint_selection_eligible
                     ),
                     "training_song_reference_validation_improved": improved,
+                    "dynamic_crop_v3_checkpoint_candidate_origin": (
+                        "training_only_bias_prior_retained_to_burn_in"
+                        if improved
+                        and dynamic_crop_v3_prior_candidate_selection
+                        and dynamic_crop_v3_prior_candidate_selection.get(
+                            "retention_authorized"
+                        )
+                        is True
+                        and finetune_optimizer_steps
+                        == dynamic_crop_v3_prior_retention_finetune_steps
+                        else "joint_finetuning"
+                        if improved
+                        else None
+                    ),
                 }
             )
             if improved:
@@ -2552,6 +3506,17 @@ def train_production_stage_edit(
                 best_epoch = epoch
                 best_step = optimizer_steps
                 best_finetune_optimizer_step = finetune_optimizer_steps
+                best_checkpoint_origin = (
+                    "training_only_bias_prior_retained_to_burn_in"
+                    if dynamic_crop_v3_prior_candidate_selection
+                    and dynamic_crop_v3_prior_candidate_selection.get(
+                        "retention_authorized"
+                    )
+                    is True
+                    and finetune_optimizer_steps
+                    == dynamic_crop_v3_prior_retention_finetune_steps
+                    else "joint_finetuning"
+                )
                 finetune_steps_without_improvement = 0
                 checkpoint_id = (
                     f"production-{corpus.data_id[:16]}-seed{seed}-"
@@ -2632,10 +3597,41 @@ def train_production_stage_edit(
         finetune_optimizer_state_final_step = int(
             optimizer.state["step"].item()
         )
-        if finetune_optimizer_state_final_step != finetune_optimizer_steps:
+        expected_active_optimizer_steps = (
+            finetune_optimizer_steps
+            - dynamic_crop_v3_prior_retention_finetune_steps
+            if finetune_optimizer_reset_at_dynamic_crop_v3_prior_release
+            else finetune_optimizer_steps
+        )
+        if finetune_optimizer_state_final_step != expected_active_optimizer_steps:
             raise RuntimeError(
                 "multi-head optimizer state step differs from phase-local history"
             )
+        if dynamic_crop_v3_prior_retention_finetune_steps:
+            if (
+                not finetune_optimizer_reset_at_dynamic_crop_v3_prior_release
+                or finetune_joint_optimizer_initial_step != 0
+                or dynamic_crop_v3_prior_retention_evidence is None
+            ):
+                raise RuntimeError(
+                    "Dynamic Crop v3 prior release did not reset joint optimizer"
+                )
+            dynamic_crop_v3_prior_retention_evidence = {
+                **dynamic_crop_v3_prior_retention_evidence,
+                "retention_optimizer_state_final_step": (
+                    finetune_retention_optimizer_state_final_step
+                ),
+                "released_joint_optimizer_initial_step": (
+                    finetune_joint_optimizer_initial_step
+                ),
+                "released_joint_optimizer_state_final_step": (
+                    finetune_optimizer_state_final_step
+                ),
+                "optimizer_state_reset_before_dynamic_head_release": True,
+                "released_joint_optimizer_schedule_offset_steps": (
+                    dynamic_crop_v3_prior_retention_finetune_steps
+                ),
+            }
 
     if (
         saved_metadata is None
@@ -2784,6 +3780,28 @@ def train_production_stage_edit(
                 "selected_training_step": best_step,
                 "selected_finetune_optimizer_step": (
                     best_finetune_optimizer_step
+                ),
+                "selected_checkpoint_origin": best_checkpoint_origin,
+                "dynamic_crop_v3_prior_pretraining_optimizer_steps": (
+                    dynamic_crop_v3_prior_pretraining_optimizer_steps
+                ),
+                "dynamic_crop_v3_prior_candidate_retained_to_burn_in": (
+                    best_checkpoint_origin
+                    == "training_only_bias_prior_retained_to_burn_in"
+                ),
+                "dynamic_crop_v3_prior_selected_candidate_step": (
+                    dynamic_crop_v3_prior_candidate_selection.get(
+                        "selected_candidate_step"
+                    )
+                    if dynamic_crop_v3_prior_candidate_selection
+                    else None
+                ),
+                "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256": (
+                    dynamic_crop_v3_prior_candidate_selection.get(
+                        "selected_candidate_value_bias_sha256"
+                    )
+                    if dynamic_crop_v3_prior_candidate_selection
+                    else None
                 ),
                 "minimum_checkpoint_selection_finetune_steps": (
                     minimum_checkpoint_selection_finetune_steps
@@ -3077,6 +4095,9 @@ def train_production_stage_edit(
             "source_pretraining_optimizer_steps": (
                 source_pretraining_optimizer_steps
             ),
+            "dynamic_crop_v3_prior_pretraining_optimizer_steps": (
+                dynamic_crop_v3_prior_pretraining_optimizer_steps
+            ),
             "multi_head_finetuning_optimizer_steps": (
                 finetune_optimizer_steps
             ),
@@ -3086,7 +4107,10 @@ def train_production_stage_edit(
             "learning_rate": learning_rate,
             "learning_rate_schedule": {
                 "contract": (
-                    "independent_warmup_cosine_cut_source_and_joint_"
+                    "independent_warmup_cosine_cut_source_v3_prior_and_"
+                    "joint_with_retained_selection_burn_in_v4"
+                    if dynamic_crop_v3_prior_pretrain_steps
+                    else "independent_warmup_cosine_cut_source_and_joint_"
                     "with_step_floor_v3"
                 ),
                 "cut_pretraining_steps": cut_pretrain_steps,
@@ -3108,6 +4132,20 @@ def train_production_stage_edit(
                     source_pretrain_warmup_steps
                     if source_pretrain_steps
                     else 0
+                ),
+                "dynamic_crop_v3_prior_pretraining_steps": (
+                    dynamic_crop_v3_prior_pretrain_steps
+                ),
+                "dynamic_crop_v3_prior_pretraining_peak_learning_rate": (
+                    dynamic_crop_v3_prior_pretrain_learning_rate
+                ),
+                "dynamic_crop_v3_prior_pretraining_warmup_steps": (
+                    dynamic_crop_v3_prior_pretrain_warmup_steps
+                    if dynamic_crop_v3_prior_pretrain_steps
+                    else 0
+                ),
+                "dynamic_crop_v3_prior_retention_finetune_steps": (
+                    dynamic_crop_v3_prior_retention_finetune_steps
                 ),
                 "finetune_steps_planned": finetune_steps_planned,
                 "finetune_warmup_steps": finetune_warmup,
@@ -3151,6 +4189,38 @@ def train_production_stage_edit(
                 "heldout_labels_consumed": False,
                 "sampling": source_pretraining_sampling_evidence,
             },
+            "dynamic_crop_v3_prior_pretraining": (
+                {
+                    "enabled": True,
+                    "partition": "training_references_only",
+                    "objective": (
+                        "renderer_range_normalized_coordinate_mae_exactly_"
+                        "aligned_with_validation_gate_v1"
+                    ),
+                    "mutable_parameter_scope": (
+                        "dynamic_crop_context_head_bias_value_rows_0_31_only"
+                    ),
+                    "optimizer_weight_decay": 0.0,
+                    "checkpoint_selection_eligible_during_warmup": False,
+                    "checkpoint_write_before_joint_finetuning": False,
+                    "selection_gate_evaluated_without_gradients": True,
+                    "validation_labels_consumed_for_gradients": False,
+                    "heldout_labels_consumed": False,
+                    "sampling": dynamic_crop_v3_prior_sampling_evidence,
+                    "component_scale": (
+                        dynamic_crop_v3_prior_component_scale_evidence
+                    ),
+                    "parameter_invariance": (
+                        dynamic_crop_v3_prior_parameter_invariance
+                    ),
+                    "candidate_selection": (
+                        dynamic_crop_v3_prior_candidate_selection
+                    ),
+                    "retention": dynamic_crop_v3_prior_retention_evidence,
+                }
+                if dynamic_crop_v3_prior_pretrain_steps
+                else None
+            ),
             "weight_decay": weight_decay,
             "gradient_clip_norm": gradient_clip_norm,
             "effective_loss_contract": asdict(effective_loss_contract),
@@ -3189,10 +4259,19 @@ def train_production_stage_edit(
             "finetune_optimizer_state_final_step": (
                 finetune_optimizer_state_final_step
             ),
+            "finetune_retention_optimizer_state_final_step": (
+                finetune_retention_optimizer_state_final_step
+            ),
+            "finetune_joint_optimizer_initial_step": (
+                finetune_joint_optimizer_initial_step
+            ),
+            "finetune_optimizer_reset_at_dynamic_crop_v3_prior_release": (
+                finetune_optimizer_reset_at_dynamic_crop_v3_prior_release
+            ),
             "finetune_optimizer_state_reset_after_cut_pretraining": (
                 finetune_optimizer_initial_step == 0
                 and finetune_optimizer_state_final_step
-                == finetune_optimizer_steps
+                == expected_active_optimizer_steps
             ),
             "cut_pretraining_optimizer_initial_step": (
                 cut_pretraining_optimizer_initial_step
@@ -3206,6 +4285,12 @@ def train_production_stage_edit(
             "source_pretraining_optimizer_state_final_step": (
                 source_pretraining_optimizer_state_final_step
             ),
+            "dynamic_crop_v3_prior_optimizer_initial_step": (
+                dynamic_crop_v3_prior_optimizer_initial_step
+            ),
+            "dynamic_crop_v3_prior_optimizer_state_final_step": (
+                dynamic_crop_v3_prior_optimizer_state_final_step
+            ),
             "source_pretraining_optimizer_state_reset_after_cut_pretraining": (
                 source_pretraining_optimizer_initial_step == 0
                 and source_pretraining_optimizer_state_final_step
@@ -3214,7 +4299,22 @@ def train_production_stage_edit(
             "finetune_optimizer_state_reset_after_cut_and_source_pretraining": (
                 finetune_optimizer_initial_step == 0
                 and finetune_optimizer_state_final_step
-                == finetune_optimizer_steps
+                == expected_active_optimizer_steps
+            ),
+            "dynamic_crop_v3_prior_optimizer_state_reset_after_source_pretraining": (
+                dynamic_crop_v3_prior_optimizer_initial_step == 0
+                and dynamic_crop_v3_prior_optimizer_state_final_step
+                == dynamic_crop_v3_prior_pretraining_optimizer_steps
+            ),
+            "finetune_optimizer_state_reset_after_dynamic_crop_v3_prior_pretraining": (
+                finetune_optimizer_initial_step == 0
+                and finetune_optimizer_state_final_step
+                == expected_active_optimizer_steps
+                and (
+                    not dynamic_crop_v3_prior_retention_finetune_steps
+                    or finetune_optimizer_reset_at_dynamic_crop_v3_prior_release
+                    and finetune_joint_optimizer_initial_step == 0
+                )
             ),
             "checkpoint_writes_before_joint_finetuning": 0,
             "finetune_steps_without_improvement_at_stop": (
@@ -3230,6 +4330,7 @@ def train_production_stage_edit(
             "best_finetune_optimizer_step": (
                 best_finetune_optimizer_step
             ),
+            "best_checkpoint_origin": best_checkpoint_origin,
             "best_validation_total_loss": best_validation_loss,
             "best_validation_selection_score": (
                 best_validation_selection_score
@@ -3273,6 +4374,9 @@ def train_production_stage_edit(
         },
         "cut_pretraining_history": cut_pretraining_history,
         "source_pretraining_history": source_pretraining_history,
+        "dynamic_crop_v3_prior_pretraining_history": (
+            dynamic_crop_v3_prior_pretraining_history
+        ),
         "history": history,
     }
     checkpoint_root.mkdir(parents=True, exist_ok=True)
@@ -3300,6 +4404,8 @@ def train_production_stage_edit(
 
 
 __all__ = [
+    "DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT",
+    "DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS",
     "DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT",
     "PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION",
     "STAGE_EDIT_SELECTION_FREEZE_FILENAME",

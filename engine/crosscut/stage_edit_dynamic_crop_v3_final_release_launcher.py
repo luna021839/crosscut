@@ -24,7 +24,6 @@ from .professional_montage_policy import (
     load_professional_montage_policy,
 )
 from .stage_edit_dynamic_crop_capacity_probe import (
-    PROBE_TRAINING_SCHEDULE,
     SELECTION_SONG_IDS,
 )
 from .stage_edit_dynamic_crop_head_v3 import (
@@ -37,6 +36,9 @@ from .stage_edit_dynamic_crop_head_v3 import (
     StageEditDynamicCropCheckpointMetadataV3,
     StageEditTransformerDynamicCropV3,
     load_stage_edit_dynamic_crop_checkpoint_v3,
+)
+from .stage_edit_dynamic_crop_v3_capacity_smoke import (
+    V3_PROBE_TRAINING_SCHEDULE as PROBE_TRAINING_SCHEDULE,
 )
 from .stage_edit_dynamic_crop_training import (
     build_stage_edit_dynamic_crop_training_corpus_v2,
@@ -63,6 +65,10 @@ from .stage_edit_dynamic_crop_v3_final_fit import (
 from .stage_edit_production_train_cli import (
     _dynamic_artifact_map,
     _snapshot_map,
+)
+from .stage_edit_production_training import (
+    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT,
+    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS,
 )
 from .stage_edit_reference_adapter import load_reference_training_corpus
 from .stage_edit_transformer import (
@@ -128,6 +134,7 @@ class DynamicCropV3FinalFitPreflight:
     evidence_directory: Path
     source_commit: str
     frozen_cut_probability_threshold: float
+    frozen_dynamic_crop_v3_prior_candidate_step: int
     quality_thresholds: Mapping[str, Any]
     reference_ids_by_song: Mapping[str, tuple[str, ...]]
     supervision_paths_by_song: Mapping[str, Mapping[str, Path]]
@@ -148,6 +155,9 @@ class DynamicCropV3FinalFitPreflight:
             "source_commit": self.source_commit,
             "frozen_cut_probability_threshold": (
                 self.frozen_cut_probability_threshold
+            ),
+            "frozen_dynamic_crop_v3_prior_candidate_step": (
+                self.frozen_dynamic_crop_v3_prior_candidate_step
             ),
             "quality_thresholds": dict(self.quality_thresholds),
             "reference_ids_by_song": {
@@ -346,6 +356,21 @@ def _median_three(values: Sequence[float]) -> float:
     return ordered[1]
 
 
+def _median_three_prior_candidate_steps(values: Sequence[int]) -> int:
+    if (
+        len(values) != 3
+        or any(
+            isinstance(value, bool)
+            or value not in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            for value in values
+        )
+    ):
+        raise DynamicCropV3FinalReleaseError(
+            "exactly three predeclared prior candidate milestones are required"
+        )
+    return sorted(int(value) for value in values)[1]
+
+
 def _inactive_authority_contract() -> dict[str, bool]:
     return {
         "production_activation_authorized": False,
@@ -459,6 +484,7 @@ def _load_complete_same_candidate_loso(
             "capacity plan must predeclare only production-balanced before LOSO"
         )
     thresholds: list[float] = []
+    prior_candidate_steps: list[int] = []
     fold_records: list[dict[str, Any]] = []
     quality_thresholds: Mapping[str, Any] | None = None
     for receipt_path, receipt in sorted(
@@ -477,6 +503,18 @@ def _load_complete_same_candidate_loso(
         quality = _mapping(heldout.get("quality_gate"), "fold quality gate")
         split = _mapping(report.get("split"), "fold split")
         optimization = _mapping(report.get("optimization"), "fold optimization")
+        prior = _mapping(
+            optimization.get("dynamic_crop_v3_prior_pretraining"),
+            "fold Dynamic Crop v3 prior",
+        )
+        prior_selection = _mapping(
+            prior.get("candidate_selection"),
+            "fold Dynamic Crop v3 prior candidate selection",
+        )
+        selected_prior_step = prior_selection.get("selected_candidate_step")
+        selected_prior_digest = prior_selection.get(
+            "selected_candidate_value_bias_sha256"
+        )
         threshold_freeze = _mapping(
             report.get("cut_threshold_freeze"), "fold cut threshold freeze"
         )
@@ -511,6 +549,20 @@ def _load_complete_same_candidate_loso(
             is not False
             or threshold_freeze.get("selected_before_heldout_forward") is not True
             or selection.get("cut_threshold_freeze") != threshold_freeze
+            or prior_selection.get("contract")
+            != DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT
+            or prior_selection.get("predeclared_candidate_steps")
+            != list(DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS)
+            or prior_selection.get("retention_authorized") is not True
+            or isinstance(selected_prior_step, bool)
+            or selected_prior_step not in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
+            or not _is_sha256(selected_prior_digest)
+            or selection.get("dynamic_crop_v3_prior_selected_candidate_step")
+            != selected_prior_step
+            or selection.get(
+                "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256"
+            )
+            != selected_prior_digest
         ):
             raise DynamicCropV3FinalReleaseError(
                 "fold held-out data influenced model or threshold selection"
@@ -529,6 +581,7 @@ def _load_complete_same_candidate_loso(
                 "fold quality thresholds differ"
             )
         thresholds.append(threshold)
+        prior_candidate_steps.append(int(selected_prior_step))
         fold_records.append(
             {
                 "validation_song_id": receipt["validation_song_id"],
@@ -548,6 +601,12 @@ def _load_complete_same_candidate_loso(
                 "selected_finetune_optimizer_step": selection.get(
                     "selected_finetune_optimizer_step"
                 ),
+                "dynamic_crop_v3_prior_selected_candidate_step": (
+                    selected_prior_step
+                ),
+                "dynamic_crop_v3_prior_selected_candidate_value_bias_sha256": (
+                    selected_prior_digest
+                ),
                 "heldout_gate_passed": True,
                 "heldout_used_for_selection": False,
             }
@@ -561,6 +620,12 @@ def _load_complete_same_candidate_loso(
         "folds": fold_records,
         "fold_cut_probability_thresholds": thresholds,
         "frozen_cut_probability_threshold": _median_three(thresholds),
+        "fold_dynamic_crop_v3_prior_selected_candidate_steps": (
+            prior_candidate_steps
+        ),
+        "frozen_dynamic_crop_v3_prior_candidate_step": (
+            _median_three_prior_candidate_steps(prior_candidate_steps)
+        ),
         "quality_thresholds": dict(quality_thresholds),
     }
 
@@ -615,6 +680,15 @@ def create_dynamic_crop_v3_release_freeze(
             "frozen_cut_probability_threshold"
         ],
         "cut_threshold_aggregation": "median_of_three_preheldout_thresholds_v1",
+        "fold_dynamic_crop_v3_prior_selected_candidate_steps": list(
+            loso["fold_dynamic_crop_v3_prior_selected_candidate_steps"]
+        ),
+        "frozen_dynamic_crop_v3_prior_candidate_step": loso[
+            "frozen_dynamic_crop_v3_prior_candidate_step"
+        ],
+        "dynamic_crop_v3_prior_candidate_step_aggregation": (
+            "median_of_three_preheldout_selected_predeclared_milestones_v1"
+        ),
         "capacity_plan": _pointer(
             loso["capacity_plan_path"], "v3 capacity plan"
         ),
@@ -650,6 +724,9 @@ _FREEZE_KEYS = {
     "fold_cut_probability_thresholds",
     "frozen_cut_probability_threshold",
     "cut_threshold_aggregation",
+    "fold_dynamic_crop_v3_prior_selected_candidate_steps",
+    "frozen_dynamic_crop_v3_prior_candidate_step",
+    "dynamic_crop_v3_prior_candidate_step_aggregation",
     "capacity_plan",
     "folds",
     "professional_montage_profile",
@@ -691,6 +768,10 @@ def _strict_release_freeze(path: Path) -> dict[str, Any]:
         != PROBE_TRAINING_SCHEDULE["finetune_steps_planned"]
         or payload.get("cut_threshold_aggregation")
         != "median_of_three_preheldout_thresholds_v1"
+        or payload.get("dynamic_crop_v3_prior_candidate_step_aggregation")
+        != "median_of_three_preheldout_selected_predeclared_milestones_v1"
+        or payload.get("frozen_dynamic_crop_v3_prior_candidate_step")
+        not in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
         or not _exact_json_equal(
             payload.get("loso_scope"), _loso_scope_contract()
         )
@@ -739,6 +820,10 @@ def _strict_release_freeze(path: Path) -> dict[str, Any]:
         != loso["fold_cut_probability_thresholds"]
         or payload.get("frozen_cut_probability_threshold")
         != loso["frozen_cut_probability_threshold"]
+        or payload.get("fold_dynamic_crop_v3_prior_selected_candidate_steps")
+        != loso["fold_dynamic_crop_v3_prior_selected_candidate_steps"]
+        or payload.get("frozen_dynamic_crop_v3_prior_candidate_step")
+        != loso["frozen_dynamic_crop_v3_prior_candidate_step"]
     ):
         raise DynamicCropV3FinalReleaseError(
             "v3 release freeze no longer replays from LOSO evidence"
@@ -826,6 +911,9 @@ def create_dynamic_crop_v3_final_fit_plan(
         "candidate_id": freeze["candidate_id"],
         "candidate_contract": freeze["candidate_contract"],
         "training_schedule": freeze["training_schedule"],
+        "frozen_dynamic_crop_v3_prior_candidate_step": freeze[
+            "frozen_dynamic_crop_v3_prior_candidate_step"
+        ],
         "frozen_cut_probability_threshold": freeze[
             "frozen_cut_probability_threshold"
         ],
@@ -867,6 +955,7 @@ _PLAN_KEYS = {
     "candidate_id",
     "candidate_contract",
     "training_schedule",
+    "frozen_dynamic_crop_v3_prior_candidate_step",
     "frozen_cut_probability_threshold",
     "quality_thresholds",
     "professional_montage_profile",
@@ -931,6 +1020,8 @@ def _strict_final_fit_plan(path: Path) -> dict[str, Any]:
         or not _exact_json_equal(
             payload.get("training_schedule"), freeze["training_schedule"]
         )
+        or payload.get("frozen_dynamic_crop_v3_prior_candidate_step")
+        != freeze["frozen_dynamic_crop_v3_prior_candidate_step"]
         or payload.get("frozen_cut_probability_threshold")
         != freeze["frozen_cut_probability_threshold"]
         or not _exact_json_equal(
@@ -1054,6 +1145,9 @@ def preflight_dynamic_crop_v3_final_fit(
         frozen_cut_probability_threshold=float(
             plan["frozen_cut_probability_threshold"]
         ),
+        frozen_dynamic_crop_v3_prior_candidate_step=int(
+            plan["frozen_dynamic_crop_v3_prior_candidate_step"]
+        ),
         quality_thresholds=dict(plan["quality_thresholds"]),
         reference_ids_by_song=dict(manifests.reference_ids_by_song),
         supervision_paths_by_song=dict(
@@ -1127,6 +1221,9 @@ def _execute_final_fit(
         base_loss_contract=candidate.base_loss_contract,
         dynamic_crop_loss_contract=candidate.dynamic_crop_loss_contract,
         frozen_training_schedule=PROBE_TRAINING_SCHEDULE,
+        frozen_dynamic_crop_v3_prior_candidate_step=(
+            preflight.frozen_dynamic_crop_v3_prior_candidate_step
+        ),
         frozen_cut_probability_threshold=(
             preflight.frozen_cut_probability_threshold
         ),
@@ -1195,6 +1292,10 @@ def record_dynamic_crop_v3_final_fit_receipt(
             "cut_probability_threshold"
         )
         != preflight.frozen_cut_probability_threshold
+        or report.get("frozen_decisions", {}).get(
+            "dynamic_crop_v3_prior_candidate_step"
+        )
+        != preflight.frozen_dynamic_crop_v3_prior_candidate_step
         or report.get("frozen_decisions", {}).get("quality_thresholds")
         != dict(preflight.quality_thresholds)
         or metadata.base_model_config != candidate.model_config
@@ -1382,7 +1483,14 @@ def load_dynamic_crop_v3_final_fit_receipt(path: Path) -> dict[str, Any]:
         raise DynamicCropV3FinalReleaseError(
             "v3 final-fit receipt paths differ from its immutable plan"
         )
-    report = load_dynamic_crop_v3_final_fit_report(paths["final_fit_report"])
+    try:
+        report = load_dynamic_crop_v3_final_fit_report(
+            paths["final_fit_report"]
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise DynamicCropV3FinalReleaseError(
+            f"v3 final-fit receipt checkpoint identity differs: {exc}"
+        ) from exc
     try:
         metadata = StageEditDynamicCropCheckpointMetadataV3.from_dict(
             _read_json(paths["checkpoint_metadata"], "v3 final-fit metadata")
@@ -1477,6 +1585,8 @@ def load_dynamic_crop_v3_final_fit_receipt(path: Path) -> dict[str, Any]:
             report_frozen.get("training_schedule"),
             plan.get("training_schedule"),
         )
+        or report_frozen.get("dynamic_crop_v3_prior_candidate_step")
+        != plan.get("frozen_dynamic_crop_v3_prior_candidate_step")
         or report_frozen.get("cut_probability_threshold")
         != plan.get("frozen_cut_probability_threshold")
         or not _exact_json_equal(

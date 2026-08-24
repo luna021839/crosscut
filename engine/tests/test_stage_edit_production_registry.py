@@ -357,6 +357,40 @@ class StageEditProductionRegistryTests(unittest.TestCase):
             ):
                 load_registered_stage_edit_production_bundle(registry)
 
+    def test_new_registry_is_rolled_back_when_post_write_replay_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = _checkpoint(root)
+            montage_profile = _montage_profile(root)
+            registry = root / "registry" / "active-production-bundle.json"
+            with (
+                patch(
+                    "crosscut.stage_edit_production_registry."
+                    "stage_edit_readiness_report",
+                    return_value=_ready(checkpoint),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_registry."
+                    "load_registered_stage_edit_production_bundle",
+                    side_effect=StageEditProductionRegistryNotReadyError(
+                        "forced post-write replay failure"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    StageEditProductionRegistryNotReadyError,
+                    "forced post-write replay failure",
+                ):
+                    register_stage_edit_production_bundle(
+                        checkpoint,
+                        professional_montage_grammar_profile_path=montage_profile,
+                        registry_path=registry,
+                    )
+            self.assertFalse(registry.exists())
+            self.assertFalse(
+                registry.with_name(f".{registry.name}.tmp").exists()
+            )
+
     def test_different_active_bundle_cannot_overwrite_registry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
