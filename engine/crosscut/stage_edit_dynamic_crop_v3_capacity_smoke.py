@@ -25,6 +25,7 @@ import secrets
 import subprocess
 import sys
 import time
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -81,9 +82,11 @@ from .stage_edit_dynamic_crop_mlx_smoke_cli import (
 )
 from .stage_edit_reference_adapter import ReferenceTrainingExample
 from .stage_edit_transformer import (
+    DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
     StageEditLossContract,
     StageEditSupervisionBatch,
     StageEditTensorBatch,
+    valid_dynamic_crop_v3_activation_checkpointing_evidence,
     StageEditTransformerConfig,
 )
 
@@ -103,20 +106,20 @@ else:
     _MLX_IMPORT_ERROR = None
 
 
-V3_CAPACITY_SMOKE_SCHEMA_VERSION = 1
+V3_CAPACITY_SMOKE_SCHEMA_VERSION = 2
 V3_CAPACITY_SMOKE_ANALYSIS_BASIS = (
-    "real_mlx_dynamic_crop_v3_release_shape_capacity_smoke_v1"
+    "real_mlx_dynamic_crop_v3_rematerialized_release_shape_capacity_smoke_v2"
 )
 V3_CAPACITY_SMOKE_ARTIFACT_PREFIX = "dynamic-crop-v3-mlx-capacity-smoke-"
 V3_CAPACITY_SMOKE_LOG_PREFIX = "dynamic-crop-v3-mlx-capacity-log-"
 V3_CAPACITY_SMOKE_RUNNER_CONTRACT = (
-    "dynamic_crop_v3_forward_backward_clip_adamw_fresh_process_v1"
+    "dynamic_crop_v3_rematerialized_forward_backward_clip_adamw_fresh_process_v2"
 )
 V3_CAPACITY_SMOKE_PACKING_CONTRACT = (
     "immutable_bbr15_source_exact_v3_fixed_lane_2x2048x32x720_v1"
 )
 V3_CAPACITY_SMOKE_PROCESS_CONTRACT = (
-    "one_supervisor_one_fresh_worker_one_pinned_v3_candidate_v1"
+    "one_supervisor_one_fresh_worker_one_pinned_rematerialized_v3_candidate_v2"
 )
 V3_CAPACITY_SMOKE_TARGET_CONTRACT = (
     "actual_bbr_v2_renderer_evidence_simplified_to_v3_capacity_only_v1"
@@ -124,6 +127,36 @@ V3_CAPACITY_SMOKE_TARGET_CONTRACT = (
 V3_CAPACITY_SMOKE_EVENT_PREFIX = "STAGEEDIT_V3_MLX_SMOKE_EVENT="
 V3_CAPACITY_SMOKE_NONCE_ENV = "STAGEEDIT_V3_MLX_SMOKE_RUN_NONCE"
 V3_CAPACITY_SMOKE_ARTIFACT_FAMILY = "dynamic_crop_v3_capacity_smoke"
+V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE: Mapping[str, Any] = (
+    MappingProxyType(
+        {
+            "contract": DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
+            "enabled": True,
+            "scope": "base_transformer_encoder_all_layers",
+            "implementation": "mlx.nn.TransformerEncoder.checkpoint",
+            "training_only": True,
+            "serialized_parameter_tree_changed": False,
+            "inference_runtime_requires_checkpointing": False,
+            "previous_value": False,
+        }
+    )
+)
+V3_CAPACITY_SMOKE_SOURCE_RELATIVE_PATHS: Mapping[str, str] = MappingProxyType(
+    {
+        "v3_capacity_runner": (
+            "engine/crosscut/stage_edit_dynamic_crop_v3_capacity_smoke.py"
+        ),
+        "v3_dynamic_crop_head": (
+            "engine/crosscut/stage_edit_dynamic_crop_head_v3.py"
+        ),
+        "stage_edit_transformer": (
+            "engine/crosscut/stage_edit_transformer.py"
+        ),
+        "immutable_bbr_loader": (
+            "engine/crosscut/stage_edit_dynamic_crop_mlx_smoke_cli.py"
+        ),
+    }
+)
 _PINNED_CANDIDATE_NAMES = (
     "compact-balanced",
     "intermediate-balanced",
@@ -158,6 +191,142 @@ def _is_sha256(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _exact_activation_checkpointing_evidence(value: object) -> bool:
+    return valid_dynamic_crop_v3_activation_checkpointing_evidence(value)
+
+
+def _validate_capacity_smoke_code_provenance(
+    value: object,
+    *,
+    require_clean_release: bool = False,
+) -> dict[str, Any]:
+    """Validate the complete clean-commit source receipt without trusting flags."""
+
+    if not isinstance(value, Mapping):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity smoke code provenance must be an object"
+        )
+    payload = dict(value)
+    expected_keys = {
+        "runner_contract",
+        "expected_git_commit",
+        "observed_git_commit",
+        "tracked_diff_policy",
+        "repository_status_clean",
+        "repository_status_sha256",
+        "source_files_match_observed_commit",
+        "source_files",
+        "release_trust_authorized",
+    }
+    if set(payload) != expected_keys:
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity smoke code provenance keys are not exact"
+        )
+    expected_commit = payload.get("expected_git_commit")
+    observed_commit = payload.get("observed_git_commit")
+    tracked_diff_policy = payload.get("tracked_diff_policy")
+    repository_clean = payload.get("repository_status_clean")
+    status_sha256 = payload.get("repository_status_sha256")
+    if (
+        payload.get("runner_contract") != V3_CAPACITY_SMOKE_RUNNER_CONTRACT
+        or not isinstance(expected_commit, str)
+        or len(expected_commit) != 40
+        or any(character not in "0123456789abcdef" for character in expected_commit)
+        or not isinstance(observed_commit, str)
+        or len(observed_commit) != 40
+        or any(character not in "0123456789abcdef" for character in observed_commit)
+        or tracked_diff_policy not in {"require_clean", "record_development"}
+        or not isinstance(repository_clean, bool)
+        or not _is_sha256(status_sha256)
+        or (repository_clean and status_sha256 != hashlib.sha256(b"").hexdigest())
+        or not isinstance(payload.get("source_files_match_observed_commit"), bool)
+        or not isinstance(payload.get("release_trust_authorized"), bool)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity smoke code provenance declarations are invalid"
+        )
+    source_files = payload.get("source_files")
+    if (
+        not isinstance(source_files, Mapping)
+        or set(source_files) != set(V3_CAPACITY_SMOKE_SOURCE_RELATIVE_PATHS)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity smoke source provenance set is incomplete"
+        )
+    all_match = True
+    for role, expected_relative in V3_CAPACITY_SMOKE_SOURCE_RELATIVE_PATHS.items():
+        record = source_files.get(role)
+        if not isinstance(record, Mapping) or set(record) != {
+            "path",
+            "file_sha256",
+            "repo_relative_path",
+            "observed_commit_blob_sha256",
+            "matches_observed_commit",
+        }:
+            raise DynamicCropV3CapacitySmokeError(
+                f"v3 capacity smoke source record is invalid: {role}"
+            )
+        raw_path = record.get("path")
+        file_sha256 = record.get("file_sha256")
+        blob_sha256 = record.get("observed_commit_blob_sha256")
+        matches_observed = record.get("matches_observed_commit")
+        if (
+            not isinstance(raw_path, str)
+            or not Path(raw_path).is_absolute()
+            or record.get("repo_relative_path") != expected_relative
+            or not _is_sha256(file_sha256)
+            or (blob_sha256 is not None and not _is_sha256(blob_sha256))
+            or not isinstance(matches_observed, bool)
+            or matches_observed != (blob_sha256 == file_sha256)
+            or tuple(Path(raw_path).parts[-len(Path(expected_relative).parts) :])
+            != Path(expected_relative).parts
+        ):
+            raise DynamicCropV3CapacitySmokeError(
+                f"v3 capacity smoke source record differs: {role}"
+            )
+        all_match = all_match and matches_observed
+    release_trust = bool(
+        tracked_diff_policy == "require_clean"
+        and observed_commit == expected_commit
+        and repository_clean
+        and all_match
+    )
+    if (
+        payload.get("source_files_match_observed_commit") is not all_match
+        or payload.get("release_trust_authorized") is not release_trust
+        or (require_clean_release and not release_trust)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity smoke code provenance is not clean release evidence"
+        )
+    return payload
+
+
+def _enable_v3_capacity_activation_checkpointing(
+    model: StageEditTransformerDynamicCropV3,
+) -> dict[str, Any]:
+    """Enable the exact production v3 MLX recomputation path."""
+
+    if not isinstance(model, StageEditTransformerDynamicCropV3):
+        raise TypeError(
+            "v3 capacity activation checkpointing requires the v3 model"
+        )
+    encoder = getattr(getattr(model, "base", None), "encoder", None)
+    if encoder is None or not hasattr(encoder, "checkpoint"):
+        raise RuntimeError(
+            "MLX TransformerEncoder checkpoint support is unavailable"
+        )
+    previous = getattr(encoder, "checkpoint")
+    if previous is not False:
+        raise RuntimeError(
+            "v3 capacity smoke requires checkpoint previous_value=false"
+        )
+    encoder.checkpoint = True
+    if encoder.checkpoint is not True:
+        raise RuntimeError("v3 activation checkpointing did not remain enabled")
+    return dict(V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +380,9 @@ class DynamicCropV3CapacityCandidate:
             "loss_contract": DYNAMIC_CROP_V3_LOSS_CONTRACT,
             "model_class": "StageEditTransformerDynamicCropV3",
             "loss_class": "DynamicCropV3LossContract",
+            "activation_checkpointing": dict(
+                V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE
+            ),
             "legacy_v2_checkpoint_compatible": False,
             "v2_model_or_loss_accepted": False,
             "model_config": self.model_config.to_dict(),
@@ -532,17 +704,13 @@ def _code_provenance(
         raise DynamicCropV3CapacitySmokeError("tracked diff policy is invalid")
     status = _git_bytes(repo, "status", "--porcelain=v1", "--untracked-files=all")
     source_paths = {
-        "v3_capacity_runner": runner,
-        "v3_dynamic_crop_head": Path(
-            sys.modules[StageEditTransformerDynamicCropV3.__module__].__file__
-        ).resolve(),
-        "stage_edit_transformer": Path(
-            sys.modules[StageEditTensorBatch.__module__].__file__
-        ).resolve(),
-        "immutable_bbr_loader": Path(
-            sys.modules[_load_bbr_feature_dataset.__module__].__file__
-        ).resolve(),
+        role: repo / relative
+        for role, relative in V3_CAPACITY_SMOKE_SOURCE_RELATIVE_PATHS.items()
     }
+    if source_paths["v3_capacity_runner"] != runner:
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 capacity runner path differs from its committed provenance path"
+        )
     files: dict[str, Any] = {}
     all_match = True
     for role, path in source_paths.items():
@@ -771,10 +939,17 @@ def _worker_main(args: argparse.Namespace) -> int:
         )
         model.train()
         mx.eval(model.parameters())
+        parameter_tree_before_checkpointing = _tree_evidence(model.parameters())
+        activation_checkpointing = _enable_v3_capacity_activation_checkpointing(
+            model
+        )
         parameter_tree = _tree_evidence(model.parameters())
-        if parameter_tree["element_count"] != candidate.parameter_count:
+        if (
+            parameter_tree_before_checkpointing != parameter_tree
+            or parameter_tree["element_count"] != candidate.parameter_count
+        ):
             raise RuntimeError(
-                "v3 parameter tree differs from exact analytical count"
+                "v3 activation checkpointing changed the parameter tree"
             )
         stages.append(_sync_memory_stage("model_allocated", started_at))
         optimizer = optim.AdamW(
@@ -838,6 +1013,10 @@ def _worker_main(args: argparse.Namespace) -> int:
                 "provenance_hashes": observed_hashes,
                 "tensor_provenance": tensor,
                 "parameter_count": candidate.parameter_count,
+                "activation_checkpointing": activation_checkpointing,
+                "parameter_tree_before_checkpointing": (
+                    parameter_tree_before_checkpointing
+                ),
                 "parameter_tree": parameter_tree,
                 "gradient_tree": gradient_tree,
                 "post_update_parameter_tree": post_update_tree,
@@ -955,10 +1134,16 @@ def _normalize_execution(
     parameter_trees_ok = all(
         exact_parameter_tree(result.get(name))
         for name in (
+            "parameter_tree_before_checkpointing",
             "parameter_tree",
             "gradient_tree",
             "post_update_parameter_tree",
         )
+    ) and result.get("parameter_tree_before_checkpointing") == result.get(
+        "parameter_tree"
+    )
+    activation_checkpointing_ok = _exact_activation_checkpointing_evidence(
+        result.get("activation_checkpointing")
     )
     optimizer_tree = result.get("optimizer_state_tree")
     optimizer_tree_ok = (
@@ -990,6 +1175,7 @@ def _normalize_execution(
         and result.get("worker_pid") == worker_pid
         and result.get("provenance_hashes") == dict(expected_hashes)
         and result.get("parameter_count") == candidate.parameter_count
+        and activation_checkpointing_ok
         and result.get("semantic_metrics_authorized") is False
         and result.get("model_selection_authorized") is False
     )
@@ -1045,6 +1231,7 @@ def _normalize_execution(
         and stage_peak_consistent
         and peak_valid
         and parameter_trees_ok
+        and activation_checkpointing_ok
         and optimizer_tree_ok
         and scalar_evidence_ok
         and result.get("runtime_execution_passed") is True
@@ -1076,6 +1263,11 @@ def _normalize_execution(
         "parameter_count": candidate.parameter_count,
         "model_class": "StageEditTransformerDynamicCropV3",
         "loss_class": "DynamicCropV3LossContract",
+        "activation_checkpointing": (
+            dict(V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE)
+            if activation_checkpointing_ok
+            else None
+        ),
         "tensor_provenance": dict(tensor) if isinstance(tensor, Mapping) else None,
         "memory_stages": stages if isinstance(stages, list) else [],
         "worker_receipt": result,
@@ -1227,6 +1419,9 @@ def _supervisor_main(args: argparse.Namespace) -> int:
             "analysis_basis": V3_CAPACITY_SMOKE_ANALYSIS_BASIS,
             "artifact_family": V3_CAPACITY_SMOKE_ARTIFACT_FAMILY,
             "dynamic_crop_version": 3,
+            "activation_checkpointing": dict(
+                V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE
+            ),
             "candidate": candidate.to_dict(),
             "dataset_provenance": dataset,
             "code_provenance": code,
@@ -1302,6 +1497,9 @@ def _validate_candidate_payload(value: object) -> DynamicCropV3CapacityCandidate
         or contract.get("loss_contract") != DYNAMIC_CROP_V3_LOSS_CONTRACT
         or contract.get("model_class") != "StageEditTransformerDynamicCropV3"
         or contract.get("loss_class") != "DynamicCropV3LossContract"
+        or not _exact_activation_checkpointing_evidence(
+            contract.get("activation_checkpointing")
+        )
         or contract.get("legacy_v2_checkpoint_compatible") is not False
         or contract.get("v2_model_or_loss_accepted") is not False
     ):
@@ -1309,6 +1507,209 @@ def _validate_candidate_payload(value: object) -> DynamicCropV3CapacityCandidate
             "candidate does not carry an exact v3-only contract"
         )
     return candidate
+
+
+def _validate_smoke_log_execution_binding(
+    root: Mapping[str, Any],
+    *,
+    candidate: DynamicCropV3CapacityCandidate,
+    code: Mapping[str, Any],
+) -> None:
+    """Replay the recorded child event and bind every log/receipt identity."""
+
+    log_pointer = root.get("runner_log")
+    if not isinstance(log_pointer, Mapping) or set(log_pointer) != {
+        "path",
+        "file_sha256",
+    }:
+        raise DynamicCropV3CapacitySmokeError("v3 runner log pointer is invalid")
+    log_path = Path(str(log_pointer.get("path") or ""))
+    if (
+        not log_path.is_absolute()
+        or not _is_sha256(log_pointer.get("file_sha256"))
+        or _file_sha256(log_path) != log_pointer.get("file_sha256")
+    ):
+        raise DynamicCropV3CapacitySmokeError("v3 runner log pointer differs")
+    try:
+        log = _addressed_payload(
+            log_path,
+            prefix=V3_CAPACITY_SMOKE_LOG_PREFIX,
+            label="Dynamic Crop v3 capacity runner log",
+        )
+    except (OSError, ValueError) as exc:
+        raise DynamicCropV3CapacitySmokeError(str(exc)) from exc
+    expected_log_keys = {
+        "schema_version",
+        "analysis_basis",
+        "suite_id",
+        "supervisor_pid",
+        "worker_pid",
+        "fresh_process",
+        "run_nonce_sha256",
+        "started_at_unix_ns",
+        "ended_at_unix_ns",
+        "returncode",
+        "command",
+        "stdout",
+        "stderr",
+        "artifact_content_sha256",
+    }
+    command = log.get("command")
+    supervisor_pid = log.get("supervisor_pid")
+    worker_pid = log.get("worker_pid")
+    returncode = log.get("returncode")
+    started_ns = log.get("started_at_unix_ns")
+    ended_ns = log.get("ended_at_unix_ns")
+    if (
+        set(log) != expected_log_keys
+        or log.get("schema_version") != 1
+        or log.get("analysis_basis")
+        != "dynamic_crop_v3_fresh_worker_process_log_v1"
+        or not isinstance(supervisor_pid, int)
+        or isinstance(supervisor_pid, bool)
+        or supervisor_pid < 1
+        or not isinstance(worker_pid, int)
+        or isinstance(worker_pid, bool)
+        or worker_pid < 1
+        or worker_pid == supervisor_pid
+        or log.get("fresh_process") is not True
+        or not _is_sha256(log.get("suite_id"))
+        or not _is_sha256(log.get("run_nonce_sha256"))
+        or not isinstance(started_ns, int)
+        or isinstance(started_ns, bool)
+        or not isinstance(ended_ns, int)
+        or isinstance(ended_ns, bool)
+        or ended_ns < started_ns
+        or not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or not isinstance(command, list)
+        or not all(isinstance(argument, str) for argument in command)
+        or not isinstance(log.get("stdout"), str)
+        or not isinstance(log.get("stderr"), str)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 runner log process receipt is invalid"
+        )
+    assert isinstance(command, list)
+    if command[1:6] != [
+        "-P",
+        "-S",
+        "-m",
+        "crosscut.stage_edit_dynamic_crop_v3_capacity_smoke",
+        "--worker",
+    ]:
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 runner log command does not invoke the isolated worker"
+        )
+
+    def command_value(option: str) -> str:
+        indices = [index for index, value in enumerate(command) if value == option]
+        if len(indices) != 1 or indices[0] + 1 >= len(command):
+            raise DynamicCropV3CapacitySmokeError(
+                f"v3 runner log command option differs: {option}"
+            )
+        return command[indices[0] + 1]
+
+    provenance_values: dict[str, Mapping[str, Any]] = {}
+    for name, key in (
+        ("dataset", "dataset_provenance"),
+        ("code", "code_provenance"),
+        ("runtime", "runtime_provenance"),
+        ("hardware", "hardware_provenance"),
+    ):
+        value = root.get(key)
+        if not isinstance(value, Mapping):
+            raise DynamicCropV3CapacitySmokeError(
+                f"v3 capacity smoke {name} provenance is missing"
+            )
+        provenance_values[name] = value
+    expected_hashes = {
+        name: _sha256(value) for name, value in provenance_values.items()
+    }
+    if (
+        command_value("--candidate-name") != candidate.candidate_name
+        or command_value("--expected-candidate-id") != candidate.candidate_id
+        or command_value("--suite-id") != log.get("suite_id")
+        or command_value("--expected-dataset-sha256")
+        != expected_hashes["dataset"]
+        or command_value("--expected-code-sha256") != expected_hashes["code"]
+        or command_value("--expected-runtime-sha256")
+        != expected_hashes["runtime"]
+        or command_value("--expected-hardware-sha256")
+        != expected_hashes["hardware"]
+        or command_value("--expected-git-commit")
+        != code.get("expected_git_commit")
+        or command_value("--tracked-diff-policy")
+        != code.get("tracked_diff_policy")
+        or command.count("--feature-manifest") != len(SELECTION_SONG_IDS)
+        or command.count("--materialization-manifest") != len(SELECTION_SONG_IDS)
+        or command.count("--dynamic-crop-manifest") != len(SELECTION_SONG_IDS)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 runner log command/provenance binding differs"
+        )
+    events = _parse_events(str(log["stdout"]))
+    attestation = root.get("supervisor_attestation")
+    expected_attestation_keys = {
+        "process_contract",
+        "suite_id",
+        "supervisor_pid",
+        "worker_pid",
+        "fresh_process",
+        "run_nonce_sha256",
+        "worker_event_count",
+        "worker_event_sha256",
+    }
+    if (
+        not isinstance(attestation, Mapping)
+        or set(attestation) != expected_attestation_keys
+        or attestation.get("process_contract")
+        != V3_CAPACITY_SMOKE_PROCESS_CONTRACT
+        or attestation.get("suite_id") != log.get("suite_id")
+        or attestation.get("supervisor_pid") != supervisor_pid
+        or attestation.get("worker_pid") != worker_pid
+        or attestation.get("fresh_process") is not True
+        or attestation.get("run_nonce_sha256") != log.get("run_nonce_sha256")
+        or attestation.get("worker_event_count") != 1
+        or len(events) != 1
+        or attestation.get("worker_event_sha256") != _sha256(events)
+    ):
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 fresh-process log/event attestation differs"
+        )
+    budget_payload = root.get("device_memory_budget")
+    if not isinstance(budget_payload, Mapping):
+        raise DynamicCropV3CapacitySmokeError("v3 device memory budget is missing")
+    try:
+        budget = DeviceMemoryBudget(**dict(budget_payload))
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3CapacitySmokeError(
+            f"v3 device memory budget is invalid: {exc}"
+        ) from exc
+    if budget.to_dict() != dict(budget_payload):
+        raise DynamicCropV3CapacitySmokeError("v3 device memory budget differs")
+    normalized = _normalize_execution(
+        event=events[0],
+        returncode=returncode,
+        candidate=candidate,
+        budget=budget,
+        supervisor_pid=supervisor_pid,
+        worker_pid=worker_pid,
+        suite_id=str(log["suite_id"]),
+        run_nonce_sha256=str(log["run_nonce_sha256"]),
+        expected_hashes=expected_hashes,
+    )
+    try:
+        normalized_bytes = _canonical_bytes(normalized)
+        observed_bytes = _canonical_bytes(root.get("execution"))
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3CapacitySmokeError(
+            f"v3 execution receipt cannot be canonicalized: {exc}"
+        ) from exc
+    if observed_bytes != normalized_bytes:
+        raise DynamicCropV3CapacitySmokeError(
+            "v3 execution receipt differs from the bound worker log event"
+        )
 
 
 def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
@@ -1327,6 +1728,7 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
         "analysis_basis",
         "artifact_family",
         "dynamic_crop_version",
+        "activation_checkpointing",
         "candidate",
         "dataset_provenance",
         "code_provenance",
@@ -1350,6 +1752,9 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
         or root.get("analysis_basis") != V3_CAPACITY_SMOKE_ANALYSIS_BASIS
         or root.get("artifact_family") != V3_CAPACITY_SMOKE_ARTIFACT_FAMILY
         or root.get("dynamic_crop_version") != 3
+        or not _exact_activation_checkpointing_evidence(
+            root.get("activation_checkpointing")
+        )
         or root.get("capacity_runtime_evidence_only") is not True
         or root.get("semantic_metrics_authorized") is not False
         or root.get("model_selection_authorized") is not False
@@ -1358,6 +1763,9 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
             "v3 capacity smoke schema or authority differs"
         )
     candidate = _validate_candidate_payload(root.get("candidate"))
+    code = _validate_capacity_smoke_code_provenance(
+        root.get("code_provenance")
+    )
     execution = root.get("execution")
     if not isinstance(execution, Mapping):
         raise DynamicCropV3CapacitySmokeError("v3 execution must be an object")
@@ -1367,6 +1775,9 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
             execution.get("model_class") != "StageEditTransformerDynamicCropV3"
             or execution.get("loss_class") != "DynamicCropV3LossContract"
             or execution.get("parameter_count") != candidate.parameter_count
+            or not _exact_activation_checkpointing_evidence(
+                execution.get("activation_checkpointing")
+            )
             or not isinstance(tensor, Mapping)
             or tensor.get("source_tensor_shape") != [2, 2048, 32, 720]
             or tensor.get("dynamic_crop_version") != 3
@@ -1376,42 +1787,16 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
                 "v3 execution contains a mixed or incomplete runtime receipt"
             )
     if (
-        execution.get("semantic_metrics_authorized") is not False
+        not _exact_activation_checkpointing_evidence(
+            execution.get("activation_checkpointing")
+        )
+        or execution.get("semantic_metrics_authorized") is not False
         or execution.get("model_selection_authorized") is not False
     ):
         raise DynamicCropV3CapacitySmokeError(
             "capacity smoke cannot authorize semantic selection"
         )
-    attestation = root.get("supervisor_attestation")
-    if (
-        not isinstance(attestation, Mapping)
-        or attestation.get("process_contract")
-        != V3_CAPACITY_SMOKE_PROCESS_CONTRACT
-        or attestation.get("fresh_process") is not True
-        or attestation.get("supervisor_pid") == attestation.get("worker_pid")
-        or attestation.get("worker_event_count") != 1
-        or not _is_sha256(attestation.get("run_nonce_sha256"))
-    ):
-        raise DynamicCropV3CapacitySmokeError(
-            "v3 fresh-process attestation is invalid"
-        )
-    log_pointer = root.get("runner_log")
-    if not isinstance(log_pointer, Mapping) or set(log_pointer) != {
-        "path",
-        "file_sha256",
-    }:
-        raise DynamicCropV3CapacitySmokeError("v3 runner log pointer is invalid")
-    log_path = Path(str(log_pointer["path"]))
-    if _file_sha256(log_path) != log_pointer["file_sha256"]:
-        raise DynamicCropV3CapacitySmokeError("v3 runner log hash differs")
-    try:
-        _addressed_payload(
-            log_path,
-            prefix=V3_CAPACITY_SMOKE_LOG_PREFIX,
-            label="Dynamic Crop v3 capacity runner log",
-        )
-    except (OSError, ValueError) as exc:
-        raise DynamicCropV3CapacitySmokeError(str(exc)) from exc
+    _validate_smoke_log_execution_binding(root, candidate=candidate, code=code)
     return root
 
 
@@ -1497,6 +1882,7 @@ __all__ = [
     "DynamicCropV3CapacityCandidate",
     "DynamicCropV3CapacitySmokeError",
     "V3_CAPACITY_SMOKE_ANALYSIS_BASIS",
+    "V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE",
     "V3_CAPACITY_SMOKE_ARTIFACT_PREFIX",
     "V3_CAPACITY_SMOKE_SCHEMA_VERSION",
     "default_dynamic_crop_v3_capacity_candidates",
