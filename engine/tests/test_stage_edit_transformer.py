@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -8,6 +9,30 @@ import tempfile
 import unittest
 
 import numpy as np
+
+from crosscut.render import EditorialTransformKeyframe
+from crosscut.stage_edit_dynamic_crop_head_v2 import (
+    DynamicCropTrajectoryTargetV2,
+    StageEditDynamicCropTargetSequenceV2,
+)
+from crosscut.stage_edit_dynamic_crop_training import (
+    StageEditDynamicCropTrainingCorpusV2,
+)
+from crosscut.stage_edit_dynamic_crop_training_v3 import (
+    StageEditDynamicCropTrainingCorpusV3,
+    build_stage_edit_dynamic_crop_training_corpus_v3,
+)
+from crosscut.stage_edit_head_materializer import (
+    materialize_stage_edit_head_frames_v3,
+)
+from crosscut.stage_edit_production_training import (
+    ProductionQualityThresholds,
+    train_production_stage_edit,
+)
+from crosscut.stage_edit_reference_adapter import (
+    ReferenceTrainingCorpus,
+    ReferenceTrainingExample,
+)
 
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
@@ -159,6 +184,91 @@ def _targets(sequence_id: str = "ive:test") -> StageEditTargetSequence:
                 transition_label="zoom_match",
             ),
         ),
+    )
+
+
+def _v3_production_corpora() -> tuple[
+    ReferenceTrainingCorpus,
+    StageEditDynamicCropTrainingCorpusV3,
+    tuple[ReferenceTrainingExample, ...],
+]:
+    examples: list[ReferenceTrainingExample] = []
+    dynamic_sequences = {}
+    for song in ("BANG", "BLACKHOLE", "XOXZ"):
+        for index in range(2):
+            reference_id = f"{song}-v3-readiness-{index}"
+            sequence = _sequence(reference_id)
+            targets = _targets(reference_id)
+            examples.append(
+                ReferenceTrainingExample(
+                    reference_id=reference_id,
+                    song_id=song,
+                    style_id="human-stage-mix",
+                    sequence=sequence,
+                    targets=targets,
+                    statistics={
+                        "dense_editorial_source_switch_positive_count": 2,
+                        "editorial_source_switch_positive_count": 2,
+                        "cut_positive_count": 2,
+                        "native_source_camera_cut_count": 0,
+                        "native_source_camera_cut_editorial_positive_count": 0,
+                        "materialized_feature_snapshot_used": True,
+                        "shared_feature_materializer_used": True,
+                    },
+                    feature_snapshot_sha256=hashlib.sha256(
+                        reference_id.encode("utf-8")
+                    ).hexdigest(),
+                )
+            )
+            dynamic_targets = [None] * len(sequence.tokens)
+            for token_index in (0, 2):
+                dynamic_targets[token_index] = DynamicCropTrajectoryTargetV2(
+                    shot_index=token_index,
+                    source_id="A",
+                    shot_duration_seconds=1.0,
+                    keyframes=(
+                        EditorialTransformKeyframe(
+                            0.0, 1.04, 0.50, 0.50, 0.0
+                        ),
+                        EditorialTransformKeyframe(
+                            0.5, 1.07, 0.51, 0.50, 0.0
+                        ),
+                    ),
+                    motion_label="dynamic",
+                    motion_label_loss_masked=False,
+                    artifact_content_sha256="a" * 64,
+                    build_fingerprint_sha256="b" * 64,
+                )
+            dynamic_sequences[reference_id] = (
+                StageEditDynamicCropTargetSequenceV2(
+                    reference_id,
+                    tuple(dynamic_targets),
+                )
+            )
+    example_tuple = tuple(examples)
+    corpus = ReferenceTrainingCorpus(
+        examples=example_tuple,
+        data_id="7" * 64,
+        source_paths=(),
+        statistics={
+            "crop_coordinate_supervision_count": 24,
+            "transition_supervision_count": 12,
+        },
+    )
+    dynamic_v2 = StageEditDynamicCropTrainingCorpusV2(
+        sequences=dynamic_sequences,
+        data_id="dynamic-v2-readiness-test",
+        artifact_paths=(),
+        statistics={
+            "track_label_count": 2 * len(example_tuple),
+            "keyframe_label_count": 4 * len(example_tuple),
+            "motion_label_count": 2 * len(example_tuple),
+        },
+    )
+    return (
+        corpus,
+        build_stage_edit_dynamic_crop_training_corpus_v3(dynamic_v2),
+        example_tuple,
     )
 
 
@@ -1336,6 +1446,125 @@ class StageEditMLXTests(unittest.TestCase):
                 self.assertIn(
                     "unseen song was not excluded", rejected.reason
                 )
+
+    def test_v3_readiness_report_and_materializer_are_version_exact(self) -> None:
+        corpus, dynamic_corpus, examples = _v3_production_corpora()
+        thresholds = ProductionQualityThresholds(
+            minimum_cut_labels=2,
+            minimum_cut_positives=1,
+            minimum_cut_negatives=1,
+            minimum_cut_auroc=0.0,
+            minimum_cut_balanced_accuracy=0.0,
+            minimum_source_groups=1,
+            minimum_source_top1_accuracy=0.0,
+            minimum_source_mrr=0.0,
+            minimum_duration_labels=1,
+            minimum_duration_accuracy=0.0,
+            minimum_transition_labels=1,
+            minimum_transition_accuracy=0.0,
+            minimum_crop_labels_per_coordinate=1,
+            maximum_zoom_mae=100.0,
+            maximum_center_mae=100.0,
+            maximum_roll_mae_degrees=100.0,
+            minimum_dynamic_crop_tracks=1,
+            minimum_dynamic_crop_keyframes=1,
+            minimum_dynamic_crop_motion_labels=1,
+            maximum_dynamic_crop_zoom_mae=100.0,
+            maximum_dynamic_crop_center_mae=100.0,
+            maximum_dynamic_crop_roll_mae_degrees=100.0,
+            maximum_dynamic_crop_normalized_time_mae=100.0,
+            minimum_dynamic_crop_presence_f1=0.0,
+            minimum_dynamic_crop_keyframe_count_accuracy=0.0,
+            minimum_dynamic_crop_motion_accuracy=0.0,
+            minimum_dynamic_crop_renderer_decode_rate=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "v3-production"
+            trained = train_production_stage_edit(
+                corpus,
+                checkpoint_directory=checkpoint,
+                held_out_song_ids=("XOXZ",),
+                model_config=self.config,
+                epochs=8,
+                early_stopping_patience=16,
+                batch_size=2,
+                learning_rate=3.0e-3,
+                cut_pretrain_steps=0,
+                source_pretrain_steps=0,
+                finetune_warmup_steps=0,
+                minimum_finetune_optimizer_steps=1,
+                minimum_checkpoint_selection_finetune_steps=1,
+                seed=37,
+                device=mx.cpu,
+                dynamic_crop_corpus=dynamic_corpus,
+                quality_thresholds=thresholds,
+                authorize_production_activation=True,
+            )
+            self.assertTrue(trained.production_ready)
+            readiness = stage_edit_readiness_report(checkpoint)
+            self.assertTrue(readiness.learned_inference_ready, readiness.reason)
+            self.assertEqual("production_checkpoint_ready", readiness.status)
+            self.assertEqual("dynamic_crop_v3", readiness.checkpoint_format)
+            self.assertEqual(3, readiness.dynamic_crop_version)
+            self.assertEqual(
+                "dynamic-crop-v3-metadata.json",
+                readiness.checkpoint_metadata_filename,
+            )
+
+            materialized = materialize_stage_edit_head_frames_v3(
+                checkpoint_directory=checkpoint,
+                sequence=examples[0].sequence,
+                canonical_source_ids=("A", "B", "C"),
+                schema=SCHEMA,
+            )
+            self.assertEqual(3, materialized.dynamic_crop_version)
+            self.assertEqual(len(examples[0].sequence.tokens), len(materialized.frames))
+            self.assertTrue(
+                all(frame.dynamic_crop_v3_by_source for frame in materialized.frames)
+            )
+
+            report_path = checkpoint / PRODUCTION_TRAINING_REPORT_FILENAME
+            original_report = json.loads(report_path.read_text(encoding="utf-8"))
+            tampered_model = copy.deepcopy(original_report)
+            tampered_model["model"]["dynamic_crop_version"] = 2
+            report_path.write_text(
+                json.dumps(tampered_model), encoding="utf-8"
+            )
+            rejected_model = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(rejected_model.learned_inference_ready)
+            self.assertIn("does not declare v3", rejected_model.reason)
+
+            tampered_gate = copy.deepcopy(original_report)
+            tampered_gate["optimization"][
+                "best_validation_selection_evidence"
+            ]["dynamic_crop_v3_selection_gate"][
+                "minimum_safe_zoom_projection_count"
+            ] = 1
+            report_path.write_text(
+                json.dumps(tampered_gate), encoding="utf-8"
+            )
+            rejected_gate = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(rejected_gate.learned_inference_ready)
+            self.assertIn("projection count is not zero", rejected_gate.reason)
+
+            report_path.write_text(
+                json.dumps(original_report), encoding="utf-8"
+            )
+            mixed_path = checkpoint / "dynamic-crop-v2-metadata.json"
+            mixed_path.write_text("{}", encoding="utf-8")
+            mixed = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(mixed.learned_inference_ready)
+            self.assertEqual("checkpoint_invalid", mixed.status)
+            self.assertIn("mixed model namespaces", mixed.reason)
+            mixed_path.unlink()
+
+            weight_path = checkpoint / "dynamic-crop-v3-model.safetensors"
+            original_weights = weight_path.read_bytes()
+            weight_path.write_bytes(original_weights + b"tamper")
+            tampered_weights = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(tampered_weights.learned_inference_ready)
+            self.assertEqual("untrained_checkpoint_only", tampered_weights.status)
+            weight_path.write_bytes(original_weights)
 
 
 if __name__ == "__main__":

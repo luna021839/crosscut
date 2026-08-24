@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -10,11 +13,17 @@ from crosscut.stage_edit_dynamic_crop_head_v2 import (
     new_stage_edit_dynamic_crop_checkpoint_metadata_v2,
 )
 from crosscut.stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_MODEL_CONTRACT,
     StageEditDynamicCropModelOutputV3,
+    StageEditTransformerDynamicCropV3,
     new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
+    save_stage_edit_dynamic_crop_checkpoint_v3,
 )
 from crosscut.stage_edit_head_materializer import (
+    STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION,
     StageEditHeadMaterializerInputError,
+    StageEditHeadMaterializerNotReadyError,
+    materialize_stage_edit_head_frames_v3,
     stage_edit_head_frames_from_dynamic_crop_output_v2,
     stage_edit_head_frames_from_dynamic_crop_output_v3,
 )
@@ -22,6 +31,7 @@ from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     SourceCandidateToken,
     StageEditSequence,
+    StageEditReadinessReport,
     StageEditToken,
     StageEditTransformerConfig,
     mlx_runtime_version,
@@ -288,6 +298,157 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
                 schema=DEFAULT_STAGE_EDIT_SCHEMA,
                 metadata=self.metadata_v3,
             )
+
+    def test_v3_source_order_and_effective_gates_fail_closed(self) -> None:
+        with self.assertRaisesRegex(
+            StageEditHeadMaterializerInputError,
+            "outside canonical order",
+        ):
+            stage_edit_head_frames_from_dynamic_crop_output_v3(
+                sequence=self.sequence,
+                batch=self.batch,
+                output=self._output_v3(),
+                canonical_source_ids=("A",),
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                metadata=self.metadata_v3,
+            )
+
+        mismatched = self._output_v3()
+        mismatched.effective_source_mask[0, 0, 0] = False
+        with self.assertRaisesRegex(
+            StageEditHeadMaterializerInputError,
+            "effective-source mask",
+        ):
+            stage_edit_head_frames_from_dynamic_crop_output_v3(
+                sequence=self.sequence,
+                batch=self.batch,
+                output=mismatched,
+                canonical_source_ids=("A", "B"),
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                metadata=self.metadata_v3,
+            )
+
+    def test_v3_checkpoint_forward_reports_versioned_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mx.stream(mx.cpu):
+            checkpoint = Path(directory)
+            model = StageEditTransformerDynamicCropV3(self.config)
+            saved = save_stage_edit_dynamic_crop_checkpoint_v3(
+                checkpoint,
+                model,
+                self.metadata_v3,
+            )
+            readiness = StageEditReadinessReport(
+                architecture_available=True,
+                learned_inference_ready=True,
+                status="production_checkpoint_ready",
+                reason="test production evidence",
+                mlx_version=mlx_runtime_version(),
+                checkpoint_path=str(checkpoint.resolve()),
+                training_steps=saved.training_steps,
+                checkpoint_format="dynamic_crop_v3",
+                dynamic_crop_version=3,
+                checkpoint_metadata_filename="dynamic-crop-v3-metadata.json",
+            )
+            with patch(
+                "crosscut.stage_edit_head_materializer.stage_edit_readiness_report",
+                return_value=readiness,
+            ):
+                result = materialize_stage_edit_head_frames_v3(
+                    checkpoint_directory=checkpoint,
+                    sequence=self.sequence,
+                    canonical_source_ids=("A", "B"),
+                    schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                )
+
+            self.assertEqual(
+                STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION,
+                result.schema_version,
+            )
+            self.assertEqual("dynamic_crop_v3", result.checkpoint_format)
+            self.assertEqual(3, result.dynamic_crop_version)
+            self.assertEqual(
+                "dynamic-crop-v3-metadata.json",
+                result.checkpoint_metadata_filename,
+            )
+            self.assertEqual(
+                DYNAMIC_CROP_V3_MODEL_CONTRACT,
+                result.checkpoint_contracts["model_contract"],
+            )
+            self.assertEqual(
+                saved.contract_fingerprint_sha256,
+                result.checkpoint_contracts["contract_fingerprint_sha256"],
+            )
+            result_payload = result.to_dict()
+            self.assertEqual(3, result_payload["dynamic_crop_version"])
+            self.assertEqual(
+                DYNAMIC_CROP_V3_MODEL_CONTRACT,
+                result_payload["checkpoint_contracts"]["model_contract"],
+            )
+            self.assertTrue(
+                all(
+                    frame.dynamic_crop_v3_by_source
+                    for frame in result.frames
+                )
+            )
+            self.assertTrue(
+                all(frame.dynamic_crop_v2 is None for frame in result.frames)
+            )
+
+    def test_v3_checkpoint_namespace_and_schema_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mx.stream(mx.cpu):
+            checkpoint = Path(directory)
+            model = StageEditTransformerDynamicCropV3(self.config)
+            saved = save_stage_edit_dynamic_crop_checkpoint_v3(
+                checkpoint,
+                model,
+                self.metadata_v3,
+            )
+            readiness = StageEditReadinessReport(
+                architecture_available=True,
+                learned_inference_ready=True,
+                status="production_checkpoint_ready",
+                reason="test production evidence",
+                mlx_version=mlx_runtime_version(),
+                checkpoint_path=str(checkpoint.resolve()),
+                training_steps=saved.training_steps,
+                checkpoint_format="dynamic_crop_v3",
+                dynamic_crop_version=3,
+                checkpoint_metadata_filename="dynamic-crop-v3-metadata.json",
+            )
+            (checkpoint / "dynamic-crop-v2-metadata.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                StageEditHeadMaterializerNotReadyError,
+                "unambiguous Dynamic Crop v3",
+            ):
+                materialize_stage_edit_head_frames_v3(
+                    checkpoint_directory=checkpoint,
+                    sequence=self.sequence,
+                    canonical_source_ids=("A", "B"),
+                )
+            (checkpoint / "dynamic-crop-v2-metadata.json").unlink()
+
+            incompatible_schema = replace(
+                DEFAULT_STAGE_EDIT_SCHEMA,
+                style_feature_names=(
+                    *DEFAULT_STAGE_EDIT_SCHEMA.style_feature_names,
+                    "test_only_extra_style",
+                ),
+            )
+            with patch(
+                "crosscut.stage_edit_head_materializer.stage_edit_readiness_report",
+                return_value=readiness,
+            ), self.assertRaisesRegex(
+                StageEditHeadMaterializerInputError,
+                "token schema differs",
+            ):
+                materialize_stage_edit_head_frames_v3(
+                    checkpoint_directory=checkpoint,
+                    sequence=self.sequence,
+                    canonical_source_ids=("A", "B"),
+                    schema=incompatible_schema,
+                )
 
 
 if __name__ == "__main__":

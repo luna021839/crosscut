@@ -87,6 +87,15 @@ STAGE_EDIT_VALIDATION_SELECTION_CONTRACT = (
 STAGE_EDIT_CUT_THRESHOLD_SELECTION_CONTRACT = (
     "training_song_reference_validation_balanced_accuracy_threshold_v1"
 )
+DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT = (
+    "dynamic_crop_v3_renderer_exact_static_prior_improvement_gate_v1"
+)
+DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT = (
+    "immutable_v2_renderer_evidence_to_simplified_source_exact_v3_targets_v1"
+)
+DYNAMIC_CROP_V3_PRODUCTION_ARCHITECTURE = (
+    "causal_long_context_transformer_with_source_conditioned_dynamic_crop_v3"
+)
 STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES = tuple(
     f"pose_model_embedding_{index:02d}" for index in range(60)
 )
@@ -1803,9 +1812,179 @@ class StageEditReadinessReport:
     mlx_version: str | None
     checkpoint_path: str | None
     training_steps: int
+    checkpoint_format: str | None = None
+    dynamic_crop_version: int | None = None
+    checkpoint_metadata_filename: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _dynamic_crop_v3_selection_gate_errors(
+    value: Any,
+    *,
+    name: str,
+) -> tuple[str, ...]:
+    """Validate the exact validation-only renderer gate bound to v3 selection."""
+
+    if not isinstance(value, Mapping):
+        return (f"{name} is missing",)
+    errors: list[str] = []
+    if value.get("contract") != DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT:
+        errors.append(f"{name} contract differs")
+    if value.get("selectable") is not True:
+        errors.append(f"{name} is not selectable")
+    if value.get("reasons") != []:
+        errors.append(f"{name} contains rejection reasons")
+    if value.get("heldout_metrics_consumed") is not False:
+        errors.append(f"{name} consumed held-out metrics")
+    if value.get("static_prior_can_be_selected") is not False:
+        errors.append(f"{name} permits the static prior")
+
+    attempt_count = value.get("renderer_decode_attempt_count")
+    eligible_count = value.get("renderer_decode_eligible_count")
+    eligible_rate = value.get("renderer_decode_eligible_rate")
+    if (
+        isinstance(attempt_count, bool)
+        or not isinstance(attempt_count, int)
+        or attempt_count < 1
+    ):
+        errors.append(f"{name} renderer attempts are invalid")
+    if (
+        isinstance(eligible_count, bool)
+        or not isinstance(eligible_count, int)
+        or not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or eligible_count != attempt_count
+        or not isinstance(eligible_rate, (int, float))
+        or isinstance(eligible_rate, bool)
+        or not math.isfinite(float(eligible_rate))
+        or float(eligible_rate) != 1.0
+    ):
+        errors.append(f"{name} renderer decode is not exactly 100 percent")
+    projection_count = value.get("minimum_safe_zoom_projection_count")
+    if (
+        isinstance(projection_count, bool)
+        or not isinstance(projection_count, int)
+        or projection_count != 0
+    ):
+        errors.append(f"{name} renderer projection count is not zero")
+    mismatch_count = value.get("target_source_slot_mismatch_count")
+    if (
+        isinstance(mismatch_count, bool)
+        or not isinstance(mismatch_count, int)
+        or mismatch_count != 0
+    ):
+        errors.append(f"{name} source-slot mismatch count is not zero")
+    improvement = value.get(
+        "aggregate_normalized_improvement_over_static_prior"
+    )
+    score_component = value.get("score_component")
+    if (
+        not isinstance(improvement, (int, float))
+        or isinstance(improvement, bool)
+        or not math.isfinite(float(improvement))
+        or float(improvement) <= 0.0
+        or not isinstance(score_component, (int, float))
+        or isinstance(score_component, bool)
+        or not math.isfinite(float(score_component))
+        or float(score_component) != float(improvement)
+    ):
+        errors.append(f"{name} does not prove positive static-prior improvement")
+    return tuple(errors)
+
+
+def _dynamic_crop_v3_gate_metric_binding_errors(
+    gate: Any,
+    metrics: Any,
+    *,
+    metadata: Any,
+    name: str,
+) -> tuple[str, ...]:
+    """Bind summarized gate evidence to the full evaluator payload."""
+
+    if not isinstance(gate, Mapping) or not isinstance(metrics, Mapping):
+        return (f"{name} metric binding is missing",)
+    errors: list[str] = []
+    expected_contracts = {
+        "schema_version": 3,
+        "model_contract": getattr(metadata, "model_contract", None),
+        "target_contract": getattr(metadata, "target_contract", None),
+        "output_contract": getattr(metadata, "output_contract", None),
+        "legacy_v2_checkpoint_or_output_used": False,
+        "legacy_static_crop_head_used_for_trajectory": False,
+    }
+    for field_name, expected in expected_contracts.items():
+        if metrics.get(field_name) != expected:
+            errors.append(f"{name} evaluator {field_name} differs")
+    trajectory = metrics.get("trajectory")
+    renderer = (
+        trajectory.get("renderer_decode")
+        if isinstance(trajectory, Mapping)
+        else None
+    )
+    if not isinstance(trajectory, Mapping) or not isinstance(renderer, Mapping):
+        errors.append(f"{name} evaluator trajectory is missing")
+        return tuple(errors)
+    bindings = {
+        "renderer_decode_attempt_count": renderer.get("attempt_count"),
+        "renderer_decode_eligible_count": renderer.get("eligible_count"),
+        "renderer_decode_eligible_rate": renderer.get("eligible_rate"),
+        "minimum_safe_zoom_projection_count": renderer.get(
+            "minimum_safe_zoom_projection_count"
+        ),
+        "target_source_slot_mismatch_count": trajectory.get(
+            "target_source_slot_mismatch_count"
+        ),
+        "aggregate_normalized_improvement_over_static_prior": trajectory.get(
+            "aggregate_normalized_improvement_over_static_prior"
+        ),
+    }
+    for field_name, expected in bindings.items():
+        if gate.get(field_name) != expected:
+            errors.append(f"{name} gate {field_name} differs from evaluator metrics")
+    return tuple(errors)
+
+
+def _dynamic_crop_v3_composite_selection_errors(
+    value: Any,
+    *,
+    name: str,
+) -> tuple[str, ...]:
+    if not isinstance(value, Mapping):
+        return (f"{name} composite evidence is missing",)
+    base_score = value.get("base_selection_score")
+    dynamic_score = value.get("dynamic_crop_v3_score_component")
+    score = value.get("score")
+    numeric = all(
+        isinstance(item, (int, float))
+        and not isinstance(item, bool)
+        and math.isfinite(float(item))
+        for item in (base_score, dynamic_score, score)
+    )
+    components = value.get("components")
+    component_score = (
+        components.get(
+            "dynamic_crop_v3_aggregate_normalized_improvement_over_static_prior"
+        )
+        if isinstance(components, Mapping)
+        else None
+    )
+    if (
+        not numeric
+        or float(dynamic_score) <= 0.0
+        or not math.isclose(
+            float(score),
+            float(base_score) + float(dynamic_score),
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        )
+        or component_score != dynamic_score
+        or "dynamic_crop_v3_aggregate_normalized_improvement_over_static_prior"
+        not in str(value.get("formula", ""))
+    ):
+        return (f"{name} composite score does not include v3 improvement",)
+    return ()
 
 
 def _production_training_report_errors(
@@ -1813,12 +1992,17 @@ def _production_training_report_errors(
     *,
     metadata: Any,
     actual_weight_sha256: str | None,
+    checkpoint_format: str,
 ) -> tuple[str, ...]:
     """Validate the minimum evidence contract for learned production use."""
 
     if not isinstance(payload, Mapping):
         return ("production training report root must be an object",)
     errors: list[str] = []
+    dynamic_crop_v2_checkpoint = checkpoint_format == "dynamic_crop_v2"
+    dynamic_crop_v3_checkpoint = checkpoint_format == "dynamic_crop_v3"
+    if checkpoint_format not in ("legacy", "dynamic_crop_v2", "dynamic_crop_v3"):
+        return ("production checkpoint format is unsupported",)
     schema_version = payload.get("schema_version")
     if (
         isinstance(schema_version, bool)
@@ -1926,7 +2110,7 @@ def _production_training_report_errors(
         if isinstance(effective_dynamic_loss, Mapping)
         else None
     )
-    if hasattr(metadata, "dynamic_crop_config") and (
+    if (dynamic_crop_v2_checkpoint or dynamic_crop_v3_checkpoint) and (
         not isinstance(dynamic_base_loss, Mapping)
         or dynamic_base_loss.get("transition_authority")
         != getattr(metadata_config, "transition_authority", None)
@@ -2018,7 +2202,6 @@ def _production_training_report_errors(
                 )
 
     checkpoint = payload.get("checkpoint")
-    dynamic_crop_v2_checkpoint = hasattr(metadata, "dynamic_crop_config")
     if not isinstance(checkpoint, Mapping):
         errors.append("production checkpoint evidence is missing")
     else:
@@ -2039,10 +2222,56 @@ def _production_training_report_errors(
             dynamic_crop_v2_checkpoint
         ):
             errors.append("training report dynamic-crop checkpoint kind mismatches")
+        if dynamic_crop_v3_checkpoint:
+            expected_checkpoint_fields = {
+                "checkpoint_format": "dynamic_crop_v3",
+                "dynamic_crop_version": 3,
+                "metadata_filename": "dynamic-crop-v3-metadata.json",
+                "dynamic_crop_v2_checkpoint": False,
+                "dynamic_crop_v3_checkpoint": True,
+                "dynamic_crop_model_contract": getattr(
+                    metadata, "model_contract", None
+                ),
+                "dynamic_crop_target_contract": getattr(
+                    metadata, "target_contract", None
+                ),
+                "dynamic_crop_output_contract": getattr(
+                    metadata, "output_contract", None
+                ),
+            }
+            for field_name, expected in expected_checkpoint_fields.items():
+                if checkpoint.get(field_name) != expected:
+                    errors.append(
+                        f"production checkpoint {field_name} does not declare v3"
+                    )
+            data_id = checkpoint.get("dynamic_crop_v3_data_id")
+            if not isinstance(data_id, str) or not data_id.strip():
+                errors.append(
+                    "production checkpoint dynamic-crop v3 data id is missing"
+                )
 
     model = payload.get("model")
     if not isinstance(model, Mapping):
         errors.append("production model evidence is missing")
+    elif dynamic_crop_v3_checkpoint:
+        expected_model_fields = {
+            "architecture": DYNAMIC_CROP_V3_PRODUCTION_ARCHITECTURE,
+            "dynamic_crop_version": 3,
+            "dynamic_crop_v2_enabled": False,
+            "dynamic_crop_v3_enabled": True,
+            "dynamic_crop_model_contract": getattr(
+                metadata, "model_contract", None
+            ),
+            "dynamic_crop_target_contract": getattr(
+                metadata, "target_contract", None
+            ),
+            "dynamic_crop_output_contract": getattr(
+                metadata, "output_contract", None
+            ),
+        }
+        for field_name, expected in expected_model_fields.items():
+            if model.get(field_name) != expected:
+                errors.append(f"production model {field_name} does not declare v3")
     elif dynamic_crop_v2_checkpoint:
         if model.get("dynamic_crop_v2_enabled") is not True:
             errors.append("dynamic-crop v2 model activation evidence is missing")
@@ -2050,6 +2279,58 @@ def _production_training_report_errors(
             "causal_long_context_transformer_with_k8_dynamic_crop_v2"
         ):
             errors.append("production model is not the K=8 dynamic-crop v2 architecture")
+
+    data = payload.get("data")
+    if dynamic_crop_v3_checkpoint:
+        if not isinstance(data, Mapping):
+            errors.append("production dynamic-crop v3 corpus evidence is missing")
+        else:
+            dynamic_v3_data = data.get("dynamic_crop_v3")
+            if data.get("dynamic_crop_version") != 3:
+                errors.append("production corpus does not declare dynamic-crop v3")
+            if data.get("dynamic_crop_v2") is not None:
+                errors.append("production v3 corpus evidence contains a v2 corpus")
+            if not isinstance(dynamic_v3_data, Mapping):
+                errors.append("production dynamic-crop v3 corpus manifest is missing")
+            else:
+                expected_data_id = (
+                    checkpoint.get("dynamic_crop_v3_data_id")
+                    if isinstance(checkpoint, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(dynamic_v3_data.get("data_id"), str)
+                    or not dynamic_v3_data.get("data_id", "").strip()
+                    or dynamic_v3_data.get("data_id") != expected_data_id
+                ):
+                    errors.append("production dynamic-crop v3 corpus data id differs")
+                if (
+                    not isinstance(dynamic_v3_data.get("source_v2_data_id"), str)
+                    or not dynamic_v3_data.get("source_v2_data_id", "").strip()
+                ):
+                    errors.append(
+                        "production dynamic-crop v3 source-v2 corpus id is missing"
+                    )
+                if dynamic_v3_data.get("contract") != (
+                    DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT
+                ):
+                    errors.append("production dynamic-crop v3 corpus contract differs")
+                if dynamic_v3_data.get("target_contract") != getattr(
+                    metadata, "target_contract", None
+                ):
+                    errors.append("production dynamic-crop v3 target contract differs")
+                manifest_sha256 = dynamic_v3_data.get("manifest_sha256")
+                if (
+                    not isinstance(manifest_sha256, str)
+                    or len(manifest_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in manifest_sha256
+                    )
+                ):
+                    errors.append(
+                        "production dynamic-crop v3 corpus manifest digest is invalid"
+                    )
 
     split = payload.get("split")
     if not isinstance(split, Mapping):
@@ -2150,6 +2431,120 @@ def _production_training_report_errors(
             or selection.get("heldout_metrics_consumed") is not False
         ):
             errors.append("validation composite selection evidence is invalid")
+        if dynamic_crop_v3_checkpoint:
+            selected_v3_gate = None
+            if optimization.get("dynamic_crop_v3_model_selection") != (
+                DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT
+            ):
+                errors.append("dynamic-crop v3 selection contract differs")
+            if optimization.get(
+                "effective_dynamic_crop_loss_contract_version"
+            ) != 3:
+                errors.append("dynamic-crop v3 loss contract version is missing")
+            versioned_dynamic_loss = optimization.get(
+                "effective_dynamic_crop_v3_loss_contract"
+            )
+            if (
+                not isinstance(versioned_dynamic_loss, Mapping)
+                or versioned_dynamic_loss != effective_dynamic_loss
+            ):
+                errors.append("dynamic-crop v3 effective loss evidence differs")
+            if isinstance(selection, Mapping):
+                errors.extend(
+                    _dynamic_crop_v3_composite_selection_errors(
+                        selection,
+                        name="dynamic-crop v3 selected validation",
+                    )
+                )
+                errors.extend(
+                    _dynamic_crop_v3_selection_gate_errors(
+                        selection.get("dynamic_crop_v3_selection_gate"),
+                        name="dynamic-crop v3 selected validation gate",
+                    )
+                )
+                score_component = selection.get(
+                    "dynamic_crop_v3_score_component"
+                )
+                selected_v3_gate = selection.get(
+                    "dynamic_crop_v3_selection_gate"
+                )
+                gate_score = (
+                    selected_v3_gate.get("score_component")
+                    if isinstance(selected_v3_gate, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(score_component, (int, float))
+                    or isinstance(score_component, bool)
+                    or not math.isfinite(float(score_component))
+                    or float(score_component) <= 0.0
+                    or score_component != gate_score
+                ):
+                    errors.append(
+                        "dynamic-crop v3 selection score does not include improvement"
+                    )
+            reloaded_selection = optimization.get(
+                "reloaded_checkpoint_validation_selection_evidence"
+            )
+            if (
+                not isinstance(reloaded_selection, Mapping)
+                or reloaded_selection.get("contract")
+                != STAGE_EDIT_VALIDATION_SELECTION_CONTRACT
+                or reloaded_selection.get("selectable") is not True
+                or reloaded_selection.get("heldout_metrics_consumed") is not False
+            ):
+                errors.append(
+                    "reloaded dynamic-crop v3 validation selection evidence is invalid"
+                )
+            else:
+                errors.extend(
+                    _dynamic_crop_v3_composite_selection_errors(
+                        reloaded_selection,
+                        name="reloaded dynamic-crop v3 validation",
+                    )
+                )
+                errors.extend(
+                    _dynamic_crop_v3_selection_gate_errors(
+                        reloaded_selection.get(
+                            "dynamic_crop_v3_selection_gate"
+                        ),
+                        name="reloaded dynamic-crop v3 validation gate",
+                    )
+                )
+            selected_metrics = optimization.get(
+                "selected_checkpoint_validation_metrics"
+            )
+            selected_dynamic_metrics = (
+                selected_metrics.get("dynamic_crop_v3")
+                if isinstance(selected_metrics, Mapping)
+                else None
+            )
+            if not isinstance(selected_dynamic_metrics, Mapping):
+                errors.append(
+                    "selected checkpoint dynamic-crop v3 metrics are missing"
+                )
+            else:
+                errors.extend(
+                    _dynamic_crop_v3_gate_metric_binding_errors(
+                        selected_v3_gate,
+                        selected_dynamic_metrics,
+                        metadata=metadata,
+                        name="selected dynamic-crop v3",
+                    )
+                )
+                reloaded_gate = (
+                    reloaded_selection.get("dynamic_crop_v3_selection_gate")
+                    if isinstance(reloaded_selection, Mapping)
+                    else None
+                )
+                errors.extend(
+                    _dynamic_crop_v3_gate_metric_binding_errors(
+                        reloaded_gate,
+                        selected_dynamic_metrics,
+                        metadata=metadata,
+                        name="reloaded dynamic-crop v3",
+                    )
+                )
 
     threshold_freeze = payload.get("cut_threshold_freeze")
     if not isinstance(threshold_freeze, Mapping):
@@ -2248,6 +2643,21 @@ def _production_training_report_errors(
             held_out.get("dynamic_crop_v2_metrics"), Mapping
         ):
             errors.append("held-out dynamic-crop v2 metrics are missing")
+        if dynamic_crop_v3_checkpoint:
+            if held_out.get("dynamic_crop_version") != 3:
+                errors.append("held-out evaluation does not declare dynamic-crop v3")
+            if held_out.get("dynamic_crop_v2_metrics") is not None:
+                errors.append("held-out dynamic-crop v3 evaluation contains v2 metrics")
+            if not isinstance(
+                held_out.get("dynamic_crop_v3_metrics"), Mapping
+            ):
+                errors.append("held-out dynamic-crop v3 metrics are missing")
+            if held_out.get(
+                "heldout_dynamic_crop_metrics_used_for_checkpoint_selection"
+            ) is not False:
+                errors.append(
+                    "held-out dynamic-crop v3 metrics contaminated checkpoint selection"
+                )
     return tuple(errors)
 
 
@@ -2286,38 +2696,80 @@ def stage_edit_readiness_report(
         )
     source = Path(checkpoint_directory)
     legacy_metadata_path = source / "metadata.json"
-    dynamic_metadata_path = source / "dynamic-crop-v2-metadata.json"
-    metadata_paths = tuple(
-        path
-        for path in (legacy_metadata_path, dynamic_metadata_path)
+    dynamic_v2_metadata_path = source / "dynamic-crop-v2-metadata.json"
+    dynamic_v3_metadata_path = source / "dynamic-crop-v3-metadata.json"
+    namespace_paths = {
+        "legacy": (
+            legacy_metadata_path,
+            source / "model.safetensors",
+        ),
+        "dynamic_crop_v2": (
+            dynamic_v2_metadata_path,
+            source / "dynamic-crop-v2-model.safetensors",
+        ),
+        "dynamic_crop_v3": (
+            dynamic_v3_metadata_path,
+            source / "dynamic-crop-v3-model.safetensors",
+        ),
+    }
+    present_namespaces = tuple(
+        name
+        for name, paths in namespace_paths.items()
+        if any(path.exists() or path.is_symlink() for path in paths)
+    )
+    metadata_entries = tuple(
+        (path, name)
+        for name, paths in namespace_paths.items()
+        for path in paths[:1]
         if path.is_file()
     )
-    if not metadata_paths:
-        return StageEditReadinessReport(
-            architecture_available=True,
-            learned_inference_ready=False,
-            status="checkpoint_metadata_missing",
-            reason=(
-                "neither legacy nor dynamic-crop v2 checkpoint metadata exists"
-            ),
-            mlx_version=version,
-            checkpoint_path=str(source.resolve()),
-            training_steps=0,
-        )
-    if len(metadata_paths) != 1:
+    if len(present_namespaces) > 1 or len(metadata_entries) > 1:
         return StageEditReadinessReport(
             architecture_available=True,
             learned_inference_ready=False,
             status="checkpoint_invalid",
-            reason="checkpoint directory ambiguously contains both model formats",
+            reason="checkpoint directory ambiguously contains mixed model namespaces",
             mlx_version=version,
             checkpoint_path=str(source.resolve()),
             training_steps=0,
         )
-    metadata_path = metadata_paths[0]
+    if not metadata_entries:
+        if present_namespaces:
+            reason = "checkpoint namespace contains weights without metadata"
+            status = "checkpoint_invalid"
+        else:
+            reason = (
+                "none of legacy, dynamic-crop v2, or dynamic-crop v3 "
+                "checkpoint metadata exists"
+            )
+            status = "checkpoint_metadata_missing"
+        return StageEditReadinessReport(
+            architecture_available=True,
+            learned_inference_ready=False,
+            status=status,
+            reason=reason,
+            mlx_version=version,
+            checkpoint_path=str(source.resolve()),
+            training_steps=0,
+        )
+    metadata_path, checkpoint_format = metadata_entries[0]
+    dynamic_crop_version = (
+        3
+        if checkpoint_format == "dynamic_crop_v3"
+        else 2
+        if checkpoint_format == "dynamic_crop_v2"
+        else None
+    )
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata_path == dynamic_metadata_path:
+        if checkpoint_format == "dynamic_crop_v3":
+            # Local imports avoid the v3 head -> base Transformer module cycle.
+            from .stage_edit_dynamic_crop_head_v3 import (
+                StageEditDynamicCropCheckpointMetadataV3,
+            )
+
+            metadata = StageEditDynamicCropCheckpointMetadataV3.from_dict(payload)
+        elif checkpoint_format == "dynamic_crop_v2":
             # Local import avoids a module cycle: the v2 model nests this base
             # Transformer and owns a deliberately separate checkpoint schema.
             from .stage_edit_dynamic_crop_head_v2 import (
@@ -2342,6 +2794,9 @@ def stage_edit_readiness_report(
             mlx_version=version,
             checkpoint_path=str(source.resolve()),
             training_steps=0,
+            checkpoint_format=checkpoint_format,
+            dynamic_crop_version=dynamic_crop_version,
+            checkpoint_metadata_filename=metadata_path.name,
         )
     integrity_ready = bool(
         metadata.weights_trained and metadata.training_steps > 0 and valid_weights
@@ -2357,6 +2812,9 @@ def stage_edit_readiness_report(
             mlx_version=version,
             checkpoint_path=str(source.resolve()),
             training_steps=metadata.training_steps,
+            checkpoint_format=checkpoint_format,
+            dynamic_crop_version=dynamic_crop_version,
+            checkpoint_metadata_filename=metadata_path.name,
         )
 
     report_path = source / PRODUCTION_TRAINING_REPORT_FILENAME
@@ -2372,6 +2830,9 @@ def stage_edit_readiness_report(
             mlx_version=version,
             checkpoint_path=str(source.resolve()),
             training_steps=metadata.training_steps,
+            checkpoint_format=checkpoint_format,
+            dynamic_crop_version=dynamic_crop_version,
+            checkpoint_metadata_filename=metadata_path.name,
         )
     try:
         report_payload = json.loads(report_path.read_text(encoding="utf-8"))
@@ -2381,6 +2842,7 @@ def stage_edit_readiness_report(
             actual_weight_sha256=(
                 metadata.weight_sha256 if valid_weights else None
             ),
+            checkpoint_format=checkpoint_format,
         )
     except (OSError, json.JSONDecodeError) as exc:
         report_errors = (f"production training report cannot be read: {exc}",)
@@ -2393,6 +2855,9 @@ def stage_edit_readiness_report(
             mlx_version=version,
             checkpoint_path=str(source.resolve()),
             training_steps=metadata.training_steps,
+            checkpoint_format=checkpoint_format,
+            dynamic_crop_version=dynamic_crop_version,
+            checkpoint_metadata_filename=metadata_path.name,
         )
     return StageEditReadinessReport(
         architecture_available=True,
@@ -2405,12 +2870,18 @@ def stage_edit_readiness_report(
         mlx_version=version,
         checkpoint_path=str(source.resolve()),
         training_steps=metadata.training_steps,
+        checkpoint_format=checkpoint_format,
+        dynamic_crop_version=dynamic_crop_version,
+        checkpoint_metadata_filename=metadata_path.name,
     )
 
 
 __all__ = [
     "CHECKPOINT_FORMAT_VERSION",
     "DEFAULT_STAGE_EDIT_SCHEMA",
+    "DYNAMIC_CROP_V3_PRODUCTION_ARCHITECTURE",
+    "DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT",
+    "DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT",
     "MASKED_SOURCE_LOGIT",
     "PRODUCTION_CHECKPOINT_SCOPE",
     "PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT",

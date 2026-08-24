@@ -21,6 +21,7 @@ import numpy as np
 
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
+    DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
     StageEditDynamicCropCheckpointMetadataV2,
     StageEditDynamicCropModelOutputV2,
     load_stage_edit_dynamic_crop_checkpoint_v2,
@@ -29,8 +30,11 @@ from .stage_edit_dynamic_crop_semimarkov_adapter import (
     dynamic_crop_prediction_from_model_token_v2,
 )
 from .stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+    DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
     StageEditDynamicCropCheckpointMetadataV3,
     StageEditDynamicCropModelOutputV3,
+    load_stage_edit_dynamic_crop_checkpoint_v3,
 )
 from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     dynamic_crop_predictions_from_model_token_v3,
@@ -53,10 +57,11 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 4
+STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 5
 STAGE_EDIT_HEAD_MATERIALIZER_CONTRACT = (
     "production_dynamic_crop_v2_v3_transformer_to_semimarkov_heads_with_"
-    "source_exact_crop_pair_continuity_and_exact_music_structure_v4"
+    "source_exact_crop_pair_continuity_exact_music_structure_and_versioned_"
+    "checkpoint_evidence_v5"
 )
 
 
@@ -65,7 +70,7 @@ class StageEditHeadMaterializerError(RuntimeError):
 
 
 class StageEditHeadMaterializerNotReadyError(StageEditHeadMaterializerError):
-    """The supplied checkpoint is not an unambiguous production v2 bundle."""
+    """The supplied checkpoint is not an unambiguous production bundle."""
 
 
 class StageEditHeadMaterializerInputError(StageEditHeadMaterializerError, ValueError):
@@ -89,6 +94,70 @@ def _canonical_sha256(payload: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_materializer_checkpoint_namespace(
+    checkpoint: Path,
+    *,
+    requested_version: int,
+) -> Path:
+    """Require exactly one v2/v3 namespace, including orphaned weights."""
+
+    if requested_version not in (2, 3):
+        raise ValueError("unsupported Dynamic Crop materializer version")
+    namespaces = {
+        "legacy": (
+            checkpoint / "metadata.json",
+            checkpoint / "model.safetensors",
+        ),
+        "dynamic_crop_v2": (
+            checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
+            checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
+        ),
+        "dynamic_crop_v3": (
+            checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+            checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+        ),
+    }
+    requested = f"dynamic_crop_v{requested_version}"
+    requested_metadata = namespaces[requested][0]
+    present_namespaces = tuple(
+        name
+        for name, paths in namespaces.items()
+        if any(path.exists() or path.is_symlink() for path in paths)
+    )
+    if (
+        present_namespaces != (requested,)
+        or not requested_metadata.is_file()
+    ):
+        raise StageEditHeadMaterializerNotReadyError(
+            "head materialization requires one unambiguous "
+            f"Dynamic Crop v{requested_version} checkpoint namespace"
+        )
+    return requested_metadata
+
+
+def _checkpoint_contract_evidence(metadata: Any) -> dict[str, Any]:
+    names = (
+        "model_contract",
+        "target_contract",
+        "output_contract",
+        "loss_contract",
+        "source_conditioning",
+        "time_parameterization",
+        "value_parameterization",
+    )
+    return {
+        **{
+            name: getattr(metadata, name)
+            for name in names
+            if hasattr(metadata, name)
+        },
+        "contract_fingerprint_sha256": (
+            metadata.contract_fingerprint_sha256
+        ),
+        "training_data_id": metadata.training_data_id,
+    }
 
 
 def _finite_tuple(values: Any, *, name: str, expected: int) -> tuple[float, ...]:
@@ -288,6 +357,10 @@ class StageEditHeadMaterializationResult:
     decision_history_input_contract: Mapping[str, Any]
     contract: str = STAGE_EDIT_HEAD_MATERIALIZER_CONTRACT
     schema_version: int = STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION
+    checkpoint_format: str = "dynamic_crop_v2"
+    dynamic_crop_version: int = 2
+    checkpoint_metadata_filename: str = DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+    checkpoint_contracts: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.frames:
@@ -323,6 +396,31 @@ class StageEditHeadMaterializationResult:
             != 64
         ):
             raise ValueError("StageEdit decision-history contract is invalid")
+        expected_format = f"dynamic_crop_v{self.dynamic_crop_version}"
+        if self.dynamic_crop_version not in (2, 3) or self.checkpoint_format != (
+            expected_format
+        ):
+            raise ValueError("StageEdit materialization checkpoint version is invalid")
+        expected_metadata_filename = (
+            DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+            if self.dynamic_crop_version == 3
+            else DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+        )
+        if self.checkpoint_metadata_filename != expected_metadata_filename:
+            raise ValueError("StageEdit checkpoint metadata filename differs")
+        if (
+            self.readiness.checkpoint_format != self.checkpoint_format
+            or self.readiness.dynamic_crop_version != self.dynamic_crop_version
+            or self.readiness.checkpoint_metadata_filename
+            != self.checkpoint_metadata_filename
+        ):
+            raise ValueError("StageEdit readiness checkpoint identity differs")
+        if self.checkpoint_contracts is not None:
+            fingerprint = self.checkpoint_contracts.get(
+                "contract_fingerprint_sha256"
+            )
+            if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+                raise ValueError("StageEdit checkpoint contract evidence is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -334,6 +432,14 @@ class StageEditHeadMaterializationResult:
             "checkpoint_directory": self.checkpoint_directory,
             "checkpoint_id": self.checkpoint_id,
             "training_steps": self.training_steps,
+            "checkpoint_format": self.checkpoint_format,
+            "dynamic_crop_version": self.dynamic_crop_version,
+            "checkpoint_metadata_filename": self.checkpoint_metadata_filename,
+            "checkpoint_contracts": (
+                dict(self.checkpoint_contracts)
+                if self.checkpoint_contracts is not None
+                else None
+            ),
             "metadata_sha256": self.metadata_sha256,
             "weights_sha256": self.weights_sha256,
             "supplied_sequence_sha256": self.supplied_sequence_sha256,
@@ -352,25 +458,31 @@ class StageEditHeadMaterializationResult:
 
 
 def _sequence_payload(sequence: StageEditSequence) -> dict[str, Any]:
+    def json_values(values: Sequence[float]) -> list[float | None]:
+        return [
+            float(value) if math.isfinite(float(value)) else None
+            for value in values
+        ]
+
     return {
         "sequence_id": sequence.sequence_id,
         "tokens": [
             {
                 "master_time_seconds": token.master_time_seconds,
-                "music_features": list(token.music_features),
-                "section_features": list(token.section_features),
+                "music_features": json_values(token.music_features),
+                "section_features": json_values(token.section_features),
                 "source_candidates": [
                     {
                         "source_id": candidate.source_id,
-                        "features": list(candidate.features),
+                        "features": json_values(candidate.features),
                         "missing_mask": list(candidate.missing_mask),
                         "available": candidate.available,
                         "hard_gate_passed": candidate.hard_gate_passed,
                     }
                     for candidate in token.source_candidates
                 ],
-                "recent_edit_features": list(token.recent_edit_features),
-                "style_features": list(token.style_features),
+                "recent_edit_features": json_values(token.recent_edit_features),
+                "style_features": json_values(token.style_features),
                 "missing_mask": list(token.missing_mask),
             }
             for token in sequence.tokens
@@ -890,12 +1002,10 @@ def materialize_stage_edit_head_frames_v2(
     """Run a verified production Dynamic Crop v2 checkpoint exactly once."""
 
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
-    dynamic_metadata_path = checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
-    legacy_metadata_path = checkpoint / "metadata.json"
-    if legacy_metadata_path.exists() or not dynamic_metadata_path.is_file():
-        raise StageEditHeadMaterializerNotReadyError(
-            "head materialization requires one unambiguous Dynamic Crop v2 checkpoint"
-        )
+    dynamic_metadata_path = _require_materializer_checkpoint_namespace(
+        checkpoint,
+        requested_version=2,
+    )
     readiness = stage_edit_readiness_report(checkpoint)
     if not (
         readiness.architecture_available
@@ -903,6 +1013,10 @@ def materialize_stage_edit_head_frames_v2(
         and readiness.status == "production_checkpoint_ready"
         and readiness.checkpoint_path == str(checkpoint)
         and readiness.training_steps > 0
+        and readiness.checkpoint_format == "dynamic_crop_v2"
+        and readiness.dynamic_crop_version == 2
+        and readiness.checkpoint_metadata_filename
+        == DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
     ):
         raise StageEditHeadMaterializerNotReadyError(
             "Dynamic Crop v2 checkpoint rejected: "
@@ -998,6 +1112,148 @@ def materialize_stage_edit_head_frames_v2(
         dynamic_crop_config_fingerprint=metadata.dynamic_crop_config.fingerprint,
         readiness=readiness,
         decision_history_input_contract=history_contract,
+        checkpoint_format="dynamic_crop_v2",
+        dynamic_crop_version=2,
+        checkpoint_metadata_filename=(
+            DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+        ),
+        checkpoint_contracts=_checkpoint_contract_evidence(metadata),
+    )
+
+
+def materialize_stage_edit_head_frames_v3(
+    *,
+    checkpoint_directory: Path,
+    sequence: StageEditSequence,
+    canonical_source_ids: Sequence[str],
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    source_shot_sizes_by_token: Sequence[Mapping[str, str]] = (),
+) -> StageEditHeadMaterializationResult:
+    """Run one verified source-conditioned Dynamic Crop v3 checkpoint."""
+
+    checkpoint = Path(checkpoint_directory).expanduser().resolve()
+    dynamic_metadata_path = _require_materializer_checkpoint_namespace(
+        checkpoint,
+        requested_version=3,
+    )
+    readiness = stage_edit_readiness_report(checkpoint)
+    if not (
+        readiness.architecture_available
+        and readiness.learned_inference_ready
+        and readiness.status == "production_checkpoint_ready"
+        and readiness.checkpoint_path == str(checkpoint)
+        and readiness.training_steps > 0
+        and readiness.checkpoint_format == "dynamic_crop_v3"
+        and readiness.dynamic_crop_version == 3
+        and readiness.checkpoint_metadata_filename
+        == DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+    ):
+        raise StageEditHeadMaterializerNotReadyError(
+            "Dynamic Crop v3 checkpoint rejected: "
+            f"{readiness.status}: {readiness.reason}"
+        )
+    try:
+        metadata_payload = json.loads(
+            dynamic_metadata_path.read_text(encoding="utf-8")
+        )
+        metadata = StageEditDynamicCropCheckpointMetadataV3.from_dict(
+            metadata_payload
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise StageEditHeadMaterializerNotReadyError(
+            f"Dynamic Crop v3 metadata is invalid: {exc}"
+        ) from exc
+    if metadata.token_schema.fingerprint != schema.fingerprint:
+        raise StageEditHeadMaterializerInputError(
+            "requested token schema differs from production checkpoint"
+        )
+    weight_path = checkpoint / metadata.weight_filename
+    before = {
+        "metadata": _sha256_file(dynamic_metadata_path),
+        "weights": _sha256_file(weight_path),
+    }
+    supplied_sequence_sha256 = _canonical_sha256(_sequence_payload(sequence))
+    model_sequence = mask_stage_edit_recent_history_for_semimarkov(
+        sequence, schema
+    )
+    history_contract = stage_edit_recent_history_mask_contract(schema)
+    try:
+        model, loaded_metadata = load_stage_edit_dynamic_crop_checkpoint_v3(
+            checkpoint,
+            expected_schema=schema,
+            require_trained=True,
+        )
+        if loaded_metadata != metadata:
+            raise ValueError("loaded metadata identity changed")
+        if hasattr(model, "eval"):
+            model.eval()
+        batch = tensorize_stage_edit_batch(
+            (model_sequence,), schema, metadata.base_model_config
+        )
+        output = model(batch)
+        import mlx.core as mx
+
+        mx.eval(
+            output.cut_timing_logits,
+            output.source_selection_logits,
+            output.duration_bucket_logits,
+            output.transition_logits,
+            output.crop,
+            output.effective_source_mask,
+            output.dynamic_crop_values,
+            output.dynamic_crop_count_logits,
+            output.dynamic_crop_time_interval_logits,
+            output.dynamic_crop_motion_logits,
+        )
+        frames = stage_edit_head_frames_from_dynamic_crop_output_v3(
+            sequence=model_sequence,
+            batch=batch,
+            output=output,
+            canonical_source_ids=canonical_source_ids,
+            schema=schema,
+            metadata=metadata,
+            source_shot_sizes_by_token=source_shot_sizes_by_token,
+        )
+    except StageEditHeadMaterializerError:
+        raise
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise StageEditHeadMaterializerError(
+            f"production Dynamic Crop v3 forward failed: {exc}"
+        ) from exc
+    after = {
+        "metadata": _sha256_file(dynamic_metadata_path),
+        "weights": _sha256_file(weight_path),
+    }
+    if before != after or metadata.weight_sha256 != after["weights"]:
+        raise StageEditHeadMaterializerNotReadyError(
+            "Dynamic Crop v3 checkpoint changed during inference"
+        )
+    sequence_sha256 = _canonical_sha256(_sequence_payload(model_sequence))
+    frames_sha256 = _canonical_sha256([item.to_dict() for item in frames])
+    return StageEditHeadMaterializationResult(
+        frames=frames,
+        sequence_id=sequence.sequence_id,
+        canonical_source_ids=tuple(
+            str(value).strip() for value in canonical_source_ids
+        ),
+        checkpoint_directory=str(checkpoint),
+        checkpoint_id=metadata.checkpoint_id,
+        training_steps=metadata.training_steps,
+        metadata_sha256=after["metadata"],
+        weights_sha256=after["weights"],
+        supplied_sequence_sha256=supplied_sequence_sha256,
+        input_sequence_sha256=sequence_sha256,
+        output_frames_sha256=frames_sha256,
+        token_schema_fingerprint=schema.fingerprint,
+        dynamic_crop_config_fingerprint=metadata.dynamic_crop_config.fingerprint,
+        readiness=readiness,
+        decision_history_input_contract=history_contract,
+        checkpoint_format="dynamic_crop_v3",
+        dynamic_crop_version=3,
+        checkpoint_metadata_filename=(
+            DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+        ),
+        checkpoint_contracts=_checkpoint_contract_evidence(metadata),
     )
 
 
@@ -1009,6 +1265,7 @@ __all__ = [
     "StageEditHeadMaterializerInputError",
     "StageEditHeadMaterializerNotReadyError",
     "materialize_stage_edit_head_frames_v2",
+    "materialize_stage_edit_head_frames_v3",
     "stage_edit_head_frames_from_dynamic_crop_output_v2",
     "stage_edit_head_frames_from_dynamic_crop_output_v3",
 ]
