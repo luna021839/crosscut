@@ -6686,7 +6686,20 @@ def _stage_edit_motion_cut_profile_manifest_payload(
         "source_identity_binding_passed": True,
         "recommendation": recommendation_payload,
         "runtime_binding": {
+            # Retained for consumers of the v1 manifest; this is the motion
+            # qualifier authority, not the decoder's primary boundary scorer.
             "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+            "continuity_role": (
+                "independent_handcrafted_motion_eligibility_qualifier"
+            ),
+            "continuity_scorer_contract": (
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+            ),
+            "continuity_scorer_fingerprint": (
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+            ),
+            "independent_from_primary_boundary_continuity": True,
+            "primary_boundary_score_reused": False,
             "both_motion_minimum_pose_motion_p10": (
                 recommendation.both_moving_minimum_pose_motion
             ),
@@ -6943,15 +6956,12 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
     ),
 ) -> StageEditSemiMarkovConfig:
-    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
-        if require_motion_cut_calibration or motion_cut_profile is not None:
-            raise RuntimeError(
-                "StageEdit learned continuity authority lacks a separately "
-                "calibrated authority-matched motion-cut profile"
-            )
-    elif continuity_authority != HANDCRAFTED_CONTINUITY_AUTHORITY:
+    if continuity_authority not in {
+        HANDCRAFTED_CONTINUITY_AUTHORITY,
+        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    }:
         raise RuntimeError(
-            "StageEdit motion-cut calibration continuity authority is unsupported"
+            "StageEdit primary boundary-continuity authority is unsupported"
         )
     if require_motion_cut_calibration and motion_cut_profile is None:
         raise RuntimeError(
@@ -6967,6 +6977,16 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         )
         motion_calibration = motion_cut_profile.to_stage_edit_calibration()
         motion_recommendation = motion_cut_profile.recommendation
+        if not (
+            motion_calibration.continuity_authority
+            == HANDCRAFTED_CONTINUITY_AUTHORITY
+            and motion_calibration.continuity_scorer_contract
+            == HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+        ):
+            raise RuntimeError(
+                "StageEdit motion-cut profile must bind the independent "
+                "handcrafted continuity qualifier"
+            )
     product = policy.product_editorial_requirements
     identity = policy.identity
     policy_fingerprint = _professional_montage_policy_fingerprint(policy)

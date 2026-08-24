@@ -419,6 +419,14 @@ class ProfessionalMotionCutProfileTest(unittest.TestCase):
         self.assertEqual(14, calibration.pose_embedding_cosine_observed_switch_count)
         self.assertEqual(0, calibration.sharpness_pair_observed_switch_count)
         self.assertIsNone(calibration.sharpness_minimum_quantiles)
+        self.assertTrue(
+            calibration.to_dict()["continuity_qualifier"]
+            ["independent_from_primary_boundary_continuity"]
+        )
+        self.assertFalse(
+            calibration.to_dict()["continuity_qualifier"]
+            ["primary_boundary_score_reused"]
+        )
         recommendation = profile.recommendation
         config = StageEditSemiMarkovConfig(
             highlight_motion_calibration=calibration,

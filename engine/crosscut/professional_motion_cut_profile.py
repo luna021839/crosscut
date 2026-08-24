@@ -37,6 +37,9 @@ from .stage_edit_reference_adapter import (
     ReferenceTrainingCorpus,
     load_reference_training_corpus,
 )
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+)
 from .stage_edit_semimarkov_beam import (
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
     HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
@@ -1918,6 +1921,12 @@ class ProfessionalMotionCutProfile:
             sharpness_minimum_quantiles=None,
             pose_embedding_cosine_quantiles=quantiles(
                 "pose_embedding_cosine_similarity"
+            ),
+            # This calibration remains an independent handcrafted qualifier
+            # even when the decoder's primary boundary scorer is learned.
+            continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
+            continuity_scorer_contract=(
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
             ),
         )
 

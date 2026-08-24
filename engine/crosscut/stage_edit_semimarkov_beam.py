@@ -84,8 +84,8 @@ from .stage_edit_transition_authority import (
 )
 
 
-DECODER_SCHEMA_VERSION = 13
-DECODER_CONTRACT = "stage_edit_semimarkov_beam_v10"
+DECODER_SCHEMA_VERSION = 14
+DECODER_CONTRACT = "stage_edit_semimarkov_beam_v11"
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -247,6 +247,9 @@ class StageEditHighlightMotionCalibration:
     distribution.  This separate payload lets an audited source-pair corpus
     bind those observations without silently turning them into a hard quota.
     Runtime thresholds remain explicit on :class:`StageEditSemiMarkovConfig`.
+    Its continuity distribution is deliberately an independent handcrafted
+    motion qualifier.  It is not the primary boundary-continuity authority and
+    therefore remains valid when that primary authority is learned.
     """
 
     analysis_basis: str
@@ -520,6 +523,16 @@ class StageEditHighlightMotionCalibration:
             },
             "continuity_authority": self.continuity_authority,
             "continuity_scorer_contract": self.continuity_scorer_contract,
+            "continuity_qualifier": {
+                "role": "independent_handcrafted_motion_eligibility_qualifier",
+                "independent_from_primary_boundary_continuity": True,
+                "authority": self.continuity_authority,
+                "scorer_contract": self.continuity_scorer_contract,
+                "scorer_fingerprint": (
+                    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+                ),
+                "primary_boundary_score_reused": False,
+            },
             "distributions": distributions,
         }
         canonical = json.dumps(
@@ -1164,7 +1177,9 @@ class StageEditSemiMarkovConfig:
     # Profile v2 has no choreography-motion boundary distribution.  These
     # hooks therefore default inactive rather than inventing a quota.  When a
     # future profile binds them, a boundary counts only when motion amount,
-    # continuity compatibility, and (when observed) sharpness all pass.
+    # the independently recomputed handcrafted continuity qualifier, and
+    # (when observed) sharpness all pass. The primary boundary scorer may be
+    # learned and is never compared with these handcrafted quantiles.
     highlight_motion_boundary_minimum_pose_motion: float | None = None
     highlight_motion_boundary_minimum_continuity_score: float | None = None
     highlight_motion_boundary_minimum_sharpness: float | None = None
@@ -1453,28 +1468,20 @@ class StageEditSemiMarkovConfig:
                     raise StageEditDecodeInputError(
                         "motion continuity threshold is not a calibrated quantile"
                     )
-                if calibration.continuity_authority != self.continuity_authority:
-                    raise StageEditDecodeInputError(
-                        "motion calibration continuity authority does not match "
-                        "the runtime authority"
-                    )
-                resolved_scorer_contract = self.continuity_scorer_contract
-                if (
-                    resolved_scorer_contract is None
-                    and self.continuity_authority
+                # The calibration quantiles were measured with the fixed
+                # handcrafted scorer.  They qualify highlight motion
+                # independently of the primary boundary-continuity authority;
+                # comparing a learned primary score to these quantiles would
+                # mix two incompatible score distributions.
+                if not (
+                    calibration.continuity_authority
                     == HANDCRAFTED_CONTINUITY_AUTHORITY
-                ):
-                    resolved_scorer_contract = (
-                        HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-                    )
-                if (
-                    resolved_scorer_contract is not None
                     and calibration.continuity_scorer_contract
-                    != resolved_scorer_contract
+                    == HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
                 ):
                     raise StageEditDecodeInputError(
-                        "motion calibration scorer contract does not match the "
-                        "runtime scorer"
+                        "motion calibration must bind the independent "
+                        "handcrafted continuity qualifier"
                     )
             pose_phase_threshold = (
                 self.highlight_motion_boundary_minimum_pose_phase_cosine
@@ -1852,6 +1859,9 @@ class StageEditBeamDecision:
     boundary_temporal_incoming_content_sha256: str | None = None
     boundary_temporal_pair_content_sha256: str | None = None
     boundary_pose_direction_or_velocity_proven: bool = False
+    # Appended so positional construction of the pre-v11 decision remains
+    # compatible. The primary boundary score above is preserved separately.
+    boundary_handcrafted_motion_continuity_qualifier_score: float | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -1913,6 +1923,25 @@ class StageEditBeamDecision:
                 "camera_motion_delta": self.boundary_camera_motion_delta,
                 "minimum_sharpness": self.boundary_minimum_sharpness,
                 "continuity_score": self.boundary_continuity_score,
+                "primary_boundary_continuity_score": (
+                    self.boundary_continuity_score
+                ),
+                "handcrafted_continuity_qualifier_score": (
+                    self.boundary_handcrafted_motion_continuity_qualifier_score
+                ),
+                "motion_continuity_qualifier_provenance": {
+                    "role": (
+                        "independent_handcrafted_motion_eligibility_qualifier"
+                    ),
+                    "authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+                    "scorer_contract": (
+                        HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+                    ),
+                    "scorer_fingerprint": (
+                        HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+                    ),
+                    "primary_boundary_score_reused": False,
+                },
                 "pose_phase_cosine": self.boundary_pose_phase_cosine,
                 "pose_phase_evidence_observed": (
                     self.boundary_pose_phase_evidence_observed
@@ -2689,7 +2718,10 @@ def _profile_calibrated_motion_bonus_active(
     return bool(
         pose_threshold is not None
         and continuity_threshold is not None
-        and calibration.continuity_authority == config.continuity_authority
+        and calibration.continuity_authority
+        == HANDCRAFTED_CONTINUITY_AUTHORITY
+        and calibration.continuity_scorer_contract
+        == HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
         and _calibration_quantile_label(
             pose_threshold,
             calibration.pose_motion_minimum_quantiles,
@@ -2723,14 +2755,53 @@ def _highlight_motion_calibration_audit(
     pose_phase_threshold = (
         config.highlight_motion_boundary_minimum_pose_phase_cosine
     )
+    primary_scorer_contract = config.continuity_scorer_contract
+    if primary_scorer_contract is None:
+        primary_scorer_contract = (
+            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+            if config.continuity_authority
+            == HANDCRAFTED_CONTINUITY_AUTHORITY
+            else STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+        )
+    primary_scorer_fingerprint = config.continuity_scorer_fingerprint
+    if (
+        primary_scorer_fingerprint is None
+        and config.continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY
+    ):
+        primary_scorer_fingerprint = (
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+        )
     return {
         "evidence_semantics": (
-            "scalar_pose_motion_amount_plus_resolved_boundary_continuity_"
+            "scalar_pose_motion_amount_plus_independent_handcrafted_"
+            "continuity_qualifier_"
             "plus_optional_same_time_pose_phase_cosine_and_sharpness"
         ),
         "profile_v2_contains_motion_distribution": False,
         "profile_v3_calibration_input_bound": calibration is not None,
         "calibration": calibration.to_dict() if calibration is not None else None,
+        "primary_boundary_continuity": {
+            "authority": config.continuity_authority,
+            "scorer_contract": primary_scorer_contract,
+            "scorer_fingerprint": primary_scorer_fingerprint,
+            "used_for_motion_calibration_threshold": False,
+        },
+        "motion_continuity_qualifier": {
+            "role": "independent_handcrafted_motion_eligibility_qualifier",
+            "independent_from_primary_boundary_continuity": True,
+            "authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+            "scorer_contract": HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            "scorer_fingerprint": (
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+            ),
+            "runtime_score_source": (
+                "recomputed_from_exact_boundary_pair_observations"
+            ),
+            "primary_boundary_score_reused": False,
+            "used_for_motion_calibration_threshold": (
+                calibration is not None and continuity_threshold is not None
+            ),
+        },
         "selected_thresholds": {
             "pose_motion_minimum": pose_threshold,
             "pose_motion_quantile": (
@@ -2743,6 +2814,17 @@ def _highlight_motion_calibration_audit(
             ),
             "continuity_score_minimum": continuity_threshold,
             "continuity_score_quantile": (
+                _calibration_quantile_label(
+                    continuity_threshold,
+                    calibration.continuity_score_quantiles,
+                )
+                if calibration is not None
+                else None
+            ),
+            "handcrafted_continuity_qualifier_score_minimum": (
+                continuity_threshold
+            ),
+            "handcrafted_continuity_qualifier_score_quantile": (
                 _calibration_quantile_label(
                     continuity_threshold,
                     calibration.continuity_score_quantiles,
@@ -4126,10 +4208,24 @@ def _evaluate_montage_grammar(
                 "close_only_multi_source_burst": close_only_burst_evidence,
                 "motion_amount_plus_continuity_boundaries": {
                     "evidence_contract": (
-                        "exact_source_pair_pose_motion_plus_resolved_"
-                        "continuity_plus_optional_same_time_pose_phase_cosine_"
-                        "and_sharpness_v2"
+                        "exact_source_pair_pose_motion_plus_independent_"
+                        "handcrafted_continuity_qualifier_plus_optional_same_"
+                        "time_pose_phase_cosine_and_sharpness_v3"
                     ),
+                    "motion_continuity_qualifier": {
+                        "role": (
+                            "independent_handcrafted_motion_eligibility_qualifier"
+                        ),
+                        "independent_from_primary_boundary_continuity": True,
+                        "authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+                        "scorer_contract": (
+                            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+                        ),
+                        "scorer_fingerprint": (
+                            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+                        ),
+                        "primary_boundary_score_reused": False,
+                    },
                     "profile_v2_human_distribution_available": False,
                     "profile_v3_calibration_input_bound": (
                         config.highlight_motion_calibration is not None
@@ -4199,8 +4295,17 @@ def _evaluate_montage_grammar(
                     "minimum_pose_motion": (
                         config.highlight_motion_boundary_minimum_pose_motion
                     ),
+                    "minimum_handcrafted_continuity_qualifier_score": (
+                        config.highlight_motion_boundary_minimum_continuity_score
+                    ),
+                    # Retained as a clearly labelled compatibility alias for
+                    # pre-v11 report readers.  It is never the primary learned
+                    # boundary score.
                     "minimum_continuity_score": (
                         config.highlight_motion_boundary_minimum_continuity_score
+                    ),
+                    "minimum_continuity_score_legacy_alias_semantics": (
+                        "minimum_handcrafted_continuity_qualifier_score"
                     ),
                     "minimum_sharpness": (
                         config.highlight_motion_boundary_minimum_sharpness
@@ -5192,6 +5297,9 @@ def _boundary_motion_amount_plus_continuity_evidence(
     The legacy pose-phase field remains a same-time 60-D cosine proxy only.
     Sparse temporal sidecars are content-bound for audit, but cannot prove
     direction or phase until their samples are timestamp-bound to this cut.
+    ``continuity_score`` is the primary boundary scorer's value and is kept
+    only for audit/backwards compatibility.  Motion eligibility always
+    recomputes the handcrafted qualifier calibrated by the motion profile.
     """
 
     inactive = {
@@ -5200,6 +5308,8 @@ def _boundary_motion_amount_plus_continuity_evidence(
         "camera_motion_delta": None,
         "minimum_sharpness": None,
         "continuity_score": None,
+        "primary_boundary_continuity_score": None,
+        "handcrafted_continuity_qualifier_score": None,
         "pose_phase_cosine": None,
         "pose_phase_evidence_observed": False,
         "pose_phase_threshold_bound": False,
@@ -5247,6 +5357,18 @@ def _boundary_motion_amount_plus_continuity_evidence(
         return inactive
     outgoing = frame.source_continuity[outgoing_source_index]
     incoming = frame.source_continuity[incoming_source_index]
+    primary_continuity_score = _finite(
+        continuity_score,
+        "primary_boundary_continuity_score",
+    )
+    if not -1.0 <= primary_continuity_score <= 0.0:
+        raise StageEditDecodeInputError(
+            "primary boundary continuity scorer violated its bounded [-1, 0] "
+            "contract"
+        )
+    handcrafted_continuity_qualifier_score = (
+        stage_edit_boundary_continuity_score(outgoing, incoming)
+    )
     outgoing_pose = outgoing.pose_model_embedding
     incoming_pose = incoming.pose_model_embedding
     outgoing_pose_evidence = _same_time_pose_scalar_evidence(outgoing_pose)
@@ -5364,9 +5486,11 @@ def _boundary_motion_amount_plus_continuity_evidence(
         evidence_complete
         and pose_minimum is not None
         and pose_minimum + _TIME_EPSILON >= float(amount_threshold)
-        # The same resolved authority that scores the actual pair must also
-        # say the pair is compatible. High motion alone can never pass.
-        and continuity_score + _TIME_EPSILON >= float(continuity_threshold)
+        # The profile quantiles were measured with handcrafted continuity.
+        # Recompute that exact qualifier even when a learned scorer owns the
+        # primary boundary score. High motion alone can never pass.
+        and handcrafted_continuity_qualifier_score + _TIME_EPSILON
+        >= float(continuity_threshold)
         # Phase is optional only while its calibrated threshold is inactive.
         # Once bound, neither motion nor continuity may bypass the pose match.
         and (
@@ -5390,7 +5514,14 @@ def _boundary_motion_amount_plus_continuity_evidence(
         "pose_motion_delta": pose_delta,
         "camera_motion_delta": camera_delta,
         "minimum_sharpness": sharpness_minimum,
-        "continuity_score": continuity_score,
+        # Keep the legacy key bound to the primary boundary score.  The
+        # explicit qualifier key below is the only value used by the motion
+        # threshold.
+        "continuity_score": primary_continuity_score,
+        "primary_boundary_continuity_score": primary_continuity_score,
+        "handcrafted_continuity_qualifier_score": (
+            handcrafted_continuity_qualifier_score
+        ),
         "pose_phase_cosine": pose_phase_cosine,
         "pose_phase_evidence_observed": pose_phase_cosine is not None,
         "pose_phase_threshold_bound": pose_phase_threshold_bound,
@@ -6668,6 +6799,11 @@ def decode_stage_edit_semimarkov_beam(
                             boundary_continuity_score=(
                                 boundary_motion_evidence["continuity_score"]
                             ),
+                            boundary_handcrafted_motion_continuity_qualifier_score=(
+                                boundary_motion_evidence[
+                                    "handcrafted_continuity_qualifier_score"
+                                ]
+                            ),
                             boundary_motion_amount_plus_continuity_evidence_complete=(
                                 bool(
                                     boundary_motion_evidence[
@@ -7101,14 +7237,15 @@ def decode_stage_edit_semimarkov_beam(
             ),
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 12,
+                "supersedes": 13,
                 "reason": (
-                    "optional separately calibrated source-exact temporal "
-                    "pose sidecars can qualify dynamic highlight continuity, "
-                    "and hash-bound close-only multi-source burst evidence can "
-                    "supply a sparse evidence-weighted soft tie-break without "
+                    "highlight motion eligibility now recomputes its calibrated "
+                    "handcrafted continuity qualifier independently of the "
+                    "primary learned-or-handcrafted boundary scorer, without "
                     "changing Transformer tokens or checkpoints"
                 ),
+                "motion_continuity_qualifier_independent_from_primary": True,
+                "learned_primary_score_reused_for_handcrafted_quantile": False,
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,
                 "same_time_pose_cosine_relabelled_as_temporal": False,

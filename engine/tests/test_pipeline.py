@@ -82,7 +82,12 @@ from crosscut.professional_motion_cut_profile import (
     load_professional_motion_cut_profile,
 )
 from crosscut.stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
 )
 from crosscut.stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
@@ -781,6 +786,14 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertTrue(runtime["soft_bonus_only"])
         self.assertFalse(runtime["hard_gate"])
+        self.assertTrue(
+            runtime["independent_from_primary_boundary_continuity"]
+        )
+        self.assertFalse(runtime["primary_boundary_score_reused"])
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            runtime["continuity_scorer_fingerprint"],
+        )
         self.assertIsNone(runtime["minimum_required_switches_per_section"])
         self.assertEqual(
             0,
@@ -875,7 +888,7 @@ class PipelineTests(unittest.TestCase):
                 montage_policy=changed_policy,
             )
 
-    def test_active_learned_continuity_has_no_silent_motion_calibration_fallback(
+    def test_active_learned_continuity_keeps_independent_handcrafted_motion_qualifier(
         self,
     ) -> None:
         montage_policy = load_professional_montage_policy(
@@ -888,22 +901,38 @@ class PipelineTests(unittest.TestCase):
             ),
             verify_source_inputs=False,
         )
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "learned continuity authority lacks.*authority-matched",
-        ):
-            _stage_edit_semimarkov_config_from_montage_policy(
-                montage_policy,
-                motion_cut_profile=profile,
-                require_motion_cut_calibration=True,
-                continuity_authority=(
-                    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
-                ),
-                continuity_scorer_contract=(
-                    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
-                ),
-                continuity_scorer_fingerprint="a" * 64,
-            )
+        config = _stage_edit_semimarkov_config_from_montage_policy(
+            montage_policy,
+            motion_cut_profile=profile,
+            require_motion_cut_calibration=True,
+            continuity_authority=(
+                PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ),
+            continuity_scorer_contract=(
+                STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+            ),
+            continuity_scorer_fingerprint="a" * 64,
+        )
+
+        self.assertEqual(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            config.continuity_authority,
+        )
+        self.assertEqual(
+            STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            config.continuity_scorer_contract,
+        )
+        self.assertEqual("a" * 64, config.continuity_scorer_fingerprint)
+        self.assertIsNotNone(config.highlight_motion_calibration)
+        assert config.highlight_motion_calibration is not None
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            config.highlight_motion_calibration.continuity_authority,
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            config.highlight_motion_calibration.continuity_scorer_contract,
+        )
 
     def test_stage_edit_request_is_forwarded_to_top32_proxy_rerank_only_when_explicit(
         self,

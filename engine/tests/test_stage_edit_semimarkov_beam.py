@@ -32,6 +32,7 @@ from crosscut.stage_edit_semimarkov_beam import (
     DECODER_SCHEMA_VERSION,
     HANDCRAFTED_CONTINUITY_AUTHORITY,
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     StageEditCheckpointNotReadyError,
     StageEditDecodeInputError,
@@ -578,6 +579,23 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         self.assertTrue(audit["profile_v3_calibration_input_bound"])
         self.assertTrue(audit["soft_bonus_active"])
+        self.assertTrue(
+            audit["motion_continuity_qualifier"]
+            ["independent_from_primary_boundary_continuity"]
+        )
+        self.assertFalse(
+            audit["motion_continuity_qualifier"]
+            ["primary_boundary_score_reused"]
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            audit["motion_continuity_qualifier"]["scorer_fingerprint"],
+        )
+        self.assertEqual(
+            audit["motion_continuity_qualifier"]["scorer_fingerprint"],
+            audit["calibration"]["continuity_qualifier"]
+            ["scorer_fingerprint"],
+        )
         self.assertEqual(0, audit["hard_minimum_supported_boundary_count"])
         self.assertEqual(
             170,
@@ -629,6 +647,11 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         self.assertEqual(
             "p10",
             audit["selected_thresholds"]["continuity_score_quantile"],
+        )
+        self.assertEqual(
+            "p10",
+            audit["selected_thresholds"]
+            ["handcrafted_continuity_qualifier_score_quantile"],
         )
         self.assertEqual(
             "p10",
@@ -720,6 +743,116 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             **past_target,
         )
         self.assertAlmostEqual(past_static, past_moving)
+
+    def test_learned_primary_score_is_not_reused_for_handcrafted_motion_quantile(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        config = StageEditSemiMarkovConfig(
+            continuity_authority=PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            continuity_scorer_contract=STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            continuity_scorer_fingerprint="a" * 64,
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+        )
+        outgoing = StageEditSourceContinuity(
+            face_scale=0.30,
+            face_center_x=0.10,
+            face_center_y=0.10,
+            camera_motion_x=1.0,
+            camera_motion_y=1.0,
+            pose_motion=0.9,
+            camera_zoom_velocity=1.0,
+            camera_roll_normalized=1.0,
+            exposure=0.0,
+            color_temperature_normalized=0.0,
+            sharpness=1.0,
+        )
+        incompatible = StageEditSourceContinuity(
+            face_scale=0.10,
+            face_center_x=0.90,
+            face_center_y=0.90,
+            camera_motion_x=-1.0,
+            camera_motion_y=-1.0,
+            pose_motion=0.9,
+            camera_zoom_velocity=-1.0,
+            camera_roll_normalized=-1.0,
+            exposure=1.0,
+            color_temperature_normalized=1.0,
+            sharpness=1.0,
+        )
+
+        learned_passes_handcrafted_fails = (
+            _boundary_motion_amount_plus_continuity_evidence(
+                frame=replace(
+                    _frames(1, 2)[0],
+                    source_continuity=(outgoing, incompatible),
+                ),
+                outgoing_source_index=0,
+                incoming_source_index=1,
+                derivative_family_ids=(0, 1),
+                continuity_score=0.0,
+                config=config,
+            )
+        )
+        self.assertEqual(
+            0.0,
+            learned_passes_handcrafted_fails[
+                "primary_boundary_continuity_score"
+            ],
+        )
+        self.assertLess(
+            learned_passes_handcrafted_fails[
+                "handcrafted_continuity_qualifier_score"
+            ],
+            calibration.continuity_score_quantiles[0],
+        )
+        self.assertFalse(
+            learned_passes_handcrafted_fails["accent_supported"]
+        )
+
+        learned_fails_handcrafted_passes = (
+            _boundary_motion_amount_plus_continuity_evidence(
+                frame=replace(
+                    _frames(1, 2)[0],
+                    source_continuity=(outgoing, outgoing),
+                ),
+                outgoing_source_index=0,
+                incoming_source_index=1,
+                derivative_family_ids=(0, 1),
+                continuity_score=-1.0,
+                config=config,
+            )
+        )
+        self.assertEqual(
+            -1.0,
+            learned_fails_handcrafted_passes[
+                "primary_boundary_continuity_score"
+            ],
+        )
+        self.assertGreaterEqual(
+            learned_fails_handcrafted_passes[
+                "handcrafted_continuity_qualifier_score"
+            ],
+            calibration.continuity_score_quantiles[0],
+        )
+        self.assertTrue(learned_fails_handcrafted_passes["accent_supported"])
+
+        audit = _highlight_motion_calibration_audit(config)
+        self.assertEqual(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            audit["primary_boundary_continuity"]["authority"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            audit["motion_continuity_qualifier"]["authority"],
+        )
+        self.assertTrue(audit["soft_bonus_active"])
 
     def test_zero_observed_sharpness_cannot_activate_a_profile_threshold(self) -> None:
         calibration = _actual_highlight_motion_calibration()
@@ -1302,6 +1435,33 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             grammar["contract"],
         )
         section = grammar["sections"][0]
+        motion_audit = section["motion_amount_plus_continuity_boundaries"]
+        self.assertEqual(
+            "exact_source_pair_pose_motion_plus_independent_handcrafted_"
+            "continuity_qualifier_plus_optional_same_time_pose_phase_cosine_"
+            "and_sharpness_v3",
+            motion_audit["evidence_contract"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            motion_audit["motion_continuity_qualifier"]["authority"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            motion_audit["motion_continuity_qualifier"]["scorer_fingerprint"],
+        )
+        self.assertFalse(
+            motion_audit["motion_continuity_qualifier"]
+            ["primary_boundary_score_reused"]
+        )
+        self.assertEqual(
+            motion_audit["minimum_handcrafted_continuity_qualifier_score"],
+            motion_audit["minimum_continuity_score"],
+        )
+        self.assertEqual(
+            "minimum_handcrafted_continuity_qualifier_score",
+            motion_audit["minimum_continuity_score_legacy_alias_semantics"],
+        )
         self.assertTrue(section["formation_wide_anchor_present"])
         self.assertGreaterEqual(section["closeup_shot_fraction"], 0.18)
         self.assertGreaterEqual(section["nonwide_shot_fraction"], 0.35)
@@ -2975,7 +3135,7 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            12,
+            13,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(
