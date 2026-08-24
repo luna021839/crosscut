@@ -9,11 +9,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from crosscut import stage_edit_release_fold_launcher as launcher
+from crosscut.stage_edit_dynamic_crop_capacity_probe import (
+    default_dynamic_crop_v2_probe_candidates,
+    write_dynamic_crop_capacity_selection,
+)
 from crosscut.stage_edit_transformer import (
     PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
     PRODUCTION_TRAINING_RUN_KIND,
 )
 from tests.test_professional_montage_policy import _profile, _write
+from tests.test_stage_edit_dynamic_crop_capacity_probe import BUDGET, _inputs
 
 
 def _write_dummy_manifests(
@@ -34,7 +39,28 @@ def _write_montage_profile(root: Path) -> Path:
     return path
 
 
-def _create_development_plan(root: Path, checkpoint: Path) -> Path:
+def _write_capacity_selection(root: Path) -> Path:
+    capacity_root = root / "capacity-selection-evidence"
+    capacity_root.mkdir(parents=True, exist_ok=True)
+    candidates = default_dynamic_crop_v2_probe_candidates()
+    dataset, folds, smokes = _inputs(
+        capacity_root,
+        tuple((candidate, (1.0, 1.0, 1.0)) for candidate in candidates),
+    )
+    return write_dynamic_crop_capacity_selection(
+        capacity_root,
+        candidates=candidates,
+        fold_run_evidence_paths=folds,
+        selection_dataset_manifest_path=dataset,
+        mlx_smoke_evidence_paths_by_candidate=smokes,
+        device_memory_budget=BUDGET,
+        baseline_candidate_id=candidates[0].candidate_id,
+    )
+
+
+def _create_development_plan(
+    root: Path, checkpoint: Path, *, capacity_selection: Path | None = None
+) -> Path:
     manifests = _write_dummy_manifests(root, launcher.DEVELOPMENT_SONG_IDS)
     return launcher.create_stage_edit_release_development_plan(
         materialization_manifests=manifests[0],
@@ -42,6 +68,11 @@ def _create_development_plan(root: Path, checkpoint: Path) -> Path:
         dynamic_crop_manifests=manifests[2],
         checkpoint_directory=checkpoint,
         output_directory=root,
+        capacity_selection_path=(
+            capacity_selection
+            if capacity_selection is not None
+            else _write_capacity_selection(root)
+        ),
     )
 
 
@@ -49,7 +80,9 @@ def _write_passing_development_checkpoint(
     checkpoint: Path, development_plan: Path
 ) -> None:
     checkpoint.mkdir(parents=True)
-    model_training = launcher._default_model_training_contract()
+    model_training = json.loads(
+        development_plan.read_text(encoding="utf-8")
+    )["model_training_contract"]
     config = model_training["model_config"]
     fingerprint = launcher._canonical_sha256(config)
     training_songs = sorted(launcher.DEVELOPMENT_TRAINING_SONG_IDS)
@@ -187,16 +220,32 @@ def _bindings(root: Path, songs: tuple[str, ...]):
 
 
 class StageEditReleaseFoldLauncherTests(unittest.TestCase):
-    def test_pre_renderer_authority_development_plan_schema_is_stale(self) -> None:
+    def setUp(self) -> None:
+        # These release-launcher fixtures deliberately use synthetic smoke
+        # repositories. The capacity-probe suite separately exercises the
+        # live clean-checkout attestation; only that external boundary is
+        # replaced here, while the exact four-candidate release contract and
+        # every content/provenance binding remain active.
+        for target in (
+            "crosscut.stage_edit_dynamic_crop_capacity_probe."
+            "_enforce_actual_smoke_source_paths",
+            "crosscut.stage_edit_dynamic_crop_capacity_probe."
+            "_enforce_live_release_smoke_attestation",
+        ):
+            attestation = patch(target)
+            attestation.start()
+            self.addCleanup(attestation.stop)
+
+    def test_pre_capacity_binding_development_plan_schema_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
                 current = _create_development_plan(root, root / "checkpoint")
                 payload = json.loads(current.read_text(encoding="utf-8"))
                 payload.pop("plan_sha256")
-                payload["schema_version"] = 2
+                payload["schema_version"] = 3
                 payload["analysis_basis"] = (
-                    "ive_stageedit_release_development_plan_v2"
+                    "ive_stageedit_release_development_plan_v3"
                 )
                 stale = launcher._write_content_addressed(
                     payload,
@@ -287,6 +336,12 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 "--dynamic-crop-loss-contract-json", result.train_cli_args
             )
             self.assertEqual(launcher.XOXZ, result.held_out_song_id)
+            self.assertEqual(
+                json.loads(plan.read_text(encoding="utf-8"))[
+                    "capacity_selection"
+                ],
+                result.capacity_selection,
+            )
 
     def test_exact_hard_cut_metadata_passes_renderer_owned_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -490,38 +545,10 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 ):
                     launcher._strict_development_plan(authority_plan)
 
-    def test_probe_selected_model_and_loss_contract_can_be_bound_explicitly(self) -> None:
+    def test_verified_capacity_selection_contract_and_origin_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
-            selected = json.loads(
-                json.dumps(launcher._default_model_training_contract())
-            )
-            selected["model_config"].update(
-                {
-                    "model_dimension": 384,
-                    "num_heads": 12,
-                    "num_layers": 8,
-                    "feed_forward_dimension": 1536,
-                }
-            )
-            selected["model_config_sha256"] = launcher._canonical_sha256(
-                selected["model_config"]
-            )
-            selected["base_loss_contract"]["source_objective"] = (
-                "eligible_all_hybrid"
-            )
-            selected["base_loss_contract_sha256"] = launcher._canonical_sha256(
-                selected["base_loss_contract"]
-            )
-            selected["dynamic_crop_loss_contract"]["base"] = json.loads(
-                json.dumps(selected["base_loss_contract"])
-            )
-            selected["dynamic_crop_loss_contract_sha256"] = (
-                launcher._canonical_sha256(
-                    selected["dynamic_crop_loss_contract"]
-                )
-            )
-            selected["source_objective"] = "eligible_all_hybrid"
+            capacity_selection = _write_capacity_selection(root)
             manifests = _write_dummy_manifests(
                 root, launcher.DEVELOPMENT_SONG_IDS
             )
@@ -532,19 +559,84 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     dynamic_crop_manifests=manifests[2],
                     checkpoint_directory=root / "checkpoint",
                     output_directory=root,
-                    model_training_contract=selected,
+                    capacity_selection_path=capacity_selection,
                 )
                 payload = launcher._strict_development_plan(plan)
+            selection = launcher.load_dynamic_crop_capacity_selection(
+                capacity_selection
+            )
             self.assertEqual(
-                384,
-                payload["model_training_contract"]["model_config"][
-                    "model_dimension"
+                selection["release_model_training_contract"],
+                payload["model_training_contract"],
+            )
+            self.assertEqual(
+                selection["selected_candidate_id"],
+                payload["capacity_selection"]["selected_candidate_id"],
+            )
+            self.assertEqual(
+                selection["release_model_training_contract_origin"],
+                payload["capacity_selection"][
+                    "release_model_training_contract_origin"
                 ],
             )
             self.assertEqual(
-                "eligible_all_hybrid",
-                payload["model_training_contract"]["source_objective"],
+                selection["artifact_content_sha256"],
+                payload["capacity_selection"]["artifact_content_sha256"],
             )
+
+    def test_capacity_selection_symlink_and_binding_tamper_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            capacity_selection = _write_capacity_selection(root)
+            manifests = _write_dummy_manifests(
+                root, launcher.DEVELOPMENT_SONG_IDS
+            )
+            symlink = root / "capacity-selection-symlink.json"
+            symlink.symlink_to(capacity_selection)
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError, "must not be a symlink"
+                ):
+                    launcher.create_stage_edit_release_development_plan(
+                        materialization_manifests=manifests[0],
+                        feature_manifests=manifests[1],
+                        dynamic_crop_manifests=manifests[2],
+                        checkpoint_directory=root / "symlink-checkpoint",
+                        output_directory=root / "symlink-plan",
+                        capacity_selection_path=symlink,
+                    )
+
+                plan = launcher.create_stage_edit_release_development_plan(
+                    materialization_manifests=manifests[0],
+                    feature_manifests=manifests[1],
+                    dynamic_crop_manifests=manifests[2],
+                    checkpoint_directory=root / "checkpoint",
+                    output_directory=root,
+                    capacity_selection_path=capacity_selection,
+                )
+                payload = json.loads(plan.read_text(encoding="utf-8"))
+                payload.pop("plan_sha256")
+                payload["capacity_selection"]["selection_identity_sha256"] = (
+                    "f" * 64
+                )
+                tampered = launcher._write_content_addressed(
+                    payload,
+                    output_directory=root / "binding-tamper",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "binding changed or does not match",
+                ):
+                    launcher._strict_development_plan(tampered)
+
+                capacity_selection.write_text("{}\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "capacity selection is missing, unsafe, or invalid",
+                ):
+                    launcher._strict_development_plan(plan)
 
     def test_final_plan_is_impossible_before_development_freeze(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -585,8 +677,15 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 payload = launcher._strict_development_freeze(
                     freeze, expected_plan_path=development
                 )
+                development_payload = launcher._strict_development_plan(
+                    development
+                )
                 self.assertTrue(payload["development_quality_gate_passed"])
                 self.assertFalse(payload["production_activation_authorized"])
+                self.assertEqual(
+                    development_payload["capacity_selection"],
+                    payload["capacity_selection"],
+                )
                 selection = checkpoint / launcher.STAGE_EDIT_SELECTION_FREEZE_FILENAME
                 selection.write_text("{}", encoding="utf-8")
                 with self.assertRaisesRegex(
@@ -630,33 +729,51 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 for index in range(3):
                     manifests[index].update(attitude[index])
                 montage_profile = _write_montage_profile(root)
-                final = launcher.create_stage_edit_release_final_plan(
-                    development_plan_path=development,
-                    development_freeze_path=freeze,
-                    materialization_manifests=manifests[0],
-                    feature_manifests=manifests[1],
-                    dynamic_crop_manifests=manifests[2],
-                    checkpoint_directory=final_checkpoint,
-                    output_directory=root,
-                    professional_montage_grammar_profile=montage_profile,
-                    production_registry=root / "active.json",
-                )
-                second_final = launcher.create_stage_edit_release_final_plan(
-                    development_plan_path=development,
-                    development_freeze_path=freeze,
-                    materialization_manifests=manifests[0],
-                    feature_manifests=manifests[1],
-                    dynamic_crop_manifests=manifests[2],
-                    checkpoint_directory=root / "different-final-checkpoint",
-                    output_directory=root,
-                    professional_montage_grammar_profile=montage_profile,
-                    production_registry=root / "active.json",
-                )
-                first_payload = launcher._strict_final_plan(final)
-                second_payload = launcher._strict_final_plan(second_final)
+                real_file_sha256 = launcher._file_sha256
+
+                def reject_premarker_attitude_hash(path, name):
+                    if launcher.ATTITUDE in str(path):
+                        raise AssertionError(
+                            "ATTITUDE was hashed before blind consumption"
+                        )
+                    return real_file_sha256(path, name)
+
+                with patch.object(
+                    launcher,
+                    "_file_sha256",
+                    side_effect=reject_premarker_attitude_hash,
+                ):
+                    final = launcher.create_stage_edit_release_final_plan(
+                        development_plan_path=development,
+                        development_freeze_path=freeze,
+                        materialization_manifests=manifests[0],
+                        feature_manifests=manifests[1],
+                        dynamic_crop_manifests=manifests[2],
+                        checkpoint_directory=final_checkpoint,
+                        output_directory=root,
+                        professional_montage_grammar_profile=montage_profile,
+                        production_registry=root / "active.json",
+                    )
+                    second_final = launcher.create_stage_edit_release_final_plan(
+                        development_plan_path=development,
+                        development_freeze_path=freeze,
+                        materialization_manifests=manifests[0],
+                        feature_manifests=manifests[1],
+                        dynamic_crop_manifests=manifests[2],
+                        checkpoint_directory=root / "different-final-checkpoint",
+                        output_directory=root,
+                        professional_montage_grammar_profile=montage_profile,
+                        production_registry=root / "active.json",
+                    )
+                    first_payload = launcher._strict_final_plan(final)
+                    second_payload = launcher._strict_final_plan(second_final)
                 self.assertEqual(
                     launcher.FINAL_RELEASE_PLAN_SCHEMA_VERSION,
                     first_payload["schema_version"],
+                )
+                self.assertEqual(
+                    development_payload["capacity_selection"],
+                    first_payload["capacity_selection"],
                 )
                 self.assertEqual(
                     first_payload["blind_consumption_marker"],
@@ -668,11 +785,36 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         "path"
                     ],
                 )
+                self.assertEqual(4, len(first_payload["songs"]))
+                self.assertNotIn(
+                    launcher.ATTITUDE,
+                    {item["song_id"] for item in first_payload["songs"]},
+                )
+                deferred_attitude = first_payload[
+                    "deferred_blind_held_out_song"
+                ]
+                self.assertEqual(
+                    launcher.DEFERRED_BLIND_MANIFEST_CONTRACT,
+                    deferred_attitude["inspection_contract"],
+                )
+                self.assertFalse(
+                    any("sha256" in key for key in deferred_attitude)
+                )
+                blind_marker = Path(first_payload["blind_consumption_marker"])
                 materializations, features = _bindings(
                     root, launcher.FINAL_SONG_IDS
                 )
+                attitude_validations = []
+
+                def guarded_release_hash(path, name):
+                    if launcher.ATTITUDE in str(path):
+                        self.assertTrue(blind_marker.is_file())
+                    return real_file_sha256(path, name)
 
                 def materialization(_pointer, *, song_id):
+                    if song_id == launcher.ATTITUDE:
+                        self.assertTrue(blind_marker.is_file())
+                        attitude_validations.append(song_id)
                     return (
                         launcher.legacy.ManifestPointer(root / "m", "a" * 64),
                         materializations[song_id],
@@ -698,6 +840,11 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         return_value=20 * 1024**3,
                     ),
                     patch.object(
+                        launcher,
+                        "_file_sha256",
+                        side_effect=guarded_release_hash,
+                    ),
+                    patch.object(
                         launcher.legacy,
                         "_validate_materialization_manifest",
                         side_effect=materialization,
@@ -712,28 +859,47 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         "_validate_dynamic_crop_manifest",
                         side_effect=dynamic,
                     ),
+                    patch.object(
+                        launcher, "production_train_main", return_value=0
+                    ) as train,
                 ):
                     result = launcher.preflight_stage_edit_release_final(final)
+                    self.assertEqual((), result.train_cli_args)
+                    self.assertTrue(result.held_out_manifest_inspection_deferred)
+                    self.assertNotIn(
+                        launcher.ATTITUDE, result.reference_ids_by_song
+                    )
+                    self.assertEqual([], attitude_validations)
+                    self.assertEqual(
+                        0, launcher.launch_stage_edit_release_final(final)
+                    )
+                    consumed_args = train.call_args.args[0]
 
-            self.assertEqual(25, result.train_cli_args.count("--input"))
+            self.assertEqual([launcher.ATTITUDE], attitude_validations)
+            self.assertTrue(blind_marker.is_file())
+            self.assertEqual(25, consumed_args.count("--input"))
             self.assertEqual(
-                5, result.train_cli_args.count("--dynamic-crop-manifest")
+                5, consumed_args.count("--dynamic-crop-manifest")
             )
             self.assertEqual(
-                4, result.train_cli_args.count("--required-training-song")
+                4, consumed_args.count("--required-training-song")
             )
             self.assertEqual(launcher.ATTITUDE, result.held_out_song_id)
             self.assertIn(
-                "--authorize-production-activation", result.train_cli_args
+                "--authorize-production-activation", consumed_args
             )
-            profile_option = result.train_cli_args.index(
+            profile_option = consumed_args.index(
                 "--professional-montage-grammar-profile"
             )
             self.assertEqual(
                 str(montage_profile),
-                result.train_cli_args[profile_option + 1],
+                consumed_args[profile_option + 1],
             )
-            self.assertIn("--production-registry", result.train_cli_args)
+            self.assertIn("--production-registry", consumed_args)
+            self.assertEqual(
+                first_payload["capacity_selection"],
+                result.capacity_selection,
+            )
 
     def test_final_plan_revalidates_immutable_montage_profile(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -790,6 +956,35 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         launcher.preflight_stage_edit_release_final(final)
                     validate_storage.assert_not_called()
 
+    def test_create_development_parser_requires_capacity_selection(self) -> None:
+        parser = launcher.build_parser()
+        minimal = [
+            "create-development",
+            "--checkpoint-dir",
+            "/tmp/checkpoint",
+            "--output-directory",
+            "/tmp/output",
+            "--materialization-manifest",
+            "song=/tmp/materialization.json",
+            "--feature-manifest",
+            "song=/tmp/features.json",
+            "--dynamic-crop-manifest",
+            "song=/tmp/dynamic.json",
+        ]
+        with self.assertRaises(SystemExit):
+            parser.parse_args(minimal)
+        parsed = parser.parse_args(
+            [
+                *minimal,
+                "--capacity-selection",
+                "/tmp/dynamic-crop-v2-capacity-selection.json",
+            ]
+        )
+        self.assertEqual(
+            Path("/tmp/dynamic-crop-v2-capacity-selection.json"),
+            parsed.capacity_selection,
+        )
+
     def test_create_final_parser_requires_explicit_montage_profile(self) -> None:
         parser = launcher.build_parser()
         minimal = [
@@ -821,6 +1016,23 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
         self.assertEqual(
             Path("/tmp/montage.json"),
             parsed.professional_montage_grammar_profile,
+        )
+
+    def test_attitude_cli_path_is_normalized_without_resolve_or_stat(self) -> None:
+        with patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("ATTITUDE path must remain deferred"),
+        ) as resolve:
+            result = launcher._keyed_paths(
+                [f"{launcher.ATTITUDE}=/tmp/blind/../attitude.json"],
+                expected_song_ids=(launcher.ATTITUDE,),
+                option="--materialization-manifest",
+                content_inspection_deferred_song_ids=(launcher.ATTITUDE,),
+            )
+        resolve.assert_not_called()
+        self.assertEqual(
+            Path("/tmp/attitude.json"), result[launcher.ATTITUDE]
         )
 
     def test_create_final_cli_forwards_explicit_montage_profile(self) -> None:
@@ -872,15 +1084,54 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 held_out_song_id=launcher.ATTITUDE,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=root / "checkpoint",
+                capacity_selection={"selected_candidate_id": "a" * 64},
                 blind_consumption_marker=marker,
+                held_out_manifest_inspection_deferred=True,
+                train_cli_args=(),
+                reference_ids_by_song={},
+            )
+            consumed = launcher.ReleaseFoldPreflight(
+                stage="final_blind",
+                plan_path=preflight.plan_path,
+                plan_sha256=preflight.plan_sha256,
+                held_out_song_id=launcher.ATTITUDE,
+                training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
+                checkpoint_directory=preflight.checkpoint_directory,
+                capacity_selection=preflight.capacity_selection,
+                blind_consumption_marker=marker,
+                held_out_manifest_inspection_deferred=False,
                 train_cli_args=("--authorize-production-activation",),
                 reference_ids_by_song={},
             )
+            ordering = []
+
+            def fsync_parent(path):
+                self.assertEqual(marker, path)
+                self.assertTrue(marker.is_file())
+                ordering.append("directory_fsynced")
+
+            def consumed_preflight(_plan, *, consumption_marker):
+                self.assertEqual(marker, consumption_marker)
+                self.assertTrue(marker.is_file())
+                self.assertEqual(["directory_fsynced"], ordering)
+                ordering.append("attitude_inspection")
+                return consumed
+
             with (
                 patch.object(
                     launcher,
                     "preflight_stage_edit_release_final",
                     return_value=preflight,
+                ),
+                patch.object(
+                    launcher,
+                    "_preflight_consumed_stage_edit_release_final",
+                    side_effect=consumed_preflight,
+                ),
+                patch.object(
+                    launcher,
+                    "_fsync_parent_directory",
+                    side_effect=fsync_parent,
                 ),
                 patch.object(
                     launcher, "production_train_main", return_value=2
@@ -897,7 +1148,61 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     launcher.ReleaseFoldPreflightError, "already consumed"
                 ):
                     launcher.launch_stage_edit_release_final(root / "plan.json")
-                train.assert_called_once_with(preflight.train_cli_args)
+                train.assert_called_once_with(consumed.train_cli_args)
+                self.assertEqual(
+                    ["directory_fsynced", "attitude_inspection"], ordering
+                )
+
+    def test_attitude_manifest_failure_after_marker_cannot_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            marker = root / "blind-consumed.json"
+            preflight = launcher.ReleaseFoldPreflight(
+                stage="final_blind",
+                plan_path=root / "plan.json",
+                plan_sha256="b" * 64,
+                held_out_song_id=launcher.ATTITUDE,
+                training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
+                checkpoint_directory=root / "checkpoint",
+                capacity_selection={"selected_candidate_id": "b" * 64},
+                blind_consumption_marker=marker,
+                held_out_manifest_inspection_deferred=True,
+                train_cli_args=(),
+                reference_ids_by_song={},
+            )
+
+            def reject_attitude(_plan, *, consumption_marker):
+                self.assertEqual(marker, consumption_marker)
+                self.assertTrue(marker.is_file())
+                raise launcher.ReleaseFoldPreflightError(
+                    "ATTITUDE manifest invalid after consumption"
+                )
+
+            with (
+                patch.object(
+                    launcher,
+                    "preflight_stage_edit_release_final",
+                    return_value=preflight,
+                ),
+                patch.object(
+                    launcher,
+                    "_preflight_consumed_stage_edit_release_final",
+                    side_effect=reject_attitude,
+                ) as consumed_preflight,
+                patch.object(launcher, "production_train_main") as train,
+            ):
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "manifest invalid after consumption",
+                ):
+                    launcher.launch_stage_edit_release_final(preflight.plan_path)
+                self.assertTrue(marker.is_file())
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError, "already consumed"
+                ):
+                    launcher.launch_stage_edit_release_final(preflight.plan_path)
+                consumed_preflight.assert_called_once()
+                train.assert_not_called()
 
 
 if __name__ == "__main__":

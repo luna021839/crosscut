@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -40,6 +40,10 @@ from .stage_edit_production_training import (
 )
 from .stage_edit_reference_adapter import load_reference_training_corpus
 from .stage_edit_dynamic_crop_head_v2 import DynamicCropV2LossContract
+from .stage_edit_dynamic_crop_capacity_probe import (
+    DynamicCropCapacityProbeError,
+    load_dynamic_crop_capacity_selection,
+)
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     PRODUCTION_TRAINING_REPORT_FILENAME,
@@ -47,7 +51,6 @@ from .stage_edit_transformer import (
     PRODUCTION_TRAINING_RUN_KIND,
     StageEditLossContract,
     StageEditTransformerConfig,
-    production_stage_edit_config,
 )
 from .stage_edit_transition_authority import (
     RENDERER_OWNED_ALLOWED_MODEL_LABELS,
@@ -57,13 +60,17 @@ from .stage_edit_transition_authority import (
 )
 
 
-RELEASE_PLAN_SCHEMA_VERSION = 3
-FINAL_RELEASE_PLAN_SCHEMA_VERSION = 4
-DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v3"
-DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v3"
-FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v4"
+RELEASE_PLAN_SCHEMA_VERSION = 4
+FINAL_RELEASE_PLAN_SCHEMA_VERSION = 6
+DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v4"
+DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v4"
+FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v6"
 MODEL_TRAINING_CONTRACT_VERSION = 2
 STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 2
+CAPACITY_SELECTION_BINDING_VERSION = 1
+DEFERRED_BLIND_MANIFEST_CONTRACT = (
+    "absolute_paths_only_until_blind_consumption_marker_v1"
+)
 
 BANG_BANG = "IVE-BANG-BANG"
 BLACKHOLE = "IVE-BLACKHOLE"
@@ -105,7 +112,9 @@ class ReleaseFoldPreflight:
     held_out_song_id: str
     training_song_ids: tuple[str, ...]
     checkpoint_directory: Path
+    capacity_selection: Mapping[str, Any]
     blind_consumption_marker: Path | None
+    held_out_manifest_inspection_deferred: bool
     train_cli_args: tuple[str, ...]
     reference_ids_by_song: Mapping[str, tuple[str, ...]]
 
@@ -117,10 +126,14 @@ class ReleaseFoldPreflight:
             "held_out_song_id": self.held_out_song_id,
             "training_song_ids": list(self.training_song_ids),
             "checkpoint_directory": str(self.checkpoint_directory),
+            "capacity_selection": dict(self.capacity_selection),
             "blind_consumption_marker": (
                 str(self.blind_consumption_marker)
                 if self.blind_consumption_marker is not None
                 else None
+            ),
+            "held_out_manifest_inspection_deferred": (
+                self.held_out_manifest_inspection_deferred
             ),
             "held_out_used_for_model_or_threshold_selection": False,
             "activation_authority_present": (
@@ -407,36 +420,171 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
     return contract
 
 
-def _default_model_training_contract() -> dict[str, Any]:
-    authority = StageEditTransitionAuthority(
-        mode=RENDERER_OWNED_TRANSITION_AUTHORITY
-    )
-    model = asdict(
-        replace(
-            production_stage_edit_config(),
-            transition_authority=authority.mode,
+_CAPACITY_SELECTION_BINDING_KEYS = {
+    "binding_version",
+    "path",
+    "file_sha256",
+    "artifact_content_sha256",
+    "capacity_probe_schema_version",
+    "capacity_probe_analysis_basis",
+    "selection_identity_sha256",
+    "selected_candidate_id",
+    "release_model_training_contract_origin",
+    "release_model_training_contract_sha256",
+}
+
+
+def _load_verified_capacity_selection(
+    path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load one immutable capacity result and project its release authority.
+
+    The capacity loader performs the expensive deterministic replay of the
+    BANG BANG / BLACKHOLE / REBEL HEART evidence.  This wrapper additionally
+    binds the exact file bytes and the selected candidate/origin to the release
+    model contract so a caller cannot substitute a standalone JSON contract.
+    """
+
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raise ReleaseFoldPreflightError(
+            "capacity selection path must be explicit and absolute"
+        )
+    if raw.is_symlink():
+        raise ReleaseFoldPreflightError("capacity selection must not be a symlink")
+    try:
+        before_sha256 = _file_sha256(raw, "capacity selection")
+        selection = load_dynamic_crop_capacity_selection(raw)
+        after_sha256 = _file_sha256(raw, "capacity selection")
+    except (DynamicCropCapacityProbeError, OSError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"capacity selection is missing, unsafe, or invalid: {exc}"
+        ) from exc
+    if before_sha256 != after_sha256:
+        raise ReleaseFoldPreflightError("capacity selection changed while loading")
+
+    resolved = raw.resolve()
+    artifact_sha256 = selection.get("artifact_content_sha256")
+    selection_identity = selection.get("selection_identity_sha256")
+    selected_candidate_id = selection.get("selected_candidate_id")
+    if not all(
+        _is_sha256(value)
+        for value in (
+            artifact_sha256,
+            selection_identity,
+            selected_candidate_id,
+        )
+    ):
+        raise ReleaseFoldPreflightError(
+            "capacity selection identity hashes are invalid"
+        )
+    schema_version = selection.get("schema_version")
+    analysis_basis = selection.get("analysis_basis")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version < 1
+        or not isinstance(analysis_basis, str)
+        or not analysis_basis
+    ):
+        raise ReleaseFoldPreflightError(
+            "capacity selection schema identity is invalid"
+        )
+
+    origin = dict(
+        _mapping(
+            selection.get("release_model_training_contract_origin"),
+            "capacity-selected release model/training contract origin",
         )
     )
-    base = StageEditLossContract(
-        transition_weight=0.0,
-        transition_authority=authority.mode,
+    if set(origin) != {
+        "capacity_probe_schema_version",
+        "selection_identity_sha256",
+        "selected_candidate_id",
+    }:
+        raise ReleaseFoldPreflightError(
+            "capacity-selected release contract origin keys are not exact"
+        )
+    if origin != {
+        "capacity_probe_schema_version": schema_version,
+        "selection_identity_sha256": selection_identity,
+        "selected_candidate_id": selected_candidate_id,
+    }:
+        raise ReleaseFoldPreflightError(
+            "capacity-selected release contract origin is inconsistent"
+        )
+
+    selected_candidates = [
+        dict(candidate)
+        for candidate in _array(selection.get("candidates"), "capacity candidates")
+        if isinstance(candidate, Mapping)
+        and candidate.get("candidate_id") == selected_candidate_id
+    ]
+    if len(selected_candidates) != 1:
+        raise ReleaseFoldPreflightError(
+            "capacity-selected candidate identity is not unique"
+        )
+    contract = _validate_model_training_contract(
+        selection.get("release_model_training_contract")
     )
-    base_loss = asdict(base)
-    dynamic_loss = asdict(DynamicCropV2LossContract(base=base))
-    return _validate_model_training_contract(
-        {
-            "contract_version": MODEL_TRAINING_CONTRACT_VERSION,
-            "model_config": model,
-            "model_config_sha256": _canonical_sha256(model),
-            "base_loss_contract": base_loss,
-            "base_loss_contract_sha256": _canonical_sha256(base_loss),
-            "dynamic_crop_loss_contract": dynamic_loss,
-            "dynamic_crop_loss_contract_sha256": _canonical_sha256(dynamic_loss),
-            "source_objective": base_loss["source_objective"],
-            "transition_authority_contract": authority.to_dict(),
-            "transition_authority_contract_sha256": authority.fingerprint,
-        }
+    selected_contract = _mapping(
+        selected_candidates[0].get("contract"),
+        "capacity-selected candidate contract",
     )
+    for key in (
+        "model_config",
+        "model_config_sha256",
+        "base_loss_contract",
+        "base_loss_contract_sha256",
+        "dynamic_crop_loss_contract",
+        "dynamic_crop_loss_contract_sha256",
+    ):
+        if selected_contract.get(key) != contract.get(key):
+            raise ReleaseFoldPreflightError(
+                "capacity-selected release contract differs from selected candidate"
+            )
+    binding = {
+        "binding_version": CAPACITY_SELECTION_BINDING_VERSION,
+        "path": str(resolved),
+        "file_sha256": after_sha256,
+        "artifact_content_sha256": artifact_sha256,
+        "capacity_probe_schema_version": schema_version,
+        "capacity_probe_analysis_basis": analysis_basis,
+        "selection_identity_sha256": selection_identity,
+        "selected_candidate_id": selected_candidate_id,
+        "release_model_training_contract_origin": origin,
+        "release_model_training_contract_sha256": _canonical_sha256(contract),
+    }
+    return selection, binding, contract
+
+
+def _verify_capacity_selection_binding(
+    value: object,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    binding = dict(_mapping(value, "capacity selection binding"))
+    if set(binding) != _CAPACITY_SELECTION_BINDING_KEYS:
+        raise ReleaseFoldPreflightError(
+            "capacity selection binding keys are not exact"
+        )
+    if binding.get("binding_version") != CAPACITY_SELECTION_BINDING_VERSION:
+        raise ReleaseFoldPreflightError(
+            "capacity selection binding version is invalid"
+        )
+    raw_path = binding.get("path")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise ReleaseFoldPreflightError("capacity selection binding path is invalid")
+    if not _is_sha256(binding.get("file_sha256")):
+        raise ReleaseFoldPreflightError(
+            "capacity selection binding file hash is invalid"
+        )
+    selection, observed, contract = _load_verified_capacity_selection(
+        Path(raw_path)
+    )
+    if observed != binding:
+        raise ReleaseFoldPreflightError(
+            "capacity selection binding changed or does not match its origin"
+        )
+    return selection, contract
 
 
 def _structured_head_preflight_contract() -> dict[str, Any]:
@@ -535,6 +683,103 @@ def _song_records(
     ]
 
 
+def _normalized_absolute_path_without_inspection(path: Path, name: str) -> str:
+    """Normalize an absolute path lexically without stat, resolve, or content IO."""
+
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        raise ReleaseFoldPreflightError(f"{name} path must be absolute")
+    return os.path.normpath(str(expanded))
+
+
+def _deferred_blind_song_record(
+    *,
+    materialization_manifest: Path,
+    feature_manifest: Path,
+    dynamic_crop_manifest: Path,
+) -> dict[str, Any]:
+    return {
+        "song_id": ATTITUDE,
+        "inspection_contract": DEFERRED_BLIND_MANIFEST_CONTRACT,
+        "materialization_manifest_path": (
+            _normalized_absolute_path_without_inspection(
+                materialization_manifest,
+                "ATTITUDE materialization manifest",
+            )
+        ),
+        "feature_manifest_path": _normalized_absolute_path_without_inspection(
+            feature_manifest,
+            "ATTITUDE feature manifest",
+        ),
+        "dynamic_crop_manifest_path": (
+            _normalized_absolute_path_without_inspection(
+                dynamic_crop_manifest,
+                "ATTITUDE dynamic crop manifest",
+            )
+        ),
+    }
+
+
+def _strict_deferred_blind_song_record(value: object) -> dict[str, Any]:
+    record = dict(_mapping(value, "deferred ATTITUDE manifest record"))
+    expected_keys = {
+        "song_id",
+        "inspection_contract",
+        "materialization_manifest_path",
+        "feature_manifest_path",
+        "dynamic_crop_manifest_path",
+    }
+    if set(record) != expected_keys:
+        raise ReleaseFoldPreflightError(
+            "deferred ATTITUDE manifest record keys are not exact"
+        )
+    if (
+        record.get("song_id") != ATTITUDE
+        or record.get("inspection_contract") != DEFERRED_BLIND_MANIFEST_CONTRACT
+    ):
+        raise ReleaseFoldPreflightError(
+            "deferred ATTITUDE manifest inspection contract is invalid"
+        )
+    for key in (
+        "materialization_manifest_path",
+        "feature_manifest_path",
+        "dynamic_crop_manifest_path",
+    ):
+        raw = record.get(key)
+        if not isinstance(raw, str) or not Path(raw).is_absolute():
+            raise ReleaseFoldPreflightError(
+                "deferred ATTITUDE manifest path is not absolute"
+            )
+        if os.path.normpath(raw) != raw:
+            raise ReleaseFoldPreflightError(
+                "deferred ATTITUDE manifest path is not lexically normalized"
+            )
+    return record
+
+
+def _materialize_deferred_blind_song_record(
+    value: object,
+) -> dict[str, Any]:
+    """Read/hash ATTITUDE evidence only after a verified consumption marker."""
+
+    record = _strict_deferred_blind_song_record(value)
+    return {
+        "song_id": ATTITUDE,
+        "materialization_manifest": _pointer(
+            Path(record["materialization_manifest_path"]),
+            "ATTITUDE materialization manifest",
+        ),
+        "feature_manifest": _pointer(
+            Path(record["feature_manifest_path"]),
+            "ATTITUDE feature manifest",
+        ),
+        "dynamic_crop_manifest": _pointer(
+            Path(record["dynamic_crop_manifest_path"]),
+            "ATTITUDE dynamic crop manifest",
+        ),
+    }
+
+
 def create_stage_edit_release_development_plan(
     *,
     materialization_manifests: Mapping[str, Path],
@@ -542,8 +787,8 @@ def create_stage_edit_release_development_plan(
     dynamic_crop_manifests: Mapping[str, Path],
     checkpoint_directory: Path,
     output_directory: Path,
+    capacity_selection_path: Path,
     training_config: Mapping[str, Any] = DEFAULT_RELEASE_TRAINING_CONFIG,
-    model_training_contract: Mapping[str, Any] | None = None,
 ) -> Path:
     """Bind the exact four-song development fold without activation authority."""
 
@@ -553,6 +798,9 @@ def create_stage_edit_release_development_plan(
         raise ReleaseFoldPreflightError(
             f"development checkpoint must be on {volume}: {checkpoint}"
         )
+    _, capacity_selection, model_training_contract = (
+        _load_verified_capacity_selection(capacity_selection_path)
+    )
     unsigned = {
         "schema_version": RELEASE_PLAN_SCHEMA_VERSION,
         "analysis_basis": DEVELOPMENT_PLAN_ANALYSIS_BASIS,
@@ -565,11 +813,8 @@ def create_stage_edit_release_development_plan(
         "required_volume": str(legacy.PRODUCTION_VOLUME_ROOT),
         "minimum_free_bytes": legacy.MINIMUM_FREE_BYTES,
         "training_config": _validate_training_config(training_config),
-        "model_training_contract": _validate_model_training_contract(
-            model_training_contract
-            if model_training_contract is not None
-            else _default_model_training_contract()
-        ),
+        "capacity_selection": capacity_selection,
+        "model_training_contract": model_training_contract,
         "structured_head_preflight_contract": (
             _structured_head_preflight_contract()
         ),
@@ -597,6 +842,7 @@ _DEVELOPMENT_PLAN_KEYS = {
     "required_volume",
     "minimum_free_bytes",
     "training_config",
+    "capacity_selection",
     "model_training_contract",
     "structured_head_preflight_contract",
     "checkpoint_directory",
@@ -626,7 +872,16 @@ def _strict_development_plan(path: Path) -> dict[str, Any]:
     ):
         raise ReleaseFoldPreflightError("development storage contract mismatch")
     _validate_training_config(payload.get("training_config"))
-    _validate_model_training_contract(payload.get("model_training_contract"))
+    _, selected_contract = _verify_capacity_selection_binding(
+        payload.get("capacity_selection")
+    )
+    planned_contract = _validate_model_training_contract(
+        payload.get("model_training_contract")
+    )
+    if planned_contract != selected_contract:
+        raise ReleaseFoldPreflightError(
+            "development model/training contract differs from capacity selection"
+        )
     _validate_structured_head_preflight_contract(
         payload.get("structured_head_preflight_contract")
     )
@@ -984,7 +1239,9 @@ def preflight_stage_edit_release_development(
         held_out_song_id=XOXZ,
         training_song_ids=DEVELOPMENT_TRAINING_SONG_IDS,
         checkpoint_directory=checkpoint,
+        capacity_selection=dict(payload["capacity_selection"]),
         blind_consumption_marker=None,
+        held_out_manifest_inspection_deferred=False,
         train_cli_args=tuple(args),
         reference_ids_by_song=references,
     )
@@ -1183,6 +1440,7 @@ def freeze_stage_edit_release_development(
         "checkpoint_id": checkpoint_id,
         "model_config": config,
         "model_config_fingerprint_sha256": _canonical_sha256(config),
+        "capacity_selection": dict(plan["capacity_selection"]),
         "model_training_contract": dict(plan["model_training_contract"]),
         "structured_head_preflight_contract": dict(
             plan["structured_head_preflight_contract"]
@@ -1214,6 +1472,7 @@ _DEVELOPMENT_FREEZE_KEYS = {
     "checkpoint_id",
     "model_config",
     "model_config_fingerprint_sha256",
+    "capacity_selection",
     "model_training_contract",
     "structured_head_preflight_contract",
     "training_config",
@@ -1252,10 +1511,21 @@ def _strict_development_freeze(
     plan = _strict_development_plan(plan_path)
     if payload.get("training_config") != plan.get("training_config"):
         raise ReleaseFoldPreflightError("development training config freeze mismatch")
+    if payload.get("capacity_selection") != plan.get("capacity_selection"):
+        raise ReleaseFoldPreflightError(
+            "development capacity selection freeze mismatch"
+        )
+    _, selected_contract = _verify_capacity_selection_binding(
+        payload.get("capacity_selection")
+    )
     if payload.get("model_training_contract") != plan.get(
         "model_training_contract"
     ):
         raise ReleaseFoldPreflightError("development model/loss contract freeze mismatch")
+    if payload.get("model_training_contract") != selected_contract:
+        raise ReleaseFoldPreflightError(
+            "development frozen model/loss contract differs from capacity selection"
+        )
     _validate_model_training_contract(payload.get("model_training_contract"))
     if payload.get("structured_head_preflight_contract") != plan.get(
         "structured_head_preflight_contract"
@@ -1345,11 +1615,34 @@ def create_stage_edit_release_final_plan(
         raise ReleaseFoldPreflightError(
             "professional montage grammar profile path identity changed"
         )
+    required_songs = set(FINAL_SONG_IDS)
+    for name, manifests in (
+        ("materialization", materialization_manifests),
+        ("feature", feature_manifests),
+        ("dynamic crop", dynamic_crop_manifests),
+    ):
+        if set(manifests) != required_songs:
+            raise ReleaseFoldPreflightError(
+                f"{name} manifests must name the exact five release songs"
+            )
     records = _song_records(
-        FINAL_SONG_IDS,
-        materialization_manifests=materialization_manifests,
-        feature_manifests=feature_manifests,
-        dynamic_crop_manifests=dynamic_crop_manifests,
+        DEVELOPMENT_SONG_IDS,
+        materialization_manifests={
+            song: materialization_manifests[song]
+            for song in DEVELOPMENT_SONG_IDS
+        },
+        feature_manifests={
+            song: feature_manifests[song] for song in DEVELOPMENT_SONG_IDS
+        },
+        dynamic_crop_manifests={
+            song: dynamic_crop_manifests[song]
+            for song in DEVELOPMENT_SONG_IDS
+        },
+    )
+    deferred_attitude = _deferred_blind_song_record(
+        materialization_manifest=materialization_manifests[ATTITUDE],
+        feature_manifest=feature_manifests[ATTITUDE],
+        dynamic_crop_manifest=dynamic_crop_manifests[ATTITUDE],
     )
     development_records = _indexed_song_records(development, DEVELOPMENT_SONG_IDS)
     final_records = {str(item["song_id"]): item for item in records}
@@ -1388,6 +1681,7 @@ def create_stage_edit_release_final_plan(
         "model_config_fingerprint_sha256": freeze[
             "model_config_fingerprint_sha256"
         ],
+        "capacity_selection": dict(freeze["capacity_selection"]),
         "model_training_contract": dict(freeze["model_training_contract"]),
         "structured_head_preflight_contract": dict(
             freeze["structured_head_preflight_contract"]
@@ -1402,6 +1696,7 @@ def create_stage_edit_release_final_plan(
         "professional_montage_grammar_profile": montage_profile_identity,
         "production_registry": registry,
         "songs": records,
+        "deferred_blind_held_out_song": deferred_attitude,
     }
     return _write_content_addressed(
         unsigned,
@@ -1420,6 +1715,7 @@ _FINAL_PLAN_KEYS = {
     "minimum_free_bytes",
     "training_config",
     "model_config_fingerprint_sha256",
+    "capacity_selection",
     "model_training_contract",
     "structured_head_preflight_contract",
     "development_plan",
@@ -1429,6 +1725,7 @@ _FINAL_PLAN_KEYS = {
     "professional_montage_grammar_profile",
     "production_registry",
     "songs",
+    "deferred_blind_held_out_song",
     "plan_sha256",
 }
 
@@ -1465,11 +1762,22 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
         "model_config_fingerprint_sha256"
     ):
         raise ReleaseFoldPreflightError("final model config differs from development freeze")
+    if payload.get("capacity_selection") != freeze.get("capacity_selection"):
+        raise ReleaseFoldPreflightError(
+            "final capacity selection differs from development freeze"
+        )
+    _, selected_contract = _verify_capacity_selection_binding(
+        payload.get("capacity_selection")
+    )
     if payload.get("model_training_contract") != freeze.get(
         "model_training_contract"
     ):
         raise ReleaseFoldPreflightError(
             "final model/loss contract differs from development freeze"
+        )
+    if payload.get("model_training_contract") != selected_contract:
+        raise ReleaseFoldPreflightError(
+            "final model/loss contract differs from capacity selection"
         )
     _validate_model_training_contract(payload.get("model_training_contract"))
     if payload.get("structured_head_preflight_contract") != freeze.get(
@@ -1481,7 +1789,10 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
     _validate_structured_head_preflight_contract(
         payload.get("structured_head_preflight_contract")
     )
-    final_records = _indexed_song_records(payload, FINAL_SONG_IDS)
+    final_records = _indexed_song_records(payload, DEVELOPMENT_SONG_IDS)
+    _strict_deferred_blind_song_record(
+        payload.get("deferred_blind_held_out_song")
+    )
     development_records = _indexed_song_records(development, DEVELOPMENT_SONG_IDS)
     for song_id in DEVELOPMENT_SONG_IDS:
         if final_records[song_id] != development_records[song_id]:
@@ -1546,7 +1857,7 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
 
 
 def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
-    """Validate frozen evidence before reading ATTITUDE manifests for one run."""
+    """Validate final authority without reading or exposing ATTITUDE inputs."""
 
     payload = _strict_final_plan(plan_path)
     checkpoint = Path(str(payload["checkpoint_directory"])).resolve()
@@ -1556,7 +1867,89 @@ def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
         raise ReleaseFoldPreflightError(
             "ATTITUDE blind evaluation was already consumed for this release"
         )
-    args, references, _ = _manifest_cli_args(payload, FINAL_SONG_IDS)
+    # BANG BANG / BLACKHOLE / REBEL HEART / XOXZ are already inside the
+    # development evidence boundary. ATTITUDE remains path-only and unopened.
+    _, references, _ = _manifest_cli_args(payload, DEVELOPMENT_SONG_IDS)
+    return ReleaseFoldPreflight(
+        stage="final_blind",
+        plan_path=Path(plan_path).expanduser().resolve(),
+        plan_sha256=str(payload["plan_sha256"]),
+        held_out_song_id=ATTITUDE,
+        training_song_ids=FINAL_TRAINING_SONG_IDS,
+        checkpoint_directory=checkpoint,
+        capacity_selection=dict(payload["capacity_selection"]),
+        blind_consumption_marker=marker,
+        held_out_manifest_inspection_deferred=True,
+        train_cli_args=(),
+        reference_ids_by_song=references,
+    )
+
+
+def _blind_consumption_marker_payload(
+    preflight: ReleaseFoldPreflight,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "contract": "attitude_one_shot_blind_evaluation_consumed_v1",
+        "final_plan_path": str(preflight.plan_path),
+        "final_plan_sha256": preflight.plan_sha256,
+        "held_out_song_id": ATTITUDE,
+        "held_out_used_for_model_or_threshold_selection": False,
+        "retry_allowed": False,
+    }
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Make the newly created O_EXCL marker durable before blind evidence IO."""
+
+    descriptor = os.open(Path(path).parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _preflight_consumed_stage_edit_release_final(
+    plan_path: Path, *, consumption_marker: Path
+) -> ReleaseFoldPreflight:
+    """Expand ATTITUDE evidence only after the one-shot marker is durable."""
+
+    payload = _strict_final_plan(plan_path)
+    checkpoint = Path(str(payload["checkpoint_directory"])).resolve()
+    marker = Path(str(payload["blind_consumption_marker"])).resolve()
+    if marker != Path(consumption_marker).expanduser().resolve():
+        raise ReleaseFoldPreflightError(
+            "consumed final preflight received a different marker"
+        )
+    marker_evidence = _read_json_object(marker, "ATTITUDE blind consumption marker")
+    marker_preflight = ReleaseFoldPreflight(
+        stage="final_blind",
+        plan_path=Path(plan_path).expanduser().resolve(),
+        plan_sha256=str(payload["plan_sha256"]),
+        held_out_song_id=ATTITUDE,
+        training_song_ids=FINAL_TRAINING_SONG_IDS,
+        checkpoint_directory=checkpoint,
+        capacity_selection=dict(payload["capacity_selection"]),
+        blind_consumption_marker=marker,
+        held_out_manifest_inspection_deferred=True,
+        train_cli_args=(),
+        reference_ids_by_song={},
+    )
+    if marker_evidence != _blind_consumption_marker_payload(marker_preflight):
+        raise ReleaseFoldPreflightError(
+            "ATTITUDE blind consumption marker is invalid or mismatched"
+        )
+
+    # No ATTITUDE pointer, hash, manifest, or supervision content is touched
+    # above this line. Materialization below is authorized by the durable marker.
+    expanded_payload = dict(payload)
+    expanded_payload["songs"] = [
+        *_array(payload.get("songs"), "frozen development songs"),
+        _materialize_deferred_blind_song_record(
+            payload.get("deferred_blind_held_out_song")
+        ),
+    ]
+    args, references, _ = _manifest_cli_args(expanded_payload, FINAL_SONG_IDS)
     for song_id in FINAL_TRAINING_SONG_IDS:
         args.extend(["--required-training-song", song_id])
     args.extend(
@@ -1591,7 +1984,9 @@ def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
         held_out_song_id=ATTITUDE,
         training_song_ids=FINAL_TRAINING_SONG_IDS,
         checkpoint_directory=checkpoint,
+        capacity_selection=dict(payload["capacity_selection"]),
         blind_consumption_marker=marker,
+        held_out_manifest_inspection_deferred=False,
         train_cli_args=tuple(args),
         reference_ids_by_song=references,
     )
@@ -1604,15 +1999,7 @@ def launch_stage_edit_release_final(plan_path: Path) -> int:
     assert preflight.blind_consumption_marker is not None
     marker = preflight.blind_consumption_marker
     marker.parent.mkdir(parents=True, exist_ok=True)
-    marker_payload = {
-        "schema_version": 1,
-        "contract": "attitude_one_shot_blind_evaluation_consumed_v1",
-        "final_plan_path": str(preflight.plan_path),
-        "final_plan_sha256": preflight.plan_sha256,
-        "held_out_song_id": ATTITUDE,
-        "held_out_used_for_model_or_threshold_selection": False,
-        "retry_allowed": False,
-    }
+    marker_payload = _blind_consumption_marker_payload(preflight)
     encoded = json.dumps(
         marker_payload,
         ensure_ascii=False,
@@ -1621,23 +2008,42 @@ def launch_stage_edit_release_final(plan_path: Path) -> int:
         allow_nan=False,
     ).encode("utf-8") + b"\n"
     try:
-        with marker.open("xb") as handle:
+        descriptor = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_parent_directory(marker)
     except FileExistsError as exc:
         raise ReleaseFoldPreflightError(
             "ATTITUDE blind evaluation was already consumed"
         ) from exc
     # The general CLI registers only when every fixed held-out gate passes.
     # A failed final blind run remains inactive and the marker remains consumed.
-    return production_train_main(preflight.train_cli_args)
+    consumed = _preflight_consumed_stage_edit_release_final(
+        preflight.plan_path,
+        consumption_marker=marker,
+    )
+    return production_train_main(consumed.train_cli_args)
 
 
 def _keyed_paths(
-    values: Sequence[str], *, expected_song_ids: Sequence[str], option: str
+    values: Sequence[str],
+    *,
+    expected_song_ids: Sequence[str],
+    option: str,
+    content_inspection_deferred_song_ids: Sequence[str] = (),
 ) -> dict[str, Path]:
     output: dict[str, Path] = {}
+    deferred = set(content_inspection_deferred_song_ids)
+    if not deferred.issubset(set(expected_song_ids)):
+        raise ReleaseFoldPreflightError(
+            f"{option} deferred songs are outside the expected fold"
+        )
     for value in values:
         song_id, separator, raw_path = value.partition("=")
         song_id = song_id.strip()
@@ -1648,7 +2054,15 @@ def _keyed_paths(
             )
         if song_id in output:
             raise ReleaseFoldPreflightError(f"duplicate {option} song: {song_id}")
-        output[song_id] = Path(raw_path).expanduser().resolve()
+        candidate = Path(raw_path).expanduser()
+        if song_id in deferred:
+            if not candidate.is_absolute():
+                raise ReleaseFoldPreflightError(
+                    f"deferred {option} path must be absolute"
+                )
+            output[song_id] = Path(os.path.normpath(str(candidate)))
+        else:
+            output[song_id] = candidate.resolve()
     if set(output) != set(expected_song_ids):
         raise ReleaseFoldPreflightError(
             f"{option} must name the exact release songs"
@@ -1672,12 +2086,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_dev.add_argument("--checkpoint-dir", required=True, type=Path)
     create_dev.add_argument("--output-directory", required=True, type=Path)
     create_dev.add_argument(
-        "--model-training-contract",
+        "--capacity-selection",
+        required=True,
         type=Path,
         help=(
-            "Optional probe-selected model/loss contract JSON. When omitted, "
-            "the current release candidate is still serialized and hash-bound; "
-            "a later capacity probe may supply its selected contract explicitly."
+            "Verified content-addressed Dynamic Crop v2 capacity-selection "
+            "artifact; its selected model/loss contract is mandatory."
         ),
     )
     for name in ("preflight-development", "launch-development"):
@@ -1726,14 +2140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
-            model_training_contract=(
-                _read_json_object(
-                    args.model_training_contract.expanduser().resolve(),
-                    "probe-selected model/training contract",
-                )
-                if args.model_training_contract is not None
-                else None
-            ),
+            capacity_selection_path=args.capacity_selection,
         )
         print(json.dumps({"plan_path": str(path)}, ensure_ascii=False, indent=2))
         return 0
@@ -1759,16 +2166,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.materialization_manifest,
                 expected_song_ids=expected,
                 option="--materialization-manifest",
+                content_inspection_deferred_song_ids=(ATTITUDE,),
             ),
             feature_manifests=_keyed_paths(
                 args.feature_manifest,
                 expected_song_ids=expected,
                 option="--feature-manifest",
+                content_inspection_deferred_song_ids=(ATTITUDE,),
             ),
             dynamic_crop_manifests=_keyed_paths(
                 args.dynamic_crop_manifest,
                 expected_song_ids=expected,
                 option="--dynamic-crop-manifest",
+                content_inspection_deferred_song_ids=(ATTITUDE,),
             ),
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
