@@ -173,6 +173,165 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
             [Path("/tmp/crop-manifest.json")],
             parsed.dynamic_crop_manifest,
         )
+        self.assertIsNone(parsed.professional_montage_grammar_profile)
+
+    def test_authorized_activation_requires_explicit_montage_profile(self) -> None:
+        base = [
+            "--input",
+            "/tmp/input.json",
+            "--song-id",
+            "reference-a=IVE-XOXZ",
+            "--held-out-song",
+            "IVE-XOXZ",
+            "--feature-snapshot",
+            "reference-a=/tmp/features.json",
+            "--dynamic-crop-manifest",
+            "/tmp/crop-manifest.json",
+            "--checkpoint-dir",
+            "/tmp/new-checkpoint",
+        ]
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(
+                ValueError,
+                "requires --professional-montage-grammar-profile",
+            ),
+        ):
+            main([*base, "--authorize-production-activation"])
+        load.assert_not_called()
+
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(
+                ValueError,
+                "requires --authorize-production-activation",
+            ),
+        ):
+            main(
+                [
+                    *base,
+                    "--professional-montage-grammar-profile",
+                    "/tmp/montage-profile.json",
+                ]
+            )
+        load.assert_not_called()
+
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(ValueError, "explicit absolute path"),
+        ):
+            main(
+                [
+                    *base,
+                    "--authorize-production-activation",
+                    "--professional-montage-grammar-profile",
+                    "relative-profile.json",
+                ]
+            )
+        load.assert_not_called()
+
+        parsed = build_parser().parse_args(
+            [
+                *base,
+                "--authorize-production-activation",
+                "--professional-montage-grammar-profile",
+                "/tmp/montage-profile.json",
+            ]
+        )
+        self.assertEqual(
+            Path("/tmp/montage-profile.json"),
+            parsed.professional_montage_grammar_profile,
+        )
+
+    def test_authorized_registration_receives_the_exact_profile_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            checkpoint = root / "checkpoint"
+            profile = root / "montage-profile.json"
+            registry = root / "active-production-bundle.json"
+            quality_gate = SimpleNamespace(passed=True, to_dict=lambda: {})
+            training_result = SimpleNamespace(
+                checkpoint_directory=checkpoint,
+                report_path=checkpoint / "training-report.json",
+                best_epoch=3,
+                best_training_step=9,
+                production_ready=True,
+                quality_gate=quality_gate,
+            )
+            with (
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "load_professional_montage_policy",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli._snapshot_map",
+                    return_value={},
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "load_reference_training_corpus",
+                    return_value=SimpleNamespace(examples=()),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "_dynamic_artifact_map",
+                    return_value={},
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "build_stage_edit_dynamic_crop_training_corpus_v2",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "train_production_stage_edit",
+                    return_value=training_result,
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "register_stage_edit_production_bundle",
+                    return_value=registry,
+                ) as register,
+                patch("builtins.print"),
+            ):
+                exit_code = main(
+                    [
+                        "--input",
+                        str(root / "input.json"),
+                        "--song-id",
+                        "reference-a=IVE-XOXZ",
+                        "--held-out-song",
+                        "IVE-XOXZ",
+                        "--feature-snapshot",
+                        f"reference-a={root / 'features.json'}",
+                        "--dynamic-crop-manifest",
+                        str(root / "crop-manifest.json"),
+                        "--checkpoint-dir",
+                        str(checkpoint),
+                        "--authorize-production-activation",
+                        "--professional-montage-grammar-profile",
+                        str(profile),
+                        "--production-registry",
+                        str(registry),
+                    ]
+                )
+
+            self.assertEqual(0, exit_code)
+            register.assert_called_once_with(
+                checkpoint,
+                professional_montage_grammar_profile_path=profile,
+                registry_path=registry,
+            )
 
     def test_existing_checkpoint_directory_fails_before_loading_data(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

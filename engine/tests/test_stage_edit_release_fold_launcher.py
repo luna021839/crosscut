@@ -12,6 +12,7 @@ from crosscut.stage_edit_transformer import (
     PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
     PRODUCTION_TRAINING_RUN_KIND,
 )
+from tests.test_professional_montage_policy import _profile, _write
 
 
 def _write_dummy_manifests(
@@ -24,6 +25,12 @@ def _write_dummy_manifests(
             path.write_text(json.dumps({"song": song_id, "family": family}))
             groups[index][song_id] = path
     return groups[0], groups[1], groups[2]
+
+
+def _write_montage_profile(root: Path) -> Path:
+    path = root / "professional-montage-grammar-profile.json"
+    _write(path, _profile())
+    return path
 
 
 def _create_development_plan(root: Path, checkpoint: Path) -> Path:
@@ -251,6 +258,9 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                             dynamic_crop_manifests={},
                             checkpoint_directory=root / "final",
                             output_directory=root,
+                            professional_montage_grammar_profile=(
+                                root / "missing-profile.json"
+                            ),
                         )
                     song_records.assert_not_called()
 
@@ -311,6 +321,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 attitude = _write_dummy_manifests(root, (launcher.ATTITUDE,))
                 for index in range(3):
                     manifests[index].update(attitude[index])
+                montage_profile = _write_montage_profile(root)
                 final = launcher.create_stage_edit_release_final_plan(
                     development_plan_path=development,
                     development_freeze_path=freeze,
@@ -319,6 +330,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     dynamic_crop_manifests=manifests[2],
                     checkpoint_directory=final_checkpoint,
                     output_directory=root,
+                    professional_montage_grammar_profile=montage_profile,
                     production_registry=root / "active.json",
                 )
                 second_final = launcher.create_stage_edit_release_final_plan(
@@ -329,13 +341,24 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     dynamic_crop_manifests=manifests[2],
                     checkpoint_directory=root / "different-final-checkpoint",
                     output_directory=root,
+                    professional_montage_grammar_profile=montage_profile,
                     production_registry=root / "active.json",
                 )
                 first_payload = launcher._strict_final_plan(final)
                 second_payload = launcher._strict_final_plan(second_final)
                 self.assertEqual(
+                    launcher.FINAL_RELEASE_PLAN_SCHEMA_VERSION,
+                    first_payload["schema_version"],
+                )
+                self.assertEqual(
                     first_payload["blind_consumption_marker"],
                     second_payload["blind_consumption_marker"],
+                )
+                self.assertEqual(
+                    str(montage_profile),
+                    first_payload["professional_montage_grammar_profile"][
+                        "path"
+                    ],
                 )
                 materializations, features = _bindings(
                     root, launcher.FINAL_SONG_IDS
@@ -395,7 +418,140 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             self.assertIn(
                 "--authorize-production-activation", result.train_cli_args
             )
+            profile_option = result.train_cli_args.index(
+                "--professional-montage-grammar-profile"
+            )
+            self.assertEqual(
+                str(montage_profile),
+                result.train_cli_args[profile_option + 1],
+            )
             self.assertIn("--production-registry", result.train_cli_args)
+
+    def test_final_plan_revalidates_immutable_montage_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            development_checkpoint = root / "development-checkpoint"
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                development = _create_development_plan(
+                    root, development_checkpoint
+                )
+                _write_passing_development_checkpoint(
+                    development_checkpoint, development
+                )
+                freeze = launcher.freeze_stage_edit_release_development(
+                    development, output_directory=root
+                )
+                development_payload = launcher._strict_development_plan(
+                    development
+                )
+                records = launcher._indexed_song_records(
+                    development_payload, launcher.DEVELOPMENT_SONG_IDS
+                )
+                manifests = [dict(), dict(), dict()]
+                for song_id in launcher.DEVELOPMENT_SONG_IDS:
+                    for index, key in enumerate(
+                        (
+                            "materialization_manifest",
+                            "feature_manifest",
+                            "dynamic_crop_manifest",
+                        )
+                    ):
+                        manifests[index][song_id] = Path(records[song_id][key]["path"])
+                attitude = _write_dummy_manifests(root, (launcher.ATTITUDE,))
+                for index in range(3):
+                    manifests[index].update(attitude[index])
+                montage_profile = _write_montage_profile(root)
+                final = launcher.create_stage_edit_release_final_plan(
+                    development_plan_path=development,
+                    development_freeze_path=freeze,
+                    materialization_manifests=manifests[0],
+                    feature_manifests=manifests[1],
+                    dynamic_crop_manifests=manifests[2],
+                    checkpoint_directory=root / "final-checkpoint",
+                    output_directory=root,
+                    professional_montage_grammar_profile=montage_profile,
+                )
+                montage_profile.write_text("{}", encoding="utf-8")
+                with patch.object(
+                    launcher.legacy, "_validate_storage"
+                ) as validate_storage:
+                    with self.assertRaisesRegex(
+                        launcher.ReleaseFoldPreflightError,
+                        "profile is missing, changed, or invalid",
+                    ):
+                        launcher.preflight_stage_edit_release_final(final)
+                    validate_storage.assert_not_called()
+
+    def test_create_final_parser_requires_explicit_montage_profile(self) -> None:
+        parser = launcher.build_parser()
+        minimal = [
+            "create-final",
+            "--development-plan",
+            "/tmp/development.json",
+            "--development-freeze",
+            "/tmp/freeze.json",
+            "--checkpoint-dir",
+            "/tmp/checkpoint",
+            "--output-directory",
+            "/tmp/output",
+            "--materialization-manifest",
+            "song=/tmp/materialization.json",
+            "--feature-manifest",
+            "song=/tmp/features.json",
+            "--dynamic-crop-manifest",
+            "song=/tmp/dynamic.json",
+        ]
+        with self.assertRaises(SystemExit):
+            parser.parse_args(minimal)
+        parsed = parser.parse_args(
+            [
+                *minimal,
+                "--professional-montage-grammar-profile",
+                "/tmp/montage.json",
+            ]
+        )
+        self.assertEqual(
+            Path("/tmp/montage.json"),
+            parsed.professional_montage_grammar_profile,
+        )
+
+    def test_create_final_cli_forwards_explicit_montage_profile(self) -> None:
+        profile = Path("/tmp/professional-montage.json")
+        argv = [
+            "create-final",
+            "--development-plan",
+            "/tmp/development.json",
+            "--development-freeze",
+            "/tmp/freeze.json",
+            "--checkpoint-dir",
+            "/tmp/checkpoint",
+            "--output-directory",
+            "/tmp/output",
+            "--materialization-manifest",
+            "song=/tmp/materialization.json",
+            "--feature-manifest",
+            "song=/tmp/features.json",
+            "--dynamic-crop-manifest",
+            "song=/tmp/dynamic.json",
+            "--professional-montage-grammar-profile",
+            str(profile),
+        ]
+        with (
+            patch.object(launcher, "_keyed_paths", return_value={}),
+            patch.object(
+                launcher,
+                "create_stage_edit_release_final_plan",
+                return_value=Path("/tmp/final-plan.json"),
+            ) as create_final,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(0, launcher.main(argv))
+        self.assertEqual(
+            profile,
+            create_final.call_args.kwargs[
+                "professional_montage_grammar_profile"
+            ],
+        )
 
     def test_final_launch_consumes_marker_even_when_quality_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

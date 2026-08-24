@@ -27,6 +27,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import stage_edit_production_fold_launcher as legacy
+from .professional_montage_policy import (
+    ProfessionalMontagePolicyError,
+    load_professional_montage_policy,
+)
 from .stage_edit_production_train_cli import main as production_train_main
 from .stage_edit_production_training import STAGE_EDIT_SELECTION_FREEZE_FILENAME
 from .stage_edit_transformer import (
@@ -38,9 +42,10 @@ from .stage_edit_transformer import (
 
 
 RELEASE_PLAN_SCHEMA_VERSION = 1
+FINAL_RELEASE_PLAN_SCHEMA_VERSION = 2
 DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v1"
 DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v1"
-FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v1"
+FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v2"
 
 BANG_BANG = "IVE-BANG-BANG"
 BLACKHOLE = "IVE-BLACKHOLE"
@@ -210,6 +215,7 @@ def _strict_content_addressed(
     schema_basis: str,
     prefix: str,
     hash_field: str,
+    expected_schema_version: int = RELEASE_PLAN_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file() or resolved.is_symlink():
@@ -219,7 +225,7 @@ def _strict_content_addressed(
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or set(payload) != expected_keys:
         raise ReleaseFoldPreflightError("release evidence keys are not exact")
-    if payload.get("schema_version") != RELEASE_PLAN_SCHEMA_VERSION:
+    if payload.get("schema_version") != expected_schema_version:
         raise ReleaseFoldPreflightError("release evidence schema mismatch")
     if payload.get("analysis_basis") != schema_basis:
         raise ReleaseFoldPreflightError("release evidence analysis basis mismatch")
@@ -806,6 +812,7 @@ def create_stage_edit_release_final_plan(
     dynamic_crop_manifests: Mapping[str, Path],
     checkpoint_directory: Path,
     output_directory: Path,
+    professional_montage_grammar_profile: Path,
     production_registry: Path | None = None,
 ) -> Path:
     """Create the final ATTITUDE plan only after a valid development freeze."""
@@ -819,6 +826,25 @@ def create_stage_edit_release_final_plan(
     volume = legacy.PRODUCTION_VOLUME_ROOT.resolve()
     if volume != checkpoint and volume not in checkpoint.parents:
         raise ReleaseFoldPreflightError(f"final checkpoint must be on {volume}: {checkpoint}")
+    montage_profile_path = Path(
+        professional_montage_grammar_profile
+    ).expanduser()
+    if not montage_profile_path.is_absolute():
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile path must be explicit and absolute"
+        )
+    try:
+        montage_policy = load_professional_montage_policy(montage_profile_path)
+    except ProfessionalMontagePolicyError as exc:
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile is missing, unsafe, or invalid: "
+            f"{exc}"
+        ) from exc
+    montage_profile_identity = montage_policy.profile_identity
+    if montage_profile_identity.get("path") != str(montage_profile_path):
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile path identity changed"
+        )
     records = _song_records(
         FINAL_SONG_IDS,
         materialization_manifests=materialization_manifests,
@@ -848,7 +874,7 @@ def create_stage_edit_release_final_plan(
         f"stageedit-release-{freeze_digest[:16]}.attitude-blind-consumed.json"
     )
     unsigned = {
-        "schema_version": RELEASE_PLAN_SCHEMA_VERSION,
+        "schema_version": FINAL_RELEASE_PLAN_SCHEMA_VERSION,
         "analysis_basis": FINAL_PLAN_ANALYSIS_BASIS,
         "stage": "final_blind",
         "release_contract": _release_contract(
@@ -869,6 +895,7 @@ def create_stage_edit_release_final_plan(
         ),
         "checkpoint_directory": str(checkpoint),
         "blind_consumption_marker": str(marker),
+        "professional_montage_grammar_profile": montage_profile_identity,
         "production_registry": registry,
         "songs": records,
     }
@@ -893,6 +920,7 @@ _FINAL_PLAN_KEYS = {
     "development_freeze",
     "checkpoint_directory",
     "blind_consumption_marker",
+    "professional_montage_grammar_profile",
     "production_registry",
     "songs",
     "plan_sha256",
@@ -906,6 +934,7 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
         schema_basis=FINAL_PLAN_ANALYSIS_BASIS,
         prefix="stageedit-release-attitude-blind-plan",
         hash_field="plan_sha256",
+        expected_schema_version=FINAL_RELEASE_PLAN_SCHEMA_VERSION,
     )
     if payload.get("stage") != "final_blind" or payload.get("release_contract") != _release_contract(
         training_song_ids=FINAL_TRAINING_SONG_IDS,
@@ -948,6 +977,44 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
     )
     if marker != expected_marker:
         raise ReleaseFoldPreflightError("blind consumption marker path is not canonical")
+    montage_profile = _mapping(
+        payload.get("professional_montage_grammar_profile"),
+        "professional montage grammar profile",
+    )
+    if set(montage_profile) != {
+        "analysis_basis",
+        "schema_version",
+        "path",
+        "file_sha256",
+        "content_sha256",
+    }:
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile identity schema mismatch"
+        )
+    raw_profile_path = montage_profile.get("path")
+    if not isinstance(raw_profile_path, str) or not Path(raw_profile_path).is_absolute():
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile path is invalid"
+        )
+    expected_profile_file_sha256 = montage_profile.get("file_sha256")
+    if not _is_sha256(expected_profile_file_sha256):
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile file hash is invalid"
+        )
+    try:
+        actual_montage_policy = load_professional_montage_policy(
+            Path(raw_profile_path),
+            expected_file_sha256=str(expected_profile_file_sha256),
+        )
+    except ProfessionalMontagePolicyError as exc:
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile is missing, changed, or invalid: "
+            f"{exc}"
+        ) from exc
+    if actual_montage_policy.profile_identity != dict(montage_profile):
+        raise ReleaseFoldPreflightError(
+            "professional montage grammar profile identity changed"
+        )
     registry = payload.get("production_registry")
     if registry is not None and (
         not isinstance(registry, str) or not Path(registry).is_absolute()
@@ -985,6 +1052,12 @@ def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
         ]
     )
     args.extend(_training_config_cli_args(_validate_training_config(payload["training_config"])))
+    args.extend(
+        [
+            "--professional-montage-grammar-profile",
+            str(payload["professional_montage_grammar_profile"]["path"]),
+        ]
+    )
     args.append("--authorize-production-activation")
     if payload.get("production_registry") is not None:
         args.extend(["--production-registry", str(payload["production_registry"])])
@@ -1087,6 +1160,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_final.add_argument("--development-freeze", required=True, type=Path)
     create_final.add_argument("--checkpoint-dir", required=True, type=Path)
     create_final.add_argument("--output-directory", required=True, type=Path)
+    create_final.add_argument(
+        "--professional-montage-grammar-profile",
+        required=True,
+        type=Path,
+    )
     create_final.add_argument("--production-registry", type=Path)
     for name in ("preflight-final", "launch-final"):
         command = commands.add_parser(name)
@@ -1154,6 +1232,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
+            professional_montage_grammar_profile=(
+                args.professional_montage_grammar_profile
+            ),
             production_registry=args.production_registry,
         )
         print(json.dumps({"plan_path": str(path)}, ensure_ascii=False, indent=2))

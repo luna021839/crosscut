@@ -17,6 +17,10 @@ from .reference_dynamic_crop_job import (
 from .reference_dynamic_crop_supervision import (
     load_reference_dynamic_crop_supervision,
 )
+from .professional_montage_policy import (
+    ProfessionalMontagePolicyError,
+    load_professional_montage_policy,
+)
 from .stage_edit_feature_materializer import StageEditFeatureSnapshot
 from .stage_edit_production_training import train_production_stage_edit
 from .stage_edit_production_registry import (
@@ -281,6 +285,15 @@ def build_parser() -> argparse.ArgumentParser:
             "the external-SSD-first machine default is used."
         ),
     )
+    parser.add_argument(
+        "--professional-montage-grammar-profile",
+        type=Path,
+        help=(
+            "Explicit absolute non-symlink IVE professional montage grammar "
+            "profile. Required for production activation and hash-bound into "
+            "the active registry."
+        ),
+    )
     return parser
 
 
@@ -292,6 +305,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--production-registry requires --authorize-production-activation"
         )
+    if args.authorize_production_activation and (
+        args.professional_montage_grammar_profile is None
+    ):
+        raise ValueError(
+            "--authorize-production-activation requires "
+            "--professional-montage-grammar-profile"
+        )
+    if args.professional_montage_grammar_profile is not None and not (
+        args.authorize_production_activation
+    ):
+        raise ValueError(
+            "--professional-montage-grammar-profile requires "
+            "--authorize-production-activation"
+        )
+    if args.authorize_production_activation:
+        montage_profile_path = Path(args.professional_montage_grammar_profile)
+        if not montage_profile_path.is_absolute():
+            raise ValueError(
+                "--professional-montage-grammar-profile must be an explicit "
+                "absolute path"
+            )
+        try:
+            load_professional_montage_policy(montage_profile_path)
+        except ProfessionalMontagePolicyError as exc:
+            raise ValueError(
+                "--professional-montage-grammar-profile is unsafe or invalid: "
+                f"{exc}"
+            ) from exc
+        args.professional_montage_grammar_profile = montage_profile_path
     checkpoint_directory = args.checkpoint_dir.expanduser().resolve()
     if checkpoint_directory.exists() or checkpoint_directory.is_symlink():
         raise FileExistsError(
@@ -354,6 +396,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result.production_ready and args.authorize_production_activation:
         registered_production_bundle = register_stage_edit_production_bundle(
             result.checkpoint_directory,
+            professional_montage_grammar_profile_path=(
+                args.professional_montage_grammar_profile
+            ),
             registry_path=args.production_registry,
         )
     print(

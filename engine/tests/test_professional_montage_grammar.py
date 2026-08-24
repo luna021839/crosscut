@@ -1,0 +1,612 @@
+from __future__ import annotations
+
+from copy import deepcopy
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from crosscut.professional_montage_grammar import (
+    MontageGrammarConfig,
+    MontageGrammarEvidenceError,
+    MontageSongInput,
+    ProfessionalMontageGrammarProfile,
+    build_professional_montage_grammar_profile,
+)
+from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
+from crosscut.stage_edit_transformer import (
+    DEFAULT_STAGE_EDIT_SCHEMA,
+    SourceCandidateToken,
+    StageEditSequence,
+    StageEditToken,
+)
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _snapshot_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_json(path: Path, value: object) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
+class _SyntheticSong:
+    def __init__(
+        self,
+        root: Path,
+        song_id: str,
+        *,
+        cut_clock_offset: bool = False,
+        missing_first_scale: bool = False,
+        mismatched_source_catalog: bool = False,
+        mismatched_snapshot_schema: bool = False,
+    ) -> None:
+        self.root = root / song_id
+        self.song_id = song_id
+        self.reference_ids = ("REF_A", "REF_B")
+        self.source_ids = ("A", "B", "C")
+        source_catalog_ids = (
+            ("A", "B", "D") if mismatched_source_catalog else self.source_ids
+        )
+        self.source_catalog = [
+            {
+                "video_id": source_id,
+                "path": f"/synthetic/{song_id}/{source_id}.mp4",
+                "clock": {},
+                "provenance": {},
+                "media_probe": {},
+            }
+            for source_id in source_catalog_ids
+        ]
+        self.supervisions: dict[str, Path] = {}
+        self.snapshots: dict[str, Path] = {}
+        self.snapshot_objects: dict[str, dict[str, object]] = {}
+        supervision_records: list[dict[str, object]] = []
+        snapshot_records: list[dict[str, object]] = []
+
+        for reference_index, reference_id in enumerate(self.reference_ids):
+            snapshot = self._snapshot(
+                reference_id,
+                missing_first_scale=(missing_first_scale and reference_index == 0),
+            )
+            snapshot_payload = snapshot.to_dict()
+            if mismatched_snapshot_schema and reference_index == 0:
+                snapshot_payload["token_schema_fingerprint"] = "0" * 64
+                unsigned = deepcopy(snapshot_payload)
+                unsigned.pop("snapshot_sha256")
+                snapshot_payload["snapshot_sha256"] = _snapshot_sha256(unsigned)
+            snapshot_hash = str(snapshot_payload["snapshot_sha256"])
+            snapshot_path = self.root / (
+                f"{reference_id}-stageedit-feature-snapshot-"
+                f"{snapshot_hash[:16]}.json"
+            )
+            _write_json(snapshot_path, snapshot_payload)
+            self.snapshots[reference_id] = snapshot_path
+            self.snapshot_objects[reference_id] = snapshot_payload
+            snapshot_records.append(
+                {
+                    "reference_id": reference_id,
+                    "path": str(snapshot_path.resolve()),
+                    "snapshot_sha256": snapshot_hash,
+                    "token_count": 6,
+                    "source_count": 3,
+                    "performance_start_seconds": 0.0,
+                    "performance_end_seconds": 6.0,
+                }
+            )
+
+            supervision = self._supervision(
+                reference_id,
+                cut_clock_offset=(cut_clock_offset and reference_index == 0),
+            )
+            supervision_path = self.root / f"{reference_id}-supervision.json"
+            supervision_raw = _write_json(supervision_path, supervision)
+            supervision_sha = hashlib.sha256(supervision_raw).hexdigest()
+            self.supervisions[reference_id] = supervision_path
+            supervision_records.append(
+                {
+                    "reference_id": reference_id,
+                    "path": str(supervision_path.resolve()),
+                    "sha256": supervision_sha,
+                }
+            )
+
+        contract = {
+            "analysis_basis": "immutable_reference_training_materialization_v1",
+            "style_id": f"{song_id}-style",
+            "reference_dataset_schema_version": 4,
+            "reference_supervision_schema_version": 3,
+            "expected_reference_count": 2,
+            "expected_source_count": 3,
+            "inputs": [
+                {
+                    "reference_id": reference_id,
+                    "source_count": 3,
+                    "known_shot_count": 6,
+                }
+                for reference_id in self.reference_ids
+            ],
+        }
+        fingerprint = _canonical_sha256(contract)
+        outputs = [
+            {
+                "reference_id": item["reference_id"],
+                "supervision_path": item["path"],
+                "supervision_file_sha256": item["sha256"],
+            }
+            for item in supervision_records
+        ]
+        materialization = {
+            "schema_version": 1,
+            "analysis_basis": "immutable_reference_training_materialization_v1",
+            "created_at": "2026-08-24T00:00:00+00:00",
+            "input_fingerprint_sha256": fingerprint,
+            "input_contract": contract,
+            "outputs": outputs,
+            "statistics": {
+                "reference_count": 2,
+                "known_shot_label_count": 12,
+            },
+            "immutable_inputs_modified": False,
+        }
+        self.materialization_path = self.root / (
+            f"reference-training-materialization-{fingerprint[:16]}.json"
+        )
+        _write_json(self.materialization_path, materialization)
+
+        source_content = [
+            {
+                "source_id": source_id,
+                "path": f"/synthetic/{song_id}/{source_id}.mp4",
+                "content_sha256": hashlib.sha256(source_id.encode()).hexdigest(),
+            }
+            for source_id in self.source_ids
+        ]
+        unsigned_manifest = {
+            "schema_version": 2,
+            "analysis_basis": (
+                "synchronized_source_causal_stage_edit_feature_snapshot_v2"
+            ),
+            "song_id": song_id,
+            "input_policy": {
+                "features_available_before_current_editorial_choice": True,
+                "strictly_past_causal_edit_history_only": True,
+                "reference_match_scores_present": False,
+                "selected_or_rejected_source_targets_present": False,
+                "raw_frames_persisted": False,
+                "identity_embeddings_persisted": False,
+            },
+            "sampling": {},
+            "source_catalog_sha256": _canonical_sha256(self.source_catalog),
+            "source_count": 3,
+            "source_content": source_content,
+            "supervision_inputs": supervision_records,
+            "feature_provenance": {},
+            "snapshots": snapshot_records,
+            "statistics": {
+                "reference_count": 2,
+                "source_count": 3,
+            },
+        }
+        manifest_sha = _canonical_sha256(unsigned_manifest)
+        feature_manifest = {**unsigned_manifest, "manifest_sha256": manifest_sha}
+        self.feature_path = self.root / (
+            f"stageedit-feature-snapshot-job-manifest-{manifest_sha[:16]}.json"
+        )
+        _write_json(self.feature_path, feature_manifest)
+
+    @property
+    def input(self) -> MontageSongInput:
+        return MontageSongInput(
+            self.song_id,
+            self.feature_path,
+            self.materialization_path,
+        )
+
+    def _snapshot(
+        self,
+        reference_id: str,
+        *,
+        missing_first_scale: bool,
+    ) -> StageEditFeatureSnapshot:
+        roles = ("verse_like", "verse_like", "chorus_like", "chorus_like", "chorus_like", "chorus_like")
+        section_progress = (0.0, 0.5, 0.0, 0.25, 0.50, 0.75)
+        phrase_progress = (0.0, 0.7, 0.0, 0.4, 0.1, 0.6)
+        selected_sources = ("A", "B", "C", "A", "B", "C")
+        selected_scales = (0.10, 0.20, 0.35, 0.70, 0.80, 0.15)
+        role_index = {
+            "intro": 0,
+            "verse_like": 1,
+            "build": 2,
+            "chorus_like": 3,
+            "bridge_like": 4,
+            "outro": 5,
+        }
+        scale_index = DEFAULT_STAGE_EDIT_SCHEMA.source_feature_names.index(
+            "shot_scale"
+        )
+        detected_index = DEFAULT_STAGE_EDIT_SCHEMA.source_feature_names.index(
+            "detected_person_count_normalized"
+        )
+        formation_index = DEFAULT_STAGE_EDIT_SCHEMA.source_feature_names.index(
+            "formation_person_count_normalized"
+        )
+        phrase_index = DEFAULT_STAGE_EDIT_SCHEMA.music_feature_names.index(
+            "phrase_progress"
+        )
+        tokens: list[StageEditToken] = []
+        for index in range(6):
+            music = [0.0] * len(DEFAULT_STAGE_EDIT_SCHEMA.music_feature_names)
+            music[phrase_index] = phrase_progress[index]
+            section = [0.0] * len(DEFAULT_STAGE_EDIT_SCHEMA.section_feature_names)
+            section[role_index[roles[index]]] = 0.8
+            section[6] = section_progress[index]
+            candidates: list[SourceCandidateToken] = []
+            for source_id in self.source_ids:
+                features = [0.0] * DEFAULT_STAGE_EDIT_SCHEMA.raw_source_dimension
+                missing = [True] * DEFAULT_STAGE_EDIT_SCHEMA.raw_source_dimension
+                features[scale_index] = (
+                    selected_scales[index]
+                    if source_id == selected_sources[index]
+                    else 0.4
+                )
+                missing[scale_index] = False
+                features[detected_index] = (
+                    1.0 if features[scale_index] < 0.22 else 1.0 / 6.0
+                )
+                features[formation_index] = features[detected_index]
+                missing[detected_index] = False
+                missing[formation_index] = False
+                if missing_first_scale and index == 0 and source_id == "A":
+                    features[scale_index] = 0.0
+                    missing[scale_index] = True
+                candidates.append(
+                    SourceCandidateToken(
+                        source_id=source_id,
+                        features=tuple(features),
+                        missing_mask=tuple(missing),
+                        available=True,
+                        hard_gate_passed=True,
+                    )
+                )
+            tokens.append(
+                StageEditToken(
+                    master_time_seconds=float(index),
+                    music_features=tuple(music),
+                    section_features=tuple(section),
+                    source_candidates=tuple(candidates),
+                    recent_edit_features=(0.0,)
+                    * len(DEFAULT_STAGE_EDIT_SCHEMA.recent_edit_feature_names),
+                    style_features=(0.0,)
+                    * len(DEFAULT_STAGE_EDIT_SCHEMA.style_feature_names),
+                    missing_mask=(False,)
+                    * DEFAULT_STAGE_EDIT_SCHEMA.raw_context_dimension,
+                )
+            )
+        return StageEditFeatureSnapshot.build(
+            StageEditSequence(
+                f"stageedit-features:{self.song_id}:{reference_id}",
+                tuple(tokens),
+            )
+        )
+
+    def _supervision(
+        self,
+        reference_id: str,
+        *,
+        cut_clock_offset: bool,
+    ) -> dict[str, object]:
+        selected_sources = ("A", "B", "C", "A", "B", "C")
+        labels: list[dict[str, object]] = []
+        for index, source_id in enumerate(selected_sources):
+            start = float(index)
+            if cut_clock_offset and index == 1:
+                start += 0.001
+            end = float(index + 1)
+            labels.append(
+                {
+                    "record_id": f"{reference_id}:{index}",
+                    "style_id": f"{self.song_id}-style",
+                    "reference_id": reference_id,
+                    "shot_index": index,
+                    "selected_source_id": source_id,
+                    "selected_source_time": start,
+                    "edit_labels": {
+                        "cut": {
+                            "boundary_label": "reference_start" if index == 0 else "cut",
+                            "nominal_cut_master_time": start,
+                            "cut_master_time": start,
+                            "end_master_time": end,
+                            "duration_seconds": end - start,
+                        },
+                        "source_transition": {},
+                        "boundary_event": {},
+                        "dense_attribution": {},
+                        "crop": {},
+                        "geometry_evidence": {},
+                    },
+                    "attribution_confidence": {},
+                }
+            )
+        return {
+            "schema_version": 3,
+            "dataset_kind": "reference_stage_mix_pairwise_listwise_supervision",
+            "style_id": f"{self.song_id}-style",
+            "reference_id": reference_id,
+            "reference_path": f"/synthetic/{reference_id}.mp4",
+            "source_catalog": deepcopy(self.source_catalog),
+            "base_reference_dataset_schema_version": 4,
+            "canonical_shot_schema": {},
+            "dense_attribution_schema": {},
+            "crop_supervision_schema": {},
+            "label_policy": {},
+            "attribution_analysis": {},
+            "reference_evidence_provenance": {},
+            "shot_labels": labels,
+            "detected_boundary_records": [],
+            "detected_boundary_statistics": {},
+            "pairwise_records": [],
+            "listwise_records": [],
+            "statistics": {},
+        }
+
+
+class ProfessionalMontageGrammarTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.config = MontageGrammarConfig(
+            minimum_song_count=2,
+            minimum_references_per_song=2,
+            minimum_sources_per_song=3,
+            early_anchor_shot_count=2,
+            reference_floor_quantile=0.10,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _profile(self, **first_song_options: object) -> ProfessionalMontageGrammarProfile:
+        first = _SyntheticSong(
+            self.root,
+            "IVE-SONG-A",
+            **first_song_options,
+        )
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        return build_professional_montage_grammar_profile(
+            (first.input, second.input),
+            config=self.config,
+        )
+
+    def test_measures_wide_switches_anchors_and_closeup_bursts(self) -> None:
+        profile = self._profile()
+        payload = profile.to_dict()
+        self.assertEqual(2, profile.song_count)
+        self.assertEqual(4, profile.reference_count)
+        verse = payload["aggregate_by_acoustic_role"]["verse_like"]
+        chorus = payload["aggregate_by_acoustic_role"]["chorus_like"]
+        self.assertEqual(
+            1.0,
+            verse["reference_distributions"]
+            ["wide_to_wide_source_switch_fraction"]["median"],
+        )
+        self.assertEqual(
+            1.0,
+            verse["reference_distributions"]["entry_wide_anchor_fraction"][
+                "median"
+            ],
+        )
+        self.assertEqual(
+            0.0,
+            chorus["reference_distributions"]["entry_wide_anchor_fraction"][
+                "median"
+            ],
+        )
+        self.assertEqual(4, chorus["pooled_counts"]["short_closeup_burst_count"])
+        self.assertEqual(
+            2.0,
+            chorus["burst_event_distributions"]["short_closeup_shot_count"][
+                "median"
+            ],
+        )
+        self.assertEqual(
+            0.0,
+            chorus["reference_distributions"]
+            ["phrase_entry_wide_anchor_fraction"]["reference_floor"]["value"],
+        )
+
+    def test_person_count_is_evidence_not_a_formation_assertion(self) -> None:
+        payload = self._profile().to_dict()
+        limitations = payload["evidence_limitations"]
+        self.assertFalse(limitations["generic_wide_is_proven_group_formation"])
+        evidence = payload["aggregate_by_acoustic_role"]["verse_like"][
+            "wide_shot_person_count_evidence"
+        ]
+        self.assertEqual(8, evidence["detected_person_count_normalized"]["count"])
+        self.assertEqual(
+            "identity_free_observed_counts_only_no_group_formation_threshold",
+            evidence["semantics"],
+        )
+
+    def test_missing_scale_remains_unknown_and_never_becomes_wide(self) -> None:
+        payload = self._profile(missing_first_scale=True).to_dict()
+        first = payload["songs"][0]["references"][0]
+        verse = first["by_acoustic_role"]["verse_like"]
+        self.assertEqual(1, verse["unknown_shot_scale_count"])
+        self.assertEqual(1, verse["unknown_shot_scale_reasons"]["missing_mask"])
+        self.assertEqual(1, verse["shot_size_counts"]["wide"])
+
+    def test_round_trip_rebuilds_from_immutable_inputs(self) -> None:
+        profile = self._profile()
+        path = profile.write_json(self.root / "profile.json")
+        restored = ProfessionalMontageGrammarProfile.from_file(path)
+        self.assertEqual(profile.profile_content_sha256, restored.profile_content_sha256)
+        self.assertIsNotNone(restored.file_sha256)
+
+    def test_round_trip_detects_later_input_mutation(self) -> None:
+        first = _SyntheticSong(self.root, "IVE-SONG-A")
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        profile = build_professional_montage_grammar_profile(
+            (first.input, second.input),
+            config=self.config,
+        )
+        path = profile.write_json(self.root / "profile.json")
+        supervision = first.supervisions["REF_A"]
+        supervision.write_bytes(supervision.read_bytes() + b" ")
+        with self.assertRaisesRegex(MontageGrammarEvidenceError, "SHA-256 mismatch"):
+            ProfessionalMontageGrammarProfile.from_file(path)
+        unverified = ProfessionalMontageGrammarProfile.from_file(
+            path,
+            verify_input_hashes=False,
+        )
+        self.assertEqual(profile.profile_content_sha256, unverified.profile_content_sha256)
+
+    def test_profile_hash_rejects_metric_tampering(self) -> None:
+        payload = self._profile().to_dict()
+        payload["songs"][0]["references"][0]["shot_count"] += 1
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "shot count mismatch|known-gap coverage mismatch|content SHA-256 mismatch",
+        ):
+            ProfessionalMontageGrammarProfile.from_mapping(payload)
+
+    def test_feature_manifest_hash_is_fail_closed(self) -> None:
+        first = _SyntheticSong(self.root, "IVE-SONG-A")
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        payload = json.loads(first.feature_path.read_text(encoding="utf-8"))
+        payload["statistics"]["reference_count"] = 999
+        _write_json(first.feature_path, payload)
+        with self.assertRaisesRegex(MontageGrammarEvidenceError, "content hash"):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_duplicate_snapshot_record_is_rejected_even_with_valid_hash(self) -> None:
+        first = _SyntheticSong(self.root, "IVE-SONG-A")
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        payload = json.loads(first.feature_path.read_text(encoding="utf-8"))
+        payload["snapshots"].append(deepcopy(payload["snapshots"][0]))
+        payload.pop("manifest_sha256")
+        digest = _canonical_sha256(payload)
+        payload["manifest_sha256"] = digest
+        first.feature_path = first.root / (
+            f"stageedit-feature-snapshot-job-manifest-{digest[:16]}.json"
+        )
+        _write_json(first.feature_path, payload)
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "snapshot reference set mismatch",
+        ):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_materialization_and_feature_source_counts_must_match(self) -> None:
+        first = _SyntheticSong(self.root, "IVE-SONG-A")
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        payload = json.loads(first.materialization_path.read_text(encoding="utf-8"))
+        payload["input_contract"]["expected_source_count"] = 4
+        fingerprint = _canonical_sha256(payload["input_contract"])
+        payload["input_fingerprint_sha256"] = fingerprint
+        first.materialization_path = first.root / (
+            f"reference-training-materialization-{fingerprint[:16]}.json"
+        )
+        _write_json(first.materialization_path, payload)
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "materialization/feature source count mismatch",
+        ):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_cut_clock_requires_exact_stageedit_token(self) -> None:
+        first = _SyntheticSong(
+            self.root,
+            "IVE-SONG-A",
+            cut_clock_offset=True,
+        )
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "no exact StageEdit token",
+        ):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_source_catalog_mismatch_is_rejected(self) -> None:
+        first = _SyntheticSong(
+            self.root,
+            "IVE-SONG-A",
+            mismatched_source_catalog=True,
+        )
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        with self.assertRaisesRegex(MontageGrammarEvidenceError, "source set mismatch"):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_snapshot_schema_fingerprint_mismatch_is_rejected(self) -> None:
+        first = _SyntheticSong(
+            self.root,
+            "IVE-SONG-A",
+            mismatched_snapshot_schema=True,
+        )
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "token schema mismatch|snapshot is invalid",
+        ):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_ive_only_and_multi_song_coverage_are_mandatory(self) -> None:
+        only = _SyntheticSong(self.root, "IVE-SONG-A")
+        with self.assertRaisesRegex(ValueError, "not enough songs"):
+            build_professional_montage_grammar_profile(
+                (only.input,),
+                config=self.config,
+            )
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        with self.assertRaisesRegex(ValueError, "IVE-only"):
+            build_professional_montage_grammar_profile(
+                (only.input, second.input),
+                artist="OTHER",
+                config=self.config,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,808 @@
+"""Load a hash-bound production policy from an IVE montage profile.
+
+The profile describes observations from human reference edits.  This module
+keeps those observations separate from the small number of explicit product
+editorial requirements used by the production gate.  In particular, it never
+derives a non-wide quota as ``1 - wide`` and never calls weak, identity-free
+person-count evidence proof of a full group formation.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import stat
+from typing import Any, Mapping
+
+from .professional_montage_grammar import (
+    MODULE_VERSION,
+    PROFILE_ANALYSIS_BASIS,
+    PROFILE_SCHEMA_VERSION,
+    ROLE_NAMES,
+)
+
+
+PROFILE_CONTENT_HASH_ALGORITHM = (
+    "sha256_of_canonical_json_with_profile_content_sha256_null"
+)
+PROFILE_GENERATOR_MODULE = "crosscut.professional_montage_grammar"
+FORMATION_PERSON_COUNT_SEMANTICS = (
+    "identity_free_observed_counts_only_no_group_formation_threshold"
+)
+WEAK_FORMATION_EVIDENCE_LABEL = (
+    "weak_observed_person_evidence_never_proven_full_formation"
+)
+PRODUCT_EDITORIAL_REQUIREMENT_BASIS = (
+    "product_editorial_requirement_informed_by_observed_event_shape"
+)
+REFERENCE_FLOOR_BASIS = (
+    "lower_quantile_of_contributing_human_reference_edits"
+)
+REFERENCE_FLOOR_QUANTILE = 0.10
+FORMATION_EVIDENCE_THRESHOLD_NORMALIZED = 1.0 / 6.0
+EXPECTED_SONG_COUNT = 4
+EXPECTED_REFERENCE_COUNT = 20
+
+_SHA256_LENGTH = 64
+_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "analysis_basis",
+    "configuration",
+    "distributional_policy",
+    "evidence_limitations",
+    "provenance",
+    "scope",
+    "songs",
+    "aggregate_by_acoustic_role",
+}
+_CHORUS_KEYS = {
+    "contributing_reference_count",
+    "pooled_counts",
+    "reference_distributions",
+    "burst_event_distributions",
+    "wide_shot_person_count_evidence",
+}
+
+
+class ProfessionalMontagePolicyError(ValueError):
+    """Raised when a profile cannot safely supply a production policy."""
+
+
+def _mapping(value: object, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ProfessionalMontagePolicyError(f"{name} must be an object")
+    return value
+
+
+def _array(value: object, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ProfessionalMontagePolicyError(f"{name} must be an array")
+    return value
+
+
+def _integer(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProfessionalMontagePolicyError(f"{name} must be an integer")
+    return value
+
+
+def _finite(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProfessionalMontagePolicyError(f"{name} must be numeric")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ProfessionalMontagePolicyError(f"{name} must be finite")
+    return number
+
+
+def _sha256(value: object, name: str) -> str:
+    if not (
+        isinstance(value, str)
+        and len(value) == _SHA256_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        raise ProfessionalMontagePolicyError(
+            f"{name} must be a lowercase SHA-256"
+        )
+    return value
+
+
+def _canonical_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProfessionalMontagePolicyError(
+            f"profile is not canonical-JSON serializable: {exc}"
+        ) from exc
+
+
+def _reject_constant(value: str) -> None:
+    raise ProfessionalMontagePolicyError(
+        f"profile contains non-finite JSON number {value}"
+    )
+
+
+def _object_without_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProfessionalMontagePolicyError(
+                f"profile contains duplicate JSON key {key!r}"
+            )
+        result[key] = value
+    return result
+
+
+def _stable_json_bytes(path: Path) -> bytes:
+    source = Path(path)
+    if not source.is_absolute():
+        raise ProfessionalMontagePolicyError("profile path must be absolute")
+    if source.suffix.lower() != ".json":
+        raise ProfessionalMontagePolicyError("profile must be a JSON file")
+    try:
+        path_before = source.lstat()
+    except OSError as exc:
+        raise ProfessionalMontagePolicyError(
+            f"could not stat montage profile {source}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+        raise ProfessionalMontagePolicyError(
+            f"profile must be a regular non-symlink file: {source}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise ProfessionalMontagePolicyError(
+            f"could not open montage profile {source}: {exc}"
+        ) from exc
+    try:
+        opened_before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        path_after = source.lstat()
+    except OSError as exc:
+        raise ProfessionalMontagePolicyError(
+            f"profile disappeared while it was read: {source}"
+        ) from exc
+
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    if not (
+        identity(path_before)
+        == identity(opened_before)
+        == identity(opened_after)
+        == identity(path_after)
+    ):
+        raise ProfessionalMontagePolicyError(
+            f"profile changed while it was read: {source}"
+        )
+    raw = b"".join(chunks)
+    if len(raw) != opened_before.st_size:
+        raise ProfessionalMontagePolicyError(
+            f"profile size changed while it was read: {source}"
+        )
+    return raw
+
+
+def _decode_profile(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_constant,
+            object_pairs_hook=_object_without_duplicate_keys,
+        )
+    except ProfessionalMontagePolicyError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ProfessionalMontagePolicyError(
+            f"could not decode montage profile: {exc}"
+        ) from exc
+    return dict(_mapping(value, "montage profile"))
+
+
+def _at(value: Mapping[str, Any], path: str) -> Any:
+    current: Any = value
+    for part in path.split("."):
+        current = _mapping(current, path).get(part)
+    return current
+
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalMontageProfileIdentity:
+    analysis_basis: str
+    schema_version: int
+    path: str
+    file_sha256: str
+    content_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the exact stable identity persisted by downstream gates."""
+
+        return {
+            "analysis_basis": self.analysis_basis,
+            "schema_version": self.schema_version,
+            "path": self.path,
+            "file_sha256": self.file_sha256,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileStatisticProvenance:
+    profile_identity: ProfessionalMontageProfileIdentity
+    statistic_path: str
+    statistic: str
+    quantile: float
+    reference_floor_basis: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile_identity": self.profile_identity.to_dict(),
+            "statistic_path": self.statistic_path,
+            "statistic": self.statistic,
+            "quantile": self.quantile,
+            "reference_floor_basis": self.reference_floor_basis,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileDerivedMinimum:
+    name: str
+    value: float
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class UnusableReferenceFloor:
+    statistic_path: str
+    value: float
+    reason: str
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "statistic_path": self.statistic_path,
+            "value": self.value,
+            "usable_as_positive_production_minimum": False,
+            "reason": self.reason,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProductEditorialRequirements:
+    requirement_basis: str = PRODUCT_EDITORIAL_REQUIREMENT_BASIS
+    minimum_nonwide_multi_family_burst_count: int = 1
+    minimum_post_burst_formation_evidenced_wide_reset_count: int = 1
+    formation_evidence_threshold_normalized: float = (
+        FORMATION_EVIDENCE_THRESHOLD_NORMALIZED
+    )
+    formation_evidence_semantics: str = FORMATION_PERSON_COUNT_SEMANTICS
+    formation_evidence_label: str = WEAK_FORMATION_EVIDENCE_LABEL
+    formation_evidence_proves_full_group_formation: bool = False
+    missing_or_zero_formation_evidence_passes: bool = False
+    is_reference_floor: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requirement_basis": self.requirement_basis,
+            "minimum_nonwide_multi_family_burst_count": (
+                self.minimum_nonwide_multi_family_burst_count
+            ),
+            "minimum_post_burst_formation_evidenced_wide_reset_count": (
+                self.minimum_post_burst_formation_evidenced_wide_reset_count
+            ),
+            "formation_evidence_threshold_normalized": (
+                self.formation_evidence_threshold_normalized
+            ),
+            "formation_evidence_semantics": self.formation_evidence_semantics,
+            "formation_evidence_label": self.formation_evidence_label,
+            "formation_evidence_proves_full_group_formation": (
+                self.formation_evidence_proves_full_group_formation
+            ),
+            "missing_or_zero_formation_evidence_passes": (
+                self.missing_or_zero_formation_evidence_passes
+            ),
+            "is_reference_floor": self.is_reference_floor,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalMontagePolicy:
+    identity: ProfessionalMontageProfileIdentity
+    minimum_close_duration_fraction: ProfileDerivedMinimum
+    minimum_early_wide_anchor_fraction: ProfileDerivedMinimum
+    minimum_phrase_entry_wide_anchor_fraction: ProfileDerivedMinimum
+    minimum_wide_involved_source_switch_fraction: ProfileDerivedMinimum
+    minimum_nonwide_burst_shot_count: ProfileDerivedMinimum
+    minimum_nonwide_burst_duration_seconds: ProfileDerivedMinimum
+    minimum_nonwide_burst_source_switch_fraction: ProfileDerivedMinimum
+    minimum_close_burst_shot_count: ProfileDerivedMinimum
+    minimum_close_burst_duration_seconds: ProfileDerivedMinimum
+    minimum_close_burst_source_switch_fraction: ProfileDerivedMinimum
+    minimum_nonwide_duration_fraction: None
+    nonwide_duration_fraction_policy: str
+    unusable_zero_reference_floors: tuple[UnusableReferenceFloor, ...]
+    product_editorial_requirements: ProductEditorialRequirements
+
+    @property
+    def profile_identity(self) -> dict[str, Any]:
+        return self.identity.to_dict()
+
+    def to_dict(self) -> dict[str, Any]:
+        threshold_names = (
+            "minimum_close_duration_fraction",
+            "minimum_early_wide_anchor_fraction",
+            "minimum_phrase_entry_wide_anchor_fraction",
+            "minimum_wide_involved_source_switch_fraction",
+            "minimum_nonwide_burst_shot_count",
+            "minimum_nonwide_burst_duration_seconds",
+            "minimum_nonwide_burst_source_switch_fraction",
+            "minimum_close_burst_shot_count",
+            "minimum_close_burst_duration_seconds",
+            "minimum_close_burst_source_switch_fraction",
+        )
+        return {
+            "profile_identity": self.profile_identity,
+            "profile_derived_minimums": {
+                name: getattr(self, name).to_dict() for name in threshold_names
+            },
+            "minimum_nonwide_duration_fraction": None,
+            "nonwide_duration_fraction_policy": (
+                self.nonwide_duration_fraction_policy
+            ),
+            "unusable_zero_reference_floors": [
+                item.to_dict() for item in self.unusable_zero_reference_floors
+            ],
+            "product_editorial_requirements": (
+                self.product_editorial_requirements.to_dict()
+            ),
+        }
+
+
+def _validate_profile_contract(profile: Mapping[str, Any]) -> Mapping[str, Any]:
+    if set(profile) != _TOP_LEVEL_KEYS:
+        raise ProfessionalMontagePolicyError(
+            "montage profile top-level schema mismatch"
+        )
+    if _integer(profile.get("schema_version"), "schema_version") != (
+        PROFILE_SCHEMA_VERSION
+    ):
+        raise ProfessionalMontagePolicyError("unsupported profile schema version")
+    if profile.get("analysis_basis") != PROFILE_ANALYSIS_BASIS:
+        raise ProfessionalMontagePolicyError("unsupported profile analysis basis")
+
+    provenance = _mapping(profile.get("provenance"), "profile provenance")
+    if provenance.get("content_hash_algorithm") != PROFILE_CONTENT_HASH_ALGORITHM:
+        raise ProfessionalMontagePolicyError(
+            "unsupported profile content hash algorithm"
+        )
+    generator = _mapping(provenance.get("generator"), "profile generator")
+    if set(generator) != {"module", "module_version"} or generator != {
+        "module": PROFILE_GENERATOR_MODULE,
+        "module_version": MODULE_VERSION,
+    }:
+        raise ProfessionalMontagePolicyError("unsupported profile generator")
+
+    configuration = _mapping(profile.get("configuration"), "configuration")
+    if not math.isclose(
+        _finite(configuration.get("reference_floor_quantile"), "floor quantile"),
+        REFERENCE_FLOOR_QUANTILE,
+        abs_tol=1e-12,
+    ):
+        raise ProfessionalMontagePolicyError(
+            "profile reference floor quantile must be p10"
+        )
+    distributional = _mapping(
+        profile.get("distributional_policy"), "distributional policy"
+    )
+    if distributional.get("hand_authored_visual_quality_thresholds_present") is not False:
+        raise ProfessionalMontagePolicyError(
+            "profile unexpectedly contains hand-authored quality thresholds"
+        )
+    if distributional.get("reference_floors_are_lower_distribution_quantiles") is not True:
+        raise ProfessionalMontagePolicyError("profile reference-floor semantics mismatch")
+
+    scope = _mapping(profile.get("scope"), "profile scope")
+    if scope.get("artist") != "IVE":
+        raise ProfessionalMontagePolicyError("profile is not scoped to IVE")
+    if _integer(scope.get("song_count"), "scope song_count") != EXPECTED_SONG_COUNT:
+        raise ProfessionalMontagePolicyError("profile must contain exactly four songs")
+    if _integer(scope.get("reference_count"), "scope reference_count") != (
+        EXPECTED_REFERENCE_COUNT
+    ):
+        raise ProfessionalMontagePolicyError(
+            "profile must contain exactly twenty references"
+        )
+    songs = _array(profile.get("songs"), "songs")
+    if len(songs) != EXPECTED_SONG_COUNT:
+        raise ProfessionalMontagePolicyError("profile song payload count mismatch")
+    song_ids: set[str] = set()
+    reference_count = 0
+    for index, raw_song in enumerate(songs):
+        song = _mapping(raw_song, f"song {index}")
+        song_id = song.get("song_id")
+        if not isinstance(song_id, str) or not song_id or song_id in song_ids:
+            raise ProfessionalMontagePolicyError("profile song ids are invalid")
+        song_ids.add(song_id)
+        references = _array(song.get("references"), f"song {index} references")
+        if len(references) != 5:
+            raise ProfessionalMontagePolicyError(
+                "each of the four songs must contribute five references"
+            )
+        reference_count += len(references)
+    if reference_count != EXPECTED_REFERENCE_COUNT:
+        raise ProfessionalMontagePolicyError("profile reference payload count mismatch")
+
+    roles = _mapping(
+        profile.get("aggregate_by_acoustic_role"),
+        "aggregate_by_acoustic_role",
+    )
+    if set(roles) != set(ROLE_NAMES):
+        raise ProfessionalMontagePolicyError("acoustic-role aggregate schema mismatch")
+    chorus = _mapping(roles.get("chorus_like"), "chorus_like aggregate")
+    if set(chorus) != _CHORUS_KEYS:
+        raise ProfessionalMontagePolicyError("chorus_like aggregate schema mismatch")
+    if _integer(
+        chorus.get("contributing_reference_count"),
+        "chorus contributing_reference_count",
+    ) != EXPECTED_REFERENCE_COUNT:
+        raise ProfessionalMontagePolicyError(
+            "chorus_like must have twenty contributing references"
+        )
+    person_evidence = _mapping(
+        chorus.get("wide_shot_person_count_evidence"),
+        "wide-shot person-count evidence",
+    )
+    if person_evidence.get("semantics") != FORMATION_PERSON_COUNT_SEMANTICS:
+        raise ProfessionalMontagePolicyError(
+            "formation person-count evidence semantics mismatch"
+        )
+    limitations = _mapping(
+        profile.get("evidence_limitations"), "evidence limitations"
+    )
+    if (
+        limitations.get("generic_wide_is_proven_group_formation") is not False
+        or limitations.get("person_count_threshold_used_to_assert_group_formation")
+        is not False
+        or limitations.get("formation_identity_or_member_labels_present") is not False
+    ):
+        raise ProfessionalMontagePolicyError(
+            "profile incorrectly claims proof of group formation"
+        )
+    return chorus
+
+
+def _profile_identity(
+    *,
+    source: Path,
+    raw: bytes,
+    profile: Mapping[str, Any],
+    expected_file_sha256: str | None,
+) -> ProfessionalMontageProfileIdentity:
+    file_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected_file_sha256 is not None:
+        expected = _sha256(expected_file_sha256, "expected profile file SHA-256")
+        if file_sha256 != expected:
+            raise ProfessionalMontagePolicyError("profile file SHA-256 mismatch")
+
+    provenance = _mapping(profile.get("provenance"), "profile provenance")
+    recorded = _sha256(
+        provenance.get("profile_content_sha256"),
+        "profile content SHA-256",
+    )
+    unsigned = deepcopy(dict(profile))
+    unsigned_provenance = dict(
+        _mapping(unsigned.get("provenance"), "profile provenance")
+    )
+    if "profile_content_sha256" not in unsigned_provenance:
+        raise ProfessionalMontagePolicyError(
+            "profile content SHA-256 field is missing"
+        )
+    unsigned_provenance["profile_content_sha256"] = None
+    unsigned["provenance"] = unsigned_provenance
+    actual = hashlib.sha256(_canonical_bytes(unsigned)).hexdigest()
+    if actual != recorded:
+        raise ProfessionalMontagePolicyError("profile content SHA-256 mismatch")
+    return ProfessionalMontageProfileIdentity(
+        analysis_basis=PROFILE_ANALYSIS_BASIS,
+        schema_version=PROFILE_SCHEMA_VERSION,
+        path=str(source),
+        file_sha256=file_sha256,
+        content_sha256=actual,
+    )
+
+
+def _reference_minimum(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+    *,
+    name: str,
+    path: str,
+    fraction: bool,
+) -> ProfileDerivedMinimum:
+    distribution = _mapping(_at(profile, path), path)
+    p10 = _finite(distribution.get("p10"), f"{path}.p10")
+    floor = _mapping(distribution.get("reference_floor"), f"{path}.reference_floor")
+    quantile = _finite(floor.get("quantile"), f"{path}.reference_floor.quantile")
+    value = _finite(floor.get("value"), f"{path}.reference_floor.value")
+    if (
+        not math.isclose(quantile, REFERENCE_FLOOR_QUANTILE, abs_tol=1e-12)
+        or not math.isclose(value, p10, abs_tol=1e-12)
+        or floor.get("basis") != REFERENCE_FLOOR_BASIS
+    ):
+        raise ProfessionalMontagePolicyError(
+            f"{path} is not a profile p10 reference floor"
+        )
+    if value <= 0.0 or (fraction and value > 1.0):
+        raise ProfessionalMontagePolicyError(
+            f"{path} cannot supply a positive production minimum"
+        )
+    return ProfileDerivedMinimum(
+        name=name,
+        value=value,
+        provenance=ProfileStatisticProvenance(
+            profile_identity=identity,
+            statistic_path=path,
+            statistic="profile_reference_floor_p10",
+            quantile=quantile,
+            reference_floor_basis=REFERENCE_FLOOR_BASIS,
+        ),
+    )
+
+
+def _event_minimum(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+    *,
+    name: str,
+    path: str,
+    fraction: bool = False,
+) -> ProfileDerivedMinimum:
+    distribution = _mapping(_at(profile, path), path)
+    count = _integer(distribution.get("count"), f"{path}.count")
+    value = _finite(distribution.get("p10"), f"{path}.p10")
+    if count < 1 or value <= 0.0 or (fraction and value > 1.0):
+        raise ProfessionalMontagePolicyError(
+            f"{path} cannot supply a positive event p10"
+        )
+    return ProfileDerivedMinimum(
+        name=name,
+        value=value,
+        provenance=ProfileStatisticProvenance(
+            profile_identity=identity,
+            statistic_path=path,
+            statistic="observed_burst_event_distribution_p10",
+            quantile=REFERENCE_FLOOR_QUANTILE,
+            reference_floor_basis=None,
+        ),
+    )
+
+
+def _collect_zero_reference_floors(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+) -> tuple[UnusableReferenceFloor, ...]:
+    root_path = "aggregate_by_acoustic_role.chorus_like.reference_distributions"
+    root = _mapping(_at(profile, root_path), root_path)
+    found: list[UnusableReferenceFloor] = []
+
+    def visit(value: Mapping[str, Any], path: str) -> None:
+        if "reference_floor" in value:
+            floor = _mapping(value.get("reference_floor"), f"{path}.reference_floor")
+            quantile = _finite(
+                floor.get("quantile"), f"{path}.reference_floor.quantile"
+            )
+            floor_value = _finite(
+                floor.get("value"), f"{path}.reference_floor.value"
+            )
+            p10 = _finite(value.get("p10"), f"{path}.p10")
+            if (
+                not math.isclose(quantile, REFERENCE_FLOOR_QUANTILE, abs_tol=1e-12)
+                or not math.isclose(floor_value, p10, abs_tol=1e-12)
+                or floor.get("basis") != REFERENCE_FLOOR_BASIS
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{path} has invalid reference-floor provenance"
+                )
+            if floor_value == 0.0:
+                provenance = ProfileStatisticProvenance(
+                    profile_identity=identity,
+                    statistic_path=path,
+                    statistic="profile_reference_floor_p10",
+                    quantile=quantile,
+                    reference_floor_basis=REFERENCE_FLOOR_BASIS,
+                )
+                found.append(
+                    UnusableReferenceFloor(
+                        statistic_path=path,
+                        value=0.0,
+                        reason=(
+                            "zero_reference_floor_cannot_supply_a_positive_"
+                            "production_minimum"
+                        ),
+                        provenance=provenance,
+                    )
+                )
+            return
+        for key, child in value.items():
+            if isinstance(child, Mapping):
+                visit(child, f"{path}.{key}")
+
+    visit(root, root_path)
+    if not found:
+        raise ProfessionalMontagePolicyError(
+            "profile has no explicit zero reference floors to mark unusable"
+        )
+    return tuple(sorted(found, key=lambda item: item.statistic_path))
+
+
+def load_professional_montage_policy(
+    profile_path: Path,
+    *,
+    expected_file_sha256: str | None = None,
+) -> ProfessionalMontagePolicy:
+    """Load and strictly verify a production montage policy.
+
+    ``expected_file_sha256`` binds the raw JSON serialization when supplied.
+    The profile's own canonical content hash is always verified.
+    """
+
+    source = Path(profile_path)
+    raw = _stable_json_bytes(source)
+    profile = _decode_profile(raw)
+    identity = _profile_identity(
+        source=source,
+        raw=raw,
+        profile=profile,
+        expected_file_sha256=expected_file_sha256,
+    )
+    chorus = _validate_profile_contract(profile)
+
+    reference_root = (
+        "aggregate_by_acoustic_role.chorus_like.reference_distributions"
+    )
+    event_root = (
+        "aggregate_by_acoustic_role.chorus_like.burst_event_distributions"
+    )
+    pooled = _mapping(chorus.get("pooled_counts"), "chorus pooled_counts")
+    events = _mapping(
+        chorus.get("burst_event_distributions"),
+        "chorus burst event distributions",
+    )
+    for pooled_name, event_name in (
+        ("nonwide_multi_source_burst_count", "nonwide_multi_source_shot_count"),
+        ("closeup_multi_source_burst_count", "closeup_multi_source_shot_count"),
+    ):
+        pooled_count = _integer(pooled.get(pooled_name), pooled_name)
+        event_count = _integer(
+            _mapping(events.get(event_name), event_name).get("count"),
+            f"{event_name}.count",
+        )
+        if pooled_count != event_count or pooled_count < 1:
+            raise ProfessionalMontagePolicyError(
+                f"{pooled_name} disagrees with its event distribution"
+            )
+
+    reference_specs = (
+        (
+            "minimum_close_duration_fraction",
+            f"{reference_root}.shot_size_fractions.close",
+        ),
+        (
+            "minimum_early_wide_anchor_fraction",
+            f"{reference_root}.early_wide_anchor_fraction",
+        ),
+        (
+            "minimum_phrase_entry_wide_anchor_fraction",
+            f"{reference_root}.phrase_entry_wide_anchor_fraction",
+        ),
+        (
+            "minimum_wide_involved_source_switch_fraction",
+            f"{reference_root}.source_switch_with_wide_fraction",
+        ),
+    )
+    reference_minimums = {
+        name: _reference_minimum(
+            profile,
+            identity,
+            name=name,
+            path=path,
+            fraction=True,
+        )
+        for name, path in reference_specs
+    }
+    event_specs = (
+        (
+            "minimum_nonwide_burst_shot_count",
+            f"{event_root}.nonwide_multi_source_shot_count",
+            False,
+        ),
+        (
+            "minimum_nonwide_burst_duration_seconds",
+            f"{event_root}.nonwide_multi_source_duration_seconds",
+            False,
+        ),
+        (
+            "minimum_nonwide_burst_source_switch_fraction",
+            f"{event_root}.nonwide_multi_source_switch_fraction",
+            True,
+        ),
+        (
+            "minimum_close_burst_shot_count",
+            f"{event_root}.closeup_multi_source_shot_count",
+            False,
+        ),
+        (
+            "minimum_close_burst_duration_seconds",
+            f"{event_root}.closeup_multi_source_duration_seconds",
+            False,
+        ),
+        (
+            "minimum_close_burst_source_switch_fraction",
+            f"{event_root}.closeup_multi_source_switch_fraction",
+            True,
+        ),
+    )
+    event_minimums = {
+        name: _event_minimum(
+            profile,
+            identity,
+            name=name,
+            path=path,
+            fraction=fraction,
+        )
+        for name, path, fraction in event_specs
+    }
+    return ProfessionalMontagePolicy(
+        identity=identity,
+        **reference_minimums,
+        **event_minimums,
+        minimum_nonwide_duration_fraction=None,
+        nonwide_duration_fraction_policy=(
+            "unavailable_never_derived_from_one_minus_wide"
+        ),
+        unusable_zero_reference_floors=_collect_zero_reference_floors(
+            profile, identity
+        ),
+        product_editorial_requirements=ProductEditorialRequirements(),
+    )

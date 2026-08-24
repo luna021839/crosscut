@@ -7,6 +7,8 @@ field.  This module provides one fail-closed discovery boundary:
 * no registry means the optional learned editor is not installed;
 * an existing registry is never ignored when it is malformed or stale;
 * every checkpoint file is rebound to the hashes recorded at registration;
+* the exact professional IVE montage profile is rebound by path plus file and
+  canonical-content hashes on every load;
 * only a Dynamic Crop v2 bundle that passes the production readiness report is
   admitted; and
 * registering a different bundle never overwrites an existing active record.
@@ -27,6 +29,10 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from .professional_montage_policy import (
+    ProfessionalMontagePolicyError,
+    load_professional_montage_policy,
+)
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
@@ -40,7 +46,7 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION = 1
+STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION = 2
 STAGE_EDIT_PRODUCTION_REGISTRY_KIND = (
     "ive_stage_edit_dynamic_crop_v2_active_production_bundle"
 )
@@ -116,6 +122,11 @@ class RegisteredStageEditProductionBundle:
     token_schema_fingerprint: str
     maximum_sequence_length: int
     maximum_sources: int
+    professional_montage_grammar_profile_path: Path
+    professional_montage_grammar_profile_file_sha256: str
+    professional_montage_grammar_profile_content_sha256: str
+    professional_montage_grammar_profile_analysis_basis: str
+    professional_montage_grammar_profile_schema_version: int
     metadata_sha256: str
     weights_sha256: str
     training_report_sha256: str
@@ -125,12 +136,19 @@ class RegisteredStageEditProductionBundle:
     def __post_init__(self) -> None:
         registry = Path(self.registry_path)
         checkpoint = Path(self.checkpoint_directory)
-        if not registry.is_absolute() or not checkpoint.is_absolute():
+        montage_profile = Path(self.professional_montage_grammar_profile_path)
+        if not (
+            registry.is_absolute()
+            and checkpoint.is_absolute()
+            and montage_profile.is_absolute()
+        ):
             raise ValueError("registered StageEdit paths must be absolute")
         if not self.checkpoint_id.strip():
             raise ValueError("registered StageEdit checkpoint id cannot be blank")
         for value in (
             self.token_schema_fingerprint,
+            self.professional_montage_grammar_profile_file_sha256,
+            self.professional_montage_grammar_profile_content_sha256,
             self.metadata_sha256,
             self.weights_sha256,
             self.training_report_sha256,
@@ -140,6 +158,24 @@ class RegisteredStageEditProductionBundle:
                 raise ValueError("registered StageEdit identity must be SHA-256")
         if self.maximum_sequence_length < 1 or self.maximum_sources < 2:
             raise ValueError("registered StageEdit model limits are invalid")
+        if not self.professional_montage_grammar_profile_analysis_basis.strip():
+            raise ValueError(
+                "registered professional montage profile analysis basis is invalid"
+            )
+        if (
+            isinstance(
+                self.professional_montage_grammar_profile_schema_version,
+                bool,
+            )
+            or not isinstance(
+                self.professional_montage_grammar_profile_schema_version,
+                int,
+            )
+            or self.professional_montage_grammar_profile_schema_version < 1
+        ):
+            raise ValueError(
+                "registered professional montage profile schema version is invalid"
+            )
         if not (
             self.readiness.architecture_available
             and self.readiness.learned_inference_ready
@@ -148,6 +184,26 @@ class RegisteredStageEditProductionBundle:
             and self.readiness.training_steps > 0
         ):
             raise ValueError("registered StageEdit bundle must be production ready")
+
+    @property
+    def professional_montage_grammar_profile_identity(self) -> dict[str, Any]:
+        """Return the exact immutable montage-profile identity."""
+
+        return {
+            "path": str(self.professional_montage_grammar_profile_path),
+            "analysis_basis": (
+                self.professional_montage_grammar_profile_analysis_basis
+            ),
+            "schema_version": (
+                self.professional_montage_grammar_profile_schema_version
+            ),
+            "file_sha256": (
+                self.professional_montage_grammar_profile_file_sha256
+            ),
+            "content_sha256": (
+                self.professional_montage_grammar_profile_content_sha256
+            ),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,6 +215,9 @@ class RegisteredStageEditProductionBundle:
             "token_schema_fingerprint": self.token_schema_fingerprint,
             "maximum_sequence_length": self.maximum_sequence_length,
             "maximum_sources": self.maximum_sources,
+            "professional_montage_grammar_profile": (
+                self.professional_montage_grammar_profile_identity
+            ),
             "metadata_sha256": self.metadata_sha256,
             "weights_sha256": self.weights_sha256,
             "training_report_sha256": self.training_report_sha256,
@@ -196,6 +255,7 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         "metadata",
         "weights",
         "training_report",
+        "professional_montage_grammar_profile",
         "storage_policy",
         "registry_sha256",
     }
@@ -221,6 +281,17 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         raise StageEditProductionRegistryError(
             "production registry activation contract is unsupported"
         )
+    expected_storage_policy = {
+        "external_ssd_preferred": True,
+        "checkpoint_absolute_path_required": True,
+        "professional_montage_profile_absolute_path_required": True,
+        "symlinks_allowed": False,
+        "different_active_record_overwrite_allowed": False,
+    }
+    if payload.get("storage_policy") != expected_storage_policy:
+        raise StageEditProductionRegistryError(
+            "production registry storage policy is unsupported"
+        )
     return payload
 
 
@@ -230,6 +301,82 @@ def hmac_compare_digest(left: str, right: str) -> bool:
     import hmac
 
     return hmac.compare_digest(left, right)
+
+
+def _registered_montage_profile_identity(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw = payload.get("professional_montage_grammar_profile")
+    expected_keys = {
+        "path",
+        "analysis_basis",
+        "schema_version",
+        "file_sha256",
+        "content_sha256",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != expected_keys:
+        raise StageEditProductionRegistryError(
+            "production registry professional montage profile evidence is invalid"
+        )
+    raw_path = raw.get("path")
+    analysis_basis = raw.get("analysis_basis")
+    schema_version = raw.get("schema_version")
+    file_sha256 = raw.get("file_sha256")
+    content_sha256 = raw.get("content_sha256")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise StageEditProductionRegistryError(
+            "production registry professional montage profile path is invalid"
+        )
+    profile_path = Path(raw_path)
+    if not profile_path.is_absolute():
+        raise StageEditProductionRegistryError(
+            "production registry professional montage profile path must be absolute"
+        )
+    if not isinstance(analysis_basis, str) or not analysis_basis.strip():
+        raise StageEditProductionRegistryError(
+            "production registry professional montage profile analysis basis is invalid"
+        )
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 1
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry professional montage profile schema is invalid"
+        )
+    for name, value in (
+        ("file", file_sha256),
+        ("content", content_sha256),
+    ):
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+            raise StageEditProductionRegistryError(
+                "production registry professional montage profile "
+                f"{name} hash is invalid"
+            )
+
+    try:
+        policy = load_professional_montage_policy(
+            profile_path,
+            expected_file_sha256=file_sha256,
+        )
+    except ProfessionalMontagePolicyError as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            "registered professional montage grammar profile is missing, "
+            f"changed, or invalid: {exc}"
+        ) from exc
+    actual = policy.profile_identity
+    expected = {
+        "path": raw_path,
+        "analysis_basis": analysis_basis,
+        "schema_version": schema_version,
+        "file_sha256": file_sha256,
+        "content_sha256": content_sha256,
+    }
+    if actual != expected:
+        raise StageEditProductionRegistryNotReadyError(
+            "registered professional montage grammar profile identity changed"
+        )
+    return expected
 
 
 def load_registered_stage_edit_production_bundle(
@@ -263,6 +410,8 @@ def load_registered_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             f"registered checkpoint is missing or unsafe: {checkpoint}"
         )
+
+    montage_profile = _registered_montage_profile_identity(payload)
 
     evidence_fields = (
         (
@@ -350,6 +499,21 @@ def load_registered_stage_edit_production_bundle(
         token_schema_fingerprint=token_schema,
         maximum_sequence_length=int(maximum_sequence_length),
         maximum_sources=int(maximum_sources),
+        professional_montage_grammar_profile_path=Path(
+            montage_profile["path"]
+        ),
+        professional_montage_grammar_profile_file_sha256=str(
+            montage_profile["file_sha256"]
+        ),
+        professional_montage_grammar_profile_content_sha256=str(
+            montage_profile["content_sha256"]
+        ),
+        professional_montage_grammar_profile_analysis_basis=str(
+            montage_profile["analysis_basis"]
+        ),
+        professional_montage_grammar_profile_schema_version=int(
+            montage_profile["schema_version"]
+        ),
         metadata_sha256=evidence["metadata"][1],
         weights_sha256=evidence["weights"][1],
         training_report_sha256=evidence["training_report"][1],
@@ -394,6 +558,7 @@ def discover_registered_stage_edit_production_bundle(
 def register_stage_edit_production_bundle(
     checkpoint_directory: Path,
     *,
+    professional_montage_grammar_profile_path: Path,
     registry_path: Path | None = None,
 ) -> Path:
     """Install one verified bundle without replacing another active record."""
@@ -407,6 +572,23 @@ def register_stage_edit_production_bundle(
     if not checkpoint.is_dir():
         raise StageEditProductionRegistryNotReadyError(
             "checkpoint directory is missing or unsafe"
+        )
+    raw_montage_profile = Path(professional_montage_grammar_profile_path)
+    if not raw_montage_profile.is_absolute():
+        raise StageEditProductionRegistryNotReadyError(
+            "professional montage grammar profile path must be explicit and absolute"
+        )
+    try:
+        montage_policy = load_professional_montage_policy(raw_montage_profile)
+    except ProfessionalMontagePolicyError as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            "professional montage grammar profile cannot be registered: "
+            f"{exc}"
+        ) from exc
+    montage_profile = montage_policy.profile_identity
+    if montage_profile.get("path") != str(raw_montage_profile):
+        raise StageEditProductionRegistryNotReadyError(
+            "professional montage grammar profile path identity changed"
         )
     metadata_path = checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
     weights_path = checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
@@ -462,6 +644,8 @@ def register_stage_edit_production_bundle(
             and installed.metadata_sha256 == metadata_sha
             and installed.weights_sha256 == weights_sha
             and installed.training_report_sha256 == report_sha
+            and installed.professional_montage_grammar_profile_identity
+            == montage_profile
         ):
             return destination
         raise StageEditProductionRegistryError(
@@ -491,9 +675,11 @@ def register_stage_edit_production_bundle(
             "filename": report_path.name,
             "sha256": report_sha,
         },
+        "professional_montage_grammar_profile": montage_profile,
         "storage_policy": {
             "external_ssd_preferred": True,
             "checkpoint_absolute_path_required": True,
+            "professional_montage_profile_absolute_path_required": True,
             "symlinks_allowed": False,
             "different_active_record_overwrite_allowed": False,
         },
