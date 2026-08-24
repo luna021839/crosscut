@@ -34,9 +34,10 @@ def _automatic_request(
     member: bool = False,
     desired: int | None = None,
     acquire_only: bool = False,
+    song: str = "I AM",
 ) -> AnalysisRequest:
     payload: dict[str, object] = {
-        "song": "I AM",
+        "song": song,
         "edit_mode": "member" if member else "group",
         "aspect_ratio": "9:16" if member else "16:9",
         "target_member": "가을" if member else None,
@@ -237,13 +238,53 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             self.assertEqual(summary["minimum_acceptable_source_count"], 8)
             self.assertEqual(summary["downloaded_source_count"], 8)
             self.assertTrue(summary["source_count_fallback_applied"])
+            refresh = artifact.manifest["cache_refresh_upgrade"]
+            self.assertTrue(refresh["refresh_required"])
+            self.assertEqual(refresh["result"], "initial_verified_fallback")
 
             materialized = request.with_materialized_sources(
                 artifact.source_paths
             )
             self.assertEqual(len(materialized.sources), 8)
 
-    def test_completed_group_nine_of_ten_cache_reuses_without_web_drift(
+    def test_completed_group_eight_cache_also_attempts_explicit_refresh(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root)
+            entries = [_official_entry(index) for index in range(8)]
+            first = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+            second_client = _FakeClient([])
+
+            second = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+            self.assertEqual(second.source_paths, first.source_paths)
+            self.assertGreater(len(second_client.search_calls), 0)
+            self.assertEqual(second_client.download_attempts, [])
+            refresh = second.manifest["cache_refresh_upgrade"]
+            self.assertEqual(
+                refresh["decision"],
+                "refresh_metadata_to_upgrade_verified_fallback_pool",
+            )
+            self.assertEqual(
+                refresh["result"],
+                "retained_verified_fallback_after_refresh",
+            )
+
+    def test_completed_group_nine_of_ten_cache_refreshes_and_retains_fallback(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -269,7 +310,7 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             )
 
             self.assertEqual(second.source_paths, first.source_paths)
-            self.assertEqual(second_client.search_calls, [])
+            self.assertGreater(len(second_client.search_calls), 0)
             self.assertEqual(second_client.download_attempts, [])
             self.assertEqual(
                 second.manifest["source_count_policy"]["policy"],
@@ -280,6 +321,87 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             self.assertEqual(summary["cache_reuse_count"], 1)
             self.assertEqual(summary["downloaded_source_count"], 9)
             self.assertTrue(summary["source_count_fallback_applied"])
+            refresh = second.manifest["cache_refresh_upgrade"]
+            self.assertTrue(refresh["refresh_required"])
+            self.assertTrue(refresh["metadata_refresh_attempted"])
+            self.assertEqual(
+                refresh["result"],
+                "retained_verified_fallback_after_refresh",
+            )
+            self.assertEqual(refresh["new_download_count"], 0)
+
+    def test_completed_group_nine_cache_refresh_upgrades_only_missing_tenth(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root)
+            first_entries = [_official_entry(index) for index in range(9)]
+            acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(first_entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+            second_client = _FakeClient(
+                [*first_entries, _official_entry(9)]
+            )
+
+            upgraded = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+            self.assertGreater(len(second_client.search_calls), 0)
+            self.assertEqual(second_client.download_attempts, ["contract0009"])
+            self.assertEqual(len(upgraded.source_paths), 10)
+            refresh = upgraded.manifest["cache_refresh_upgrade"]
+            self.assertEqual(refresh["result"], "upgraded_to_target")
+            self.assertEqual(refresh["new_download_count"], 1)
+            self.assertEqual(refresh["authenticated_cache_reuse_count"], 9)
+
+    def test_pre_latest_policy_cache_is_reselected_without_redownload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root)
+            first = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(  # type: ignore[arg-type]
+                    [_official_entry(index) for index in range(10)]
+                ),
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+            legacy = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+            legacy.pop("latest_song_acquisition_policy_version")
+            legacy.pop("promotion_date_cluster_selection")
+            for item in legacy["selected"]:
+                item.pop("broadcast_program")
+            first.manifest_path.write_text(
+                json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+            )
+            second_client = _FakeClient([])
+
+            upgraded = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+            self.assertEqual(upgraded.source_paths, first.source_paths)
+            self.assertGreater(len(second_client.search_calls), 0)
+            self.assertEqual(second_client.download_attempts, [])
+            self.assertEqual(
+                upgraded.manifest["cache_refresh_upgrade"]["result"],
+                "latest_song_policy_applied_to_target_pool",
+            )
 
     def test_explicit_group_counts_do_not_inherit_default_ten_fallback(
         self,
@@ -452,6 +574,120 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
         )
         self.assertFalse(partial.selectable)
         self.assertTrue(future.selectable)
+
+    def test_unregistered_song_uses_exact_normalized_title_and_rejects_mix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            request = _automatic_request(
+                Path(temp), desired=9, song="Neon Dream"
+            )
+            exact = _metadata_candidate(
+                _official_entry(
+                    0,
+                    title="IVE NEON.DREAM Music Bank Stage 260801",
+                ),
+                request=request,
+                query="future-title-contract",
+            )
+            substring = _metadata_candidate(
+                _official_entry(
+                    1,
+                    title="IVE Neon Dreamscape Music Bank Stage 260802",
+                ),
+                request=request,
+                query="future-title-contract",
+            )
+            mixed = _metadata_candidate(
+                _official_entry(
+                    2,
+                    title=(
+                        "IVE Neon Dream + ATTITUDE Music Bank Stage 260803"
+                    ),
+                ),
+                request=request,
+                query="future-title-contract",
+            )
+
+        assert exact is not None and substring is not None and mixed is not None
+        self.assertTrue(exact.selectable)
+        self.assertIn("song_title_signal_missing", substring.rejection_reasons)
+        self.assertIn(
+            "requested_song_conflicts_with_known_ive_title",
+            mixed.rejection_reasons,
+        )
+        self.assertFalse(mixed.selectable)
+
+    def test_registered_song_rejects_title_mixed_with_other_ive_activity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            request = _automatic_request(
+                Path(temp), desired=9, song="ATTITUDE"
+            )
+            mixed = _metadata_candidate(
+                _official_entry(
+                    0,
+                    title="IVE ATTITUDE + XOXZ Music Bank Stage 260801",
+                ),
+                request=request,
+                query="other-activity-contract",
+            )
+
+        assert mixed is not None
+        self.assertIn("other_ive_song_title_signal", mixed.rejection_reasons)
+        self.assertFalse(mixed.selectable)
+
+    def test_equal_size_promotion_clusters_choose_the_newer_virtual_song_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, song="Neon Dream")
+            old_entries = [
+                _official_entry(
+                    index,
+                    title=(
+                        "IVE Neon Dream Music Bank Stage "
+                        f"2501{index + 1:02d}"
+                    ),
+                )
+                for index in range(8)
+            ]
+            new_entries = [
+                _official_entry(
+                    20 + index,
+                    title=(
+                        "IVE Neon Dream Music Bank Stage "
+                        f"2608{index + 1:02d}"
+                    ),
+                )
+                for index in range(8)
+            ]
+            client = _FakeClient([*old_entries, *new_entries])
+
+            artifact = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        self.assertEqual(len(artifact.source_paths), 8)
+        self.assertEqual(
+            set(client.download_attempts),
+            {f"contract{20 + index:04d}" for index in range(8)},
+        )
+        cluster = artifact.manifest["promotion_date_cluster_selection"]
+        self.assertEqual(cluster["status"], "selected_qualifying_cluster")
+        self.assertEqual(len(cluster["clusters"]), 2)
+        self.assertEqual(
+            cluster["selected_cluster"]["start_date"], "2026-08-01"
+        )
+        self.assertEqual(
+            cluster["selected_cluster"]["deduplicated_stage_count"], 8
+        )
 
     def test_non_music_show_formats_are_hard_rejected_with_specific_reasons(self) -> None:
         cases = {
@@ -673,13 +909,13 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
                         "allowlisted_channel_id",
                     )
 
-    def test_unique_broadcast_dates_precede_same_date_variants(self) -> None:
+    def test_same_broadcast_date_and_program_keeps_only_canonical_cut(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             request = _automatic_request(Path(temp), desired=9)
             entries = (
                 _official_entry(
                     0,
-                    title="IVE I AM Fullcam Music Bank 230414",
+                    title="IVE I AM Full Cam Music Bank 230414",
                 ),
                 _official_entry(
                     1,
@@ -702,14 +938,45 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
         ordered = _ordered_for_download(
             tuple(candidate for candidate in candidates if candidate is not None)
         )
-        first_dates = [candidate.broadcast_date for candidate in ordered[:3]]
+        self.assertEqual(len(ordered), 3)
+        first_dates = [candidate.broadcast_date for candidate in ordered]
         self.assertEqual(
             set(first_dates),
             {"2023-04-14", "2023-04-21", "2023-04-28"},
         )
         self.assertEqual(len(set(first_dates)), 3)
-        self.assertEqual(ordered[3].broadcast_date, "2023-04-14")
-        self.assertIn("fullcam", ordered[3].title.casefold())
+        self.assertNotIn(
+            "full cam",
+            " ".join(item.title for item in ordered).casefold(),
+        )
+
+    def test_same_date_different_music_show_programs_are_distinct_slots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            request = _automatic_request(Path(temp), desired=9)
+            candidates = tuple(
+                _metadata_candidate(entry, request=request, query="contract")
+                for entry in (
+                    _official_entry(
+                        0,
+                        title="IVE I AM Music Bank Stage 230414",
+                    ),
+                    _official_entry(
+                        1,
+                        title="IVE I AM SBS Inkigayo Stage 230414",
+                    ),
+                )
+            )
+
+        ordered = _ordered_for_download(
+            [candidate for candidate in candidates if candidate is not None]
+        )
+        self.assertEqual(len(ordered), 2)
+        self.assertEqual(
+            {candidate.broadcast_program for candidate in ordered},
+            {"music_bank", "inkigayo"},
+        )
 
     def test_clean_later_broadcast_precedes_earlier_one_take_variant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

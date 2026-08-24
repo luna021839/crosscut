@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterable, Sequence
 from .events import EventReporter
 from .group_source_quality import (
     GROUP_RELATIVE_QUALITY_GATE_VERSION,
+    GROUP_RELATIVE_QUALITY_TARGET,
     GroupSourceQualityAssessment,
     RankedGroupSource,
     analyze_group_source_quality,
@@ -56,6 +57,7 @@ class AcquisitionCandidate:
     selection_tier: int
     trust_score: int
     broadcast_date: str | None = None
+    broadcast_program: str | None = None
     official_channel_signal: str = "none"
     rejection_reasons: tuple[str, ...] = ()
     fallback_reason: str | None = None
@@ -101,6 +103,8 @@ _MINIMUM_DURATION_SECONDS = 95.0
 _MAXIMUM_DURATION_SECONDS = 480.0
 _SELECTION_POLICY_VERSION = 5
 _LEGACY_SELECTION_POLICY_VERSION = 4
+_LATEST_SONG_ACQUISITION_POLICY_VERSION = 1
+_PROMOTION_CLUSTER_MAXIMUM_GAP_DAYS = 28
 _CURRENT_HARD_TITLE_AUDIT_POLICY = (
     "selected_title_encore_winner_afterstage_and_music_bank_global_special_v3"
 )
@@ -176,23 +180,14 @@ _TRUSTED_CHANNEL_IDS = {
     # ARIRANG K-POP / Simply K-Pop
     "UC_6zPf4uuteHFFctnQtEaXQ",
 }
-_MUSIC_SHOW_MARKERS = (
-    "music bank",
-    "musicbank",
-    "music core",
-    "musiccore",
-    "m countdown",
-    "mcountdown",
-    "inkigayo",
-    "show champion",
-    "the show",
-    "simply k-pop",
-    "뮤직뱅크",
-    "인기가요",
-    "엠카운트다운",
-    "음악중심",
-    "쇼챔피언",
-    "더쇼",
+_MUSIC_SHOW_PROGRAM_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("m_countdown", ("m countdown", "mcountdown", "엠카운트다운")),
+    ("music_bank", ("music bank", "musicbank", "뮤직뱅크", "뮤직 뱅크")),
+    ("music_core", ("music core", "musiccore", "음악중심", "음악 중심")),
+    ("inkigayo", ("inkigayo", "인기가요")),
+    ("show_champion", ("show champion", "쇼챔피언", "쇼 챔피언")),
+    ("the_show", ("the show", "더쇼", "더 쇼")),
+    ("simply_kpop", ("simply k-pop", "simply kpop")),
 )
 _FANCAM_MARKERS = ("fancam", "facecam", "fan cam", "직캠", "입덕직캠")
 _MEMBER_CLOSEUP_MARKERS = (
@@ -362,18 +357,12 @@ def _contains_alias(value: str, aliases: Iterable[str]) -> bool:
     value_tokens = re.findall(r"[0-9a-z]+|[가-힣]+", folded_value)
     for alias in aliases:
         folded_alias = _fold(alias)
-        if any("가" <= character <= "힣" for character in folded_alias):
-            # Hangul aliases must be complete syllable runs.  A compact
-            # substring check makes short member names unsafe: for example,
-            # "레이" appears inside "릴레이" and "리즈" inside "시리즈".
-            if re.search(
-                rf"(?<![가-힣]){re.escape(folded_alias)}(?![가-힣])",
-                folded_value,
-            ) is not None:
-                return True
-            continue
-        alias_tokens = re.findall(r"[0-9a-z]+", folded_alias)
+        alias_tokens = re.findall(r"[0-9a-z]+|[가-힣]+", folded_alias)
         compact_alias = _compact(alias)
+        # Exact normalized tokens support future, unregistered song names
+        # across case, whitespace, and punctuation without ever accepting a
+        # substring inside another word. This also keeps short Hangul member
+        # names safe: "레이" is not the complete token "릴레이".
         if compact_alias in value_tokens:
             return True
         if alias_tokens and any(
@@ -382,6 +371,15 @@ def _contains_alias(value: str, aliases: Iterable[str]) -> bool:
         ):
             return True
     return False
+
+
+def _music_show_program(title: str) -> str | None:
+    """Return one canonical weekly-show key from title metadata."""
+
+    for program, markers in _MUSIC_SHOW_PROGRAM_MARKERS:
+        if _contains_alias(title, markers):
+            return program
+    return None
 
 
 def _has_ive_title_signal(title: str) -> bool:
@@ -666,20 +664,32 @@ def _metadata_candidate(
     requested_aliases = _song_aliases(request.song)
     if not _contains_alias(title, requested_aliases):
         rejection_reasons.append("song_title_signal_missing")
-    elif _known_song_alias_group(request.song) is None and any(
-        _contains_alias(title, known_aliases)
-        for known_aliases in _SONG_ALIAS_GROUPS
-    ):
-        # Keep future IVE titles discoverable, but never let a partial unknown
-        # input such as "AM" or "DIVE" impersonate the known titles "I AM" or
-        # "LOVE DIVE" merely because one token appears in the metadata title.
-        rejection_reasons.append("requested_song_conflicts_with_known_ive_title")
+    else:
+        requested_known_group = _known_song_alias_group(request.song)
+        other_known_song_signal = any(
+            known_aliases != requested_known_group
+            and _contains_alias(title, known_aliases)
+            for known_aliases in _SONG_ALIAS_GROUPS
+        )
+        if requested_known_group is None and other_known_song_signal:
+            # Keep future IVE titles discoverable, but never let a partial
+            # unknown input such as "AM" or "DIVE" impersonate a registered
+            # title merely because one complete token appears in metadata.
+            rejection_reasons.append(
+                "requested_song_conflicts_with_known_ive_title"
+            )
+        elif requested_known_group is not None and other_known_song_signal:
+            # A result naming two IVE activities is usually a compilation,
+            # relay, or stale-search collision rather than this promotion's
+            # canonical weekly stage.
+            rejection_reasons.append("other_ive_song_title_signal")
 
     hard_title_reason = _current_hard_title_rejection_reason(title)
     if hard_title_reason is not None:
         rejection_reasons.append(f"non_music_show_{hard_title_reason}")
 
-    has_music_show_signal = any(marker in folded_title for marker in _MUSIC_SHOW_MARKERS)
+    broadcast_program = _music_show_program(title)
+    has_music_show_signal = broadcast_program is not None
     has_fancam_signal = any(marker in folded_title for marker in _FANCAM_MARKERS)
     official_channel_signal = _official_channel_signal(channel, channel_id)
     trusted = official_channel_signal == "allowlisted_channel_id"
@@ -762,6 +772,7 @@ def _metadata_candidate(
         selection_tier=selection_tier,
         trust_score=trust_score,
         broadcast_date=_metadata_broadcast_date(entry, title),
+        broadcast_program=broadcast_program,
         official_channel_signal=official_channel_signal,
         rejection_reasons=tuple(dict.fromkeys(rejection_reasons)),
         fallback_reason=fallback_reason,
@@ -800,6 +811,7 @@ def _merge_discovery(
         selection_tier=better.selection_tier,
         trust_score=better.trust_score,
         broadcast_date=better.broadcast_date,
+        broadcast_program=better.broadcast_program,
         official_channel_signal=better.official_channel_signal,
         rejection_reasons=better.rejection_reasons,
         fallback_reason=better.fallback_reason,
@@ -819,9 +831,11 @@ def _record(candidate: AcquisitionCandidate) -> dict[str, Any]:
         "selection_tier": candidate.selection_tier,
         "trust_score": candidate.trust_score,
         "broadcast_date": candidate.broadcast_date,
+        "broadcast_program": candidate.broadcast_program,
         "official_channel_signal": candidate.official_channel_signal,
         "fallback_reason": candidate.fallback_reason,
         "rejection_reasons": list(candidate.rejection_reasons),
+        "selection_exclusion_reason": None,
         "selected": False,
         "download_status": "not_selected",
         "local_path": None,
@@ -1132,41 +1146,69 @@ def _content_integrity_matches(path: Path, binding: object) -> bool:
     return hmac.compare_digest(actual_digest, expected_digest)
 
 
+def _is_capture_variant(candidate: AcquisitionCandidate) -> bool:
+    folded = _fold(candidate.title)
+    return any(
+        marker in folded
+        for marker in (
+            "풀캠",
+            "fullcam",
+            "full cam",
+            "직캠",
+            "fancam",
+            "choreography",
+            "one take",
+            "one-take",
+            "원테이크",
+            "단독샷",
+            "항공캠",
+            "sky cam",
+            "skycam",
+            "encore",
+            "앵콜",
+        )
+    )
+
+
+def _broadcast_slot_key(
+    candidate: AcquisitionCandidate,
+) -> tuple[str, str] | None:
+    if candidate.broadcast_date is None or candidate.broadcast_program is None:
+        return None
+    return (candidate.broadcast_date, candidate.broadcast_program)
+
+
+def _deduplicate_broadcast_slots(
+    candidates: Sequence[AcquisitionCandidate],
+) -> list[AcquisitionCandidate]:
+    """Keep the first-ranked cut for each exact broadcast date/program."""
+
+    result: list[AcquisitionCandidate] = []
+    used_slots: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        slot = _broadcast_slot_key(candidate)
+        if slot is not None and slot in used_slots:
+            continue
+        result.append(candidate)
+        if slot is not None:
+            used_slots.add(slot)
+    return result
+
+
 def _ordered_for_download(
     candidates: Sequence[AcquisitionCandidate],
 ) -> list[AcquisitionCandidate]:
-    """Prefer one clean canonical stage per broadcast date before variants."""
+    """Prefer canonical stages and keep one cut per date/program slot."""
 
     if not candidates:
         return []
-    def is_capture_variant(candidate: AcquisitionCandidate) -> bool:
-        folded = _fold(candidate.title)
-        return any(
-            marker in folded
-            for marker in (
-                "풀캠",
-                "fullcam",
-                "직캠",
-                "fancam",
-                "choreography",
-                "one take",
-                "one-take",
-                "원테이크",
-                "단독샷",
-                "항공캠",
-                "sky cam",
-                "skycam",
-                "encore",
-                "앵콜",
-            )
-        )
 
     clean_durations = [
         candidate.duration_seconds
         for candidate in candidates
         if candidate.selection_tier <= 1
         and candidate.fallback_reason is None
-        and not is_capture_variant(candidate)
+        and not _is_capture_variant(candidate)
     ]
     median_duration = statistics.median(
         clean_durations or [candidate.duration_seconds for candidate in candidates]
@@ -1176,51 +1218,141 @@ def _ordered_for_download(
         return (
             candidate.selection_tier,
             candidate.fallback_reason is not None,
-            is_capture_variant(candidate),
+            _is_capture_variant(candidate),
             abs(candidate.duration_seconds - median_duration),
             -candidate.trust_score,
             _fold(candidate.title),
             candidate.video_id,
         )
 
-    ranked = sorted(candidates, key=quality_order)
-    canonical = ranked[0]
-    result = [canonical]
-    used_ids = {canonical.video_id}
-    used_dates = {canonical.broadcast_date} if canonical.broadcast_date else set()
-
-    # Dated stages are the strongest deterministic performance-level dedupe.
-    dated_best: dict[str, AcquisitionCandidate] = {}
-    for candidate in ranked:
-        if candidate.video_id in used_ids or candidate.broadcast_date is None:
-            continue
-        dated_best.setdefault(candidate.broadcast_date, candidate)
-    # A different broadcast date is valuable, but not at the cost of replacing
-    # a later clean programme cut with an early fullcam/one-take/encore.  Use
-    # every unique clean date first, then unique capture variants.
-    dated_order = sorted(
-        dated_best.items(),
-        key=lambda item: (is_capture_variant(item[1]), item[0]),
+    # Sorting by quality first guarantees that a canonical programme cut wins
+    # its slot over fullcam/one-take variants before the slot is deduplicated.
+    ranked = _deduplicate_broadcast_slots(
+        sorted(candidates, key=quality_order)
     )
-    for date, candidate in dated_order:
-        if date in used_dates:
-            continue
-        result.append(candidate)
-        used_ids.add(candidate.video_id)
-        used_dates.add(date)
+    canonical = ranked[0]
+    remainder = sorted(
+        ranked[1:],
+        key=lambda candidate: (
+            _is_capture_variant(candidate),
+            candidate.broadcast_date is None,
+            candidate.broadcast_date or "",
+            quality_order(candidate),
+        ),
+    )
+    return [canonical, *remainder]
 
-    # Undated sources precede alternate fullcam/one-take versions of an
-    # already represented show date. All ordering remains reproducible.
-    for candidate in ranked:
-        if candidate.video_id in used_ids or candidate.broadcast_date is not None:
+
+def _select_promotion_date_cluster(
+    candidates: Sequence[AcquisitionCandidate],
+    *,
+    minimum_count: int,
+) -> tuple[list[AcquisitionCandidate], dict[str, Any]]:
+    """Select one promotion run with enough distinct weekly-show slots.
+
+    Dates connected by no more than 28 days form one deterministic promotion
+    cluster. The cluster with the largest deduplicated stage pool wins; an
+    equal-sized newer cluster wins the tie. Undated and cross-promotion clips
+    cannot silently fill the eight-source floor.
+    """
+
+    dated: dict[str, list[AcquisitionCandidate]] = {}
+    for candidate in candidates:
+        if candidate.broadcast_date is not None:
+            dated.setdefault(candidate.broadcast_date, []).append(candidate)
+    ordered_dates = sorted(dated)
+    date_clusters: list[list[str]] = []
+    for broadcast_date in ordered_dates:
+        if not date_clusters:
+            date_clusters.append([broadcast_date])
             continue
-        result.append(candidate)
-        used_ids.add(candidate.video_id)
-    for candidate in ranked:
-        if candidate.video_id not in used_ids:
-            result.append(candidate)
-            used_ids.add(candidate.video_id)
-    return result
+        previous = datetime.strptime(
+            date_clusters[-1][-1], "%Y-%m-%d"
+        ).date()
+        current = datetime.strptime(broadcast_date, "%Y-%m-%d").date()
+        if (current - previous).days <= _PROMOTION_CLUSTER_MAXIMUM_GAP_DAYS:
+            date_clusters[-1].append(broadcast_date)
+        else:
+            date_clusters.append([broadcast_date])
+
+    cluster_records: list[dict[str, Any]] = []
+    cluster_candidates: list[list[AcquisitionCandidate]] = []
+    for cluster_index, dates in enumerate(date_clusters):
+        date_set = set(dates)
+        pool = [
+            candidate
+            for candidate in candidates
+            if candidate.broadcast_date in date_set
+        ]
+        ordered_pool = _ordered_for_download(pool)
+        cluster_candidates.append(pool)
+        cluster_records.append(
+            {
+                "cluster_index": cluster_index,
+                "start_date": dates[0],
+                "end_date": dates[-1],
+                "dated_candidate_count": len(pool),
+                "deduplicated_stage_count": len(ordered_pool),
+                "canonical_stage_count": sum(
+                    not _is_capture_variant(candidate)
+                    for candidate in ordered_pool
+                ),
+                "capture_variant_stage_count": sum(
+                    _is_capture_variant(candidate)
+                    for candidate in ordered_pool
+                ),
+                "qualifies": len(ordered_pool) >= minimum_count,
+            }
+        )
+
+    qualifying = [
+        record for record in cluster_records if record["qualifies"]
+    ]
+    selected_record = (
+        max(
+            qualifying,
+            key=lambda record: (
+                record["deduplicated_stage_count"],
+                record["end_date"],
+            ),
+        )
+        if qualifying
+        else None
+    )
+    selected = (
+        cluster_candidates[selected_record["cluster_index"]]
+        if selected_record is not None
+        else []
+    )
+    selected_ids = {candidate.video_id for candidate in selected}
+    diagnostics = {
+        "policy_version": _LATEST_SONG_ACQUISITION_POLICY_VERSION,
+        "maximum_adjacent_date_gap_days": (
+            _PROMOTION_CLUSTER_MAXIMUM_GAP_DAYS
+        ),
+        "minimum_deduplicated_stage_count": minimum_count,
+        "selection_order": (
+            "largest_deduplicated_stage_count_then_latest_end_date"
+        ),
+        "same_broadcast_slot": "broadcast_date_plus_program",
+        "dated_candidate_count": sum(len(items) for items in dated.values()),
+        "undated_candidate_count": sum(
+            candidate.broadcast_date is None for candidate in candidates
+        ),
+        "clusters": cluster_records,
+        "status": (
+            "selected_qualifying_cluster"
+            if selected_record is not None
+            else "no_qualifying_cluster"
+        ),
+        "selected_cluster": selected_record,
+        "excluded_cross_promotion_video_ids": sorted(
+            candidate.video_id
+            for candidate in candidates
+            if candidate.video_id not in selected_ids
+        ),
+    }
+    return (selected, diagnostics)
 
 
 def _is_member_closeup_candidate(candidate: AcquisitionCandidate) -> bool:
@@ -1372,6 +1504,148 @@ def _manifest_matches_request_contract(
     return summary.get("status") == "complete"
 
 
+def _cache_refresh_upgrade_decision(
+    *,
+    artifact: AcquisitionArtifact,
+    request: AnalysisRequest,
+) -> dict[str, Any]:
+    """Explain whether a valid fallback-sized cache must search for upgrades."""
+
+    summary = artifact.manifest.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    raw_materialized = summary.get("materialized_source_count")
+    materialized_count = (
+        raw_materialized
+        if isinstance(raw_materialized, int)
+        and not isinstance(raw_materialized, bool)
+        and raw_materialized >= len(artifact.source_paths)
+        else len(artifact.source_paths)
+    )
+    fallback_allowed = (
+        _minimum_acceptable_source_count(request)
+        < request.desired_source_count
+    )
+    promotion_selection = artifact.manifest.get(
+        "promotion_date_cluster_selection"
+    )
+    latest_policy_current = (
+        artifact.manifest.get("latest_song_acquisition_policy_version")
+        == _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        and isinstance(promotion_selection, dict)
+        and promotion_selection.get("policy_version")
+        == _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        and promotion_selection.get("status")
+        == "selected_qualifying_cluster"
+        and isinstance(promotion_selection.get("selected_cluster"), dict)
+        and bool(promotion_selection["selected_cluster"].get("qualifies"))
+    )
+    refresh_required = (
+        not latest_policy_current
+        or (
+            fallback_allowed
+            and materialized_count < request.desired_source_count
+        )
+    )
+    if not latest_policy_current:
+        decision = "refresh_metadata_to_apply_latest_song_policy"
+    elif refresh_required:
+        decision = "refresh_metadata_to_upgrade_verified_fallback_pool"
+    elif len(artifact.source_paths) < request.desired_source_count:
+        decision = "reuse_target_materialized_quality_gate_reduced_pool"
+    else:
+        decision = "reuse_target_complete_pool"
+    return {
+        "policy_version": _LATEST_SONG_ACQUISITION_POLICY_VERSION,
+        "decision": decision,
+        "refresh_required": refresh_required,
+        "latest_song_policy_current": latest_policy_current,
+        "metadata_refresh_attempted": False,
+        "authenticated_cached_source_count": len(artifact.source_paths),
+        "prior_materialized_source_count": materialized_count,
+        "target_source_count": request.desired_source_count,
+        "minimum_acceptable_source_count": (
+            _minimum_acceptable_source_count(request)
+        ),
+        "prior_selected_promotion_cluster": artifact.manifest.get(
+            "promotion_date_cluster_selection", {}
+        ).get("selected_cluster")
+        if isinstance(
+            artifact.manifest.get("promotion_date_cluster_selection"), dict
+        )
+        else None,
+        "result": "pending_refresh" if refresh_required else "reused",
+        "new_download_count": 0,
+    }
+
+
+def _manifest_refresh_candidates(
+    *,
+    artifact: AcquisitionArtifact,
+    request: AnalysisRequest,
+) -> list[AcquisitionCandidate]:
+    """Rehydrate authenticated selected and quality-excluded cache bindings."""
+
+    candidates: list[AcquisitionCandidate] = []
+    selected = artifact.manifest.get("selected")
+    if not isinstance(selected, list):
+        return candidates
+    excluded = _validated_group_quality_excluded_bindings(
+        manifest=artifact.manifest,
+        manifest_path=artifact.manifest_path,
+        request=request,
+    )
+    refresh_items = [
+        *selected,
+        *(item for item, _path, _video_id in excluded),
+    ]
+    for item in refresh_items:
+        if not isinstance(item, dict):
+            continue
+        query_value = item.get("query")
+        query = query_value if isinstance(query_value, str) else "verified-cache"
+        candidate = _metadata_candidate(
+            {
+                "id": item.get("video_id"),
+                "title": item.get("title"),
+                "channel": item.get("channel"),
+                "channel_id": item.get("channel_id"),
+                "duration": item.get("duration_seconds"),
+                "webpage_url": item.get("webpage_url"),
+            },
+            request=request,
+            query=query,
+        )
+        if candidate is None or not candidate.selectable:
+            continue
+        stored_date = item.get("broadcast_date")
+        stored_program = item.get("broadcast_program")
+        candidates.append(
+            AcquisitionCandidate(
+                video_id=candidate.video_id,
+                title=candidate.title,
+                channel=candidate.channel,
+                channel_id=candidate.channel_id,
+                duration_seconds=candidate.duration_seconds,
+                webpage_url=candidate.webpage_url,
+                queries=candidate.queries,
+                selection_tier=candidate.selection_tier,
+                trust_score=candidate.trust_score,
+                broadcast_date=(
+                    stored_date if isinstance(stored_date, str) else candidate.broadcast_date
+                ),
+                broadcast_program=(
+                    stored_program
+                    if isinstance(stored_program, str)
+                    else candidate.broadcast_program
+                ),
+                official_channel_signal=candidate.official_channel_signal,
+                rejection_reasons=candidate.rejection_reasons,
+                fallback_reason=candidate.fallback_reason,
+            )
+        )
+    return candidates
+
+
 def _validated_manifest_selection(
     *,
     manifest: dict[str, Any],
@@ -1435,6 +1709,248 @@ def _validated_manifest_selection(
     if len(set(paths)) != len(paths) or len(set(video_ids)) != len(video_ids):
         return None
     return tuple(entries)
+
+
+def _validated_group_quality_excluded_bindings(
+    *,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    request: AnalysisRequest,
+) -> tuple[tuple[dict[str, Any], Path, str], ...]:
+    """Authenticate retained GROUP-quality exclusions from a complete cache.
+
+    Relative quality exclusion does not make a downloaded file invalid.  A
+    nine-source cache may therefore retain one authenticated ninth file while
+    exposing only the top eight to the editor.  Admit those retained bindings
+    into a metadata refresh only when the complete current-policy manifest,
+    applied quality gate, ranking, counts, cache-owned path, video ID, size,
+    and SHA-256 all agree.  Any ambiguity rejects the entire excluded set.
+    """
+
+    promotion_selection = manifest.get("promotion_date_cluster_selection")
+    selected_cluster = (
+        promotion_selection.get("selected_cluster")
+        if isinstance(promotion_selection, dict)
+        else None
+    )
+    group_gate = manifest.get("group_relative_quality_gate")
+    if (
+        not _requires_group_relative_quality_gate(request)
+        or manifest.get("selection_policy_version") != _SELECTION_POLICY_VERSION
+        or manifest.get("latest_song_acquisition_policy_version")
+        != _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        or not _manifest_matches_request_contract(manifest, request)
+        or manifest.get("group_relative_quality_gate_version")
+        != GROUP_RELATIVE_QUALITY_GATE_VERSION
+        or not isinstance(group_gate, dict)
+        or group_gate.get("gate_version")
+        != GROUP_RELATIVE_QUALITY_GATE_VERSION
+        or group_gate.get("status") != "applied_top_eight_selected"
+        or group_gate.get("applied") is not True
+        or not isinstance(promotion_selection, dict)
+        or promotion_selection.get("policy_version")
+        != _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        or promotion_selection.get("status")
+        != "selected_qualifying_cluster"
+        or not isinstance(selected_cluster, dict)
+        or selected_cluster.get("qualifies") is not True
+    ):
+        return ()
+
+    selected_entries = _validated_manifest_selection(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        request=request,
+    )
+    summary = manifest.get("summary")
+    raw_records = manifest.get("candidates")
+    ranking = group_gate.get("ranking")
+    if (
+        selected_entries is None
+        or len(selected_entries) != GROUP_RELATIVE_QUALITY_TARGET
+        or not isinstance(summary, dict)
+        or summary.get("status") != "complete"
+        or not isinstance(raw_records, list)
+        or not raw_records
+        or any(not isinstance(record, dict) for record in raw_records)
+        or not isinstance(ranking, list)
+        or any(not isinstance(item, dict) for item in ranking)
+    ):
+        return ()
+
+    records = list(raw_records)
+    candidate_ids = [record.get("video_id") for record in records]
+    if (
+        any(
+            not isinstance(video_id, str)
+            or _VIDEO_ID.fullmatch(video_id) is None
+            for video_id in candidate_ids
+        )
+        or len(candidate_ids) != len(set(candidate_ids))
+    ):
+        return ()
+
+    excluded_records = [
+        record
+        for record in records
+        if record.get("download_status") == "downloaded_quality_excluded"
+    ]
+    if not excluded_records or any(
+        record.get("selected") is not False
+        or record.get("group_quality_eligible") is not False
+        or record.get("rejection_reasons") != []
+        or record.get("download_hard_rejection_reasons") != []
+        or not isinstance(record.get("group_relative_quality"), dict)
+        or not isinstance(record.get("group_quality_exclusion_reasons"), list)
+        or not record["group_quality_exclusion_reasons"]
+        for record in excluded_records
+    ):
+        return ()
+
+    selected_ids = {video_id for _item, _path, video_id in selected_entries}
+    selected_paths = {path for _item, path, _video_id in selected_entries}
+    excluded_ids = {str(record["video_id"]) for record in excluded_records}
+    if (
+        len(excluded_ids) != len(excluded_records)
+        or selected_ids & excluded_ids
+        or not (selected_ids | excluded_ids) <= set(candidate_ids)
+    ):
+        return ()
+
+    materialized_count = len(selected_entries) + len(excluded_records)
+    if materialized_count not in {
+        GROUP_RELATIVE_QUALITY_TARGET + 1,
+        request.desired_source_count,
+    }:
+        return ()
+
+    def exact_nonnegative_int(value: object, expected: int) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value == expected
+        )
+
+    if (
+        not exact_nonnegative_int(
+            summary.get("materialized_source_count"), materialized_count
+        )
+        or not exact_nonnegative_int(
+            summary.get("eligible_source_count"), len(selected_entries)
+        )
+        or not exact_nonnegative_int(
+            summary.get("downloaded_source_count"), len(selected_entries)
+        )
+        or not exact_nonnegative_int(
+            summary.get("group_quality_excluded_source_count"),
+            len(excluded_records),
+        )
+        or not exact_nonnegative_int(
+            group_gate.get("input_source_count"), materialized_count
+        )
+        or not exact_nonnegative_int(
+            group_gate.get("selected_source_count"), len(selected_entries)
+        )
+        or len(ranking) != materialized_count
+    ):
+        return ()
+
+    ranking_ids = [item.get("video_id") for item in ranking]
+    ranking_indices = [item.get("acquisition_source_index") for item in ranking]
+    if (
+        any(not isinstance(video_id, str) for video_id in ranking_ids)
+        or len(ranking_ids) != len(set(ranking_ids))
+        or set(ranking_ids) != selected_ids | excluded_ids
+        or any(
+            not isinstance(index, int) or isinstance(index, bool)
+            for index in ranking_indices
+        )
+        or set(ranking_indices) != set(range(materialized_count))
+    ):
+        return ()
+    eligible_ranking_ids = {
+        str(item["video_id"])
+        for item in ranking
+        if item.get("eligible") is True
+    }
+    excluded_ranking_ids = {
+        str(item["video_id"])
+        for item in ranking
+        if item.get("eligible") is False
+    }
+    if (
+        eligible_ranking_ids != selected_ids
+        or excluded_ranking_ids != excluded_ids
+        or len(eligible_ranking_ids) + len(excluded_ranking_ids)
+        != len(ranking)
+    ):
+        return ()
+
+    selected_gate_indices = group_gate.get("selected_acquisition_indices")
+    excluded_gate_indices = group_gate.get("excluded_acquisition_indices")
+    expected_selected_indices = {
+        int(item["acquisition_source_index"])
+        for item in ranking
+        if item.get("eligible") is True
+    }
+    expected_excluded_indices = set(range(materialized_count)) - (
+        expected_selected_indices
+    )
+    if (
+        not isinstance(selected_gate_indices, list)
+        or not isinstance(excluded_gate_indices, list)
+        or any(
+            not isinstance(index, int) or isinstance(index, bool)
+            for index in (*selected_gate_indices, *excluded_gate_indices)
+        )
+        or len(selected_gate_indices) != len(set(selected_gate_indices))
+        or len(excluded_gate_indices) != len(set(excluded_gate_indices))
+        or set(selected_gate_indices) != expected_selected_indices
+        or set(excluded_gate_indices) != expected_excluded_indices
+    ):
+        return ()
+
+    ranking_order = {
+        str(item["video_id"]): int(item["acquisition_source_index"])
+        for item in ranking
+    }
+    raw_videos_directory = manifest_path.parent / "videos"
+    if raw_videos_directory.is_symlink():
+        return ()
+    videos_directory = raw_videos_directory.resolve()
+    bindings: list[tuple[dict[str, Any], Path, str]] = []
+    excluded_paths: set[Path] = set()
+    try:
+        for record in sorted(
+            excluded_records,
+            key=lambda item: ranking_order[str(item["video_id"])],
+        ):
+            raw_path = record.get("local_path")
+            video_id = str(record["video_id"])
+            if not isinstance(raw_path, str):
+                return ()
+            unresolved_path = Path(raw_path)
+            if unresolved_path.is_symlink():
+                return ()
+            path = unresolved_path.resolve()
+            if (
+                path.parent != videos_directory
+                or path.stem != video_id
+                or path.suffix.lower() not in _VIDEO_SUFFIXES
+                or not path.is_file()
+                or path in selected_paths
+                or path in excluded_paths
+                or not _content_integrity_matches(
+                    path,
+                    record.get("content_integrity"),
+                )
+            ):
+                return ()
+            excluded_paths.add(path)
+            bindings.append((record, path, video_id))
+    except (AcquisitionError, OSError, RuntimeError, ValueError):
+        return ()
+    return tuple(bindings)
 
 
 def _quarantine_prior_hard_title_rejections(
@@ -1519,7 +2035,16 @@ def _authenticated_cached_path(
     )
     if entries is None:
         return None
-    matches = [entry for entry in entries if entry[2] == candidate.video_id]
+    excluded_entries = _validated_group_quality_excluded_bindings(
+        manifest=prior_manifest,
+        manifest_path=manifest_path,
+        request=request,
+    )
+    matches = [
+        entry
+        for entry in (*entries, *excluded_entries)
+        if entry[2] == candidate.video_id
+    ]
     if len(matches) != 1:
         return None
     item, path, _ = matches[0]
@@ -1659,6 +2184,8 @@ def _upgrade_completed_manifest_missing_group_quality_gate(
     if (
         manifest is None
         or not _manifest_matches_cache_binding_contract(manifest, request)
+        or manifest.get("latest_song_acquisition_policy_version")
+        != _LATEST_SONG_ACQUISITION_POLICY_VERSION
         or not _manifest_selected_titles_pass_current_hard_audit(manifest)
         or manifest.get("group_relative_quality_gate_version") is not None
         or manifest.get("group_relative_quality_gate") is not None
@@ -2041,15 +2568,35 @@ def acquire_sources(
         media_validator=media_validator,
         media_probe=scoped_media_probe,
     )
+    cache_refresh_upgrade: dict[str, Any] | None = None
+    verified_cache_candidates: list[AcquisitionCandidate] = []
     if reusable is not None:
+        cache_refresh_upgrade = _cache_refresh_upgrade_decision(
+            artifact=reusable,
+            request=request,
+        )
+        reusable.manifest["cache_refresh_upgrade"] = cache_refresh_upgrade
+        _write_manifest(manifest_path, reusable.manifest)
+        if not cache_refresh_upgrade["refresh_required"]:
+            reporter.status(
+                f"검증된 IVE 소스 {len(reusable.source_paths)}개 캐시를 재사용합니다."
+            )
+            reporter.log(
+                f"완료된 소스 구성 재사용: {len(reusable.source_paths)}개"
+            )
+            reporter.progress(0.20, "IVE 교차편집 소스 확인 완료")
+            return reusable
+        prior_manifest = reusable.manifest
+        verified_cache_candidates = _manifest_refresh_candidates(
+            artifact=reusable,
+            request=request,
+        )
+        cache_refresh_upgrade["metadata_refresh_attempted"] = True
         reporter.status(
-            f"검증된 IVE 소스 {len(reusable.source_paths)}개 캐시를 재사용합니다."
+            f"검증된 {len(reusable.source_paths)}개 캐시를 유지하며 "
+            f"목표 {request.desired_source_count}개로 업그레이드할 "
+            "최신 음방 메타데이터를 확인합니다."
         )
-        reporter.log(
-            f"완료된 소스 구성 재사용: {len(reusable.source_paths)}개"
-        )
-        reporter.progress(0.20, "IVE 교차편집 소스 확인 완료")
-        return reusable
     upgraded = _upgrade_completed_manifest_missing_group_quality_gate(
         request=request,
         manifest_path=manifest_path,
@@ -2079,12 +2626,35 @@ def acquire_sources(
                 "일치하는 경우에만 재사용합니다."
             ),
         )
-    client = client or YTDLPClient()
+    try:
+        client = client or YTDLPClient()
+    except AcquisitionError:
+        if reusable is None or cache_refresh_upgrade is None:
+            raise
+        cache_refresh_upgrade.update(
+            {
+                "result": "refresh_unavailable_reused_verified_fallback",
+                "result_source_count": len(reusable.source_paths),
+            }
+        )
+        _write_manifest(manifest_path, reusable.manifest)
+        reporter.emit(
+            "log",
+            level="warning",
+            message=(
+                "최신 메타데이터 갱신을 시작하지 못해 "
+                "검증된 fallback 캐시를 그대로 사용합니다."
+            ),
+        )
+        return reusable
     queries = _metadata_queries(request)
     search_limit = min(40, max(18, request.desired_source_count * 2))
     reporter.status("IVE 음방 영상 후보를 검색하는 중…")
 
-    by_id: dict[str, AcquisitionCandidate] = {}
+    by_id: dict[str, AcquisitionCandidate] = {
+        candidate.video_id: candidate
+        for candidate in verified_cache_candidates
+    }
     search_failures: list[dict[str, str]] = []
     for query_index, query in enumerate(queries):
         reporter.log(f"YouTube 메타데이터 검색: {query}")
@@ -2110,7 +2680,16 @@ def acquire_sources(
     # Collapse mirror/re-upload duplicates after exact video-ID deduplication.
     deduplicated: dict[tuple[str, int], AcquisitionCandidate] = {}
     duplicate_ids: list[str] = []
-    for candidate in sorted(by_id.values(), key=_candidate_order):
+    verified_cache_ids = {
+        candidate.video_id for candidate in verified_cache_candidates
+    }
+    for candidate in sorted(
+        by_id.values(),
+        key=lambda candidate: (
+            candidate.video_id not in verified_cache_ids,
+            _candidate_order(candidate),
+        ),
+    ):
         fingerprint = _content_fingerprint(candidate)
         if fingerprint in deduplicated:
             duplicate_ids.append(candidate.video_id)
@@ -2120,6 +2699,21 @@ def acquire_sources(
     records = [_record(candidate) for candidate in candidates]
     records_by_id = {record["video_id"]: record for record in records}
     selectable = [candidate for candidate in candidates if candidate.selectable]
+    selectable, promotion_cluster_selection = _select_promotion_date_cluster(
+        selectable,
+        minimum_count=_minimum_acceptable_source_count(request),
+    )
+    promotion_selected_ids = {
+        candidate.video_id for candidate in selectable
+    }
+    for record in records:
+        if (
+            not record["rejection_reasons"]
+            and record["video_id"] not in promotion_selected_ids
+        ):
+            record["selection_exclusion_reason"] = (
+                "outside_selected_promotion_date_cluster"
+            )
     primary = [candidate for candidate in selectable if candidate.selection_tier <= 1]
     fallback = [candidate for candidate in selectable if candidate.selection_tier > 1]
     if request.edit_mode is EditMode.MEMBER:
@@ -2151,6 +2745,10 @@ def acquire_sources(
         ]
     else:
         ordered = [*_ordered_for_download(primary), *_ordered_for_download(fallback)]
+    # The primary/fallback and standard/close-up lanes are ranked separately,
+    # then reconciled once so the same programme broadcast is never selected
+    # twice through a lower-priority variant lane.
+    ordered = _deduplicate_broadcast_slots(ordered)
 
     portrait_contract_required = _requires_automatic_member_portrait_contract(
         request
@@ -2164,7 +2762,11 @@ def acquire_sources(
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "selection_policy_version": _SELECTION_POLICY_VERSION,
+        "latest_song_acquisition_policy_version": (
+            _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        ),
         "prior_selection_policy_title_audit": prior_policy_title_audit,
+        "cache_refresh_upgrade": cache_refresh_upgrade,
         "content_integrity_contract_version": (
             _CONTENT_INTEGRITY_CONTRACT_VERSION
         ),
@@ -2244,6 +2846,7 @@ def acquire_sources(
         "queries": list(queries),
         "search_failures": search_failures,
         "deduplicated_video_ids": duplicate_ids,
+        "promotion_date_cluster_selection": promotion_cluster_selection,
         "selection_policy": {
             "primary": "trusted_official_broadcast_channel_and_music_show_title",
             "fallback": "official_intro_plus_song_stage_only_after_clean_stages",
@@ -2255,6 +2858,7 @@ def acquire_sources(
                 "dance_practice",
                 "stage_mix",
                 "music_video",
+                "other_ive_song_title_signal",
                 *(
                     [
                         "automatic_video_resolution_below_minimum",
@@ -2285,7 +2889,20 @@ def acquire_sources(
                 ),
             ],
             "channel_requirement": "allowlisted_channel_id_required_name_signal_diagnostic_only",
-            "performance_diversity": "unique_broadcast_date_before_same_date_variants",
+            "performance_diversity": (
+                "one_canonical_cut_per_broadcast_date_and_program_"
+                "before_fullcam_or_one_take"
+            ),
+            "latest_song_title_policy": {
+                "unregistered_song": (
+                    "exact_normalized_token_sequence_case_space_punctuation"
+                ),
+                "substring_inside_another_title": "rejected",
+                "other_registered_ive_activity_in_same_title": "rejected",
+                "promotion_cluster": (
+                    "minimum_floor_then_largest_stage_count_then_latest_tie"
+                ),
+            },
             "reference_source": "clean_canonical_stage_near_median_duration",
             "encore_title_policy": {
                 "explicit_markers": ["encore", "앵콜"],
@@ -2377,12 +2994,44 @@ def acquire_sources(
             "aspect_hard_rejection_count": 0,
             "fallback_selected_count": 0,
             "status": "metadata_complete",
+            "cache_reuse_count": (
+                int(
+                    prior_manifest.get("summary", {}).get(
+                        "cache_reuse_count", 0
+                    )
+                )
+                if cache_refresh_upgrade is not None
+                and isinstance(prior_manifest, dict)
+                and isinstance(prior_manifest.get("summary"), dict)
+                else 0
+            ),
         },
     }
     _write_manifest(manifest_path, manifest)
 
     minimum_acceptable_count = _minimum_acceptable_source_count(request)
     if len(ordered) < minimum_acceptable_count:
+        if reusable is not None and cache_refresh_upgrade is not None:
+            cache_refresh_upgrade.update(
+                {
+                    "result": (
+                        "refresh_metadata_insufficient_reused_verified_fallback"
+                    ),
+                    "result_source_count": len(reusable.source_paths),
+                    "new_download_count": 0,
+                }
+            )
+            _write_manifest(manifest_path, reusable.manifest)
+            reporter.emit(
+                "log",
+                level="warning",
+                message=(
+                    "최신 메타데이터에서 8개 이상의 하나의 "
+                    "활동 군집을 다시 확보하지 못해 검증된 "
+                    "fallback 캐시를 사용합니다."
+                ),
+            )
+            return reusable
         manifest["summary"]["status"] = "insufficient_metadata_candidates"
         _write_manifest(manifest_path, manifest)
         raise AcquisitionError(
@@ -2396,6 +3045,8 @@ def acquire_sources(
     download_failures = 0
     fallback_selected_count = 0
     aspect_hard_rejection_count = 0
+    authenticated_cache_reuse_ids: set[str] = set()
+    new_download_ids: set[str] = set()
     for candidate_index, candidate in enumerate(ordered):
         if len(source_paths) >= request.desired_source_count:
             break
@@ -2483,6 +3134,10 @@ def acquire_sources(
                 else "downloaded"
             )
             record["local_path"] = str(path)
+            if authenticated_cached_path is not None:
+                authenticated_cache_reuse_ids.add(candidate.video_id)
+            else:
+                new_download_ids.add(candidate.video_id)
             if candidate.fallback_reason is not None:
                 fallback_selected_count += 1
             manifest["selected"].append(
@@ -2496,6 +3151,7 @@ def acquire_sources(
                     "webpage_url": candidate.webpage_url,
                     "query": candidate.query,
                     "broadcast_date": candidate.broadcast_date,
+                    "broadcast_program": candidate.broadcast_program,
                     "official_channel_signal": candidate.official_channel_signal,
                     "fallback_reason": candidate.fallback_reason,
                     "download_status": record["download_status"],
@@ -2533,6 +3189,26 @@ def acquire_sources(
         )
 
     if len(source_paths) < minimum_acceptable_count:
+        if reusable is not None and cache_refresh_upgrade is not None:
+            cache_refresh_upgrade.update(
+                {
+                    "result": (
+                        "refresh_downloads_insufficient_reused_verified_fallback"
+                    ),
+                    "result_source_count": len(reusable.source_paths),
+                    "new_download_count": len(new_download_ids),
+                }
+            )
+            _write_manifest(manifest_path, reusable.manifest)
+            reporter.emit(
+                "log",
+                level="warning",
+                message=(
+                    "최신 활동 군집 다운로드가 8개에 못 미쳐 "
+                    "기존 검증 fallback 캐시를 유지합니다."
+                ),
+            )
+            return reusable
         manifest["summary"]["status"] = "insufficient_downloaded_sources"
         _write_manifest(manifest_path, manifest)
         raise AcquisitionError(
@@ -2583,6 +3259,103 @@ def acquire_sources(
     manifest["summary"]["source_count_fallback_applied"] = (
         len(source_paths) < request.desired_source_count
     )
+    if cache_refresh_upgrade is None:
+        refresh_on_next_run = (
+            _minimum_acceptable_source_count(request)
+            < request.desired_source_count
+            and materialized_source_count < request.desired_source_count
+        )
+        manifest["cache_refresh_upgrade"] = {
+            "policy_version": _LATEST_SONG_ACQUISITION_POLICY_VERSION,
+            "decision": (
+                "refresh_metadata_on_next_run_for_verified_fallback_pool"
+                if refresh_on_next_run
+                else "no_refresh_needed_target_materialized"
+            ),
+            "refresh_required": refresh_on_next_run,
+            "metadata_refresh_attempted": False,
+            "authenticated_cached_source_count": 0,
+            "prior_materialized_source_count": materialized_source_count,
+            "target_source_count": request.desired_source_count,
+            "minimum_acceptable_source_count": (
+                _minimum_acceptable_source_count(request)
+            ),
+            "result": (
+                "initial_verified_fallback"
+                if refresh_on_next_run
+                else "initial_target_materialized"
+            ),
+            "new_download_count": materialized_source_count,
+        }
+    else:
+        # The relative quality gate changes an excluded record's status to
+        # ``downloaded_quality_excluded`` regardless of whether this run
+        # downloaded or authenticated it. Preserve actual per-run provenance
+        # so a retained ninth binding is neither counted nor treated as a new
+        # download during a 9 -> 10 refresh.
+        new_download_count = len(new_download_ids)
+        cached_reuse_count = len(authenticated_cache_reuse_ids)
+        prior_cluster = cache_refresh_upgrade.get(
+            "prior_selected_promotion_cluster"
+        )
+        current_cluster = promotion_cluster_selection.get("selected_cluster")
+        prior_start = (
+            prior_cluster.get("start_date")
+            if isinstance(prior_cluster, dict)
+            else None
+        )
+        prior_end = (
+            prior_cluster.get("end_date")
+            if isinstance(prior_cluster, dict)
+            else None
+        )
+        current_start = (
+            current_cluster.get("start_date")
+            if isinstance(current_cluster, dict)
+            else None
+        )
+        current_end = (
+            current_cluster.get("end_date")
+            if isinstance(current_cluster, dict)
+            else None
+        )
+        switched_cluster = (
+            all(
+                isinstance(value, str)
+                for value in (
+                    prior_start,
+                    prior_end,
+                    current_start,
+                    current_end,
+                )
+            )
+            and (current_start > prior_end or prior_start > current_end)
+        )
+        prior_latest_policy_current = bool(
+            cache_refresh_upgrade.get("latest_song_policy_current")
+        )
+        if switched_cluster:
+            refresh_result = "switched_to_newer_qualifying_promotion_cluster"
+        elif not prior_latest_policy_current:
+            refresh_result = (
+                "latest_song_policy_applied_to_target_pool"
+                if materialized_source_count >= request.desired_source_count
+                else "latest_song_policy_applied_to_verified_fallback"
+            )
+        elif materialized_source_count >= request.desired_source_count:
+            refresh_result = "upgraded_to_target"
+        else:
+            refresh_result = "retained_verified_fallback_after_refresh"
+        cache_refresh_upgrade.update(
+            {
+                "result": refresh_result,
+                "new_download_count": new_download_count,
+                "authenticated_cache_reuse_count": cached_reuse_count,
+                "result_materialized_source_count": materialized_source_count,
+                "result_eligible_source_count": len(source_paths),
+                "selected_promotion_cluster": current_cluster,
+            }
+        )
     _write_manifest(manifest_path, manifest)
     return AcquisitionArtifact(
         source_paths=tuple(source_paths),

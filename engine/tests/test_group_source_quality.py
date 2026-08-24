@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -295,6 +296,111 @@ class GroupSourceQualityTests(unittest.TestCase):
             self.assertEqual(cached.source_paths, artifact.source_paths)
             self.assertEqual(
                 cached.manifest["summary"]["materialized_source_count"],
+                10,
+            )
+
+    def test_rankable_nine_to_ten_refresh_reuses_verified_quality_exclusion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root)
+
+            def analyzer(
+                path: Path,
+                _info: MediaInfo,
+                **_kwargs,
+            ) -> GroupSourceQualityAssessment:
+                index = int(path.stem[-4:])
+                return _assessment(100.0 - index)
+
+            first_client = _FakeClient(_entries(9))
+            first = acquire_sources(
+                request,
+                _Reporter(),  # type: ignore[arg-type]
+                client=first_client,  # type: ignore[arg-type]
+                media_validator=lambda _path: None,
+                media_probe=_media,
+                group_quality_analyzer=analyzer,
+            )
+
+            self.assertEqual(len(first.source_paths), 8)
+            self.assertEqual(
+                first.manifest["summary"]["materialized_source_count"],
+                9,
+            )
+            excluded_before = next(
+                record
+                for record in first.manifest["candidates"]
+                if record["video_id"] == "quality0008"
+            )
+            self.assertEqual(
+                excluded_before["download_status"],
+                "downloaded_quality_excluded",
+            )
+            retained_path = Path(excluded_before["local_path"])
+            retained_stat = retained_path.stat()
+            retained_identity = (
+                retained_path.resolve(),
+                retained_stat.st_dev,
+                retained_stat.st_ino,
+                retained_stat.st_size,
+                retained_stat.st_mtime_ns,
+            )
+            retained_sha256 = hashlib.sha256(retained_path.read_bytes()).hexdigest()
+            self.assertEqual(
+                retained_sha256,
+                excluded_before["content_integrity"]["sha256"],
+            )
+
+            second_client = _FakeClient(_entries(10))
+            upgraded = acquire_sources(
+                request,
+                _Reporter(),  # type: ignore[arg-type]
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda _path: None,
+                media_probe=_media,
+                group_quality_analyzer=analyzer,
+            )
+
+            self.assertGreater(second_client.search_calls, 0)
+            self.assertEqual(second_client.download_attempts, ["quality0009"])
+            self.assertTrue(retained_path.is_file())
+            after_stat = retained_path.stat()
+            self.assertEqual(
+                (
+                    retained_path.resolve(),
+                    after_stat.st_dev,
+                    after_stat.st_ino,
+                    after_stat.st_size,
+                    after_stat.st_mtime_ns,
+                ),
+                retained_identity,
+            )
+            self.assertEqual(
+                hashlib.sha256(retained_path.read_bytes()).hexdigest(),
+                retained_sha256,
+            )
+            self.assertEqual(
+                list(retained_path.parent.glob("quality0008.mp4.invalid*")),
+                [],
+            )
+            excluded_after = next(
+                record
+                for record in upgraded.manifest["candidates"]
+                if record["video_id"] == "quality0008"
+            )
+            self.assertEqual(excluded_after["local_path"], str(retained_path))
+            self.assertEqual(
+                excluded_after["content_integrity"]["sha256"],
+                retained_sha256,
+            )
+            refresh = upgraded.manifest["cache_refresh_upgrade"]
+            self.assertEqual(refresh["result"], "upgraded_to_target")
+            self.assertEqual(refresh["new_download_count"], 1)
+            self.assertEqual(refresh["authenticated_cache_reuse_count"], 9)
+            self.assertEqual(
+                upgraded.manifest["summary"]["materialized_source_count"],
                 10,
             )
 

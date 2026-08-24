@@ -342,9 +342,10 @@ class AcquisitionTests(unittest.TestCase):
                 _metadata_candidate(item, request=request, query="test") for item in raw
             ]
         ordered = _ordered_for_download([item for item in candidates if item is not None])
+        self.assertEqual(len(ordered), 2)
         self.assertEqual(ordered[0].video_id, "stage000002")
         self.assertEqual(ordered[1].broadcast_date, "2023-04-21")
-        self.assertEqual(ordered[2].broadcast_date, "2023-04-14")
+        self.assertNotIn("stage000001", {item.video_id for item in ordered})
 
     def test_order_demotes_skycam_until_after_clean_broadcasts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
