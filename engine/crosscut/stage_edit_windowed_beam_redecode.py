@@ -12,21 +12,33 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .render import RenderTransition, aligned_render_segment
 from .section_director import SectionPlan
 from .stage_edit import StageBoundary, StageShot
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
 from .stage_edit_pipeline_bridge import StageEditPipelineBridgeResult
 from .stage_edit_repair_loop import (
     StageEditRepairProposal,
     StageEditRepairRequest,
 )
 from .stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+    StageEditHeadFrame,
     StageEditNoValidTimelineError,
     StageEditSemiMarkovConfig,
     StageEditSourceMetadata,
     decode_stage_edit_semimarkov_beam,
+    stage_edit_boundary_continuity_score,
+)
+from .stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+    StageEditSourcePairScorer,
 )
 from .timewarp import TimeWarpMap
 
@@ -76,6 +88,226 @@ def _clipped_section_plan(
 
 def _maximum_switch_count(rate: float, duration: float) -> int:
     return max(1, int(math.ceil(rate * duration / 60.0 - 1e-12)))
+
+
+def _resolved_continuity_identity(
+    config: StageEditSemiMarkovConfig,
+    source_pair_scorer: StageEditSourcePairScorer | None,
+) -> dict[str, Any]:
+    """Resolve the exact scorer used by both local and exterior boundaries."""
+
+    authority = config.continuity_authority
+    if authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
+        if source_pair_scorer is not None:
+            raise StageEditWindowedBeamError(
+                "handcrafted exterior continuity rejects a learned scorer"
+            )
+        contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+        fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+    elif authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
+            raise StageEditWindowedBeamError(
+                "learned exterior continuity requires the production source-pair scorer"
+            )
+        contract = source_pair_scorer.contract
+        fingerprint = source_pair_scorer.fingerprint
+        if contract != STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT:
+            raise StageEditWindowedBeamError(
+                "learned exterior continuity scorer contract changed"
+            )
+    else:
+        raise StageEditWindowedBeamError(
+            "windowed continuity authority is unsupported"
+        )
+    if (
+        config.continuity_scorer_contract is not None
+        and config.continuity_scorer_contract != contract
+    ):
+        raise StageEditWindowedBeamError(
+            "windowed continuity scorer contract differs from production"
+        )
+    if (
+        config.continuity_scorer_fingerprint is not None
+        and config.continuity_scorer_fingerprint != fingerprint
+    ):
+        raise StageEditWindowedBeamError(
+            "windowed continuity scorer fingerprint differs from production"
+        )
+    return {
+        "continuity_authority": authority,
+        "continuity_scorer_contract": contract,
+        "continuity_scorer_fingerprint": fingerprint,
+        "learned_source_pair_scorer_bound": source_pair_scorer is not None,
+    }
+
+
+def _validate_decoder_continuity_provenance(
+    provenance: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> None:
+    expected = {
+        "authority": identity["continuity_authority"],
+        "scorer_contract": identity["continuity_scorer_contract"],
+        "scorer_fingerprint": identity["continuity_scorer_fingerprint"],
+    }
+    if any(provenance.get(name) != value for name, value in expected.items()):
+        raise StageEditWindowedBeamError(
+            "local decoder continuity provenance differs from its resolved scorer"
+        )
+
+
+def _exact_head_frame(
+    frames: Sequence[StageEditHeadFrame],
+    boundary_time_seconds: float,
+) -> StageEditHeadFrame:
+    matches = tuple(
+        frame
+        for frame in frames
+        if abs(frame.master_time_seconds - boundary_time_seconds) <= _TIME_EPSILON
+    )
+    if len(matches) != 1:
+        raise StageEditWindowedBeamError(
+            "exterior splice boundary lacks one exact production head frame"
+        )
+    return matches[0]
+
+
+def _exterior_splice_continuity_evidence(
+    request: StageEditRepairRequest,
+    replacement_shots: Sequence[StageShot],
+    *,
+    config: StageEditSemiMarkovConfig,
+    derivative_family_ids: Sequence[int],
+    all_frames: Sequence[StageEditHeadFrame],
+    source_pair_scorer: StageEditSourcePairScorer | None,
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Score every newly created fixed-context edge on the exact master clock."""
+
+    source_count = len(request.base_edit.sources)
+    if len(derivative_family_ids) != source_count:
+        raise StageEditWindowedBeamError(
+            "exterior continuity derivative families do not align with sources"
+        )
+    if not replacement_shots:
+        raise StageEditWindowedBeamError(
+            "exterior continuity needs at least one replacement shot"
+        )
+    edge_inputs: list[tuple[str, float, int, int]] = []
+    if request.window.start_shot > 0:
+        edge_inputs.append(
+            (
+                "left",
+                request.window.actual_start_seconds,
+                request.base_edit.shots[
+                    request.window.start_shot - 1
+                ].segment.source_index,
+                replacement_shots[0].segment.source_index,
+            )
+        )
+    if request.window.end_shot_exclusive < len(request.base_edit.shots):
+        edge_inputs.append(
+            (
+                "right",
+                request.window.actual_end_seconds,
+                replacement_shots[-1].segment.source_index,
+                request.base_edit.shots[
+                    request.window.end_shot_exclusive
+                ].segment.source_index,
+            )
+        )
+
+    edges: list[dict[str, Any]] = []
+    for side, boundary_time, outgoing_source, incoming_source in edge_inputs:
+        frame = _exact_head_frame(all_frames, boundary_time)
+        outgoing_family = derivative_family_ids[outgoing_source]
+        incoming_family = derivative_family_ids[incoming_source]
+        cross_family = outgoing_family != incoming_family
+        scorer_invoked = False
+        neutral_reason: str | None = None
+        if not cross_family:
+            raw_score = 0.0
+            neutral_reason = "same_derivative_family_neutral"
+        elif not frame.source_continuity:
+            if (
+                identity["continuity_authority"]
+                == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ):
+                raise StageEditWindowedBeamError(
+                    "learned exterior continuity is missing exact observations"
+                )
+            raw_score = 0.0
+            neutral_reason = "handcrafted_missing_observation_neutral"
+        else:
+            if len(frame.source_continuity) != source_count:
+                raise StageEditWindowedBeamError(
+                    "exterior continuity observations do not align with sources"
+                )
+            outgoing = frame.source_continuity[outgoing_source]
+            incoming = frame.source_continuity[incoming_source]
+            if (
+                identity["continuity_authority"]
+                == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ):
+                assert isinstance(source_pair_scorer, StageEditSourcePairScorer)
+                raw_score = source_pair_scorer.score(outgoing, incoming)
+            else:
+                raw_score = stage_edit_boundary_continuity_score(
+                    outgoing,
+                    incoming,
+                )
+            scorer_invoked = True
+        raw_score = float(raw_score)
+        if not math.isfinite(raw_score) or not -1.0 <= raw_score <= 0.0:
+            raise StageEditWindowedBeamError(
+                "exterior continuity scorer violated its bounded [-1, 0] contract"
+            )
+        weight = float(config.boundary_continuity_weight)
+        weighted_score = raw_score * weight
+        if (
+            not math.isfinite(weighted_score)
+            or weighted_score < -weight - _TIME_EPSILON
+            or weighted_score > _TIME_EPSILON
+        ):
+            raise StageEditWindowedBeamError(
+                "weighted exterior continuity score is outside its bounded range"
+            )
+        edges.append(
+            {
+                "side": side,
+                "boundary_time_seconds": boundary_time,
+                "head_frame_time_seconds": frame.master_time_seconds,
+                "outgoing_source_index": outgoing_source,
+                "incoming_source_index": incoming_source,
+                "outgoing_derivative_family_id": outgoing_family,
+                "incoming_derivative_family_id": incoming_family,
+                "cross_derivative_family": cross_family,
+                "authority_rule_evaluated": True,
+                "scorer_evaluated": scorer_invoked,
+                "scorer_invoked": scorer_invoked,
+                "neutral_reason": neutral_reason,
+                "raw_score": raw_score,
+                "weight": weight,
+                "weighted_score": weighted_score,
+                **dict(identity),
+            }
+        )
+    expected_edge_count = len(edge_inputs)
+    return {
+        "expected_edge_count": expected_edge_count,
+        "evaluated_edge_count": len(edges),
+        "scorer_invocation_count": sum(
+            bool(edge["scorer_invoked"]) for edge in edges
+        ),
+        "raw_score_total": sum(float(edge["raw_score"]) for edge in edges),
+        "weighted_score_total": sum(
+            float(edge["weighted_score"]) for edge in edges
+        ),
+        "raw_score_range": [-1.0, 0.0],
+        "full_edit_validation_passed": len(edges) == expected_edge_count,
+        "edges": edges,
+        **dict(identity),
+    }
 
 
 def _full_edit_constraint_rejections(
@@ -401,6 +633,40 @@ class StageEditWindowedBeamRedecoder:
             montage_grammar_score_weight=0.0,
             enforce_montage_grammar=False,
         )
+        source_pair_scorer = getattr(
+            self.bridge_result.preflight, "source_pair_scorer", None
+        )
+        continuity_identity = _resolved_continuity_identity(
+            local_config,
+            source_pair_scorer,
+        )
+        declared_authority = getattr(
+            self.bridge_result.preflight,
+            "continuity_authority",
+            continuity_identity["continuity_authority"],
+        )
+        if declared_authority != continuity_identity["continuity_authority"]:
+            raise StageEditWindowedBeamError(
+                "windowed continuity authority differs from production preflight"
+            )
+        declared_fingerprint = getattr(
+            self.bridge_result.preflight,
+            "source_pair_scorer_fingerprint",
+            None,
+        )
+        if declared_fingerprint is None and (
+            continuity_identity["continuity_authority"]
+            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        ):
+            raise StageEditWindowedBeamError(
+                "learned windowed continuity preflight lacks its scorer fingerprint"
+            )
+        if declared_fingerprint is not None and declared_fingerprint != (
+            continuity_identity["continuity_scorer_fingerprint"]
+        ):
+            raise StageEditWindowedBeamError(
+                "windowed continuity fingerprint differs from production preflight"
+            )
         call_audit: dict[str, Any] = {
             "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
             "iteration": request.iteration,
@@ -413,6 +679,10 @@ class StageEditWindowedBeamRedecoder:
                 frame.master_time_seconds for frame in frames
             ],
             "local_config": asdict(local_config),
+            "dynamic_crop_version": getattr(
+                self.bridge_result.preflight, "dynamic_crop_version", 2
+            ),
+            **continuity_identity,
             "local_only_relaxations": [
                 "minimum_unique_sources_deferred_to_full_edit_recheck",
                 "source_occupancy_deferred_to_full_edit_recheck",
@@ -444,26 +714,55 @@ class StageEditWindowedBeamRedecoder:
                 source_derivative_metadata=(
                     self.bridge_result.source_derivative_diversity
                 ),
+                source_pair_scorer=source_pair_scorer,
             )
         except StageEditNoValidTimelineError as exc:
             call_audit["decoder_no_valid_timeline"] = str(exc)
             self.call_audits.append(call_audit)
             return ()
         call_audit["decoder_audit"] = decoded.audit.to_dict()
+        decoder_score_provenance = getattr(decoded.audit, "score_provenance", None)
+        decoder_continuity_provenance = (
+            decoder_score_provenance.get("boundary_continuity")
+            if isinstance(decoder_score_provenance, Mapping)
+            else None
+        )
+        if not isinstance(decoder_continuity_provenance, Mapping):
+            raise StageEditWindowedBeamError(
+                "local decoder omitted continuity score provenance"
+            )
+        _validate_decoder_continuity_provenance(
+            decoder_continuity_provenance,
+            continuity_identity,
+        )
         call_audit["returned_timeline_count"] = len(decoded.timelines)
-        proposals: list[StageEditRepairProposal] = []
+        derivative_family_ids = (
+            self.bridge_result.source_derivative_diversity.family_ids
+            if self.bridge_result.source_derivative_diversity is not None
+            else tuple(range(len(self.sources)))
+        )
+        eligible: list[tuple[float, int, Any, tuple[StageShot, ...], dict[str, Any]]] = []
         for timeline in decoded.timelines:
             try:
+                timeline_provenance = getattr(
+                    timeline,
+                    "boundary_continuity_score_provenance",
+                    None,
+                )
+                if not isinstance(timeline_provenance, Mapping):
+                    raise StageEditWindowedBeamError(
+                        "local timeline omitted continuity score provenance"
+                    )
+                _validate_decoder_continuity_provenance(
+                    timeline_provenance,
+                    continuity_identity,
+                )
                 shots = self._exact_shots(request, timeline)
                 rejection_reasons = _full_edit_constraint_rejections(
                     request,
                     shots,
                     config=production_config,
-                    derivative_family_ids=(
-                        self.bridge_result.source_derivative_diversity.family_ids
-                        if self.bridge_result.source_derivative_diversity is not None
-                        else tuple(range(len(self.sources)))
-                    ),
+                    derivative_family_ids=derivative_family_ids,
                 )
                 if rejection_reasons:
                     call_audit["rejections"].append(
@@ -473,31 +772,36 @@ class StageEditWindowedBeamRedecoder:
                         }
                     )
                     continue
-                proposals.append(
-                    StageEditRepairProposal(
-                        proposal_id=(
-                            f"actual-windowed-semimarkov-i{request.iteration:02d}-"
-                            f"r{timeline.rank:02d}"
-                        ),
-                        rank=timeline.rank,
-                        replacement_shots=shots,
-                        replacement_boundaries=self._boundary_patch(
-                            request,
-                            timeline,
-                        ),
-                        audit={
-                            "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
-                            "actual_public_decoder_invoked": True,
-                            "decoder_input_sha256": decoded.audit.input_sha256,
-                            "decoder_timeline_rank": timeline.rank,
-                            "decoder_timeline_score": timeline.score,
-                            "exact_source_clock_reprojected": True,
-                            "full_edit_constraints_rechecked": True,
-                        },
+                exterior_evidence = _exterior_splice_continuity_evidence(
+                    request,
+                    shots,
+                    config=production_config,
+                    derivative_family_ids=derivative_family_ids,
+                    all_frames=all_frames,
+                    source_pair_scorer=source_pair_scorer,
+                    identity=continuity_identity,
+                )
+                if not exterior_evidence["full_edit_validation_passed"]:
+                    raise StageEditWindowedBeamError(
+                        "exterior splice continuity full-edit validation failed"
+                    )
+                decoder_score = float(timeline.score)
+                candidate_selection_score = decoder_score + float(
+                    exterior_evidence["weighted_score_total"]
+                )
+                if not math.isfinite(candidate_selection_score):
+                    raise StageEditWindowedBeamError(
+                        "exterior-adjusted candidate selection score is not finite"
+                    )
+                eligible.append(
+                    (
+                        candidate_selection_score,
+                        timeline.rank,
+                        timeline,
+                        shots,
+                        exterior_evidence,
                     )
                 )
-                if len(proposals) == 8:
-                    break
             except (TypeError, ValueError, StageEditWindowedBeamError) as exc:
                 call_audit["rejections"].append(
                     {
@@ -505,6 +809,65 @@ class StageEditWindowedBeamRedecoder:
                         "reasons": [f"{type(exc).__name__}: {exc}"],
                     }
                 )
+
+        ordered = tuple(
+            sorted(
+                eligible,
+                key=lambda value: (-value[0], value[1]),
+            )[:8]
+        )
+        proposals: list[StageEditRepairProposal] = []
+        for selection_rank, (
+            candidate_selection_score,
+            decoder_rank,
+            timeline,
+            shots,
+            exterior_evidence,
+        ) in enumerate(ordered, start=1):
+            proposals.append(
+                StageEditRepairProposal(
+                    proposal_id=(
+                        f"actual-windowed-semimarkov-i{request.iteration:02d}-"
+                        f"r{decoder_rank:02d}"
+                    ),
+                    rank=selection_rank,
+                    replacement_shots=shots,
+                    replacement_boundaries=self._boundary_patch(
+                        request,
+                        timeline,
+                    ),
+                    audit={
+                        "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+                        "actual_public_decoder_invoked": True,
+                        "decoder_input_sha256": decoded.audit.input_sha256,
+                        "decoder_timeline_rank": decoder_rank,
+                        "decoder_timeline_score": timeline.score,
+                        "candidate_selection_rank": selection_rank,
+                        "candidate_selection_score": candidate_selection_score,
+                        "exterior_score_applied_to_candidate_selection": True,
+                        "exterior_splice_continuity": exterior_evidence,
+                        "exact_source_clock_reprojected": True,
+                        "full_edit_constraints_rechecked": True,
+                        "full_edit_exterior_continuity_rechecked": True,
+                        **continuity_identity,
+                    },
+                )
+            )
+        call_audit["eligible_timeline_count"] = len(eligible)
+        call_audit["candidate_selection_order"] = [
+            {
+                "candidate_selection_rank": proposal.rank,
+                "proposal_id": proposal.proposal_id,
+                "decoder_timeline_rank": proposal.audit["decoder_timeline_rank"],
+                "candidate_selection_score": proposal.audit[
+                    "candidate_selection_score"
+                ],
+                "exterior_weighted_score_total": proposal.audit[
+                    "exterior_splice_continuity"
+                ]["weighted_score_total"],
+            }
+            for proposal in proposals
+        ]
         call_audit["accepted_proposal_count"] = len(proposals)
         self.call_audits.append(call_audit)
         return tuple(proposals)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
     AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
     _GroupRenderCandidateBundle,
+    _apply_stage_edit_candidate_render_contract,
     _attempt_proxy_triggered_partial_reedit,
     _enforce_automatic_stage_edit_post_render_qa,
     analyze,
@@ -38,9 +40,18 @@ from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.stage_edit import StageBoundary, StageEdit, StageShot
 from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
 from crosscut.stage_edit_pipeline_bridge import (
+    STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
     RetainedStageEditCandidate,
     StageEditPipelineBridgePreflight,
     StageEditPipelineBridgeResult,
+)
+from crosscut.stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+    StageEditSemiMarkovConfig,
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
@@ -54,6 +65,7 @@ from crosscut.stage_edit_visual_candidate_adapter import (
     StageEditMaterializedVisualCandidate,
     StageEditVisualCandidateBatch,
     StageEditVisualCandidateError,
+    _retained_dynamic_crop_version,
     apply_stage_edit_dynamic_crop_to_render_plan,
     materialize_stage_edit_visual_candidates,
 )
@@ -67,6 +79,11 @@ from engine.tests.test_pipeline import (
     _MemoryReporter,
     _analysis_media,
     _visual_choice,
+)
+from engine.tests.test_stage_edit_pipeline_bridge import (
+    _typed_decode_result,
+    _typed_head_result,
+    _typed_timelines,
 )
 
 
@@ -196,26 +213,70 @@ def _bridge_result(count: int = 8) -> StageEditPipelineBridgeResult:
             mlx_version="test",
             checkpoint_path=str(checkpoint),
             training_steps=10,
+            checkpoint_format="dynamic_crop_v2",
+            dynamic_crop_version=2,
+            checkpoint_metadata_filename="dynamic-crop-v2-metadata.json",
         ),
     )
     retained = tuple(
         RetainedStageEditCandidate(
             rank=index + 1,
             score=10.0 - index,
-            edit=_edit(sources),
+            edit=replace(
+                _edit(sources),
+                candidate_history=(
+                    *_edit(sources).candidate_history,
+                    {
+                        "bridge": STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+                        "dynamic_crop_version": 2,
+                        "continuity_authority": (
+                            HANDCRAFTED_CONTINUITY_AUTHORITY
+                        ),
+                    },
+                ),
+            ),
             exact_clock_reprojected=True,
             timewarped_segment_count=0,
         )
         for index in range(count)
     )
+    config = StageEditSemiMarkovConfig(minimum_unique_sources=1)
+    timelines = _typed_timelines(
+        sources,
+        count=count,
+        authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
+        scorer_contract=HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+        scorer_fingerprint=HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+    )
+    decoded = _typed_decode_result(
+        timelines,
+        config=config,
+        scorer_contract=HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+        scorer_fingerprint=HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+        request_fulfilled=(count == config.timeline_count),
+    )
     return StageEditPipelineBridgeResult(
         preflight=preflight,
-        head_materialization=SimpleNamespace(to_dict=lambda: {"test": True}),
-        semimarkov=SimpleNamespace(to_dict=lambda: {"test": True}),
+        head_materialization=replace(
+            _typed_head_result(checkpoint),
+            sequence_id=snapshot.sequence.sequence_id,
+            token_schema_fingerprint=snapshot.token_schema_fingerprint,
+            readiness=preflight.readiness,
+            training_steps=preflight.readiness.training_steps,
+        ),
+        semimarkov=decoded,
         retained_candidates=retained,
         selection_policy={
             "selected_for_render": False,
             "visual_baseline_replaced": False,
+            "dynamic_crop_version": 2,
+            "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+            "continuity_scorer_contract": (
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+            ),
+            "continuity_scorer_fingerprint": (
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+            ),
         },
     )
 
@@ -254,7 +315,148 @@ def _visual_fixture(*, passed: bool = True):
     return candidate_set, base_materialized
 
 
+def _typed_visual_batch() -> StageEditVisualCandidateBatch:
+    bridge = _bridge_result()
+    candidate_set, base_materialized = _visual_fixture()
+    with (
+        patch(
+            "crosscut.stage_edit_visual_candidate_adapter."
+            "build_prescribed_visual_timeline_candidate_set",
+            return_value=candidate_set,
+        ),
+        patch(
+            "crosscut.stage_edit_visual_candidate_adapter."
+            "materialize_visual_timeline_candidates",
+            return_value=(base_materialized,),
+        ),
+    ):
+        return materialize_stage_edit_visual_candidates(
+            bridge,
+            sources=bridge.retained_candidates[0].edit.sources,
+            audio_offsets=(0.0, 0.0),
+            sync_scores=(0.9, 0.8),
+            scene_cut_times=((), ()),
+            source_timewarps=(None, None),
+        )
+
+
 class StageEditVisualCandidateAdapterTests(unittest.TestCase):
+    def test_visual_batch_direct_constructor_rejects_fake_records_and_versions(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            TypeError,
+            "typed materialized candidates",
+        ):
+            StageEditVisualCandidateBatch(
+                tuple(SimpleNamespace(candidate_index=index) for index in range(8))
+            )
+
+        valid = _typed_visual_batch()
+        first = valid.candidates[0]
+        with self.assertRaisesRegex(TypeError, "typed candidate records"):
+            StageEditVisualCandidateBatch(
+                (
+                    replace(
+                        first,
+                        candidate_record=SimpleNamespace(
+                            review=SimpleNamespace(passed=True)
+                        ),
+                    ),
+                    *valid.candidates[1:],
+                )
+            )
+
+        invalid_retained = replace(
+            first.retained_candidate,
+            edit=replace(
+                first.retained_candidate.edit,
+                candidate_history=(
+                    {
+                        "bridge": STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+                        "dynamic_crop_version": 4,
+                        "continuity_authority": (
+                            HANDCRAFTED_CONTINUITY_AUTHORITY
+                        ),
+                    },
+                ),
+            ),
+        )
+        invalid_candidate = replace(
+            first,
+            candidate_record=replace(
+                first.candidate_record,
+                retained_candidate=invalid_retained,
+            ),
+            retained_candidate=invalid_retained,
+        )
+        with self.assertRaisesRegex(
+            StageEditVisualCandidateError,
+            "invalid Dynamic Crop version",
+        ):
+            StageEditVisualCandidateBatch(
+                (invalid_candidate, *valid.candidates[1:])
+            )
+
+    def test_bridge_result_rejects_v3_preflight_with_v2_candidate_history(
+        self,
+    ) -> None:
+        bridge = _bridge_result()
+        v3_readiness = replace(
+            bridge.preflight.readiness,
+            checkpoint_format="dynamic_crop_v3",
+            dynamic_crop_version=3,
+            checkpoint_metadata_filename="dynamic-crop-v3-metadata.json",
+        )
+        v3_preflight = replace(
+            bridge.preflight,
+            readiness=v3_readiness,
+            dynamic_crop_version=3,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "retained candidate version differs"
+        ):
+            replace(
+                bridge,
+                preflight=v3_preflight,
+                head_materialization=replace(
+                    bridge.head_materialization,
+                    readiness=v3_readiness,
+                    checkpoint_format="dynamic_crop_v3",
+                    dynamic_crop_version=3,
+                    checkpoint_metadata_filename=(
+                        "dynamic-crop-v3-metadata.json"
+                    ),
+                ),
+                selection_policy={
+                    **bridge.selection_policy,
+                    "dynamic_crop_version": 3,
+                },
+            )
+
+    def test_candidate_history_rejects_invalid_or_mixed_dynamic_crop_versions(
+        self,
+    ) -> None:
+        retained = _bridge_result().retained_candidates[0]
+        for history in (
+            (*retained.edit.candidate_history, {"dynamic_crop_version": 4}),
+            (
+                *retained.edit.candidate_history,
+                {"dynamic_crop_version": 2},
+                {"dynamic_crop_version": 3},
+            ),
+        ):
+            with self.subTest(history=history[-1]):
+                invalid = replace(
+                    retained,
+                    edit=replace(retained.edit, candidate_history=history),
+                )
+                with self.assertRaisesRegex(
+                    StageEditVisualCandidateError,
+                    "invalid Dynamic Crop version|mixes Dynamic Crop versions",
+                ):
+                    _retained_dynamic_crop_version(invalid)
+
     @staticmethod
     def _post_render_report(verdict: str) -> SimpleNamespace:
         passed = verdict == "PASS"
@@ -697,6 +899,98 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             TransitionKind.FACE_DISSOLVE,
         )
 
+    def test_v3_render_contract_uses_truthful_generic_audit_without_v2_alias(self) -> None:
+        bridge = _bridge_result()
+        candidate_set, base_materialized = _visual_fixture()
+        with (
+            patch(
+                "crosscut.stage_edit_visual_candidate_adapter."
+                "build_prescribed_visual_timeline_candidate_set",
+                return_value=candidate_set,
+            ),
+            patch(
+                "crosscut.stage_edit_visual_candidate_adapter."
+                "materialize_visual_timeline_candidates",
+                return_value=(base_materialized,),
+            ),
+        ):
+            candidate = materialize_stage_edit_visual_candidates(
+                bridge,
+                sources=bridge.retained_candidates[0].edit.sources,
+                audio_offsets=(0.0, 0.0),
+                sync_scores=(0.9, 0.8),
+                scene_cut_times=((), ()),
+                source_timewarps=(None, None),
+            ).candidates[0]
+        v3_edit = replace(
+            candidate.retained_candidate.edit,
+            candidate_history=(
+                *candidate.retained_candidate.edit.candidate_history[:-1],
+                {
+                    **candidate.retained_candidate.edit.candidate_history[-1],
+                    "dynamic_crop_version": 3,
+                },
+            ),
+        )
+        v3_retained = replace(candidate.retained_candidate, edit=v3_edit)
+        v3_candidate = replace(
+            candidate,
+            retained_candidate=v3_retained,
+            candidate_record=replace(
+                candidate.candidate_record,
+                retained_candidate=v3_retained,
+            ),
+        )
+        plan = RenderPlan(
+            sources=v3_edit.sources,
+            segments=tuple(
+                replace(shot.segment, editorial_transform=None)
+                for shot in v3_edit.shots
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("/tmp/stage-edit-v3-audit.mp4"),
+            transitions=(
+                RenderTransition(
+                    TransitionKind.FACE_DISSOLVE,
+                    9,
+                    "verified_face_alignment",
+                    face_mismatch=0.08,
+                    tier="A",
+                ),
+            ),
+        )
+        bundle = _GroupRenderCandidateBundle(
+            candidate_index=0,
+            review_rank=0,
+            cadence_profile="stage_edit_v3",
+            pre_render_score=10.0,
+            visual_timeline=v3_candidate.visual_plan,
+            boundary_repairs=None,
+            timeline_review=None,
+            face_match_plan=None,
+            group_transition_plan=GroupTransitionPlan(plan.transitions),
+            boundary_affine_plan=None,
+            editorial_motion_plan=None,
+            render_plan=plan,
+        )
+        with patch(
+            "crosscut.pipeline._stage_edit_exact_shot_clock_from_edit",
+            return_value={"contract": "test-exact-clock"},
+        ):
+            promoted = _apply_stage_edit_candidate_render_contract(
+                bundle, v3_candidate
+            )
+        event = promoted.candidate_lineage[-1]
+        self.assertEqual(event["stage"], "dynamic_crop_v3_render_plan_overlay")
+        self.assertEqual(event["dynamic_crop_version"], 3)
+        self.assertEqual(event["dynamic_crop_suppressed_segment_indices"], [0, 1])
+        self.assertNotIn("dynamic_crop_v2_suppressed_segment_indices", event)
+        self.assertIn(
+            "stage_edit_dynamic_crop_v3_render_contract_applied",
+            promoted.diagnostics,
+        )
+
     def test_request_rejects_ambiguous_generated_and_baseline_rerank_mix(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -1120,7 +1414,6 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             transitions = GroupTransitionPlan(())
             ordinary_bundles = []
             promoted_bundles = []
-            candidate_mocks = []
             for index in range(8):
                 visual = VisualTimelinePlan(
                     (_visual_choice(0, index, 0.0, 8.0),),
@@ -1188,18 +1481,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                         },
                     )
                 )
-                candidate = Mock(spec=StageEditMaterializedVisualCandidate)
-                candidate.candidate_index = index
-                candidate.review_rank = index
-                candidate.candidate_record = SimpleNamespace(
-                    review=SimpleNamespace(passed=True)
-                )
-                candidate.to_dict.return_value = {
-                    "candidate_index": index,
-                    "candidate_origin": "explicit_stage_edit_generation",
-                }
-                candidate_mocks.append(candidate)
-            batch = StageEditVisualCandidateBatch(tuple(candidate_mocks))
+            batch = _typed_visual_batch()
 
             def _write_generation(path: Path):
                 path.write_text("{}", encoding="utf-8")

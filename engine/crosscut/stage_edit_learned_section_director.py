@@ -2,7 +2,7 @@
 
 The acoustic section plan remains the source of contiguous song boundaries.
 This adapter replaces its hand-authored *editing budgets* with bounded evidence
-from the production Transformer's cut, source-selection, and Dynamic Crop v2
+from the production Transformer's cut, source-selection, and Dynamic Crop v2/v3
 heads.  It therefore cannot invent semantic verse/chorus labels, and it cannot
 run from random weights or a held-out-tuned threshold.
 """
@@ -22,10 +22,10 @@ from .stage_edit_semimarkov_beam import StageEditHeadFrame
 from .stage_edit_transformer import PRODUCTION_TRAINING_REPORT_FILENAME
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CONTRACT = (
     "validation_frozen_stageedit_heads_section_budget_"
-    "profile_chorus_wide_anchor_allocation_v2"
+    "source_exact_dynamic_crop_v2_v3_profile_chorus_wide_anchor_allocation_v3"
 )
 CHORUS_WIDE_ANCHOR_ALLOCATION_BASIS = (
     "phrase_count_then_duration_then_energy_then_learned_wide_support_"
@@ -74,28 +74,62 @@ def _threshold_logit(probability: float) -> float:
     return math.log(bounded / (1.0 - bounded))
 
 
-def _top_source_shot_size(frame: StageEditHeadFrame) -> str | None:
-    if not frame.source_shot_sizes:
-        return None
+def _selected_effective_source_index(frame: StageEditHeadFrame) -> int | None:
+    if frame.dynamic_crop_v2 is not None and frame.dynamic_crop_v3_by_source:
+        raise LearnedSectionDirectorError(
+            "one Section Director frame cannot mix Dynamic Crop v2 and v3"
+        )
     eligible = [
         index for index, allowed in enumerate(frame.effective_source_mask) if allowed
     ]
     if not eligible:
         return None
-    selected = max(eligible, key=lambda index: frame.source_logits[index])
+    return max(eligible, key=lambda index: frame.source_logits[index])
+
+
+def _top_source_shot_size(frame: StageEditHeadFrame) -> str | None:
+    if not frame.source_shot_sizes:
+        return None
+    selected = _selected_effective_source_index(frame)
+    if selected is None:
+        return None
     value = frame.source_shot_sizes[selected].strip().lower()
     return value or None
 
 
+def _selected_dynamic_prediction(frame: StageEditHeadFrame) -> Any | None:
+    selected = _selected_effective_source_index(frame)
+    if selected is None:
+        return None
+    if frame.dynamic_crop_v3_by_source:
+        prediction = frame.dynamic_crop_v3_by_source[selected]
+        if prediction is None:
+            raise LearnedSectionDirectorError(
+                "selected effective source lacks its Dynamic Crop v3 prediction"
+            )
+        return prediction
+    return frame.dynamic_crop_v2
+
+
 def _dynamic_motion_probability(frame: StageEditHeadFrame) -> float | None:
-    prediction = frame.dynamic_crop_v2
+    prediction = _selected_dynamic_prediction(frame)
     return _sigmoid(prediction.motion_logit) if prediction is not None else None
 
 
 def _dynamic_roll_support(frame: StageEditHeadFrame) -> float | None:
-    prediction = frame.dynamic_crop_v2
+    prediction = _selected_dynamic_prediction(frame)
     if prediction is None:
         return None
+    if frame.dynamic_crop_v3_by_source:
+        return max(
+            (
+                _clamp(abs(values[3]) / 1.60, 0.0, 1.0)
+                for values in prediction.values[
+                    : prediction.predicted_keyframe_count
+                ]
+            ),
+            default=0.0,
+        )
     supports = [
         _sigmoid(presence) * _clamp(abs(values[3]) / 1.60, 0.0, 1.0)
         for presence, values in zip(
@@ -125,6 +159,7 @@ class LearnedSectionBudgetEvidence:
     learned_preferred_source_hold_beats: int
     learned_top_source_wide_support: float | None
     chorus_wide_anchor_selected: bool
+    dynamic_crop_version: int | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +180,7 @@ class LearnedSectionDirectorResult:
     chorus_section_count: int
     chorus_wide_anchor_allocated_count: int
     chorus_wide_anchor_allocated_section_indices: tuple[int, ...]
+    dynamic_crop_version: int | None
     chorus_wide_anchor_allocation_basis: str = (
         CHORUS_WIDE_ANCHOR_ALLOCATION_BASIS
     )
@@ -158,6 +194,13 @@ class LearnedSectionDirectorResult:
             item.section_index for item in self.section_plan.sections
         ):
             raise ValueError("learned Section Director evidence is misaligned")
+        if self.dynamic_crop_version not in (None, 2, 3):
+            raise ValueError("learned Section Director Dynamic Crop version is invalid")
+        if any(
+            item.dynamic_crop_version != self.dynamic_crop_version
+            for item in self.evidence
+        ):
+            raise ValueError("learned Section Director version evidence is inconsistent")
         if not 0.0 <= self.cut_probability_threshold <= 1.0:
             raise ValueError("learned Section Director threshold is invalid")
         for digest in (
@@ -218,6 +261,7 @@ class LearnedSectionDirectorResult:
             "checkpoint_id": self.checkpoint_id,
             "training_report_path": self.training_report_path,
             "training_report_sha256": self.training_report_sha256,
+            "dynamic_crop_version": self.dynamic_crop_version,
             "cut_probability_threshold": self.cut_probability_threshold,
             "cut_threshold_freeze_sha256": self.cut_threshold_freeze_sha256,
             "chorus_wide_anchor_allocation": {
@@ -252,6 +296,20 @@ def adapt_section_plan_from_stage_edit_heads(
     frames = tuple(head_frames)
     if not frames:
         raise LearnedSectionDirectorError("learned Section Director needs head frames")
+    frame_versions = tuple(
+        3
+        if frame.dynamic_crop_v3_by_source
+        else 2
+        if frame.dynamic_crop_v2 is not None
+        else None
+        for frame in frames
+    )
+    if len(set(frame_versions)) != 1:
+        raise LearnedSectionDirectorError(
+            "Section Director head frames cannot mix legacy, Dynamic Crop v2, "
+            "and Dynamic Crop v3"
+        )
+    dynamic_crop_version = frame_versions[0]
     if isinstance(chorus_wide_anchor_fraction, bool):
         raise LearnedSectionDirectorError("chorus wide-anchor fraction is invalid")
     try:
@@ -443,6 +501,7 @@ def adapt_section_plan_from_stage_edit_heads(
                 learned_preferred_source_hold_beats=hold,
                 learned_top_source_wide_support=wide_support,
                 chorus_wide_anchor_selected=chorus_wide_anchor_selected,
+                dynamic_crop_version=dynamic_crop_version,
             )
         )
 
@@ -469,6 +528,7 @@ def adapt_section_plan_from_stage_edit_heads(
         chorus_wide_anchor_allocated_section_indices=(
             allocated_chorus_indices
         ),
+        dynamic_crop_version=dynamic_crop_version,
     )
 
 

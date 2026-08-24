@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .render import (
     EditorialTransformKeyframe,
@@ -38,13 +38,39 @@ from .visual_score import (
 
 
 STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT = (
-    "exact_eight_stage_edit_visual_hard_gate_materialization_v1"
+    "exact_eight_stage_edit_visual_hard_gate_dynamic_crop_v2_v3_materialization_v2"
 )
 STAGE_EDIT_VISUAL_CANDIDATE_COUNT = 8
 
 
 class StageEditVisualCandidateError(RuntimeError):
     """A generated candidate batch cannot enter rendered-proxy review."""
+
+
+def _retained_dynamic_crop_version(
+    retained: RetainedStageEditCandidate,
+) -> int:
+    versions: set[int] = set()
+    for item in retained.edit.candidate_history:
+        if not isinstance(item, Mapping) or "dynamic_crop_version" not in item:
+            continue
+        value = item["dynamic_crop_version"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in (2, 3)
+        ):
+            raise StageEditVisualCandidateError(
+                "StageEdit candidate history has an invalid Dynamic Crop version"
+            )
+        versions.add(value)
+    if len(versions) > 1:
+        raise StageEditVisualCandidateError(
+            "StageEdit candidate history mixes Dynamic Crop versions"
+        )
+    # Pre-v3 retained candidates did not serialize the version.  Their only
+    # valid interpretation is the legacy v2 path.
+    return next(iter(versions), 2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +95,10 @@ class StageEditVisualCandidateRecord:
     def path_signature(self) -> tuple[str, ...]:
         return self.base_record.path_signature
 
+    @property
+    def dynamic_crop_version(self) -> int:
+        return _retained_dynamic_crop_version(self.retained_candidate)
+
     def to_dict(self) -> dict[str, Any]:
         payload = self.base_record.to_dict()
         payload.update(
@@ -79,6 +109,7 @@ class StageEditVisualCandidateRecord:
                 "stage_edit_candidate_rank": self.retained_candidate.rank,
                 "stage_edit_semimarkov_score": self.retained_candidate.score,
                 "candidate_origin": "explicit_stage_edit_generation",
+                "dynamic_crop_version": self.dynamic_crop_version,
             }
         )
         return payload
@@ -104,6 +135,10 @@ class StageEditMaterializedVisualCandidate:
     @property
     def cadence_profile(self) -> str:
         return self.candidate_record.cadence_profile
+
+    @property
+    def dynamic_crop_version(self) -> int:
+        return _retained_dynamic_crop_version(self.retained_candidate)
 
     @property
     def segments(self) -> tuple[Any, ...]:
@@ -132,6 +167,7 @@ class StageEditMaterializedVisualCandidate:
                 ],
                 "visual_hard_gates_passed": self.candidate_record.review.passed,
                 "visual_review": self.candidate_record.review.to_dict(),
+                "dynamic_crop_version": self.dynamic_crop_version,
             },
         )
 
@@ -142,6 +178,7 @@ class StageEditMaterializedVisualCandidate:
             "cadence_profile": self.cadence_profile,
             "stage_edit_candidate_rank": self.retained_candidate.rank,
             "stage_edit_semimarkov_score": self.retained_candidate.score,
+            "dynamic_crop_version": self.dynamic_crop_version,
             "visual_candidate": self.candidate_record.to_dict(),
             "lineage": list(self.lineage),
         }
@@ -155,10 +192,40 @@ class StageEditVisualCandidateBatch:
     def __post_init__(self) -> None:
         if len(self.candidates) != STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
             raise ValueError("StageEdit visual batch must contain exactly 8 candidates")
+        if any(
+            not isinstance(item, StageEditMaterializedVisualCandidate)
+            for item in self.candidates
+        ):
+            raise TypeError(
+                "StageEdit visual batch requires typed materialized candidates"
+            )
+        if any(
+            not isinstance(item.candidate_record, StageEditVisualCandidateRecord)
+            for item in self.candidates
+        ):
+            raise TypeError(
+                "StageEdit visual batch requires typed candidate records"
+            )
+        if any(
+            not isinstance(item.retained_candidate, RetainedStageEditCandidate)
+            or not isinstance(
+                item.candidate_record.retained_candidate,
+                RetainedStageEditCandidate,
+            )
+            or item.candidate_record.retained_candidate
+            is not item.retained_candidate
+            for item in self.candidates
+        ):
+            raise TypeError(
+                "StageEdit visual batch candidate lineage is not typed and bound"
+            )
         if tuple(item.candidate_index for item in self.candidates) != tuple(range(8)):
             raise ValueError("StageEdit visual candidate indices must be contiguous")
         if any(not item.candidate_record.review.passed for item in self.candidates):
             raise ValueError("StageEdit visual batch cannot retain failed candidates")
+        versions = {item.dynamic_crop_version for item in self.candidates}
+        if len(versions) != 1:
+            raise ValueError("StageEdit visual batch mixes Dynamic Crop versions")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,6 +236,7 @@ class StageEditVisualCandidateBatch:
             "silent_baseline_fallback_allowed": False,
             "required_candidate_count": STAGE_EDIT_VISUAL_CANDIDATE_COUNT,
             "candidate_count": len(self.candidates),
+            "dynamic_crop_version": self.candidates[0].dynamic_crop_version,
             "all_prescribed_paths_passed_visual_hard_gates": all(
                 item.candidate_record.review.passed for item in self.candidates
             ),
@@ -223,11 +291,43 @@ def materialize_stage_edit_visual_candidates(
 
     if not isinstance(bridge_result, StageEditPipelineBridgeResult):
         raise TypeError("bridge_result must be a StageEditPipelineBridgeResult")
+    expected_dynamic_crop_version = getattr(
+        bridge_result.preflight, "dynamic_crop_version", 2
+    )
+    if expected_dynamic_crop_version not in (2, 3):
+        raise StageEditVisualCandidateError(
+            "StageEdit bridge has an invalid Dynamic Crop version"
+        )
+    if getattr(
+        bridge_result.head_materialization,
+        "dynamic_crop_version",
+        expected_dynamic_crop_version,
+    ) != expected_dynamic_crop_version:
+        raise StageEditVisualCandidateError(
+            "StageEdit visual materialization head version differs from preflight"
+        )
+    director = bridge_result.learned_section_director
+    if (
+        director is not None
+        and getattr(director, "dynamic_crop_version", None)
+        != expected_dynamic_crop_version
+    ):
+        raise StageEditVisualCandidateError(
+            "StageEdit visual materialization Section Director version differs"
+        )
     retained = bridge_result.retained_candidates
     if len(retained) != STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
         raise StageEditVisualCandidateError(
             "StageEdit rendered-proxy promotion requires exactly 8 retained "
             f"candidates; got {len(retained)}"
+        )
+    if any(
+        _retained_dynamic_crop_version(candidate)
+        != expected_dynamic_crop_version
+        for candidate in retained
+    ):
+        raise StageEditVisualCandidateError(
+            "StageEdit retained candidate version differs from bridge preflight"
         )
     normalized_sources = tuple(Path(path).expanduser().resolve() for path in sources)
     if len(normalized_sources) != len(bridge_result.preflight.source_ids):
@@ -337,7 +437,10 @@ def materialize_stage_edit_visual_candidate(
     global_record = StageEditVisualCandidateRecord(
         candidate_index=candidate_index,
         review_rank=review_rank,
-        cadence_profile="stage_edit_dynamic_crop_v2_prescribed_visual_gate",
+        cadence_profile=(
+            "stage_edit_dynamic_crop_"
+            f"v{_retained_dynamic_crop_version(candidate)}_prescribed_visual_gate"
+        ),
         base_record=base_record,
         retained_candidate=candidate,
     )
@@ -366,7 +469,7 @@ def _reparameterized_dynamic_crop_track(
         return None
     if original_duration <= 0.0 or target_duration <= 0.0:
         raise StageEditVisualCandidateError(
-            "Dynamic Crop v2 track cannot be applied to a non-positive segment"
+            "Dynamic Crop track cannot be applied to a non-positive segment"
         )
     scale = target_duration / original_duration
     return EditorialTransformTrack(
@@ -400,7 +503,7 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
     baseline editorial-motion heuristic.  The exception is a segment touching
     a verified face dissolve: that transition was hard-gated using its existing
     face-alignment crop, so that reviewed geometry has precedence over an
-    independently inferred Dynamic Crop v2 trajectory on both sides.
+    independently inferred Dynamic Crop trajectory on both sides.
     """
 
     if not isinstance(materialized, StageEditMaterializedVisualCandidate):
@@ -410,7 +513,7 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
     )
     if len(original_segments) != len(render_plan.segments):
         raise StageEditVisualCandidateError(
-            "Dynamic Crop v2 overlay segment count changed"
+            "Dynamic Crop overlay segment count changed"
         )
     face_dissolve_segments: set[int] = set()
     for boundary_index, transition in enumerate(render_plan.transitions):
@@ -422,7 +525,7 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
     ):
         if original.source_index != current.source_index:
             raise StageEditVisualCandidateError(
-                "Dynamic Crop v2 overlay source path changed at segment "
+                "Dynamic Crop overlay source path changed at segment "
                 f"{index}"
             )
         if index in face_dissolve_segments:

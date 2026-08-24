@@ -11,6 +11,9 @@ from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
     DynamicCropHeadPredictionV2,
 )
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropHeadPredictionV3,
+)
 from crosscut.stage_edit_learned_section_director import (
     CONTRACT,
     LearnedSectionDirectorError,
@@ -122,7 +125,143 @@ def _frame(
     )
 
 
+def _crop_v3(
+    *,
+    source_id: str,
+    source_index: int,
+    motion_logit: float,
+    rolls: tuple[float, ...],
+    predicted_count: int,
+) -> DynamicCropHeadPredictionV3:
+    values = tuple(
+        (1.02, 0.5, 0.5, rolls[index] if index < len(rolls) else 0.0)
+        for index in range(8)
+    )
+    count_logits = tuple(
+        4.0 if index == predicted_count - 1 else -4.0 for index in range(8)
+    )
+    return DynamicCropHeadPredictionV3(
+        source_id=source_id,
+        source_index=source_index,
+        values=values,
+        count_logits=count_logits,
+        time_interval_logits=(0.0,) * 35,
+        motion_logit=motion_logit,
+    )
+
+
+def _frame_v3(
+    timestamp: float,
+    *,
+    source_logits: tuple[float, float],
+    source_predictions: tuple[DynamicCropHeadPredictionV3, ...],
+) -> StageEditHeadFrame:
+    return StageEditHeadFrame(
+        master_time_seconds=timestamp,
+        cut_logit=0.0,
+        source_logits=source_logits,
+        duration_logits=(0.0, 0.0, 0.0, 0.0),
+        transition_logits=(1.0, 0.0, 0.0, 0.0),
+        crop=(1.0, 0.5, 0.5, 0.0),
+        available_source_mask=(True, True),
+        hard_source_gate_mask=(True, True),
+        source_shot_sizes=("medium", "wide"),
+        dynamic_crop_v3_by_source=source_predictions,
+    )
+
+
 class LearnedSectionDirectorTests(unittest.TestCase):
+    def test_v3_section_budgets_use_highest_logit_effective_source_exactly(self) -> None:
+        low = _crop_v3(
+            source_id="source-a",
+            source_index=0,
+            motion_logit=-4.0,
+            rolls=(0.0,) * 8,
+            predicted_count=8,
+        )
+        selected = _crop_v3(
+            source_id="source-b",
+            source_index=1,
+            motion_logit=4.0,
+            # Only the first count-selected value is authoritative; large
+            # padded rolls must not manufacture roll support.
+            rolls=(0.0, 1.6, 1.6, 1.6, 1.6, 1.6, 1.6, 1.6),
+            predicted_count=1,
+        )
+        frames = (
+            _frame_v3(
+                0.0,
+                source_logits=(1.0, 5.0),
+                source_predictions=(low, selected),
+            ),
+            _frame_v3(
+                4.0,
+                source_logits=(1.0, 5.0),
+                source_predictions=(low, selected),
+            ),
+        )
+        result = adapt_section_plan_from_stage_edit_heads(
+            _section_plan(),
+            frames,
+            chorus_wide_anchor_fraction=1.0 / 3.0,
+            cut_probability_threshold=0.5,
+            cut_threshold_freeze_sha256="a" * 64,
+            checkpoint_id="checkpoint-v3",
+            training_report_path="/checkpoint/training-report.json",
+            training_report_sha256="b" * 64,
+        )
+        self.assertEqual(result.dynamic_crop_version, 3)
+        self.assertTrue(
+            all(item.dynamic_crop_version == 3 for item in result.evidence)
+        )
+        self.assertGreater(
+            result.evidence[0].mean_dynamic_motion_probability, 0.98
+        )
+        self.assertEqual(result.evidence[0].mean_dynamic_roll_support, 0.0)
+        self.assertEqual(result.to_dict()["dynamic_crop_version"], 3)
+
+    def test_section_director_rejects_mixed_v2_v3_frame_lattice(self) -> None:
+        v3 = _frame_v3(
+            4.0,
+            source_logits=(2.0, 1.0),
+            source_predictions=(
+                _crop_v3(
+                    source_id="source-a",
+                    source_index=0,
+                    motion_logit=0.0,
+                    rolls=(0.0,),
+                    predicted_count=1,
+                ),
+                _crop_v3(
+                    source_id="source-b",
+                    source_index=1,
+                    motion_logit=0.0,
+                    rolls=(0.0,),
+                    predicted_count=1,
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(LearnedSectionDirectorError, "cannot mix"):
+            adapt_section_plan_from_stage_edit_heads(
+                _section_plan(),
+                (
+                    _frame(
+                        0.0,
+                        cut_logit=0.0,
+                        motion_logit=0.0,
+                        roll=0.0,
+                        shot_sizes=("medium", "wide"),
+                    ),
+                    v3,
+                ),
+                chorus_wide_anchor_fraction=1.0 / 3.0,
+                cut_probability_threshold=0.5,
+                cut_threshold_freeze_sha256="a" * 64,
+                checkpoint_id="checkpoint-v3",
+                training_report_path="/checkpoint/training-report.json",
+                training_report_sha256="b" * 64,
+            )
+
     def test_learned_heads_change_section_budgets_before_semimarkov(self) -> None:
         frames = (
             _frame(
@@ -233,8 +372,9 @@ class LearnedSectionDirectorTests(unittest.TestCase):
             training_report_sha256="b" * 64,
         )
 
-        self.assertEqual(result.schema_version, 2)
-        self.assertTrue(result.contract.endswith("_v2"))
+        self.assertEqual(result.schema_version, 3)
+        self.assertTrue(result.contract.endswith("_v3"))
+        self.assertEqual(result.dynamic_crop_version, 2)
         self.assertEqual(result.chorus_section_count, 3)
         self.assertEqual(result.chorus_wide_anchor_allocated_count, 1)
         self.assertEqual(

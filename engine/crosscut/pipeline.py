@@ -140,7 +140,19 @@ from .stage_edit_pipeline_bridge import (
     preflight_stage_edit_pipeline_bridge,
     run_stage_edit_pipeline_bridge,
 )
-from .stage_edit_semimarkov_beam import StageEditSemiMarkovConfig
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
+from .stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+    StageEditSemiMarkovConfig,
+)
+from .stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+)
+from .stage_edit_transformer import stage_edit_readiness_report
 from .stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
 )
@@ -2798,6 +2810,7 @@ def _apply_stage_edit_candidate_render_contract(
 ) -> _GroupRenderCandidateBundle:
     """Preserve the learned camera track after ordinary visual derivation."""
 
+    dynamic_crop_version = materialized.dynamic_crop_version
     plan = apply_stage_edit_dynamic_crop_to_render_plan(
         materialized,
         bundle.render_plan,
@@ -2833,29 +2846,38 @@ def _apply_stage_edit_candidate_render_contract(
     stripped_materialized_lineage, superseded_clock_hashes = (
         _strip_superseded_exact_stage_edit_shot_clocks(materialized.lineage)
     )
-    lineage = stripped_materialized_lineage + (
-        {
-            "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
-            "stage": "dynamic_crop_v2_render_plan_overlay",
-            "ordinary_editorial_motion_discarded": True,
-            "source_path_preserved": True,
-            "timing_reparameterized_segment_indices": list(reparameterized),
-            "verified_face_dissolve_alignment_preserved": True,
-            "dynamic_crop_v2_suppressed_segment_indices": list(
-                face_dissolve_alignment_segments
-            ),
-            "deterministic_render_plan_validation_passed": True,
-            "superseded_candidate_history_exact_shot_clock_sha256": list(
-                superseded_clock_hashes
-            ),
-        },
-    )
+    overlay_event = {
+        "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
+        "stage": f"dynamic_crop_v{dynamic_crop_version}_render_plan_overlay",
+        "dynamic_crop_version": dynamic_crop_version,
+        "dynamic_crop_render_contract": (
+            "stage_edit_dynamic_crop_render_plan_overlay_v2"
+        ),
+        "ordinary_editorial_motion_discarded": True,
+        "source_path_preserved": True,
+        "timing_reparameterized_segment_indices": list(reparameterized),
+        "verified_face_dissolve_alignment_preserved": True,
+        "dynamic_crop_suppressed_segment_indices": list(
+            face_dissolve_alignment_segments
+        ),
+        "deterministic_render_plan_validation_passed": True,
+        "superseded_candidate_history_exact_shot_clock_sha256": list(
+            superseded_clock_hashes
+        ),
+    }
+    if dynamic_crop_version == 2:
+        overlay_event["dynamic_crop_v2_suppressed_segment_indices"] = list(
+            face_dissolve_alignment_segments
+        )
+    lineage = stripped_materialized_lineage + (overlay_event,)
     return replace(
         bundle,
         editorial_motion_plan=None,
         render_plan=plan,
         diagnostics=bundle.diagnostics
-        + ("stage_edit_dynamic_crop_v2_render_contract_applied",),
+        + (
+            f"stage_edit_dynamic_crop_v{dynamic_crop_version}_render_contract_applied",
+        ),
         candidate_origin="explicit_stage_edit_generation",
         candidate_lineage=lineage,
         stage_edit_exact_shot_clock=_stage_edit_exact_shot_clock_from_edit(
@@ -3197,7 +3219,7 @@ def _stage_edit_montage_analysis_payload(
             if bundle.editorial_motion_plan is not None
             else None
         ),
-        # Dynamic Crop v2 is attached directly to RenderSegment after the
+        # Dynamic Crop v2/v3 is attached directly to RenderSegment after the
         # ordinary editorial-motion plan is intentionally discarded.
         "render": {
             "segments": deepcopy(plan_payload["segments"]),
@@ -4600,6 +4622,369 @@ def _stage_edit_proxy_repair_review(
     )
 
 
+def _committed_window_continuity_lineage(
+    repair_result: Any,
+    redecoder: StageEditWindowedBeamRedecoder,
+) -> dict[str, Any]:
+    """Fail closed unless every committed splice retains exact scorer evidence."""
+
+    def finite_number(value: Any, name: str) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise RuntimeError(
+                f"committed windowed continuity {name} is not finite"
+            )
+        return float(value)
+
+    call_by_iteration: dict[int, Mapping[str, Any]] = {}
+    for raw_call in redecoder.audit_payload().get("calls", ()):
+        if not isinstance(raw_call, Mapping):
+            raise RuntimeError("windowed re-decode call audit is malformed")
+        iteration = raw_call.get("iteration")
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or iteration < 1
+            or iteration in call_by_iteration
+        ):
+            raise RuntimeError("windowed re-decode call iteration is invalid")
+        call_by_iteration[iteration] = raw_call
+
+    identity_fields = (
+        "continuity_authority",
+        "continuity_scorer_contract",
+        "continuity_scorer_fingerprint",
+    )
+    committed_evaluations: list[dict[str, Any]] = []
+    committed_identities: set[tuple[str, str, str]] = set()
+    for iteration_audit in repair_result.audit.iterations:
+        committed_id = iteration_audit.committed_proposal_id
+        if committed_id is None:
+            continue
+        committed_records = tuple(
+            record
+            for record in iteration_audit.proposal_audits
+            if record.get("committed") is True
+        )
+        if (
+            len(committed_records) != 1
+            or committed_records[0].get("proposal_id") != committed_id
+        ):
+            raise RuntimeError(
+                "committed windowed repair proposal audit is ambiguous"
+            )
+        call_audit = call_by_iteration.get(iteration_audit.iteration)
+        if call_audit is None:
+            raise RuntimeError(
+                "committed windowed repair lacks its decoder call audit"
+            )
+        record = committed_records[0]
+        proposal_audit = record.get("decoder_audit")
+        if not isinstance(proposal_audit, Mapping):
+            raise RuntimeError(
+                "committed windowed repair lacks proposal decoder evidence"
+            )
+        identity_values: list[str] = []
+        for field_name in identity_fields:
+            value = proposal_audit.get(field_name)
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(
+                    "committed windowed repair continuity identity is missing"
+                )
+            if value != call_audit.get(field_name):
+                raise RuntimeError(
+                    "committed windowed repair continuity identity changed"
+                )
+            identity_values.append(value)
+        authority, scorer_contract, scorer_fingerprint = identity_values
+        if (
+            len(scorer_fingerprint) != 64
+            or any(value not in "0123456789abcdef" for value in scorer_fingerprint)
+        ):
+            raise RuntimeError(
+                "committed windowed repair scorer fingerprint is invalid"
+            )
+        learned_bound = proposal_audit.get(
+            "learned_source_pair_scorer_bound"
+        )
+        expected_learned_bound = (
+            authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        )
+        if authority not in {
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+        }:
+            raise RuntimeError(
+                "committed windowed repair continuity authority is unsupported"
+            )
+        if (
+            learned_bound is not expected_learned_bound
+            or call_audit.get("learned_source_pair_scorer_bound")
+            is not expected_learned_bound
+        ):
+            raise RuntimeError(
+                "committed windowed repair scorer binding is untruthful"
+            )
+        expected_contract = (
+            STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+            if expected_learned_bound
+            else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+        )
+        if scorer_contract != expected_contract:
+            raise RuntimeError(
+                "committed windowed repair scorer contract conflicts with authority"
+            )
+        if (
+            not expected_learned_bound
+            and scorer_fingerprint
+            != HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+        ):
+            raise RuntimeError(
+                "committed handcrafted continuity fingerprint changed"
+            )
+
+        exterior = proposal_audit.get("exterior_splice_continuity")
+        if not isinstance(exterior, Mapping):
+            raise RuntimeError(
+                "committed windowed repair lacks exterior continuity evidence"
+            )
+        if exterior.get("learned_source_pair_scorer_bound") is not (
+            expected_learned_bound
+        ):
+            raise RuntimeError(
+                "committed exterior continuity scorer binding changed"
+            )
+        if any(
+            exterior.get(name) != value
+            for name, value in zip(
+                identity_fields,
+                identity_values,
+                strict=True,
+            )
+        ):
+            raise RuntimeError(
+                "committed exterior continuity identity changed"
+            )
+        request_payload = iteration_audit.request
+        expected_sides = tuple(
+            side
+            for side, context_field in (
+                ("left", "left_context_decision_id"),
+                ("right", "right_context_decision_id"),
+            )
+            if request_payload.get(context_field) is not None
+        )
+        edges = exterior.get("edges")
+        if not isinstance(edges, (list, tuple)) or any(
+            not isinstance(edge, Mapping) for edge in edges
+        ):
+            raise RuntimeError(
+                "committed exterior continuity edges are malformed"
+            )
+        expected_edge_count = exterior.get("expected_edge_count")
+        evaluated_edge_count = exterior.get("evaluated_edge_count")
+        if (
+            exterior.get("full_edit_validation_passed") is not True
+            or expected_edge_count != len(expected_sides)
+            or evaluated_edge_count != expected_edge_count
+            or len(edges) != expected_edge_count
+            or tuple(edge.get("side") for edge in edges) != expected_sides
+        ):
+            raise RuntimeError(
+                "committed exterior continuity did not validate every splice edge"
+            )
+        raw_total = 0.0
+        weighted_total = 0.0
+        for edge in edges:
+            if edge.get("authority_rule_evaluated") is not True:
+                raise RuntimeError(
+                    "committed exterior continuity edge was not evaluated"
+                )
+            if any(
+                edge.get(name) != value
+                for name, value in zip(
+                    identity_fields,
+                    identity_values,
+                    strict=True,
+                )
+            ):
+                raise RuntimeError(
+                    "committed exterior edge scorer identity changed"
+                )
+            scorer_evaluated = edge.get("scorer_evaluated")
+            if (
+                edge.get("cross_derivative_family") is not True
+                or edge.get("learned_source_pair_scorer_bound") is not (
+                    expected_learned_bound
+                )
+                or not isinstance(scorer_evaluated, bool)
+                or edge.get("scorer_invoked") is not scorer_evaluated
+                or (expected_learned_bound and not scorer_evaluated)
+                or (
+                    not scorer_evaluated
+                    and edge.get("neutral_reason")
+                    != "handcrafted_missing_observation_neutral"
+                )
+            ):
+                raise RuntimeError(
+                    "committed exterior edge scorer evaluation is untruthful"
+                )
+            raw_score = finite_number(edge.get("raw_score"), "raw score")
+            weight = finite_number(edge.get("weight"), "score weight")
+            weighted_score = finite_number(
+                edge.get("weighted_score"),
+                "weighted score",
+            )
+            if (
+                not -1.0 <= raw_score <= 0.0
+                or weight < 0.0
+                or not math.isclose(
+                    weighted_score,
+                    raw_score * weight,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise RuntimeError(
+                    "committed exterior continuity score is outside its contract"
+                )
+            raw_total += raw_score
+            weighted_total += weighted_score
+        reported_raw_total = finite_number(
+            exterior.get("raw_score_total"),
+            "raw score total",
+        )
+        reported_weighted_total = finite_number(
+            exterior.get("weighted_score_total"),
+            "weighted score total",
+        )
+        if (
+            not math.isclose(
+                raw_total,
+                reported_raw_total,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                weighted_total,
+                reported_weighted_total,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise RuntimeError(
+                "committed exterior continuity totals are inconsistent"
+            )
+        decoder_score = finite_number(
+            proposal_audit.get("decoder_timeline_score"),
+            "decoder timeline score",
+        )
+        selection_score = finite_number(
+            proposal_audit.get("candidate_selection_score"),
+            "candidate selection score",
+        )
+        if (
+            proposal_audit.get(
+                "exterior_score_applied_to_candidate_selection"
+            )
+            is not True
+            or proposal_audit.get(
+                "full_edit_exterior_continuity_rechecked"
+            )
+            is not True
+            or not math.isclose(
+                selection_score,
+                decoder_score + weighted_total,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise RuntimeError(
+                "committed exterior continuity was not applied to selection"
+            )
+        committed_identities.add(
+            (authority, scorer_contract, scorer_fingerprint)
+        )
+        committed_evaluations.append(
+            {
+                "iteration": iteration_audit.iteration,
+                "proposal_id": committed_id,
+                "base_edit_sha256": request_payload.get("base_edit_sha256"),
+                "committed_edit_sha256": iteration_audit.committed_edit_sha256,
+                "decoder_timeline_rank": proposal_audit.get(
+                    "decoder_timeline_rank"
+                ),
+                "candidate_selection_rank": proposal_audit.get(
+                    "candidate_selection_rank"
+                ),
+                "candidate_selection_score": selection_score,
+                "exterior_splice_continuity": deepcopy(dict(exterior)),
+            }
+        )
+    if (
+        len(committed_evaluations)
+        != repair_result.audit.committed_iteration_count
+        or not committed_evaluations
+        or len(committed_identities) != 1
+    ):
+        raise RuntimeError(
+            "committed windowed repair continuity lineage is incomplete or mixed"
+        )
+    authority, scorer_contract, scorer_fingerprint = next(
+        iter(committed_identities)
+    )
+    return {
+        "continuity_authority": authority,
+        "continuity_scorer_contract": scorer_contract,
+        "continuity_scorer_fingerprint": scorer_fingerprint,
+        "continuity_provenance_owner": "committed_window_semimarkov_redecode",
+        "initial_decode_continuity_provenance_authoritative_for_repaired_edges": False,
+        "committed_window_exterior_continuity_evaluations": committed_evaluations,
+    }
+
+
+def _committed_repair_dynamic_crop_version(
+    proposal_lineage: Sequence[Mapping[str, Any]],
+    bridge_result: StageEditPipelineBridgeResult,
+) -> int:
+    """Bind repaired lineage to the exact bridge model generation."""
+
+    expected_version = bridge_result.preflight.dynamic_crop_version
+    versions: set[int] = set()
+    for item in proposal_lineage:
+        if not isinstance(item, Mapping):
+            raise RuntimeError(
+                "accepted StageEdit repair lineage contains a malformed event"
+            )
+        if "dynamic_crop_version" not in item:
+            continue
+        value = item["dynamic_crop_version"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in (2, 3)
+        ):
+            raise RuntimeError(
+                "accepted StageEdit repair lineage has an invalid Dynamic Crop version"
+            )
+        versions.add(value)
+    if not versions:
+        if expected_version == 2:
+            # Pre-v3 v2 lineage did not always serialize its model generation.
+            return 2
+        raise RuntimeError(
+            "accepted Dynamic Crop v3 repair lineage omitted its model version"
+        )
+    if versions != {expected_version}:
+        raise RuntimeError(
+            "accepted StageEdit repair lineage differs from the bridge Dynamic Crop version"
+        )
+    return expected_version
+
+
 def _attempt_stage_edit_windowed_beam_reedit(
     selected_bundle: _GroupRenderCandidateBundle,
     selected_materialized: StageEditMaterializedVisualCandidate,
@@ -5002,6 +5387,14 @@ def _attempt_stage_edit_windowed_beam_reedit(
             "accepted windowed StageEdit repair exact shot clock is stale or "
             "does not match the final repaired source path"
         )
+    committed_continuity_lineage = _committed_window_continuity_lineage(
+        repair_result,
+        redecoder,
+    )
+    proposal_dynamic_crop_version = _committed_repair_dynamic_crop_version(
+        proposal_lineage,
+        bridge_result,
+    )
     suppressed_dynamic_crop_indices = tuple(
         sorted(
             {
@@ -5009,8 +5402,11 @@ def _attempt_stage_edit_windowed_beam_reedit(
                 for item in proposal_lineage
                 for raw_values in (
                     item.get(
-                        "dynamic_crop_v2_suppressed_segment_indices",
-                        (),
+                        "dynamic_crop_suppressed_segment_indices",
+                        item.get(
+                            "dynamic_crop_v2_suppressed_segment_indices",
+                            (),
+                        ),
                     ),
                 )
                 for value in (
@@ -5072,7 +5468,8 @@ def _attempt_stage_edit_windowed_beam_reedit(
                 "substituted_target_boundary_indices"
             ]
         ),
-        "dynamic_crop_v2_suppressed_segment_indices": list(
+        "dynamic_crop_version": proposal_dynamic_crop_version,
+        "dynamic_crop_suppressed_segment_indices": list(
             suppressed_dynamic_crop_indices
         ),
         "proposal_materialization_lineage_preserved": True,
@@ -5080,7 +5477,12 @@ def _attempt_stage_edit_windowed_beam_reedit(
         "superseded_exact_shot_clock_sha256": list(
             superseded_exact_clock_hashes
         ),
+        **committed_continuity_lineage,
     }
+    if proposal_dynamic_crop_version == 2:
+        selected_redecode_evidence[
+            "dynamic_crop_v2_suppressed_segment_indices"
+        ] = list(suppressed_dynamic_crop_indices)
     lineage_event = {
         "stage": "reviewer_issue_window_actual_semimarkov_redecode",
         "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
@@ -5263,10 +5665,28 @@ def _load_stage_edit_generation_preflight(
         raise RuntimeError(
             "StageEdit generation checkpoint requires feature snapshot and source ids"
         )
+    readiness = stage_edit_readiness_report(checkpoint)
+    dynamic_crop_version = getattr(readiness, "dynamic_crop_version", None)
+    if (
+        isinstance(dynamic_crop_version, bool)
+        or not isinstance(dynamic_crop_version, int)
+        or dynamic_crop_version not in (2, 3)
+    ):
+        raise RuntimeError(
+            "explicit StageEdit generation checkpoint has an unsupported "
+            "Dynamic Crop version"
+        )
+    # The three-field advanced request predates learned source-pair authority
+    # and carries none of its immutable scorer identities.  It can honestly
+    # route either checkpoint generation only under handcrafted continuity;
+    # production learned continuity remains registry-only until the request
+    # schema can bind the full scorer identity.
     return preflight_stage_edit_pipeline_bridge(
         feature_snapshot_path=snapshot,
         checkpoint_directory=checkpoint,
         source_ids=source_ids,
+        dynamic_crop_version=dynamic_crop_version,
+        continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
     )
 
 
@@ -5360,11 +5780,114 @@ def _load_stage_edit_montage_policy(
     return policy
 
 
+def _registered_stage_edit_bridge_kwargs(
+    bundle: RegisteredStageEditProductionBundle,
+) -> dict[str, Any]:
+    """Resolve one registry version/continuity identity without fallback."""
+
+    version = getattr(bundle, "dynamic_crop_version", 2)
+    authority = getattr(bundle, "continuity_authority", None)
+    if version == 2:
+        if authority is not None:
+            raise RuntimeError(
+                "registered Dynamic Crop v2 bundle cannot declare a continuity authority"
+            )
+        return {
+            "dynamic_crop_version": 2,
+            "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+        }
+    if version != 3 or authority not in {
+        HANDCRAFTED_CONTINUITY_AUTHORITY,
+        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    }:
+        raise RuntimeError(
+            "registered StageEdit bundle has an unsupported Dynamic Crop/continuity identity"
+        )
+    resolved: dict[str, Any] = {
+        "dynamic_crop_version": 3,
+        "continuity_authority": authority,
+    }
+    pair_fields = {
+        "source_pair_scorer_path": getattr(
+            bundle, "source_pair_scorer_path", None
+        ),
+        "source_pair_scorer_file_sha256": getattr(
+            bundle, "source_pair_scorer_file_sha256", None
+        ),
+        "source_pair_scorer_fingerprint": getattr(
+            bundle, "source_pair_scorer_fingerprint", None
+        ),
+        "source_pair_checkpoint_sha256": getattr(
+            bundle, "source_pair_checkpoint_sha256", None
+        ),
+        "source_pair_corpus_sha256": getattr(
+            bundle, "source_pair_corpus_sha256", None
+        ),
+    }
+    if authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if any(value is None for value in pair_fields.values()):
+            raise RuntimeError(
+                "registered learned continuity authority lacks an exact "
+                "source-pair scorer identity"
+            )
+        resolved.update(pair_fields)
+    elif any(value is not None for value in pair_fields.values()):
+        raise RuntimeError(
+            "registered handcrafted continuity authority unexpectedly binds a source-pair scorer"
+        )
+    return resolved
+
+
+def _stage_edit_continuity_config_identity(
+    *,
+    registered_bundle: RegisteredStageEditProductionBundle | None,
+    explicit_preflight: StageEditPipelineBridgePreflight | None,
+) -> tuple[str, str, str]:
+    if registered_bundle is not None:
+        activation = _registered_stage_edit_bridge_kwargs(registered_bundle)
+        authority = activation["continuity_authority"]
+        fingerprint = (
+            activation["source_pair_scorer_fingerprint"]
+            if authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+        )
+    elif explicit_preflight is not None:
+        authority = getattr(
+            explicit_preflight,
+            "continuity_authority",
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+        )
+        observed_fingerprint = getattr(
+            explicit_preflight,
+            "source_pair_scorer_fingerprint",
+            None,
+        )
+        fingerprint = (
+            observed_fingerprint
+            if observed_fingerprint is not None
+            else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+        )
+    else:
+        authority = HANDCRAFTED_CONTINUITY_AUTHORITY
+        fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+    contract = (
+        STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+        if authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+    )
+    return authority, contract, fingerprint
+
+
 def _stage_edit_semimarkov_config_from_montage_policy(
     policy: ProfessionalMontagePolicy,
     *,
     minimum_unique_sources: int = 3,
     maximum_source_occupancy_fraction: float = 0.60,
+    continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY,
+    continuity_scorer_contract: str = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    continuity_scorer_fingerprint: str = (
+        HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+    ),
 ) -> StageEditSemiMarkovConfig:
     product = policy.product_editorial_requirements
     return StageEditSemiMarkovConfig(
@@ -5412,6 +5935,9 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         highlight_minimum_post_burst_formation_resets=(
             product.minimum_post_burst_formation_evidenced_wide_reset_count
         ),
+        continuity_authority=continuity_authority,
+        continuity_scorer_contract=continuity_scorer_contract,
+        continuity_scorer_fingerprint=continuity_scorer_fingerprint,
     )
 
 
@@ -5483,6 +6009,7 @@ def _materialize_registered_stage_edit_preflight(
         feature_snapshot_path=materialized.snapshot_path,
         checkpoint_directory=bundle.checkpoint_directory,
         source_ids=materialized.source_ids,
+        **_registered_stage_edit_bridge_kwargs(bundle),
     )
     if preflight.readiness.checkpoint_path != str(bundle.checkpoint_directory):
         raise RuntimeError(
@@ -5578,6 +6105,14 @@ def analyze(
         registered_bundle=registered_stage_edit_bundle,
         explicit_preflight=stage_edit_generation_preflight,
     )
+    (
+        stage_edit_continuity_authority,
+        stage_edit_continuity_scorer_contract,
+        stage_edit_continuity_scorer_fingerprint,
+    ) = _stage_edit_continuity_config_identity(
+        registered_bundle=registered_stage_edit_bundle,
+        explicit_preflight=stage_edit_generation_preflight,
+    )
     stage_edit_semimarkov_config = (
         _stage_edit_semimarkov_config_from_montage_policy(
             stage_edit_montage_policy,
@@ -5592,6 +6127,13 @@ def analyze(
                 if request.source_mode is SourceMode.AUTOMATIC
                 and request.edit_mode is EditMode.GROUP
                 else 0.60
+            ),
+            continuity_authority=stage_edit_continuity_authority,
+            continuity_scorer_contract=(
+                stage_edit_continuity_scorer_contract
+            ),
+            continuity_scorer_fingerprint=(
+                stage_edit_continuity_scorer_fingerprint
             ),
         )
         if stage_edit_montage_policy is not None
@@ -5623,10 +6165,23 @@ def analyze(
             f"{learned_reviewer_session.evidence['bundle_sha256'][:12]}"
         )
     if stage_edit_generation_preflight is not None:
+        preflight_dynamic_crop_version = getattr(
+            stage_edit_generation_preflight, "dynamic_crop_version", 2
+        )
+        preflight_continuity_authority = getattr(
+            stage_edit_generation_preflight,
+            "continuity_authority",
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+        )
         reporter.log(
-            "StageEdit Dynamic Crop v2 후보 생성을 명시적으로 활성화 · "
+            "StageEdit Dynamic Crop "
+            f"v{preflight_dynamic_crop_version} "
+            "후보 생성을 명시적으로 활성화 · "
             f"snapshot {stage_edit_generation_preflight.snapshot.snapshot_sha256[:12]} "
             f"· source {len(stage_edit_generation_preflight.source_ids)}개 · "
+            "continuity "
+            f"{preflight_continuity_authority} "
+            "· "
             "후보 8개 전수 시각·프록시 QA 통과 전에는 렌더 승격 없음"
         )
     if stage_edit_montage_policy is not None:
@@ -5638,7 +6193,9 @@ def analyze(
         )
     if registered_stage_edit_bundle is not None:
         reporter.log(
-            "등록된 production StageEdit Dynamic Crop v2 자동 활성화 · "
+            "등록된 production StageEdit Dynamic Crop "
+            f"v{getattr(registered_stage_edit_bundle, 'dynamic_crop_version', 2)} "
+            "자동 활성화 · "
             f"checkpoint {registered_stage_edit_bundle.checkpoint_id} · "
             f"registry {registered_stage_edit_bundle.registry_sha256[:12]} · "
             "현재 동기화 원본에서 feature snapshot을 새로 생성한 뒤 "
@@ -6252,6 +6809,9 @@ def analyze(
                 f"{stage_edit_inference_snapshot_result.snapshot.snapshot_sha256[:12]}"
             )
         if stage_edit_generation_preflight is not None:
+            preflight_dynamic_crop_version = getattr(
+                stage_edit_generation_preflight, "dynamic_crop_version", 2
+            )
             if section_plan is None:
                 raise RuntimeError(
                     "StageEdit generation requires a completed section plan"
@@ -6271,7 +6831,9 @@ def analyze(
                     "source to pass the current synchronization hard gate"
                 )
             reporter.status(
-                "Dynamic Crop v2 Transformer 헤드를 semi-Markov 후보로 "
+                "Dynamic Crop "
+                f"v{preflight_dynamic_crop_version} "
+                "Transformer 헤드를 semi-Markov 후보로 "
                 "디코딩하는 중…"
             )
             generation_width, generation_height = output_size(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -11,6 +12,7 @@ from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
     _GroupRenderCandidateBundle,
     _attempt_stage_edit_windowed_beam_reedit,
+    _committed_repair_dynamic_crop_version,
     _stage_edit_montage_analysis_payload,
     _stage_edit_perceptual_repair_targets,
     _stage_edit_exact_shot_clock_from_edit,
@@ -27,9 +29,19 @@ from crosscut.rendered_montage_grammar_review import (
 from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
     DynamicCropHeadPredictionV2,
 )
+from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
+from crosscut.stage_edit_head_materializer import (
+    StageEditHeadMaterializationResult,
+)
 from crosscut.stage_edit_pipeline_bridge import (
+    STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
     RetainedStageEditCandidate,
+    StageEditPipelineBridgePreflight,
     StageEditPipelineBridgeResult,
+)
+from crosscut.stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
 from crosscut.stage_edit_repair_loop import (
     StageEditRepairExclusions,
@@ -38,8 +50,26 @@ from crosscut.stage_edit_repair_loop import (
     StageEditRepairWindow,
 )
 from crosscut.stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
     StageEditSemiMarkovConfig,
+    StageEditSemiMarkovResult,
+    StageEditSourceContinuity,
     decode_stage_edit_semimarkov_beam,
+)
+from crosscut.stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+    StageEditSourcePairScorer,
+    StageEditSourcePairTrainingResult,
+    new_stage_edit_source_pair_checkpoint,
+    save_stage_edit_source_pair_checkpoint,
+)
+from crosscut.stage_edit_transformer import (
+    DEFAULT_STAGE_EDIT_SCHEMA,
+    SourceCandidateToken,
+    StageEditReadinessReport,
+    StageEditSequence,
+    StageEditToken,
 )
 from crosscut.stage_edit_windowed_beam_redecode import (
     STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
@@ -55,6 +85,7 @@ from engine.tests.test_stage_edit_semimarkov_beam import (
     _metadata,
     _plan,
     _ready_report,
+    _single_feature_scorer,
     _sources,
 )
 
@@ -83,6 +114,27 @@ def _dynamic_prediction() -> DynamicCropHeadPredictionV2:
             -20.0,
         ),
         motion_logit=20.0,
+    )
+
+
+def _splice_continuity_observation(high: bool) -> StageEditSourceContinuity:
+    scale = 0.80 if high else 0.20
+    center = 0.90 if high else 0.10
+    value = 1.0 if high else 0.0
+    return StageEditSourceContinuity(
+        face_scale=scale,
+        face_center_x=center,
+        face_center_y=center,
+        body_center_x=center,
+        body_center_y=center,
+        camera_motion_x=value,
+        camera_motion_y=value,
+        pose_motion=value,
+        camera_zoom_velocity=value,
+        camera_roll_normalized=value,
+        exposure=value,
+        color_temperature_normalized=value,
+        sharpness=value,
     )
 
 
@@ -123,7 +175,279 @@ def _perceptual_review_fields(
     }
 
 
+def _typed_snapshot(
+    source_ids: tuple[str, ...],
+    master_times_seconds: tuple[float, ...] = (0.0,),
+) -> StageEditFeatureSnapshot:
+    schema = DEFAULT_STAGE_EDIT_SCHEMA
+    candidates = tuple(
+        SourceCandidateToken(
+            source_id=source_id,
+            features=(0.1 + index * 0.01,) * schema.raw_source_dimension,
+            missing_mask=(False,) * schema.raw_source_dimension,
+            available=True,
+            hard_gate_passed=True,
+        )
+        for index, source_id in enumerate(source_ids)
+    )
+    sequence = StageEditSequence(
+        "ive:windowed-redecode",
+        tuple(
+            StageEditToken(
+                master_time_seconds=master_time_seconds,
+                music_features=(0.1,) * len(schema.music_feature_names),
+                section_features=(0.2,) * len(schema.section_feature_names),
+                source_candidates=candidates,
+                recent_edit_features=(0.0,)
+                * len(schema.recent_edit_feature_names),
+                style_features=(0.0,) * len(schema.style_feature_names),
+                missing_mask=(False,) * schema.raw_context_dimension,
+            )
+            for master_time_seconds in master_times_seconds
+        ),
+    )
+    return StageEditFeatureSnapshot.build(sequence)
+
+
+def _typed_readiness(
+    checkpoint: Path,
+    dynamic_crop_version: int,
+) -> StageEditReadinessReport:
+    return StageEditReadinessReport(
+        architecture_available=True,
+        learned_inference_ready=True,
+        status="production_checkpoint_ready",
+        reason="typed windowed-redecode fixture",
+        mlx_version="test",
+        checkpoint_path=str(checkpoint.resolve()),
+        training_steps=100,
+        checkpoint_format=f"dynamic_crop_v{dynamic_crop_version}",
+        dynamic_crop_version=dynamic_crop_version,
+        checkpoint_metadata_filename=(
+            f"dynamic-crop-v{dynamic_crop_version}-metadata.json"
+        ),
+    )
+
+
+def _saved_source_pair_evidence(
+    directory: Path,
+    scorer: StageEditSourcePairScorer,
+) -> dict[str, object]:
+    corpus_sha256 = "c" * 64
+    training = StageEditSourcePairTrainingResult(
+        scorer=scorer,
+        training_steps=1,
+        reference_count=1,
+        group_count=1,
+        initial_loss=0.0,
+        final_loss=0.0,
+        margin=0.0,
+        corpus_sha256=corpus_sha256,
+    )
+    checkpoint = new_stage_edit_source_pair_checkpoint(
+        "windowed-redecode-source-pair",
+        training,
+        created_at="2026-08-24T12:00:00+09:00",
+    )
+    path = save_stage_edit_source_pair_checkpoint(directory, checkpoint)
+    return {
+        "source_pair_scorer": scorer,
+        "source_pair_scorer_path": path,
+        "source_pair_scorer_file_sha256": hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest(),
+        "source_pair_scorer_fingerprint": scorer.fingerprint,
+        "source_pair_checkpoint_sha256": checkpoint.checkpoint_sha256,
+        "source_pair_corpus_sha256": corpus_sha256,
+    }
+
+
+def _typed_bridge_result(
+    *,
+    source_ids: tuple[str, ...],
+    checkpoint_directory: Path,
+    frames: tuple[object, ...],
+    semimarkov: StageEditSemiMarkovResult,
+    retained_candidates: tuple[RetainedStageEditCandidate, ...],
+    dynamic_crop_version: int = 2,
+    continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY,
+    source_pair_evidence: dict[str, object] | None = None,
+) -> StageEditPipelineBridgeResult:
+    readiness = _typed_readiness(
+        checkpoint_directory,
+        dynamic_crop_version,
+    )
+    pair_kwargs = source_pair_evidence or {}
+    with patch(
+        "crosscut.stage_edit_pipeline_bridge.stage_edit_readiness_report",
+        return_value=readiness,
+    ):
+        preflight = StageEditPipelineBridgePreflight(
+            snapshot_path=Path("/tmp/stageedit-windowed-snapshot.json"),
+            checkpoint_directory=checkpoint_directory.resolve(),
+            source_ids=source_ids,
+            snapshot=_typed_snapshot(
+                source_ids,
+                tuple(frame.master_time_seconds for frame in frames),
+            ),
+            readiness=readiness,
+            dynamic_crop_version=dynamic_crop_version,
+            continuity_authority=continuity_authority,
+            **pair_kwargs,
+        )
+        retained = tuple(
+            replace(
+                item,
+                edit=replace(
+                    item.edit,
+                    candidate_history=(
+                        *item.edit.candidate_history,
+                        {
+                            "bridge": STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+                            "dynamic_crop_version": dynamic_crop_version,
+                            "continuity_authority": continuity_authority,
+                        },
+                    ),
+                ),
+            )
+            for item in retained_candidates
+        )
+        scorer = preflight.source_pair_scorer
+        digest = "a" * 64
+        head_materialization = StageEditHeadMaterializationResult(
+            frames=frames,
+            sequence_id="ive:windowed-redecode",
+            canonical_source_ids=source_ids,
+            checkpoint_directory=str(checkpoint_directory.resolve()),
+            checkpoint_id="typed-windowed-redecode-checkpoint",
+            training_steps=readiness.training_steps,
+            metadata_sha256=digest,
+            weights_sha256=digest,
+            supplied_sequence_sha256=digest,
+            input_sequence_sha256=digest,
+            output_frames_sha256=digest,
+            token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+            dynamic_crop_config_fingerprint=digest,
+            readiness=readiness,
+            decision_history_input_contract={"contract_sha256": digest},
+            checkpoint_format=f"dynamic_crop_v{dynamic_crop_version}",
+            dynamic_crop_version=dynamic_crop_version,
+            checkpoint_metadata_filename=(
+                f"dynamic-crop-v{dynamic_crop_version}-metadata.json"
+            ),
+        )
+        return StageEditPipelineBridgeResult(
+            preflight=preflight,
+            head_materialization=head_materialization,
+            semimarkov=semimarkov,
+            retained_candidates=retained,
+            selection_policy={
+                "visual_baseline_replaced": False,
+                "selected_for_render": False,
+                "dynamic_crop_version": dynamic_crop_version,
+                "continuity_authority": continuity_authority,
+                "continuity_scorer_contract": (
+                    scorer.contract
+                    if scorer is not None
+                    else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+                ),
+                "continuity_scorer_fingerprint": (
+                    preflight.source_pair_scorer_fingerprint
+                    if preflight.source_pair_scorer_fingerprint is not None
+                    else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+                ),
+            },
+        )
+
+
 class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_repaired_lineage_is_cross_bound_to_bridge_dynamic_crop_version(
+        self,
+        _readiness,
+    ) -> None:
+        duration = 8
+        source_count = 4
+        sources = _sources(source_count, float(duration))
+        frames = _frames(duration, source_count)
+        config = StageEditSemiMarkovConfig(
+            beam_width=16,
+            timeline_count=8,
+            minimum_unique_sources=3,
+            maximum_source_occupancy_fraction=0.75,
+            enforce_montage_grammar=False,
+        )
+        decoded = decode_stage_edit_semimarkov_beam(
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            sources=sources,
+            source_metadata=_metadata(source_count, float(duration)),
+            head_frames=frames,
+            section_plan=_plan(duration),
+            output=Path("/tmp/stageedit-version-lineage.mp4"),
+            config=config,
+            fps=30.0,
+        )
+        retained = tuple(
+            RetainedStageEditCandidate(
+                rank=timeline.rank,
+                score=timeline.score,
+                edit=timeline.edit,
+                exact_clock_reprojected=True,
+                timewarped_segment_count=0,
+            )
+            for timeline in decoded.timelines
+        )
+        source_ids = tuple(
+            f"source-{index}" for index in range(source_count)
+        )
+        v3_bridge = _typed_bridge_result(
+            source_ids=source_ids,
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
+            semimarkov=decoded,
+            retained_candidates=retained,
+            dynamic_crop_version=3,
+        )
+        valid_v3_lineage = tuple(
+            v3_bridge.retained_candidates[0].edit.candidate_history
+        )
+        self.assertEqual(
+            3,
+            _committed_repair_dynamic_crop_version(
+                valid_v3_lineage,
+                v3_bridge,
+            ),
+        )
+        for lineage, reason in (
+            (({"stage": "version-was-lost"},), "omitted its model version"),
+            (({"dynamic_crop_version": 2},), "differs from the bridge"),
+        ):
+            with self.subTest(lineage=lineage):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    _committed_repair_dynamic_crop_version(
+                        lineage,
+                        v3_bridge,
+                    )
+
+        v2_bridge = _typed_bridge_result(
+            source_ids=source_ids,
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
+            semimarkov=decoded,
+            retained_candidates=retained,
+            dynamic_crop_version=2,
+        )
+        self.assertEqual(
+            2,
+            _committed_repair_dynamic_crop_version(
+                ({"stage": "legacy-v2-lineage"},),
+                v2_bridge,
+            ),
+        )
+
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
         return_value=_ready_report(),
@@ -163,7 +487,7 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
             config=config,
             fps=30.0,
         )
-        retained = tuple(
+        raw_retained = tuple(
             RetainedStageEditCandidate(
                 rank=timeline.rank,
                 score=timeline.score,
@@ -173,19 +497,16 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
             )
             for timeline in decoded.timelines
         )
-        bridge = StageEditPipelineBridgeResult(
-            preflight=SimpleNamespace(
-                source_ids=tuple(f"source-{index}" for index in range(source_count)),
-                checkpoint_directory=Path("/tmp/stageedit-production"),
+        bridge = _typed_bridge_result(
+            source_ids=tuple(
+                f"source-{index}" for index in range(source_count)
             ),
-            head_materialization=SimpleNamespace(frames=frames),
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
             semimarkov=decoded,
-            retained_candidates=retained,
-            selection_policy={
-                "visual_baseline_replaced": False,
-                "selected_for_render": False,
-            },
+            retained_candidates=raw_retained,
         )
+        retained = bridge.retained_candidates
         base = retained[0].edit
         self.assertGreaterEqual(len(base.shots), 3)
         start_shot = 1
@@ -258,6 +579,43 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
         proposal = proposals[0]
         self.assertTrue(proposal.audit["actual_public_decoder_invoked"])
         self.assertTrue(proposal.audit["exact_source_clock_reprojected"])
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            proposal.audit["continuity_authority"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            proposal.audit["continuity_scorer_contract"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            proposal.audit["continuity_scorer_fingerprint"],
+        )
+        exterior = proposal.audit["exterior_splice_continuity"]
+        self.assertEqual(2, exterior["expected_edge_count"])
+        self.assertEqual(2, exterior["evaluated_edge_count"])
+        self.assertTrue(exterior["full_edit_validation_passed"])
+        self.assertEqual(
+            ["left", "right"],
+            [edge["side"] for edge in exterior["edges"]],
+        )
+        self.assertTrue(
+            all(
+                edge["authority_rule_evaluated"]
+                and -1.0 <= edge["raw_score"] <= 0.0
+                and edge["continuity_scorer_fingerprint"]
+                == HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+                for edge in exterior["edges"]
+            )
+        )
+        self.assertAlmostEqual(
+            proposal.audit["candidate_selection_score"],
+            proposal.audit["decoder_timeline_score"]
+            + exterior["weighted_score_total"],
+        )
+        self.assertTrue(
+            proposal.audit["exterior_score_applied_to_candidate_selection"]
+        )
         self.assertTrue(
             all(
                 shot.segment.editorial_transform is not None
@@ -283,6 +641,378 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
         self.assertEqual(STAGE_EDIT_WINDOWED_BEAM_CONTRACT, audit["contract"])
         self.assertEqual(1, audit["call_count"])
         self.assertTrue(audit["calls"][0]["actual_public_decoder_invoked"])
+        self.assertFalse(audit["calls"][0]["learned_source_pair_scorer_bound"])
+        self.assertIsNone(
+            actual_decoder.call_args.kwargs["source_pair_scorer"]
+        )
+
+        scorer = StageEditSourcePairScorer.uniform()
+        learned_config = replace(
+            config,
+            continuity_authority=PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            continuity_scorer_contract=STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            continuity_scorer_fingerprint=scorer.fingerprint,
+        )
+        pair_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(pair_directory.cleanup)
+        pair_evidence = _saved_source_pair_evidence(
+            Path(pair_directory.name),
+            scorer,
+        )
+        learned_semimarkov = decode_stage_edit_semimarkov_beam(
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            sources=sources,
+            source_metadata=_metadata(source_count, float(duration)),
+            head_frames=frames,
+            section_plan=_plan(duration),
+            output=Path("/tmp/stageedit-window-base-learned.mp4"),
+            config=learned_config,
+            fps=30.0,
+            source_pair_scorer=scorer,
+        )
+        learned_retained = tuple(
+            RetainedStageEditCandidate(
+                rank=timeline.rank,
+                score=timeline.score,
+                edit=timeline.edit,
+                exact_clock_reprojected=True,
+                timewarped_segment_count=0,
+            )
+            for timeline in learned_semimarkov.timelines
+        )
+        learned_bridge = _typed_bridge_result(
+            source_ids=tuple(
+                f"source-{index}" for index in range(source_count)
+            ),
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
+            semimarkov=learned_semimarkov,
+            retained_candidates=learned_retained,
+            dynamic_crop_version=3,
+            continuity_authority=PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            source_pair_evidence=pair_evidence,
+        )
+        learned_redecoder = StageEditWindowedBeamRedecoder(
+            bridge_result=learned_bridge,
+            sources=sources,
+            source_durations_seconds=(float(duration),) * source_count,
+            source_start_offsets_seconds=(0.0,) * source_count,
+            internal_cut_times_seconds=((),) * source_count,
+            source_timewarps=(None,) * source_count,
+            source_quality_log_priors=(0.0,) * source_count,
+            output=Path("/tmp/stageedit-window-redecode-learned.mp4"),
+        )
+        with patch(
+            "crosscut.stage_edit_windowed_beam_redecode."
+            "decode_stage_edit_semimarkov_beam",
+            wraps=decode_stage_edit_semimarkov_beam,
+        ) as learned_decoder:
+            learned_proposals = learned_redecoder(request)
+        self.assertIs(
+            learned_decoder.call_args.kwargs["source_pair_scorer"],
+            learned_bridge.preflight.source_pair_scorer,
+        )
+        learned_audit = learned_redecoder.audit_payload()["calls"][0]
+        self.assertTrue(learned_audit["learned_source_pair_scorer_bound"])
+        self.assertEqual(
+            learned_audit["continuity_scorer_fingerprint"], scorer.fingerprint
+        )
+        self.assertGreater(len(learned_proposals), 0, learned_audit)
+        learned_proposal_audit = learned_proposals[0].audit
+        self.assertEqual(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            learned_proposal_audit["continuity_authority"],
+        )
+        self.assertEqual(
+            STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            learned_proposal_audit["continuity_scorer_contract"],
+        )
+        self.assertEqual(
+            scorer.fingerprint,
+            learned_proposal_audit["continuity_scorer_fingerprint"],
+        )
+        learned_exterior = learned_proposal_audit[
+            "exterior_splice_continuity"
+        ]
+        self.assertTrue(learned_exterior["full_edit_validation_passed"])
+        self.assertEqual(2, learned_exterior["evaluated_edge_count"])
+        self.assertTrue(
+            all(
+                edge["scorer_evaluated"]
+                and edge["continuity_scorer_fingerprint"]
+                == scorer.fingerprint
+                for edge in learned_exterior["edges"]
+            )
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_exterior_continuity_reranks_both_authorities_and_right_edge_fails_closed(
+        self,
+        _readiness,
+    ) -> None:
+        duration = 8
+        source_count = 4
+        sources = _sources(source_count, float(duration))
+        low = _splice_continuity_observation(False)
+        high = _splice_continuity_observation(True)
+        learned_scorer = _single_feature_scorer("camera_motion_distance")
+        cases = (
+            (
+                HANDCRAFTED_CONTINUITY_AUTHORITY,
+                None,
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            ),
+            (
+                PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                learned_scorer,
+                STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+                learned_scorer.fingerprint,
+            ),
+        )
+        for authority, scorer, contract, fingerprint in cases:
+            with self.subTest(authority=authority):
+                config = StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_shot_seconds=1.0,
+                    maximum_shot_seconds=1.0,
+                    minimum_unique_sources=3,
+                    maximum_source_occupancy_fraction=0.75,
+                    enforce_aba_exclusion=False,
+                    enforce_montage_grammar=False,
+                    maximum_global_switches_per_minute=120.0,
+                    section_cut_density_multiplier=10.0,
+                    cut_score_weight=0.0,
+                    source_score_weight=1.0,
+                    duration_score_weight=0.0,
+                    transition_score_weight=0.0,
+                    crop_correction_weight=0.0,
+                    source_quality_weight=0.0,
+                    boundary_continuity_weight=1.0,
+                    cadence_score_weight=0.0,
+                    diversity_score_weight=0.0,
+                    occupancy_balance_weight=0.0,
+                    montage_grammar_score_weight=0.0,
+                    continuity_authority=authority,
+                    continuity_scorer_contract=contract,
+                    continuity_scorer_fingerprint=fingerprint,
+                )
+                base_frames = _frames(duration, source_count)
+                decoded = decode_stage_edit_semimarkov_beam(
+                    checkpoint_directory=Path("/tmp/stageedit-production"),
+                    sources=sources,
+                    source_metadata=_metadata(source_count, float(duration)),
+                    head_frames=base_frames,
+                    section_plan=_plan(duration),
+                    output=Path(
+                        f"/tmp/stageedit-exterior-rerank-{authority}.mp4"
+                    ),
+                    config=config,
+                    fps=30.0,
+                    source_pair_scorer=scorer,
+                )
+                base = decoded.timelines[0].edit
+                self.assertEqual(
+                    (0, 1, 2, 3, 0, 1, 2, 3),
+                    tuple(
+                        shot.segment.source_index for shot in base.shots
+                    ),
+                )
+                frames = list(base_frames)
+                frames[1] = replace(
+                    frames[1],
+                    source_logits=(-20.0, 2.9, -20.0, 3.0),
+                    source_continuity=(low, low, low, high),
+                )
+                frames[2] = replace(
+                    frames[2],
+                    source_continuity=(low, low, low, high),
+                )
+                retained = tuple(
+                    RetainedStageEditCandidate(
+                        rank=timeline.rank,
+                        score=timeline.score,
+                        edit=timeline.edit,
+                        exact_clock_reprojected=True,
+                        timewarped_segment_count=0,
+                    )
+                    for timeline in decoded.timelines
+                )
+                source_pair_evidence = None
+                if scorer is not None:
+                    pair_directory = tempfile.TemporaryDirectory()
+                    self.addCleanup(pair_directory.cleanup)
+                    source_pair_evidence = _saved_source_pair_evidence(
+                        Path(pair_directory.name),
+                        scorer,
+                    )
+                bridge = _typed_bridge_result(
+                    source_ids=tuple(
+                        f"source-{index}" for index in range(source_count)
+                    ),
+                    checkpoint_directory=Path("/tmp/stageedit-production"),
+                    frames=tuple(frames),
+                    semimarkov=decoded,
+                    retained_candidates=retained,
+                    dynamic_crop_version=(3 if scorer is not None else 2),
+                    continuity_authority=authority,
+                    source_pair_evidence=source_pair_evidence,
+                )
+                window = StageEditRepairWindow(
+                    issue_ids=("exterior-rerank",),
+                    causes=("learned_editorial_discontinuity",),
+                    requested_start_seconds=1.0,
+                    requested_end_seconds=2.0,
+                    context_start_seconds=1.0,
+                    context_end_seconds=2.0,
+                    canonical_start_seconds=1.0,
+                    canonical_end_seconds=2.0,
+                    actual_start_seconds=1.0,
+                    actual_end_seconds=2.0,
+                    start_shot=1,
+                    end_shot_exclusive=2,
+                )
+                request = StageEditRepairRequest(
+                    iteration=1,
+                    base_edit=base,
+                    current_review=StageEditRepairReview(
+                        50.0,
+                        50.0,
+                        -1.0,
+                    ),
+                    window=window,
+                    canonical_boundaries_seconds=tuple(
+                        float(index) for index in range(duration + 1)
+                    ),
+                    exclusions=StageEditRepairExclusions(),
+                    forbidden_edit_sha256s=(),
+                )
+
+                def redecoder_for(
+                    value: StageEditPipelineBridgeResult,
+                ) -> StageEditWindowedBeamRedecoder:
+                    return StageEditWindowedBeamRedecoder(
+                        bridge_result=value,
+                        sources=sources,
+                        source_durations_seconds=(float(duration),)
+                        * source_count,
+                        source_start_offsets_seconds=(0.0,) * source_count,
+                        internal_cut_times_seconds=((),) * source_count,
+                        source_timewarps=(None,) * source_count,
+                        source_quality_log_priors=(0.0,) * source_count,
+                        output=Path(
+                            f"/tmp/stageedit-exterior-window-{authority}.mp4"
+                        ),
+                    )
+
+                redecoder = redecoder_for(bridge)
+                proposals = redecoder(request)
+                self.assertGreaterEqual(len(proposals), 2)
+                self.assertEqual(
+                    [1, 3],
+                    [
+                        proposal.replacement_shots[0].segment.source_index
+                        for proposal in proposals[:2]
+                    ],
+                )
+                self.assertEqual([1, 2], [value.rank for value in proposals[:2]])
+                self.assertEqual(
+                    [2, 1],
+                    [
+                        value.audit["decoder_timeline_rank"]
+                        for value in proposals[:2]
+                    ],
+                )
+                expected_pairs = (
+                    ((0, 1), (1, 2)),
+                    ((0, 3), (3, 2)),
+                )
+                for proposal, pairs in zip(
+                    proposals[:2],
+                    expected_pairs,
+                    strict=True,
+                ):
+                    exterior = proposal.audit[
+                        "exterior_splice_continuity"
+                    ]
+                    self.assertEqual(2, exterior["expected_edge_count"])
+                    self.assertEqual(2, exterior["evaluated_edge_count"])
+                    self.assertTrue(exterior["full_edit_validation_passed"])
+                    self.assertEqual(
+                        [("left", 1.0), ("right", 2.0)],
+                        [
+                            (
+                                edge["side"],
+                                edge["boundary_time_seconds"],
+                            )
+                            for edge in exterior["edges"]
+                        ],
+                    )
+                    self.assertEqual(
+                        list(pairs),
+                        [
+                            (
+                                edge["outgoing_source_index"],
+                                edge["incoming_source_index"],
+                            )
+                            for edge in exterior["edges"]
+                        ],
+                    )
+                    self.assertTrue(
+                        all(
+                            edge["scorer_evaluated"]
+                            and edge["continuity_scorer_fingerprint"]
+                            == fingerprint
+                            for edge in exterior["edges"]
+                        )
+                    )
+                    self.assertAlmostEqual(
+                        proposal.audit["candidate_selection_score"],
+                        proposal.audit["decoder_timeline_score"]
+                        + exterior["weighted_score_total"],
+                    )
+                self.assertAlmostEqual(
+                    0.0,
+                    proposals[0].audit["exterior_splice_continuity"][
+                        "raw_score_total"
+                    ],
+                )
+                self.assertAlmostEqual(
+                    -2.0,
+                    proposals[1].audit["exterior_splice_continuity"][
+                        "raw_score_total"
+                    ],
+                )
+
+                if scorer is not None:
+                    broken_frames = list(frames)
+                    broken_frames[2] = replace(
+                        broken_frames[2],
+                        source_continuity=(),
+                    )
+                    broken_bridge = replace(
+                        bridge,
+                        head_materialization=replace(
+                            bridge.head_materialization,
+                            frames=tuple(broken_frames),
+                        ),
+                    )
+                    broken_redecoder = redecoder_for(broken_bridge)
+                    self.assertEqual((), broken_redecoder(request))
+                    self.assertTrue(
+                        any(
+                            "learned exterior continuity is missing exact observations"
+                            in reason
+                            for rejection in broken_redecoder.audit_payload()[
+                                "calls"
+                            ][0]["rejections"]
+                            for reason in rejection["reasons"]
+                        )
+                    )
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -649,19 +1379,16 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
             )
             for timeline in decoded.timelines
         )
-        bridge = StageEditPipelineBridgeResult(
-            preflight=SimpleNamespace(
-                source_ids=tuple(f"source-{index}" for index in range(source_count)),
-                checkpoint_directory=Path("/tmp/stageedit-production"),
+        bridge = _typed_bridge_result(
+            source_ids=tuple(
+                f"source-{index}" for index in range(source_count)
             ),
-            head_materialization=SimpleNamespace(frames=frames),
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
             semimarkov=decoded,
             retained_candidates=retained,
-            selection_policy={
-                "visual_baseline_replaced": False,
-                "selected_for_render": False,
-            },
         )
+        retained = bridge.retained_candidates
         base_retained = retained[0]
         base = base_retained.edit
         boundary_index = max(0, len(base.boundaries) // 2)
@@ -1079,6 +1806,31 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
             for item in repair_iterations[1]["proposal_audits"]
             if item["committed"]
         )
+        for committed in (first_committed, second_committed):
+            decoder_audit = committed["decoder_audit"]
+            self.assertEqual(
+                HANDCRAFTED_CONTINUITY_AUTHORITY,
+                decoder_audit["continuity_authority"],
+            )
+            self.assertEqual(
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+                decoder_audit["continuity_scorer_contract"],
+            )
+            self.assertEqual(
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+                decoder_audit["continuity_scorer_fingerprint"],
+            )
+            exterior = decoder_audit["exterior_splice_continuity"]
+            self.assertTrue(exterior["full_edit_validation_passed"])
+            self.assertEqual(
+                exterior["expected_edge_count"],
+                exterior["evaluated_edge_count"],
+            )
+            self.assertTrue(
+                decoder_audit[
+                    "exterior_score_applied_to_candidate_selection"
+                ]
+            )
         self.assertFalse(
             first_committed["review"]["audit"][
                 "perceptual_source_admission"
@@ -1152,9 +1904,89 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
                 "dynamic_crop_v2_suppressed_segment_indices"
             ],
         )
+        self.assertEqual(
+            [1], selected_evidence["dynamic_crop_suppressed_segment_indices"]
+        )
+        self.assertEqual(selected_evidence["dynamic_crop_version"], 2)
         self.assertTrue(
             selected_evidence["proposal_materialization_lineage_preserved"]
         )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
+            selected_evidence["continuity_authority"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            selected_evidence["continuity_scorer_contract"],
+        )
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            selected_evidence["continuity_scorer_fingerprint"],
+        )
+        self.assertEqual(
+            "committed_window_semimarkov_redecode",
+            selected_evidence["continuity_provenance_owner"],
+        )
+        self.assertFalse(
+            selected_evidence[
+                "initial_decode_continuity_provenance_authoritative_for_repaired_edges"
+            ]
+        )
+        committed_exterior = selected_evidence[
+            "committed_window_exterior_continuity_evaluations"
+        ]
+        self.assertEqual(2, len(committed_exterior))
+        self.assertEqual(
+            [1, 2],
+            [item["iteration"] for item in committed_exterior],
+        )
+        self.assertTrue(
+            all(
+                item["exterior_splice_continuity"][
+                    "full_edit_validation_passed"
+                ]
+                for item in committed_exterior
+            )
+        )
+        committed_records = [first_committed, second_committed]
+        for iteration_number, evaluation, committed in zip(
+            (1, 2),
+            committed_exterior,
+            committed_records,
+            strict=True,
+        ):
+            decoder_audit = committed["decoder_audit"]
+            self.assertEqual(iteration_number, evaluation["iteration"])
+            self.assertEqual(
+                committed["proposal_id"],
+                evaluation["proposal_id"],
+            )
+            self.assertEqual(
+                decoder_audit["decoder_timeline_rank"],
+                evaluation["decoder_timeline_rank"],
+            )
+            self.assertEqual(
+                decoder_audit["candidate_selection_rank"],
+                evaluation["candidate_selection_rank"],
+            )
+            self.assertEqual(
+                decoder_audit["candidate_selection_score"],
+                evaluation["candidate_selection_score"],
+            )
+            self.assertEqual(
+                decoder_audit["exterior_splice_continuity"],
+                evaluation["exterior_splice_continuity"],
+            )
+            self.assertTrue(
+                all(
+                    -1.0 <= edge["raw_score"] <= 0.0
+                    and edge["weighted_score"]
+                    == edge["raw_score"] * edge["weight"]
+                    for edge in evaluation[
+                        "exterior_splice_continuity"
+                    ]["edges"]
+                )
+            )
         lineage = result.selected_bundle.candidate_lineage[-1]
         self.assertTrue(lineage["actual_public_decoder_invoked"])
         self.assertTrue(lineage["actual_semimarkov_redecode"])
@@ -1163,8 +1995,24 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
         self.assertEqual(
             [1], lineage["dynamic_crop_v2_suppressed_segment_indices"]
         )
+        self.assertEqual(
+            [1], lineage["dynamic_crop_suppressed_segment_indices"]
+        )
         self.assertTrue(lineage["decoded_proxy_revalidated_after_splice"])
         self.assertFalse(lineage["heuristic_timing_repair_used_as_reviewer_repair"])
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            lineage["continuity_scorer_fingerprint"],
+        )
+        self.assertEqual(
+            committed_exterior,
+            lineage["committed_window_exterior_continuity_evaluations"],
+        )
+        self.assertFalse(
+            lineage[
+                "initial_decode_continuity_provenance_authoritative_for_repaired_edges"
+            ]
+        )
         self.assertTrue(
             any(
                 item.get("dynamic_crop_v2_suppressed_segment_indices") == [1]
