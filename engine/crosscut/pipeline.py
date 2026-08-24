@@ -5482,6 +5482,34 @@ def _materialize_registered_stage_edit_preflight(
     return materialized, preflight
 
 
+def _enforce_automatic_group_stage_edit_requirement(
+    request: AnalysisRequest,
+    registered_bundle: RegisteredStageEditProductionBundle | None,
+) -> None:
+    """Keep the simple automatic product path from silently using baseline."""
+
+    requires_professional_generation = bool(
+        getattr(request, "source_mode", None) is SourceMode.AUTOMATIC
+        and getattr(request, "edit_mode", None) is EditMode.GROUP
+        and not bool(getattr(request, "acquire_only", False))
+    )
+    if (
+        requires_professional_generation
+        and registered_bundle is None
+        and getattr(
+            request,
+            "stage_edit_generation_checkpoint_directory",
+            None,
+        )
+        is None
+    ):
+        raise RuntimeError(
+            "automatic IVE group editing requires a verified registered "
+            "StageEdit production bundle; the ordinary visual baseline is "
+            "not an allowed fallback"
+        )
+
+
 def analyze(
     request: AnalysisRequest,
     reporter: EventReporter,
@@ -5496,21 +5524,10 @@ def analyze(
     registered_stage_edit_bundle = (
         _discover_automatic_stage_edit_production_bundle(request)
     )
-    automatic_group_requires_professional_generation = bool(
-        request.source_mode is SourceMode.AUTOMATIC
-        and request.edit_mode is EditMode.GROUP
-        and not bool(getattr(request, "acquire_only", False))
+    _enforce_automatic_group_stage_edit_requirement(
+        request,
+        registered_stage_edit_bundle,
     )
-    if (
-        automatic_group_requires_professional_generation
-        and registered_stage_edit_bundle is None
-        and request.stage_edit_generation_checkpoint_directory is None
-    ):
-        raise RuntimeError(
-            "automatic IVE group editing requires a verified registered "
-            "StageEdit production bundle; the ordinary visual baseline is "
-            "not an allowed fallback"
-        )
     if (
         (
             request.stage_edit_checkpoint_directory is not None

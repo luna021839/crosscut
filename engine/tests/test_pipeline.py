@@ -1671,6 +1671,8 @@ class PipelineTests(unittest.TestCase):
             )
 
             with patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+            ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
             ), patch(
@@ -2309,6 +2311,8 @@ class PipelineTests(unittest.TestCase):
 
             reporter = _MemoryReporter()
             with patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+            ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
             ), patch(
@@ -2499,6 +2503,8 @@ class PipelineTests(unittest.TestCase):
                     }
 
             with patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+            ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
             ), patch(
@@ -2694,6 +2700,8 @@ class PipelineTests(unittest.TestCase):
                 return (SceneChange(frame_index, 0.9, 0.8, 0.7),)
 
             with patch(
+                "crosscut.pipeline._enforce_automatic_group_stage_edit_requirement"
+            ), patch(
                 "crosscut.pipeline.probe_media",
                 side_effect=lambda source: _analysis_media(source, duration=12.0),
             ), patch(
