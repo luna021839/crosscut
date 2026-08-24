@@ -1178,27 +1178,18 @@ def _broadcast_slot_key(
     return (candidate.broadcast_date, candidate.broadcast_program)
 
 
-def _deduplicate_broadcast_slots(
-    candidates: Sequence[AcquisitionCandidate],
-) -> list[AcquisitionCandidate]:
-    """Keep the first-ranked cut for each exact broadcast date/program."""
-
-    result: list[AcquisitionCandidate] = []
-    used_slots: set[tuple[str, str]] = set()
-    for candidate in candidates:
-        slot = _broadcast_slot_key(candidate)
-        if slot is not None and slot in used_slots:
-            continue
-        result.append(candidate)
-        if slot is not None:
-            used_slots.add(slot)
-    return result
-
-
 def _ordered_for_download(
     candidates: Sequence[AcquisitionCandidate],
 ) -> list[AcquisitionCandidate]:
-    """Prefer canonical stages and keep one cut per date/program slot."""
+    """Put every canonical broadcast slot before its camera variants.
+
+    Some short IVE promotions do not expose eight distinct date/program slots.
+    A fullcam or one-take from an already represented broadcast is still a
+    genuinely different camera source and may be needed to reach the automatic
+    eight-source floor.  It must never displace that slot's canonical programme
+    cut, so variants are retained only in a second, round-robin lane after all
+    canonical slots.
+    """
 
     if not candidates:
         return []
@@ -1225,22 +1216,40 @@ def _ordered_for_download(
             candidate.video_id,
         )
 
-    # Sorting by quality first guarantees that a canonical programme cut wins
-    # its slot over fullcam/one-take variants before the slot is deduplicated.
-    ranked = _deduplicate_broadcast_slots(
-        sorted(candidates, key=quality_order)
+    ranked = sorted(candidates, key=quality_order)
+    canonical_by_slot: list[AcquisitionCandidate] = []
+    variants_by_slot: dict[tuple[str, str], list[AcquisitionCandidate]] = {}
+    unslotted: list[AcquisitionCandidate] = []
+    seen_slots: set[tuple[str, str]] = set()
+    for candidate in ranked:
+        slot = _broadcast_slot_key(candidate)
+        if slot is None:
+            unslotted.append(candidate)
+        elif slot not in seen_slots:
+            seen_slots.add(slot)
+            canonical_by_slot.append(candidate)
+        else:
+            variants_by_slot.setdefault(slot, []).append(candidate)
+
+    # One alternate from each represented programme is preferable to several
+    # alternates from a single broadcast.  Preserve deterministic quality
+    # ordering within every round.
+    variants: list[AcquisitionCandidate] = []
+    maximum_variant_count = max(
+        (len(items) for items in variants_by_slot.values()),
+        default=0,
     )
-    canonical = ranked[0]
-    remainder = sorted(
-        ranked[1:],
-        key=lambda candidate: (
-            _is_capture_variant(candidate),
-            candidate.broadcast_date is None,
-            candidate.broadcast_date or "",
-            quality_order(candidate),
-        ),
+    ordered_slots = sorted(
+        variants_by_slot,
+        key=lambda slot: quality_order(variants_by_slot[slot][0]),
     )
-    return [canonical, *remainder]
+    for variant_index in range(maximum_variant_count):
+        variants.extend(
+            variants_by_slot[slot][variant_index]
+            for slot in ordered_slots
+            if variant_index < len(variants_by_slot[slot])
+        )
+    return [*canonical_by_slot, *unslotted, *variants]
 
 
 def _select_promotion_date_cluster(
@@ -1251,9 +1260,11 @@ def _select_promotion_date_cluster(
     """Select one promotion run with enough distinct weekly-show slots.
 
     Dates connected by no more than 28 days form one deterministic promotion
-    cluster. The cluster with the largest deduplicated stage pool wins; an
-    equal-sized newer cluster wins the tie. Undated and cross-promotion clips
-    cannot silently fill the eight-source floor.
+    cluster. The cluster with the broadest distinct broadcast-slot coverage
+    wins, then total camera-source count and recency break ties. At least four
+    distinct slots are required; camera variants may fill the remaining
+    automatic eight-source floor. Undated and cross-promotion clips cannot
+    silently fill that floor.
     """
 
     dated: dict[str, list[AcquisitionCandidate]] = {}
@@ -1285,6 +1296,12 @@ def _select_promotion_date_cluster(
             if candidate.broadcast_date in date_set
         ]
         ordered_pool = _ordered_for_download(pool)
+        distinct_slots = {
+            slot
+            for candidate in ordered_pool
+            if (slot := _broadcast_slot_key(candidate)) is not None
+        }
+        minimum_distinct_slots = min(4, minimum_count)
         cluster_candidates.append(pool)
         cluster_records.append(
             {
@@ -1292,7 +1309,16 @@ def _select_promotion_date_cluster(
                 "start_date": dates[0],
                 "end_date": dates[-1],
                 "dated_candidate_count": len(pool),
+                "ordered_source_count": len(ordered_pool),
+                # Retain the original diagnostic key for manifest readers,
+                # while making its source-level meaning explicit. Exact
+                # video/content duplicates were already removed upstream;
+                # alternate cameras from one broadcast remain valid sources.
                 "deduplicated_stage_count": len(ordered_pool),
+                "distinct_broadcast_slot_count": len(distinct_slots),
+                "minimum_distinct_broadcast_slot_count": (
+                    minimum_distinct_slots
+                ),
                 "canonical_stage_count": sum(
                     not _is_capture_variant(candidate)
                     for candidate in ordered_pool
@@ -1301,7 +1327,10 @@ def _select_promotion_date_cluster(
                     _is_capture_variant(candidate)
                     for candidate in ordered_pool
                 ),
-                "qualifies": len(ordered_pool) >= minimum_count,
+                "qualifies": (
+                    len(ordered_pool) >= minimum_count
+                    and len(distinct_slots) >= minimum_distinct_slots
+                ),
             }
         )
 
@@ -1312,7 +1341,8 @@ def _select_promotion_date_cluster(
         max(
             qualifying,
             key=lambda record: (
-                record["deduplicated_stage_count"],
+                record["distinct_broadcast_slot_count"],
+                record["ordered_source_count"],
                 record["end_date"],
             ),
         )
@@ -1332,7 +1362,7 @@ def _select_promotion_date_cluster(
         ),
         "minimum_deduplicated_stage_count": minimum_count,
         "selection_order": (
-            "largest_deduplicated_stage_count_then_latest_end_date"
+            "largest_distinct_slot_count_then_source_count_then_latest_end_date"
         ),
         "same_broadcast_slot": "broadcast_date_plus_program",
         "dated_candidate_count": sum(len(items) for items in dated.values()),
@@ -2745,10 +2775,10 @@ def acquire_sources(
         ]
     else:
         ordered = [*_ordered_for_download(primary), *_ordered_for_download(fallback)]
-    # The primary/fallback and standard/close-up lanes are ranked separately,
-    # then reconciled once so the same programme broadcast is never selected
-    # twice through a lower-priority variant lane.
-    ordered = _deduplicate_broadcast_slots(ordered)
+    # The primary/fallback and standard/close-up lanes are ranked separately.
+    # Their internal ordering has already placed all canonical programme slots
+    # before alternate cameras; retaining those alternates is necessary when a
+    # short promotion exposes fewer than eight distinct weekly-show slots.
 
     portrait_contract_required = _requires_automatic_member_portrait_contract(
         request
@@ -2890,8 +2920,8 @@ def acquire_sources(
             ],
             "channel_requirement": "allowlisted_channel_id_required_name_signal_diagnostic_only",
             "performance_diversity": (
-                "one_canonical_cut_per_broadcast_date_and_program_"
-                "before_fullcam_or_one_take"
+                "all_canonical_broadcast_slots_before_round_robin_"
+                "fullcam_or_one_take_floor_completion"
             ),
             "latest_song_title_policy": {
                 "unregistered_song": (
@@ -2900,7 +2930,8 @@ def acquire_sources(
                 "substring_inside_another_title": "rejected",
                 "other_registered_ive_activity_in_same_title": "rejected",
                 "promotion_cluster": (
-                    "minimum_floor_then_largest_stage_count_then_latest_tie"
+                    "minimum_four_distinct_slots_and_eight_sources_then_"
+                    "largest_slot_count_source_count_latest_tie"
                 ),
             },
             "reference_source": "clean_canonical_stage_near_median_duration",

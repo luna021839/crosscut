@@ -689,6 +689,72 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             cluster["selected_cluster"]["deduplicated_stage_count"], 8
         )
 
+    def test_short_promotion_uses_camera_variants_only_after_all_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, song="BANG BANG")
+            entries = [
+                _official_entry(
+                    0,
+                    title="IVE BANG BANG Music Bank Stage 260213",
+                ),
+                _official_entry(
+                    1,
+                    title="IVE BANG BANG Full Cam Music Bank 260213",
+                ),
+                _official_entry(
+                    2,
+                    title="IVE BANG BANG Music Core Stage 260214",
+                ),
+                _official_entry(
+                    3,
+                    title="IVE BANG BANG FullCam Music Core 260214",
+                ),
+                _official_entry(
+                    4,
+                    title="IVE BANG BANG Inkigayo Stage 260215",
+                ),
+                _official_entry(
+                    5,
+                    title="IVE BANG BANG One Take Inkigayo 260215",
+                ),
+                _official_entry(
+                    6,
+                    title="IVE BANG BANG M COUNTDOWN Stage 260226",
+                ),
+                _official_entry(
+                    7,
+                    title="IVE BANG BANG Show Champion Stage 260227",
+                ),
+            ]
+            client = _FakeClient(entries)
+
+            artifact = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        canonical_ids = {
+            "contract0000",
+            "contract0002",
+            "contract0004",
+            "contract0006",
+            "contract0007",
+        }
+        variant_ids = {"contract0001", "contract0003", "contract0005"}
+        self.assertEqual(len(artifact.source_paths), 8)
+        self.assertEqual(set(client.download_attempts[:5]), canonical_ids)
+        self.assertEqual(set(client.download_attempts[5:]), variant_ids)
+        selected_cluster = artifact.manifest[
+            "promotion_date_cluster_selection"
+        ]["selected_cluster"]
+        self.assertTrue(selected_cluster["qualifies"])
+        self.assertEqual(selected_cluster["distinct_broadcast_slot_count"], 5)
+        self.assertEqual(selected_cluster["ordered_source_count"], 8)
+
     def test_non_music_show_formats_are_hard_rejected_with_specific_reasons(self) -> None:
         cases = {
             "[MV] Music Bank Stage": "non_music_show_music_video",
@@ -909,7 +975,7 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
                         "allowlisted_channel_id",
                     )
 
-    def test_same_broadcast_date_and_program_keeps_only_canonical_cut(self) -> None:
+    def test_same_broadcast_slot_places_canonical_before_camera_variant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             request = _automatic_request(Path(temp), desired=9)
             entries = (
@@ -938,17 +1004,15 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
         ordered = _ordered_for_download(
             tuple(candidate for candidate in candidates if candidate is not None)
         )
-        self.assertEqual(len(ordered), 3)
-        first_dates = [candidate.broadcast_date for candidate in ordered]
+        self.assertEqual(len(ordered), 4)
+        first_dates = [candidate.broadcast_date for candidate in ordered[:3]]
         self.assertEqual(
             set(first_dates),
             {"2023-04-14", "2023-04-21", "2023-04-28"},
         )
         self.assertEqual(len(set(first_dates)), 3)
-        self.assertNotIn(
-            "full cam",
-            " ".join(item.title for item in ordered).casefold(),
-        )
+        self.assertEqual(ordered[3].broadcast_date, "2023-04-14")
+        self.assertIn("full cam", ordered[3].title.casefold())
 
     def test_same_date_different_music_show_programs_are_distinct_slots(
         self,
