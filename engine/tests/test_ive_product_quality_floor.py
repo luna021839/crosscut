@@ -19,6 +19,7 @@ from crosscut.rendered_montage_grammar_review import (
 from crosscut.rendered_proxy_review import (
     SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
     SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+    SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
 )
 
 
@@ -52,7 +53,7 @@ def _rendered_geometry_evidence(
     passed: bool = True,
 ) -> tuple[dict[str, object], dict[str, object]]:
     source_core: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
         "analysis_basis": SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
         "contract": SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
         "sampling_schedule_sha256": "1" * 64,

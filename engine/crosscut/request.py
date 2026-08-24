@@ -96,6 +96,11 @@ class AnalysisRequest:
     target_member: IVEMember | None = None
     reference_source: int = 0
     member_anchors: tuple[MemberAnchorRequest, ...] = ()
+    # Missing legacy request fields intentionally resolve to enabled so older
+    # member jobs preserve the established pose-matched dissolve policy.  The
+    # planner still decides boundary-by-boundary eligibility and may emit only
+    # hard cuts even when this request-level preference is enabled.
+    member_pose_dissolve_enabled: bool = True
     source_mode: SourceMode = SourceMode.LOCAL
     desired_source_count: int = DEFAULT_AUTOMATIC_SOURCE_COUNT
     source_cache_directory: Path | None = None
@@ -129,6 +134,8 @@ class AnalysisRequest:
         return self.desired_source_count
 
     def __post_init__(self) -> None:
+        if not isinstance(self.member_pose_dissolve_enabled, bool):
+            raise ValueError("member_pose_dissolve_enabled must be a boolean")
         if self.professional_reference_profile is not None:
             profile_path = Path(self.professional_reference_profile).expanduser()
             if not profile_path.is_file():
@@ -485,6 +492,15 @@ class AnalysisRequest:
         if mode is EditMode.GROUP and member_anchors:
             raise ValueError("group mode does not accept member anchors")
 
+        # This field is deliberately strict when present, while an omitted
+        # field defaults to True for backward compatibility with saved jobs
+        # created before the member effect became user-configurable.
+        raw_member_pose_dissolve_enabled = payload.get(
+            "member_pose_dissolve_enabled", True
+        )
+        if not isinstance(raw_member_pose_dissolve_enabled, bool):
+            raise ValueError("member_pose_dissolve_enabled must be a boolean")
+
         raw_output = payload.get("output_directory") or "outputs"
         if not isinstance(raw_output, str):
             raise ValueError("output_directory must be a string")
@@ -760,6 +776,7 @@ class AnalysisRequest:
             target_member=target_member,
             reference_source=reference_source,
             member_anchors=member_anchors,
+            member_pose_dissolve_enabled=raw_member_pose_dissolve_enabled,
             source_mode=source_mode,
             desired_source_count=desired_source_count,
             source_cache_directory=source_cache_directory,
@@ -807,6 +824,7 @@ class AnalysisRequest:
             "target_member": self.target_member.value if self.target_member else None,
             "reference_source": self.reference_source,
             "member_anchors": [anchor.as_dict() for anchor in self.member_anchors],
+            "member_pose_dissolve_enabled": self.member_pose_dissolve_enabled,
             "source_mode": self.source_mode.value,
             "desired_source_count": self.desired_source_count,
             "source_cache_directory": (

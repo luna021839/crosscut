@@ -384,6 +384,11 @@ class FrameVisualDescriptor:
     # blown-out stage-light entry from a legitimate one-frame flash.  No
     # pixels, appearance vectors, or identity evidence are retained.
     highlight_clipping_ratio: float = 0.0
+    # Explains which decoded geometry produced ``shot_scale``.  In
+    # particular, a detector miss is no longer silently serialized as a wide
+    # shot: callers can keep the neutral MEDIUM enum for compatibility while
+    # excluding ``unknown_no_subject_geometry`` from observed-medium counts.
+    shot_scale_basis: str = "legacy"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -391,6 +396,7 @@ class FrameVisualDescriptor:
             "composition_score": self.composition_score,
             "shot_scale": self.shot_scale,
             "shot_type": self.shot_type.value,
+            "shot_scale_basis": self.shot_scale_basis,
             "face_count": self.face_count,
             "primary_face_bbox_xywh": (
                 list(self.primary_face_bbox)
@@ -542,6 +548,7 @@ class VisualTimelineChoice:
     detected_person_counts: tuple[int, int, int] = (0, 0, 0)
     formation_person_counts: tuple[int, int, int] = (0, 0, 0)
     formation_upper_body_counts: tuple[int, int, int] = (0, 0, 0)
+    shot_scale_bases: tuple[str, str, str] = ("legacy", "legacy", "legacy")
     silhouette_samples_xywh: tuple[
         tuple[float, float, float, float] | None,
         tuple[float, float, float, float] | None,
@@ -696,6 +703,7 @@ class VisualTimelineChoice:
             "formation_upper_body_counts": list(
                 self.formation_upper_body_counts
             ),
+            "shot_scale_bases": list(self.shot_scale_bases),
             "silhouette_samples_xywh": [
                 list(sample) if sample is not None else None
                 for sample in self.silhouette_samples_xywh
@@ -1025,7 +1033,7 @@ class VisualTimelinePlan:
     choices: tuple[VisualTimelineChoice, ...]
     optimizer_score: float
     analysis_basis: str = (
-        "reviewed_thirty_two_candidate_native_cut_and_boundary_stability_safe_v12"
+        "reviewed_thirty_two_candidate_shot_hierarchy_boundary_stability_safe_v13"
     )
     selected_candidate_index: int = 0
     candidate_generation_basis: str = (
@@ -1991,15 +1999,92 @@ def describe_frame(
         )
         composition = _unit(0.55 * composition + 0.45 * face_center_score)
         shot_scale = _unit(face_scale / 0.42)
+        shot_scale_basis = "dominant_face_height"
     else:
-        shot_scale = 0.12
+        # Face detection is a poor wide-shot oracle: profile faces, motion
+        # blur and stage lighting routinely hide a face in a tight shot.  Use
+        # the decoded full-person/aggregate geometry before falling back to an
+        # explicitly unknown neutral label.
+        people = tuple(subject.formation_people)
+        if people:
+            heights = sorted(float(person.bbox_xywh[3]) for person in people)
+            median_height = heights[len(heights) // 2]
+            union_left = min(person.bbox_xywh[0] for person in people)
+            union_top = min(person.bbox_xywh[1] for person in people)
+            union_right = max(
+                person.bbox_xywh[0] + person.bbox_xywh[2] for person in people
+            )
+            union_bottom = max(
+                person.bbox_xywh[1] + person.bbox_xywh[3] for person in people
+            )
+            union_width = union_right - union_left
+            boundary_clipped = union_top <= 0.035 or union_bottom >= 0.965
+            if len(people) >= 3:
+                shot_scale = min(0.21, max(0.08, median_height * 0.30))
+                shot_type = ShotType.GROUP_WIDE
+                shot_scale_basis = "aggregate_formation_people"
+            elif (
+                len(people) == 1
+                and boundary_clipped
+                and median_height >= 0.68
+                and union_width <= 0.58
+            ):
+                shot_scale = max(0.53, min(0.78, median_height * 0.78))
+                shot_type = ShotType.CLOSE_UP
+                shot_scale_basis = "clipped_single_performer_bbox"
+            elif median_height >= 0.43 and union_width <= 0.72:
+                shot_scale = max(0.28, min(0.50, median_height * 0.56))
+                shot_type = ShotType.MEDIUM
+                shot_scale_basis = "single_or_pair_performer_bbox"
+            else:
+                shot_scale = min(0.21, max(0.10, median_height * 0.34))
+                shot_type = ShotType.GROUP_WIDE
+                shot_scale_basis = "distant_single_or_pair_performer_bbox"
+        elif (
+            subject.silhouette_bbox_xywh is not None
+            and subject.silhouette_confidence >= 0.72
+        ):
+            left, top, width, height = subject.silhouette_bbox_xywh
+            boundary_clipped = top <= 0.035 or top + height >= 0.965
+            if boundary_clipped and height >= 0.70 and width <= 0.46:
+                shot_scale = max(0.53, min(0.72, height * 0.72))
+                shot_type = ShotType.CLOSE_UP
+                shot_scale_basis = "clipped_single_subject_silhouette"
+            elif height >= 0.54 and width <= 0.54:
+                shot_scale = max(0.28, min(0.50, height * 0.58))
+                shot_type = ShotType.MEDIUM
+                shot_scale_basis = "single_subject_silhouette"
+            else:
+                shot_scale = min(0.21, max(0.10, height * 0.30))
+                shot_type = ShotType.GROUP_WIDE
+                shot_scale_basis = "aggregate_or_distant_silhouette"
+        else:
+            # ShotType has no UNKNOWN case and is persisted in older plans.
+            # MEDIUM is the least destructive optimizer label; the basis is
+            # the authoritative signal that review/statistics must treat this
+            # observation as unknown rather than an observed medium shot.
+            shot_scale = 0.34
+            shot_type = ShotType.MEDIUM
+            shot_scale_basis = "unknown_no_subject_geometry"
 
-    if face_count >= 4 or shot_scale < 0.22:
-        shot_type = ShotType.GROUP_WIDE
-    elif shot_scale < 0.52:
-        shot_type = ShotType.MEDIUM
-    else:
-        shot_type = ShotType.CLOSE_UP
+    if face_count:
+        if face_count < 4 and shot_scale >= 0.52:
+            shot_type = ShotType.CLOSE_UP
+        elif len(subject.formation_people) >= 3:
+            heights = sorted(
+                float(person.bbox_xywh[3])
+                for person in subject.formation_people
+            )
+            shot_scale = min(
+                0.21,
+                max(0.08, heights[len(heights) // 2] * 0.30),
+            )
+            shot_type = ShotType.GROUP_WIDE
+            shot_scale_basis = "aggregate_formation_people"
+        elif face_count >= 4 or shot_scale < 0.22:
+            shot_type = ShotType.GROUP_WIDE
+        elif shot_scale < 0.52:
+            shot_type = ShotType.MEDIUM
     return FrameVisualDescriptor(
         quality_score=quality,
         composition_score=composition,
@@ -2037,6 +2122,7 @@ def describe_frame(
         silhouette_backend=subject.silhouette_backend,
         foreground_obstruction_score=foreground_obstruction_score,
         highlight_clipping_ratio=highlight_clipping_ratio,
+        shot_scale_basis=shot_scale_basis,
     )
 
 
@@ -2123,6 +2209,7 @@ class _CandidateSubjectMetadata:
     person_counts: tuple[int, int, int]
     formation_person_counts: tuple[int, int, int]
     formation_upper_body_counts: tuple[int, int, int]
+    shot_scale_bases: tuple[str, str, str]
     silhouette_boxes: tuple[
         tuple[float, float, float, float] | None,
         tuple[float, float, float, float] | None,
@@ -3190,6 +3277,11 @@ def _missing_candidate_subject_metadata() -> _CandidateSubjectMetadata:
         person_counts=(0, 0, 0),
         formation_person_counts=(0, 0, 0),
         formation_upper_body_counts=(0, 0, 0),
+        shot_scale_bases=(
+            "unknown_no_subject_geometry",
+            "unknown_no_subject_geometry",
+            "unknown_no_subject_geometry",
+        ),
         silhouette_boxes=(None, None, None),
         silhouette_centroids=(None, None, None),
         silhouette_backends=("none", "none", "none"),
@@ -3411,6 +3503,7 @@ def materialize_visual_timeline_candidate(
                 formation_upper_body_counts=(
                     subject_metadata.formation_upper_body_counts
                 ),
+                shot_scale_bases=subject_metadata.shot_scale_bases,
                 silhouette_samples_xywh=subject_metadata.silhouette_boxes,
                 silhouette_centroid_samples_xy=(
                     subject_metadata.silhouette_centroids
@@ -3878,6 +3971,11 @@ def _build_visual_timeline(
                             bool(person.upper_body_keypoints_xyc)
                             for person in exit_descriptor.formation_people
                         ),
+                    ),
+                    shot_scale_bases=(
+                        entry.shot_scale_basis,
+                        middle.shot_scale_basis,
+                        exit_descriptor.shot_scale_basis,
                     ),
                     silhouette_boxes=(
                         entry.silhouette_bbox_xywh,

@@ -676,6 +676,7 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(object["source_mode"] as? String, "local")
         XCTAssertEqual(object["desired_source_count"] as? Int, 10)
         XCTAssertEqual(object["acquire_only"] as? Bool, false)
+        XCTAssertEqual(object["member_pose_dissolve_enabled"] as? Bool, true)
         let anchors = try XCTUnwrap(object["member_anchors"] as? [[String: Any]])
         XCTAssertEqual(anchors.count, 1)
         XCTAssertEqual(anchors[0]["source_index"] as? Int, 0)
@@ -706,6 +707,53 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(object["acquire_only"] as? Bool, false)
         XCTAssertEqual((object["sources"] as? [Any])?.count, 0)
         XCTAssertEqual((object["member_anchors"] as? [Any])?.count, 0)
+        XCTAssertEqual(object["member_pose_dissolve_enabled"] as? Bool, true)
+    }
+
+    func testMemberPoseDissolveToggleIsMemberOnlyAndDefaultsOn() throws {
+        XCTAssertTrue(
+            ProjectSettingsControlPolicy.showsMemberPoseDissolve(
+                editMode: .member,
+                sourceMode: .automatic
+            )
+        )
+        XCTAssertFalse(
+            ProjectSettingsControlPolicy.showsMemberPoseDissolve(
+                editMode: .group,
+                sourceMode: .automatic
+            )
+        )
+        XCTAssertFalse(
+            ProjectSettingsControlPolicy.showsMemberPoseDissolve(
+                editMode: .member,
+                sourceMode: .local
+            )
+        )
+
+        let disabled = EditRequest(
+            song: "ATTITUDE",
+            targetMember: .gaeul,
+            editMode: .member,
+            aspectRatio: .portrait,
+            sources: [],
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            memberPoseDissolveEnabled: false,
+            sourceMode: .automatic
+        )
+        let disabledObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(disabled))
+                as? [String: Any]
+        )
+        XCTAssertEqual(
+            disabledObject["member_pose_dissolve_enabled"] as? Bool,
+            false
+        )
+
+        var legacyObject = disabledObject
+        legacyObject.removeValue(forKey: "member_pose_dissolve_enabled")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let decodedLegacy = try JSONDecoder().decode(EditRequest.self, from: legacyData)
+        XCTAssertTrue(decodedLegacy.memberPoseDissolveEnabled)
     }
 
     func testAutomaticSourceCountIsClampedToSupportedQualityRange() {

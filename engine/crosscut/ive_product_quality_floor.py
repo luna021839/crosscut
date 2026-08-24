@@ -22,6 +22,7 @@ from .rendered_montage_grammar_review import (
 from .rendered_proxy_review import (
     SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
     SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+    SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
 )
 
 
@@ -487,7 +488,8 @@ def _modern_rendered_geometry_i_am_metrics(
             "rendered proxy segment-interior evidence SHA-256 mismatch"
         )
     if (
-        source.get("schema_version") != 1
+        source.get("schema_version")
+        != SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION
         or source.get("analysis_basis")
         != SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS
         or source.get("contract") != SEGMENT_INTERIOR_GEOMETRY_CONTRACT

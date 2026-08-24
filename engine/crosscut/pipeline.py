@@ -54,6 +54,10 @@ from .direct_member_editorial_motion import (
     DirectMemberDenseFaceProvider,
     build_direct_member_editorial_motion_plan,
 )
+from .direct_member_transition import (
+    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT,
+    build_direct_member_pose_dissolve_plan,
+)
 from .editorial_motion import EditorialMotionPlan, build_editorial_motion_plan
 from .events import EventReporter
 from .face_match import FaceMatchPlan, build_face_match_plan
@@ -135,7 +139,7 @@ from .rendered_montage_grammar_review import (
     review_rendered_montage_grammar,
 )
 from .rhythm import RhythmAnalysis, analyze_rhythm
-from .section_director import SectionPlan, build_section_plan
+from .section_director import SectionPlan, SectionRole, build_section_plan
 from .source_look_match import SourceLookMatchResult, analyze_source_look_match
 from .source_derivative_diversity import (
     SourceDerivativeDiversityResult,
@@ -2821,6 +2825,11 @@ def _official_target_fancam_direct_full_frame_segments(
     source_timewarps: Sequence[TimeWarpMap | None] | None,
     scene_cut_times: Sequence[Sequence[float]],
     descriptor_provider: DescriptorProvider | None = None,
+    eligible_source_durations_seconds: Sequence[float] | None = None,
+    source_metadata_contract: str | None = None,
+    highlight_intervals: Sequence[tuple[float, float]] = (),
+    member_pose_dissolve_enabled: bool = True,
+    output_fps: float = 29.97,
 ) -> tuple[
     tuple[RenderSegment, ...],
     tuple[RenderTransition, ...],
@@ -3023,6 +3032,63 @@ def _official_target_fancam_direct_full_frame_segments(
         "reference_calibrated_proof_directed_partition_fallback_v2"
     )
     cadence["partition_search"] = partition_search
+    dissolve_planner_error: str | None = None
+    try:
+        dissolve_plan = build_direct_member_pose_dissolve_plan(
+            visual_selection=visual_selection,
+            render_segments=resolved,
+            eligible_request_source_indices=eligible,
+            eligible_source_durations_seconds=eligible_source_durations_seconds,
+            common_master_start=common_master_start,
+            source_metadata_contract=source_metadata_contract,
+            enabled=member_pose_dissolve_enabled,
+            highlight_intervals=highlight_intervals,
+            hard_cut_reason=OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,
+            fps=output_fps,
+        )
+    except (
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        FloatingPointError,
+    ) as exc:
+        # The effect is optional.  A stale or malformed effect diagnostic must
+        # never weaken the already-validated direct-member source path or turn
+        # into an unreviewed dissolve; retain the exact hard-cut timeline.
+        dissolve_planner_error = str(exc)
+        dissolve_plan = build_direct_member_pose_dissolve_plan(
+            visual_selection=visual_selection,
+            render_segments=resolved,
+            eligible_request_source_indices=eligible,
+            eligible_source_durations_seconds=None,
+            common_master_start=common_master_start,
+            source_metadata_contract=None,
+            enabled=member_pose_dissolve_enabled,
+            highlight_intervals=(),
+            hard_cut_reason=OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,
+            fps=output_fps,
+        )
+    transitions = dissolve_plan.transitions
+    dissolve_payload = dissolve_plan.to_dict()
+    dissolve_payload["planner_completed"] = dissolve_planner_error is None
+    dissolve_payload["planner_error"] = dissolve_planner_error
+    cadence["pose_matched_dissolves"] = dissolve_payload
+    cadence["member_pose_dissolve_requested"] = bool(
+        dissolve_payload["member_pose_dissolve_requested"]
+    )
+    cadence["member_pose_dissolve_effective"] = bool(
+        dissolve_payload["member_pose_dissolve_effective"]
+    )
+    cadence["member_pose_dissolve_count"] = int(
+        dissolve_payload["member_pose_dissolve_count"]
+    )
+    for segment_index, detail in enumerate(details):
+        detail["outgoing_transition"] = (
+            transitions[segment_index].to_dict(output_fps)
+            if segment_index < len(transitions)
+            else None
+        )
     return (
         tuple(resolved),
         transitions,
@@ -9879,6 +9945,29 @@ def analyze(
             reporter.status(
                 "직캠별 동작·위치 연속성과 아웃트로 유효성을 비교하는 중…"
             )
+            direct_highlight_intervals: tuple[tuple[float, float], ...] = ()
+            try:
+                direct_section_plan = build_section_plan(
+                    rhythm_analysis,
+                    start_seconds=member_common_start,
+                    end_seconds=common_end,
+                )
+                direct_highlight_intervals = tuple(
+                    (section.start_seconds, section.end_seconds)
+                    for section in direct_section_plan.sections
+                    if section.role
+                    in {SectionRole.BUILD, SectionRole.CHORUS_LIKE}
+                    and section.camera_motion_budget >= 0.50
+                )
+            except (AttributeError, TypeError, ValueError, FloatingPointError) as exc:
+                reporter.emit(
+                    "log",
+                    level="warning",
+                    message=(
+                        "직캠 디졸브 하이라이트 우선순위를 확정하지 못해 "
+                        f"동작·포즈 근거만 사용: {exc}"
+                    ),
+                )
             try:
                 (
                     segments,
@@ -9895,6 +9984,26 @@ def analyze(
                     common_master_start=member_common_start,
                     source_timewarps=source_timewarps,
                     scene_cut_times=scene_cut_times,
+                    eligible_source_durations_seconds=tuple(
+                        float(
+                            media[index].video_streams[0].duration_seconds
+                            or media[index].duration_seconds
+                            or 0.0
+                        )
+                        for index in eligible_indices
+                    ),
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    highlight_intervals=direct_highlight_intervals,
+                    member_pose_dissolve_enabled=bool(
+                        getattr(
+                            request,
+                            "member_pose_dissolve_enabled",
+                            True,
+                        )
+                    ),
+                    output_fps=29.97,
                 )
             except DirectMemberVisualSelectionError as exc:
                 raise _report_direct_member_selection_failure(
@@ -9913,6 +10022,16 @@ def analyze(
                 f"{visual_aggregate['warning_boundary_count']}개 · "
                 "콘텐츠 제외 후보 "
                 f"{visual_aggregate['content_validity']['invalid_candidate_count']}개"
+            )
+            dissolve_payload = direct_cadence["pose_matched_dissolves"]
+            reporter.log(
+                "직캠 포즈 연결 디졸브 "
+                f"{dissolve_payload['selected_dissolve_count']}개 / "
+                f"안전 후보 {dissolve_payload['eligible_candidate_count']}개 · "
+                "하이라이트 "
+                f"{dissolve_payload['selected_highlight_count']}개 · "
+                "동작 연결 "
+                f"{dissolve_payload['selected_both_moving_count']}개"
             )
             dense_face_provider: DirectMemberDenseFaceProvider | None = None
             direct_motion_error: str | None = None
@@ -10011,7 +10130,10 @@ def analyze(
                     dense_face_provider.diagnostics()
                     if dense_face_provider is not None
                     else {
-                        "backend": "yunet_dominant_face_dense_selected_ramps",
+                        "backend": (
+                            "yunet_face_plus_pphumanseg_or_face_associated_"
+                            "person_dense_selected_ramps"
+                        ),
                         "request_count": 0,
                         "cache_hit_count": 0,
                         "decode_count": 0,
@@ -10139,6 +10261,21 @@ def analyze(
                 width=width,
                 height=height,
                 transitions=member_transitions,
+                member_pose_dissolve_requested=(
+                    bool(direct_cadence["member_pose_dissolve_requested"])
+                    if use_direct_member_full_frame and direct_cadence is not None
+                    else None
+                ),
+                member_pose_dissolve_effective=(
+                    bool(direct_cadence["member_pose_dissolve_effective"])
+                    if use_direct_member_full_frame and direct_cadence is not None
+                    else None
+                ),
+                member_pose_dissolve_count=(
+                    int(direct_cadence["member_pose_dissolve_count"])
+                    if use_direct_member_full_frame and direct_cadence is not None
+                    else None
+                ),
             )
             write_plan(plan, render_plan_path)
             reporter.status(
@@ -10181,6 +10318,18 @@ def analyze(
                         MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
                     ),
                     "cadence": direct_cadence,
+                    "member_pose_dissolve_requested": direct_cadence[
+                        "member_pose_dissolve_requested"
+                    ],
+                    "member_pose_dissolve_effective": direct_cadence[
+                        "member_pose_dissolve_effective"
+                    ],
+                    "member_pose_dissolve_count": direct_cadence[
+                        "member_pose_dissolve_count"
+                    ],
+                    "pose_matched_dissolves": direct_cadence[
+                        "pose_matched_dissolves"
+                    ],
                     "visual_selection": _direct_member_visual_payload(
                         direct_visual_selection,
                         eligible_indices=eligible_indices,

@@ -46,12 +46,13 @@ HUMAN_REFERENCE_BOUNDARY_ANALYSIS_BASIS = (
     "human_reference_hard_cut_boundary_scalar_evidence_v2"
 )
 SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS = (
-    "decoded_output_segment_interior_identity_free_geometry_sampling_v2"
+    "decoded_output_segment_interior_shot_hierarchy_geometry_sampling_v3"
 )
 SEGMENT_INTERIOR_GEOMETRY_CONTRACT = (
     "render_plan_source_content_and_output_content_bound_segment_interior_"
-    "geometry_v2"
+    "geometry_v3"
 )
+SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION = 2
 SEGMENT_INTERIOR_SAMPLE_FRACTIONS = (0.25, 0.50, 0.75)
 _STABLE_PROXY_IDENTITY_FIELDS = (
     "width",
@@ -379,6 +380,11 @@ class OutputSubjectGeometry:
     silhouette_centroid_xy: tuple[float, float] | None = None
     silhouette_confidence: float = 0.0
     silhouette_backend: str = "none"
+    detected_person_count: int = 0
+    formation_boxes_xywh: tuple[
+        tuple[float, float, float, float], ...
+    ] = ()
+    shot_scale_basis: str = "unknown_no_subject_geometry"
 
     def __post_init__(self) -> None:
         if (
@@ -387,6 +393,12 @@ class OutputSubjectGeometry:
             or self.face_count < 0
         ):
             raise ValueError("face_count must be a non-negative integer")
+        if (
+            isinstance(self.detected_person_count, bool)
+            or not isinstance(self.detected_person_count, int)
+            or self.detected_person_count < 0
+        ):
+            raise ValueError("detected_person_count must be a non-negative integer")
         for name in ("face_bbox_xywh", "silhouette_bbox_xywh"):
             box = getattr(self, name)
             if box is None:
@@ -404,6 +416,26 @@ class OutputSubjectGeometry:
             ):
                 raise ValueError(f"{name} must fit normalized output bounds")
             object.__setattr__(self, name, (x, y, width, height))
+        normalized_formation: list[tuple[float, float, float, float]] = []
+        for raw in self.formation_boxes_xywh:
+            if len(raw) != 4:
+                raise ValueError("formation box needs four normalized values")
+            x, y, width, height = tuple(
+                _finite(value, "formation box") for value in raw
+            )
+            if not (
+                0.0 <= x <= 1.0
+                and 0.0 <= y <= 1.0
+                and 0.0 < width <= 1.0
+                and 0.0 < height <= 1.0
+                and x + width <= 1.000001
+                and y + height <= 1.000001
+            ):
+                raise ValueError("formation box must fit normalized output bounds")
+            normalized_formation.append((x, y, width, height))
+        object.__setattr__(
+            self, "formation_boxes_xywh", tuple(normalized_formation)
+        )
         if self.silhouette_centroid_xy is not None:
             centroid = tuple(
                 _finite(value, "silhouette centroid")
@@ -424,6 +456,10 @@ class OutputSubjectGeometry:
             "silhouette_backend",
             self.silhouette_backend.strip() or "none",
         )
+        basis = self.shot_scale_basis.strip()
+        if not basis:
+            raise ValueError("shot_scale_basis cannot be blank")
+        object.__setattr__(self, "shot_scale_basis", basis)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -446,6 +482,11 @@ class OutputSubjectGeometry:
             ),
             "silhouette_confidence": self.silhouette_confidence,
             "silhouette_backend": self.silhouette_backend,
+            "detected_person_count": self.detected_person_count,
+            "formation_boxes_xywh": [
+                list(box) for box in self.formation_boxes_xywh
+            ],
+            "shot_scale_basis": self.shot_scale_basis,
         }
 
 
@@ -471,6 +512,11 @@ def _default_geometry_provider(frame: np.ndarray) -> OutputSubjectGeometry:
         silhouette_centroid_xy=descriptor.silhouette_centroid_xy,
         silhouette_confidence=descriptor.silhouette_confidence,
         silhouette_backend=descriptor.silhouette_backend,
+        detected_person_count=descriptor.detected_person_count,
+        formation_boxes_xywh=tuple(
+            person.bbox_xywh for person in descriptor.formation_people
+        ),
+        shot_scale_basis=descriptor.shot_scale_basis,
     )
 
 
@@ -773,7 +819,7 @@ def _segment_interior_geometry_evidence(
         for sample in schedule
     ]
     core: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
         "analysis_basis": SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
         "contract": SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
         "source_index_domain": "render_plan_sources_array_index",
@@ -2696,6 +2742,7 @@ __all__ = [
     "RenderedProxyReview",
     "SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS",
     "SEGMENT_INTERIOR_GEOMETRY_CONTRACT",
+    "SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION",
     "SEGMENT_INTERIOR_SAMPLE_FRACTIONS",
     "TIER_D_CONTINUITY_DOMAIN",
     "derive_proxy_render_plan",

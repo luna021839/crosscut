@@ -34,6 +34,7 @@ def _automatic_request(
     root: Path,
     *,
     member: bool = False,
+    member_pose_dissolve_enabled: bool = True,
     desired: int | None = None,
     acquire_only: bool = False,
     song: str = "I AM",
@@ -49,6 +50,8 @@ def _automatic_request(
         "source_cache_directory": str(root / "cache"),
         "acquire_only": acquire_only,
     }
+    if member:
+        payload["member_pose_dissolve_enabled"] = member_pose_dissolve_enabled
     if desired is not None:
         payload["desired_source_count"] = desired
     return AnalysisRequest.from_dict(payload)
@@ -471,7 +474,11 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
     def test_member_target_ten_completes_with_four_verified_portrait_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            request = _automatic_request(root, member=True)
+            request = _automatic_request(
+                root,
+                member=True,
+                member_pose_dissolve_enabled=False,
+            )
             client = _FakeClient(_member_entries(4))
 
             artifact = acquire_sources(
@@ -496,6 +503,10 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
 
             materialized = request.with_materialized_sources(artifact.source_paths)
             self.assertEqual(len(materialized.sources), 4)
+            self.assertFalse(materialized.member_pose_dissolve_enabled)
+            self.assertFalse(
+                materialized.as_dict()["member_pose_dissolve_enabled"]
+            )
 
     def test_member_three_distinct_fancams_fail_the_four_source_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

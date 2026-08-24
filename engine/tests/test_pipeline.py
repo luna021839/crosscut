@@ -12,6 +12,9 @@ from unittest.mock import patch
 
 from crosscut.auto_anchor import AutoAnchorResult
 from crosscut.direct_member_visual import DirectMemberVisualSelectionError
+from crosscut.direct_member_transition import (
+    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT,
+)
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from crosscut.group_transition import GroupTransitionPlan
@@ -4570,6 +4573,11 @@ class PipelineTests(unittest.TestCase):
                     source_timewarps=timewarps,
                     scene_cut_times=scene_cut_times,
                     descriptor_provider=lambda *_args: None,
+                    eligible_source_durations_seconds=(120.0,) * 10,
+                    source_metadata_contract=(
+                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                    ),
+                    member_pose_dissolve_enabled=False,
                 )
             )
         self.assertEqual(
@@ -4609,6 +4617,15 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(cadence["source_switches_per_minute"], 13.5)
         self.assertAlmostEqual(cadence["source_run_median_seconds"], 4.0)
         self.assertAlmostEqual(cadence["longest_source_run_seconds"], 4.0)
+        self.assertFalse(cadence["member_pose_dissolve_requested"])
+        self.assertFalse(cadence["member_pose_dissolve_effective"])
+        self.assertEqual(cadence["member_pose_dissolve_count"], 0)
+        self.assertEqual(
+            cadence["pose_matched_dissolves"]["rejection_reason_counts"][
+                "effect_disabled_by_request"
+            ],
+            9,
+        )
         self.assertEqual(visual_selection.source_counts, (1,) * 10)
 
     def test_direct_full_frame_reference_length_avoids_the_200_cut_path(self) -> None:
@@ -5472,6 +5489,9 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(dense_face_provider.closed)
             plan = render_video.call_args.args[0]
+            self.assertTrue(plan.member_pose_dissolve_requested)
+            self.assertFalse(plan.member_pose_dissolve_effective)
+            self.assertEqual(plan.member_pose_dissolve_count, 0)
             self.assertEqual(len(plan.segments), 10)
             self.assertEqual(
                 [item.source_index for item in plan.segments],
@@ -5495,6 +5515,27 @@ class PipelineTests(unittest.TestCase):
             self.assertIsNone(manifest["member_draft"])
             direct = manifest["member_direct_full_frame"]
             self.assertTrue(direct["enabled"])
+            self.assertTrue(direct["member_pose_dissolve_requested"])
+            self.assertFalse(direct["member_pose_dissolve_effective"])
+            self.assertEqual(direct["member_pose_dissolve_count"], 0)
+            self.assertEqual(
+                direct["pose_matched_dissolves"]["hard_cut_count"],
+                9,
+            )
+            self.assertTrue(
+                direct["pose_matched_dissolves"][
+                    "source_metadata_contract_verified"
+                ]
+            )
+            self.assertTrue(
+                direct["pose_matched_dissolves"]["planner_completed"]
+            )
+            self.assertNotIn(
+                "source_duration_evidence_missing_or_invalid",
+                direct["pose_matched_dissolves"][
+                    "rejection_reason_counts"
+                ],
+            )
             self.assertEqual(
                 direct["policy"],
                 OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,

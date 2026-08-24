@@ -1251,7 +1251,16 @@ def _attach_valid_segment_interior_geometry(
             int(frame[0, 0, 0])
         ]
         if shot_class == "wide":
-            return OutputSubjectGeometry(face_count=0)
+            return OutputSubjectGeometry(
+                face_count=0,
+                detected_person_count=3,
+                formation_boxes_xywh=(
+                    (0.15, 0.30, 0.14, 0.48),
+                    (0.43, 0.26, 0.15, 0.54),
+                    (0.71, 0.31, 0.13, 0.47),
+                ),
+                shot_scale_basis="aggregate_formation_people",
+            )
         height = 0.15 if shot_class == "medium" else 0.30
         return OutputSubjectGeometry(
             face_count=1,

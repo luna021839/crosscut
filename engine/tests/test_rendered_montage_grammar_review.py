@@ -366,8 +366,16 @@ def _attach_segment_interior_geometry(
             int(frame[0, 0, 0])
         ]
         if shot_class == "wide":
-            # Exercise the exact visual_score no-face => group-wide fallback.
-            return OutputSubjectGeometry(face_count=0)
+            return OutputSubjectGeometry(
+                face_count=0,
+                detected_person_count=3,
+                formation_boxes_xywh=(
+                    (0.14, 0.30, 0.15, 0.50),
+                    (0.42, 0.27, 0.16, 0.55),
+                    (0.70, 0.31, 0.14, 0.49),
+                ),
+                shot_scale_basis="aggregate_formation_people",
+            )
         height = 0.15 if shot_class == "medium" else 0.30
         return OutputSubjectGeometry(
             face_count=1,
@@ -511,7 +519,7 @@ def _hash_bound_montage_config() -> RenderedMontageGrammarConfig:
 
 
 class RenderedMontageGrammarReviewTests(unittest.TestCase):
-    def test_successful_no_face_geometry_matches_visual_score_wide_fallback(
+    def test_no_face_without_body_geometry_is_unknown_not_wide(
         self,
     ) -> None:
         self.assertEqual(
@@ -519,7 +527,70 @@ class RenderedMontageGrammarReviewTests(unittest.TestCase):
                 {"face_count": 0, "face_bbox_xywh": None},
                 RenderedMontageGrammarConfig(),
             ),
+            "unknown",
+        )
+
+    def test_no_face_proxy_uses_person_geometry_hierarchy(self) -> None:
+        config = RenderedMontageGrammarConfig()
+        self.assertEqual(
+            _proxy_geometry_shot_class(
+                OutputSubjectGeometry(
+                    detected_person_count=1,
+                    formation_boxes_xywh=((0.40, 0.14, 0.20, 0.72),),
+                    shot_scale_basis="single_or_pair_performer_bbox",
+                ).to_dict(),
+                config,
+            ),
+            "medium",
+        )
+        self.assertEqual(
+            _proxy_geometry_shot_class(
+                OutputSubjectGeometry(
+                    detected_person_count=3,
+                    formation_boxes_xywh=(
+                        (0.15, 0.30, 0.14, 0.48),
+                        (0.43, 0.26, 0.15, 0.54),
+                        (0.71, 0.31, 0.13, 0.47),
+                    ),
+                    shot_scale_basis="aggregate_formation_people",
+                ).to_dict(),
+                config,
+            ),
             "wide",
+        )
+        self.assertEqual(
+            _proxy_geometry_shot_class(
+                OutputSubjectGeometry(
+                    face_count=1,
+                    face_bbox_xywh=(0.46, 0.22, 0.08, 0.08),
+                    detected_person_count=3,
+                    formation_boxes_xywh=(
+                        (0.15, 0.30, 0.14, 0.48),
+                        (0.43, 0.26, 0.15, 0.54),
+                        (0.71, 0.31, 0.13, 0.47),
+                    ),
+                    shot_scale_basis="aggregate_formation_people",
+                ).to_dict(),
+                config,
+            ),
+            "wide",
+        )
+        self.assertEqual(
+            _proxy_geometry_shot_class(
+                OutputSubjectGeometry(
+                    face_count=1,
+                    face_bbox_xywh=(0.40, 0.18, 0.20, 0.28),
+                    detected_person_count=3,
+                    formation_boxes_xywh=(
+                        (0.15, 0.30, 0.14, 0.48),
+                        (0.43, 0.26, 0.15, 0.54),
+                        (0.71, 0.31, 0.13, 0.47),
+                    ),
+                    shot_scale_basis="aggregate_formation_people",
+                ).to_dict(),
+                config,
+            ),
+            "close",
         )
 
     def test_all_wide_bridge_cannot_bypass_role_conditioned_duration_gate(

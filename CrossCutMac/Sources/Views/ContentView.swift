@@ -30,6 +30,17 @@ enum ProjectSettingsControlPolicy {
     ) -> Bool {
         editMode == .member && sourceMode == .local && !isRunning
     }
+
+    static func showsMemberPoseDissolve(
+        editMode: EditMode,
+        sourceMode: SourceMode
+    ) -> Bool {
+        // Pose-matched dissolve currently depends on the official-fancam
+        // provenance and full-frame endpoint evidence produced by automatic
+        // member acquisition. Local confirmed-anchor tracking intentionally
+        // stays on its existing hard-cut path.
+        editMode == .member && sourceMode == .automatic
+    }
 }
 
 struct ContentView: View {
@@ -41,6 +52,7 @@ struct ContentView: View {
     @State private var song = ""
     @State private var targetMember = IVEMember.anYujin
     @State private var editMode = EditMode.group
+    @State private var memberPoseDissolveEnabled = true
     @State private var aspectRatio = OutputAspectRatio.landscape
     @State private var manuallySelectedMemberAspectRatio: OutputAspectRatio?
     @State private var sourceMode = SourceMode.automatic
@@ -266,6 +278,22 @@ struct ContentView: View {
                     .pickerStyle(.menu)
                     .disabled(!canSelectMember)
                     .opacity(canSelectMember ? 1 : 0.55)
+                }
+
+                if ProjectSettingsControlPolicy.showsMemberPoseDissolve(
+                    editMode: editMode,
+                    sourceMode: sourceMode
+                ) {
+                    labeled("멤버 전환 효과") {
+                        Toggle("포즈 매치 디졸브", isOn: $memberPoseDissolveEnabled)
+                            .disabled(runner.state.isRunning)
+                        Text(
+                            "자세·얼굴 위치가 충분히 맞는 멤버 직캠 경계만 짧게 블렌드합니다. 조건을 통과하지 못한 경계는 하드컷을 유지합니다."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 labeled("화면 비율") {
@@ -727,6 +755,9 @@ struct ContentView: View {
                 aspectRatio: aspectRatio,
                 sources: [],
                 outputDirectory: outputDirectory,
+                memberPoseDissolveEnabled: (
+                    editMode == .member ? memberPoseDissolveEnabled : false
+                ),
                 sourceMode: .automatic,
                 desiredSourceCount: automaticSourceCount,
                 sourceCacheDirectory: automaticCacheDirectory,
@@ -762,7 +793,8 @@ struct ContentView: View {
             aspectRatio: aspectRatio,
             sources: selectedVideos.map(\.url),
             outputDirectory: outputDirectory,
-            memberAnchors: memberAnchors
+            memberAnchors: memberAnchors,
+            memberPoseDissolveEnabled: false
         )
         runner.start(request: request)
     }

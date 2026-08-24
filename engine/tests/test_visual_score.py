@@ -700,6 +700,108 @@ class VisualScoreTests(unittest.TestCase):
         self.assertEqual(persisted["formation_upper_body_count"], 1)
         self.assertNotIn("formation_people", persisted)
 
+    def test_no_face_uses_single_performer_geometry_instead_of_forcing_wide(self) -> None:
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        subject = SubjectGeometryDescriptor(
+            detected_person_count=1,
+            formation_people=(formation_person(0.5),),
+        )
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=subject,
+        ), patch("crosscut.visual_score._detect_faces", return_value=((), "test")):
+            descriptor = describe_frame(frame)
+
+        self.assertEqual(descriptor.shot_type, ShotType.MEDIUM)
+        self.assertEqual(
+            descriptor.shot_scale_basis,
+            "single_or_pair_performer_bbox",
+        )
+        self.assertEqual(
+            descriptor.to_dict()["shot_scale_basis"],
+            "single_or_pair_performer_bbox",
+        )
+
+    def test_no_face_multi_person_geometry_is_aggregate_wide(self) -> None:
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        subject = SubjectGeometryDescriptor(
+            detected_person_count=3,
+            formation_people=(
+                formation_person(0.25),
+                formation_person(0.50),
+                formation_person(0.75),
+            ),
+        )
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=subject,
+        ), patch("crosscut.visual_score._detect_faces", return_value=((), "test")):
+            descriptor = describe_frame(frame)
+
+        self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
+        self.assertEqual(descriptor.shot_scale_basis, "aggregate_formation_people")
+
+    def test_large_dominant_face_precedes_background_formation_people(self) -> None:
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        subject = SubjectGeometryDescriptor(
+            detected_person_count=3,
+            formation_people=(
+                formation_person(0.25),
+                formation_person(0.50),
+                formation_person(0.75),
+            ),
+        )
+        face = _DetectedFace((120.0, 28.0, 64.0, 72.0))
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=subject,
+        ), patch(
+            "crosscut.visual_score._detect_faces",
+            return_value=((face,), "test"),
+        ):
+            descriptor = describe_frame(frame)
+
+        self.assertEqual(descriptor.shot_type, ShotType.CLOSE_UP)
+        self.assertEqual(descriptor.shot_scale_basis, "dominant_face_height")
+
+    def test_small_partial_face_does_not_demote_multi_person_formation(self) -> None:
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        subject = SubjectGeometryDescriptor(
+            detected_person_count=3,
+            formation_people=(
+                formation_person(0.25),
+                formation_person(0.50),
+                formation_person(0.75),
+            ),
+        )
+        face = _DetectedFace((145.0, 50.0, 30.0, 24.0))
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=subject,
+        ), patch(
+            "crosscut.visual_score._detect_faces",
+            return_value=((face,), "test"),
+        ):
+            descriptor = describe_frame(frame)
+
+        self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
+        self.assertEqual(descriptor.shot_scale_basis, "aggregate_formation_people")
+
+    def test_missing_face_and_body_geometry_is_explicit_unknown_not_observed_wide(self) -> None:
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=SubjectGeometryDescriptor(),
+        ), patch("crosscut.visual_score._detect_faces", return_value=((), "test")):
+            descriptor = describe_frame(frame)
+
+        self.assertEqual(descriptor.shot_type, ShotType.MEDIUM)
+        self.assertEqual(descriptor.shot_scale, 0.34)
+        self.assertEqual(
+            descriptor.shot_scale_basis,
+            "unknown_no_subject_geometry",
+        )
+
     def test_visual_plan_exposes_selected_body_transition_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             paths = self.write_constant_sources(
@@ -742,6 +844,12 @@ class VisualScoreTests(unittest.TestCase):
         self.assertTrue(describe.call_args_list[2].kwargs["include_formation_pose"])
         self.assertNotIn("include_formation_pose", describe.call_args_list[3].kwargs)
         self.assertNotIn("include_formation_pose", describe.call_args_list[4].kwargs)
+
+        self.assertEqual(plan.choices[1].shot_scale_bases, ("legacy",) * 3)
+        self.assertEqual(
+            plan.choices[1].to_dict()["shot_scale_bases"],
+            ["legacy", "legacy", "legacy"],
+        )
 
         self.assertEqual(
             plan.choices[1].pose_transition_basis_from_previous,
@@ -1337,7 +1445,7 @@ class VisualScoreTests(unittest.TestCase):
         self.assertLessEqual(self.maximum_source_run(sources), 6)
         self.assertEqual(
             plan.analysis_basis,
-            "reviewed_thirty_two_candidate_native_cut_and_boundary_stability_safe_v12",
+            "reviewed_thirty_two_candidate_shot_hierarchy_boundary_stability_safe_v13",
         )
 
     def test_nine_equal_sources_follow_full_coverage_preferences(self) -> None:

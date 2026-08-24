@@ -902,6 +902,9 @@ class RenderPlan:
     height: int = 1080
     fps: float = 29.97
     transitions: tuple[RenderTransition, ...] = ()
+    member_pose_dissolve_requested: bool | None = None
+    member_pose_dissolve_effective: bool | None = None
+    member_pose_dissolve_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.aspect_ratio, AspectRatio):
@@ -952,6 +955,57 @@ class RenderPlan:
             )
         if len(self.transitions) != len(self.segments) - 1:
             raise ValueError("render plan needs one transition per segment boundary")
+        member_dissolve_fields = (
+            self.member_pose_dissolve_requested,
+            self.member_pose_dissolve_effective,
+            self.member_pose_dissolve_count,
+        )
+        if any(value is not None for value in member_dissolve_fields):
+            if not all(value is not None for value in member_dissolve_fields):
+                raise ValueError(
+                    "member pose dissolve render metadata must be complete"
+                )
+            if not isinstance(
+                self.member_pose_dissolve_requested,
+                bool,
+            ) or not isinstance(self.member_pose_dissolve_effective, bool):
+                raise TypeError("member pose dissolve render flags must be boolean")
+            if (
+                isinstance(self.member_pose_dissolve_count, bool)
+                or not isinstance(self.member_pose_dissolve_count, int)
+                or self.member_pose_dissolve_count < 0
+            ):
+                raise ValueError("member pose dissolve render count is invalid")
+            actual_member_dissolves = sum(
+                transition.kind is TransitionKind.FACE_DISSOLVE
+                and transition.reason
+                == "official_target_member_pose_matched_logistic_face_dissolve_v1"
+                for transition in self.transitions
+            )
+            actual_face_dissolves = sum(
+                transition.kind is TransitionKind.FACE_DISSOLVE
+                for transition in self.transitions
+            )
+            if actual_face_dissolves != actual_member_dissolves:
+                raise ValueError(
+                    "direct member render contains an uncontracted face dissolve"
+                )
+            if self.member_pose_dissolve_count != actual_member_dissolves:
+                raise ValueError(
+                    "member pose dissolve render count disagrees with transitions"
+                )
+            if self.member_pose_dissolve_effective != bool(actual_member_dissolves):
+                raise ValueError(
+                    "member pose dissolve effective flag disagrees with transitions"
+                )
+            if not self.member_pose_dissolve_requested and (
+                self.member_pose_dissolve_effective
+                or self.member_pose_dissolve_count != 0
+                or actual_face_dissolves != 0
+            ):
+                raise ValueError(
+                    "disabled member pose dissolve cannot author an effect"
+                )
         counts = segment_frame_counts(self)
         for segment, frame_count in zip(self.segments, counts, strict=True):
             if segment.editorial_transform is None:
@@ -1105,6 +1159,13 @@ class RenderPlan:
             "transitions": [
                 transition.to_dict(self.fps) for transition in self.transitions
             ],
+            "member_pose_dissolve_requested": (
+                self.member_pose_dissolve_requested
+            ),
+            "member_pose_dissolve_effective": (
+                self.member_pose_dissolve_effective
+            ),
+            "member_pose_dissolve_count": self.member_pose_dissolve_count,
             "duration": self.duration,
             "render_duration": self.render_duration,
             "output_frame_count": self.output_frame_count,

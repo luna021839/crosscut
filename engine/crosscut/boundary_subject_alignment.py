@@ -40,7 +40,7 @@ from .render import (
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
-ANALYSIS_BASIS = "exact_cut_frame_boundary_local_subject_alignment_v1"
+ANALYSIS_BASIS = "exact_cut_frame_shot_adaptive_subject_alignment_v2"
 FrameProvider = Callable[[int, float], np.ndarray | None]
 
 
@@ -55,6 +55,10 @@ class BoundarySubjectObservation:
     face_eye_scale: float | None = None
     silhouette_box_xywh: tuple[float, float, float, float] | None = None
     silhouette_confidence: float = 0.0
+    detected_person_count: int = 0
+    formation_boxes_xywh: tuple[
+        tuple[float, float, float, float], ...
+    ] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -83,6 +87,31 @@ class BoundarySubjectObservation:
             ):
                 raise ValueError(f"{name} must fit normalized output bounds")
             object.__setattr__(self, name, box)
+        if (
+            isinstance(self.detected_person_count, bool)
+            or not isinstance(self.detected_person_count, int)
+            or self.detected_person_count < 0
+        ):
+            raise ValueError("detected_person_count must be a non-negative integer")
+        formation_boxes: list[tuple[float, float, float, float]] = []
+        for raw in self.formation_boxes_xywh:
+            if len(raw) != 4:
+                raise ValueError("formation box needs four normalized values")
+            box = tuple(float(value) for value in raw)
+            if not all(math.isfinite(value) for value in box):
+                raise ValueError("formation boxes must be finite")
+            x_value, y_value, width, height = box
+            if not (
+                0.0 <= x_value <= 1.0
+                and 0.0 <= y_value <= 1.0
+                and 0.0 < width <= 1.0
+                and 0.0 < height <= 1.0
+                and x_value + width <= 1.000001
+                and y_value + height <= 1.000001
+            ):
+                raise ValueError("formation boxes must fit normalized output bounds")
+            formation_boxes.append(box)
+        object.__setattr__(self, "formation_boxes_xywh", tuple(formation_boxes))
         if self.face_landmarks_xy is not None:
             landmarks = tuple(
                 (float(point[0]), float(point[1]))
@@ -143,7 +172,7 @@ class BoundarySubjectAlignmentConfig:
     analysis_width: int = 854
     analysis_height: int = 480
     renderer_schema_max_zoom: float = 1.18
-    conservative_1080_max_zoom: float = 1.10
+    conservative_1080_max_zoom: float = 1.18
     native_1440_max_zoom: float = 1.33
     native_2160_max_zoom: float = 2.0
     unknown_resolution_max_zoom: float = 1.06
@@ -152,6 +181,17 @@ class BoundarySubjectAlignmentConfig:
     minimum_silhouette_confidence: float = 0.72
     minimum_face_visible_fraction: float = 0.995
     minimum_silhouette_visible_fraction: float = 0.92
+    minimum_performer_visible_fraction: float = 0.985
+    maximum_face_zoom: float = 1.18
+    maximum_upper_body_zoom: float = 1.16
+    maximum_formation_zoom: float = 1.08
+    maximum_silhouette_zoom: float = 1.08
+    maximum_face_center_shift: float = 0.040
+    maximum_upper_body_center_shift: float = 0.040
+    maximum_formation_center_shift: float = 0.018
+    maximum_silhouette_center_shift: float = 0.025
+    maximum_transformed_layout_mismatch: float = 0.34
+    maximum_layout_worsening: float = 0.02
     minimum_geometry_improvement: float = 0.015
     minimum_geometry_improvement_fraction: float = 0.10
     already_matched_scale_ratio: float = 1.015
@@ -181,6 +221,17 @@ class BoundarySubjectAlignmentConfig:
                 "minimum_silhouette_confidence",
                 "minimum_face_visible_fraction",
                 "minimum_silhouette_visible_fraction",
+                "minimum_performer_visible_fraction",
+                "maximum_face_zoom",
+                "maximum_upper_body_zoom",
+                "maximum_formation_zoom",
+                "maximum_silhouette_zoom",
+                "maximum_face_center_shift",
+                "maximum_upper_body_center_shift",
+                "maximum_formation_center_shift",
+                "maximum_silhouette_center_shift",
+                "maximum_transformed_layout_mismatch",
+                "maximum_layout_worsening",
                 "minimum_geometry_improvement",
                 "minimum_geometry_improvement_fraction",
                 "already_matched_scale_ratio",
@@ -210,6 +261,48 @@ class BoundarySubjectAlignmentConfig:
             raise ValueError("face containment threshold is invalid")
         if not 0.8 <= self.minimum_silhouette_visible_fraction <= 1.0:
             raise ValueError("silhouette containment threshold is invalid")
+        if not 0.8 <= self.minimum_performer_visible_fraction <= 1.0:
+            raise ValueError("performer containment threshold is invalid")
+        for value in (
+            self.maximum_face_zoom,
+            self.maximum_upper_body_zoom,
+            self.maximum_formation_zoom,
+            self.maximum_silhouette_zoom,
+        ):
+            if not 1.0 < value <= self.renderer_schema_max_zoom:
+                raise ValueError("subject zoom cap exceeds the renderer schema")
+        for value in (
+            self.maximum_face_center_shift,
+            self.maximum_upper_body_center_shift,
+            self.maximum_formation_center_shift,
+            self.maximum_silhouette_center_shift,
+        ):
+            if not 0.0 <= value <= self.maximum_center_shift:
+                raise ValueError("subject pan cap exceeds the renderer schema")
+        if not 0.0 < self.maximum_transformed_layout_mismatch < 1.0:
+            raise ValueError("layout mismatch cap must be normalized")
+        if not 0.0 <= self.maximum_layout_worsening <= 0.10:
+            raise ValueError("layout worsening tolerance is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _SubjectGeometry:
+    kind: str
+    alignment_box: tuple[float, float, float, float]
+    scale: float
+    roll_radians: float | None = None
+    containment_boxes: tuple[tuple[float, float, float, float], ...] = ()
+    layout_boxes: tuple[tuple[float, float, float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"face", "upper_body", "formation", "silhouette"}:
+            raise ValueError("unsupported shot-adaptive alignment subject")
+        if not math.isfinite(self.scale) or self.scale <= 0.0:
+            raise ValueError("alignment subject scale must be positive")
+        if not self.containment_boxes:
+            object.__setattr__(self, "containment_boxes", (self.alignment_box,))
+        if not self.layout_boxes:
+            object.__setattr__(self, "layout_boxes", self.containment_boxes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +362,10 @@ class BoundarySubjectAlignmentDecision:
     partial_scale_alignment: bool = False
     validated_output_frame_count: int = 0
     optical_flow_containment_frame_count: int = 0
+    outgoing_shot_policy: str | None = None
+    incoming_shot_policy: str | None = None
+    baseline_layout_mismatch: float | None = None
+    transformed_layout_mismatch: float | None = None
 
     def __post_init__(self) -> None:
         if self.boundary_index < 0 or min(
@@ -285,7 +382,12 @@ class BoundarySubjectAlignmentDecision:
             raise ValueError("boundary source clocks must be finite and non-negative")
         if self.eligible == bool(self.rejection_reason):
             raise ValueError("eligible decision and rejection reason disagree")
-        if self.subject_kind is not None and self.subject_kind not in {"face", "silhouette"}:
+        if self.subject_kind is not None and self.subject_kind not in {
+            "face",
+            "upper_body",
+            "formation",
+            "silhouette",
+        }:
             raise ValueError("boundary subject kind is invalid")
         if self.transformed_side is not None and self.transformed_side not in {
             "outgoing",
@@ -334,6 +436,10 @@ class BoundarySubjectAlignmentDecision:
             "optical_flow_containment_frame_count": (
                 self.optical_flow_containment_frame_count
             ),
+            "outgoing_shot_policy": self.outgoing_shot_policy,
+            "incoming_shot_policy": self.incoming_shot_policy,
+            "baseline_layout_mismatch": self.baseline_layout_mismatch,
+            "transformed_layout_mismatch": self.transformed_layout_mismatch,
         }
 
 
@@ -419,9 +525,21 @@ class BoundarySubjectAlignmentPlan:
 
     def to_dict(self) -> dict[str, Any]:
         rejections: dict[str, int] = {}
+        subjects: dict[str, int] = {}
+        eligible_subjects: dict[str, int] = {}
         for item in self.decisions:
             if item.rejection_reason is not None:
                 rejections[item.rejection_reason] = rejections.get(item.rejection_reason, 0) + 1
+            if item.subject_kind is not None:
+                subjects[item.subject_kind] = subjects.get(item.subject_kind, 0) + 1
+                if item.eligible:
+                    eligible_subjects[item.subject_kind] = (
+                        eligible_subjects.get(item.subject_kind, 0) + 1
+                    )
+        hard_cut_decision_count = sum(
+            item.rejection_reason != "unreviewed_dissolve_overlap"
+            for item in self.decisions
+        )
         return {
             "analysis_basis": self.analysis_basis,
             "policy": {
@@ -431,6 +549,11 @@ class BoundarySubjectAlignmentPlan:
                 "native_internal_cuts_transformed": False,
                 "dissolve_overlap_transformed": False,
                 "frame_validation": "every_transformed_output_frame_after_base_crop",
+                "shot_policy": (
+                    "close_face_medium_upper_body_wide_formation_"
+                    "with_silhouette_fail_closed_fallback"
+                ),
+                "group_transition_kind": "hard_cut_only",
                 "legacy_editorial_schema_globally_relaxed": False,
             },
             "decision_count": len(self.decisions),
@@ -442,6 +565,20 @@ class BoundarySubjectAlignmentPlan:
             "optical_flow_containment_frame_count": (
                 self.optical_flow_containment_frame_count
             ),
+            "hard_cut_decision_count": hard_cut_decision_count,
+            "applied_boundary_density": (
+                self.eligible_count / hard_cut_decision_count
+                if hard_cut_decision_count
+                else 0.0
+            ),
+            "alignment_subject_counts": [
+                {"subject": subject, "count": count}
+                for subject, count in sorted(subjects.items())
+            ],
+            "eligible_alignment_subject_counts": [
+                {"subject": subject, "count": count}
+                for subject, count in sorted(eligible_subjects.items())
+            ],
             "rejection_counts": [
                 {"reason": reason, "count": count}
                 for reason, count in sorted(rejections.items())
@@ -520,6 +657,10 @@ def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservati
         face_eye_scale=descriptor.primary_face_eye_scale,
         silhouette_box_xywh=descriptor.silhouette_bbox_xywh,
         silhouette_confidence=descriptor.silhouette_confidence,
+        detected_person_count=descriptor.detected_person_count,
+        formation_boxes_xywh=tuple(
+            person.bbox_xywh for person in descriptor.formation_people
+        ),
     )
 
 
@@ -629,37 +770,188 @@ def _source_seconds(
     )
 
 
+def _union_box(
+    boxes: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
+    if not boxes:
+        raise ValueError("cannot union an empty box set")
+    left = min(box[0] for box in boxes)
+    top = min(box[1] for box in boxes)
+    right = max(box[0] + box[2] for box in boxes)
+    bottom = max(box[1] + box[3] for box in boxes)
+    return (left, top, right - left, bottom - top)
+
+
+def _upper_body_box(
+    person_box: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    left, top, width, height = person_box
+    # Screen-space shoulders/hands/hips anchor.  The full person box remains a
+    # separate containment envelope, so matching the upper body cannot crop
+    # hands or feet out of the decoded settle window.
+    inset = width * 0.04
+    return (left + inset, top, width - 2.0 * inset, height * 0.66)
+
+
+def _central_person_box(
+    boxes: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float] | None:
+    if not boxes:
+        return None
+    ranked = sorted(
+        boxes,
+        key=lambda box: (
+            math.hypot(_center(box)[0] - 0.5, _center(box)[1] - 0.48),
+            -(box[2] * box[3]),
+            box[0],
+        ),
+    )
+    if len(ranked) > 1:
+        first_distance = math.hypot(
+            _center(ranked[0])[0] - 0.5,
+            _center(ranked[0])[1] - 0.48,
+        )
+        second_distance = math.hypot(
+            _center(ranked[1])[0] - 0.5,
+            _center(ranked[1])[1] - 0.48,
+        )
+        first_area = ranked[0][2] * ranked[0][3]
+        second_area = ranked[1][2] * ranked[1][3]
+        if abs(first_distance - second_distance) < 0.035 and (
+            min(first_area, second_area) / max(first_area, second_area) > 0.82
+        ):
+            return None
+    return ranked[0]
+
+
+def _associated_person_box(
+    face_box: tuple[float, float, float, float],
+    boxes: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float] | None:
+    face_center = _center(face_box)
+    containing = tuple(
+        box
+        for box in boxes
+        if box[0] - 0.02 <= face_center[0] <= box[0] + box[2] + 0.02
+        and box[1] - 0.02 <= face_center[1] <= box[1] + box[3] + 0.02
+    )
+    if not containing:
+        return None
+    return min(containing, key=lambda box: math.hypot(
+        _center(box)[0] - face_center[0], _center(box)[1] - face_center[1]
+    ))
+
+
+def _shot_policy(observation: BoundarySubjectObservation) -> str:
+    boxes = observation.formation_boxes_xywh
+    observed_people = max(observation.detected_person_count, len(boxes))
+    if (
+        observation.face_count == 1
+        and observation.face_box_xywh is not None
+        and observation.face_box_xywh[3] >= 0.2184
+    ):
+        return "close_face"
+    if observed_people >= 3 or len(boxes) >= 3:
+        return "wide_formation"
+    if observation.face_count == 1 and observation.face_box_xywh is not None:
+        return "medium_focus"
+    if boxes:
+        if len(boxes) == 1:
+            box = boxes[0]
+            clipped = box[1] <= 0.035 or box[1] + box[3] >= 0.965
+            if clipped and box[3] >= 0.68:
+                return "close_upper_body"
+        return "medium_focus"
+    if (
+        observation.silhouette_box_xywh is not None
+        and observation.silhouette_confidence >= 0.72
+    ):
+        box = observation.silhouette_box_xywh
+        if box[2] >= 0.56 or box[3] < 0.50:
+            return "wide_formation"
+        return "medium_silhouette"
+    return "unknown"
+
+
 def _subject(
     observation: BoundarySubjectObservation,
     *,
     preferred_kind: str | None,
     settings: BoundarySubjectAlignmentConfig,
-) -> tuple[
-    str,
-    tuple[float, float, float, float],
-    float | None,
-    float | None,
-] | None:
+) -> _SubjectGeometry | None:
+    boxes = observation.formation_boxes_xywh
     if preferred_kind in (None, "face") and (
         observation.face_count == 1 and observation.face_box_xywh is not None
     ):
-        return (
+        face_box = observation.face_box_xywh
+        performer = _associated_person_box(face_box, boxes)
+        containment = (performer,) if performer is not None else (face_box,)
+        return _SubjectGeometry(
             "face",
-            observation.face_box_xywh,
-            observation.face_eye_scale,
+            face_box,
+            observation.face_eye_scale or face_box[3],
             observation.face_head_roll_radians,
+            containment,
+            containment,
+        )
+    if preferred_kind in (None, "upper_body"):
+        performer = _central_person_box(boxes)
+        if performer is not None and len(boxes) <= 2:
+            upper = _upper_body_box(performer)
+            return _SubjectGeometry(
+                "upper_body",
+                upper,
+                upper[3],
+                None,
+                (performer,),
+                (performer,),
+            )
+    if preferred_kind in (None, "formation") and len(boxes) >= 2:
+        aggregate = _union_box(boxes)
+        return _SubjectGeometry(
+            "formation",
+            aggregate,
+            aggregate[3],
+            None,
+            boxes,
+            boxes,
         )
     if preferred_kind in (None, "silhouette") and (
         observation.silhouette_box_xywh is not None
         and observation.silhouette_confidence >= settings.minimum_silhouette_confidence
     ):
-        return (
+        return _SubjectGeometry(
             "silhouette",
             observation.silhouette_box_xywh,
-            None,
+            observation.silhouette_box_xywh[3],
             None,
         )
     return None
+
+
+def _common_subjects(
+    outgoing: BoundarySubjectObservation,
+    incoming: BoundarySubjectObservation,
+    *,
+    settings: BoundarySubjectAlignmentConfig,
+) -> tuple[_SubjectGeometry | None, _SubjectGeometry | None, str | None]:
+    outgoing_policy = _shot_policy(outgoing)
+    incoming_policy = _shot_policy(incoming)
+    outgoing_wide = outgoing_policy == "wide_formation"
+    incoming_wide = incoming_policy == "wide_formation"
+    if outgoing_wide != incoming_wide:
+        return (None, None, "shot_policy_family_mismatch")
+    preferred: tuple[str, ...]
+    if outgoing_wide:
+        preferred = ("formation", "silhouette")
+    else:
+        preferred = ("face", "upper_body", "silhouette")
+    for kind in preferred:
+        left = _subject(outgoing, preferred_kind=kind, settings=settings)
+        right = _subject(incoming, preferred_kind=kind, settings=settings)
+        if left is not None and right is not None:
+            return (left, right, None)
+    return (None, None, "exact_common_subject_geometry_unavailable")
 
 
 def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -676,6 +968,63 @@ def _geometry_mismatch(
     height = min(1.0, abs(math.log(left[3] / right[3])) / math.log(1.8))
     width = min(1.0, abs(math.log(left[2] / right[2])) / math.log(1.8))
     return 0.58 * center + 0.24 * height + 0.18 * width
+
+
+def _layout_mismatch(
+    left: Sequence[tuple[float, float, float, float]],
+    right: Sequence[tuple[float, float, float, float]],
+) -> float:
+    if not left or not right:
+        return 1.0
+    left_sorted = sorted(left, key=lambda box: _center(box)[0])
+    right_sorted = sorted(right, key=lambda box: _center(box)[0])
+    count_penalty = abs(len(left_sorted) - len(right_sorted)) / max(
+        len(left_sorted), len(right_sorted)
+    )
+    comparable = min(len(left_sorted), len(right_sorted))
+    pair_mismatch = 0.0
+    for left_box, right_box in zip(
+        left_sorted[:comparable], right_sorted[:comparable], strict=True
+    ):
+        pair_mismatch += _geometry_mismatch(left_box, right_box)
+    return min(1.0, 0.45 * count_penalty + 0.55 * pair_mismatch / comparable)
+
+
+def _subject_zoom_cap(
+    kind: str,
+    settings: BoundarySubjectAlignmentConfig,
+) -> float:
+    return {
+        "face": settings.maximum_face_zoom,
+        "upper_body": settings.maximum_upper_body_zoom,
+        "formation": settings.maximum_formation_zoom,
+        "silhouette": settings.maximum_silhouette_zoom,
+    }[kind]
+
+
+def _subject_center_shift_cap(
+    kind: str,
+    settings: BoundarySubjectAlignmentConfig,
+) -> float:
+    return {
+        "face": settings.maximum_face_center_shift,
+        "upper_body": settings.maximum_upper_body_center_shift,
+        "formation": settings.maximum_formation_center_shift,
+        "silhouette": settings.maximum_silhouette_center_shift,
+    }[kind]
+
+
+def _subject_visibility_threshold(
+    kind: str,
+    settings: BoundarySubjectAlignmentConfig,
+) -> float:
+    if kind == "face":
+        # If a full performer envelope is available, the denser performer
+        # threshold below is used for every containment box.
+        return settings.minimum_face_visible_fraction
+    if kind in {"upper_body", "formation"}:
+        return settings.minimum_performer_visible_fraction
+    return settings.minimum_silhouette_visible_fraction
 
 
 def _project_point(
@@ -877,6 +1226,7 @@ def _target_state(
     target_box: tuple[float, float, float, float],
     zoom: float,
     roll_degrees: float,
+    maximum_center_shift: float,
     settings: BoundarySubjectAlignmentConfig,
 ) -> tuple[_TransformState | None, bool]:
     source_center = _center(box)
@@ -887,7 +1237,7 @@ def _target_state(
         desired_x,
         desired_y,
         zoom=zoom,
-        maximum_shift=settings.maximum_center_shift,
+        maximum_shift=maximum_center_shift,
     )
     roll_applied = abs(roll_degrees) > 1e-6
     candidate = _TransformState(zoom, center_x, center_y, roll_degrees)
@@ -1121,12 +1471,9 @@ def build_boundary_subject_alignment_plan(
         choice_index: int,
         frame_index: int,
         preferred_kind: str,
-    ) -> tuple[
-        str,
-        tuple[float, float, float, float],
-        float | None,
-        float | None,
-    ] | None:
+    ) -> _SubjectGeometry | None:
+        if preferred_kind not in {"face", "silhouette"}:
+            return None
         target = canonical_frame_at(choice_index, frame_index)
         if target is None:
             return None
@@ -1153,19 +1500,58 @@ def build_boundary_subject_alignment_plan(
                 tracked_box = _optical_flow_box(
                     reference,
                     target,
-                    reference_subject[1],
+                    reference_subject.alignment_box,
                 )
-                if tracked_box is not None:
-                    return (
-                        preferred_kind,
-                        tracked_box,
-                        None,
-                        None,
-                    )
+                if tracked_box is None:
+                    continue
+                # Preserve every envelope proved on the reference frame.  A
+                # face-only optical fallback must not silently discard an
+                # associated full-performer box and thereby weaken hands/feet
+                # or layout containment during a one-frame detector miss.
+                tracked_by_box: dict[
+                    tuple[float, float, float, float],
+                    tuple[float, float, float, float],
+                ] = {reference_subject.alignment_box: tracked_box}
+
+                def tracked_boxes(
+                    boxes: Sequence[tuple[float, float, float, float]],
+                ) -> tuple[tuple[float, float, float, float], ...] | None:
+                    values: list[tuple[float, float, float, float]] = []
+                    for reference_box in boxes:
+                        tracked = tracked_by_box.get(reference_box)
+                        if tracked is None:
+                            tracked = _optical_flow_box(
+                                reference,
+                                target,
+                                reference_box,
+                            )
+                            if tracked is None:
+                                return None
+                            tracked_by_box[reference_box] = tracked
+                        values.append(tracked)
+                    return tuple(values)
+
+                tracked_containment = tracked_boxes(
+                    reference_subject.containment_boxes
+                )
+                tracked_layout = tracked_boxes(reference_subject.layout_boxes)
+                if tracked_containment is None or tracked_layout is None:
+                    continue
+                return _SubjectGeometry(
+                    preferred_kind,
+                    tracked_box,
+                    tracked_box[3],
+                    None,
+                    tracked_containment,
+                    tracked_layout,
+                )
         return None
 
     decisions: list[BoundarySubjectAlignmentDecision] = []
     candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
+    target_layout_by_boundary: dict[
+        int, tuple[tuple[float, float, float, float], ...]
+    ] = {}
 
     def rejected(
         boundary_index: int,
@@ -1174,6 +1560,10 @@ def build_boundary_subject_alignment_plan(
         subject_kind: str | None = None,
         baseline: float | None = None,
         ratio: float | None = None,
+        outgoing_policy: str | None = None,
+        incoming_policy: str | None = None,
+        baseline_layout: float | None = None,
+        transformed_layout: float | None = None,
     ) -> BoundarySubjectAlignmentDecision:
         left = choices[boundary_index]
         right = choices[boundary_index + 1]
@@ -1190,6 +1580,10 @@ def build_boundary_subject_alignment_plan(
             subject_kind=subject_kind,
             baseline_geometry_mismatch=baseline,
             exact_scale_ratio=ratio,
+            outgoing_shot_policy=outgoing_policy,
+            incoming_shot_policy=incoming_policy,
+            baseline_layout_mismatch=baseline_layout,
+            transformed_layout_mismatch=transformed_layout,
         )
 
     try:
@@ -1218,61 +1612,33 @@ def build_boundary_subject_alignment_plan(
             if outgoing_observation is None or incoming_observation is None:
                 decisions.append(rejected(boundary_index, "exact_cut_frame_decode_or_geometry_failed"))
                 continue
-            outgoing_shot_type = left.exit_shot_type or left.shot_type
-            incoming_shot_type = right.entry_shot_type or right.shot_type
-            group_context = bool(
-                outgoing_shot_type.value in {"group_wide", "wide"}
-                or incoming_shot_type.value in {"group_wide", "wide"}
-                or left.detected_person_counts[2] > 1
-                or right.detected_person_counts[0] > 1
-                or left.formation_person_counts[2] > 1
-                or right.formation_person_counts[0] > 1
-            )
-            preferred_endpoint_kind = "silhouette" if group_context else None
-            outgoing_subject = _subject(
+            outgoing_policy = _shot_policy(outgoing_observation)
+            incoming_policy = _shot_policy(incoming_observation)
+            outgoing_subject, incoming_subject, subject_failure = _common_subjects(
                 outgoing_observation,
-                preferred_kind=preferred_endpoint_kind,
-                settings=settings,
-            )
-            incoming_subject = _subject(
                 incoming_observation,
-                preferred_kind=(outgoing_subject[0] if outgoing_subject is not None else None),
                 settings=settings,
             )
             if outgoing_subject is None or incoming_subject is None:
-                decisions.append(rejected(boundary_index, "exact_common_subject_geometry_unavailable"))
-                continue
-            if outgoing_subject[0] != incoming_subject[0]:
-                # Retry a group silhouette when one side happened to expose a
-                # single dominant face but the other did not.
-                outgoing_subject = _subject(
-                    outgoing_observation,
-                    preferred_kind="silhouette",
-                    settings=settings,
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        subject_failure or "exact_common_subject_geometry_unavailable",
+                        outgoing_policy=outgoing_policy,
+                        incoming_policy=incoming_policy,
+                    )
                 )
-                incoming_subject = _subject(
-                    incoming_observation,
-                    preferred_kind="silhouette",
-                    settings=settings,
-                )
-            if outgoing_subject is None or incoming_subject is None or outgoing_subject[0] != incoming_subject[0]:
-                decisions.append(rejected(boundary_index, "exact_common_subject_geometry_unavailable"))
                 continue
-            subject_kind = outgoing_subject[0]
-            outgoing_box = outgoing_subject[1]
-            incoming_box = incoming_subject[1]
+            subject_kind = outgoing_subject.kind
+            outgoing_box = outgoing_subject.alignment_box
+            incoming_box = incoming_subject.alignment_box
             baseline = _geometry_mismatch(outgoing_box, incoming_box)
-            outgoing_scale = (
-                outgoing_subject[2]
-                if subject_kind == "face" and outgoing_subject[2] is not None
-                else outgoing_box[3]
+            baseline_layout = _layout_mismatch(
+                outgoing_subject.layout_boxes,
+                incoming_subject.layout_boxes,
             )
-            incoming_scale = (
-                incoming_subject[2]
-                if subject_kind == "face" and incoming_subject[2] is not None
-                else incoming_box[3]
-            )
-            assert outgoing_scale is not None and incoming_scale is not None
+            outgoing_scale = outgoing_subject.scale
+            incoming_scale = incoming_subject.scale
             ratio = max(outgoing_scale, incoming_scale) / max(
                 1e-9, min(outgoing_scale, incoming_scale)
             )
@@ -1291,6 +1657,9 @@ def build_boundary_subject_alignment_plan(
                         subject_kind=subject_kind,
                         baseline=baseline,
                         ratio=ratio,
+                        outgoing_policy=outgoing_policy,
+                        incoming_policy=incoming_policy,
+                        baseline_layout=baseline_layout,
                     )
                 )
                 continue
@@ -1300,8 +1669,12 @@ def build_boundary_subject_alignment_plan(
                 box = outgoing_box
                 target_box = incoming_box
                 raw_roll = (
-                    math.degrees(incoming_subject[3] - outgoing_subject[3])
-                    if outgoing_subject[3] is not None and incoming_subject[3] is not None
+                    math.degrees(
+                        incoming_subject.roll_radians
+                        - outgoing_subject.roll_radians
+                    )
+                    if outgoing_subject.roll_radians is not None
+                    and incoming_subject.roll_radians is not None
                     else 0.0
                 )
             else:
@@ -1310,8 +1683,12 @@ def build_boundary_subject_alignment_plan(
                 box = incoming_box
                 target_box = outgoing_box
                 raw_roll = (
-                    math.degrees(outgoing_subject[3] - incoming_subject[3])
-                    if outgoing_subject[3] is not None and incoming_subject[3] is not None
+                    math.degrees(
+                        outgoing_subject.roll_radians
+                        - incoming_subject.roll_radians
+                    )
+                    if outgoing_subject.roll_radians is not None
+                    and incoming_subject.roll_radians is not None
                     else 0.0
                 )
             transformed_choice_index = (
@@ -1328,7 +1705,8 @@ def build_boundary_subject_alignment_plan(
                 transformed_choice_index,
                 transformed_frame_index,
             )
-            maximum_zoom = _headroom(
+            maximum_zoom = min(
+                _headroom(
                 source_index,
                 resolutions[source_index],
                 output_width=output_width,
@@ -1338,16 +1716,18 @@ def build_boundary_subject_alignment_plan(
                     if transformed_base_crop is not None
                     else 1.0
                 ),
-                settings=settings,
-            ).effective_max_zoom
+                    settings=settings,
+                ).effective_max_zoom,
+                _subject_zoom_cap(subject_kind, settings),
+            )
             desired_zoom = ratio
             if ratio <= settings.already_matched_scale_ratio:
                 desired_zoom = 1.02
             zoom = min(maximum_zoom, max(1.0, desired_zoom))
             roll_available = bool(
                 subject_kind == "face"
-                and outgoing_subject[3] is not None
-                and incoming_subject[3] is not None
+                and outgoing_subject.roll_radians is not None
+                and incoming_subject.roll_radians is not None
             )
             roll = (
                 max(-settings.maximum_roll_degrees, min(settings.maximum_roll_degrees, raw_roll))
@@ -1364,6 +1744,9 @@ def build_boundary_subject_alignment_plan(
                 target_box=target_box,
                 zoom=zoom,
                 roll_degrees=roll,
+                maximum_center_shift=_subject_center_shift_cap(
+                    subject_kind, settings
+                ),
                 settings=settings,
             )
             if state is None:
@@ -1374,51 +1757,129 @@ def build_boundary_subject_alignment_plan(
                         subject_kind=subject_kind,
                         baseline=baseline,
                         ratio=ratio,
+                        outgoing_policy=outgoing_policy,
+                        incoming_policy=incoming_policy,
+                        baseline_layout=baseline_layout,
                     )
                 )
                 continue
+            # Search back toward neutral instead of throwing away a useful
+            # hard-cut correction merely because the full requested match
+            # clips a hand/foot or crosses the layout gate.  Every tried state
+            # still passes the renderer edge check and the same dense gates;
+            # this is bounded partial alignment, never an unchecked crop.
+            state_candidates = tuple(
+                _TransformState(
+                    1.0 + (state.zoom - 1.0) * strength,
+                    0.5 + (state.center_x - 0.5) * strength,
+                    0.5 + (state.center_y - 0.5) * strength,
+                    state.roll_degrees * strength,
+                )
+                for strength in (1.0, 0.82, 0.66, 0.50, 0.36)
+            )
+            selected_state: _TransformState | None = None
+            selected_transformed = baseline
+            selected_layout = baseline_layout
+            saw_containment_failure = False
+            saw_layout_failure = False
+            for trial_state in state_candidates:
+                try:
+                    trial_state.keyframe(0.0)
+                except ValueError:
+                    continue
+                if transformed_side == "outgoing":
+                    projected_alignment, alignment_visibility = _project_box(
+                        outgoing_box, trial_state
+                    )
+                    trial_transformed = _geometry_mismatch(
+                        projected_alignment, incoming_box
+                    )
+                    trial_layout = _layout_mismatch(
+                        tuple(
+                            _project_box(item, trial_state)[0]
+                            for item in outgoing_subject.layout_boxes
+                        ),
+                        incoming_subject.layout_boxes,
+                    )
+                    containment_boxes = outgoing_subject.containment_boxes
+                else:
+                    projected_alignment, alignment_visibility = _project_box(
+                        incoming_box, trial_state
+                    )
+                    trial_transformed = _geometry_mismatch(
+                        outgoing_box, projected_alignment
+                    )
+                    trial_layout = _layout_mismatch(
+                        outgoing_subject.layout_boxes,
+                        tuple(
+                            _project_box(item, trial_state)[0]
+                            for item in incoming_subject.layout_boxes
+                        ),
+                    )
+                    containment_boxes = incoming_subject.containment_boxes
+                containment_visibility = min(
+                    _project_box(item, trial_state)[1]
+                    for item in containment_boxes
+                )
+                minimum_visibility = _subject_visibility_threshold(
+                    subject_kind, settings
+                )
+                if (
+                    min(alignment_visibility, containment_visibility) + 1e-9
+                    < minimum_visibility
+                ):
+                    saw_containment_failure = True
+                    continue
+                if (
+                    trial_layout > settings.maximum_transformed_layout_mismatch
+                    or trial_layout
+                    > baseline_layout + settings.maximum_layout_worsening
+                ):
+                    saw_layout_failure = True
+                    continue
+                improvement = baseline - trial_transformed
+                improvement_fraction = improvement / max(1e-9, baseline)
+                if (
+                    improvement < settings.minimum_geometry_improvement
+                    or improvement_fraction
+                    < settings.minimum_geometry_improvement_fraction
+                ):
+                    continue
+                selected_state = trial_state
+                selected_transformed = trial_transformed
+                selected_layout = trial_layout
+                break
+            if selected_state is None:
+                reason = (
+                    "exact_subject_would_be_clipped"
+                    if saw_containment_failure and not saw_layout_failure
+                    else "post_transform_layout_mismatch_gate"
+                    if saw_layout_failure
+                    else "geometry_improvement_too_small"
+                )
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        reason,
+                        subject_kind=subject_kind,
+                        baseline=baseline,
+                        ratio=ratio,
+                        outgoing_policy=outgoing_policy,
+                        incoming_policy=incoming_policy,
+                        baseline_layout=baseline_layout,
+                        transformed_layout=selected_layout,
+                    )
+                )
+                continue
+            state = selected_state
+            transformed = selected_transformed
+            transformed_layout = selected_layout
             if transformed_side == "outgoing":
                 outgoing_state = state
                 incoming_state = _TransformState()
-                projected_outgoing, visibility = _project_box(outgoing_box, state)
-                transformed = _geometry_mismatch(projected_outgoing, incoming_box)
             else:
                 outgoing_state = _TransformState()
                 incoming_state = state
-                projected_incoming, visibility = _project_box(incoming_box, state)
-                transformed = _geometry_mismatch(outgoing_box, projected_incoming)
-            minimum_visibility = (
-                settings.minimum_face_visible_fraction
-                if subject_kind == "face"
-                else settings.minimum_silhouette_visible_fraction
-            )
-            improvement = baseline - transformed
-            improvement_fraction = improvement / max(1e-9, baseline)
-            if visibility + 1e-9 < minimum_visibility:
-                decisions.append(
-                    rejected(
-                        boundary_index,
-                        "exact_subject_would_be_clipped",
-                        subject_kind=subject_kind,
-                        baseline=baseline,
-                        ratio=ratio,
-                    )
-                )
-                continue
-            if (
-                improvement < settings.minimum_geometry_improvement
-                or improvement_fraction < settings.minimum_geometry_improvement_fraction
-            ):
-                decisions.append(
-                    rejected(
-                        boundary_index,
-                        "geometry_improvement_too_small",
-                        subject_kind=subject_kind,
-                        baseline=baseline,
-                        ratio=ratio,
-                    )
-                )
-                continue
             candidate = BoundarySubjectAlignmentDecision(
                 boundary_index,
                 left.segment_index,
@@ -1438,11 +1899,21 @@ def build_boundary_subject_alignment_plan(
                 ratio,
                 roll_available,
                 roll_applied,
-                desired_zoom > zoom + 1e-9,
+                desired_zoom > state.zoom + 1e-9,
                 0,
+                0,
+                outgoing_policy,
+                incoming_policy,
+                baseline_layout,
+                transformed_layout,
             )
             decisions.append(candidate)
             candidate_by_boundary[boundary_index] = candidate
+            target_layout_by_boundary[boundary_index] = (
+                incoming_subject.layout_boxes
+                if transformed_side == "outgoing"
+                else outgoing_subject.layout_boxes
+            )
 
         # Build segment-local curves.  Only the two choices adjacent to an
         # eligible boundary can receive a transform; Tier-D neighbors never
@@ -1540,14 +2011,41 @@ def build_boundary_subject_alignment_plan(
                 if subject is None:
                     failure = "per_frame_subject_geometry_unavailable"
                     break
-                _projected, visibility = _project_box(subject[1], state)
-                threshold = (
-                    settings.minimum_face_visible_fraction
-                    if subject[0] == "face"
-                    else settings.minimum_silhouette_visible_fraction
+                visibility = min(
+                    _project_box(box, state)[1]
+                    for box in subject.containment_boxes
                 )
+                threshold = _subject_visibility_threshold(subject.kind, settings)
                 if visibility + 1e-9 < threshold:
                     failure = "per_frame_subject_containment_failed"
+                    break
+                nearest_boundary = min(
+                    touched,
+                    key=lambda boundary_index: (
+                        frame_index
+                        if boundary_index == choice_index - 1
+                        else counts[choice_index] - 1 - frame_index
+                    ),
+                )
+                target_layout = target_layout_by_boundary[nearest_boundary]
+                baseline_frame_layout = _layout_mismatch(
+                    subject.layout_boxes,
+                    target_layout,
+                )
+                transformed_frame_layout = _layout_mismatch(
+                    tuple(
+                        _project_box(box, state)[0]
+                        for box in subject.layout_boxes
+                    ),
+                    target_layout,
+                )
+                if (
+                    transformed_frame_layout
+                    > settings.maximum_transformed_layout_mismatch
+                    or transformed_frame_layout
+                    > baseline_frame_layout + settings.maximum_layout_worsening
+                ):
+                    failure = "per_frame_layout_mismatch_gate"
                     break
             if failure is not None:
                 for boundary_index in touched:

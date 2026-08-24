@@ -1389,6 +1389,10 @@ def _deserialize_visual_timeline(
                 length=3,
                 integers=True,
             ),  # type: ignore[arg-type]
+            shot_scale_bases=_three_strings(
+                item.get("shot_scale_bases", ["legacy", "legacy", "legacy"]),
+                "choice.shot_scale_bases",
+            ),
             silhouette_samples_xywh=_three_optional_boxes(
                 item.get("silhouette_samples_xywh"),
                 "choice.silhouette_samples_xywh",

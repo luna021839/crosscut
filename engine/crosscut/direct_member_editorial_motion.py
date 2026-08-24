@@ -29,6 +29,7 @@ from .member_editorial_motion import (
     _track_for_states,
     _visible_fraction,
 )
+from .pose import SILHOUETTE_BACKEND
 from .render import (
     EditorialTransformTrack,
     RenderSegment,
@@ -46,6 +47,9 @@ class DirectMemberFaceSample:
     bbox_xywh: tuple[float, float, float, float]
     face_count: int
     detector_backend: str
+    subject_bbox_xywh: tuple[float, float, float, float] | None = None
+    subject_confidence: float = 0.0
+    subject_geometry_basis: str = "none"
 
     def __post_init__(self) -> None:
         if len(self.bbox_xywh) != 4:
@@ -71,8 +75,45 @@ class DirectMemberFaceSample:
         backend = self.detector_backend.strip().casefold()
         if backend != "yunet":
             raise ValueError("direct member face sample needs verified YuNet geometry")
+        subject_box = self.subject_bbox_xywh
+        if subject_box is not None:
+            if len(subject_box) != 4:
+                raise ValueError("direct member subject box needs four values")
+            sx, sy, swidth, sheight = tuple(float(value) for value in subject_box)
+            if any(
+                not math.isfinite(value)
+                for value in (sx, sy, swidth, sheight)
+            ) or not (
+                0.0 <= sx < 1.0
+                and 0.0 <= sy < 1.0
+                and 0.0 < swidth <= 1.0
+                and 0.0 < sheight <= 1.0
+                and sx + swidth <= 1.0 + 1e-7
+                and sy + sheight <= 1.0 + 1e-7
+            ):
+                raise ValueError(
+                    "direct member subject box must fit normalized bounds"
+                )
+            subject_box = (sx, sy, swidth, sheight)
+        confidence = float(self.subject_confidence)
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("direct member subject confidence must be normalized")
+        basis = self.subject_geometry_basis.strip()
+        if subject_box is None:
+            if confidence != 0.0 or basis != "none":
+                raise ValueError(
+                    "direct member missing subject box cannot claim geometry"
+                )
+        elif confidence <= 0.0 or basis not in {
+            "pphumanseg_full_subject_silhouette",
+            "face_associated_formation_person_box",
+        }:
+            raise ValueError("direct member subject geometry is unverified")
         object.__setattr__(self, "bbox_xywh", (x, y, width, height))
         object.__setattr__(self, "detector_backend", backend)
+        object.__setattr__(self, "subject_bbox_xywh", subject_box)
+        object.__setattr__(self, "subject_confidence", confidence)
+        object.__setattr__(self, "subject_geometry_basis", basis)
 
 
 DirectMemberGeometryProvider = Callable[
@@ -131,14 +172,49 @@ class DirectMemberDenseFaceProvider:
         try:
             descriptor = describe_frame(
                 frame,
-                include_subject_geometry=False,
-                include_formation_pose=False,
+                include_subject_geometry=True,
+                include_formation_pose=True,
             )
+            subject_box = None
+            subject_confidence = 0.0
+            subject_basis = "none"
+            if (
+                descriptor.silhouette_bbox_xywh is not None
+                and descriptor.silhouette_confidence >= 0.30
+                and descriptor.silhouette_backend == SILHOUETTE_BACKEND
+            ):
+                subject_box = descriptor.silhouette_bbox_xywh
+                subject_confidence = descriptor.silhouette_confidence
+                subject_basis = "pphumanseg_full_subject_silhouette"
+            elif descriptor.primary_face_bbox is not None:
+                face = descriptor.primary_face_bbox
+                face_center = (
+                    face[0] + face[2] / 2.0,
+                    face[1] + face[3] / 2.0,
+                )
+                associated = tuple(
+                    person
+                    for person in descriptor.formation_people
+                    if person.bbox_xywh[0] - 1e-6
+                    <= face_center[0]
+                    <= person.bbox_xywh[0] + person.bbox_xywh[2] + 1e-6
+                    and person.bbox_xywh[1] - 1e-6
+                    <= face_center[1]
+                    <= person.bbox_xywh[1] + person.bbox_xywh[3] + 1e-6
+                    and person.detection_confidence >= 0.50
+                )
+                if len(associated) == 1:
+                    subject_box = associated[0].bbox_xywh
+                    subject_confidence = associated[0].detection_confidence
+                    subject_basis = "face_associated_formation_person_box"
             sample = (
                 DirectMemberFaceSample(
                     descriptor.primary_face_bbox,
                     descriptor.face_count,
                     descriptor.face_detector_backend,
+                    subject_box,
+                    subject_confidence,
+                    subject_basis,
                 )
                 if descriptor.primary_face_bbox is not None
                 and descriptor.face_count == 1
@@ -152,7 +228,10 @@ class DirectMemberDenseFaceProvider:
 
     def diagnostics(self) -> dict[str, int | bool | str]:
         return {
-            "backend": "yunet_dominant_face_dense_selected_ramps",
+            "backend": (
+                "yunet_face_plus_pphumanseg_or_face_associated_person_"
+                "dense_selected_ramps"
+            ),
             "request_count": self._request_count,
             "cache_hit_count": self._cache_hit_count,
             "decode_count": self._decode_count,
@@ -170,12 +249,18 @@ class DirectMemberDenseFaceProvider:
 @dataclass(frozen=True, slots=True)
 class DirectMemberEditorialMotionConfig:
     ramp_seconds: float = 0.75
-    maximum_boundary_zoom: float = 1.12
-    maximum_center_shift: float = 0.025
+    maximum_boundary_zoom: float = 1.18
+    maximum_center_shift: float = 0.040
     maximum_boundary_center_distance: float = 0.18
     maximum_residual_center_distance: float = 0.08
     minimum_mismatch_improvement_fraction: float = 0.20
     minimum_face_visible_fraction: float = 0.995
+    legacy_face_only_maximum_zoom: float = 1.12
+    legacy_face_only_maximum_center_shift: float = 0.025
+    minimum_widened_subject_confidence: float = 0.30
+    minimum_widened_subject_visible_fraction: float = 0.995
+    maximum_dense_subject_center_step: float = 0.12
+    maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.10
     maximum_dense_height_ratio: float = 1.35
     maximum_endpoint_center_disagreement: float = 0.08
@@ -192,6 +277,12 @@ class DirectMemberEditorialMotionConfig:
             "maximum_residual_center_distance",
             "minimum_mismatch_improvement_fraction",
             "minimum_face_visible_fraction",
+            "legacy_face_only_maximum_zoom",
+            "legacy_face_only_maximum_center_shift",
+            "minimum_widened_subject_confidence",
+            "minimum_widened_subject_visible_fraction",
+            "maximum_dense_subject_center_step",
+            "maximum_dense_subject_height_ratio",
             "maximum_dense_center_step",
             "maximum_dense_height_ratio",
             "maximum_endpoint_center_disagreement",
@@ -208,6 +299,18 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("dense face center-step gate is invalid")
         if not 1.0 <= self.maximum_dense_height_ratio <= 2.0:
             raise ValueError("dense face height-ratio gate is invalid")
+        if not 1.0 <= self.legacy_face_only_maximum_zoom <= 1.12:
+            raise ValueError("legacy face-only zoom boundary is invalid")
+        if not 0.0 <= self.legacy_face_only_maximum_center_shift <= 0.025:
+            raise ValueError("legacy face-only pan boundary is invalid")
+        if not 0.0 <= self.minimum_widened_subject_confidence <= 1.0:
+            raise ValueError("widened subject confidence gate is invalid")
+        if not 0.95 <= self.minimum_widened_subject_visible_fraction <= 1.0:
+            raise ValueError("widened subject containment gate is invalid")
+        if not 0.0 <= self.maximum_dense_subject_center_step <= 0.20:
+            raise ValueError("dense subject center-step gate is invalid")
+        if not 1.0 <= self.maximum_dense_subject_height_ratio <= 2.0:
+            raise ValueError("dense subject height-ratio gate is invalid")
         if not 0.0 <= self.maximum_endpoint_center_disagreement <= 0.20:
             raise ValueError("dense endpoint center gate is invalid")
         if not 1.0 <= self.maximum_endpoint_height_ratio <= 2.0:
@@ -316,7 +419,20 @@ def _track_is_dense_face_safe(
         if frame_index + 1 < frame_count:
             review_frames.add(frame_index + 1)
 
+    widened_subject_proof_required = bool(
+        any(
+            keyframe.zoom
+            > config.legacy_face_only_maximum_zoom + 1e-9
+            or abs(keyframe.center_x - 0.5)
+            > config.legacy_face_only_maximum_center_shift + 1e-9
+            or abs(keyframe.center_y - 0.5)
+            > config.legacy_face_only_maximum_center_shift + 1e-9
+            for keyframe in track.keyframes
+        )
+    )
+
     previous_box: tuple[float, float, float, float] | None = None
+    previous_subject_box: tuple[float, float, float, float] | None = None
     previous_frame_index: int | None = None
     for frame_index in sorted(review_frames):
         local_time = frame_index / fps
@@ -325,6 +441,7 @@ def _track_is_dense_face_safe(
             or frame_index != previous_frame_index + 1
         ):
             previous_box = None
+            previous_subject_box = None
         canonical_time = common_master_start + segment.master_start + local_time
         sample = geometry_provider(eligible_source_index, canonical_time)
         if sample is None:
@@ -354,6 +471,40 @@ def _track_is_dense_face_safe(
             < config.minimum_face_visible_fraction
         ):
             return False
+        if widened_subject_proof_required:
+            subject_box = sample.subject_bbox_xywh
+            if (
+                subject_box is None
+                or sample.subject_confidence + 1e-9
+                < config.minimum_widened_subject_confidence
+                or sample.subject_geometry_basis
+                not in {
+                    "pphumanseg_full_subject_silhouette",
+                    "face_associated_formation_person_box",
+                }
+            ):
+                return False
+            if previous_subject_box is not None:
+                subject_center_step = math.hypot(
+                    _center(subject_box)[0] - _center(previous_subject_box)[0],
+                    _center(subject_box)[1] - _center(previous_subject_box)[1],
+                )
+                subject_height_ratio = max(
+                    subject_box[3], previous_subject_box[3]
+                ) / max(1e-9, min(subject_box[3], previous_subject_box[3]))
+                if (
+                    subject_center_step
+                    > config.maximum_dense_subject_center_step + 1e-9
+                    or subject_height_ratio
+                    > config.maximum_dense_subject_height_ratio + 1e-9
+                ):
+                    return False
+            if (
+                _visible_fraction(subject_box, state) + 1e-9
+                < config.minimum_widened_subject_visible_fraction
+            ):
+                return False
+            previous_subject_box = subject_box
         previous_box = box
         previous_frame_index = frame_index
     return True
@@ -617,7 +768,10 @@ def build_direct_member_editorial_motion_plan(
                 source_index=source_path[index],
                 track=tracks[index],
                 reasons=(
-                    ("official_fancam_dense_face_scale_position_match",)
+                    (
+                        "official_fancam_dense_face_subject_"
+                        "scale_position_match",
+                    )
                     if index in accepted_segments
                     else ("no_safe_dense_face_editorial_motion",)
                 ),
@@ -635,7 +789,8 @@ def build_direct_member_editorial_motion_plan(
         blocked_dissolve_segment_count=len(blocked),
         skipped_boundary_reasons=tuple(sorted(skipped.items())),
         analysis_basis=(
-            "official_target_fancam_unambiguous_face_dense_output_frame_review_v1"
+            "official_target_fancam_unambiguous_face_dense_output_frame_"
+            "plus_widened_full_subject_containment_review_v2"
         ),
     )
 

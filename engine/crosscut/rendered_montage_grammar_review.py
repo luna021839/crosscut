@@ -40,6 +40,7 @@ from .professional_montage_policy import (
 from .rendered_proxy_review import (
     SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
     SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+    SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
     SEGMENT_INTERIOR_SAMPLE_FRACTIONS,
     verified_file_content_sha256,
 )
@@ -919,28 +920,133 @@ def _proxy_geometry_shot_class(
     config: RenderedMontageGrammarConfig,
 ) -> str:
     geometry = value if isinstance(value, Mapping) else {}
-    face_count = geometry.get("face_count")
-    if (
-        isinstance(face_count, int)
-        and not isinstance(face_count, bool)
-        and face_count == 0
-        and geometry.get("face_bbox_xywh") is None
-    ):
-        # Match visual_score exactly: detector success with no face uses
-        # shot_scale=0.12, which is below the 0.22 group-wide boundary.
-        return "wide"
     parsed = _normalized_face_geometry(value)
-    if parsed is None:
-        return "unknown"
-    face_count, (_x, _y, _width, height) = parsed
-    # Reuse the production visual-score classifier exactly: four detected
-    # faces is a group wide regardless of dominant-face size; otherwise the
-    # 0.42-normalized 0.22/0.52 shot-scale boundaries become 0.0924/0.2184.
-    if face_count >= 4 or height < config.minimum_nonwide_proxy_face_height_fraction:
+    if parsed is not None:
+        face_count, (_x, _y, _width, height) = parsed
+        if (
+            face_count < 4
+            and height >= config.minimum_closeup_proxy_face_height_fraction
+        ):
+            return "close"
+    raw_formation = geometry.get("formation_boxes_xywh")
+    reported_people = geometry.get("detected_person_count")
+    if (
+        isinstance(raw_formation, (list, tuple))
+        and len(raw_formation) >= 3
+        and isinstance(reported_people, int)
+        and not isinstance(reported_people, bool)
+        and reported_people >= 3
+        and all(
+            isinstance(raw, (list, tuple))
+            and len(raw) == 4
+            and all(
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and math.isfinite(float(item))
+                for item in raw
+            )
+            and 0.0 <= float(raw[0]) <= 1.0
+            and 0.0 <= float(raw[1]) <= 1.0
+            and 0.0 < float(raw[2]) <= 1.0
+            and 0.0 < float(raw[3]) <= 1.0
+            and float(raw[0]) + float(raw[2]) <= 1.000001
+            and float(raw[1]) + float(raw[3]) <= 1.000001
+            for raw in raw_formation
+        )
+    ):
         return "wide"
-    if height < config.minimum_closeup_proxy_face_height_fraction:
-        return "medium"
-    return "close"
+    if parsed is not None:
+        face_count, (_x, _y, _width, height) = parsed
+        # Reuse visual_score's face thresholds exactly.
+        if (
+            face_count >= 4
+            or height < config.minimum_nonwide_proxy_face_height_fraction
+        ):
+            return "wide"
+        if height < config.minimum_closeup_proxy_face_height_fraction:
+            return "medium"
+        return "close"
+
+    raw_boxes = geometry.get("formation_boxes_xywh")
+    boxes: list[tuple[float, float, float, float]] = []
+    if isinstance(raw_boxes, (list, tuple)):
+        for raw in raw_boxes:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                return "unknown"
+            if not all(
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and math.isfinite(float(item))
+                for item in raw
+            ):
+                return "unknown"
+            box = tuple(float(item) for item in raw)
+            if not (
+                0.0 <= box[0] <= 1.0
+                and 0.0 <= box[1] <= 1.0
+                and 0.0 < box[2] <= 1.0
+                and 0.0 < box[3] <= 1.0
+                and box[0] + box[2] <= 1.000001
+                and box[1] + box[3] <= 1.000001
+            ):
+                return "unknown"
+            boxes.append(box)
+    person_count = geometry.get("detected_person_count")
+    if (
+        isinstance(person_count, bool)
+        or not isinstance(person_count, int)
+        or person_count < 0
+    ):
+        person_count = len(boxes)
+    if boxes:
+        heights = sorted(box[3] for box in boxes)
+        median_height = heights[len(heights) // 2]
+        union_left = min(box[0] for box in boxes)
+        union_top = min(box[1] for box in boxes)
+        union_right = max(box[0] + box[2] for box in boxes)
+        union_bottom = max(box[1] + box[3] for box in boxes)
+        union_width = union_right - union_left
+        boundary_clipped = union_top <= 0.035 or union_bottom >= 0.965
+        if max(person_count, len(boxes)) >= 3:
+            return "wide"
+        if (
+            len(boxes) == 1
+            and boundary_clipped
+            and median_height >= 0.68
+            and union_width <= 0.58
+        ):
+            return "close"
+        if median_height >= 0.43 and union_width <= 0.72:
+            return "medium"
+        return "wide"
+
+    silhouette = geometry.get("silhouette_bbox_xywh")
+    confidence = geometry.get("silhouette_confidence")
+    if (
+        isinstance(silhouette, (list, tuple))
+        and len(silhouette) == 4
+        and all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in silhouette
+        )
+        and isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and float(confidence) >= 0.72
+    ):
+        _left, top, width, height = tuple(float(item) for item in silhouette)
+        boundary_clipped = top <= 0.035 or top + height >= 0.965
+        if boundary_clipped and height >= 0.70 and width <= 0.46:
+            return "close"
+        if height >= 0.54 and width <= 0.54:
+            return "medium"
+        return "wide"
+
+    # A face miss without corroborating body geometry is unknown, never proof
+    # of a wide shot.  This keeps decoded QA aligned with visual_score's
+    # explicit ``unknown_no_subject_geometry`` basis.
+    return "unknown"
 
 
 def _geometry_proves_closeup(
@@ -1507,7 +1613,8 @@ def _review_segment_interior_geometry(
     if _canonical_sha256(evidence) != evidence_sha256:
         raise ValueError("segment interior geometry evidence SHA-256 mismatch")
     if (
-        evidence.get("schema_version") != 1
+        evidence.get("schema_version")
+        != SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION
         or evidence.get("analysis_basis")
         != SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS
         or evidence.get("contract") != SEGMENT_INTERIOR_GEOMETRY_CONTRACT
@@ -1601,6 +1708,7 @@ def _review_segment_interior_geometry(
     close_claim_contradiction_count = 0
     nonwide_claim_wide_contradiction_count = 0
     observed_sample_count = 0
+    shot_scale_basis_counts: dict[str, int] = {}
     for segment_index, (raw_segment, raw_choice) in enumerate(
         zip(raw_segments, choices, strict=True)
     ):
@@ -1679,6 +1787,20 @@ def _review_segment_interior_geometry(
                     sample.get("subject_geometry"), config
                 )
             )
+            raw_geometry = (
+                sample.get("subject_geometry")
+                if isinstance(sample.get("subject_geometry"), Mapping)
+                else {}
+            )
+            raw_basis = raw_geometry.get("shot_scale_basis")
+            shot_scale_basis = (
+                raw_basis.strip()
+                if isinstance(raw_basis, str) and raw_basis.strip()
+                else "legacy_geometry_without_basis"
+            )
+            shot_scale_basis_counts[shot_scale_basis] = (
+                shot_scale_basis_counts.get(shot_scale_basis, 0) + 1
+            )
             classifications.append(proxy_class)
             observed_sample_count += 1
             provider_failure_sample_count += int(failed)
@@ -1704,6 +1826,7 @@ def _review_segment_interior_geometry(
                     "end_seconds": cell_end,
                     "duration_seconds": cell_end - cell_start,
                     "shot_class": proxy_class,
+                    "shot_scale_basis": shot_scale_basis,
                     "declared_shot_class": declared_class,
                 }
             )
@@ -1780,7 +1903,10 @@ def _review_segment_interior_geometry(
             "render_timeline_binding_sha256"
         ],
         "classification_policy": {
-            "basis": "existing_visual_score_face_scale_thresholds",
+            "basis": (
+                "decoded_face_then_person_formation_then_silhouette_"
+                "shot_geometry_hierarchy_v2"
+            ),
             "four_or_more_faces_is_wide": True,
             "minimum_nonwide_face_height_fraction": (
                 config.minimum_nonwide_proxy_face_height_fraction
@@ -1788,7 +1914,20 @@ def _review_segment_interior_geometry(
             "minimum_closeup_face_height_fraction": (
                 config.minimum_closeup_proxy_face_height_fraction
             ),
-            "missing_face_geometry": "unknown_fail_closed_when_required",
+            "no_face_person_geometry_policy": (
+                "single_or_pair_bbox_medium_or_close_when_large_"
+                "three_plus_people_formation_wide"
+            ),
+            "silhouette_fallback_policy": (
+                "single_large_subject_nonwide_aggregate_or_distant_wide"
+            ),
+            "missing_face_and_body_geometry": (
+                "unknown_fail_closed_when_required_not_observed_medium_or_wide"
+            ),
+            "wide_dominance_gate": (
+                "whole_and_section_duration_plus_consecutive_run_with_"
+                "formation_anchor_retained"
+            ),
             "duration_semantics": (
                 "nearest_sample_frame_cell_proxy_estimate_not_all_frame_claim"
             ),
@@ -1796,6 +1935,10 @@ def _review_segment_interior_geometry(
         "sample_count": observed_sample_count,
         "unknown_sample_count": unknown_sample_count,
         "provider_failure_sample_count": provider_failure_sample_count,
+        "shot_scale_basis_counts": [
+            {"basis": basis, "count": count}
+            for basis, count in sorted(shot_scale_basis_counts.items())
+        ],
         "close_claim_contradiction_count": close_claim_contradiction_count,
         "nonwide_claim_wide_contradiction_count": (
             nonwide_claim_wide_contradiction_count
@@ -1809,11 +1952,17 @@ def _review_segment_interior_geometry(
             ),
             "close_duration_seconds": close_duration,
             "nonwide_duration_seconds": nonwide_duration,
+            "wide_duration_seconds": known_duration - nonwide_duration,
             "close_duration_fraction": (
                 close_duration / known_duration if known_duration > 0.0 else 0.0
             ),
             "nonwide_duration_fraction": (
                 nonwide_duration / known_duration if known_duration > 0.0 else 0.0
+            ),
+            "wide_duration_fraction": (
+                (known_duration - nonwide_duration) / known_duration
+                if known_duration > 0.0
+                else 0.0
             ),
             "maximum_consecutive_wide_run_seconds": maximum_wide_run,
         },

@@ -361,6 +361,64 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(request.source_mode, SourceMode.LOCAL)
         self.assertFalse(request.acquire_only)
 
+    def test_member_pose_dissolve_toggle_defaults_on_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            legacy = AnalysisRequest.from_dict(
+                {
+                    "song": "ATTITUDE",
+                    "edit_mode": "member",
+                    "aspect_ratio": "9:16",
+                    "target_member": "가을",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "output_directory": str(root / "legacy-out"),
+                }
+            )
+            self.assertTrue(legacy.member_pose_dissolve_enabled)
+            self.assertTrue(legacy.as_dict()["member_pose_dissolve_enabled"])
+
+            disabled = AnalysisRequest.from_dict(
+                {
+                    "song": "ATTITUDE",
+                    "edit_mode": "member",
+                    "aspect_ratio": "9:16",
+                    "target_member": "가을",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "output_directory": str(root / "disabled-out"),
+                    "member_pose_dissolve_enabled": False,
+                }
+            )
+            self.assertFalse(disabled.member_pose_dissolve_enabled)
+            self.assertFalse(disabled.as_dict()["member_pose_dissolve_enabled"])
+            restored = AnalysisRequest.from_dict(disabled.as_dict())
+            self.assertFalse(restored.member_pose_dissolve_enabled)
+
+            sources = [root / f"fancam-{index}.mp4" for index in range(4)]
+            for source in sources:
+                source.touch()
+            materialized = disabled.with_materialized_sources(sources)
+            self.assertFalse(materialized.member_pose_dissolve_enabled)
+
+    def test_member_pose_dissolve_toggle_rejects_non_boolean_values(self) -> None:
+        for invalid in (0, 1, "false", None, [], {}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError,
+                "member_pose_dissolve_enabled must be a boolean",
+            ):
+                AnalysisRequest.from_dict(
+                    {
+                        "song": "ATTITUDE",
+                        "edit_mode": "member",
+                        "aspect_ratio": "9:16",
+                        "target_member": "가을",
+                        "source_mode": "automatic",
+                        "sources": [],
+                        "member_pose_dissolve_enabled": invalid,
+                    }
+                )
+
     def test_automatic_request_accepts_zero_sources_and_defaults_to_ten(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

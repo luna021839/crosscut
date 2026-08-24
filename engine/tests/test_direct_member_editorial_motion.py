@@ -78,8 +78,21 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
     @staticmethod
     def _sample(
         box: tuple[float, float, float, float],
+        *,
+        subject_box: tuple[float, float, float, float] | None = None,
     ) -> DirectMemberFaceSample:
-        return DirectMemberFaceSample(box, 1, "yunet")
+        return DirectMemberFaceSample(
+            box,
+            1,
+            "yunet",
+            subject_box,
+            0.95 if subject_box is not None else 0.0,
+            (
+                "pphumanseg_full_subject_silhouette"
+                if subject_box is not None
+                else "none"
+            ),
+        )
 
     @classmethod
     def _basic_inputs(cls, *, duration: float = 8.0):
@@ -114,7 +127,135 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.05)
         self.assertEqual(
             plan.analysis_basis,
-            "official_target_fancam_unambiguous_face_dense_output_frame_review_v1",
+            "official_target_fancam_unambiguous_face_dense_output_frame_"
+            "plus_widened_full_subject_containment_review_v2",
+        )
+
+    def test_direct_defaults_expand_only_to_renderer_safe_reference_bounds(self) -> None:
+        config = DirectMemberEditorialMotionConfig()
+
+        self.assertEqual(config.maximum_boundary_zoom, 1.18)
+        self.assertEqual(config.maximum_center_shift, 0.04)
+        self.assertEqual(config.legacy_face_only_maximum_zoom, 1.12)
+        self.assertEqual(config.legacy_face_only_maximum_center_shift, 0.025)
+
+    def test_widened_zoom_requires_dense_full_subject_and_enlarges_smaller_side(self) -> None:
+        source_indices = (0, 1)
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.205, 0.18, 0.585),
+        )
+        selection = self._selection(source_indices, boxes)
+        renders = self._renders(source_indices, (8.0, 8.0))
+        subject_box = (0.31, 0.08, 0.38, 0.80)
+
+        without_subject = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+        )
+        with_subject = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source], subject_box=subject_box
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(without_subject.applied_count, 0)
+        self.assertIn(
+            ("dense_face_containment_or_continuity_failed", 1),
+            without_subject.skipped_boundary_reasons,
+        )
+        self.assertEqual(with_subject.applied_count, 1)
+        self.assertIsNotNone(with_subject.track_for(0))
+        self.assertIsNone(with_subject.track_for(1))
+        self.assertGreater(with_subject.track_for(0).final_keyframe.zoom, 1.12)
+        self.assertLessEqual(with_subject.track_for(0).final_keyframe.zoom, 1.18)
+
+    def test_widened_zoom_rejects_full_subject_edge_clipping_on_any_ramp_frame(self) -> None:
+        source_indices = (0, 1)
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.205, 0.18, 0.585),
+        )
+        selection = self._selection(source_indices, boxes)
+        renders = self._renders(source_indices, (8.0, 8.0))
+
+        def geometry_provider(
+            source: int,
+            canonical_time: float,
+        ) -> DirectMemberFaceSample:
+            subject_box = (
+                (0.0, 0.02, 0.42, 0.96)
+                if source == 0 and round(canonical_time * 30.0) == 225
+                else (0.31, 0.08, 0.38, 0.80)
+            )
+            return self._sample(boxes[source], subject_box=subject_box)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=geometry_provider,
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertIn(
+            ("dense_face_containment_or_continuity_failed", 1),
+            plan.skipped_boundary_reasons,
+        )
+
+    def test_widened_pan_alone_also_requires_full_subject_proof(self) -> None:
+        source_indices = (0, 1)
+        boxes = (
+            (0.31, 0.25, 0.18, 0.50),
+            (0.41, 0.235, 0.18, 0.53),
+        )
+        selection = self._selection(source_indices, boxes)
+        renders = self._renders(source_indices, (8.0, 8.0))
+
+        without_subject = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+        )
+        with_subject = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source],
+                subject_box=(0.20, 0.10, 0.60, 0.75),
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(without_subject.applied_count, 0)
+        self.assertEqual(with_subject.applied_count, 1)
+        track = with_subject.track_for(0)
+        self.assertIsNotNone(track)
+        assert track is not None
+        self.assertLessEqual(track.final_keyframe.zoom, 1.12)
+        self.assertGreater(
+            abs(track.final_keyframe.center_x - 0.5),
+            0.025,
+        )
+        self.assertLessEqual(
+            abs(track.final_keyframe.center_x - 0.5),
+            0.04,
         )
 
     def test_non_face_or_multiple_face_audit_is_rejected(self) -> None:

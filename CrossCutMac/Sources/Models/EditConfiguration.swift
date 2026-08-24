@@ -92,6 +92,7 @@ struct EditRequest: Codable, Equatable {
     let sources: [String]
     let outputDirectory: String
     let memberAnchors: [MemberAnchorRequest]
+    let memberPoseDissolveEnabled: Bool
     let sourceMode: String
     let desiredSourceCount: Int
     let sourceCacheDirectory: String
@@ -106,6 +107,7 @@ struct EditRequest: Codable, Equatable {
         sources: [URL],
         outputDirectory: URL,
         memberAnchors: [MemberAnchorRequest] = [],
+        memberPoseDissolveEnabled: Bool = true,
         sourceMode: SourceMode = .local,
         desiredSourceCount: Int = 10,
         sourceCacheDirectory: URL? = nil,
@@ -127,6 +129,7 @@ struct EditRequest: Codable, Equatable {
         self.memberAnchors = editMode == .member && sourceMode == .local
             ? memberAnchors
             : []
+        self.memberPoseDissolveEnabled = memberPoseDissolveEnabled
         self.sourceMode = sourceMode.rawValue
         self.desiredSourceCount = (
             editMode == .member && sourceMode == .automatic
@@ -147,11 +150,43 @@ struct EditRequest: Codable, Equatable {
         case sources
         case outputDirectory = "output_directory"
         case memberAnchors = "member_anchors"
+        case memberPoseDissolveEnabled = "member_pose_dissolve_enabled"
         case sourceMode = "source_mode"
         case desiredSourceCount = "desired_source_count"
         case sourceCacheDirectory = "source_cache_directory"
         case catalogCacheDirectory = "catalog_cache_directory"
         case acquireOnly = "acquire_only"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        song = try container.decode(String.self, forKey: .song)
+        targetMember = try container.decodeIfPresent(String.self, forKey: .targetMember)
+        editMode = try container.decode(String.self, forKey: .editMode)
+        aspectRatio = try container.decode(String.self, forKey: .aspectRatio)
+        sources = try container.decode([String].self, forKey: .sources)
+        outputDirectory = try container.decode(String.self, forKey: .outputDirectory)
+        memberAnchors = try container.decode(
+            [MemberAnchorRequest].self,
+            forKey: .memberAnchors
+        )
+        // Requests saved before this preference existed behaved as though the
+        // evidence-gated member dissolve policy was enabled.
+        memberPoseDissolveEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .memberPoseDissolveEnabled
+        ) ?? true
+        sourceMode = try container.decode(String.self, forKey: .sourceMode)
+        desiredSourceCount = try container.decode(Int.self, forKey: .desiredSourceCount)
+        sourceCacheDirectory = try container.decode(
+            String.self,
+            forKey: .sourceCacheDirectory
+        )
+        catalogCacheDirectory = try container.decodeIfPresent(
+            String.self,
+            forKey: .catalogCacheDirectory
+        )
+        acquireOnly = try container.decode(Bool.self, forKey: .acquireOnly)
     }
 }
 
