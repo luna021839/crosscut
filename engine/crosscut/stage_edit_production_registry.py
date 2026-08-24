@@ -72,6 +72,7 @@ from .stage_edit_transformer import (
     PRODUCTION_TRAINING_REPORT_FILENAME,
     StageEditReadinessReport,
     stage_edit_readiness_report,
+    valid_dynamic_crop_v3_activation_checkpointing_evidence,
 )
 from .stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
@@ -681,6 +682,12 @@ def _validate_v3_training_report_declarations(
     ):
         raise StageEditProductionRegistryNotReadyError(
             "production training report mixes v2 and v3 declarations"
+        )
+    if not valid_dynamic_crop_v3_activation_checkpointing_evidence(
+        model.get("activation_checkpointing")
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report activation checkpointing evidence differs"
         )
     dynamic_data = data.get("dynamic_crop_v3")
     if (

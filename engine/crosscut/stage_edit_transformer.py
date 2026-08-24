@@ -59,6 +59,21 @@ PRODUCTION_TRAINING_REPORT_FILENAME = "training-report.json"
 PRODUCTION_TRAINING_RUN_KIND = "stage_edit_production_training"
 PRODUCTION_CHECKPOINT_SCOPE = "production_learned_editor"
 PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION = 7
+DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT = (
+    "mlx_transformer_encoder_layer_recompute_training_only_v1"
+)
+_DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_KEYS = frozenset(
+    {
+        "contract",
+        "enabled",
+        "scope",
+        "implementation",
+        "training_only",
+        "serialized_parameter_tree_changed",
+        "inference_runtime_requires_checkpointing",
+        "previous_value",
+    }
+)
 PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT = (
     "shared_media_feature_snapshot_with_postload_history_scrub_v2"
 )
@@ -96,6 +111,29 @@ DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT = (
 DYNAMIC_CROP_V3_PRODUCTION_ARCHITECTURE = (
     "causal_long_context_transformer_with_source_conditioned_dynamic_crop_v3"
 )
+
+
+def valid_dynamic_crop_v3_activation_checkpointing_evidence(
+    value: Any,
+) -> bool:
+    """Return whether a report carries the exact typed recomputation proof."""
+
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_KEYS
+        and value.get("contract")
+        == DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT
+        and value.get("enabled") is True
+        and value.get("scope") == "base_transformer_encoder_all_layers"
+        and value.get("implementation")
+        == "mlx.nn.TransformerEncoder.checkpoint"
+        and value.get("training_only") is True
+        and value.get("serialized_parameter_tree_changed") is False
+        and value.get("inference_runtime_requires_checkpointing") is False
+        and value.get("previous_value") is False
+    )
+
+
 STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES = tuple(
     f"pose_model_embedding_{index:02d}" for index in range(60)
 )
@@ -2272,6 +2310,12 @@ def _production_training_report_errors(
         for field_name, expected in expected_model_fields.items():
             if model.get(field_name) != expected:
                 errors.append(f"production model {field_name} does not declare v3")
+        if not valid_dynamic_crop_v3_activation_checkpointing_evidence(
+            model.get("activation_checkpointing")
+        ):
+            errors.append(
+                "production model activation checkpointing evidence differs"
+            )
     elif dynamic_crop_v2_checkpoint:
         if model.get("dynamic_crop_v2_enabled") is not True:
             errors.append("dynamic-crop v2 model activation evidence is missing")
@@ -2880,6 +2924,7 @@ __all__ = [
     "CHECKPOINT_FORMAT_VERSION",
     "DEFAULT_STAGE_EDIT_SCHEMA",
     "DYNAMIC_CROP_V3_PRODUCTION_ARCHITECTURE",
+    "DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT",
     "DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT",
     "DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT",
     "MASKED_SOURCE_LOGIT",
@@ -2935,4 +2980,5 @@ __all__ = [
     "targets_from_reference_supervision",
     "tensorize_stage_edit_batch",
     "tensorize_stage_edit_supervision",
+    "valid_dynamic_crop_v3_activation_checkpointing_evidence",
 ]

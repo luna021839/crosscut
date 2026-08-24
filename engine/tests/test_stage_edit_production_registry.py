@@ -39,6 +39,7 @@ from crosscut.stage_edit_source_pair_production import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
     DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT,
     DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT,
     StageEditReadinessReport,
@@ -188,6 +189,18 @@ def _checkpoint_v3(
             "dynamic_crop_version": 3,
             "dynamic_crop_v2_enabled": False,
             "dynamic_crop_v3_enabled": True,
+            "activation_checkpointing": {
+                "contract": (
+                    DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT
+                ),
+                "enabled": True,
+                "scope": "base_transformer_encoder_all_layers",
+                "implementation": "mlx.nn.TransformerEncoder.checkpoint",
+                "training_only": True,
+                "serialized_parameter_tree_changed": False,
+                "inference_runtime_requires_checkpointing": False,
+                "previous_value": False,
+            },
         },
         "data": {
             "dynamic_crop_version": 3,
@@ -953,6 +966,9 @@ class StageEditProductionRegistryTests(unittest.TestCase):
             original = json.loads(training_report_path.read_text(encoding="utf-8"))
             for failure, pattern in (
                 ("checkpoint", "exact v3 checkpoint"),
+                ("activation_checkpointing", "activation checkpointing"),
+                ("activation_checkpointing_int", "activation checkpointing"),
+                ("activation_checkpointing_missing", "activation checkpointing"),
                 ("gate", "validation gate"),
                 ("heldout", "held-out evidence"),
             ):
@@ -960,6 +976,21 @@ class StageEditProductionRegistryTests(unittest.TestCase):
                     report = json.loads(json.dumps(original))
                     if failure == "checkpoint":
                         report["checkpoint"]["dynamic_crop_version"] = 2
+                    elif failure == "activation_checkpointing":
+                        report["model"]["activation_checkpointing"][
+                            "enabled"
+                        ] = False
+                    elif failure == "activation_checkpointing_int":
+                        report["model"]["activation_checkpointing"][
+                            "enabled"
+                        ] = 1
+                        report["model"]["activation_checkpointing"][
+                            "previous_value"
+                        ] = 0
+                    elif failure == "activation_checkpointing_missing":
+                        report["model"]["activation_checkpointing"].pop(
+                            "training_only"
+                        )
                     elif failure == "gate":
                         report["optimization"][
                             "best_validation_selection_evidence"

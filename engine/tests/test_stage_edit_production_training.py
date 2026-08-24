@@ -71,6 +71,7 @@ from crosscut.stage_edit_semimarkov_beam import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
     SourceCandidateToken,
     StageEditSequence,
     StageEditLossContract,
@@ -810,6 +811,19 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             self.assertEqual(3, report["model"]["dynamic_crop_version"])
             self.assertTrue(report["model"]["dynamic_crop_v3_enabled"])
             self.assertFalse(report["model"]["dynamic_crop_v2_enabled"])
+            activation_checkpointing = report["model"][
+                "activation_checkpointing"
+            ]
+            self.assertEqual(
+                DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
+                activation_checkpointing["contract"],
+            )
+            self.assertTrue(activation_checkpointing["enabled"])
+            self.assertTrue(activation_checkpointing["training_only"])
+            self.assertFalse(
+                activation_checkpointing["serialized_parameter_tree_changed"]
+            )
+            self.assertFalse(reloaded_model.base.encoder.checkpoint)
             self.assertIsNone(report["data"]["dynamic_crop_v2"])
             self.assertEqual(
                 dynamic_corpus.data_id,

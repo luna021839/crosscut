@@ -79,6 +79,7 @@ from .stage_edit_training import (
 )
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
     PRODUCTION_CHECKPOINT_SCOPE,
     PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT,
     PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
@@ -147,6 +148,52 @@ def _require_mlx() -> None:
     if mx is None or nn is None or optim is None:
         detail = f": {_MLX_IMPORT_ERROR}" if _MLX_IMPORT_ERROR else ""
         raise RuntimeError(f"production StageEdit training requires MLX{detail}")
+
+
+def _enable_dynamic_crop_v3_activation_checkpointing(
+    model: Any,
+) -> dict[str, Any]:
+    """Enable MLX layer recomputation without changing checkpoint weights.
+
+    MLX's TransformerEncoder owns a training-only ``checkpoint`` switch.  It
+    recomputes encoder-layer intermediates during backward instead of retaining
+    them, while the serialized parameter tree and inference model remain
+    identical.  Dynamic Crop v3 production training always uses this path so
+    the pinned 105M candidate can stay below the measured device budget.
+    """
+
+    if not isinstance(model, StageEditTransformerDynamicCropV3):
+        raise TypeError(
+            "activation checkpointing requires a Dynamic Crop v3 model"
+        )
+    base = getattr(model, "base", None)
+    encoder = getattr(base, "encoder", None)
+    if encoder is None or not hasattr(encoder, "checkpoint"):
+        raise RuntimeError(
+            "MLX TransformerEncoder checkpoint support is unavailable"
+        )
+    previous = getattr(encoder, "checkpoint")
+    if not isinstance(previous, bool):
+        raise RuntimeError(
+            "MLX TransformerEncoder checkpoint switch is not boolean"
+        )
+    if previous is not False:
+        raise RuntimeError(
+            "Dynamic Crop v3 activation checkpointing must start disabled"
+        )
+    encoder.checkpoint = True
+    if encoder.checkpoint is not True:
+        raise RuntimeError("activation checkpointing did not remain enabled")
+    return {
+        "contract": DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_CONTRACT,
+        "enabled": True,
+        "scope": "base_transformer_encoder_all_layers",
+        "implementation": "mlx.nn.TransformerEncoder.checkpoint",
+        "training_only": True,
+        "serialized_parameter_tree_changed": False,
+        "inference_runtime_requires_checkpointing": False,
+        "previous_value": False,
+    }
 
 
 def _finite_metric(value: Any) -> float | None:
@@ -1955,6 +2002,7 @@ def train_production_stage_edit(
     }
     saved_metadata = None
     clipping_supported = hasattr(optim, "clip_grad_norm")
+    activation_checkpointing_evidence: Mapping[str, Any] | None = None
 
     with mx.stream(active_device):
         mx.random.seed(seed)
@@ -1965,6 +2013,10 @@ def train_production_stage_edit(
             if dynamic_crop_v2_enabled
             else StageEditTransformer(config)
         )
+        if dynamic_crop_v3_enabled:
+            activation_checkpointing_evidence = (
+                _enable_dynamic_crop_v3_activation_checkpointing(model)
+            )
 
         cut_only_loss_contract = _cut_only_pretraining_loss_contract(
             effective_loss_contract
@@ -2998,6 +3050,11 @@ def train_production_stage_edit(
             "dynamic_crop_version": dynamic_crop_version,
             "dynamic_crop_v2_enabled": dynamic_crop_v2_enabled,
             "dynamic_crop_v3_enabled": dynamic_crop_v3_enabled,
+            "activation_checkpointing": (
+                dict(activation_checkpointing_evidence)
+                if activation_checkpointing_evidence is not None
+                else None
+            ),
             "dynamic_crop_model_contract": getattr(
                 loaded_metadata, "model_contract", None
             ),

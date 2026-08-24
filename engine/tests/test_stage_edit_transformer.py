@@ -1534,6 +1534,41 @@ class StageEditMLXTests(unittest.TestCase):
             self.assertFalse(rejected_model.learned_inference_ready)
             self.assertIn("does not declare v3", rejected_model.reason)
 
+            tampered_activation_checkpointing = copy.deepcopy(original_report)
+            tampered_activation_checkpointing["model"][
+                "activation_checkpointing"
+            ]["enabled"] = False
+            report_path.write_text(
+                json.dumps(tampered_activation_checkpointing), encoding="utf-8"
+            )
+            rejected_activation_checkpointing = stage_edit_readiness_report(
+                checkpoint
+            )
+            self.assertFalse(
+                rejected_activation_checkpointing.learned_inference_ready
+            )
+            self.assertIn(
+                "activation checkpointing evidence differs",
+                rejected_activation_checkpointing.reason,
+            )
+
+            tampered_activation_types = copy.deepcopy(original_report)
+            tampered_activation_types["model"]["activation_checkpointing"][
+                "enabled"
+            ] = 1
+            tampered_activation_types["model"]["activation_checkpointing"][
+                "previous_value"
+            ] = 0
+            report_path.write_text(
+                json.dumps(tampered_activation_types), encoding="utf-8"
+            )
+            rejected_activation_types = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(rejected_activation_types.learned_inference_ready)
+            self.assertIn(
+                "activation checkpointing evidence differs",
+                rejected_activation_types.reason,
+            )
+
             tampered_gate = copy.deepcopy(original_report)
             tampered_gate["optimization"][
                 "best_validation_selection_evidence"
