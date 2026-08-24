@@ -17,6 +17,10 @@ from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
     DYNAMIC_CROP_V2_SEMIMARKOV_ADAPTER_CONTRACT,
     DynamicCropHeadPredictionV2,
 )
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT,
+    DynamicCropHeadPredictionV3,
+)
 from crosscut.stage_edit_semimarkov_beam import (
     StageEditCheckpointNotReadyError,
     StageEditDecodeInputError,
@@ -1346,6 +1350,23 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             motion_logit=20.0,
         )
 
+    @staticmethod
+    def _dynamic_prediction_v3(
+        source_index: int,
+        *,
+        source_id: str | None = None,
+        zoom: float | None = None,
+    ) -> DynamicCropHeadPredictionV3:
+        selected_zoom = zoom if zoom is not None else 1.02 + 0.04 * source_index
+        return DynamicCropHeadPredictionV3(
+            source_id=source_id or f"source-{source_index}",
+            source_index=source_index,
+            values=((selected_zoom, 0.5, 0.5, 0.0),) * 8,
+            count_logits=(20.0, -20.0, -20.0, -20.0, -20.0, -20.0, -20.0, -20.0),
+            time_interval_logits=(0.0,) * 35,
+            motion_logit=0.0,
+        )
+
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
         return_value=_ready_report(),
@@ -1455,6 +1476,119 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(StageEditDecodeInputError, "cannot mix"):
             _decode(frames=tuple(frames))
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_dynamic_crop_v3_decodes_only_selected_canonical_source_slot(
+        self, _mocked
+    ) -> None:
+        frames = tuple(
+            replace(
+                frame,
+                # Unsafe legacy values prove v3 does not consult that head.
+                crop=(99.0, 99.0, -99.0, 99.0),
+                dynamic_crop_v3_by_source=tuple(
+                    self._dynamic_prediction_v3(source_index)
+                    for source_index in range(4)
+                ),
+            )
+            for frame in _frames(6, 4)
+        )
+
+        result = _decode(frames=frames)
+
+        self.assertEqual(
+            DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT,
+            result.audit.input_summary["crop_contract"],
+        )
+        self.assertEqual("v3", result.audit.input_summary["dynamic_crop_mode"])
+        self.assertEqual(
+            result.audit.input_summary["selected_dynamic_crop_attempt_count"],
+            result.audit.input_summary["selected_dynamic_crop_v3_attempt_count"],
+        )
+        for timeline in result.timelines:
+            for decision in timeline.decisions:
+                expected_zoom = 1.02 + 0.04 * decision.source_index
+                self.assertAlmostEqual(expected_zoom, decision.crop_requested[0])
+                self.assertAlmostEqual(expected_zoom, decision.crop_applied[0])
+                self.assertIsNone(decision.dynamic_crop_decode)
+                decoded = decision.dynamic_crop_decode_v3
+                assert decoded is not None
+                self.assertEqual(decision.source_index, decoded.source_index)
+                self.assertEqual(decision.source_id, decoded.source_id)
+                self.assertEqual(
+                    DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT,
+                    decision.crop_contract,
+                )
+                diagnostic = decision.to_dict()["dynamic_crop_v3"]
+                assert diagnostic is not None
+                self.assertEqual(decision.source_id, diagnostic["source_id"])
+                self.assertEqual(decision.source_index, diagnostic["source_index"])
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_dynamic_crop_v3_source_identity_mismatch_fails_closed(
+        self, _mocked
+    ) -> None:
+        predictions = tuple(
+            self._dynamic_prediction_v3(
+                source_index,
+                source_id=("wrong-source" if source_index == 2 else None),
+            )
+            for source_index in range(4)
+        )
+        frames = tuple(
+            replace(frame, dynamic_crop_v3_by_source=predictions)
+            for frame in _frames(6, 4)
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError, "v3 source identity mismatch"
+        ):
+            _decode(frames=frames)
+
+    def test_dynamic_crop_v3_effective_slot_cannot_omit_prediction(self) -> None:
+        predictions = tuple(
+            None if source_index == 1 else self._dynamic_prediction_v3(source_index)
+            for source_index in range(4)
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError, "prediction presence differs from source gates"
+        ):
+            replace(
+                _frames(6, 4)[0],
+                dynamic_crop_v3_by_source=predictions,
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_mixed_v2_v3_and_legacy_frame_sets_fail_closed(self, _mocked) -> None:
+        v3_predictions = tuple(
+            self._dynamic_prediction_v3(source_index)
+            for source_index in range(4)
+        )
+        v3_frames = tuple(
+            replace(frame, dynamic_crop_v3_by_source=v3_predictions)
+            for frame in _frames(6, 4)
+        )
+        legacy_and_v3 = (replace(v3_frames[0], dynamic_crop_v3_by_source=()),) + v3_frames[1:]
+        with self.assertRaisesRegex(StageEditDecodeInputError, "cannot mix"):
+            _decode(frames=legacy_and_v3)
+
+        v2_and_v3 = (
+            replace(
+                v3_frames[0],
+                dynamic_crop_v3_by_source=(),
+                dynamic_crop_v2=self._dynamic_prediction(),
+            ),
+        ) + v3_frames[1:]
+        with self.assertRaisesRegex(StageEditDecodeInputError, "cannot mix"):
+            _decode(frames=v2_and_v3)
 
 
 if __name__ == "__main__":

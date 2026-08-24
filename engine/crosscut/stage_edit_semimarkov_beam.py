@@ -34,6 +34,11 @@ from .stage_edit_dynamic_crop_semimarkov_adapter import (
     DynamicCropHeadPredictionV2,
     DynamicCropTrackDecodeV2,
 )
+from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT,
+    DynamicCropHeadPredictionV3,
+    DynamicCropTrackDecodeV3,
+)
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_DECISION_HISTORY_OWNER,
@@ -261,6 +266,13 @@ class StageEditHeadFrame:
     section_progress: float | None = None
     phrase_progress: float | None = None
     section_role: str | None = None
+    # V3 retains one source-exact trajectory per canonical source slot.  A
+    # hard-gated/unavailable slot is represented by ``None``; an empty tuple
+    # means this is a legacy or v2 frame.  Appending the field preserves the
+    # positional constructor contract of every pre-v3 caller.
+    dynamic_crop_v3_by_source: tuple[
+        DynamicCropHeadPredictionV3 | None, ...
+    ] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -321,6 +333,43 @@ class StageEditHeadFrame:
             raise StageEditDecodeInputError(
                 "dynamic_crop_v2 must be a DynamicCropHeadPredictionV2"
             )
+        dynamic_v3 = tuple(self.dynamic_crop_v3_by_source)
+        if any(
+            value is not None and not isinstance(value, DynamicCropHeadPredictionV3)
+            for value in dynamic_v3
+        ):
+            raise StageEditDecodeInputError(
+                "dynamic_crop_v3_by_source must contain v3 predictions or None"
+            )
+        if self.dynamic_crop_v2 is not None and dynamic_v3:
+            raise StageEditDecodeInputError(
+                "one frame cannot contain both Dynamic Crop v2 and v3"
+            )
+        if dynamic_v3:
+            if len(dynamic_v3) != len(self.source_logits):
+                raise StageEditDecodeInputError(
+                    "dynamic_crop_v3_by_source must align with canonical source slots"
+                )
+            if (
+                len(self.available_source_mask) != len(self.source_logits)
+                or len(self.hard_source_gate_mask) != len(self.source_logits)
+            ):
+                raise StageEditDecodeInputError(
+                    "Dynamic Crop v3 source masks must align with canonical slots"
+                )
+            effective = self.effective_source_mask
+            for source_index, (prediction, is_effective) in enumerate(
+                zip(dynamic_v3, effective, strict=True)
+            ):
+                if (prediction is not None) != is_effective:
+                    raise StageEditDecodeInputError(
+                        "Dynamic Crop v3 prediction presence differs from source gates"
+                    )
+                if prediction is not None and prediction.source_index != source_index:
+                    raise StageEditDecodeInputError(
+                        "Dynamic Crop v3 prediction index differs from canonical slot"
+                    )
+        object.__setattr__(self, "dynamic_crop_v3_by_source", dynamic_v3)
         for name in ("section_progress", "phrase_progress"):
             value = getattr(self, name)
             if value is None:
@@ -367,6 +416,10 @@ class StageEditHeadFrame:
                 if self.dynamic_crop_v2 is not None
                 else None
             ),
+            "dynamic_crop_v3_by_source": [
+                value.to_dict() if value is not None else None
+                for value in self.dynamic_crop_v3_by_source
+            ],
             "section_progress": self.section_progress,
             "phrase_progress": self.phrase_progress,
             "section_role": self.section_role,
@@ -662,6 +715,9 @@ class StageEditBeamDecision:
     section_progress: float | None = None
     phrase_progress: float | None = None
     section_role: str | None = None
+    # Separate from the preserved v2 field so downstream users that type-check
+    # ``dynamic_crop_decode`` continue to receive only the v2 decode contract.
+    dynamic_crop_decode_v3: DynamicCropTrackDecodeV3 | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -762,6 +818,29 @@ class StageEditBeamDecision:
                     ),
                     "rejection_reasons": list(
                         self.dynamic_crop_decode.rejection_reasons
+                    ),
+                }
+            ),
+            "dynamic_crop_v3": (
+                None
+                if self.dynamic_crop_decode_v3 is None
+                else {
+                    "adapter_contract": self.dynamic_crop_decode_v3.adapter_contract,
+                    "source_id": self.dynamic_crop_decode_v3.source_id,
+                    "source_index": self.dynamic_crop_decode_v3.source_index,
+                    "eligible": self.dynamic_crop_decode_v3.eligible,
+                    "loss_masked": self.dynamic_crop_decode_v3.loss_masked,
+                    "predicted_keyframe_count": (
+                        self.dynamic_crop_decode_v3.predicted_keyframe_count
+                    ),
+                    "applied_keyframe_count": (
+                        self.dynamic_crop_decode_v3.applied_keyframe_count
+                    ),
+                    "minimum_safe_zoom_projection_count": (
+                        self.dynamic_crop_decode_v3.minimum_safe_zoom_projection_count
+                    ),
+                    "rejection_reasons": list(
+                        self.dynamic_crop_decode_v3.rejection_reasons
                     ),
                 }
             ),
@@ -2478,10 +2557,18 @@ def _validate_decode_inputs(
         raise StageEditDecodeInputError("reference_source is outside the source list")
     if not frames:
         raise StageEditDecodeInputError("candidate head frames cannot be empty")
-    dynamic_crop_modes = tuple(frame.dynamic_crop_v2 is not None for frame in frames)
-    if any(dynamic_crop_modes) and not all(dynamic_crop_modes):
+    dynamic_crop_modes = tuple(
+        "v2"
+        if frame.dynamic_crop_v2 is not None
+        else "v3"
+        if frame.dynamic_crop_v3_by_source
+        else "legacy"
+        for frame in frames
+    )
+    if len(set(dynamic_crop_modes)) != 1:
         raise StageEditDecodeInputError(
-            "candidate head frames cannot mix legacy and Dynamic Crop v2 contracts"
+            "candidate head frames cannot mix legacy, Dynamic Crop v2, and "
+            "Dynamic Crop v3 contracts"
         )
     if abs(frames[0].master_time_seconds - section_plan.start_seconds) > _TIME_EPSILON:
         raise StageEditDecodeInputError(
@@ -2521,6 +2608,23 @@ def _validate_decode_inputs(
             raise StageEditDecodeInputError(
                 f"frame {index} continuity count does not match sources"
             )
+        if frame.dynamic_crop_v3_by_source:
+            if len(frame.dynamic_crop_v3_by_source) != source_count:
+                raise StageEditDecodeInputError(
+                    f"frame {index} Dynamic Crop v3 count does not match sources"
+                )
+            for source_index, prediction in enumerate(
+                frame.dynamic_crop_v3_by_source
+            ):
+                if prediction is None:
+                    continue
+                if (
+                    prediction.source_index != source_index
+                    or prediction.source_id != source_ids[source_index]
+                ):
+                    raise StageEditDecodeInputError(
+                        f"frame {index} Dynamic Crop v3 source identity mismatch"
+                    )
         if len(frame.duration_logits) != schema.duration_bucket_count:
             raise StageEditDecodeInputError(
                 f"frame {index} duration logit count does not match schema"
@@ -2685,11 +2789,14 @@ def decode_stage_edit_semimarkov_beam(
             for frame in frames
         )
     # Legacy four-value crops remain available for old checkpoints.  Dynamic
-    # Crop v2 predictions are intentionally *not* projected here: the model's
-    # normalized K=8 times can only be interpreted after a concrete duration
-    # hypothesis exists inside the semi-Markov expansion.
+    # Crop predictions are intentionally *not* projected here: normalized
+    # trajectory times can only be interpreted after a concrete duration
+    # hypothesis exists inside the semi-Markov expansion.  V3 additionally
+    # keeps the canonical source axis until a source hypothesis is selected.
     crop_values = tuple(
-        None if frame.dynamic_crop_v2 is not None else _crop_transform(frame.crop)
+        None
+        if frame.dynamic_crop_v2 is not None or frame.dynamic_crop_v3_by_source
+        else _crop_transform(frame.crop)
         for frame in frames
     )
 
@@ -2976,6 +3083,7 @@ def decode_stage_edit_semimarkov_beam(
                             ]
 
                         dynamic_crop_decode: DynamicCropTrackDecodeV2 | None = None
+                        dynamic_crop_decode_v3: DynamicCropTrackDecodeV3 | None = None
                         editorial_transform: EditorialTransformTrack | None
                         if frame.dynamic_crop_v2 is not None:
                             dynamic_crop_decode = frame.dynamic_crop_v2.decode(duration)
@@ -3004,10 +3112,58 @@ def decode_stage_edit_semimarkov_beam(
                                     )
                                 )
                             else:
-                                # A rejected v2 trajectory means exactly "no
-                                # transform" for this cut.  Never substitute
-                                # the legacy crop head, a centered zoom, or a
-                                # synthesized t=0 keyframe.
+                                # A rejected dynamic trajectory means exactly
+                                # "no transform" for this cut.  Never
+                                # substitute the legacy crop head, a centered
+                                # zoom, or a synthesized t=0 keyframe.
+                                applied_crop = (1.0, 0.5, 0.5, 0.0)
+                                crop_corrected = False
+                                crop_correction = 1.0
+                        elif frame.dynamic_crop_v3_by_source:
+                            # The source axis is resolved only after this beam
+                            # hypothesis selects its canonical source.  Never
+                            # borrow another source's trajectory, even when its
+                            # values happen to look more renderer-friendly.
+                            prediction_v3 = frame.dynamic_crop_v3_by_source[
+                                source_index
+                            ]
+                            if prediction_v3 is None:
+                                raise StageEditDecodeInputError(
+                                    "selected Dynamic Crop v3 source has no prediction"
+                                )
+                            if (
+                                prediction_v3.source_index != source_index
+                                or prediction_v3.source_id != metadata.source_id
+                            ):
+                                raise StageEditDecodeInputError(
+                                    "selected Dynamic Crop v3 prediction/source mismatch"
+                                )
+                            dynamic_crop_decode_v3 = prediction_v3.decode(duration)
+                            requested_crop = prediction_v3.values[0]
+                            crop_contract = (
+                                DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT
+                            )
+                            editorial_transform = dynamic_crop_decode_v3.track
+                            if dynamic_crop_decode_v3.eligible:
+                                assert editorial_transform is not None
+                                first_keyframe = editorial_transform.keyframes[0]
+                                applied_crop = (
+                                    first_keyframe.zoom,
+                                    first_keyframe.center_x,
+                                    first_keyframe.center_y,
+                                    first_keyframe.roll_degrees,
+                                )
+                                crop_corrected = bool(
+                                    dynamic_crop_decode_v3.minimum_safe_zoom_projection_count
+                                )
+                                crop_correction = (
+                                    dynamic_crop_decode_v3.minimum_safe_zoom_projection_count
+                                    / max(
+                                        1,
+                                        dynamic_crop_decode_v3.predicted_keyframe_count,
+                                    )
+                                )
+                            else:
                                 applied_crop = (1.0, 0.5, 0.5, 0.0)
                                 crop_corrected = False
                                 crop_correction = 1.0
@@ -3233,6 +3389,7 @@ def decode_stage_edit_semimarkov_beam(
                             ),
                             editorial_transform=editorial_transform,
                             dynamic_crop_decode=dynamic_crop_decode,
+                            dynamic_crop_decode_v3=dynamic_crop_decode_v3,
                             crop_contract=crop_contract,
                             section_progress=frame.section_progress,
                             phrase_progress=frame.phrase_progress,
@@ -3389,11 +3546,21 @@ def decode_stage_edit_semimarkov_beam(
         schema=schema,
         source_derivative_metadata=source_derivative_metadata,
     )
-    selected_dynamic_decodes = tuple(
+    selected_dynamic_v2_decodes = tuple(
         decision.dynamic_crop_decode
         for timeline in timelines
         for decision in timeline.decisions
         if decision.dynamic_crop_decode is not None
+    )
+    selected_dynamic_v3_decodes = tuple(
+        decision.dynamic_crop_decode_v3
+        for timeline in timelines
+        for decision in timeline.decisions
+        if decision.dynamic_crop_decode_v3 is not None
+    )
+    selected_dynamic_decodes = (
+        *selected_dynamic_v2_decodes,
+        *selected_dynamic_v3_decodes,
     )
     dynamic_rejection_counts: dict[str, int] = {}
     for decoded in selected_dynamic_decodes:
@@ -3463,9 +3630,38 @@ def decode_stage_edit_semimarkov_beam(
             "crop_contract": (
                 DYNAMIC_CROP_V2_SEMIMARKOV_ADAPTER_CONTRACT
                 if frames[0].dynamic_crop_v2 is not None
+                else DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT
+                if frames[0].dynamic_crop_v3_by_source
                 else "legacy_static_crop_head_v1"
             ),
+            "dynamic_crop_mode": (
+                "v2"
+                if selected_dynamic_v2_decodes
+                else "v3"
+                if selected_dynamic_v3_decodes
+                else "legacy"
+            ),
             "selected_dynamic_crop_attempt_count": len(selected_dynamic_decodes),
+            "selected_dynamic_crop_v2_attempt_count": len(
+                selected_dynamic_v2_decodes
+            ),
+            "selected_dynamic_crop_v3_attempt_count": len(
+                selected_dynamic_v3_decodes
+            ),
+            "selected_dynamic_crop_v3_source_counts": dict(
+                sorted(
+                    {
+                        f"{source_index}:{source_id}": sum(
+                            value.source_index == source_index
+                            and value.source_id == source_id
+                            for value in selected_dynamic_v3_decodes
+                        )
+                        for source_index, source_id in enumerate(
+                            value.source_id for value in normalized_metadata
+                        )
+                    }.items()
+                )
+            ),
             "selected_dynamic_crop_eligible_count": sum(
                 value.eligible for value in selected_dynamic_decodes
             ),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -8,9 +9,14 @@ from crosscut.stage_edit_dynamic_crop_head_v2 import (
     StageEditDynamicCropModelOutputV2,
     new_stage_edit_dynamic_crop_checkpoint_metadata_v2,
 )
+from crosscut.stage_edit_dynamic_crop_head_v3 import (
+    StageEditDynamicCropModelOutputV3,
+    new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
+)
 from crosscut.stage_edit_head_materializer import (
     StageEditHeadMaterializerInputError,
     stage_edit_head_frames_from_dynamic_crop_output_v2,
+    stage_edit_head_frames_from_dynamic_crop_output_v3,
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
@@ -86,6 +92,14 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             weights_trained=True,
             training_data_id="synthetic",
         )
+        self.metadata_v3 = new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
+            "head-materializer-v3-test",
+            schema,
+            self.config,
+            training_steps=1,
+            weights_trained=True,
+            training_data_id="synthetic-v3",
+        )
         self.sequence = _sequence()
         with mx.stream(mx.cpu):
             self.batch = tensorize_stage_edit_batch(
@@ -122,6 +136,44 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             dynamic_crop_normalized_times=times,
             dynamic_crop_presence_logits=presence,
             dynamic_crop_motion_logits=np.ones((1, 2), dtype=np.float32),
+        )
+
+    def _output_v3(self) -> StageEditDynamicCropModelOutputV3:
+        source_logits = np.zeros((1, 2, 3), dtype=np.float32)
+        source_logits[0, 0] = (11.0, 22.0, -1.0)
+        source_logits[0, 1] = (33.0, 44.0, -1.0)
+        values = np.zeros((1, 2, 3, 8, 4), dtype=np.float32)
+        values[..., 0] = 1.02
+        values[..., 1] = 0.5
+        values[..., 2] = 0.5
+        # Token zero is padded B,A but the expected materialized order is A,B.
+        values[0, 0, 0, :, 0] = 1.04
+        values[0, 0, 1, :, 0] = 1.14
+        values[0, 1, 0, :, 0] = 1.12
+        values[0, 1, 1, :, 0] = 1.05
+        count_logits = np.full((1, 2, 3, 8), -20.0, dtype=np.float32)
+        count_logits[..., 0] = 20.0
+        candidate = np.asarray(self.batch.source_candidate_mask, dtype=bool)
+        gates = np.asarray(self.batch.hard_source_gate_mask, dtype=bool)
+        return StageEditDynamicCropModelOutputV3(
+            cut_timing_logits=np.array([[0.1, 0.2]], dtype=np.float32),
+            source_selection_logits=source_logits,
+            duration_bucket_logits=np.zeros(
+                (1, 2, DEFAULT_STAGE_EDIT_SCHEMA.duration_bucket_count),
+                dtype=np.float32,
+            ),
+            transition_logits=np.zeros(
+                (1, 2, len(DEFAULT_STAGE_EDIT_SCHEMA.transition_labels)),
+                dtype=np.float32,
+            ),
+            crop=np.full((1, 2, 4), 999.0, dtype=np.float32),
+            effective_source_mask=np.logical_and(candidate, gates),
+            dynamic_crop_values=values,
+            dynamic_crop_count_logits=count_logits,
+            dynamic_crop_time_interval_logits=np.zeros(
+                (1, 2, 3, 35), dtype=np.float32
+            ),
+            dynamic_crop_motion_logits=np.ones((1, 2, 3), dtype=np.float32),
         )
 
     def test_remaps_padded_source_slots_and_preserves_raw_k8_prediction(self) -> None:
@@ -196,6 +248,46 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             0.2,
             frames[0].source_continuity[1].formation_pose_coverage,
         )
+
+    def test_v3_remaps_each_padded_prediction_to_exact_canonical_source(self) -> None:
+        frames = stage_edit_head_frames_from_dynamic_crop_output_v3(
+            sequence=self.sequence,
+            batch=self.batch,
+            output=self._output_v3(),
+            canonical_source_ids=("A", "B"),
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            metadata=self.metadata_v3,
+        )
+
+        self.assertEqual((22.0, 11.0), frames[0].source_logits)
+        predictions = frames[0].dynamic_crop_v3_by_source
+        self.assertEqual(2, len(predictions))
+        assert predictions[0] is not None
+        assert predictions[1] is not None
+        self.assertEqual(("A", 0), (predictions[0].source_id, predictions[0].source_index))
+        self.assertEqual(("B", 1), (predictions[1].source_id, predictions[1].source_index))
+        self.assertAlmostEqual(1.14, predictions[0].values[0][0], places=5)
+        self.assertAlmostEqual(1.04, predictions[1].values[0][0], places=5)
+        self.assertIsNone(frames[1].dynamic_crop_v3_by_source[1])
+        self.assertEqual((True, False), frames[1].effective_source_mask)
+        self.assertIsNone(frames[0].dynamic_crop_v2)
+
+    def test_v3_duplicate_padded_source_identity_fails_closed(self) -> None:
+        bad_batch = replace(
+            self.batch,
+            source_ids=((('B', 'B', None), ('A', 'B', None)),),
+        )
+        with self.assertRaisesRegex(
+            StageEditHeadMaterializerInputError, "padded source ids.*unique"
+        ):
+            stage_edit_head_frames_from_dynamic_crop_output_v3(
+                sequence=self.sequence,
+                batch=bad_batch,
+                output=self._output_v3(),
+                canonical_source_ids=("A", "B"),
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                metadata=self.metadata_v3,
+            )
 
 
 if __name__ == "__main__":

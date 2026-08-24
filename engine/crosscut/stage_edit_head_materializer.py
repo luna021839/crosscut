@@ -1,15 +1,16 @@
 """Production Transformer forward pass to semi-Markov head frames.
 
-This is the strict, auditable bridge that was previously missing between a
-trained Dynamic Crop v2 checkpoint and :mod:`stage_edit_semimarkov_beam`.
-Source logits are remapped from each token's padded model slots into one
-caller-supplied canonical source order.  Dynamic trajectories remain in
-normalized K=8 form until the beam tests a concrete shot duration.
+This is the strict, auditable bridge between trained Dynamic Crop checkpoints
+and :mod:`stage_edit_semimarkov_beam`.  Source logits are remapped from each
+token's padded model slots into one caller-supplied canonical source order.
+V2 trajectories remain in normalized K=8 form; source-conditioned v3 keeps
+that normalized trajectory for every canonical source until the beam chooses
+both a concrete source and duration.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -26,6 +27,13 @@ from .stage_edit_dynamic_crop_head_v2 import (
 )
 from .stage_edit_dynamic_crop_semimarkov_adapter import (
     dynamic_crop_prediction_from_model_token_v2,
+)
+from .stage_edit_dynamic_crop_head_v3 import (
+    StageEditDynamicCropCheckpointMetadataV3,
+    StageEditDynamicCropModelOutputV3,
+)
+from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    dynamic_crop_predictions_from_model_token_v3,
 )
 from .stage_edit_semimarkov_beam import (
     StageEditHeadFrame,
@@ -45,10 +53,10 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 3
+STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 4
 STAGE_EDIT_HEAD_MATERIALIZER_CONTRACT = (
-    "production_dynamic_crop_v2_transformer_to_semimarkov_heads_with_pair_"
-    "continuity_and_exact_music_structure_v3"
+    "production_dynamic_crop_v2_v3_transformer_to_semimarkov_heads_with_"
+    "source_exact_crop_pair_continuity_and_exact_music_structure_v4"
 )
 
 
@@ -370,6 +378,84 @@ def _sequence_payload(sequence: StageEditSequence) -> dict[str, Any]:
     }
 
 
+def _strict_token_source_mapping(
+    *,
+    token: Any,
+    batch: StageEditTensorBatch,
+    batch_index: int,
+    token_index: int,
+    canonical_source_ids: tuple[str, ...],
+    candidate_mask: np.ndarray,
+    hard_gate_mask: np.ndarray,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Prove supplied-token, padded-slot, and canonical identities agree.
+
+    Dict comprehensions alone silently collapse duplicate ids.  That is unsafe
+    for source-conditioned crop because it could attach one camera's trajectory
+    to another camera.  This helper validates identities before constructing
+    either lookup and also proves the tensorized masks still describe the
+    supplied token.
+    """
+
+    candidate_ids = tuple(
+        str(candidate.source_id).strip() for candidate in token.source_candidates
+    )
+    if any(not value for value in candidate_ids) or len(candidate_ids) != len(
+        set(candidate_ids)
+    ):
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} candidate source ids must be non-empty and unique"
+        )
+    candidate_by_id = dict(zip(candidate_ids, token.source_candidates, strict=True))
+
+    try:
+        padded_ids = tuple(batch.source_ids[batch_index][token_index])
+    except IndexError as exc:
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} padded source ids are missing"
+        ) from exc
+    observed_padded_ids = tuple(
+        str(source_id).strip() for source_id in padded_ids if source_id is not None
+    )
+    if any(not value for value in observed_padded_ids) or len(
+        observed_padded_ids
+    ) != len(set(observed_padded_ids)):
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} padded source ids must be non-empty and unique"
+        )
+    if set(observed_padded_ids) != set(candidate_ids):
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} padded source ids differ from supplied candidates"
+        )
+    unknown = set(observed_padded_ids) - set(canonical_source_ids)
+    if unknown:
+        raise StageEditHeadMaterializerInputError(
+            "token contains source ids outside canonical order: "
+            + ", ".join(sorted(unknown))
+        )
+    slot_by_id = {
+        str(source_id).strip(): slot
+        for slot, source_id in enumerate(padded_ids)
+        if source_id is not None
+    }
+    for source_id, slot in slot_by_id.items():
+        candidate = candidate_by_id[source_id]
+        expected_available = bool(candidate.available)
+        expected_hard_gate = bool(
+            candidate.available and candidate.hard_gate_passed
+        )
+        if (
+            bool(candidate_mask[batch_index, token_index, slot])
+            != expected_available
+            or bool(hard_gate_mask[batch_index, token_index, slot])
+            != expected_hard_gate
+        ):
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} source {source_id} masks differ from supplied token"
+            )
+    return candidate_by_id, slot_by_id
+
+
 def stage_edit_head_frames_from_dynamic_crop_output_v2(
     *,
     sequence: StageEditSequence,
@@ -444,23 +530,16 @@ def stage_edit_head_frames_from_dynamic_crop_output_v2(
             )
 
     frames: list[StageEditHeadFrame] = []
-    canonical_set = set(source_ids)
     for token_index, token in enumerate(sequence.tokens):
-        candidate_by_id = {
-            candidate.source_id: candidate for candidate in token.source_candidates
-        }
-        padded_ids = batch.source_ids[batch_index][token_index]
-        slot_by_id = {
-            source_id: slot
-            for slot, source_id in enumerate(padded_ids)
-            if source_id is not None
-        }
-        unknown = set(slot_by_id) - canonical_set
-        if unknown:
-            raise StageEditHeadMaterializerInputError(
-                "token contains source ids outside canonical order: "
-                + ", ".join(sorted(unknown))
-            )
+        candidate_by_id, slot_by_id = _strict_token_source_mapping(
+            token=token,
+            batch=batch,
+            batch_index=batch_index,
+            token_index=token_index,
+            canonical_source_ids=source_ids,
+            candidate_mask=candidate_mask,
+            hard_gate_mask=hard_gate_mask,
+        )
         remapped_logits: list[float] = []
         available: list[bool] = []
         hard_gates: list[bool] = []
@@ -565,6 +644,238 @@ def stage_edit_head_frames_from_dynamic_crop_output_v2(
         )
     if len(frames) != token_count:
         raise AssertionError("internal StageEdit head materialization count mismatch")
+    return tuple(frames)
+
+
+def stage_edit_head_frames_from_dynamic_crop_output_v3(
+    *,
+    sequence: StageEditSequence,
+    batch: StageEditTensorBatch,
+    output: StageEditDynamicCropModelOutputV3,
+    canonical_source_ids: Sequence[str],
+    schema: StageEditTokenSchema,
+    metadata: StageEditDynamicCropCheckpointMetadataV3,
+    source_shot_sizes_by_token: Sequence[Mapping[str, str]] = (),
+    batch_index: int = 0,
+) -> tuple[StageEditHeadFrame, ...]:
+    """Convert source-conditioned v3 output without losing its source axis.
+
+    Model slots are local to each token and may be permuted.  Returned v3
+    prediction tuples instead use the caller's canonical source order, with
+    each prediction's ``source_index`` rewritten to that same canonical slot.
+    Unavailable or hard-gated canonical slots remain explicit ``None`` values.
+    """
+
+    if not isinstance(output, StageEditDynamicCropModelOutputV3):
+        raise StageEditHeadMaterializerInputError(
+            "Dynamic Crop v3 materialization requires a v3 model output"
+        )
+    if not isinstance(metadata, StageEditDynamicCropCheckpointMetadataV3):
+        raise StageEditHeadMaterializerInputError(
+            "Dynamic Crop v3 materialization requires v3 checkpoint metadata"
+        )
+    source_ids = tuple(str(value).strip() for value in canonical_source_ids)
+    if not source_ids or any(not value for value in source_ids):
+        raise StageEditHeadMaterializerInputError(
+            "canonical source ids must be non-empty"
+        )
+    if len(source_ids) != len(set(source_ids)):
+        raise StageEditHeadMaterializerInputError(
+            "canonical source ids must be unique"
+        )
+    if len(source_ids) > metadata.base_model_config.max_sources:
+        raise StageEditHeadMaterializerInputError(
+            "canonical source count exceeds checkpoint maximum"
+        )
+    if batch_index < 0 or batch_index >= len(batch.sequence_ids):
+        raise StageEditHeadMaterializerInputError("batch index is outside model batch")
+    if batch.sequence_ids[batch_index] != sequence.sequence_id:
+        raise StageEditHeadMaterializerInputError(
+            "batch sequence identity differs from requested sequence"
+        )
+    if source_shot_sizes_by_token and len(source_shot_sizes_by_token) != len(
+        sequence.tokens
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "source shot-size mappings must align with every token"
+        )
+
+    cut_logits = np.asarray(output.cut_timing_logits)
+    source_logits = np.asarray(output.source_selection_logits)
+    duration_logits = np.asarray(output.duration_bucket_logits)
+    transition_logits = np.asarray(output.transition_logits)
+    legacy_crop = np.asarray(output.crop)
+    output_effective_mask = np.asarray(output.effective_source_mask, dtype=bool)
+    candidate_mask = np.asarray(batch.source_candidate_mask, dtype=bool)
+    hard_gate_mask = np.asarray(batch.hard_source_gate_mask, dtype=bool)
+    expected_effective_mask = np.logical_and(candidate_mask, hard_gate_mask)
+    if output_effective_mask.shape != expected_effective_mask.shape or not np.array_equal(
+        output_effective_mask, expected_effective_mask
+    ):
+        raise StageEditHeadMaterializerInputError(
+            "model effective-source mask differs from tensorized hard gates"
+        )
+
+    token_count = len(sequence.tokens)
+    expected_prefix = (len(batch.sequence_ids), batch.sequence_mask.shape[1])
+    for name, array, tail in (
+        ("cut logits", cut_logits, ()),
+        ("source logits", source_logits, (metadata.base_model_config.max_sources,)),
+        (
+            "duration logits",
+            duration_logits,
+            (schema.duration_bucket_count,),
+        ),
+        ("transition logits", transition_logits, (len(schema.transition_labels),)),
+        ("legacy crop", legacy_crop, (4,)),
+    ):
+        if array.shape != (*expected_prefix, *tail):
+            raise StageEditHeadMaterializerInputError(
+                f"{name} shape {array.shape} violates checkpoint contract"
+            )
+
+    frames: list[StageEditHeadFrame] = []
+    for token_index, token in enumerate(sequence.tokens):
+        candidate_by_id, slot_by_id = _strict_token_source_mapping(
+            token=token,
+            batch=batch,
+            batch_index=batch_index,
+            token_index=token_index,
+            canonical_source_ids=source_ids,
+            candidate_mask=candidate_mask,
+            hard_gate_mask=hard_gate_mask,
+        )
+        remapped_logits: list[float] = []
+        available: list[bool] = []
+        hard_gates: list[bool] = []
+        continuity: list[StageEditSourceContinuity] = []
+        for source_id in source_ids:
+            slot = slot_by_id.get(source_id)
+            if slot is None:
+                remapped_logits.append(float(MASKED_SOURCE_LOGIT))
+                available.append(False)
+                hard_gates.append(False)
+                continuity.append(StageEditSourceContinuity())
+                continue
+            candidate = candidate_by_id[source_id]
+            remapped_logits.append(float(source_logits[batch_index, token_index, slot]))
+            available.append(bool(candidate_mask[batch_index, token_index, slot]))
+            hard_gates.append(bool(hard_gate_mask[batch_index, token_index, slot]))
+            continuity.append(_source_continuity_from_candidate(candidate, schema))
+        if not any(
+            left and right for left, right in zip(available, hard_gates, strict=True)
+        ):
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} has no source surviving hard gates"
+            )
+
+        try:
+            padded_predictions = dynamic_crop_predictions_from_model_token_v3(
+                output,
+                batch,
+                batch_index=batch_index,
+                token_index=token_index,
+                config=metadata.dynamic_crop_config,
+            )
+        except (IndexError, TypeError, ValueError, OverflowError) as exc:
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} Dynamic Crop v3 output is invalid: {exc}"
+            ) from exc
+        if len(padded_predictions) != metadata.base_model_config.max_sources:
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} Dynamic Crop v3 slot count changed"
+            )
+        canonical_predictions = []
+        for canonical_index, source_id in enumerate(source_ids):
+            padded_slot = slot_by_id.get(source_id)
+            if padded_slot is None:
+                canonical_predictions.append(None)
+                continue
+            prediction = padded_predictions[padded_slot]
+            if prediction is not None:
+                if (
+                    prediction.source_id != source_id
+                    or prediction.source_index != padded_slot
+                ):
+                    raise StageEditHeadMaterializerInputError(
+                        f"token {token_index} Dynamic Crop v3 source-slot mismatch"
+                    )
+                prediction = replace(prediction, source_index=canonical_index)
+            canonical_predictions.append(prediction)
+
+        supplied_shot_size_map = (
+            source_shot_sizes_by_token[token_index]
+            if source_shot_sizes_by_token
+            else {}
+        )
+        frames.append(
+            StageEditHeadFrame(
+                master_time_seconds=float(token.master_time_seconds),
+                cut_logit=float(cut_logits[batch_index, token_index]),
+                source_logits=tuple(remapped_logits),
+                duration_logits=_finite_tuple(
+                    duration_logits[batch_index, token_index],
+                    name=f"duration logits token {token_index}",
+                    expected=schema.duration_bucket_count,
+                ),
+                transition_logits=_finite_tuple(
+                    transition_logits[batch_index, token_index],
+                    name=f"transition logits token {token_index}",
+                    expected=len(schema.transition_labels),
+                ),
+                crop=_finite_tuple(
+                    legacy_crop[batch_index, token_index],
+                    name=f"legacy crop token {token_index}",
+                    expected=4,
+                ),
+                available_source_mask=tuple(available),
+                hard_source_gate_mask=tuple(hard_gates),
+                source_shot_sizes=tuple(
+                    str(
+                        supplied_shot_size_map[source_id]
+                        if source_id in supplied_shot_size_map
+                        else (
+                            _shot_size_from_candidate(
+                                candidate_by_id[source_id], schema
+                            )
+                            if source_id in candidate_by_id
+                            else "unknown"
+                        )
+                    )
+                    for source_id in source_ids
+                ),
+                source_continuity=tuple(continuity),
+                candidate_id=(
+                    f"{sequence.sequence_id}:token-{token_index:04d}:"
+                    f"{float(token.master_time_seconds):.6f}"
+                ),
+                section_progress=_exact_progress_feature(
+                    values=token.section_features,
+                    missing_mask=token.missing_mask,
+                    names=schema.section_feature_names,
+                    feature_name="section_progress",
+                    token_index=token_index,
+                    missing_mask_offset=len(schema.music_feature_names),
+                ),
+                phrase_progress=_exact_progress_feature(
+                    values=token.music_features,
+                    missing_mask=token.missing_mask,
+                    names=schema.music_feature_names,
+                    feature_name="phrase_progress",
+                    token_index=token_index,
+                    missing_mask_offset=0,
+                ),
+                section_role=_exact_section_role(
+                    values=token.section_features,
+                    missing_mask=token.missing_mask,
+                    schema=schema,
+                    token_index=token_index,
+                ),
+                dynamic_crop_v3_by_source=tuple(canonical_predictions),
+            )
+        )
+    if len(frames) != token_count:
+        raise AssertionError("internal StageEdit v3 head materialization count mismatch")
     return tuple(frames)
 
 
@@ -699,4 +1010,5 @@ __all__ = [
     "StageEditHeadMaterializerNotReadyError",
     "materialize_stage_edit_head_frames_v2",
     "stage_edit_head_frames_from_dynamic_crop_output_v2",
+    "stage_edit_head_frames_from_dynamic_crop_output_v3",
 ]
