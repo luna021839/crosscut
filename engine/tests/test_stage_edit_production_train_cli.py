@@ -7,6 +7,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, patch
 
+from crosscut.stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
 from crosscut.stage_edit_dynamic_crop_head_v3 import DynamicCropV3LossContract
 from crosscut.stage_edit_production_train_cli import (
     _dynamic_artifact_map,
@@ -176,6 +180,9 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
         )
         self.assertIsNone(parsed.professional_montage_grammar_profile)
         self.assertEqual(2, parsed.dynamic_crop_version)
+        self.assertIsNone(parsed.continuity_authority)
+        self.assertIsNone(parsed.source_pair_scorer)
+        self.assertIsNone(parsed.source_pair_production_report)
 
     def test_v3_is_explicitly_promoted_and_routed_to_the_v3_loss_contract(
         self,
@@ -423,6 +430,176 @@ class StageEditProductionTrainCliTests(unittest.TestCase):
                 checkpoint,
                 professional_montage_grammar_profile_path=profile,
                 registry_path=registry,
+                dynamic_crop_version=2,
+                continuity_authority=None,
+                source_pair_scorer_path=None,
+                source_pair_production_report_path=None,
+            )
+
+    def test_v3_activation_requires_one_explicit_continuity_authority(self) -> None:
+        base = [
+            "--input",
+            "/tmp/input.json",
+            "--song-id",
+            "reference-a=IVE-XOXZ",
+            "--held-out-song",
+            "IVE-XOXZ",
+            "--feature-snapshot",
+            "reference-a=/tmp/features.json",
+            "--dynamic-crop-manifest",
+            "/tmp/crop-manifest.json",
+            "--dynamic-crop-version",
+            "3",
+            "--checkpoint-dir",
+            "/tmp/new-v3-checkpoint",
+            "--authorize-production-activation",
+            "--professional-montage-grammar-profile",
+            "/tmp/montage-profile.json",
+        ]
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(ValueError, "requires --continuity-authority"),
+        ):
+            main(base)
+        load.assert_not_called()
+
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(ValueError, "requires both --source-pair"),
+        ):
+            main(
+                [
+                    *base,
+                    "--continuity-authority",
+                    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                ]
+            )
+        load.assert_not_called()
+
+        with (
+            patch(
+                "crosscut.stage_edit_production_train_cli."
+                "load_reference_training_corpus"
+            ) as load,
+            self.assertRaisesRegex(ValueError, "rejects source-pair"),
+        ):
+            main(
+                [
+                    *base,
+                    "--continuity-authority",
+                    HANDCRAFTED_CONTINUITY_AUTHORITY,
+                    "--source-pair-scorer",
+                    "/tmp/source-pair.json",
+                ]
+            )
+        load.assert_not_called()
+
+    def test_v3_learned_activation_routes_exact_pair_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            checkpoint = root / "checkpoint-v3"
+            profile = root / "montage-profile.json"
+            registry = root / "active-production-bundle.json"
+            scorer = root / "stage-edit-source-pair-checkpoint.json"
+            pair_report = root / "stage-edit-source-pair-production-report.json"
+            scorer.write_text("{}", encoding="utf-8")
+            pair_report.write_text("{}", encoding="utf-8")
+            quality_gate = SimpleNamespace(passed=True, to_dict=lambda: {})
+            training_result = SimpleNamespace(
+                checkpoint_directory=checkpoint,
+                report_path=checkpoint / "training-report.json",
+                best_epoch=3,
+                best_training_step=120,
+                production_ready=True,
+                quality_gate=quality_gate,
+            )
+            with (
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "load_professional_montage_policy",
+                    return_value=SimpleNamespace(),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli._snapshot_map",
+                    return_value={},
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "load_reference_training_corpus",
+                    return_value=SimpleNamespace(examples=()),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "_dynamic_artifact_map",
+                    return_value={},
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "build_stage_edit_dynamic_crop_training_corpus_v2",
+                    return_value=SimpleNamespace(name="v2"),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "build_stage_edit_dynamic_crop_training_corpus_v3",
+                    return_value=SimpleNamespace(name="v3"),
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "train_production_stage_edit",
+                    return_value=training_result,
+                ),
+                patch(
+                    "crosscut.stage_edit_production_train_cli."
+                    "register_stage_edit_production_bundle",
+                    return_value=registry,
+                ) as register,
+                patch("builtins.print"),
+            ):
+                exit_code = main(
+                    [
+                        "--input",
+                        str(root / "input.json"),
+                        "--song-id",
+                        "reference-a=IVE-XOXZ",
+                        "--held-out-song",
+                        "IVE-XOXZ",
+                        "--feature-snapshot",
+                        f"reference-a={root / 'features.json'}",
+                        "--dynamic-crop-manifest",
+                        str(root / "crop-manifest.json"),
+                        "--dynamic-crop-version",
+                        "3",
+                        "--checkpoint-dir",
+                        str(checkpoint),
+                        "--authorize-production-activation",
+                        "--professional-montage-grammar-profile",
+                        str(profile),
+                        "--production-registry",
+                        str(registry),
+                        "--continuity-authority",
+                        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                        "--source-pair-scorer",
+                        str(scorer),
+                        "--source-pair-production-report",
+                        str(pair_report),
+                    ]
+                )
+
+            self.assertEqual(0, exit_code)
+            register.assert_called_once_with(
+                checkpoint,
+                professional_montage_grammar_profile_path=profile,
+                registry_path=registry,
+                dynamic_crop_version=3,
+                continuity_authority=PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                source_pair_scorer_path=scorer,
+                source_pair_production_report_path=pair_report,
             )
 
     def test_existing_checkpoint_directory_fails_before_loading_data(self) -> None:

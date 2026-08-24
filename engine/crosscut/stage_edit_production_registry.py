@@ -9,8 +9,9 @@ field.  This module provides one fail-closed discovery boundary:
 * every checkpoint file is rebound to the hashes recorded at registration;
 * the exact professional IVE montage profile is rebound by path plus file and
   canonical-content hashes on every load;
-* only a Dynamic Crop v2 bundle that passes the production readiness report is
-  admitted; and
+* legacy Dynamic Crop v2 registries remain loadable, while v3 records one
+  explicit continuity authority and binds source-pair evidence only when the
+  production learned authority is selected;
 * registering a different bundle never overwrites an existing active record.
 
 Large checkpoints naturally live on the preferred external SSD.  A single
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,13 +35,40 @@ from .professional_montage_policy import (
     ProfessionalMontagePolicyError,
     load_professional_montage_policy,
 )
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    STAGE_EDIT_CONTINUITY_AUTHORITIES,
+)
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
     DYNAMIC_CROP_V2_MODEL_CONTRACT,
     StageEditDynamicCropCheckpointMetadataV2,
 )
+from .stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+    DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+    DYNAMIC_CROP_V3_MODEL_CONTRACT,
+    StageEditDynamicCropCheckpointMetadataV3,
+)
+from .stage_edit_source_pair_production import (
+    STAGE_EDIT_SOURCE_PAIR_CROSS_VALIDATION_CONTRACT,
+    STAGE_EDIT_SOURCE_PAIR_PRODUCTION_REPORT_CONTRACT,
+    STAGE_EDIT_SOURCE_PAIR_PRODUCTION_REPORT_FILENAME,
+    STAGE_EDIT_SOURCE_PAIR_PRODUCTION_SCHEMA_VERSION,
+)
+from .stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_CHECKPOINT_FILENAME,
+    StageEditSourcePairCheckpointError,
+    load_stage_edit_source_pair_checkpoint,
+)
+from .stage_edit_source_pair_training import (
+    STAGE_EDIT_SOURCE_PAIR_ACTIVATION_GATE_CONTRACT,
+)
 from .stage_edit_transformer import (
+    DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT,
+    DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT,
     PRODUCTION_TRAINING_REPORT_FILENAME,
     StageEditReadinessReport,
     stage_edit_readiness_report,
@@ -53,6 +82,10 @@ from .stage_edit_transition_authority import (
 STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION = 3
 STAGE_EDIT_PRODUCTION_REGISTRY_KIND = (
     "ive_stage_edit_dynamic_crop_v2_active_production_bundle"
+)
+STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION = 4
+STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND = (
+    "ive_stage_edit_dynamic_crop_v3_active_production_bundle"
 )
 STAGE_EDIT_PRODUCTION_REGISTRY_ENV = "CROSSCUT_STAGE_EDIT_PRODUCTION_REGISTRY"
 STAGE_EDIT_PRODUCTION_REGISTRY_FILENAME = "active-production-bundle.json"
@@ -79,6 +112,16 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _canonical_digest_matches(expected: object, value: Any) -> bool:
+    if not isinstance(expected, str) or _SHA256.fullmatch(expected) is None:
+        return False
+    try:
+        actual = _canonical_sha256(value)
+    except (TypeError, ValueError):
+        return False
+    return hmac_compare_digest(expected, actual)
 
 
 def _file_sha256(path: Path) -> str:
@@ -123,6 +166,8 @@ class RegisteredStageEditProductionBundle:
     registry_path: Path
     checkpoint_directory: Path
     checkpoint_id: str
+    dynamic_crop_version: int
+    continuity_authority: str | None
     token_schema_fingerprint: str
     maximum_sequence_length: int
     maximum_sources: int
@@ -135,6 +180,14 @@ class RegisteredStageEditProductionBundle:
     metadata_sha256: str
     weights_sha256: str
     training_report_sha256: str
+    source_pair_scorer_path: Path | None
+    source_pair_production_report_path: Path | None
+    source_pair_scorer_file_sha256: str | None
+    source_pair_production_report_file_sha256: str | None
+    source_pair_production_report_sha256: str | None
+    source_pair_scorer_fingerprint: str | None
+    source_pair_checkpoint_sha256: str | None
+    source_pair_corpus_sha256: str | None
     registry_sha256: str
     readiness: StageEditReadinessReport
 
@@ -150,6 +203,12 @@ class RegisteredStageEditProductionBundle:
             raise ValueError("registered StageEdit paths must be absolute")
         if not self.checkpoint_id.strip():
             raise ValueError("registered StageEdit checkpoint id cannot be blank")
+        if (
+            isinstance(self.dynamic_crop_version, bool)
+            or not isinstance(self.dynamic_crop_version, int)
+            or self.dynamic_crop_version not in (2, 3)
+        ):
+            raise ValueError("registered Dynamic Crop version is unsupported")
         for value in (
             self.token_schema_fingerprint,
             self.professional_montage_grammar_profile_file_sha256,
@@ -161,6 +220,52 @@ class RegisteredStageEditProductionBundle:
         ):
             if _SHA256.fullmatch(value) is None:
                 raise ValueError("registered StageEdit identity must be SHA-256")
+        pair_values = (
+            self.source_pair_scorer_file_sha256,
+            self.source_pair_production_report_file_sha256,
+            self.source_pair_production_report_sha256,
+            self.source_pair_scorer_fingerprint,
+            self.source_pair_checkpoint_sha256,
+            self.source_pair_corpus_sha256,
+        )
+        pair_paths = (
+            self.source_pair_scorer_path,
+            self.source_pair_production_report_path,
+        )
+        if self.dynamic_crop_version == 2:
+            if self.continuity_authority is not None:
+                raise ValueError(
+                    "Dynamic Crop v2 cannot bind a continuity authority"
+                )
+            if any(value is not None for value in (*pair_paths, *pair_values)):
+                raise ValueError(
+                    "Dynamic Crop v2 cannot bind source-pair v3 evidence"
+                )
+        elif (
+            not isinstance(self.continuity_authority, str)
+            or self.continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES
+        ):
+            raise ValueError("Dynamic Crop v3 continuity authority is invalid")
+        elif (
+            self.continuity_authority
+            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        ):
+            if any(value is None for value in (*pair_paths, *pair_values)):
+                raise ValueError(
+                    "learned Dynamic Crop v3 continuity requires source-pair evidence"
+                )
+            if any(not Path(value).is_absolute() for value in pair_paths):
+                raise ValueError("registered source-pair paths must be absolute")
+            if any(
+                not isinstance(value, str) or _SHA256.fullmatch(value) is None
+                for value in pair_values
+            ):
+                raise ValueError("registered source-pair identity must be SHA-256")
+        elif any(value is not None for value in (*pair_paths, *pair_values)):
+            raise ValueError(
+                "handcrafted Dynamic Crop v3 continuity cannot bind "
+                "source-pair evidence"
+            )
         if self.maximum_sequence_length < 1 or self.maximum_sources < 2:
             raise ValueError("registered StageEdit model limits are invalid")
         if dict(self.transition_authority) != StageEditTransitionAuthority(
@@ -191,6 +296,15 @@ class RegisteredStageEditProductionBundle:
             and self.readiness.status == "production_checkpoint_ready"
             and self.readiness.checkpoint_path == str(checkpoint)
             and self.readiness.training_steps > 0
+            and (
+                self.dynamic_crop_version == 2
+                or (
+                    self.readiness.dynamic_crop_version == 3
+                    and self.readiness.checkpoint_format == "dynamic_crop_v3"
+                    and self.readiness.checkpoint_metadata_filename
+                    == DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+                )
+            )
         ):
             raise ValueError("registered StageEdit bundle must be production ready")
 
@@ -215,7 +329,7 @@ class RegisteredStageEditProductionBundle:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "activation": "automatic_registered_production_bundle",
             "registry_path": str(self.registry_path),
             "registry_sha256": self.registry_sha256,
@@ -234,6 +348,32 @@ class RegisteredStageEditProductionBundle:
             "readiness": self.readiness.to_dict(),
             "silent_fallback_allowed": False,
         }
+        if self.dynamic_crop_version == 3:
+            payload["dynamic_crop_version"] = 3
+            payload["continuity_authority"] = self.continuity_authority
+        if (
+            self.continuity_authority
+            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        ):
+            payload["source_pair_scorer"] = {
+                "checkpoint_path": str(self.source_pair_scorer_path),
+                "production_report_path": str(
+                    self.source_pair_production_report_path
+                ),
+                "checkpoint_file_sha256": (
+                    self.source_pair_scorer_file_sha256
+                ),
+                "production_report_file_sha256": (
+                    self.source_pair_production_report_file_sha256
+                ),
+                "production_report_sha256": (
+                    self.source_pair_production_report_sha256
+                ),
+                "scorer_fingerprint": self.source_pair_scorer_fingerprint,
+                "checkpoint_sha256": self.source_pair_checkpoint_sha256,
+                "corpus_sha256": self.source_pair_corpus_sha256,
+            }
+        return payload
 
 
 def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
@@ -251,7 +391,7 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         raise StageEditProductionRegistryError(
             "production registry root must be an object"
         )
-    expected = {
+    v2_expected = {
         "schema_version",
         "registry_kind",
         "active",
@@ -270,25 +410,67 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         "storage_policy",
         "registry_sha256",
     }
+    v3_expected = v2_expected | {
+        "dynamic_crop_version",
+        "continuity_authority",
+    }
+    schema_version = payload.get("schema_version")
+    dynamic_crop_version = payload.get("dynamic_crop_version", 2)
+    is_v2 = (
+        schema_version == STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION
+        and dynamic_crop_version == 2
+    )
+    is_v3 = (
+        schema_version == STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION
+        and dynamic_crop_version == 3
+    )
+    if not is_v2 and not is_v3:
+        raise StageEditProductionRegistryError(
+            "production registry schema does not match"
+        )
+    continuity_authority = (
+        payload.get("continuity_authority") if is_v3 else None
+    )
+    if is_v3 and (
+        not isinstance(continuity_authority, str)
+        or continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry continuity authority is unsupported"
+        )
+    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        v3_expected |= {
+            "source_pair_scorer",
+            "source_pair_production_report",
+        }
+    expected = v2_expected if is_v2 else v3_expected if is_v3 else set()
     if set(payload) != expected:
         raise StageEditProductionRegistryError(
             "production registry schema does not match"
         )
     unsigned = dict(payload)
     digest = unsigned.pop("registry_sha256", None)
-    if not isinstance(digest, str) or not hmac_compare_digest(
-        digest, _canonical_sha256(unsigned)
-    ):
+    if not _canonical_digest_matches(digest, unsigned):
         raise StageEditProductionRegistryError(
             "production registry SHA-256 mismatch"
         )
-    if (
-        payload.get("schema_version")
-        != STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION
-        or payload.get("registry_kind") != STAGE_EDIT_PRODUCTION_REGISTRY_KIND
-        or payload.get("active") is not True
-        or payload.get("model_contract") != DYNAMIC_CROP_V2_MODEL_CONTRACT
-    ):
+    if is_v2:
+        supported_contract = bool(
+            payload.get("registry_kind")
+            == STAGE_EDIT_PRODUCTION_REGISTRY_KIND
+            and payload.get("model_contract")
+            == DYNAMIC_CROP_V2_MODEL_CONTRACT
+        )
+    elif is_v3:
+        supported_contract = bool(
+            payload.get("registry_kind")
+            == STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND
+            and payload.get("model_contract")
+            == DYNAMIC_CROP_V3_MODEL_CONTRACT
+        )
+    else:  # The exact schema check above already rejects this branch.
+        supported_contract = False
+    if payload.get("active") is not True or not supported_contract:
         raise StageEditProductionRegistryError(
             "production registry activation contract is unsupported"
         )
@@ -298,13 +480,15 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         raise StageEditProductionRegistryError(
             "production registry transition authority is unsupported"
         )
-    expected_storage_policy = {
+    expected_storage_policy: dict[str, Any] = {
         "external_ssd_preferred": True,
         "checkpoint_absolute_path_required": True,
         "professional_montage_profile_absolute_path_required": True,
         "symlinks_allowed": False,
         "different_active_record_overwrite_allowed": False,
     }
+    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        expected_storage_policy["source_pair_absolute_paths_required"] = True
     if payload.get("storage_policy") != expected_storage_policy:
         raise StageEditProductionRegistryError(
             "production registry storage policy is unsupported"
@@ -318,6 +502,536 @@ def hmac_compare_digest(left: str, right: str) -> bool:
     import hmac
 
     return hmac.compare_digest(left, right)
+
+
+def _checkpoint_namespace_version(
+    checkpoint: Path,
+    *,
+    expected_version: int,
+) -> int:
+    namespaces = {
+        2: (
+            checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
+            checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
+        ),
+        3: (
+            checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+            checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+        ),
+    }
+    present = {
+        version: tuple(path.exists() or path.is_symlink() for path in paths)
+        for version, paths in namespaces.items()
+    }
+    if any(any(values) and not all(values) for values in present.values()):
+        raise StageEditProductionRegistryNotReadyError(
+            "Dynamic Crop checkpoint namespace is partial"
+        )
+    complete = tuple(
+        version for version, values in present.items() if all(values)
+    )
+    if len(complete) != 1:
+        raise StageEditProductionRegistryNotReadyError(
+            "Dynamic Crop v2/v3 checkpoint namespaces are mixed or missing"
+        )
+    observed = complete[0]
+    if observed != expected_version:
+        raise StageEditProductionRegistryNotReadyError(
+            f"Dynamic Crop v{observed} checkpoint cannot be interpreted as "
+            f"v{expected_version}"
+        )
+    return observed
+
+
+def _strict_json_mapping(path: Path, name: str) -> Mapping[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            f"{name} cannot be read: {exc}"
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise StageEditProductionRegistryNotReadyError(
+            f"{name} root must be an object"
+        )
+    return value
+
+
+def _valid_v3_selection_gate(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    expected_keys = {
+        "contract",
+        "selectable",
+        "reasons",
+        "score_component",
+        "renderer_decode_attempt_count",
+        "renderer_decode_eligible_count",
+        "renderer_decode_eligible_rate",
+        "minimum_safe_zoom_projection_count",
+        "target_source_slot_mismatch_count",
+        "aggregate_normalized_improvement_over_static_prior",
+        "static_prior_can_be_selected",
+        "heldout_metrics_consumed",
+    }
+    attempts = value.get("renderer_decode_attempt_count")
+    eligible = value.get("renderer_decode_eligible_count")
+    rate = value.get("renderer_decode_eligible_rate")
+    improvement = value.get(
+        "aggregate_normalized_improvement_over_static_prior"
+    )
+    score = value.get("score_component")
+    return bool(
+        set(value) == expected_keys
+        and value.get("contract")
+        == DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT
+        and value.get("selectable") is True
+        and value.get("reasons") == []
+        and value.get("heldout_metrics_consumed") is False
+        and value.get("static_prior_can_be_selected") is False
+        and isinstance(attempts, int)
+        and not isinstance(attempts, bool)
+        and attempts > 0
+        and isinstance(eligible, int)
+        and not isinstance(eligible, bool)
+        and eligible == attempts
+        and isinstance(rate, (int, float))
+        and not isinstance(rate, bool)
+        and math.isfinite(float(rate))
+        and float(rate) == 1.0
+        and isinstance(
+            value.get("minimum_safe_zoom_projection_count"), int
+        )
+        and not isinstance(
+            value.get("minimum_safe_zoom_projection_count"), bool
+        )
+        and value.get("minimum_safe_zoom_projection_count") == 0
+        and isinstance(value.get("target_source_slot_mismatch_count"), int)
+        and not isinstance(
+            value.get("target_source_slot_mismatch_count"), bool
+        )
+        and value.get("target_source_slot_mismatch_count") == 0
+        and isinstance(improvement, (int, float))
+        and not isinstance(improvement, bool)
+        and math.isfinite(float(improvement))
+        and float(improvement) > 0.0
+        and isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(float(score))
+        and float(score) == float(improvement)
+    )
+
+
+def _validate_v3_training_report_declarations(
+    report: Mapping[str, Any],
+    *,
+    metadata: StageEditDynamicCropCheckpointMetadataV3,
+    weight_sha256: str,
+) -> None:
+    checkpoint = report.get("checkpoint")
+    model = report.get("model")
+    data = report.get("data")
+    optimization = report.get("optimization")
+    heldout = report.get("held_out_evaluation")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (checkpoint, model, data, optimization, heldout)
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "Dynamic Crop v3 production report declarations are incomplete"
+        )
+    assert isinstance(checkpoint, Mapping)
+    assert isinstance(model, Mapping)
+    assert isinstance(data, Mapping)
+    assert isinstance(optimization, Mapping)
+    assert isinstance(heldout, Mapping)
+    checkpoint_expected = {
+        "checkpoint_id": metadata.checkpoint_id,
+        "training_steps": metadata.training_steps,
+        "weight_sha256": weight_sha256,
+        "production_activation_authorized": True,
+        "production_supervision_gate_passed": True,
+        "checkpoint_format": "dynamic_crop_v3",
+        "dynamic_crop_version": 3,
+        "metadata_filename": DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+        "dynamic_crop_v2_checkpoint": False,
+        "dynamic_crop_v3_checkpoint": True,
+        "dynamic_crop_model_contract": metadata.model_contract,
+        "dynamic_crop_target_contract": metadata.target_contract,
+        "dynamic_crop_output_contract": metadata.output_contract,
+    }
+    if any(
+        checkpoint.get(name) != value
+        for name, value in checkpoint_expected.items()
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report does not declare the exact v3 checkpoint"
+        )
+    data_id = checkpoint.get("dynamic_crop_v3_data_id")
+    if not isinstance(data_id, str) or not data_id.strip():
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report lacks the v3 corpus id"
+        )
+    if (
+        model.get("dynamic_crop_version") != 3
+        or model.get("dynamic_crop_v2_enabled") is not False
+        or model.get("dynamic_crop_v3_enabled") is not True
+        or data.get("dynamic_crop_version") != 3
+        or data.get("dynamic_crop_v2") is not None
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report mixes v2 and v3 declarations"
+        )
+    dynamic_data = data.get("dynamic_crop_v3")
+    if (
+        not isinstance(dynamic_data, Mapping)
+        or dynamic_data.get("data_id") != data_id
+        or dynamic_data.get("contract") != DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT
+        or dynamic_data.get("target_contract") != metadata.target_contract
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report v3 corpus declaration is invalid"
+        )
+    selected = optimization.get("best_validation_selection_evidence")
+    reloaded = optimization.get(
+        "reloaded_checkpoint_validation_selection_evidence"
+    )
+    if (
+        optimization.get("dynamic_crop_v3_model_selection")
+        != DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT
+        or not isinstance(selected, Mapping)
+        or not isinstance(reloaded, Mapping)
+        or not _valid_v3_selection_gate(
+            selected.get("dynamic_crop_v3_selection_gate")
+        )
+        or not _valid_v3_selection_gate(
+            reloaded.get("dynamic_crop_v3_selection_gate")
+        )
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report v3 validation gate is invalid"
+        )
+    if (
+        heldout.get("passed") is not True
+        or heldout.get("dynamic_crop_version") != 3
+        or heldout.get("dynamic_crop_v2_metrics") is not None
+        or not isinstance(heldout.get("dynamic_crop_v3_metrics"), Mapping)
+        or heldout.get(
+            "heldout_dynamic_crop_metrics_used_for_checkpoint_selection"
+        )
+        is not False
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production training report v3 held-out evidence is invalid"
+        )
+
+
+def _validate_source_pair_production_report(
+    report_path: Path,
+    *,
+    checkpoint: Any,
+) -> tuple[str, str]:
+    report = _strict_json_mapping(
+        report_path, "source-pair production report"
+    )
+    expected_keys = {
+        "schema_version",
+        "contract",
+        "cross_validation",
+        "final_full_corpus_training",
+        "checkpoint",
+        "production_authorization",
+        "report_sha256",
+    }
+    if set(report) != expected_keys:
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair production report schema is invalid"
+        )
+    unsigned_report = dict(report)
+    report_sha256 = unsigned_report.pop("report_sha256", None)
+    if (
+        not _canonical_digest_matches(report_sha256, unsigned_report)
+        or report.get("schema_version")
+        != STAGE_EDIT_SOURCE_PAIR_PRODUCTION_SCHEMA_VERSION
+        or report.get("contract")
+        != STAGE_EDIT_SOURCE_PAIR_PRODUCTION_REPORT_CONTRACT
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair production report self-hash or contract is invalid"
+        )
+    if report.get("checkpoint") != checkpoint.to_dict():
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair report checkpoint does not round-trip exactly"
+        )
+    final_training = report.get("final_full_corpus_training")
+    final_training_keys = {
+        "training_steps",
+        "reference_count",
+        "group_count",
+        "initial_loss",
+        "final_loss",
+        "margin",
+        "corpus_sha256",
+        "scorer",
+    }
+    if (
+        not isinstance(final_training, Mapping)
+        or set(final_training) != final_training_keys
+        or final_training.get("corpus_sha256") != checkpoint.corpus_sha256
+        or final_training.get("scorer") != checkpoint.scorer.to_dict()
+        or final_training.get("training_steps") != checkpoint.training_steps
+        or final_training.get("reference_count") != checkpoint.reference_count
+        or final_training.get("group_count") != checkpoint.group_count
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair corpus or scorer does not round-trip exactly"
+        )
+    cross_validation = report.get("cross_validation")
+    expected_cross_validation_keys = {
+        "schema_version",
+        "contract",
+        "protocol",
+        "configuration",
+        "source_corpus",
+        "folds",
+        "reference_balanced_heldout_aggregate",
+        "aggregate_activation_gate",
+        "production_authorized",
+        "production_denial_reasons",
+        "leakage_contract",
+        "validation_sha256",
+    }
+    if (
+        not isinstance(cross_validation, Mapping)
+        or set(cross_validation) != expected_cross_validation_keys
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair cross-validation evidence schema is invalid"
+        )
+    unsigned_validation = dict(cross_validation)
+    validation_sha256 = unsigned_validation.pop("validation_sha256", None)
+    folds = cross_validation.get("folds")
+    aggregate_gate = cross_validation.get("aggregate_activation_gate")
+    source_corpus = cross_validation.get("source_corpus")
+    configuration = cross_validation.get("configuration")
+    aggregate_metrics = cross_validation.get(
+        "reference_balanced_heldout_aggregate"
+    )
+    fold_keys = {
+        "fold_index",
+        "heldout_song_id",
+        "training_song_ids",
+        "training_reference_ids",
+        "heldout_reference_ids",
+        "training_group_ids",
+        "heldout_group_ids",
+        "training",
+        "heldout_ranking",
+        "activation_gate",
+    }
+    folds_are_structurally_valid = bool(
+        isinstance(folds, list)
+        and folds
+        and all(
+            isinstance(fold, Mapping)
+            and set(fold) == fold_keys
+            and isinstance(fold.get("fold_index"), int)
+            and not isinstance(fold.get("fold_index"), bool)
+            and isinstance(fold.get("heldout_song_id"), str)
+            and bool(str(fold.get("heldout_song_id")).strip())
+            for fold in folds
+        )
+        and tuple(fold.get("fold_index") for fold in folds)
+        == tuple(range(len(folds)))
+    )
+    fold_gates = (
+        [fold.get("activation_gate") for fold in folds]
+        if folds_are_structurally_valid and isinstance(folds, list)
+        else []
+    )
+    all_fold_gates = bool(fold_gates) and all(
+        isinstance(gate, Mapping)
+        and set(gate) == {"contract", "authorized", "reasons"}
+        and gate.get("contract")
+        == STAGE_EDIT_SOURCE_PAIR_ACTIVATION_GATE_CONTRACT
+        and gate.get("authorized") is True
+        and gate.get("reasons") == []
+        for gate in fold_gates
+    )
+    aggregate_authorized = bool(
+        isinstance(aggregate_gate, Mapping)
+        and set(aggregate_gate) == {"contract", "authorized", "reasons"}
+        and aggregate_gate.get("contract")
+        == STAGE_EDIT_SOURCE_PAIR_ACTIVATION_GATE_CONTRACT
+        and aggregate_gate.get("authorized") is True
+        and aggregate_gate.get("reasons") == []
+    )
+    expected_leakage_contract = {
+        "materialized_once_before_folds": True,
+        "training_and_heldout_songs_disjoint": True,
+        "training_and_heldout_references_disjoint": True,
+        "heldout_groups_used_for_training": False,
+        "every_song_held_out_once": True,
+        "every_reference_aggregated_once": True,
+        "in_sample_fit_gate_used_for_authorization": False,
+    }
+    source_corpus_matches_checkpoint = bool(
+        isinstance(source_corpus, Mapping)
+        and isinstance(folds, list)
+        and isinstance(source_corpus.get("song_count"), int)
+        and not isinstance(source_corpus.get("song_count"), bool)
+        and isinstance(source_corpus.get("reference_count"), int)
+        and not isinstance(source_corpus.get("reference_count"), bool)
+        and isinstance(source_corpus.get("group_count"), int)
+        and not isinstance(source_corpus.get("group_count"), bool)
+        and source_corpus.get("song_count") == len(folds)
+        and source_corpus.get("reference_count") == checkpoint.reference_count
+        and source_corpus.get("group_count") == checkpoint.group_count
+        and source_corpus.get("song_ids")
+        == [fold.get("heldout_song_id") for fold in folds]
+    )
+    if (
+        not _canonical_digest_matches(validation_sha256, unsigned_validation)
+        or cross_validation.get("schema_version")
+        != STAGE_EDIT_SOURCE_PAIR_PRODUCTION_SCHEMA_VERSION
+        or cross_validation.get("contract")
+        != STAGE_EDIT_SOURCE_PAIR_CROSS_VALIDATION_CONTRACT
+        or cross_validation.get("protocol")
+        != "song_disjoint_leave_one_song_out"
+        or not isinstance(configuration, Mapping)
+        or set(configuration) != {"learning_rate", "activation_tolerance"}
+        or not isinstance(aggregate_metrics, Mapping)
+        or set(aggregate_metrics) != {"learned", "uniform", "handcrafted"}
+        or cross_validation.get("production_authorized") is not True
+        or cross_validation.get("production_denial_reasons") != []
+        or cross_validation.get("leakage_contract")
+        != expected_leakage_contract
+        or not folds_are_structurally_valid
+        or not source_corpus_matches_checkpoint
+        or not all_fold_gates
+        or not aggregate_authorized
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair all-fold or aggregate production gate is invalid"
+        )
+    authorization = report.get("production_authorization")
+    expected_authorization = {
+        "authorized": True,
+        "all_fold_gates_authorized": all_fold_gates,
+        "overall_gate_authorized": aggregate_authorized,
+        "final_scorer_trained_after_cross_validation_gate": True,
+        "in_sample_fit_gate_used_for_authorization": False,
+        "materialization_pass_count": 1,
+    }
+    if authorization != expected_authorization:
+        raise StageEditProductionRegistryNotReadyError(
+            "source-pair production authorization does not round-trip"
+        )
+    return report_sha256, validation_sha256
+
+
+def _validated_source_pair_identity(
+    scorer_path: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    scorer = Path(scorer_path)
+    report = Path(report_path)
+    for path, expected_name in (
+        (scorer, STAGE_EDIT_SOURCE_PAIR_CHECKPOINT_FILENAME),
+        (report, STAGE_EDIT_SOURCE_PAIR_PRODUCTION_REPORT_FILENAME),
+    ):
+        if not path.is_absolute():
+            raise StageEditProductionRegistryNotReadyError(
+                "source-pair artifact paths must be explicit and absolute"
+            )
+        if path.name != expected_name or path.is_symlink() or not path.is_file():
+            raise StageEditProductionRegistryNotReadyError(
+                f"source-pair artifact is missing or unsafe: {path}"
+            )
+    try:
+        pair_scorer, pair_checkpoint = load_stage_edit_source_pair_checkpoint(
+            scorer.parent
+        )
+    except (StageEditSourcePairCheckpointError, TypeError, ValueError) as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            f"source-pair scorer checkpoint is invalid: {exc}"
+        ) from exc
+    report_sha256, validation_sha256 = _validate_source_pair_production_report(
+        report,
+        checkpoint=pair_checkpoint,
+    )
+    return {
+        "scorer_path": str(scorer),
+        "production_report_path": str(report),
+        "scorer_file_sha256": _file_sha256(scorer),
+        "production_report_file_sha256": _file_sha256(report),
+        "production_report_sha256": report_sha256,
+        "cross_validation_sha256": validation_sha256,
+        "scorer_fingerprint": pair_scorer.fingerprint,
+        "checkpoint_sha256": pair_checkpoint.checkpoint_sha256,
+        "corpus_sha256": pair_checkpoint.corpus_sha256,
+    }
+
+
+def _registered_source_pair_identity(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_scorer = payload.get("source_pair_scorer")
+    raw_report = payload.get("source_pair_production_report")
+    scorer_keys = {
+        "path",
+        "sha256",
+        "scorer_fingerprint",
+        "checkpoint_sha256",
+        "corpus_sha256",
+    }
+    report_keys = {
+        "path",
+        "sha256",
+        "report_sha256",
+        "cross_validation_sha256",
+    }
+    if (
+        not isinstance(raw_scorer, Mapping)
+        or set(raw_scorer) != scorer_keys
+        or not isinstance(raw_report, Mapping)
+        or set(raw_report) != report_keys
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry source-pair evidence is invalid"
+        )
+    scorer_path = raw_scorer.get("path")
+    report_path = raw_report.get("path")
+    if (
+        not isinstance(scorer_path, str)
+        or not scorer_path.strip()
+        or not Path(scorer_path).is_absolute()
+        or not isinstance(report_path, str)
+        or not report_path.strip()
+        or not Path(report_path).is_absolute()
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry source-pair paths must be absolute"
+        )
+    actual = _validated_source_pair_identity(
+        Path(scorer_path), Path(report_path)
+    )
+    expected = {
+        "scorer_path": scorer_path,
+        "production_report_path": report_path,
+        "scorer_file_sha256": raw_scorer.get("sha256"),
+        "production_report_file_sha256": raw_report.get("sha256"),
+        "production_report_sha256": raw_report.get("report_sha256"),
+        "cross_validation_sha256": raw_report.get("cross_validation_sha256"),
+        "scorer_fingerprint": raw_scorer.get("scorer_fingerprint"),
+        "checkpoint_sha256": raw_scorer.get("checkpoint_sha256"),
+        "corpus_sha256": raw_scorer.get("corpus_sha256"),
+    }
+    if actual != expected:
+        raise StageEditProductionRegistryNotReadyError(
+            "registered source-pair artifact identity changed"
+        )
+    return actual
 
 
 def _registered_montage_profile_identity(
@@ -428,14 +1142,36 @@ def load_registered_stage_edit_production_bundle(
             f"registered checkpoint is missing or unsafe: {checkpoint}"
         )
 
+    dynamic_crop_version = int(payload.get("dynamic_crop_version", 2))
+    continuity_authority = (
+        str(payload["continuity_authority"])
+        if dynamic_crop_version == 3
+        else None
+    )
+    _checkpoint_namespace_version(
+        checkpoint,
+        expected_version=dynamic_crop_version,
+    )
     montage_profile = _registered_montage_profile_identity(payload)
+    pair_identity = (
+        _registered_source_pair_identity(payload)
+        if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        else None
+    )
 
+    metadata_filename = (
+        DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+        if dynamic_crop_version == 3
+        else DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+    )
+    weights_filename = (
+        DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME
+        if dynamic_crop_version == 3
+        else DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
+    )
     evidence_fields = (
-        (
-            "metadata",
-            DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
-        ),
-        ("weights", DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME),
+        ("metadata", metadata_filename),
+        ("weights", weights_filename),
         ("training_report", PRODUCTION_TRAINING_REPORT_FILENAME),
     )
     evidence: dict[str, tuple[Path, str]] = {}
@@ -472,12 +1208,23 @@ def load_registered_stage_edit_production_bundle(
         )
         if not isinstance(metadata_payload, Mapping):
             raise ValueError("metadata root must be an object")
-        metadata = StageEditDynamicCropCheckpointMetadataV2.from_dict(
-            metadata_payload
+        metadata = (
+            StageEditDynamicCropCheckpointMetadataV3.from_dict(metadata_payload)
+            if dynamic_crop_version == 3
+            else StageEditDynamicCropCheckpointMetadataV2.from_dict(
+                metadata_payload
+            )
         )
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise StageEditProductionRegistryNotReadyError(
-            f"registered Dynamic Crop v2 metadata is invalid: {exc}"
+            "registered Dynamic Crop "
+            f"v{dynamic_crop_version} metadata is invalid: {exc}"
         ) from exc
 
     checkpoint_id = str(payload.get("checkpoint_id") or "")
@@ -498,7 +1245,20 @@ def load_registered_stage_edit_production_bundle(
         or evidence["weights"][1] != metadata.weight_sha256
     ):
         raise StageEditProductionRegistryNotReadyError(
-            "registered checkpoint identity differs from Dynamic Crop v2 metadata"
+            "registered checkpoint identity differs from Dynamic Crop "
+            f"v{dynamic_crop_version} metadata"
+        )
+
+    if dynamic_crop_version == 3:
+        training_report = _strict_json_mapping(
+            evidence["training_report"][0],
+            "Dynamic Crop v3 production training report",
+        )
+        assert isinstance(metadata, StageEditDynamicCropCheckpointMetadataV3)
+        _validate_v3_training_report_declarations(
+            training_report,
+            metadata=metadata,
+            weight_sha256=evidence["weights"][1],
         )
 
     readiness = stage_edit_readiness_report(checkpoint)
@@ -509,9 +1269,19 @@ def load_registered_stage_edit_production_bundle(
         and readiness.checkpoint_path == str(checkpoint)
         and readiness.training_steps == metadata.training_steps
         and readiness.training_steps > 0
+        and (
+            dynamic_crop_version == 2
+            or (
+                readiness.dynamic_crop_version == 3
+                and readiness.checkpoint_format == "dynamic_crop_v3"
+                and readiness.checkpoint_metadata_filename
+                == DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+            )
+        )
     ):
         raise StageEditProductionRegistryNotReadyError(
-            "registered Dynamic Crop v2 checkpoint is not production-ready: "
+            f"registered Dynamic Crop v{dynamic_crop_version} checkpoint is not "
+            "production-ready: "
             f"{readiness.status}: {readiness.reason}"
         )
 
@@ -519,6 +1289,8 @@ def load_registered_stage_edit_production_bundle(
         registry_path=path,
         checkpoint_directory=checkpoint,
         checkpoint_id=checkpoint_id,
+        dynamic_crop_version=dynamic_crop_version,
+        continuity_authority=continuity_authority,
         token_schema_fingerprint=token_schema,
         maximum_sequence_length=int(maximum_sequence_length),
         maximum_sources=int(maximum_sources),
@@ -541,6 +1313,46 @@ def load_registered_stage_edit_production_bundle(
         metadata_sha256=evidence["metadata"][1],
         weights_sha256=evidence["weights"][1],
         training_report_sha256=evidence["training_report"][1],
+        source_pair_scorer_path=(
+            Path(pair_identity["scorer_path"])
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_production_report_path=(
+            Path(pair_identity["production_report_path"])
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_scorer_file_sha256=(
+            pair_identity["scorer_file_sha256"]
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_production_report_file_sha256=(
+            pair_identity["production_report_file_sha256"]
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_production_report_sha256=(
+            pair_identity["production_report_sha256"]
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_scorer_fingerprint=(
+            pair_identity["scorer_fingerprint"]
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_checkpoint_sha256=(
+            pair_identity["checkpoint_sha256"]
+            if pair_identity is not None
+            else None
+        ),
+        source_pair_corpus_sha256=(
+            pair_identity["corpus_sha256"]
+            if pair_identity is not None
+            else None
+        ),
         registry_sha256=str(payload["registry_sha256"]),
         readiness=readiness,
     )
@@ -584,9 +1396,21 @@ def register_stage_edit_production_bundle(
     *,
     professional_montage_grammar_profile_path: Path,
     registry_path: Path | None = None,
+    dynamic_crop_version: int = 2,
+    continuity_authority: str | None = None,
+    source_pair_scorer_path: Path | None = None,
+    source_pair_production_report_path: Path | None = None,
 ) -> Path:
     """Install one verified bundle without replacing another active record."""
 
+    if (
+        isinstance(dynamic_crop_version, bool)
+        or not isinstance(dynamic_crop_version, int)
+        or dynamic_crop_version not in (2, 3)
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "dynamic_crop_version must be exactly 2 or 3"
+        )
     raw_checkpoint = Path(checkpoint_directory).expanduser()
     if raw_checkpoint.is_symlink():
         raise StageEditProductionRegistryNotReadyError(
@@ -597,6 +1421,53 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             "checkpoint directory is missing or unsafe"
         )
+    _checkpoint_namespace_version(
+        checkpoint,
+        expected_version=dynamic_crop_version,
+    )
+    if dynamic_crop_version == 2:
+        if continuity_authority is not None:
+            raise StageEditProductionRegistryNotReadyError(
+                "Dynamic Crop v2 cannot register a continuity authority"
+            )
+        if (
+            source_pair_scorer_path is not None
+            or source_pair_production_report_path is not None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "Dynamic Crop v2 cannot register source-pair v3 artifacts"
+            )
+        pair_identity: dict[str, Any] | None = None
+    elif (
+        not isinstance(continuity_authority, str)
+        or continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "Dynamic Crop v3 requires an explicit supported continuity authority"
+        )
+    elif continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if (
+            source_pair_scorer_path is None
+            or source_pair_production_report_path is None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "Dynamic Crop v3 requires both source-pair scorer and "
+                "production report paths"
+            )
+        pair_identity = _validated_source_pair_identity(
+            Path(source_pair_scorer_path),
+            Path(source_pair_production_report_path),
+        )
+    else:
+        if (
+            source_pair_scorer_path is not None
+            or source_pair_production_report_path is not None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "handcrafted Dynamic Crop v3 continuity cannot register "
+                "source-pair artifacts"
+            )
+        pair_identity = None
     raw_montage_profile = Path(professional_montage_grammar_profile_path)
     if not raw_montage_profile.is_absolute():
         raise StageEditProductionRegistryNotReadyError(
@@ -614,8 +1485,16 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             "professional montage grammar profile path identity changed"
         )
-    metadata_path = checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
-    weights_path = checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
+    metadata_path = checkpoint / (
+        DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+        if dynamic_crop_version == 3
+        else DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+    )
+    weights_path = checkpoint / (
+        DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME
+        if dynamic_crop_version == 3
+        else DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME
+    )
     report_path = checkpoint / PRODUCTION_TRAINING_REPORT_FILENAME
     for evidence_path in (metadata_path, weights_path, report_path):
         if evidence_path.is_symlink() or not evidence_path.is_file():
@@ -626,10 +1505,16 @@ def register_stage_edit_production_bundle(
         raw_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if not isinstance(raw_metadata, Mapping):
             raise ValueError("metadata root must be an object")
-        metadata = StageEditDynamicCropCheckpointMetadataV2.from_dict(raw_metadata)
+        metadata = (
+            StageEditDynamicCropCheckpointMetadataV3.from_dict(raw_metadata)
+            if dynamic_crop_version == 3
+            else StageEditDynamicCropCheckpointMetadataV2.from_dict(
+                raw_metadata
+            )
+        )
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise StageEditProductionRegistryNotReadyError(
-            f"Dynamic Crop v2 metadata is invalid: {exc}"
+            f"Dynamic Crop v{dynamic_crop_version} metadata is invalid: {exc}"
         ) from exc
     if (
         metadata.base_model_config.transition_authority
@@ -659,6 +1544,26 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             "checkpoint metadata weight hash differs from installed weights"
         )
+    if dynamic_crop_version == 3:
+        assert isinstance(metadata, StageEditDynamicCropCheckpointMetadataV3)
+        training_report = _strict_json_mapping(
+            report_path,
+            "Dynamic Crop v3 production training report",
+        )
+        _validate_v3_training_report_declarations(
+            training_report,
+            metadata=metadata,
+            weight_sha256=weights_sha,
+        )
+        if not (
+            readiness.dynamic_crop_version == 3
+            and readiness.checkpoint_format == "dynamic_crop_v3"
+            and readiness.checkpoint_metadata_filename
+            == DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "Dynamic Crop v3 readiness does not identify the v3 namespace"
+            )
     destination = Path(
         registry_path or preferred_stage_edit_production_registry_path()
     ).expanduser()
@@ -672,11 +1577,34 @@ def register_stage_edit_production_bundle(
         if (
             installed.checkpoint_directory == checkpoint
             and installed.checkpoint_id == metadata.checkpoint_id
+            and installed.dynamic_crop_version == dynamic_crop_version
+            and installed.continuity_authority == continuity_authority
             and installed.metadata_sha256 == metadata_sha
             and installed.weights_sha256 == weights_sha
             and installed.training_report_sha256 == report_sha
             and installed.professional_montage_grammar_profile_identity
             == montage_profile
+            and (
+                pair_identity is None
+                or (
+                    installed.source_pair_scorer_path
+                    == Path(pair_identity["scorer_path"])
+                    and installed.source_pair_production_report_path
+                    == Path(pair_identity["production_report_path"])
+                    and installed.source_pair_scorer_file_sha256
+                    == pair_identity["scorer_file_sha256"]
+                    and installed.source_pair_production_report_file_sha256
+                    == pair_identity["production_report_file_sha256"]
+                    and installed.source_pair_production_report_sha256
+                    == pair_identity["production_report_sha256"]
+                    and installed.source_pair_scorer_fingerprint
+                    == pair_identity["scorer_fingerprint"]
+                    and installed.source_pair_checkpoint_sha256
+                    == pair_identity["checkpoint_sha256"]
+                    and installed.source_pair_corpus_sha256
+                    == pair_identity["corpus_sha256"]
+                )
+            )
         ):
             return destination
         raise StageEditProductionRegistryError(
@@ -684,8 +1612,16 @@ def register_stage_edit_production_bundle(
         )
 
     unsigned: dict[str, Any] = {
-        "schema_version": STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION,
-        "registry_kind": STAGE_EDIT_PRODUCTION_REGISTRY_KIND,
+        "schema_version": (
+            STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION
+            if dynamic_crop_version == 3
+            else STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION
+        ),
+        "registry_kind": (
+            STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND
+            if dynamic_crop_version == 3
+            else STAGE_EDIT_PRODUCTION_REGISTRY_KIND
+        ),
         "active": True,
         "registered_at": datetime.now(UTC).isoformat(),
         "checkpoint_directory": str(checkpoint),
@@ -718,6 +1654,29 @@ def register_stage_edit_production_bundle(
             "different_active_record_overwrite_allowed": False,
         },
     }
+    if dynamic_crop_version == 3:
+        unsigned["dynamic_crop_version"] = 3
+        unsigned["continuity_authority"] = continuity_authority
+    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        assert pair_identity is not None
+        unsigned["source_pair_scorer"] = {
+            "path": pair_identity["scorer_path"],
+            "sha256": pair_identity["scorer_file_sha256"],
+            "scorer_fingerprint": pair_identity["scorer_fingerprint"],
+            "checkpoint_sha256": pair_identity["checkpoint_sha256"],
+            "corpus_sha256": pair_identity["corpus_sha256"],
+        }
+        unsigned["source_pair_production_report"] = {
+            "path": pair_identity["production_report_path"],
+            "sha256": pair_identity["production_report_file_sha256"],
+            "report_sha256": pair_identity["production_report_sha256"],
+            "cross_validation_sha256": pair_identity[
+                "cross_validation_sha256"
+            ],
+        }
+        unsigned["storage_policy"][
+            "source_pair_absolute_paths_required"
+        ] = True
     payload = {**unsigned, "registry_sha256": _canonical_sha256(unsigned)}
     encoded = json.dumps(
         payload,
@@ -754,6 +1713,8 @@ __all__ = [
     "STAGE_EDIT_PRODUCTION_REGISTRY_FILENAME",
     "STAGE_EDIT_PRODUCTION_REGISTRY_KIND",
     "STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION",
     "StageEditProductionRegistryError",
     "StageEditProductionRegistryNotReadyError",
     "default_stage_edit_production_registry_paths",

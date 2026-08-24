@@ -39,6 +39,12 @@ from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     DynamicCropHeadPredictionV3,
     DynamicCropTrackDecodeV3,
 )
+from .stage_edit_continuity_authority import (
+    CONTINUITY_AUTHORITY_CONTRACT,
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    STAGE_EDIT_CONTINUITY_AUTHORITIES as _CONTINUITY_AUTHORITIES,
+)
 from .stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
     StageEditSourcePairScorer,
@@ -74,25 +80,12 @@ MONTAGE_GRAMMAR_CONTRACT = (
 HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
     "ive_20_human_reference_chorus_shot_boundary_rate_distribution_v1"
 )
-CONTINUITY_AUTHORITY_CONTRACT = (
-    "explicit_single_boundary_continuity_score_authority_v1"
-)
-HANDCRAFTED_CONTINUITY_AUTHORITY = "handcrafted_boundary_continuity_v1"
-PRODUCTION_LEARNED_CONTINUITY_AUTHORITY = (
-    "production_learned_source_pair_checkpoint_v1"
-)
 HANDCRAFTED_CONTINUITY_SCORER_CONTRACT = (
     "semimarkov_boundary_continuity_handcrafted_v1"
 )
 HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT = hashlib.sha256(
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT.encode("utf-8")
 ).hexdigest()
-_CONTINUITY_AUTHORITIES = frozenset(
-    {
-        HANDCRAFTED_CONTINUITY_AUTHORITY,
-        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
-    }
-)
 
 
 class StageEditSemiMarkovError(RuntimeError):

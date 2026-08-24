@@ -31,6 +31,11 @@ from .stage_edit_production_training import train_production_stage_edit
 from .stage_edit_production_registry import (
     register_stage_edit_production_bundle,
 )
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    STAGE_EDIT_CONTINUITY_AUTHORITIES,
+)
 from .stage_edit_reference_adapter import load_reference_training_corpus
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
@@ -367,6 +372,31 @@ def build_parser() -> argparse.ArgumentParser:
             "the active registry."
         ),
     )
+    parser.add_argument(
+        "--continuity-authority",
+        choices=tuple(sorted(STAGE_EDIT_CONTINUITY_AUTHORITIES)),
+        help=(
+            "Explicit Dynamic Crop v3 boundary-continuity authority to bind "
+            "into the active production registry. Required only for authorized "
+            "v3 activation; v2 registries preserve their legacy schema."
+        ),
+    )
+    parser.add_argument(
+        "--source-pair-scorer",
+        type=Path,
+        help=(
+            "Exact production source-pair checkpoint. Allowed only with v3, "
+            "authorized activation, and learned continuity authority."
+        ),
+    )
+    parser.add_argument(
+        "--source-pair-production-report",
+        type=Path,
+        help=(
+            "Exact all-fold source-pair production report paired with "
+            "--source-pair-scorer."
+        ),
+    )
     return parser
 
 
@@ -435,6 +465,63 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--production-registry requires --authorize-production-activation"
         )
+    continuity_inputs = (
+        args.continuity_authority,
+        args.source_pair_scorer,
+        args.source_pair_production_report,
+    )
+    if any(value is not None for value in continuity_inputs) and not (
+        args.authorize_production_activation
+    ):
+        raise ValueError(
+            "continuity-authority and source-pair registry evidence require "
+            "--authorize-production-activation"
+        )
+    if args.dynamic_crop_version == 2 and any(
+        value is not None for value in continuity_inputs
+    ):
+        raise ValueError(
+            "Dynamic Crop v2 activation cannot bind v3 continuity authority "
+            "or source-pair evidence"
+        )
+    if (
+        args.authorize_production_activation
+        and args.dynamic_crop_version == 3
+        and args.continuity_authority is None
+    ):
+        raise ValueError(
+            "authorized Dynamic Crop v3 activation requires "
+            "--continuity-authority"
+        )
+    if args.continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY and (
+        args.source_pair_scorer is not None
+        or args.source_pair_production_report is not None
+    ):
+        raise ValueError(
+            "handcrafted continuity authority rejects source-pair artifacts"
+        )
+    if args.continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY and (
+        args.source_pair_scorer is None
+        or args.source_pair_production_report is None
+    ):
+        raise ValueError(
+            "learned continuity authority requires both --source-pair-scorer "
+            "and --source-pair-production-report"
+        )
+    if args.continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        for attribute, option in (
+            ("source_pair_scorer", "--source-pair-scorer"),
+            (
+                "source_pair_production_report",
+                "--source-pair-production-report",
+            ),
+        ):
+            raw_path = Path(getattr(args, attribute))
+            if not raw_path.is_absolute():
+                raise ValueError(f"{option} must be an explicit absolute path")
+            if raw_path.is_symlink() or not raw_path.is_file():
+                raise ValueError(f"{option} is missing or unsafe")
+            setattr(args, attribute, raw_path)
     if args.authorize_production_activation and (
         args.professional_montage_grammar_profile is None
     ):
@@ -549,6 +636,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.professional_montage_grammar_profile
             ),
             registry_path=args.production_registry,
+            dynamic_crop_version=args.dynamic_crop_version,
+            continuity_authority=args.continuity_authority,
+            source_pair_scorer_path=args.source_pair_scorer,
+            source_pair_production_report_path=(
+                args.source_pair_production_report
+            ),
         )
     print(
         json.dumps(
