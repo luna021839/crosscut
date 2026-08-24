@@ -734,6 +734,26 @@ def _ffprobe_payload(
     }
 
 
+def _perceptual_pass_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "analysis": (
+            "full_final_decode_temporal_pumping_and_exact_source_retention_v1"
+        ),
+        "verdict": "PASS",
+        "passed": True,
+        "issues": [],
+        "policy": {},
+        "metrics": {"fixture": True},
+        "serialization_policy": {
+            "raw_frames_serialized": False,
+            "per_frame_descriptors_serialized": False,
+            "sample_timestamps_serialized": False,
+            "scalar_aggregate_provenance_only": True,
+        },
+    }
+
+
 class _FakeRunner:
     def __init__(
         self,
@@ -776,6 +796,14 @@ class _FakeRunner:
 
 
 class PostRenderQATests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._perceptual_patcher = patch(
+            "crosscut.post_render_qa.evaluate_post_render_perceptual_quality",
+            return_value=_perceptual_pass_payload(),
+        )
+        self._perceptual_patcher.start()
+        self.addCleanup(self._perceptual_patcher.stop)
+
     def test_discovers_only_exact_nonempty_timestamp_bound_sets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -842,6 +870,47 @@ class PostRenderQATests(unittest.TestCase):
         self.assertAlmostEqual(
             metrics["production_sync"]["maximum_residual_p95_frames"],
             0.12,
+        )
+        self.assertEqual(metrics["perceptual_quality"]["verdict"], "PASS")
+
+    def test_perceptual_quality_fail_is_promoted_to_final_qa(self) -> None:
+        payload = _perceptual_pass_payload()
+        payload.update(
+            {
+                "verdict": "FAIL",
+                "passed": False,
+                "issues": [
+                    {
+                        "code": "perceptual_detail_retention_p10",
+                        "severity": "fail",
+                        "message": "Synthetic source-detail loss.",
+                        "path": (
+                            "perceptual_quality.exact_source_retention."
+                            "detail_retention_ratio.p10"
+                        ),
+                        "value": 0.4,
+                        "threshold": 0.55,
+                    }
+                ],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory)
+            )
+            with patch(
+                "crosscut.post_render_qa.evaluate_post_render_perceptual_quality",
+                return_value=payload,
+            ):
+                report = evaluate_post_render_qa(
+                    artifacts,
+                    runner=_FakeRunner(),
+                )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "perceptual_detail_retention_p10",
+            {issue.code for issue in report.issues},
         )
 
     def test_actual_pose_v3_reports_coverage_without_requiring_every_cut_pose(

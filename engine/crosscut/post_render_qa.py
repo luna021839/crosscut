@@ -21,6 +21,11 @@ import subprocess
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
+from .post_render_perceptual_quality import (
+    PerceptualQualityConfig,
+    evaluate_post_render_perceptual_quality,
+)
+
 
 SCHEMA_VERSION = 1
 ANALYSIS_BASIS = "timestamp_bound_full_decode_professional_post_render_qa_v1"
@@ -102,8 +107,13 @@ class PostRenderQAConfig:
     tool_timeout_seconds: float = 900.0
     ffprobe: str = "ffprobe"
     ffmpeg: str = "ffmpeg"
+    perceptual_quality: PerceptualQualityConfig = field(
+        default_factory=PerceptualQualityConfig
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.perceptual_quality, PerceptualQualityConfig):
+            raise TypeError("perceptual_quality must be PerceptualQualityConfig")
         if self.required_complete_candidate_count < 1:
             raise ValueError("required candidate count must be positive")
         if self.minimum_local_timewarp_anchor_count < 2:
@@ -146,7 +156,11 @@ class PostRenderQAConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            name: getattr(self, name)
+            name: (
+                value.to_dict()
+                if isinstance(value := getattr(self, name), PerceptualQualityConfig)
+                else value
+            )
             for name in self.__dataclass_fields__
         }
 
@@ -4537,11 +4551,119 @@ def _sync_quality_metrics(
     }
 
 
+PerceptualEvaluator = Callable[..., Mapping[str, Any]]
+
+
+def _perceptual_quality_metrics(
+    artifacts: PostRenderArtifactSet,
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+    evaluator: PerceptualEvaluator,
+) -> dict[str, Any]:
+    """Run the final-resolution scalar audit and import its fail-closed issues."""
+
+    try:
+        raw_payload = evaluator(
+            artifacts.video_path,
+            plan,
+            config=config.perceptual_quality,
+        )
+        payload = _mapping(raw_payload)
+    except Exception as exc:
+        payload = None
+        collector.add(
+            "perceptual_quality_evaluation_failed",
+            QAIssueSeverity.FAIL,
+            "Final-video perceptual quality could not be evaluated.",
+            path="perceptual_quality",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+    if payload is None:
+        return {
+            "analysis": None,
+            "verdict": "FAIL",
+            "passed": False,
+            "issues": [],
+            "metrics": {},
+        }
+
+    serialized_issues = _sequence(payload.get("issues"))
+    verdict = payload.get("verdict")
+    passed = payload.get("passed")
+    contract_valid = (
+        payload.get("schema_version") == 1
+        and payload.get("analysis")
+        == "full_final_decode_temporal_pumping_and_exact_source_retention_v1"
+        and verdict in {"PASS", "CONDITIONAL", "FAIL"}
+        and passed is (verdict == "PASS")
+        and serialized_issues is not None
+        and (verdict == "PASS") is (len(serialized_issues) == 0)
+        and isinstance(payload.get("metrics"), Mapping)
+        and (
+            (_mapping(payload.get("serialization_policy")) or {}).get(
+                "raw_frames_serialized"
+            )
+            is False
+        )
+        and (
+            (_mapping(payload.get("serialization_policy")) or {}).get(
+                "per_frame_descriptors_serialized"
+            )
+            is False
+        )
+    )
+    if not contract_valid:
+        collector.add(
+            "perceptual_quality_contract_invalid",
+            QAIssueSeverity.FAIL,
+            "Final-video perceptual quality returned incomplete or inconsistent evidence.",
+            path="perceptual_quality",
+            value={"verdict": verdict, "passed": passed},
+        )
+        return payload
+
+    for index, raw_issue in enumerate(serialized_issues):
+        issue = _mapping(raw_issue)
+        severity = (issue or {}).get("severity")
+        code = (issue or {}).get("code")
+        message = (issue or {}).get("message")
+        if not (
+            isinstance(code, str)
+            and code
+            and severity in {"conditional", "fail"}
+            and isinstance(message, str)
+            and message
+        ):
+            collector.add(
+                "perceptual_quality_issue_contract_invalid",
+                QAIssueSeverity.FAIL,
+                "A perceptual-quality issue record is malformed.",
+                path=f"perceptual_quality.issues[{index}]",
+                value=raw_issue,
+            )
+            continue
+        collector.add(
+            code,
+            (
+                QAIssueSeverity.FAIL
+                if severity == "fail"
+                else QAIssueSeverity.CONDITIONAL
+            ),
+            message,
+            path=(issue or {}).get("path"),
+            value=(issue or {}).get("value"),
+            threshold=(issue or {}).get("threshold"),
+        )
+    return payload
+
+
 def evaluate_post_render_qa(
     artifact_set: PostRenderArtifactSet,
     *,
     config: PostRenderQAConfig | None = None,
     runner: RunCommand = _run_command,
+    perceptual_evaluator: PerceptualEvaluator | None = None,
     created_at: datetime | None = None,
 ) -> PostRenderQAReport:
     """Evaluate one explicit completed set without modifying any input artifact."""
@@ -4589,6 +4711,13 @@ def evaluate_post_render_qa(
     metrics["tool_checks"] = tool_checks
     metrics["final_media"] = _validate_ffprobe_against_plan(
         tool_checks, analysis, plan, settings, collector
+    )
+    metrics["perceptual_quality"] = _perceptual_quality_metrics(
+        artifact_set,
+        plan,
+        settings,
+        collector,
+        perceptual_evaluator or evaluate_post_render_perceptual_quality,
     )
     metrics["production_sync"] = _sync_quality_metrics(
         analysis, plan, settings, collector
