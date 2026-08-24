@@ -20,6 +20,8 @@ from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.stage_edit import StageEdit, StageShot
 from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
 from crosscut.stage_edit_pipeline_bridge import (
+    STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+    STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION,
     StageEditPipelineBridgeError,
     StageEditPipelineBridgeInputError,
     StageEditPipelineBridgeNotReadyError,
@@ -270,6 +272,7 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
         )
         config = StageEditSemiMarkovConfig(
             minimum_unique_sources=1,
+            highlight_minimum_early_wide_anchor_fraction=0.42,
         )
         learned_sections = SimpleNamespace(
             section_plan=_section_plan(),
@@ -307,6 +310,18 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
         materialize.assert_called_once()
         direct_sections.assert_called_once()
         decode.assert_called_once()
+        self.assertEqual(
+            direct_sections.call_args.kwargs["chorus_wide_anchor_fraction"],
+            config.highlight_minimum_early_wide_anchor_fraction,
+        )
+        self.assertEqual(
+            direct_sections.call_args.kwargs["checkpoint_directory"],
+            preflight.checkpoint_directory,
+        )
+        self.assertEqual(STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION, 2)
+        self.assertTrue(STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT.endswith("_v2"))
+        self.assertEqual(result.schema_version, 2)
+        self.assertEqual(result.contract, STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT)
         self.assertEqual(8, len(result.retained_candidates))
         self.assertFalse(result.selection_policy["selected_for_render"])
         self.assertFalse(result.selection_policy["visual_baseline_replaced"])

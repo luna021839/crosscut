@@ -17,13 +17,20 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any, Mapping, Sequence
 
-from .section_director import SectionDirective, SectionPlan
+from .section_director import SectionDirective, SectionPlan, SectionRole
 from .stage_edit_semimarkov_beam import StageEditHeadFrame
 from .stage_edit_transformer import PRODUCTION_TRAINING_REPORT_FILENAME
 
 
-SCHEMA_VERSION = 1
-CONTRACT = "validation_frozen_stageedit_heads_section_budget_adapter_v1"
+SCHEMA_VERSION = 2
+CONTRACT = (
+    "validation_frozen_stageedit_heads_section_budget_"
+    "profile_chorus_wide_anchor_allocation_v2"
+)
+CHORUS_WIDE_ANCHOR_ALLOCATION_BASIS = (
+    "phrase_count_then_duration_then_energy_then_learned_wide_support_"
+    "then_stable_section_index_v1"
+)
 
 
 class LearnedSectionDirectorError(RuntimeError):
@@ -117,6 +124,7 @@ class LearnedSectionBudgetEvidence:
     base_preferred_source_hold_beats: int
     learned_preferred_source_hold_beats: int
     learned_top_source_wide_support: float | None
+    chorus_wide_anchor_selected: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -133,12 +141,23 @@ class LearnedSectionDirectorResult:
     checkpoint_id: str
     training_report_path: str
     training_report_sha256: str
+    chorus_wide_anchor_requested_fraction: float
+    chorus_section_count: int
+    chorus_wide_anchor_allocated_count: int
+    chorus_wide_anchor_allocated_section_indices: tuple[int, ...]
+    chorus_wide_anchor_allocation_basis: str = (
+        CHORUS_WIDE_ANCHOR_ALLOCATION_BASIS
+    )
     contract: str = CONTRACT
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if len(self.evidence) != len(self.section_plan.sections):
             raise ValueError("learned Section Director evidence is incomplete")
+        if tuple(item.section_index for item in self.evidence) != tuple(
+            item.section_index for item in self.section_plan.sections
+        ):
+            raise ValueError("learned Section Director evidence is misaligned")
         if not 0.0 <= self.cut_probability_threshold <= 1.0:
             raise ValueError("learned Section Director threshold is invalid")
         for digest in (
@@ -147,6 +166,50 @@ class LearnedSectionDirectorResult:
         ):
             if len(digest) != 64:
                 raise ValueError("learned Section Director identity is not SHA-256")
+        fraction = self.chorus_wide_anchor_requested_fraction
+        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+            raise ValueError("chorus wide-anchor fraction is invalid")
+        chorus_indices = tuple(
+            item.section_index
+            for item in self.section_plan.sections
+            if item.role is SectionRole.CHORUS_LIKE
+        )
+        if self.chorus_section_count != len(chorus_indices):
+            raise ValueError("chorus wide-anchor section count is inconsistent")
+        expected_count = math.ceil(fraction * len(chorus_indices))
+        allocated = self.chorus_wide_anchor_allocated_section_indices
+        if (
+            self.chorus_wide_anchor_allocated_count != expected_count
+            or len(allocated) != expected_count
+            or tuple(sorted(set(allocated))) != allocated
+            or not set(allocated).issubset(chorus_indices)
+        ):
+            raise ValueError("chorus wide-anchor allocation is inconsistent")
+        selected_from_evidence = tuple(
+            item.section_index
+            for item in self.evidence
+            if item.chorus_wide_anchor_selected
+        )
+        if selected_from_evidence != allocated:
+            raise ValueError("chorus wide-anchor evidence is inconsistent")
+        selected_from_plan = tuple(
+            item.section_index
+            for item in self.section_plan.sections
+            if item.role is SectionRole.CHORUS_LIKE
+            and item.establish_with_wide_shot
+        )
+        if selected_from_plan != allocated:
+            raise ValueError("chorus wide-anchor section plan is inconsistent")
+        if any(
+            item.establish_with_wide_shot
+            for item in self.section_plan.sections
+            if item.role not in {SectionRole.INTRO, SectionRole.CHORUS_LIKE}
+        ):
+            raise ValueError("non-chorus section was promoted to a wide anchor")
+        if self.chorus_wide_anchor_allocation_basis != (
+            CHORUS_WIDE_ANCHOR_ALLOCATION_BASIS
+        ):
+            raise ValueError("chorus wide-anchor allocation basis is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +220,17 @@ class LearnedSectionDirectorResult:
             "training_report_sha256": self.training_report_sha256,
             "cut_probability_threshold": self.cut_probability_threshold,
             "cut_threshold_freeze_sha256": self.cut_threshold_freeze_sha256,
+            "chorus_wide_anchor_allocation": {
+                "requested_fraction": (
+                    self.chorus_wide_anchor_requested_fraction
+                ),
+                "chorus_section_count": self.chorus_section_count,
+                "allocated_count": self.chorus_wide_anchor_allocated_count,
+                "allocated_section_indices": list(
+                    self.chorus_wide_anchor_allocated_section_indices
+                ),
+                "allocation_basis": self.chorus_wide_anchor_allocation_basis,
+            },
             "section_plan": self.section_plan.to_dict(),
             "evidence": [item.to_dict() for item in self.evidence],
         }
@@ -166,6 +240,7 @@ def adapt_section_plan_from_stage_edit_heads(
     section_plan: SectionPlan,
     head_frames: Sequence[StageEditHeadFrame],
     *,
+    chorus_wide_anchor_fraction: float,
     cut_probability_threshold: float,
     cut_threshold_freeze_sha256: str,
     checkpoint_id: str,
@@ -177,6 +252,18 @@ def adapt_section_plan_from_stage_edit_heads(
     frames = tuple(head_frames)
     if not frames:
         raise LearnedSectionDirectorError("learned Section Director needs head frames")
+    if isinstance(chorus_wide_anchor_fraction, bool):
+        raise LearnedSectionDirectorError("chorus wide-anchor fraction is invalid")
+    try:
+        chorus_fraction = float(chorus_wide_anchor_fraction)
+    except (TypeError, ValueError) as exc:
+        raise LearnedSectionDirectorError(
+            "chorus wide-anchor fraction is invalid"
+        ) from exc
+    if not math.isfinite(chorus_fraction) or not 0.0 < chorus_fraction <= 1.0:
+        raise LearnedSectionDirectorError(
+            "chorus wide-anchor fraction must be finite and lie in (0, 1]"
+        )
     threshold = float(cut_probability_threshold)
     if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
         raise LearnedSectionDirectorError("cut probability threshold is invalid")
@@ -200,11 +287,61 @@ def adapt_section_plan_from_stage_edit_heads(
             + ", ".join(str(value) for value in missing)
         )
 
+    wide_support_by_section: list[float | None] = []
+    for section_frames in by_section:
+        shot_sizes = [
+            value
+            for frame in section_frames
+            if (value := _top_source_shot_size(frame)) is not None
+        ]
+        wide_support_by_section.append(
+            (
+                sum(
+                    value in {"wide", "long", "full", "full_body", "group"}
+                    for value in shot_sizes
+                )
+                / len(shot_sizes)
+                if shot_sizes
+                else None
+            )
+        )
+
+    chorus_sections = tuple(
+        section
+        for section in section_plan.sections
+        if section.role is SectionRole.CHORUS_LIKE
+    )
+    chorus_allocation_count = math.ceil(
+        chorus_fraction * len(chorus_sections)
+    )
+    ranked_chorus_sections = sorted(
+        chorus_sections,
+        key=lambda section: (
+            -section.phrase_count,
+            -section.duration_seconds,
+            -section.energy_score,
+            -(
+                wide_support_by_section[section.section_index]
+                if wide_support_by_section[section.section_index] is not None
+                else -1.0
+            ),
+            section.section_index,
+        ),
+    )
+    allocated_chorus_indices = tuple(
+        sorted(
+            section.section_index
+            for section in ranked_chorus_sections[:chorus_allocation_count]
+        )
+    )
+    allocated_chorus_index_set = frozenset(allocated_chorus_indices)
+
     learned: list[SectionDirective] = []
     evidence: list[LearnedSectionBudgetEvidence] = []
-    for base, section_frames in zip(
+    for base, section_frames, wide_support in zip(
         section_plan.sections,
         by_section,
+        wide_support_by_section,
         strict=True,
     ):
         cut_strength = fmean(
@@ -258,19 +395,15 @@ def adapt_section_plan_from_stage_edit_heads(
                 ),
             ),
         )
-        shot_sizes = [
-            value
-            for frame in section_frames
-            if (value := _top_source_shot_size(frame)) is not None
-        ]
-        wide_support = (
-            sum(
-                value in {"wide", "long", "full", "full_body", "group"}
-                for value in shot_sizes
-            )
-            / len(shot_sizes)
-            if shot_sizes
-            else None
+        chorus_wide_anchor_selected = (
+            base.section_index in allocated_chorus_index_set
+        )
+        establish_with_wide_shot = (
+            base.establish_with_wide_shot
+            if base.role is SectionRole.INTRO
+            else chorus_wide_anchor_selected
+            if base.role is SectionRole.CHORUS_LIKE
+            else False
         )
 
         learned.append(
@@ -286,10 +419,7 @@ def adapt_section_plan_from_stage_edit_heads(
                 target_source_switches_per_minute=switch_rate,
                 camera_motion_budget=motion_budget,
                 target_roll_events_per_minute=roll_rate,
-                establish_with_wide_shot=(
-                    base.establish_with_wide_shot
-                    or (wide_support is not None and wide_support >= 0.55)
-                ),
+                establish_with_wide_shot=establish_with_wide_shot,
                 protect_last_beat_from_extra_cut=(
                     base.protect_last_beat_from_extra_cut or cut_strength < 0.35
                 ),
@@ -312,6 +442,7 @@ def adapt_section_plan_from_stage_edit_heads(
                 base_preferred_source_hold_beats=base.preferred_source_hold_beats,
                 learned_preferred_source_hold_beats=hold,
                 learned_top_source_wide_support=wide_support,
+                chorus_wide_anchor_selected=chorus_wide_anchor_selected,
             )
         )
 
@@ -320,7 +451,8 @@ def adapt_section_plan_from_stage_edit_heads(
         analysis_basis=f"{section_plan.analysis_basis}+{CONTRACT}",
         role_semantics=(
             section_plan.role_semantics
-            + "; boundaries acoustic; editing budgets validation-frozen learned heads"
+            + "; boundaries acoustic; editing budgets validation-frozen learned "
+            "heads; chorus wide anchors profile-fraction allocated"
         ),
     )
     return LearnedSectionDirectorResult(
@@ -331,6 +463,12 @@ def adapt_section_plan_from_stage_edit_heads(
         checkpoint_id=str(checkpoint_id),
         training_report_path=str(training_report_path),
         training_report_sha256=training_report_sha256,
+        chorus_wide_anchor_requested_fraction=chorus_fraction,
+        chorus_section_count=len(chorus_sections),
+        chorus_wide_anchor_allocated_count=chorus_allocation_count,
+        chorus_wide_anchor_allocated_section_indices=(
+            allocated_chorus_indices
+        ),
     )
 
 
@@ -339,6 +477,7 @@ def build_learned_section_plan_from_checkpoint(
     head_frames: Sequence[StageEditHeadFrame],
     *,
     checkpoint_directory: Path,
+    chorus_wide_anchor_fraction: float,
 ) -> LearnedSectionDirectorResult:
     """Load the readiness-validated report and apply its frozen cut threshold."""
 
@@ -381,6 +520,7 @@ def build_learned_section_plan_from_checkpoint(
     return adapt_section_plan_from_stage_edit_heads(
         section_plan,
         head_frames,
+        chorus_wide_anchor_fraction=chorus_wide_anchor_fraction,
         cut_probability_threshold=float(threshold),
         cut_threshold_freeze_sha256=observed_freeze_sha256,
         checkpoint_id=checkpoint_id,

@@ -55,9 +55,10 @@ from .stage_edit_transformer import (
 from .timewarp import TimeWarpMap
 
 
-STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 1
+STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 2
 STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT = (
-    "explicit_snapshot_dynamic_crop_v2_semimarkov_retention_v1"
+    "explicit_snapshot_dynamic_crop_v2_profile_chorus_anchor_"
+    "semimarkov_retention_v2"
 )
 
 
@@ -526,6 +527,9 @@ def run_stage_edit_pipeline_bridge(
         section_plan,
         heads.frames,
         checkpoint_directory=preflight.checkpoint_directory,
+        chorus_wide_anchor_fraction=(
+            config.highlight_minimum_early_wide_anchor_fraction
+        ),
     )
     learned_section_plan = learned_section_director.section_plan
     metadata = tuple(
