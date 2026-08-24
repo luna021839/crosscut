@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from crosscut.acquisition import (
     AcquisitionError,
     YTDLPClient,
+    _IVE_STAGE_PLAYLIST_ID,
+    _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+    _IVE_STAGE_PLAYLIST_URL,
+    _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT,
+    _load_official_ive_stage_catalog,
+    _merge_discovery,
     _metadata_candidate,
     _metadata_queries,
     _is_member_closeup_candidate,
@@ -52,6 +60,20 @@ def _entry(index: int, *, title: str | None = None) -> dict[str, object]:
         "channel_id": "UCeLPm9yH_a_QH8n6445G-Ow",
         "duration": 185 + index % 3,
         "webpage_url": f"https://www.youtube.com/watch?v=stage{index:06d}",
+    }
+
+
+def _catalog_payload(
+    entries: list[dict[str, object]],
+    *,
+    owner_channel_id: str = _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+) -> dict[str, object]:
+    return {
+        "id": _IVE_STAGE_PLAYLIST_ID,
+        "title": "IVE STAGE",
+        "channel": "IVE",
+        "channel_id": owner_channel_id,
+        "entries": deepcopy(entries),
     }
 
 
@@ -103,6 +125,11 @@ class _FakeClient:
         del query, limit
         return list(self.entries)
 
+    def playlist_catalog(self, playlist_id: str) -> dict[str, object]:
+        if playlist_id != _IVE_STAGE_PLAYLIST_ID:
+            raise AssertionError(f"unexpected playlist: {playlist_id}")
+        return _catalog_payload(self.entries)
+
     def download(self, candidate, directory: Path) -> Path:
         self.download_attempts.append(candidate.video_id)
         if candidate.video_id in self.failed_ids:
@@ -113,7 +140,44 @@ class _FakeClient:
         return path.resolve()
 
 
+class _CatalogClient(_FakeClient):
+    def __init__(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        catalog_entries: list[dict[str, object]] | None = None,
+        catalog_payload: dict[str, object] | None = None,
+        catalog_error: str | None = None,
+        failed_ids: set[str] | None = None,
+    ) -> None:
+        super().__init__(entries, failed_ids=failed_ids)
+        self.catalog_payload = catalog_payload or _catalog_payload(
+            catalog_entries or []
+        )
+        self.catalog_error = catalog_error
+        self.catalog_attempts = 0
+
+    def playlist_catalog(self, playlist_id: str) -> dict[str, object]:
+        self.catalog_attempts += 1
+        if playlist_id != _IVE_STAGE_PLAYLIST_ID:
+            raise AssertionError(f"unexpected playlist: {playlist_id}")
+        if self.catalog_error is not None:
+            raise AcquisitionError(self.catalog_error)
+        return deepcopy(self.catalog_payload)
+
+
 class AcquisitionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Production requires a plausibly complete 1,500-entry catalog. Small
+        # fixtures exercise the same logic with a one-entry floor; dedicated
+        # anti-regression tests below restore the production threshold.
+        floor_patch = patch(
+            "crosscut.acquisition._CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT",
+            1,
+        )
+        floor_patch.start()
+        self.addCleanup(floor_patch.stop)
+
     def test_broadcast_date_parses_compact_dotted_and_underscored_titles(self) -> None:
         self.assertEqual(_broadcast_date("Music Bank 230414"), "2023-04-14")
         self.assertEqual(
@@ -144,6 +208,52 @@ class AcquisitionTests(unittest.TestCase):
         self.assertIn("--no-config", calls[0])
         self.assertIn("--no-cookies", calls[0])
         self.assertTrue(calls[0][-1].startswith("ytsearch20:"))
+
+    def test_ytdlp_playlist_catalog_is_flat_cookie_free_and_pinned(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def runner(command, **kwargs):
+            calls.append(tuple(command))
+            self.assertFalse(kwargs["check"])
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(_catalog_payload([_entry(1)])),
+                stderr="",
+            )
+
+        client = YTDLPClient("/mock/yt-dlp", runner=runner)
+        payload = client.playlist_catalog(_IVE_STAGE_PLAYLIST_ID)
+        self.assertEqual(payload["id"], _IVE_STAGE_PLAYLIST_ID)
+        self.assertEqual(calls[0][-1], _IVE_STAGE_PLAYLIST_URL)
+        self.assertIn("--no-config", calls[0])
+        self.assertIn("--no-cookies", calls[0])
+        self.assertIn("--ignore-errors", calls[0])
+        self.assertIn("--flat-playlist", calls[0])
+        self.assertIn("--dump-single-json", calls[0])
+        self.assertNotIn("--no-playlist", calls[0])
+
+    def test_ytdlp_nonzero_partial_playlist_payload_is_not_cacheable(self) -> None:
+        def runner(command, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout=json.dumps(_catalog_payload([_entry(1)])),
+                stderr="one playlist entry failed",
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            request = _request(Path(temp), desired=8)
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=YTDLPClient("/mock/yt-dlp", runner=runner),
+                now=datetime(2026, 8, 24, 1, 0, tzinfo=UTC),
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(provenance["network_status"], "incomplete_or_regressed")
+        self.assertIn("nonzero", provenance["network_error"])
 
     def test_ytdlp_client_refuses_blind_preexisting_cache_reuse(self) -> None:
         calls: list[tuple[str, ...]] = []
@@ -202,6 +312,9 @@ class AcquisitionTests(unittest.TestCase):
             actual = client.download(candidate, root / "cache")
 
         self.assertEqual(output.resolve(), actual)
+        self.assertIn("--no-config", calls[0])
+        self.assertIn("--no-cookies", calls[0])
+        self.assertIn("--no-playlist", calls[0])
         format_value = calls[0][calls[0].index("--format") + 1]
         self.assertIn("width<=3840", format_value)
         self.assertIn("height<=3840", format_value)
@@ -916,6 +1029,14 @@ class AcquisitionTests(unittest.TestCase):
                     for index in range(5)
                 ],
             ]
+            assert request.catalog_cache_directory is not None
+            catalog_index_path = next(
+                request.catalog_cache_directory.glob("*index*.json")
+            )
+            # This regression targets partial per-song media authentication,
+            # not shared catalog retention. Force a cache miss so the supplied
+            # fresh metadata remains the complete catalog fixture for the run.
+            catalog_index_path.unlink()
             second_client = _FakeClient(fresh_entries)
             second = acquire_sources(
                 request,
@@ -1121,6 +1242,529 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(second.manifest["selection_policy_version"], 5)
         self.assertGreaterEqual(len(second_client.download_attempts), 9)
         self.assertNotEqual(second.manifest["summary"].get("cache_reuse_count"), 100)
+
+    def test_playlist_owner_never_grants_source_channel_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            query_entries = [_entry(index) for index in range(8)]
+            untrusted = _entry(
+                99,
+                title="IVE - I AM | Music Bank Stage 230425",
+            )
+            untrusted.update(
+                {
+                    "id": "owner000001",
+                    "channel": "IVE",
+                    "channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+                    "duration": 214,
+                }
+            )
+            artifact = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=_CatalogClient(
+                    query_entries,
+                    catalog_entries=[untrusted],
+                ),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        record = next(
+            item
+            for item in artifact.manifest["candidates"]
+            if item["video_id"] == "owner000001"
+        )
+        self.assertIn(
+            "official_broadcast_channel_id_unverified",
+            record["rejection_reasons"],
+        )
+        self.assertEqual(
+            record["discovery_sources"],
+            ["official_ive_stage_playlist"],
+        )
+        provenance = artifact.manifest[
+            "official_ive_stage_playlist_catalog"
+        ]
+        self.assertTrue(provenance["playlist_owner_proves_catalog_only"])
+        self.assertTrue(
+            provenance["playlist_owner_never_grants_source_channel_trust"]
+        )
+        self.assertEqual(provenance["metadata_filter_rejected_count"], 1)
+
+    def test_catalog_dedupes_after_query_and_preserves_richer_query_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            query_entries = [_entry(index) for index in range(8)]
+            degraded_duplicate = {
+                "id": query_entries[0]["id"],
+                "title": query_entries[0]["title"],
+                "channel": "KBS Kpop",
+                "duration": query_entries[0]["duration"],
+            }
+            artifact = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=_CatalogClient(
+                    query_entries,
+                    catalog_entries=[degraded_duplicate],
+                ),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        duplicate_id = str(query_entries[0]["id"])
+        matching = [
+            item
+            for item in artifact.manifest["candidates"]
+            if item["video_id"] == duplicate_id
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0]["channel_id"],
+            "UCeLPm9yH_a_QH8n6445G-Ow",
+        )
+        self.assertEqual(
+            matching[0]["discovery_sources"],
+            ["query_search", "official_ive_stage_playlist"],
+        )
+        provenance = artifact.manifest[
+            "official_ive_stage_playlist_catalog"
+        ]
+        self.assertEqual(
+            provenance["exact_video_id_duplicates_with_query_or_cache"], 1
+        )
+        self.assertEqual(
+            provenance["merge_order"],
+            "after_query_search_richer_whole_candidate_preserved",
+        )
+
+    def test_catalog_cache_tamper_is_rejected_when_refresh_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            fetched_at = datetime(2026, 8, 24, 1, 0, tzinfo=UTC)
+            first_client = _CatalogClient(
+                [],
+                catalog_entries=[_entry(1)],
+            )
+            first_entries, first_provenance = (
+                _load_official_ive_stage_catalog(
+                    request=request,
+                    client=first_client,  # type: ignore[arg-type]
+                    now=fetched_at,
+                )
+            )
+            self.assertEqual(len(first_entries), 1)
+            object_path = Path(first_provenance["object_path"])
+            object_path.write_bytes(object_path.read_bytes() + b" ")
+
+            failed_client = _CatalogClient(
+                [],
+                catalog_error="network unavailable",
+            )
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=failed_client,  # type: ignore[arg-type]
+                now=fetched_at + timedelta(hours=1),
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(failed_client.catalog_attempts, 1)
+        self.assertEqual(provenance["cache_state"], "invalid")
+        self.assertIn("SHA-256", provenance["cache_error"])
+        self.assertEqual(
+            provenance["result"],
+            "catalog_unavailable_query_search_only",
+        )
+        self.assertFalse(provenance["stale_fallback_used"])
+
+    def test_catalog_rejects_unpinned_playlist_owner_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            client = _CatalogClient(
+                [],
+                catalog_payload=_catalog_payload(
+                    [_entry(1)],
+                    owner_channel_id="UC-not-the-pinned-ive-owner",
+                ),
+            )
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=client,  # type: ignore[arg-type]
+                now=datetime(2026, 8, 24, 1, 0, tzinfo=UTC),
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(provenance["network_status"], "failed_or_untrusted")
+        self.assertIn("소유자 채널 ID", provenance["network_error"])
+        self.assertEqual(
+            provenance["result"],
+            "catalog_unavailable_query_search_only",
+        )
+
+    def test_fresh_hash_valid_catalog_cache_skips_network_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            fetched_at = datetime(2026, 8, 24, 1, 0, tzinfo=UTC)
+            first_client = _CatalogClient(
+                [],
+                catalog_entries=[_entry(1)],
+            )
+            first_entries, _ = _load_official_ive_stage_catalog(
+                request=request,
+                client=first_client,  # type: ignore[arg-type]
+                now=fetched_at,
+            )
+            offline_client = _CatalogClient(
+                [],
+                catalog_error="must not be called",
+            )
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=offline_client,  # type: ignore[arg-type]
+                now=fetched_at + timedelta(hours=1),
+            )
+
+        self.assertEqual(entries, first_entries)
+        self.assertEqual(offline_client.catalog_attempts, 0)
+        self.assertEqual(provenance["cache_state"], "fresh")
+        self.assertEqual(provenance["result"], "fresh_hash_valid_cache")
+
+    def test_catalog_cache_uses_hash_valid_stale_fallback_on_network_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            fetched_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+            first_client = _CatalogClient(
+                [],
+                catalog_entries=[_entry(1)],
+            )
+            first_entries, _ = _load_official_ive_stage_catalog(
+                request=request,
+                client=first_client,  # type: ignore[arg-type]
+                now=fetched_at,
+            )
+            failed_client = _CatalogClient(
+                [],
+                catalog_error="network unavailable",
+            )
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=failed_client,  # type: ignore[arg-type]
+                now=fetched_at + timedelta(days=2),
+            )
+
+        self.assertEqual(entries, first_entries)
+        self.assertEqual(failed_client.catalog_attempts, 1)
+        self.assertEqual(provenance["cache_state"], "stale")
+        self.assertTrue(provenance["stale_fallback_used"])
+        self.assertEqual(
+            provenance["result"],
+            "stale_hash_valid_cache_after_refresh_failure",
+        )
+
+    def test_catalog_policy_upgrade_reuses_authenticated_media_without_redownload(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            entries = [_entry(index) for index in range(8)]
+            first = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+            legacy = json.loads(
+                first.manifest_path.read_text(encoding="utf-8")
+            )
+            legacy["latest_song_acquisition_policy_version"] = 1
+            legacy["promotion_date_cluster_selection"]["policy_version"] = 1
+            legacy.pop("official_ive_stage_playlist_catalog", None)
+            first.manifest_path.write_text(
+                json.dumps(legacy, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            assert request.catalog_cache_directory is not None
+            catalog_index_path = next(
+                request.catalog_cache_directory.glob("*index*.json")
+            )
+            catalog_index = json.loads(
+                catalog_index_path.read_text(encoding="utf-8")
+            )
+            catalog_index["fetched_at"] = "2020-01-01T00:00:00+00:00"
+            catalog_index_path.write_text(
+                json.dumps(catalog_index), encoding="utf-8"
+            )
+            second_client = _CatalogClient(
+                entries,
+                catalog_entries=entries,
+            )
+            second = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        self.assertEqual(second_client.catalog_attempts, 1)
+        self.assertEqual(second_client.download_attempts, [])
+        self.assertEqual(
+            second.manifest["latest_song_acquisition_policy_version"], 2
+        )
+        self.assertEqual(
+            second.manifest["cache_refresh_upgrade"]["new_download_count"],
+            0,
+        )
+        self.assertEqual(
+            second.manifest["official_ive_stage_playlist_catalog"]["result"],
+            "validated_network_catalog_cached",
+        )
+
+    def test_query_only_completion_retries_catalog_without_media_redownload(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            query_entries = [_entry(index) for index in range(8)]
+            first = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=_CatalogClient(
+                    query_entries,
+                    catalog_error="transient outage",
+                ),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+            self.assertEqual(
+                first.manifest["official_ive_stage_playlist_catalog"]["result"],
+                "catalog_unavailable_query_search_only",
+            )
+            self.assertTrue(
+                first.manifest["cache_refresh_upgrade"]["refresh_required"]
+            )
+            self.assertTrue(
+                first.manifest["cache_refresh_upgrade"][
+                    "catalog_retry_required"
+                ]
+            )
+
+            recovered_client = _CatalogClient(
+                query_entries,
+                catalog_entries=query_entries,
+            )
+            recovered = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=recovered_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_landscape_media,
+            )
+
+        self.assertEqual(recovered_client.catalog_attempts, 1)
+        self.assertEqual(recovered_client.download_attempts, [])
+        self.assertEqual(
+            recovered.manifest["official_ive_stage_playlist_catalog"]["result"],
+            "validated_network_catalog_cached",
+        )
+        self.assertFalse(
+            recovered.manifest["cache_refresh_upgrade"][
+                "catalog_retry_required"
+            ]
+        )
+
+    def test_smaller_refresh_cannot_replace_larger_hash_valid_stale_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            fetched_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+            original_entries = [_entry(index) for index in range(3)]
+            first_entries, first_provenance = (
+                _load_official_ive_stage_catalog(
+                    request=request,
+                    client=_CatalogClient(
+                        [], catalog_entries=original_entries
+                    ),  # type: ignore[arg-type]
+                    now=fetched_at,
+                )
+            )
+            regressed_client = _CatalogClient(
+                [],
+                catalog_entries=original_entries[:2],
+            )
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=regressed_client,  # type: ignore[arg-type]
+                now=fetched_at + timedelta(days=2),
+            )
+
+        self.assertEqual(entries, first_entries)
+        self.assertEqual(provenance["network_status"], "incomplete_or_regressed")
+        self.assertTrue(provenance["stale_fallback_used"])
+        self.assertEqual(
+            provenance["object_sha256"], first_provenance["object_sha256"]
+        )
+        self.assertIn("3", provenance["network_error"])
+
+    def test_nonzero_partial_refresh_uses_larger_hash_valid_stale_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            fetched_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+            original_entries = [_entry(index) for index in range(3)]
+            first_entries, _ = _load_official_ive_stage_catalog(
+                request=request,
+                client=_CatalogClient(
+                    [], catalog_entries=original_entries
+                ),  # type: ignore[arg-type]
+                now=fetched_at,
+            )
+            partial_payload = _catalog_payload(original_entries[:2])
+            partial_payload["_crosscut_ytdlp_returncode"] = 1
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=_CatalogClient(
+                    [], catalog_payload=partial_payload
+                ),  # type: ignore[arg-type]
+                now=fetched_at + timedelta(days=2),
+            )
+
+        self.assertEqual(entries, first_entries)
+        self.assertEqual(provenance["network_status"], "incomplete_or_regressed")
+        self.assertTrue(provenance["stale_fallback_used"])
+        self.assertIn("nonzero", provenance["network_error"])
+
+    def test_initial_catalog_below_production_plausibility_floor_is_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "crosscut.acquisition._CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT",
+            _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT,
+        ):
+            root = Path(temp)
+            request = _request(root, desired=8)
+            partial_entries = [
+                {
+                    "id": f"catalog{index:06d}",
+                    "title": f"IVE catalog item {index}",
+                }
+                for index in range(
+                    _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT - 1
+                )
+            ]
+            entries, provenance = _load_official_ive_stage_catalog(
+                request=request,
+                client=_CatalogClient(
+                    [], catalog_entries=partial_entries
+                ),  # type: ignore[arg-type]
+                now=datetime(2026, 8, 24, 1, 0, tzinfo=UTC),
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(provenance["network_status"], "incomplete_or_regressed")
+        self.assertIn("1500", provenance["network_error"])
+        self.assertEqual(
+            provenance["result"],
+            "catalog_unavailable_query_search_only",
+        )
+
+    def test_exact_id_merge_only_fills_nontrust_date_and_program(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            request = _request(Path(temp), desired=8)
+            trusted = _metadata_candidate(
+                {
+                    "id": "merge000001",
+                    "title": "IVE I AM Official Stage",
+                    "channel": "KBS Kpop",
+                    "channel_id": "UCeLPm9yH_a_QH8n6445G-Ow",
+                    "duration": 180,
+                },
+                request=request,
+                query="query-search",
+            )
+            alternate = _metadata_candidate(
+                {
+                    "id": "merge000001",
+                    "title": "IVE I AM Music Bank Stage",
+                    "channel": "IVE",
+                    "channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+                    "duration": 180,
+                    "upload_date": "20230414",
+                },
+                request=request,
+                query=f"playlist:{_IVE_STAGE_PLAYLIST_ID}",
+                discovery_source="official_ive_stage_playlist",
+            )
+            assert trusted is not None and alternate is not None
+            merged = _merge_discovery(trusted, alternate)
+
+        self.assertEqual(merged.title, trusted.title)
+        self.assertEqual(merged.channel, trusted.channel)
+        self.assertEqual(merged.channel_id, trusted.channel_id)
+        self.assertEqual(merged.trust_score, trusted.trust_score)
+        self.assertEqual(merged.rejection_reasons, trusted.rejection_reasons)
+        self.assertEqual(merged.broadcast_date, "2023-04-14")
+        self.assertEqual(merged.broadcast_program, "music_bank")
+
+    def test_playlist_candidate_wrong_media_is_quarantined_and_next_is_used(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, desired=8)
+            catalog_entries = [_entry(index) for index in range(9)]
+            client = _CatalogClient([], catalog_entries=catalog_entries)
+            probed: list[Path] = []
+
+            def first_portrait_then_landscape(path: Path) -> MediaInfo:
+                probed.append(path)
+                return _portrait_media(path) if len(probed) == 1 else _landscape_media(path)
+
+            artifact = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=first_portrait_then_landscape,
+            )
+            rejected_id = client.download_attempts[0]
+            quarantined = root / "cache" / "videos" / f"{rejected_id}.mp4.invalid"
+            rejected_record = next(
+                item
+                for item in artifact.manifest["candidates"]
+                if item["video_id"] == rejected_id
+            )
+            quarantined_exists = quarantined.is_file()
+
+        self.assertEqual(len(artifact.source_paths), 8)
+        self.assertEqual(len(client.download_attempts), 9)
+        self.assertTrue(quarantined_exists)
+        self.assertIn(
+            "automatic_group_landscape_aspect_ratio_mismatch",
+            rejected_record["download_hard_rejection_reasons"],
+        )
+        self.assertEqual(
+            rejected_record["discovery_sources"],
+            ["official_ive_stage_playlist"],
+        )
 
 
 class _MemoryReporter:

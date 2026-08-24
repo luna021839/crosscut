@@ -381,6 +381,43 @@ class RequestTests(unittest.TestCase):
                 "CrossCut Sources/IVE/I AM/group"
             )
         )
+        self.assertTrue(
+            str(request.catalog_cache_directory).endswith(
+                "CrossCut Sources/IVE/_catalog"
+            )
+        )
+        self.assertEqual(
+            request.as_dict()["catalog_cache_directory"],
+            str(request.catalog_cache_directory),
+        )
+
+    def test_catalog_cache_directory_is_optional_but_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            requested = root / "shared-catalog"
+            request = AnalysisRequest.from_dict(
+                {
+                    "song": "I AM",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "catalog_cache_directory": str(requested),
+                }
+            )
+            self.assertEqual(
+                request.catalog_cache_directory,
+                requested.resolve(),
+            )
+            with self.assertRaisesRegex(ValueError, "non-empty string"):
+                AnalysisRequest.from_dict(
+                    {
+                        "song": "I AM",
+                        "edit_mode": "group",
+                        "source_mode": "automatic",
+                        "sources": [],
+                        "catalog_cache_directory": "",
+                    }
+                )
 
     def test_group_default_floor_is_eight_but_explicit_counts_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

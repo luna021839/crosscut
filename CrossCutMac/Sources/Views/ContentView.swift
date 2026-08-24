@@ -729,7 +729,8 @@ struct ContentView: View {
                 outputDirectory: outputDirectory,
                 sourceMode: .automatic,
                 desiredSourceCount: automaticSourceCount,
-                sourceCacheDirectory: automaticCacheDirectory
+                sourceCacheDirectory: automaticCacheDirectory,
+                catalogCacheDirectory: automaticCatalogCacheDirectory
             )
             runner.start(request: request)
             return
@@ -934,6 +935,12 @@ struct ContentView: View {
             .appendingPathComponent("IVE", isDirectory: true)
             .appendingPathComponent(songComponent, isDirectory: true)
             .appendingPathComponent(modeComponent, isDirectory: true)
+    }
+
+    private var automaticCatalogCacheDirectory: URL {
+        sourceCacheRootDirectory
+            .appendingPathComponent("IVE", isDirectory: true)
+            .appendingPathComponent("_catalog", isDirectory: true)
     }
 
     private func safePathComponent(_ value: String) -> String {

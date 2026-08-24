@@ -11,7 +11,11 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from crosscut.acquisition import acquire_sources
+from crosscut.acquisition import (
+    _IVE_STAGE_PLAYLIST_ID,
+    _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+    acquire_sources,
+)
 from crosscut.group_source_quality import (
     GROUP_RELATIVE_QUALITY_SAMPLE_FRACTIONS,
     GroupSourceQualityAssessment,
@@ -103,6 +107,15 @@ class _FakeClient:
         self.search_calls += 1
         return list(self.entries)
 
+    def playlist_catalog(self, playlist_id: str) -> dict[str, object]:
+        if playlist_id != _IVE_STAGE_PLAYLIST_ID:
+            raise AssertionError(f"unexpected playlist: {playlist_id}")
+        return {
+            "id": _IVE_STAGE_PLAYLIST_ID,
+            "channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+            "entries": deepcopy(self.entries),
+        }
+
     def download(self, candidate, directory: Path) -> Path:
         self.download_attempts.append(candidate.video_id)
         path = directory / "videos" / f"{candidate.video_id}.mp4"
@@ -160,6 +173,69 @@ def _entries(count: int, *, member: bool = False) -> list[dict[str, object]]:
 
 
 class GroupSourceQualityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        floor_patch = patch(
+            "crosscut.acquisition._CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT",
+            1,
+        )
+        floor_patch.start()
+        self.addCleanup(floor_patch.stop)
+
+    def test_catalog_policy_upgrade_reuses_quality_excluded_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root)
+            entries = _entries(10)
+
+            def analyzer(path: Path, *_args, **_kwargs):
+                return _assessment(100.0 - int(path.stem[-4:]))
+
+            first = acquire_sources(
+                request,
+                _Reporter(),  # type: ignore[arg-type]
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda _path: None,
+                media_probe=_media,
+                group_quality_analyzer=analyzer,
+            )
+            self.assertEqual(len(first.source_paths), 8)
+            self.assertEqual(
+                sum(
+                    record["download_status"]
+                    == "downloaded_quality_excluded"
+                    for record in first.manifest["candidates"]
+                ),
+                2,
+            )
+            legacy = deepcopy(first.manifest)
+            legacy["latest_song_acquisition_policy_version"] = 1
+            legacy["promotion_date_cluster_selection"]["policy_version"] = 1
+            first.manifest_path.write_text(
+                json.dumps(legacy, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            refresh_client = _FakeClient(entries)
+            refreshed = acquire_sources(
+                request,
+                _Reporter(),  # type: ignore[arg-type]
+                client=refresh_client,  # type: ignore[arg-type]
+                media_validator=lambda _path: None,
+                media_probe=_media,
+                group_quality_analyzer=analyzer,
+            )
+
+        self.assertEqual(refresh_client.download_attempts, [])
+        self.assertEqual(
+            refreshed.manifest["cache_refresh_upgrade"]["new_download_count"],
+            0,
+        )
+        self.assertEqual(
+            refreshed.manifest["cache_refresh_upgrade"][
+                "authenticated_cache_reuse_count"
+            ],
+            10,
+        )
+
     def test_eight_frame_analysis_prefers_sharp_consistent_source(self) -> None:
         generator = np.random.default_rng(8)
         sharp = generator.integers(24, 232, (270, 480, 3), dtype=np.uint8)

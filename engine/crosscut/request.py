@@ -99,6 +99,7 @@ class AnalysisRequest:
     source_mode: SourceMode = SourceMode.LOCAL
     desired_source_count: int = DEFAULT_AUTOMATIC_SOURCE_COUNT
     source_cache_directory: Path | None = None
+    catalog_cache_directory: Path | None = None
     acquire_only: bool = False
     professional_reference_profile: Path | None = None
     professional_reference_cadence_profile: Path | None = None
@@ -517,6 +518,40 @@ class AnalysisRequest:
         ):
             raise ValueError("source_cache_directory points to an existing file")
 
+        raw_catalog_cache = payload.get("catalog_cache_directory")
+        if raw_catalog_cache is not None and (
+            not isinstance(raw_catalog_cache, str)
+            or not raw_catalog_cache.strip()
+        ):
+            raise ValueError(
+                "catalog_cache_directory must be a non-empty string"
+            )
+        catalog_cache_directory = (
+            None
+            if raw_catalog_cache is None
+            and source_mode is not SourceMode.AUTOMATIC
+            else Path(raw_catalog_cache).expanduser().resolve()
+            if raw_catalog_cache is not None
+            else (
+                (
+                    output_directory
+                    / "CrossCut Sources"
+                    / "IVE"
+                    / "_catalog"
+                )
+                if raw_cache is None
+                else (source_cache_directory.parent / "_catalog")
+            ).resolve()
+        )
+        if (
+            catalog_cache_directory is not None
+            and catalog_cache_directory.exists()
+            and not catalog_cache_directory.is_dir()
+        ):
+            raise ValueError(
+                "catalog_cache_directory points to an existing file"
+            )
+
         raw_acquire_only = payload.get("acquire_only", False)
         if not isinstance(raw_acquire_only, bool):
             raise ValueError("acquire_only must be a boolean")
@@ -728,6 +763,7 @@ class AnalysisRequest:
             source_mode=source_mode,
             desired_source_count=desired_source_count,
             source_cache_directory=source_cache_directory,
+            catalog_cache_directory=catalog_cache_directory,
             acquire_only=raw_acquire_only,
             professional_reference_profile=professional_reference_profile,
             professional_reference_cadence_profile=(
@@ -790,6 +826,10 @@ class AnalysisRequest:
                 else None
             ),
         }
+        if self.catalog_cache_directory is not None:
+            payload["catalog_cache_directory"] = str(
+                self.catalog_cache_directory
+            )
         # Preserve the exact legacy request schema unless learned inference is
         # explicitly activated.  This also makes accidental activation visible
         # in every persisted request manifest.

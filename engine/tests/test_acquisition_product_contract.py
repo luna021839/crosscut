@@ -11,6 +11,8 @@ from unittest.mock import patch
 from crosscut.acquisition import (
     AcquisitionError,
     AcquisitionArtifact,
+    _IVE_STAGE_PLAYLIST_ID,
+    _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
     _metadata_candidate,
     _ordered_for_download,
     _quarantine_invalid_media,
@@ -129,6 +131,15 @@ class _FakeClient:
         self.search_calls.append((query, limit))
         return list(self.entries)
 
+    def playlist_catalog(self, playlist_id: str) -> dict[str, object]:
+        if playlist_id != _IVE_STAGE_PLAYLIST_ID:
+            raise AssertionError(f"unexpected playlist: {playlist_id}")
+        return {
+            "id": _IVE_STAGE_PLAYLIST_ID,
+            "channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+            "entries": [dict(entry) for entry in self.entries],
+        }
+
     def download(self, candidate, directory: Path) -> Path:  # type: ignore[no-untyped-def]
         self.download_attempts.append(candidate.video_id)
         path = directory / "videos" / f"{candidate.video_id}.mp4"
@@ -155,6 +166,14 @@ class _MemoryReporter:
 
 
 class AutomaticAcquisitionProductContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        floor_patch = patch(
+            "crosscut.acquisition._CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT",
+            1,
+        )
+        floor_patch.start()
+        self.addCleanup(floor_patch.stop)
+
     def test_failed_comparison_render_requires_explicit_cli_flag(self) -> None:
         import crosscut_cli
 

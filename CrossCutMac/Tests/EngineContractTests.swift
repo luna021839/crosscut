@@ -692,7 +692,8 @@ final class EngineContractTests: XCTestCase {
             sources: [],
             outputDirectory: URL(fileURLWithPath: "/tmp/output"),
             sourceMode: .automatic,
-            sourceCacheDirectory: URL(fileURLWithPath: "/tmp/ive-cache")
+            sourceCacheDirectory: URL(fileURLWithPath: "/tmp/ive-cache"),
+            catalogCacheDirectory: URL(fileURLWithPath: "/tmp/ive-catalog")
         )
 
         let object = try XCTUnwrap(
@@ -701,6 +702,7 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(object["source_mode"] as? String, "automatic")
         XCTAssertEqual(object["desired_source_count"] as? Int, 10)
         XCTAssertEqual(object["source_cache_directory"] as? String, "/tmp/ive-cache")
+        XCTAssertEqual(object["catalog_cache_directory"] as? String, "/tmp/ive-catalog")
         XCTAssertEqual(object["acquire_only"] as? Bool, false)
         XCTAssertEqual((object["sources"] as? [Any])?.count, 0)
         XCTAssertEqual((object["member_anchors"] as? [Any])?.count, 0)

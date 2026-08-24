@@ -95,6 +95,7 @@ struct EditRequest: Codable, Equatable {
     let sourceMode: String
     let desiredSourceCount: Int
     let sourceCacheDirectory: String
+    let catalogCacheDirectory: String?
     let acquireOnly: Bool
 
     init(
@@ -108,6 +109,7 @@ struct EditRequest: Codable, Equatable {
         sourceMode: SourceMode = .local,
         desiredSourceCount: Int = 10,
         sourceCacheDirectory: URL? = nil,
+        catalogCacheDirectory: URL? = nil,
         acquireOnly: Bool = false
     ) {
         self.song = song
@@ -133,6 +135,7 @@ struct EditRequest: Codable, Equatable {
         )
         self.sourceCacheDirectory = (sourceCacheDirectory ?? outputDirectory
             .appendingPathComponent("CrossCut Sources", isDirectory: true)).path
+        self.catalogCacheDirectory = catalogCacheDirectory?.path
         self.acquireOnly = acquireOnly
     }
 
@@ -147,6 +150,7 @@ struct EditRequest: Codable, Equatable {
         case sourceMode = "source_mode"
         case desiredSourceCount = "desired_source_count"
         case sourceCacheDirectory = "source_cache_directory"
+        case catalogCacheDirectory = "catalog_cache_directory"
         case acquireOnly = "acquire_only"
     }
 }

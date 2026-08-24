@@ -21,6 +21,7 @@ import statistics
 import subprocess
 from datetime import UTC, datetime
 from typing import Any, Callable, Iterable, Sequence
+from uuid import uuid4
 
 from .events import EventReporter
 from .group_source_quality import (
@@ -61,6 +62,7 @@ class AcquisitionCandidate:
     official_channel_signal: str = "none"
     rejection_reasons: tuple[str, ...] = ()
     fallback_reason: str | None = None
+    discovery_sources: tuple[str, ...] = ("query_search",)
 
     @property
     def query(self) -> str:
@@ -94,6 +96,10 @@ class _MediaContractError(AcquisitionError):
         self.diagnostics = diagnostics
 
 
+class _CatalogCompletenessError(AcquisitionError):
+    """A pinned playlist response is partial or regresses a valid cache."""
+
+
 RunProcess = Callable[..., subprocess.CompletedProcess[str]]
 GroupSourceQualityAnalyzer = Callable[..., GroupSourceQualityAssessment]
 
@@ -103,7 +109,8 @@ _MINIMUM_DURATION_SECONDS = 95.0
 _MAXIMUM_DURATION_SECONDS = 480.0
 _SELECTION_POLICY_VERSION = 5
 _LEGACY_SELECTION_POLICY_VERSION = 4
-_LATEST_SONG_ACQUISITION_POLICY_VERSION = 1
+_LATEST_SONG_ACQUISITION_POLICY_VERSION = 2
+_LEGACY_LATEST_SONG_ACQUISITION_POLICY_VERSION = 1
 _PROMOTION_CLUSTER_MAXIMUM_GAP_DAYS = 28
 _CURRENT_HARD_TITLE_AUDIT_POLICY = (
     "selected_title_encore_winner_afterstage_and_music_bank_global_special_v3"
@@ -129,6 +136,19 @@ _GROUP_PRODUCTION_WIDTH = 1920
 _GROUP_PRODUCTION_HEIGHT = 1080
 _MEMBER_PRODUCTION_WIDTH = 1080
 _MEMBER_PRODUCTION_HEIGHT = 1920
+_IVE_STAGE_PLAYLIST_ID = "PLPhtNKiHTFyob6KUBxHdAdHlliwZTMBFc"
+_IVE_STAGE_PLAYLIST_URL = (
+    "https://www.youtube.com/playlist?list=" + _IVE_STAGE_PLAYLIST_ID
+)
+_IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID = "UC-Fnix71vRP64WXeo0ikd0Q"
+_IVE_STAGE_PLAYLIST_OWNER_NAME = "IVE"
+_CATALOG_CACHE_SCHEMA_VERSION = 1
+_CATALOG_CACHE_POLICY_VERSION = 1
+_CATALOG_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+_CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT = 1500
+_CATALOG_CACHE_INDEX_FILENAME = "official-ive-stage-playlist-index-v1.json"
+_CATALOG_CACHE_OBJECT_MAXIMUM_BYTES = 32 * 1024 * 1024
+_CATALOG_OBJECT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _download_format_for_profile(profile: str) -> str:
@@ -547,6 +567,52 @@ class YTDLPClient:
         entries = payload.get("entries", []) if isinstance(payload, dict) else []
         return [entry for entry in entries if isinstance(entry, dict)]
 
+    def playlist_catalog(self, playlist_id: str) -> dict[str, Any]:
+        """Return flat metadata for one explicitly pinned public playlist."""
+
+        if playlist_id != _IVE_STAGE_PLAYLIST_ID:
+            raise AcquisitionError("지원하지 않는 플레이리스트 카탈로그입니다.")
+        command = (
+            *self.command,
+            "--no-config",
+            "--no-cookies",
+            "--ignore-errors",
+            "--flat-playlist",
+            "--dump-single-json",
+            _IVE_STAGE_PLAYLIST_URL,
+        )
+        try:
+            completed = self._runner(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AcquisitionError(
+                f"IVE STAGE 플레이리스트 메타데이터 수집 실패: {exc}"
+            ) from exc
+        if completed.returncode != 0 and not completed.stdout.strip():
+            detail = (
+                completed.stderr or "yt-dlp returned no playlist metadata"
+            ).strip().splitlines()[-1]
+            raise AcquisitionError(
+                f"IVE STAGE 플레이리스트 메타데이터 수집 실패: {detail}"
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise AcquisitionError(
+                "IVE STAGE 플레이리스트 메타데이터 응답을 읽지 못했습니다."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AcquisitionError(
+                "IVE STAGE 플레이리스트 메타데이터가 객체가 아닙니다."
+            )
+        payload["_crosscut_ytdlp_returncode"] = completed.returncode
+        return payload
+
     def download(self, candidate: AcquisitionCandidate, directory: Path) -> Path:
         videos_directory = directory / "videos"
         videos_directory.mkdir(parents=True, exist_ok=True)
@@ -598,6 +664,441 @@ class YTDLPClient:
         return cached
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _atomic_catalog_write(path: Path, content: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _normalized_catalog_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    video_id = entry.get("id")
+    if not isinstance(video_id, str) or _VIDEO_ID.fullmatch(video_id) is None:
+        return None
+    normalized: dict[str, Any] = {"id": video_id}
+    for key in (
+        "title",
+        "channel",
+        "channel_id",
+        "uploader",
+        "uploader_id",
+        "upload_date",
+    ):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized[key] = value.strip()
+    for key in ("webpage_url", "url"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.startswith(("https://", "http://")):
+            normalized[key] = value
+    for key in ("duration", "timestamp", "release_timestamp"):
+        value = entry.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            normalized[key] = value
+    return normalized
+
+
+def _normalized_catalog_object(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("id") != _IVE_STAGE_PLAYLIST_ID:
+        raise AcquisitionError(
+            "IVE STAGE 플레이리스트 ID가 고정 계약과 다릅니다."
+        )
+    # The playlist owner's channel ID authenticates only this catalog. It is
+    # deliberately never copied into an entry or used as source-channel trust.
+    if payload.get("channel_id") != _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID:
+        raise AcquisitionError(
+            "IVE STAGE 플레이리스트 소유자 채널 ID가 고정 계약과 다릅니다."
+        )
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raise AcquisitionError(
+            "IVE STAGE 플레이리스트 영상 목록을 읽지 못했습니다."
+        )
+    entries = [
+        normalized
+        for entry in raw_entries
+        if isinstance(entry, dict)
+        and (normalized := _normalized_catalog_entry(entry)) is not None
+    ]
+    if not entries:
+        raise AcquisitionError("IVE STAGE 플레이리스트가 비어 있습니다.")
+    return {
+        "schema_version": _CATALOG_CACHE_SCHEMA_VERSION,
+        "playlist": {
+            "id": _IVE_STAGE_PLAYLIST_ID,
+            "owner_channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+            "owner_name": _IVE_STAGE_PLAYLIST_OWNER_NAME,
+        },
+        "raw_entry_count": len(raw_entries),
+        "normalization_rejected_count": len(raw_entries) - len(entries),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _validated_cached_catalog_object(payload: object) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise AcquisitionError("카탈로그 객체가 JSON 객체가 아닙니다.")
+    playlist = payload.get("playlist")
+    raw_entries = payload.get("entries")
+    raw_count = payload.get("raw_entry_count")
+    rejected_count = payload.get("normalization_rejected_count")
+    entry_count = payload.get("entry_count")
+    if (
+        payload.get("schema_version") != _CATALOG_CACHE_SCHEMA_VERSION
+        or playlist
+        != {
+            "id": _IVE_STAGE_PLAYLIST_ID,
+            "owner_channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+            "owner_name": _IVE_STAGE_PLAYLIST_OWNER_NAME,
+        }
+        or not isinstance(raw_entries, list)
+        or not isinstance(raw_count, int)
+        or isinstance(raw_count, bool)
+        or not isinstance(rejected_count, int)
+        or isinstance(rejected_count, bool)
+        or not isinstance(entry_count, int)
+        or isinstance(entry_count, bool)
+    ):
+        raise AcquisitionError("카탈로그 객체 계약이 일치하지 않습니다.")
+    normalized_entries: list[dict[str, Any]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            raise AcquisitionError("카탈로그 항목이 JSON 객체가 아닙니다.")
+        normalized = _normalized_catalog_entry(entry)
+        if normalized is None or normalized != entry:
+            raise AcquisitionError("카탈로그 항목이 정규화 계약과 다릅니다.")
+        normalized_entries.append(normalized)
+    if (
+        not normalized_entries
+        or entry_count != len(normalized_entries)
+        or raw_count != entry_count + rejected_count
+        or rejected_count < 0
+    ):
+        raise AcquisitionError("카탈로그 항목 수 계약이 일치하지 않습니다.")
+    expected = {
+        "schema_version": _CATALOG_CACHE_SCHEMA_VERSION,
+        "playlist": playlist,
+        "raw_entry_count": raw_count,
+        "normalization_rejected_count": rejected_count,
+        "entry_count": entry_count,
+        "entries": normalized_entries,
+    }
+    if payload != expected:
+        raise AcquisitionError("카탈로그 객체에 허용되지 않은 필드가 있습니다.")
+    return expected
+
+
+def _catalog_cache_root(request: AnalysisRequest) -> Path:
+    if request.catalog_cache_directory is not None:
+        return request.catalog_cache_directory
+    assert request.source_cache_directory is not None
+    return (request.source_cache_directory.parent / "_catalog").resolve()
+
+
+def _read_catalog_cache(
+    root: Path,
+    *,
+    now: datetime,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "cache_root": str(root),
+        "cache_state": "miss",
+        "cache_error": None,
+    }
+    try:
+        if root.is_symlink():
+            raise AcquisitionError("카탈로그 캐시 루트가 심볼릭 링크입니다.")
+        index_path = root / _CATALOG_CACHE_INDEX_FILENAME
+        if not index_path.exists():
+            return None, diagnostics
+        if index_path.is_symlink() or not index_path.is_file():
+            raise AcquisitionError("카탈로그 캐시 인덱스가 일반 파일이 아닙니다.")
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        if not isinstance(index, dict):
+            raise AcquisitionError("카탈로그 캐시 인덱스가 JSON 객체가 아닙니다.")
+        object_sha256 = index.get("object_sha256")
+        expected_relative = (
+            f"objects/{object_sha256}.json"
+            if isinstance(object_sha256, str)
+            else None
+        )
+        if (
+            index.get("schema_version") != _CATALOG_CACHE_SCHEMA_VERSION
+            or index.get("cache_policy_version")
+            != _CATALOG_CACHE_POLICY_VERSION
+            or index.get("playlist_id") != _IVE_STAGE_PLAYLIST_ID
+            or index.get("owner_channel_id")
+            != _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID
+            or not isinstance(object_sha256, str)
+            or _CATALOG_OBJECT_SHA256.fullmatch(object_sha256) is None
+            or index.get("object_relative_path") != expected_relative
+        ):
+            raise AcquisitionError("카탈로그 캐시 인덱스 계약이 일치하지 않습니다.")
+        fetched_at_value = index.get("fetched_at")
+        if not isinstance(fetched_at_value, str):
+            raise AcquisitionError("카탈로그 캐시 시각이 없습니다.")
+        fetched_at = datetime.fromisoformat(fetched_at_value)
+        if fetched_at.tzinfo is None:
+            raise AcquisitionError("카탈로그 캐시 시각에 타임존이 없습니다.")
+        age_seconds = (now - fetched_at.astimezone(UTC)).total_seconds()
+        if age_seconds < -300:
+            raise AcquisitionError("카탈로그 캐시 시각이 미래입니다.")
+        objects_directory = root / "objects"
+        if objects_directory.is_symlink():
+            raise AcquisitionError("카탈로그 객체 폴더가 심볼릭 링크입니다.")
+        object_path = objects_directory / f"{object_sha256}.json"
+        if object_path.is_symlink() or not object_path.is_file():
+            raise AcquisitionError("카탈로그 객체 파일이 없거나 링크입니다.")
+        if object_path.stat().st_size > _CATALOG_CACHE_OBJECT_MAXIMUM_BYTES:
+            raise AcquisitionError("카탈로그 객체가 허용 크기를 넘습니다.")
+        raw_object = object_path.read_bytes()
+        actual_sha256 = hashlib.sha256(raw_object).hexdigest()
+        if not hmac.compare_digest(actual_sha256, object_sha256):
+            raise AcquisitionError("카탈로그 객체 SHA-256이 일치하지 않습니다.")
+        object_payload = _validated_cached_catalog_object(
+            json.loads(raw_object.decode("utf-8"))
+        )
+        if len(object_payload["entries"]) != index.get("entry_count"):
+            raise AcquisitionError("카탈로그 인덱스와 객체의 항목 수가 다릅니다.")
+        diagnostics.update(
+            {
+                "cache_state": (
+                    "fresh"
+                    if age_seconds <= _CATALOG_CACHE_MAX_AGE_SECONDS
+                    else "stale"
+                ),
+                "cache_age_seconds": max(0.0, age_seconds),
+                "object_sha256": object_sha256,
+                "object_path": str(object_path),
+                "fetched_at": fetched_at.astimezone(UTC).isoformat(),
+                "entry_count": len(object_payload["entries"]),
+                "raw_entry_count": object_payload["raw_entry_count"],
+                "normalization_rejected_count": object_payload[
+                    "normalization_rejected_count"
+                ],
+            }
+        )
+        return object_payload, diagnostics
+    except (
+        AcquisitionError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        diagnostics.update(
+            {
+                "cache_state": "invalid",
+                "cache_error": str(exc),
+            }
+        )
+        return None, diagnostics
+
+
+def _write_catalog_cache(
+    root: Path,
+    *,
+    object_payload: dict[str, Any],
+    fetched_at: datetime,
+) -> dict[str, Any]:
+    if root.is_symlink():
+        raise AcquisitionError("카탈로그 캐시 루트가 심볼릭 링크입니다.")
+    root.mkdir(parents=True, exist_ok=True)
+    objects_directory = root / "objects"
+    if objects_directory.is_symlink():
+        raise AcquisitionError("카탈로그 객체 폴더가 심볼릭 링크입니다.")
+    objects_directory.mkdir(parents=True, exist_ok=True)
+    object_bytes = _canonical_json_bytes(object_payload)
+    object_sha256 = hashlib.sha256(object_bytes).hexdigest()
+    object_path = objects_directory / f"{object_sha256}.json"
+    if object_path.exists():
+        if object_path.is_symlink() or object_path.read_bytes() != object_bytes:
+            raise AcquisitionError(
+                "동일 SHA-256 카탈로그 객체가 다른 내용으로 존재합니다."
+            )
+    else:
+        _atomic_catalog_write(object_path, object_bytes)
+    index = {
+        "schema_version": _CATALOG_CACHE_SCHEMA_VERSION,
+        "cache_policy_version": _CATALOG_CACHE_POLICY_VERSION,
+        "playlist_id": _IVE_STAGE_PLAYLIST_ID,
+        "owner_channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+        "object_sha256": object_sha256,
+        "object_relative_path": f"objects/{object_sha256}.json",
+        "entry_count": object_payload["entry_count"],
+        "fetched_at": fetched_at.astimezone(UTC).isoformat(),
+    }
+    index_path = root / _CATALOG_CACHE_INDEX_FILENAME
+    if index_path.is_symlink():
+        raise AcquisitionError("카탈로그 인덱스가 심볼릭 링크입니다.")
+    _atomic_catalog_write(index_path, _canonical_json_bytes(index))
+    return {
+        "object_sha256": object_sha256,
+        "object_path": str(object_path),
+        "fetched_at": index["fetched_at"],
+        "entry_count": object_payload["entry_count"],
+    }
+
+
+def _load_official_ive_stage_catalog(
+    *,
+    request: AnalysisRequest,
+    client: YTDLPClient,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    current_time = (now or datetime.now(UTC)).astimezone(UTC)
+    root = _catalog_cache_root(request)
+    cached_object, cache_diagnostics = _read_catalog_cache(
+        root,
+        now=current_time,
+    )
+    provenance: dict[str, Any] = {
+        "schema_version": _CATALOG_CACHE_SCHEMA_VERSION,
+        "cache_policy_version": _CATALOG_CACHE_POLICY_VERSION,
+        "playlist_id": _IVE_STAGE_PLAYLIST_ID,
+        "playlist_url": _IVE_STAGE_PLAYLIST_URL,
+        "pinned_owner_channel_id": _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
+        "pinned_owner_name": _IVE_STAGE_PLAYLIST_OWNER_NAME,
+        "playlist_owner_proves_catalog_only": True,
+        "playlist_owner_never_grants_source_channel_trust": True,
+        "source_entries_require_existing_metadata_song_member_show_channel_filters": True,
+        "maximum_fresh_age_seconds": _CATALOG_CACHE_MAX_AGE_SECONDS,
+        "minimum_plausible_entry_count": (
+            _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT
+        ),
+        **cache_diagnostics,
+        "refresh_attempted": False,
+        "network_status": "not_attempted",
+        "stale_fallback_used": False,
+        "result": "pending",
+    }
+    if cached_object is not None and cache_diagnostics["cache_state"] == "fresh":
+        provenance["result"] = "fresh_hash_valid_cache"
+        return list(cached_object["entries"]), provenance
+
+    provenance["refresh_attempted"] = True
+    try:
+        playlist_loader = getattr(client, "playlist_catalog", None)
+        if not callable(playlist_loader):
+            raise AcquisitionError(
+                "주입된 yt-dlp 클라이언트가 플레이리스트 카탈로그를 "
+                "지원하지 않습니다."
+            )
+        raw_payload = playlist_loader(_IVE_STAGE_PLAYLIST_ID)
+        if not isinstance(raw_payload, dict):
+            raise AcquisitionError(
+                "IVE STAGE 플레이리스트 메타데이터가 JSON 객체가 "
+                "아닙니다."
+            )
+        raw_returncode = raw_payload.get("_crosscut_ytdlp_returncode", 0)
+        if (
+            not isinstance(raw_returncode, int)
+            or isinstance(raw_returncode, bool)
+            or raw_returncode != 0
+        ):
+            raise _CatalogCompletenessError(
+                "yt-dlp 플레이리스트 응답이 nonzero 종료라 부분 "
+                "메타데이터로 간주합니다."
+            )
+        object_payload = _normalized_catalog_object(raw_payload)
+        entry_count = int(object_payload["entry_count"])
+        if entry_count < _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT:
+            raise _CatalogCompletenessError(
+                "IVE STAGE 카탈로그가 최소 완전성 하한보다 "
+                f"작습니다: {entry_count} < "
+                f"{_CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT}"
+            )
+        reported_counts = [
+            value
+            for key in ("playlist_count", "n_entries")
+            if isinstance((value := raw_payload.get(key)), int)
+            and not isinstance(value, bool)
+            and value > 0
+        ]
+        if (
+            reported_counts
+            and object_payload["raw_entry_count"] < max(reported_counts)
+        ):
+            raise _CatalogCompletenessError(
+                "yt-dlp 플레이리스트 응답 항목 수가 보고된 전체 "
+                "항목 수보다 작습니다."
+            )
+        if (
+            cached_object is not None
+            and entry_count < int(cached_object["entry_count"])
+        ):
+            raise _CatalogCompletenessError(
+                "IVE STAGE 카탈로그 갱신이 이전 해시 검증 캐시보다 "
+                f"작습니다: {entry_count} < "
+                f"{cached_object['entry_count']}"
+            )
+        if cached_object is not None:
+            prior_video_ids = {
+                str(entry["id"]) for entry in cached_object["entries"]
+            }
+            refreshed_video_ids = {
+                str(entry["id"]) for entry in object_payload["entries"]
+            }
+            missing_prior_video_ids = prior_video_ids - refreshed_video_ids
+            if missing_prior_video_ids:
+                raise _CatalogCompletenessError(
+                    "IVE STAGE 카탈로그 갱신에서 이전 해시 검증 "
+                    f"항목 {len(missing_prior_video_ids)}개가 사라졌습니다."
+                )
+        provenance["network_status"] = "validated_pinned_playlist"
+    except (AcquisitionError, OSError, ValueError) as exc:
+        provenance["network_status"] = (
+            "incomplete_or_regressed"
+            if isinstance(exc, _CatalogCompletenessError)
+            else "failed_or_untrusted"
+        )
+        provenance["network_error"] = str(exc)
+        if cached_object is not None and cache_diagnostics["cache_state"] == "stale":
+            provenance["stale_fallback_used"] = True
+            provenance["result"] = "stale_hash_valid_cache_after_refresh_failure"
+            return list(cached_object["entries"]), provenance
+        provenance["result"] = "catalog_unavailable_query_search_only"
+        return [], provenance
+
+    try:
+        written = _write_catalog_cache(
+            root,
+            object_payload=object_payload,
+            fetched_at=current_time,
+        )
+    except (AcquisitionError, OSError, ValueError) as exc:
+        provenance["cache_write_error"] = str(exc)
+        provenance["result"] = "validated_network_catalog_cache_write_failed"
+    else:
+        provenance.update(written)
+        provenance["cache_state"] = "refreshed"
+        provenance["result"] = "validated_network_catalog_cached"
+    provenance["raw_entry_count"] = object_payload["raw_entry_count"]
+    provenance["normalization_rejected_count"] = object_payload[
+        "normalization_rejected_count"
+    ]
+    return list(object_payload["entries"]), provenance
+
+
 def _cached_video_path(directory: Path, video_id: str) -> Path | None:
     paths = _cached_video_paths(directory, video_id)
     return paths[0] if paths else None
@@ -630,6 +1131,7 @@ def _metadata_candidate(
     *,
     request: AnalysisRequest,
     query: str,
+    discovery_source: str = "query_search",
 ) -> AcquisitionCandidate | None:
     video_id = entry.get("id")
     if not isinstance(video_id, str) or not _VIDEO_ID.fullmatch(video_id):
@@ -776,6 +1278,7 @@ def _metadata_candidate(
         official_channel_signal=official_channel_signal,
         rejection_reasons=tuple(dict.fromkeys(rejection_reasons)),
         fallback_reason=fallback_reason,
+        discovery_sources=(discovery_source,),
     )
 
 
@@ -796,10 +1299,32 @@ def _candidate_order(candidate: AcquisitionCandidate) -> tuple[Any, ...]:
     )
 
 
+def _candidate_metadata_richness(candidate: AcquisitionCandidate) -> int:
+    return sum(
+        (
+            4 if candidate.channel_id is not None else 0,
+            2 if candidate.channel != "(unknown)" else 0,
+            2 if candidate.duration_seconds > 0 else 0,
+            2 if candidate.broadcast_date is not None else 0,
+            2 if candidate.broadcast_program is not None else 0,
+            1 if candidate.title != "(untitled)" else 0,
+            1 if candidate.webpage_url.startswith("https://") else 0,
+        )
+    )
+
+
 def _merge_discovery(
     existing: AcquisitionCandidate, discovered: AcquisitionCandidate
 ) -> AcquisitionCandidate:
-    better = min((existing, discovered), key=_candidate_order)
+    def merge_order(candidate: AcquisitionCandidate) -> tuple[Any, ...]:
+        base = _candidate_order(candidate)
+        return (*base[:3], -_candidate_metadata_richness(candidate), *base[3:])
+
+    # Query search is inserted first and therefore wins an exact metadata tie;
+    # a catalog hit can replace it only when it is substantively richer or
+    # passes stricter existing filters. Never merge individual trust fields.
+    better = min((existing, discovered), key=merge_order)
+    alternate = discovered if better is existing else existing
     return AcquisitionCandidate(
         video_id=better.video_id,
         title=better.title,
@@ -810,11 +1335,21 @@ def _merge_discovery(
         queries=tuple(dict.fromkeys((*existing.queries, *discovered.queries))),
         selection_tier=better.selection_tier,
         trust_score=better.trust_score,
-        broadcast_date=better.broadcast_date,
-        broadcast_program=better.broadcast_program,
+        # Date/program are non-trust annotations. They may safely fill a gap
+        # without transplanting title, channel, trust, tier, or rejections from
+        # the losing candidate.
+        broadcast_date=better.broadcast_date or alternate.broadcast_date,
+        broadcast_program=(
+            better.broadcast_program or alternate.broadcast_program
+        ),
         official_channel_signal=better.official_channel_signal,
         rejection_reasons=better.rejection_reasons,
         fallback_reason=better.fallback_reason,
+        discovery_sources=tuple(
+            dict.fromkeys(
+                (*existing.discovery_sources, *discovered.discovery_sources)
+            )
+        ),
     )
 
 
@@ -828,6 +1363,7 @@ def _record(candidate: AcquisitionCandidate) -> dict[str, Any]:
         "webpage_url": candidate.webpage_url,
         "query": candidate.query,
         "queries": list(candidate.queries),
+        "discovery_sources": list(candidate.discovery_sources),
         "selection_tier": candidate.selection_tier,
         "trust_score": candidate.trust_score,
         "broadcast_date": candidate.broadcast_date,
@@ -1448,6 +1984,51 @@ def _group_relative_quality_selection_policy() -> dict[str, Any]:
     }
 
 
+def _manifest_has_current_hash_valid_catalog_provenance(
+    manifest: dict[str, Any],
+) -> bool:
+    provenance = manifest.get("official_ive_stage_playlist_catalog")
+    if not isinstance(provenance, dict):
+        return False
+    result = provenance.get("result")
+    expected_cache_state = {
+        "validated_network_catalog_cached": "refreshed",
+        "fresh_hash_valid_cache": "fresh",
+        "stale_hash_valid_cache_after_refresh_failure": "stale",
+    }.get(result)
+    object_sha256 = provenance.get("object_sha256")
+    entry_count = provenance.get("entry_count")
+    return (
+        expected_cache_state is not None
+        and provenance.get("schema_version")
+        == _CATALOG_CACHE_SCHEMA_VERSION
+        and provenance.get("cache_policy_version")
+        == _CATALOG_CACHE_POLICY_VERSION
+        and provenance.get("playlist_id") == _IVE_STAGE_PLAYLIST_ID
+        and provenance.get("pinned_owner_channel_id")
+        == _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID
+        and provenance.get("playlist_owner_proves_catalog_only") is True
+        and provenance.get("playlist_owner_never_grants_source_channel_trust")
+        is True
+        and provenance.get(
+            "source_entries_require_existing_metadata_song_member_show_channel_filters"
+        )
+        is True
+        and provenance.get("minimum_plausible_entry_count")
+        == _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT
+        and provenance.get("cache_state") == expected_cache_state
+        and isinstance(object_sha256, str)
+        and _CATALOG_OBJECT_SHA256.fullmatch(object_sha256) is not None
+        and isinstance(entry_count, int)
+        and not isinstance(entry_count, bool)
+        and entry_count >= _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT
+        and (
+            result != "stale_hash_valid_cache_after_refresh_failure"
+            or provenance.get("stale_fallback_used") is True
+        )
+    )
+
+
 def _manifest_matches_cache_binding_contract(
     manifest: dict[str, Any],
     request: AnalysisRequest,
@@ -1568,6 +2149,9 @@ def _cache_refresh_upgrade_decision(
         == "selected_qualifying_cluster"
         and isinstance(promotion_selection.get("selected_cluster"), dict)
         and bool(promotion_selection["selected_cluster"].get("qualifies"))
+        and _manifest_has_current_hash_valid_catalog_provenance(
+            artifact.manifest
+        )
     )
     refresh_required = (
         not latest_policy_current
@@ -1576,7 +2160,14 @@ def _cache_refresh_upgrade_decision(
             and materialized_count < request.desired_source_count
         )
     )
-    if not latest_policy_current:
+    catalog_policy_current = (
+        _manifest_has_current_hash_valid_catalog_provenance(
+            artifact.manifest
+        )
+    )
+    if not catalog_policy_current:
+        decision = "refresh_metadata_to_retry_official_catalog_policy"
+    elif not latest_policy_current:
         decision = "refresh_metadata_to_apply_latest_song_policy"
     elif refresh_required:
         decision = "refresh_metadata_to_upgrade_verified_fallback_pool"
@@ -1589,6 +2180,7 @@ def _cache_refresh_upgrade_decision(
         "decision": decision,
         "refresh_required": refresh_required,
         "latest_song_policy_current": latest_policy_current,
+        "catalog_policy_current": catalog_policy_current,
         "metadata_refresh_attempted": False,
         "authenticated_cached_source_count": len(artifact.source_paths),
         "prior_materialized_source_count": materialized_count,
@@ -1644,6 +2236,7 @@ def _manifest_refresh_candidates(
             },
             request=request,
             query=query,
+            discovery_source="verified_cache",
         )
         if candidate is None or not candidate.selectable:
             continue
@@ -1671,6 +2264,7 @@ def _manifest_refresh_candidates(
                 official_channel_signal=candidate.official_channel_signal,
                 rejection_reasons=candidate.rejection_reasons,
                 fallback_reason=candidate.fallback_reason,
+                discovery_sources=candidate.discovery_sources,
             )
         )
     return candidates
@@ -1758,6 +2352,9 @@ def _validated_group_quality_excluded_bindings(
     """
 
     promotion_selection = manifest.get("promotion_date_cluster_selection")
+    latest_song_policy_version = manifest.get(
+        "latest_song_acquisition_policy_version"
+    )
     selected_cluster = (
         promotion_selection.get("selected_cluster")
         if isinstance(promotion_selection, dict)
@@ -1767,8 +2364,11 @@ def _validated_group_quality_excluded_bindings(
     if (
         not _requires_group_relative_quality_gate(request)
         or manifest.get("selection_policy_version") != _SELECTION_POLICY_VERSION
-        or manifest.get("latest_song_acquisition_policy_version")
-        != _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        or latest_song_policy_version
+        not in {
+            _LATEST_SONG_ACQUISITION_POLICY_VERSION,
+            _LEGACY_LATEST_SONG_ACQUISITION_POLICY_VERSION,
+        }
         or not _manifest_matches_request_contract(manifest, request)
         or manifest.get("group_relative_quality_gate_version")
         != GROUP_RELATIVE_QUALITY_GATE_VERSION
@@ -1779,7 +2379,7 @@ def _validated_group_quality_excluded_bindings(
         or group_gate.get("applied") is not True
         or not isinstance(promotion_selection, dict)
         or promotion_selection.get("policy_version")
-        != _LATEST_SONG_ACQUISITION_POLICY_VERSION
+        != latest_song_policy_version
         or promotion_selection.get("status")
         != "selected_qualifying_cluster"
         or not isinstance(selected_cluster, dict)
@@ -2707,6 +3307,61 @@ def acquire_sources(
             "음방 메타데이터를 모으는 중…",
         )
 
+    reporter.status("IVE 공식 STAGE 카탈로그를 확인하는 중…")
+    catalog_entries, catalog_provenance = _load_official_ive_stage_catalog(
+        request=request,
+        client=client,
+    )
+    catalog_query = f"playlist:{_IVE_STAGE_PLAYLIST_ID}"
+    catalog_candidate_count = 0
+    catalog_selectable_count = 0
+    catalog_duplicate_video_id_count = 0
+    catalog_rejection_counts: dict[str, int] = {}
+    for entry in catalog_entries:
+        candidate = _metadata_candidate(
+            entry,
+            request=request,
+            query=catalog_query,
+            discovery_source="official_ive_stage_playlist",
+        )
+        if candidate is None:
+            continue
+        catalog_candidate_count += 1
+        if candidate.selectable:
+            catalog_selectable_count += 1
+        else:
+            for reason in candidate.rejection_reasons:
+                catalog_rejection_counts[reason] = (
+                    catalog_rejection_counts.get(reason, 0) + 1
+                )
+        previous = by_id.get(candidate.video_id)
+        if previous is not None:
+            catalog_duplicate_video_id_count += 1
+        by_id[candidate.video_id] = (
+            candidate
+            if previous is None
+            else _merge_discovery(previous, candidate)
+        )
+    catalog_provenance.update(
+        {
+            "metadata_filter_candidate_count": catalog_candidate_count,
+            "metadata_filter_selectable_count": catalog_selectable_count,
+            "metadata_filter_rejected_count": (
+                catalog_candidate_count - catalog_selectable_count
+            ),
+            "metadata_filter_rejection_counts": dict(
+                sorted(catalog_rejection_counts.items())
+            ),
+            "exact_video_id_duplicates_with_query_or_cache": (
+                catalog_duplicate_video_id_count
+            ),
+            "new_unique_video_ids_after_query_merge": (
+                catalog_candidate_count - catalog_duplicate_video_id_count
+            ),
+            "merge_order": "after_query_search_richer_whole_candidate_preserved",
+        }
+    )
+
     # Collapse mirror/re-upload duplicates after exact video-ID deduplication.
     deduplicated: dict[tuple[str, int], AcquisitionCandidate] = {}
     duplicate_ids: list[str] = []
@@ -2875,6 +3530,7 @@ def acquire_sources(
         },
         "queries": list(queries),
         "search_failures": search_failures,
+        "official_ive_stage_playlist_catalog": catalog_provenance,
         "deduplicated_video_ids": duplicate_ids,
         "promotion_date_cluster_selection": promotion_cluster_selection,
         "selection_policy": {
@@ -2919,6 +3575,16 @@ def acquire_sources(
                 ),
             ],
             "channel_requirement": "allowlisted_channel_id_required_name_signal_diagnostic_only",
+            "official_ive_stage_playlist_catalog": {
+                "playlist_id": _IVE_STAGE_PLAYLIST_ID,
+                "pinned_owner_channel_id": (
+                    _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID
+                ),
+                "playlist_owner_proves_catalog_only": True,
+                "playlist_owner_never_grants_source_channel_trust": True,
+                "every_entry_uses_existing_metadata_filters": True,
+                "media_download_uses_no_playlist": True,
+            },
             "performance_diversity": (
                 "all_canonical_broadcast_slots_before_round_robin_"
                 "fullcam_or_one_take_floor_completion"
@@ -3008,6 +3674,19 @@ def acquire_sources(
         "selected": [],
         "summary": {
             "discovered_unique_video_ids": len(by_id),
+            "query_search_unique_video_ids_before_catalog": (
+                len(by_id)
+                - catalog_candidate_count
+                + catalog_duplicate_video_id_count
+            ),
+            "catalog_metadata_candidate_count": catalog_candidate_count,
+            "catalog_metadata_selectable_count": catalog_selectable_count,
+            "catalog_metadata_rejected_count": (
+                catalog_candidate_count - catalog_selectable_count
+            ),
+            "catalog_exact_video_id_duplicate_count": (
+                catalog_duplicate_video_id_count
+            ),
             "deduplicated_candidate_count": len(candidates),
             "primary_candidate_count": len(primary),
             "fallback_candidate_count": len(fallback),
@@ -3050,8 +3729,13 @@ def acquire_sources(
                     ),
                     "result_source_count": len(reusable.source_paths),
                     "new_download_count": 0,
+                    "catalog_refresh_result": catalog_provenance["result"],
                 }
             )
+            reusable.manifest[
+                "official_ive_stage_playlist_catalog"
+            ] = catalog_provenance
+            reusable.manifest["search_failures"] = search_failures
             _write_manifest(manifest_path, reusable.manifest)
             reporter.emit(
                 "log",
@@ -3181,6 +3865,8 @@ def acquire_sources(
                     "duration_seconds": candidate.duration_seconds,
                     "webpage_url": candidate.webpage_url,
                     "query": candidate.query,
+                    "queries": list(candidate.queries),
+                    "discovery_sources": list(candidate.discovery_sources),
                     "broadcast_date": candidate.broadcast_date,
                     "broadcast_program": candidate.broadcast_program,
                     "official_channel_signal": candidate.official_channel_signal,
@@ -3228,8 +3914,13 @@ def acquire_sources(
                     ),
                     "result_source_count": len(reusable.source_paths),
                     "new_download_count": len(new_download_ids),
+                    "catalog_refresh_result": catalog_provenance["result"],
                 }
             )
+            reusable.manifest[
+                "official_ive_stage_playlist_catalog"
+            ] = catalog_provenance
+            reusable.manifest["search_failures"] = search_failures
             _write_manifest(manifest_path, reusable.manifest)
             reporter.emit(
                 "log",
@@ -3291,19 +3982,29 @@ def acquire_sources(
         len(source_paths) < request.desired_source_count
     )
     if cache_refresh_upgrade is None:
-        refresh_on_next_run = (
+        source_pool_refresh_required = (
             _minimum_acceptable_source_count(request)
             < request.desired_source_count
             and materialized_source_count < request.desired_source_count
         )
+        catalog_retry_required = not (
+            _manifest_has_current_hash_valid_catalog_provenance(manifest)
+        )
+        refresh_on_next_run = (
+            source_pool_refresh_required or catalog_retry_required
+        )
         manifest["cache_refresh_upgrade"] = {
             "policy_version": _LATEST_SONG_ACQUISITION_POLICY_VERSION,
             "decision": (
-                "refresh_metadata_on_next_run_for_verified_fallback_pool"
-                if refresh_on_next_run
+                "refresh_metadata_on_next_run_for_official_catalog"
+                if catalog_retry_required
+                else "refresh_metadata_on_next_run_for_verified_fallback_pool"
+                if source_pool_refresh_required
                 else "no_refresh_needed_target_materialized"
             ),
             "refresh_required": refresh_on_next_run,
+            "catalog_retry_required": catalog_retry_required,
+            "catalog_refresh_result": catalog_provenance["result"],
             "metadata_refresh_attempted": False,
             "authenticated_cached_source_count": 0,
             "prior_materialized_source_count": materialized_source_count,
@@ -3312,8 +4013,10 @@ def acquire_sources(
                 _minimum_acceptable_source_count(request)
             ),
             "result": (
-                "initial_verified_fallback"
-                if refresh_on_next_run
+                "initial_catalog_retry_required"
+                if catalog_retry_required
+                else "initial_verified_fallback"
+                if source_pool_refresh_required
                 else "initial_target_materialized"
             ),
             "new_download_count": materialized_source_count,
@@ -3385,6 +4088,12 @@ def acquire_sources(
                 "result_materialized_source_count": materialized_source_count,
                 "result_eligible_source_count": len(source_paths),
                 "selected_promotion_cluster": current_cluster,
+                "catalog_refresh_result": catalog_provenance["result"],
+                "catalog_retry_required": not (
+                    _manifest_has_current_hash_valid_catalog_provenance(
+                        manifest
+                    )
+                ),
             }
         )
     _write_manifest(manifest_path, manifest)
