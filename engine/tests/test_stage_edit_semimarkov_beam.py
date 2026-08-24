@@ -418,6 +418,7 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 timeline_count=8,
                 minimum_unique_sources=3,
                 maximum_source_occupancy_fraction=0.60,
+                enforce_montage_grammar=False,
             ),
         )
         audit = result.audit.input_summary["source_derivative_diversity"]
@@ -808,14 +809,18 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         self.assertEqual(
             "ive_human_reference_wide_transition_floor_plus_"
             "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-            "highlight_burst_reset_and_median_soft_target_v5",
+            "highlight_burst_reset_and_reference_cadence_target_v6",
             grammar["contract"],
         )
         section = grammar["sections"][0]
         self.assertTrue(section["formation_wide_anchor_present"])
         self.assertGreaterEqual(section["closeup_shot_fraction"], 0.18)
         self.assertGreaterEqual(section["nonwide_shot_fraction"], 0.35)
-        self.assertGreaterEqual(section["nonwide_burst_boundary_count"], 1)
+        self.assertGreaterEqual(section["nonwide_burst_boundary_count"], 2)
+        self.assertGreaterEqual(
+            section["source_switch_rate_per_minute"],
+            18.642084765823732,
+        )
         self.assertGreaterEqual(
             section["wide_involved_source_switch_fraction"],
             0.37333333333333335,
@@ -860,6 +865,17 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             section["wide_involved_source_switch_preferred_target_deviation"],
             0.0,
         )
+        cadence = grammar["policy"]["chorus_source_switch_cadence"]
+        self.assertEqual(20, cadence["eligible_human_reference_count"])
+        self.assertEqual(
+            18.642084765823732,
+            cadence["product_minimum_per_minute"],
+        )
+        self.assertEqual(
+            23.505554096533405,
+            cadence["soft_preferred_target_per_minute"],
+        )
+        self.assertFalse(cadence["product_minimum_is_reference_floor"])
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -899,6 +915,60 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                         minimum_shot_seconds=3.0,
                         maximum_shot_seconds=3.0,
                         maximum_switches_per_minute=20.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_flat_highlight_cannot_pass_with_only_fractional_shot_quotas(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 12.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        # The selected 3-second shots are wide -> medium -> close -> wide.
+        # This satisfies close/non-wide fractions, a multi-source non-wide
+        # burst, a formation reset, and wide-switch structure, but only three
+        # boundaries in twelve seconds (15/min).  It must no longer pass as a
+        # lively choreography highlight merely by meeting composition quotas.
+        frames = self._forced_frames(
+            (0, 4, 5, 1, 4, 5, 2, 4, 5, 3, 4, 5)
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_source_switch_rate_below_product_minimum",
+        ):
+            _decode(
+                duration=12,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 12.0),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                    highlight_burst_maximum_shot_seconds=3.0,
+                    highlight_minimum_nonwide_burst_boundaries=1,
+                    transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+                    transition_score_weight=0.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=3.0,
+                        maximum_shot_seconds=3.0,
+                        maximum_switches_per_minute=60.0,
                     ),
                 ),
             )
@@ -1331,6 +1401,20 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 highlight_minimum_wide_involved_source_switch_fraction=0.9,
                 highlight_preferred_wide_involved_source_switch_fraction=0.8,
             )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "preferred cadence exceeds",
+        ):
+            StageEditSemiMarkovConfig(
+                maximum_global_switches_per_minute=20.0,
+                enforce_montage_grammar=True,
+            )
+        # Legacy/non-professional callers may deliberately impose a tighter
+        # global cap; the IVE professional soft target is inactive there.
+        StageEditSemiMarkovConfig(
+            maximum_global_switches_per_minute=20.0,
+            enforce_montage_grammar=False,
+        )
 
     @staticmethod
     def _dynamic_prediction(*, first_time: float = 0.0) -> DynamicCropHeadPredictionV2:
@@ -1388,13 +1472,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         result = _decode(frames=frames)
 
-        self.assertEqual(8, result.audit.schema_version)
+        self.assertEqual(9, result.audit.schema_version)
         self.assertEqual(
             "verified_derivative_family_not_file_source",
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            7,
+            8,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(

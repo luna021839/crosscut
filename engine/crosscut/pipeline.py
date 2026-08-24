@@ -5388,6 +5388,15 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         highlight_wide_involved_source_switch_reference_count=(
             policy.preferred_wide_involved_source_switch_fraction.reference_count
         ),
+        highlight_product_minimum_source_switches_per_minute=(
+            policy.highlight_product_minimum_source_switches_per_minute.value
+        ),
+        highlight_preferred_source_switches_per_minute=(
+            policy.highlight_preferred_source_switches_per_minute.value
+        ),
+        highlight_cadence_reference_count=(
+            policy.highlight_cadence_reference_count
+        ),
         highlight_minimum_early_wide_anchor_fraction=(
             policy.minimum_early_wide_anchor_fraction.value
         ),

@@ -53,7 +53,7 @@ from .stage_edit_transition_authority import (
 )
 
 
-DECODER_SCHEMA_VERSION = 8
+DECODER_SCHEMA_VERSION = 9
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -64,7 +64,10 @@ _NONWIDE_SHOT_SIZES = frozenset({"medium", "closeup", "extreme_closeup"})
 MONTAGE_GRAMMAR_CONTRACT = (
     "ive_human_reference_wide_transition_floor_plus_"
     "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-    "highlight_burst_reset_and_median_soft_target_v5"
+    "highlight_burst_reset_and_reference_cadence_target_v6"
+)
+HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
+    "ive_20_human_reference_chorus_shot_boundary_rate_distribution_v1"
 )
 
 
@@ -524,8 +527,23 @@ class StageEditSemiMarkovConfig:
     highlight_minimum_phrase_entry_wide_anchor_fraction: float = (
         0.2785714285714286
     )
+    # Recomputed from the immutable 20-reference IVE montage profile as
+    # 60 * (chorus shot count - 1) / chorus role duration.  The median is an
+    # explicit IVE product minimum (not mislabelled as a P10 reference floor),
+    # while P75 is the soft target requested for a livelier highlight edit.
+    highlight_product_minimum_source_switches_per_minute: float = (
+        18.642084765823732
+    )
+    highlight_preferred_source_switches_per_minute: float = (
+        23.505554096533405
+    )
+    highlight_cadence_reference_count: int = 20
     highlight_burst_maximum_shot_seconds: float = 1.50
-    highlight_minimum_nonwide_burst_boundaries: int = 1
+    # The human non-wide multi-source burst median is 2.5 shots.  Requiring
+    # two internal boundaries means a three-shot product burst, rather than
+    # allowing one token two-shot exchange to make an otherwise flat chorus
+    # pass.
+    highlight_minimum_nonwide_burst_boundaries: int = 2
     formation_anchor_decision_window: int = 3
     # The reference profile only proves identity-free observed-person evidence;
     # it explicitly cannot establish a six-member formation threshold.  One
@@ -560,6 +578,7 @@ class StageEditSemiMarkovConfig:
             "formation_anchor_decision_window",
             "highlight_minimum_post_burst_formation_resets",
             "highlight_wide_involved_source_switch_reference_count",
+            "highlight_cadence_reference_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -581,6 +600,8 @@ class StageEditSemiMarkovConfig:
             "cut_density_window_seconds",
             "highlight_minimum_duration_seconds",
             "highlight_burst_maximum_shot_seconds",
+            "highlight_product_minimum_source_switches_per_minute",
+            "highlight_preferred_source_switches_per_minute",
         ):
             number = _finite(getattr(self, name), name)
             if number <= 0.0:
@@ -660,6 +681,22 @@ class StageEditSemiMarkovConfig:
             raise StageEditDecodeInputError(
                 "highlight preferred wide-switch target cannot be below its "
                 "reference floor"
+            )
+        if (
+            self.highlight_preferred_source_switches_per_minute
+            + _TIME_EPSILON
+            < self.highlight_product_minimum_source_switches_per_minute
+        ):
+            raise StageEditDecodeInputError(
+                "highlight preferred cadence cannot be below its product minimum"
+            )
+        if (
+            self.enforce_montage_grammar
+            and self.highlight_preferred_source_switches_per_minute
+            > self.maximum_global_switches_per_minute + _TIME_EPSILON
+        ):
+            raise StageEditDecodeInputError(
+                "highlight preferred cadence exceeds the global safety maximum"
             )
 
 
@@ -1223,14 +1260,19 @@ def _resolved_constraints(
             raise StageEditDecodeInputError(
                 f"section {directive.section_index} shot bounds are inverted"
             )
+        cadence_target = directive.target_source_switches_per_minute
+        if directive.role is SectionRole.CHORUS_LIKE:
+            cadence_target = max(
+                cadence_target,
+                config.highlight_preferred_source_switches_per_minute,
+            )
         rate = (
             override.maximum_switches_per_minute
             if override is not None
             and override.maximum_switches_per_minute is not None
             else min(
                 config.maximum_global_switches_per_minute,
-                directive.target_source_switches_per_minute
-                * config.section_cut_density_multiplier,
+                cadence_target * config.section_cut_density_multiplier,
             )
         )
         labels = (
@@ -1844,6 +1886,13 @@ def _evaluate_montage_grammar(
             if source_switch_boundaries
             else 0.0
         )
+        source_switch_rate_per_minute = (
+            60.0 * source_switch_boundaries / directive.duration_seconds
+        )
+        source_switch_cadence_target_deviation = abs(
+            source_switch_rate_per_minute
+            - config.highlight_preferred_source_switches_per_minute
+        )
         wide_switch_preferred_target_deviation = abs(
             wide_involved_source_switch_fraction
             - config.highlight_preferred_wide_involved_source_switch_fraction
@@ -1894,6 +1943,13 @@ def _evaluate_montage_grammar(
         )
         failures: list[str] = []
         if strict_highlight:
+            if (
+                source_switch_rate_per_minute + _TIME_EPSILON
+                < config.highlight_product_minimum_source_switches_per_minute
+            ):
+                failures.append(
+                    "highlight_source_switch_rate_below_product_minimum"
+                )
             if (
                 known_fraction + _TIME_EPSILON
                 < config.highlight_minimum_known_shot_fraction
@@ -1989,6 +2045,17 @@ def _evaluate_montage_grammar(
                 "nonwide_burst_boundary_count": burst_boundaries,
                 "closeup_chain_boundary_count": closeup_chain_boundaries,
                 "source_switch_boundary_count": source_switch_boundaries,
+                "source_switch_rate_per_minute": source_switch_rate_per_minute,
+                "source_switch_product_minimum_per_minute": (
+                    config.highlight_product_minimum_source_switches_per_minute
+                ),
+                "source_switch_preferred_target_per_minute": (
+                    config.highlight_preferred_source_switches_per_minute
+                ),
+                "source_switch_preferred_target_deviation": (
+                    source_switch_cadence_target_deviation
+                ),
+                "source_switch_product_minimum_is_reference_floor": False,
                 "wide_involved_source_switch_boundary_count": (
                     wide_involved_source_switch_boundaries
                 ),
@@ -2060,7 +2127,7 @@ def _evaluate_montage_grammar(
                 "highlight_phrase_entry_wide_anchor_fraction_below_reference_floor"
             )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": MONTAGE_GRAMMAR_CONTRACT,
         "passed": not all_failures,
         "failure_codes": all_failures,
@@ -2093,6 +2160,24 @@ def _evaluate_montage_grammar(
                 "fail_before_render_instead_of_fabricating_a_flat_highlight"
             ),
             "learned_logits_remain_primary": True,
+            "chorus_source_switch_cadence": {
+                "evidence_contract": HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT,
+                "eligible_human_reference_count": (
+                    config.highlight_cadence_reference_count
+                ),
+                "product_minimum_per_minute": (
+                    config.highlight_product_minimum_source_switches_per_minute
+                ),
+                "product_minimum_statistic": "reference_median",
+                "product_minimum_is_reference_floor": False,
+                "soft_preferred_target_per_minute": (
+                    config.highlight_preferred_source_switches_per_minute
+                ),
+                "soft_preferred_target_statistic": "reference_p75",
+                "global_safety_maximum_per_minute": (
+                    config.maximum_global_switches_per_minute
+                ),
+            },
             "chorus_wide_involved_family_switch_prior": {
                 "reference_p10_hard_floor": (
                     config.highlight_minimum_wide_involved_source_switch_fraction
@@ -2146,6 +2231,15 @@ def _evaluate_montage_grammar(
             ),
             "highlight_burst_maximum_shot_seconds": (
                 config.highlight_burst_maximum_shot_seconds
+            ),
+            "highlight_product_minimum_source_switches_per_minute": (
+                config.highlight_product_minimum_source_switches_per_minute
+            ),
+            "highlight_preferred_source_switches_per_minute": (
+                config.highlight_preferred_source_switches_per_minute
+            ),
+            "highlight_cadence_reference_count": (
+                config.highlight_cadence_reference_count
             ),
             "highlight_minimum_nonwide_burst_boundaries": (
                 config.highlight_minimum_nonwide_burst_boundaries
@@ -2897,12 +2991,17 @@ def decode_stage_edit_semimarkov_beam(
                 cut_raw = boundary_cut_score + skipped_cut_score
                 duration_bucket = schema.duration_bucket(duration)
                 duration_raw = duration_log_probabilities[start_index][duration_bucket]
+                cadence_target = directive.target_source_switches_per_minute
+                if directive.role is SectionRole.CHORUS_LIKE:
+                    cadence_target = max(
+                        cadence_target,
+                        config.highlight_preferred_source_switches_per_minute,
+                    )
                 ideal_duration = min(
                     maximum_duration,
                     max(
                         minimum_duration,
-                        60.0
-                        / max(1e-9, directive.target_source_switches_per_minute),
+                        60.0 / max(1e-9, cadence_target),
                     ),
                 )
                 cadence_raw = -abs(duration - ideal_duration) / max(
@@ -3570,7 +3669,7 @@ def decode_stage_edit_semimarkov_beam(
             )
     audit = StageEditDecodeAudit(
         schema_version=DECODER_SCHEMA_VERSION,
-        decoder="stage_edit_semimarkov_beam_v5",
+        decoder="stage_edit_semimarkov_beam_v6",
         input_sha256=digest,
         readiness=readiness.to_dict(),
         config=asdict(config),
@@ -3579,11 +3678,11 @@ def decode_stage_edit_semimarkov_beam(
             "transition_authority": transition_authority.to_dict(),
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 7,
+                "supersedes": 8,
                 "reason": (
-                    "renderer-owned IVE transition mode restricts learned "
-                    "metadata to duration-neutral hard_cut with zero transition "
-                    "score; renderer group_transition retains effect authority"
+                    "source-exact Dynamic Crop v3 retains the camera axis until "
+                    "beam selection, and IVE highlight cadence now enforces the "
+                    "20-reference median product minimum with a P75 soft target"
                 ),
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,

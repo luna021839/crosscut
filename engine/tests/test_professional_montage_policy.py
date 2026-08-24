@@ -66,10 +66,38 @@ def _event_distribution(value: float, *, count: int) -> dict[str, object]:
     }
 
 
+_ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS = (
+    (9, 25.809134238516712),
+    (4, 11.916519656435916),
+    (10, 29.495805653528365),
+    (6, 18.933705533026185),
+    (13, 38.622289783810324),
+    (11, 31.24760389005099),
+    (12, 36.33653711649983),
+    (14, 54.83347015657381),
+    (45, 54.899775343268956),
+    (3, 8.733291253498138),
+    (8, 20.670925027346737),
+    (15, 30.748324427174193),
+    (4, 7.608044066362048),
+    (12, 28.078470190044857),
+    (8, 18.985874443270276),
+    (10, 28.927961054939985),
+    (11, 21.420438393614155),
+    (6, 18.201056422958985),
+    (5, 9.692450497403534),
+    (9, 33.29892498582262),
+)
+
+
 def _profile() -> dict[str, object]:
     chorus = {
         "contributing_reference_count": 20,
         "pooled_counts": {
+            "shot_count": sum(
+                shot_count
+                for shot_count, _duration in _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS
+            ),
             "nonwide_multi_source_burst_count": 16,
             "closeup_multi_source_burst_count": 6,
         },
@@ -129,18 +157,39 @@ def _profile() -> dict[str, object]:
             "semantics": FORMATION_PERSON_COUNT_SEMANTICS,
         },
     }
-    songs = [
-        {
-            "song_id": f"IVE-SONG-{song_index}",
-            "reference_count": 5,
-            "source_count": 10,
-            "references": [
-                {"reference_id": f"REF-{song_index}-{reference_index}"}
-                for reference_index in range(5)
-            ],
-        }
-        for song_index in range(4)
-    ]
+    songs = []
+    for song_index in range(4):
+        references = []
+        for reference_index in range(5):
+            cadence_index = song_index * 5 + reference_index
+            chorus_shot_count, chorus_duration = (
+                _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS[cadence_index]
+            )
+            references.append(
+                {
+                    "reference_id": f"REF-{song_index}-{reference_index}",
+                    "by_acoustic_role": {
+                        role: {
+                            "role": role,
+                            "shot_count": (
+                                chorus_shot_count if role == "chorus_like" else 0
+                            ),
+                            "role_duration_seconds": (
+                                chorus_duration if role == "chorus_like" else 0.0
+                            ),
+                        }
+                        for role in ROLE_NAMES
+                    },
+                }
+            )
+        songs.append(
+            {
+                "song_id": f"IVE-SONG-{song_index}",
+                "reference_count": 5,
+                "source_count": 10,
+                "references": references,
+            }
+        )
     profile: dict[str, object] = {
         "schema_version": 1,
         "analysis_basis": "ive_human_reference_visual_montage_grammar_v1",
@@ -279,6 +328,54 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertFalse(serialized_preferred["hard_gate"])
             self.assertEqual(serialized_preferred["reference_count"], 17)
 
+            cadence_minimum = (
+                policy.highlight_product_minimum_source_switches_per_minute
+            )
+            cadence_preferred = (
+                policy.highlight_preferred_source_switches_per_minute
+            )
+            self.assertEqual(policy.highlight_cadence_reference_count, 20)
+            self.assertEqual(cadence_minimum.reference_count, 20)
+            self.assertEqual(
+                cadence_minimum.value,
+                18.642084765823732,
+            )
+            self.assertEqual(cadence_minimum.provenance.quantile, 0.5)
+            self.assertIsNone(
+                cadence_minimum.provenance.reference_floor_basis
+            )
+            self.assertIn(
+                "derived_shot_boundary_rate_per_minute",
+                cadence_minimum.provenance.statistic_path,
+            )
+            self.assertEqual(
+                cadence_preferred.value,
+                23.505554096533405,
+            )
+            self.assertEqual(cadence_preferred.reference_count, 20)
+            self.assertEqual(cadence_preferred.provenance.quantile, 0.75)
+            self.assertIn(
+                "lower_median",
+                cadence_minimum.provenance.statistic,
+            )
+            self.assertIn(
+                "nearest_rank_p75",
+                cadence_preferred.provenance.statistic,
+            )
+            serialized = policy.to_dict()
+            serialized_cadence_minimum = serialized[
+                "profile_informed_product_minimums"
+            ]["highlight_product_minimum_source_switches_per_minute"]
+            self.assertTrue(serialized_cadence_minimum["hard_gate"])
+            self.assertFalse(
+                serialized_cadence_minimum["is_reference_floor"]
+            )
+            serialized_cadence_preferred = serialized[
+                "profile_derived_preferred_targets"
+            ]["highlight_preferred_source_switches_per_minute"]
+            self.assertFalse(serialized_cadence_preferred["hard_gate"])
+            self.assertEqual(serialized["highlight_cadence_reference_count"], 20)
+
             self.assertIsNone(policy.minimum_nonwide_duration_fraction)
             self.assertEqual(
                 policy.nonwide_duration_fraction_policy,
@@ -311,7 +408,7 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 product.requirement_basis,
                 PRODUCT_EDITORIAL_REQUIREMENT_BASIS,
             )
-            self.assertEqual(product.minimum_nonwide_multi_family_burst_count, 1)
+            self.assertEqual(product.minimum_nonwide_multi_family_burst_count, 2)
             self.assertEqual(
                 product.minimum_post_burst_formation_evidenced_wide_reset_count,
                 1,
@@ -347,6 +444,19 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertEqual(
                 decode_config.highlight_wide_involved_source_switch_reference_count,
                 17,
+            )
+            self.assertEqual(
+                decode_config.highlight_product_minimum_source_switches_per_minute,
+                18.642084765823732,
+            )
+            self.assertEqual(
+                decode_config.highlight_preferred_source_switches_per_minute,
+                23.505554096533405,
+            )
+            self.assertEqual(decode_config.highlight_cadence_reference_count, 20)
+            self.assertEqual(
+                decode_config.highlight_minimum_nonwide_burst_boundaries,
+                2,
             )
             self.assertEqual(decode_config.minimum_unique_sources, 8)
             self.assertEqual(
@@ -483,6 +593,68 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 "reference-median target",
             ):
                 load_professional_montage_policy(inverted_path)
+
+    def test_chorus_cadence_evidence_fails_closed_when_rehashed_but_invalid(
+        self,
+    ) -> None:
+        def first_chorus(profile: dict[str, object]) -> dict[str, object]:
+            songs = profile["songs"]
+            assert isinstance(songs, list)
+            song = songs[0]
+            assert isinstance(song, dict)
+            references = song["references"]
+            assert isinstance(references, list)
+            reference = references[0]
+            assert isinstance(reference, dict)
+            roles = reference["by_acoustic_role"]
+            assert isinstance(roles, dict)
+            chorus = roles["chorus_like"]
+            assert isinstance(chorus, dict)
+            return chorus
+
+        mutations = (
+            (
+                "zero duration",
+                "cannot supply chorus cadence evidence",
+                lambda profile: first_chorus(profile).__setitem__(
+                    "role_duration_seconds", 0.0
+                ),
+            ),
+            (
+                "fractional shot count",
+                "shot_count must be an integer",
+                lambda profile: first_chorus(profile).__setitem__(
+                    "shot_count", 9.5
+                ),
+            ),
+            (
+                "wrong role label",
+                "chorus_like role label mismatch",
+                lambda profile: first_chorus(profile).__setitem__(
+                    "role", "build"
+                ),
+            ),
+            (
+                "pooled mismatch",
+                "pooled shot_count disagrees",
+                lambda profile: profile["aggregate_by_acoustic_role"][  # type: ignore[index]
+                    "chorus_like"
+                ]["pooled_counts"].__setitem__("shot_count", 214),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (name, error, mutate) in enumerate(mutations):
+                with self.subTest(name=name):
+                    profile = _profile()
+                    mutate(profile)
+                    _rehash(profile)
+                    path = Path(temporary) / f"cadence-{index}.json"
+                    _write(path, profile)
+                    with self.assertRaisesRegex(
+                        ProfessionalMontagePolicyError,
+                        error,
+                    ):
+                        load_professional_montage_policy(path)
 
     def test_event_distribution_count_must_match_pooled_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

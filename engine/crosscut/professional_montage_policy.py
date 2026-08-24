@@ -45,6 +45,15 @@ REFERENCE_FLOOR_BASIS = (
 )
 REFERENCE_FLOOR_QUANTILE = 0.10
 REFERENCE_PREFERRED_TARGET_QUANTILE = 0.50
+HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE = 0.50
+HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE = 0.75
+HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
+    "per_reference_chorus_shot_boundary_rate_per_minute_v1"
+)
+HIGHLIGHT_CADENCE_STATISTIC_PATH = (
+    "songs[].references[].by_acoustic_role.chorus_like."
+    "derived_shot_boundary_rate_per_minute"
+)
 FORMATION_EVIDENCE_THRESHOLD_NORMALIZED = 1.0 / 6.0
 EXPECTED_SONG_COUNT = 4
 EXPECTED_REFERENCE_COUNT = 20
@@ -312,6 +321,26 @@ class ProfileDerivedPreferredTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileInformedProductMinimum:
+    """A hard product requirement informed by, but not named a reference floor."""
+
+    name: str
+    value: float
+    reference_count: int
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "reference_count": self.reference_count,
+            "hard_gate": True,
+            "is_reference_floor": False,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class UnusableReferenceFloor:
     statistic_path: str
     value: float
@@ -331,7 +360,10 @@ class UnusableReferenceFloor:
 @dataclass(frozen=True, slots=True)
 class ProductEditorialRequirements:
     requirement_basis: str = PRODUCT_EDITORIAL_REQUIREMENT_BASIS
-    minimum_nonwide_multi_family_burst_count: int = 1
+    # The observed non-wide multi-source burst median is 2.5 shots.  Requiring
+    # two internal boundaries makes the product gate require a three-shot
+    # burst instead of letting one two-shot exchange make a flat chorus pass.
+    minimum_nonwide_multi_family_burst_count: int = 2
     minimum_post_burst_formation_evidenced_wide_reset_count: int = 1
     formation_evidence_threshold_normalized: float = (
         FORMATION_EVIDENCE_THRESHOLD_NORMALIZED
@@ -376,6 +408,13 @@ class ProfessionalMontagePolicy:
     preferred_wide_involved_source_switch_fraction: (
         ProfileDerivedPreferredTarget
     )
+    highlight_product_minimum_source_switches_per_minute: (
+        ProfileInformedProductMinimum
+    )
+    highlight_preferred_source_switches_per_minute: (
+        ProfileDerivedPreferredTarget
+    )
+    highlight_cadence_reference_count: int
     minimum_nonwide_burst_shot_count: ProfileDerivedMinimum
     minimum_nonwide_burst_duration_seconds: ProfileDerivedMinimum
     minimum_nonwide_burst_source_switch_fraction: ProfileDerivedMinimum
@@ -412,8 +451,22 @@ class ProfessionalMontagePolicy:
             "profile_derived_preferred_targets": {
                 "preferred_wide_involved_source_switch_fraction": (
                     self.preferred_wide_involved_source_switch_fraction.to_dict()
-                )
+                ),
+                "highlight_preferred_source_switches_per_minute": (
+                    self.highlight_preferred_source_switches_per_minute.to_dict()
+                ),
             },
+            "profile_informed_product_minimums": {
+                "highlight_product_minimum_source_switches_per_minute": (
+                    self.highlight_product_minimum_source_switches_per_minute.to_dict()
+                ),
+            },
+            "highlight_cadence_reference_count": (
+                self.highlight_cadence_reference_count
+            ),
+            "highlight_cadence_evidence_contract": (
+                HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT
+            ),
             "minimum_nonwide_duration_fraction": None,
             "nonwide_duration_fraction_policy": (
                 self.nonwide_duration_fraction_policy
@@ -653,6 +706,153 @@ def _reference_preferred_target(
     )
 
 
+def _nearest_rank_empirical_quantile(
+    values: list[float],
+    quantile: float,
+) -> float:
+    """Return an observed nearest-rank quantile without inventing a sample."""
+
+    if not values:
+        raise ProfessionalMontagePolicyError(
+            "cadence quantile requires at least one reference"
+        )
+    if not 0.0 < quantile <= 1.0:
+        raise ProfessionalMontagePolicyError(
+            "cadence quantile must lie in (0, 1]"
+        )
+    ordered = sorted(_finite(value, "chorus cadence value") for value in values)
+    return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
+def _derived_highlight_cadence(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+    chorus: Mapping[str, Any],
+) -> tuple[
+    ProfileInformedProductMinimum,
+    ProfileDerivedPreferredTarget,
+    int,
+]:
+    """Derive IVE chorus cut cadence from each immutable reference payload."""
+
+    rates: list[float] = []
+    reference_ids: set[str] = set()
+    derived_shot_count = 0
+    songs = _array(profile.get("songs"), "songs")
+    for song_index, raw_song in enumerate(songs):
+        song = _mapping(raw_song, f"song {song_index}")
+        references = _array(song.get("references"), f"song {song_index} references")
+        if _integer(
+            song.get("reference_count"),
+            f"song {song_index} reference_count",
+        ) != len(references):
+            raise ProfessionalMontagePolicyError(
+                f"song {song_index} reference_count disagrees with references"
+            )
+        for reference_index, raw_reference in enumerate(references):
+            label = f"song {song_index} reference {reference_index}"
+            reference = _mapping(raw_reference, label)
+            reference_id = reference.get("reference_id")
+            if (
+                not isinstance(reference_id, str)
+                or not reference_id
+                or reference_id in reference_ids
+            ):
+                raise ProfessionalMontagePolicyError(
+                    "profile reference ids are invalid"
+                )
+            reference_ids.add(reference_id)
+            roles = _mapping(reference.get("by_acoustic_role"), f"{label} roles")
+            if set(roles) != set(ROLE_NAMES):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} acoustic-role schema mismatch"
+                )
+            role = _mapping(roles.get("chorus_like"), f"{label} chorus_like")
+            if role.get("role") != "chorus_like":
+                raise ProfessionalMontagePolicyError(
+                    f"{label} chorus_like role label mismatch"
+                )
+            shot_count = _integer(
+                role.get("shot_count"), f"{label} chorus_like shot_count"
+            )
+            duration = _finite(
+                role.get("role_duration_seconds"),
+                f"{label} chorus_like role_duration_seconds",
+            )
+            if shot_count < 1 or duration <= 0.0:
+                raise ProfessionalMontagePolicyError(
+                    f"{label} cannot supply chorus cadence evidence"
+                )
+            rate = 60.0 * float(shot_count - 1) / duration
+            if not math.isfinite(rate) or rate < 0.0:
+                raise ProfessionalMontagePolicyError(
+                    f"{label} has invalid chorus cadence"
+                )
+            rates.append(rate)
+            derived_shot_count += shot_count
+
+    if len(rates) != EXPECTED_REFERENCE_COUNT:
+        raise ProfessionalMontagePolicyError(
+            "chorus cadence must contain exactly twenty references"
+        )
+    pooled = _mapping(chorus.get("pooled_counts"), "chorus pooled_counts")
+    if _integer(pooled.get("shot_count"), "chorus pooled shot_count") != (
+        derived_shot_count
+    ):
+        raise ProfessionalMontagePolicyError(
+            "chorus pooled shot_count disagrees with reference cadence evidence"
+        )
+
+    product_minimum = _nearest_rank_empirical_quantile(
+        rates,
+        HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE,
+    )
+    preferred_target = _nearest_rank_empirical_quantile(
+        rates,
+        HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE,
+    )
+    if product_minimum <= 0.0 or preferred_target < product_minimum:
+        raise ProfessionalMontagePolicyError(
+            "chorus cadence cannot supply ordered positive product targets"
+        )
+
+    minimum_provenance = ProfileStatisticProvenance(
+        profile_identity=identity,
+        statistic_path=HIGHLIGHT_CADENCE_STATISTIC_PATH,
+        statistic=(
+            "derived_reference_lower_median_chorus_shot_boundary_rate_"
+            "product_minimum"
+        ),
+        quantile=HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE,
+        reference_floor_basis=None,
+    )
+    preferred_provenance = ProfileStatisticProvenance(
+        profile_identity=identity,
+        statistic_path=HIGHLIGHT_CADENCE_STATISTIC_PATH,
+        statistic=(
+            "derived_reference_nearest_rank_p75_chorus_shot_boundary_rate_"
+            "soft_preferred_target"
+        ),
+        quantile=HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE,
+        reference_floor_basis=None,
+    )
+    return (
+        ProfileInformedProductMinimum(
+            name="highlight_product_minimum_source_switches_per_minute",
+            value=product_minimum,
+            reference_count=len(rates),
+            provenance=minimum_provenance,
+        ),
+        ProfileDerivedPreferredTarget(
+            name="highlight_preferred_source_switches_per_minute",
+            value=preferred_target,
+            reference_count=len(rates),
+            provenance=preferred_provenance,
+        ),
+        len(rates),
+    )
+
+
 def _event_minimum(
     profile: Mapping[str, Any],
     identity: ProfessionalMontageProfileIdentity,
@@ -821,6 +1021,11 @@ def load_professional_montage_policy(
         path=f"{reference_root}.source_switch_with_wide_fraction",
         fraction=True,
     )
+    (
+        highlight_cadence_minimum,
+        highlight_cadence_preferred,
+        highlight_cadence_reference_count,
+    ) = _derived_highlight_cadence(profile, identity, chorus)
     event_specs = (
         (
             "minimum_nonwide_burst_shot_count",
@@ -868,6 +1073,15 @@ def load_professional_montage_policy(
         **reference_minimums,
         preferred_wide_involved_source_switch_fraction=(
             preferred_wide_switch_target
+        ),
+        highlight_product_minimum_source_switches_per_minute=(
+            highlight_cadence_minimum
+        ),
+        highlight_preferred_source_switches_per_minute=(
+            highlight_cadence_preferred
+        ),
+        highlight_cadence_reference_count=(
+            highlight_cadence_reference_count
         ),
         **event_minimums,
         minimum_nonwide_duration_fraction=None,
