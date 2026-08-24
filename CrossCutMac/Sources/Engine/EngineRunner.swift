@@ -161,6 +161,10 @@ enum CompletedEngineOutputSetDiscovery {
         "decoded_output_proxy_all_transition_quality_review_v2"
     private static let proxyAnalysisBasisV3 =
         "decoded_output_proxy_domain_aware_quality_review_v3"
+    private static let automaticIVEGroupAppResultExposureContract =
+        "automatic_ive_group_app_result_exposure_v1"
+    private static let automaticIVEGroupPostRenderQAContract =
+        "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
 
     private struct ProxyMetadata: Decodable, Equatable {
         let path: String?
@@ -314,14 +318,53 @@ enum CompletedEngineOutputSetDiscovery {
     }
 
     private struct AnalysisRequest: Decodable {
+        let group: String
         let editMode: String
         let sourceMode: String
         let outputDirectory: String
 
         enum CodingKeys: String, CodingKey {
+            case group
             case editMode = "edit_mode"
             case sourceMode = "source_mode"
             case outputDirectory = "output_directory"
+        }
+    }
+
+    private struct AppResultExposure: Decodable, Equatable {
+        let contract: String
+        let videoOutputExposed: Bool
+        let deliveryCompletionMessageAllowed: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case contract
+            case videoOutputExposed = "video_output_exposed"
+            case deliveryCompletionMessageAllowed =
+                "delivery_completion_message_allowed"
+        }
+
+        var authorizesDelivery: Bool {
+            contract
+                == CompletedEngineOutputSetDiscovery
+                    .automaticIVEGroupAppResultExposureContract
+                && videoOutputExposed
+                && deliveryCompletionMessageAllowed
+        }
+    }
+
+    private struct PostRenderQAEvidence: Decodable, Equatable {
+        let contract: String
+        let required: Bool
+        let verdict: String
+        let passed: Bool
+
+        var authorizesDelivery: Bool {
+            contract
+                == CompletedEngineOutputSetDiscovery
+                    .automaticIVEGroupPostRenderQAContract
+                && required
+                && verdict == "PASS"
+                && passed
         }
     }
 
@@ -356,6 +399,9 @@ enum CompletedEngineOutputSetDiscovery {
         let interchange: Interchange
         let renderedProxyReview: ProxyReview
         let renderedCandidateSelection: CandidateSelection
+        let artifactRole: String
+        let appResultExposure: AppResultExposure
+        let postRenderQA: PostRenderQAEvidence
 
         enum CodingKeys: String, CodingKey {
             case videoPath = "video_path"
@@ -364,6 +410,9 @@ enum CompletedEngineOutputSetDiscovery {
             case interchange
             case renderedProxyReview = "rendered_proxy_review"
             case renderedCandidateSelection = "rendered_candidate_selection"
+            case artifactRole = "artifact_role"
+            case appResultExposure = "app_result_exposure"
+            case postRenderQA = "post_render_qa"
         }
     }
 
@@ -403,6 +452,9 @@ enum CompletedEngineOutputSetDiscovery {
         let renderedCandidateSelection: CandidateSelection
         let render: AnalysisRender
         let capabilities: AnalysisCapabilities
+        let artifactRole: String
+        let appResultExposure: AppResultExposure
+        let postRenderQA: PostRenderQAEvidence
 
         enum CodingKeys: String, CodingKey {
             case schemaVersion = "schema_version"
@@ -412,6 +464,9 @@ enum CompletedEngineOutputSetDiscovery {
             case renderedCandidateSelection = "rendered_candidate_selection"
             case render
             case capabilities
+            case artifactRole = "artifact_role"
+            case appResultExposure = "app_result_exposure"
+            case postRenderQA = "post_render_qa"
         }
     }
 
@@ -586,9 +641,18 @@ enum CompletedEngineOutputSetDiscovery {
               ),
               analysis.schemaVersion == 1,
               createdAtMatches(analysis.createdAt, timestamp: timestamp),
+              analysis.request.group == "IVE",
               analysis.request.editMode == "group",
               analysis.request.sourceMode == "automatic",
               samePath(analysis.request.outputDirectory, outputDirectory),
+              analysis.artifactRole == "delivery",
+              analysis.appResultExposure.authorizesDelivery,
+              analysis.postRenderQA.authorizesDelivery,
+              analysis.render.artifactRole == analysis.artifactRole,
+              analysis.render.appResultExposure == analysis.appResultExposure,
+              analysis.render.appResultExposure.authorizesDelivery,
+              analysis.render.postRenderQA == analysis.postRenderQA,
+              analysis.render.postRenderQA.authorizesDelivery,
               analysis.capabilities.groupVideoRendered,
               analysis.render.videoCodec == "h264_videotoolbox"
                 || analysis.render.videoCodec == "libx264",

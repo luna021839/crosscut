@@ -32,7 +32,8 @@ final class EngineContractTests: XCTestCase {
         timestamp: String,
         selectionPassed: Bool = true,
         videoData: Data? = Data([0, 0, 0, 1]),
-        proxySchemaVersion: Int = 2
+        proxySchemaVersion: Int = 2,
+        mutateAnalysis: ((inout [String: Any]) -> Void)? = nil
     ) throws -> [URL] {
         try FileManager.default.createDirectory(
             at: directory,
@@ -139,17 +140,35 @@ final class EngineContractTests: XCTestCase {
         let creationDate = try XCTUnwrap(filenameFormatter.date(from: timestamp))
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let analysis: [String: Any] = [
+        let postRenderQA: [String: Any] = [
+            "contract": "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2",
+            "required": true,
+            "verdict": "PASS",
+            "passed": true,
+        ]
+        let appResultExposure: [String: Any] = [
+            "contract": "automatic_ive_group_app_result_exposure_v1",
+            "video_output_exposed": true,
+            "delivery_completion_message_allowed": true,
+        ]
+        var analysis: [String: Any] = [
             "schema_version": 1,
             "created_at": isoFormatter.string(from: creationDate),
             "request": [
+                "group": "IVE",
                 "edit_mode": "group",
                 "source_mode": "automatic",
                 "output_directory": directory.path,
             ],
+            "artifact_role": "delivery",
+            "app_result_exposure": appResultExposure,
+            "post_render_qa": postRenderQA,
             "rendered_proxy_review": proxyReview,
             "rendered_candidate_selection": selection,
             "render": [
+                "artifact_role": "delivery",
+                "app_result_exposure": appResultExposure,
+                "post_render_qa": postRenderQA,
                 "video_path": videoURL.path,
                 "plan_path": planURL.path,
                 "video_codec": "libx264",
@@ -165,6 +184,7 @@ final class EngineContractTests: XCTestCase {
             ],
             "capabilities": ["group_video_rendered": true],
         ]
+        mutateAnalysis?(&analysis)
         let fps = 29.97
         let outputFrameCount = 2_997
         let plan: [String: Any] = [
@@ -202,6 +222,48 @@ final class EngineContractTests: XCTestCase {
             interchangeAuditURL,
             videoURL,
         ]
+    }
+
+    private func mutateRender(
+        in analysis: inout [String: Any],
+        _ mutation: (inout [String: Any]) -> Void
+    ) {
+        guard var render = analysis["render"] as? [String: Any] else {
+            XCTFail("fixture render payload is missing")
+            return
+        }
+        mutation(&render)
+        analysis["render"] = render
+    }
+
+    private func assertAutomaticGroupOutputIsNotRestorable(
+        timestamp: String = "20260823-070707",
+        mutateAnalysis: @escaping (inout [String: Any]) -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ive-crosscut-output-rejected-\(UUID().uuidString)"
+            )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let files = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: timestamp,
+            mutateAnalysis: mutateAnalysis
+        )
+
+        XCTAssertEqual(files.count, 8, file: file, line: line)
+        XCTAssertTrue(
+            files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) },
+            file: file,
+            line: line
+        )
+        XCTAssertNil(
+            CompletedEngineOutputSetDiscovery.latest(in: root),
+            file: file,
+            line: line
+        )
     }
 
     func testCompletedOutputDiscoveryUsesLatestValidSameTimestampSet() throws {
@@ -252,6 +314,232 @@ final class EngineContractTests: XCTestCase {
         let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.latest(in: root))
         XCTAssertEqual(result.timestamp, "20260823-060606")
         XCTAssertEqual(result.outputURLs, expected.map(\.standardizedFileURL))
+    }
+
+    func testCompletedOutputDiscoveryRejectsPendingArtifactRoleWithAllEightFiles() throws {
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            analysis["artifact_role"] = "pending"
+            self.mutateRender(in: &analysis) { render in
+                render["artifact_role"] = "pending"
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsRejectedArtifactRoleWithAllEightFiles() throws {
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            analysis["artifact_role"] = "rejected"
+            self.mutateRender(in: &analysis) { render in
+                render["artifact_role"] = "rejected"
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsComparisonArtifactRoleWithAllEightFiles() throws {
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            analysis["artifact_role"] = "comparison"
+            self.mutateRender(in: &analysis) { render in
+                render["artifact_role"] = "comparison"
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsMissingDeliveryEvidence() throws {
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { $0.removeValue(forKey: "artifact_role") },
+            { $0.removeValue(forKey: "app_result_exposure") },
+            { $0.removeValue(forKey: "post_render_qa") },
+            { analysis in
+                self.mutateRender(in: &analysis) {
+                    $0.removeValue(forKey: "artifact_role")
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) {
+                    $0.removeValue(forKey: "app_result_exposure")
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) {
+                    $0.removeValue(forKey: "post_render_qa")
+                }
+            },
+        ]
+        for mutation in mutations {
+            try assertAutomaticGroupOutputIsNotRestorable(
+                mutateAnalysis: mutation
+            )
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsWrongOrMissingPostRenderQAContract() throws {
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { analysis in
+                var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+                qa["contract"] = "unknown_contract"
+                analysis["post_render_qa"] = qa
+                self.mutateRender(in: &analysis) { render in
+                    render["post_render_qa"] = qa
+                }
+            },
+            { analysis in
+                var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+                qa.removeValue(forKey: "contract")
+                analysis["post_render_qa"] = qa
+                self.mutateRender(in: &analysis) { render in
+                    render["post_render_qa"] = qa
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) { render in
+                    var qa = render["post_render_qa"]
+                        as? [String: Any] ?? [:]
+                    qa["contract"] = "unknown_contract"
+                    render["post_render_qa"] = qa
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) { render in
+                    var qa = render["post_render_qa"]
+                        as? [String: Any] ?? [:]
+                    qa.removeValue(forKey: "contract")
+                    render["post_render_qa"] = qa
+                }
+            },
+        ]
+        for mutation in mutations {
+            try assertAutomaticGroupOutputIsNotRestorable(
+                mutateAnalysis: mutation
+            )
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsMissingOrMismatchedRenderExposure() throws {
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { analysis in
+                self.mutateRender(in: &analysis) {
+                    $0.removeValue(forKey: "app_result_exposure")
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) { render in
+                    var exposure = render["app_result_exposure"]
+                        as? [String: Any] ?? [:]
+                    exposure["contract"] = "unknown_contract"
+                    render["app_result_exposure"] = exposure
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) { render in
+                    var exposure = render["app_result_exposure"]
+                        as? [String: Any] ?? [:]
+                    exposure["video_output_exposed"] = false
+                    render["app_result_exposure"] = exposure
+                }
+            },
+            { analysis in
+                self.mutateRender(in: &analysis) { render in
+                    var exposure = render["app_result_exposure"]
+                        as? [String: Any] ?? [:]
+                    exposure["delivery_completion_message_allowed"] = false
+                    render["app_result_exposure"] = exposure
+                }
+            },
+        ]
+        for mutation in mutations {
+            try assertAutomaticGroupOutputIsNotRestorable(
+                mutateAnalysis: mutation
+            )
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsMismatchedRenderDeliveryEvidence() throws {
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            self.mutateRender(in: &analysis) { render in
+                render["artifact_role"] = "comparison"
+            }
+        }
+
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            self.mutateRender(in: &analysis) { render in
+                var qa = render["post_render_qa"] as? [String: Any] ?? [:]
+                qa["verdict"] = "FAIL"
+                qa["passed"] = false
+                render["post_render_qa"] = qa
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsPostRenderQAFailWithAllEightFiles() throws {
+        try assertAutomaticGroupOutputIsNotRestorable { analysis in
+            var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+            qa["verdict"] = "FAIL"
+            qa["passed"] = false
+            analysis["post_render_qa"] = qa
+            self.mutateRender(in: &analysis) { render in
+                render["post_render_qa"] = qa
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRejectsPendingOrRejectedQAVerdicts() throws {
+        for verdict in ["PENDING", "REJECTED"] {
+            try assertAutomaticGroupOutputIsNotRestorable { analysis in
+                var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+                qa["verdict"] = verdict
+                // A verdict other than PASS remains ineligible even if a
+                // malformed producer also claims the boolean passed flag.
+                qa["passed"] = true
+                analysis["post_render_qa"] = qa
+                self.mutateRender(in: &analysis) { render in
+                    render["post_render_qa"] = qa
+                }
+            }
+        }
+    }
+
+    func testCompletedOutputDiscoveryRequiresExactExposureAndQAAuthorization() throws {
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { analysis in
+                var exposure = analysis["app_result_exposure"]
+                    as? [String: Any] ?? [:]
+                exposure["contract"] = "unknown_contract"
+                analysis["app_result_exposure"] = exposure
+                self.mutateRender(in: &analysis) { render in
+                    render["app_result_exposure"] = exposure
+                }
+            },
+            { analysis in
+                var exposure = analysis["app_result_exposure"]
+                    as? [String: Any] ?? [:]
+                exposure["video_output_exposed"] = false
+                analysis["app_result_exposure"] = exposure
+                self.mutateRender(in: &analysis) { render in
+                    render["app_result_exposure"] = exposure
+                }
+            },
+            { analysis in
+                var exposure = analysis["app_result_exposure"]
+                    as? [String: Any] ?? [:]
+                exposure["delivery_completion_message_allowed"] = false
+                analysis["app_result_exposure"] = exposure
+                self.mutateRender(in: &analysis) { render in
+                    render["app_result_exposure"] = exposure
+                }
+            },
+            { analysis in
+                var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+                qa["required"] = false
+                analysis["post_render_qa"] = qa
+                self.mutateRender(in: &analysis) { render in
+                    render["post_render_qa"] = qa
+                }
+            },
+        ]
+        for mutation in mutations {
+            try assertAutomaticGroupOutputIsNotRestorable(
+                mutateAnalysis: mutation
+            )
+        }
     }
 
     func testCompletedOutputDiscoveryRejectsEmptyOrSymlinkedVideo() throws {
