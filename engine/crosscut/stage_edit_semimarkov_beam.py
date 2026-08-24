@@ -10,7 +10,7 @@ production readiness contract before any decoding work is attempted.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
@@ -26,7 +26,7 @@ from .render import (
     TransitionKind,
     minimum_roll_safe_zoom,
 )
-from .section_director import SectionPlan
+from .section_director import SectionPlan, SectionRole
 from .source_derivative_diversity import SourceDerivativeFamilyMetadata
 from .stage_edit import StageBoundary, StageEdit, StageShot
 from .stage_edit_dynamic_crop_semimarkov_adapter import (
@@ -42,10 +42,18 @@ from .stage_edit_transformer import (
 )
 
 
-DECODER_SCHEMA_VERSION = 4
+DECODER_SCHEMA_VERSION = 7
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
+)
+_WIDE_SHOT_SIZES = frozenset({"wide", "full"})
+_CLOSEUP_SHOT_SIZES = frozenset({"closeup", "extreme_closeup"})
+_NONWIDE_SHOT_SIZES = frozenset({"medium", "closeup", "extreme_closeup"})
+MONTAGE_GRAMMAR_CONTRACT = (
+    "ive_human_reference_wide_transition_floor_plus_"
+    "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
+    "highlight_burst_and_reset_v4"
 )
 
 
@@ -197,6 +205,9 @@ class StageEditSourceContinuity:
     sharpness: float | None = None
     exposure: float | None = None
     color_temperature_normalized: float | None = None
+    detected_person_count_normalized: float | None = None
+    formation_person_count_normalized: float | None = None
+    formation_pose_coverage: float | None = None
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -204,6 +215,14 @@ class StageEditSourceContinuity:
             if value is None:
                 continue
             object.__setattr__(self, name, _finite(value, name))
+        for name in (
+            "detected_person_count_normalized",
+            "formation_person_count_normalized",
+            "formation_pose_coverage",
+        ):
+            value = getattr(self, name)
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
 
     def to_dict(self) -> dict[str, float | None]:
         return asdict(self)
@@ -231,6 +250,11 @@ class StageEditHeadFrame:
     source_continuity: tuple[StageEditSourceContinuity, ...] = ()
     candidate_id: str = ""
     dynamic_crop_v2: DynamicCropHeadPredictionV2 | None = None
+    # These are copied from the exact serialized inference token.  They are
+    # deliberately not reconstructed from wall-clock time in the decoder.
+    section_progress: float | None = None
+    phrase_progress: float | None = None
+    section_role: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -291,6 +315,20 @@ class StageEditHeadFrame:
             raise StageEditDecodeInputError(
                 "dynamic_crop_v2 must be a DynamicCropHeadPredictionV2"
             )
+        for name in ("section_progress", "phrase_progress"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            number = _finite(value, name)
+            if not 0.0 <= number <= 1.0:
+                raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
+            object.__setattr__(self, name, number)
+        if self.section_role is not None:
+            role = str(self.section_role).strip()
+            allowed_roles = {item.value for item in SectionRole}
+            if role not in allowed_roles:
+                raise StageEditDecodeInputError("section_role is outside SectionRole")
+            object.__setattr__(self, "section_role", role)
 
     @property
     def effective_source_mask(self) -> tuple[bool, ...]:
@@ -323,6 +361,9 @@ class StageEditHeadFrame:
                 if self.dynamic_crop_v2 is not None
                 else None
             ),
+            "section_progress": self.section_progress,
+            "phrase_progress": self.phrase_progress,
+            "section_role": self.section_role,
         }
 
 
@@ -404,8 +445,39 @@ class StageEditSemiMarkovConfig:
     cadence_score_weight: float = 0.15
     diversity_score_weight: float = 0.12
     occupancy_balance_weight: float = 0.08
+    montage_grammar_score_weight: float = 0.24
+    enforce_montage_grammar: bool = True
+    highlight_minimum_duration_seconds: float = 5.0
+    highlight_minimum_known_shot_fraction: float = 0.80
+    # Exact chorus-like P10 from the immutable four-song / twenty-reference
+    # IVE professional-montage profile.  The non-wide/burst/reset requirements
+    # below are deliberately labelled as product editorial requirements rather
+    # than being misrepresented as lower-quantile reference floors.
+    highlight_minimum_closeup_fraction: float = 0.15096153846153848
+    highlight_minimum_nonwide_fraction: float = 0.35
+    highlight_minimum_wide_involved_source_switch_fraction: float = (
+        0.37333333333333335
+    )
+    highlight_minimum_early_wide_anchor_fraction: float = 1.0 / 3.0
+    highlight_minimum_phrase_entry_wide_anchor_fraction: float = (
+        0.2785714285714286
+    )
+    highlight_burst_maximum_shot_seconds: float = 1.50
+    highlight_minimum_nonwide_burst_boundaries: int = 1
+    formation_anchor_decision_window: int = 3
+    # The reference profile only proves identity-free observed-person evidence;
+    # it explicitly cannot establish a six-member formation threshold.  One
+    # observed IVE-roster unit plus non-zero pose coverage distinguishes a
+    # formation-evidenced wide from a generic/unknown wide without claiming
+    # that it proves the complete group is visible.
+    minimum_formation_anchor_person_count_normalized: float = 1.0 / 6.0
+    highlight_minimum_post_burst_formation_resets: int = 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enforce_montage_grammar, bool):
+            raise StageEditDecodeInputError(
+                "enforce_montage_grammar must be boolean"
+            )
         for name in ("beam_width", "timeline_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 8 <= value <= 32:
@@ -417,6 +489,9 @@ class StageEditSemiMarkovConfig:
             "recent_shot_size_window",
             "maximum_same_shot_size_run",
             "minimum_unique_sources",
+            "highlight_minimum_nonwide_burst_boundaries",
+            "formation_anchor_decision_window",
+            "highlight_minimum_post_burst_formation_resets",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -436,6 +511,8 @@ class StageEditSemiMarkovConfig:
             "maximum_global_switches_per_minute",
             "section_cut_density_multiplier",
             "cut_density_window_seconds",
+            "highlight_minimum_duration_seconds",
+            "highlight_burst_maximum_shot_seconds",
         ):
             number = _finite(getattr(self, name), name)
             if number <= 0.0:
@@ -467,11 +544,32 @@ class StageEditSemiMarkovConfig:
             "cadence_score_weight",
             "diversity_score_weight",
             "occupancy_balance_weight",
+            "montage_grammar_score_weight",
         ):
             number = _finite(getattr(self, name), name)
             if number < 0.0:
                 raise StageEditDecodeInputError(f"{name} cannot be negative")
             object.__setattr__(self, name, number)
+        for name in (
+            "highlight_minimum_known_shot_fraction",
+            "highlight_minimum_closeup_fraction",
+            "highlight_minimum_nonwide_fraction",
+            "highlight_minimum_wide_involved_source_switch_fraction",
+            "highlight_minimum_early_wide_anchor_fraction",
+            "highlight_minimum_phrase_entry_wide_anchor_fraction",
+            "minimum_formation_anchor_person_count_normalized",
+        ):
+            number = _finite(getattr(self, name), name)
+            if not 0.0 <= number <= 1.0:
+                raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
+            object.__setattr__(self, name, number)
+        if (
+            self.highlight_minimum_closeup_fraction
+            > self.highlight_minimum_nonwide_fraction
+        ):
+            raise StageEditDecodeInputError(
+                "highlight close-up floor cannot exceed the non-wide floor"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,6 +600,9 @@ class StageEditBeamDecision:
     source_index: int
     source_id: str
     shot_size: str
+    detected_person_count_normalized: float | None
+    formation_person_count_normalized: float | None
+    formation_pose_coverage: float | None
     duration_bucket: int
     transition_label: str
     crop_requested: tuple[float, float, float, float]
@@ -520,6 +621,9 @@ class StageEditBeamDecision:
     editorial_transform: EditorialTransformTrack | None = None
     dynamic_crop_decode: DynamicCropTrackDecodeV2 | None = None
     crop_contract: str = "legacy_static_crop_head_v1"
+    section_progress: float | None = None
+    phrase_progress: float | None = None
+    section_role: str | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -568,6 +672,16 @@ class StageEditBeamDecision:
             "source_id": self.source_id,
             "derivative_family_id": self.derivative_family_id,
             "shot_size": self.shot_size,
+            "detected_person_count_normalized": (
+                self.detected_person_count_normalized
+            ),
+            "formation_person_count_normalized": (
+                self.formation_person_count_normalized
+            ),
+            "formation_pose_coverage": self.formation_pose_coverage,
+            "section_progress": self.section_progress,
+            "phrase_progress": self.phrase_progress,
+            "section_role": self.section_role,
             "duration_bucket": self.duration_bucket,
             "transition_label": self.transition_label,
             "render_transition_kind": "hard_cut",
@@ -645,6 +759,7 @@ class StageEditBeamTimeline:
     edit: StageEdit
     source_occupancy_seconds: tuple[float, ...]
     recent_cut_density_per_minute: float
+    montage_grammar: Mapping[str, Any] = field(default_factory=dict)
     derivative_family_occupancy_seconds: tuple[float, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -657,6 +772,7 @@ class StageEditBeamTimeline:
                 self.derivative_family_occupancy_seconds
             ),
             "recent_cut_density_per_minute": self.recent_cut_density_per_minute,
+            "montage_grammar": dict(self.montage_grammar),
             "decisions": [item.to_dict() for item in self.decisions],
             "stage_edit": self.edit.to_dict(),
         }
@@ -1014,6 +1130,741 @@ def _shot_size(
     return source.default_shot_size
 
 
+def _formation_wide_evidence(
+    *,
+    shot_size: str,
+    formation_person_count_normalized: float | None,
+    formation_pose_coverage: float | None,
+    config: StageEditSemiMarkovConfig,
+) -> bool:
+    """Return only weak, identity-free evidence for a formation-aware wide.
+
+    This must never be described as proof that all six IVE members are visible.
+    The immutable human-reference profile only supports distinguishing missing
+    or zero evidence from a detector/pose-backed wide observation.
+    """
+
+    return bool(
+        shot_size in _WIDE_SHOT_SIZES
+        and formation_person_count_normalized is not None
+        and formation_person_count_normalized
+        >= config.minimum_formation_anchor_person_count_normalized
+        and formation_pose_coverage is not None
+        and formation_pose_coverage > 0.0
+    )
+
+
+def _montage_grammar_score_raw(
+    *,
+    directive: Any,
+    shot_size: str,
+    start_seconds: float,
+    duration_seconds: float,
+    previous_shot_size: str | None,
+    previous_duration_seconds: float | None,
+    derivative_family_source_switched: bool,
+    previous_formation_wide_evidenced: bool,
+    formation_person_count_normalized: float | None,
+    formation_pose_coverage: float | None,
+    config: StageEditSemiMarkovConfig,
+) -> float:
+    """Bounded structural prior; learned logits still own the edit decision.
+
+    A formation-wide is useful as a phrase anchor, but it must not occupy an
+    entire high-energy passage.  After that anchor, medium/close shots and one
+    short non-wide chain create the visual lift that a uniform sequence of
+    wide-to-wide cuts cannot provide.
+    """
+
+    if shot_size == "unknown":
+        return -0.12
+    progress = min(
+        1.0,
+        max(
+            0.0,
+            (start_seconds - directive.start_seconds)
+            / max(directive.duration_seconds, _TIME_EPSILON),
+        ),
+    )
+    anchor_zone = progress <= 0.20
+    raw = 0.0
+    if directive.establish_with_wide_shot and anchor_zone:
+        if shot_size in _WIDE_SHOT_SIZES:
+            if _formation_wide_evidence(
+                shot_size=shot_size,
+                formation_person_count_normalized=(
+                    formation_person_count_normalized
+                ),
+                formation_pose_coverage=formation_pose_coverage,
+                config=config,
+            ):
+                raw += 0.48
+            else:
+                raw += 0.04
+        elif shot_size in _CLOSEUP_SHOT_SIZES:
+            raw -= 0.12
+
+    if directive.role is SectionRole.CHORUS_LIKE:
+        if (
+            derivative_family_source_switched
+            and previous_shot_size is not None
+            and (
+                previous_shot_size in _WIDE_SHOT_SIZES
+                or shot_size in _WIDE_SHOT_SIZES
+            )
+        ):
+            # Human references put a wide on at least one side of 80% of the
+            # median chorus camera-family switches (P10 hard floor 37.33%).
+            # Keep this a small bounded prior: learned source logits still
+            # contribute far more than this term after its 0.24 weight.
+            raw += 0.10
+            if previous_formation_wide_evidenced or _formation_wide_evidence(
+                shot_size=shot_size,
+                formation_person_count_normalized=(
+                    formation_person_count_normalized
+                ),
+                formation_pose_coverage=formation_pose_coverage,
+                config=config,
+            ):
+                raw += 0.06
+        if not anchor_zone:
+            if shot_size in _CLOSEUP_SHOT_SIZES:
+                raw += 0.48
+            elif shot_size == "medium":
+                raw += 0.24
+            elif shot_size in _WIDE_SHOT_SIZES:
+                raw -= 0.12
+        if previous_shot_size is not None:
+            if (
+                previous_shot_size in _NONWIDE_SHOT_SIZES
+                and shot_size in _NONWIDE_SHOT_SIZES
+            ):
+                raw += 0.22
+                if (
+                    previous_duration_seconds is not None
+                    and previous_duration_seconds
+                    <= config.highlight_burst_maximum_shot_seconds
+                    and duration_seconds
+                    <= config.highlight_burst_maximum_shot_seconds
+                    and (
+                        previous_shot_size in _CLOSEUP_SHOT_SIZES
+                        or shot_size in _CLOSEUP_SHOT_SIZES
+                    )
+                ):
+                    raw += 0.30
+            elif (
+                previous_shot_size in _NONWIDE_SHOT_SIZES
+                and shot_size in _WIDE_SHOT_SIZES
+            ):
+                # A wide reset after a face-scale burst exposes the formation
+                # without allowing the entire highlight to collapse to wides.
+                raw += (
+                    0.18
+                    if _formation_wide_evidence(
+                        shot_size=shot_size,
+                        formation_person_count_normalized=(
+                            formation_person_count_normalized
+                        ),
+                        formation_pose_coverage=formation_pose_coverage,
+                        config=config,
+                    )
+                    else 0.02
+                )
+    elif directive.role is SectionRole.BUILD:
+        if shot_size in _CLOSEUP_SHOT_SIZES:
+            raw += 0.10 + 0.24 * progress
+        elif shot_size == "medium":
+            raw += 0.08 + 0.12 * progress
+        elif shot_size in _WIDE_SHOT_SIZES:
+            raw += 0.12 * (1.0 - progress)
+    elif directive.role in {SectionRole.INTRO, SectionRole.OUTRO}:
+        if shot_size in _WIDE_SHOT_SIZES:
+            raw += 0.18
+    else:
+        # Verse/bridge passages retain breathing room; close-ups are legal and
+        # learned, but the structural prior does not force a burst everywhere.
+        if shot_size in {"wide", "full", "medium"}:
+            raw += 0.06
+    return min(1.0, max(-1.0, raw))
+
+
+def _section_candidate_shot_support(
+    *,
+    frames: Sequence[StageEditHeadFrame],
+    source_metadata: Sequence[StageEditSourceMetadata],
+    section_plan: SectionPlan,
+    derivative_family_ids: Sequence[int],
+    config: StageEditSemiMarkovConfig,
+) -> tuple[dict[str, Any], ...]:
+    records: list[list[dict[str, Any]]] = [
+        [] for _section in section_plan.sections
+    ]
+    for frame in frames:
+        section_index = _section_index_at_start(
+            section_plan, frame.master_time_seconds
+        )
+        known_sizes: list[tuple[int, str, bool]] = []
+        for source_index, metadata in enumerate(source_metadata):
+            if not frame.effective_source_mask[source_index]:
+                continue
+            size = _shot_size(frame, metadata)
+            if size != "unknown":
+                continuity = (
+                    frame.source_continuity[source_index]
+                    if frame.source_continuity
+                    else StageEditSourceContinuity()
+                )
+                known_sizes.append(
+                    (
+                        derivative_family_ids[source_index],
+                        size,
+                        _formation_wide_evidence(
+                            shot_size=size,
+                            formation_person_count_normalized=(
+                                continuity.formation_person_count_normalized
+                            ),
+                            formation_pose_coverage=(
+                                continuity.formation_pose_coverage
+                            ),
+                            config=config,
+                        ),
+                    )
+                )
+        nonwide_families = {
+            family
+            for family, size, _formation in known_sizes
+            if size in _NONWIDE_SHOT_SIZES
+        }
+        records[section_index].append(
+            {
+                "known": bool(known_sizes),
+                "wide": any(
+                    size in _WIDE_SHOT_SIZES
+                    for _family, size, _formation in known_sizes
+                ),
+                "formation_wide": any(
+                    formation for _family, _size, formation in known_sizes
+                ),
+                "nonwide": any(
+                    size in _NONWIDE_SHOT_SIZES
+                    for _family, size, _formation in known_sizes
+                ),
+                "closeup": any(
+                    size in _CLOSEUP_SHOT_SIZES
+                    for _family, size, _formation in known_sizes
+                ),
+                "multi_family_nonwide": len(nonwide_families) >= 2,
+            }
+        )
+
+    result: list[dict[str, Any]] = []
+    for directive, section_records in zip(
+        section_plan.sections, records, strict=True
+    ):
+        count = len(section_records)
+        known_count = sum(bool(item["known"]) for item in section_records)
+        closeup_count = sum(bool(item["closeup"]) for item in section_records)
+        nonwide_count = sum(bool(item["nonwide"]) for item in section_records)
+        wide_count = sum(bool(item["wide"]) for item in section_records)
+        multi_count = sum(
+            bool(item["multi_family_nonwide"]) for item in section_records
+        )
+        early = section_records[: config.formation_anchor_decision_window]
+        result.append(
+            {
+                "section_index": directive.section_index,
+                "candidate_frame_count": count,
+                "known_shot_size_frame_count": known_count,
+                "known_shot_size_frame_fraction": (
+                    known_count / count if count else 0.0
+                ),
+                "wide_supported_frame_count": wide_count,
+                "wide_supported_frame_fraction": (
+                    wide_count / count if count else 0.0
+                ),
+                "nonwide_supported_frame_count": nonwide_count,
+                "nonwide_supported_frame_fraction": (
+                    nonwide_count / count if count else 0.0
+                ),
+                "closeup_supported_frame_count": closeup_count,
+                "closeup_supported_frame_fraction": (
+                    closeup_count / count if count else 0.0
+                ),
+                "multi_family_nonwide_supported_frame_count": multi_count,
+                "early_wide_supported": any(
+                    bool(item["wide"]) for item in early
+                ),
+                "early_formation_wide_supported": any(
+                    bool(item["formation_wide"]) for item in early
+                ),
+            }
+        )
+    return tuple(result)
+
+
+def _exact_chorus_anchor_metrics(
+    *,
+    decisions: Sequence[StageEditBeamDecision],
+    section_plan: SectionPlan,
+) -> dict[str, Any]:
+    """Mirror the immutable reference profile's exact token-reset semantics."""
+
+    missing_section_progress = sum(
+        item.section_progress is None for item in decisions
+    )
+    missing_phrase_progress = sum(item.phrase_progress is None for item in decisions)
+    missing_section_role = sum(item.section_role is None for item in decisions)
+    section_role_plan_mismatch = sum(
+        item.section_role is not None
+        and item.section_role
+        != section_plan.directive_at(item.master_start_seconds).role.value
+        for item in decisions
+    )
+
+    exact_sections: list[list[StageEditBeamDecision]] = []
+    if missing_section_progress == 0 and missing_section_role == 0:
+        for decision in decisions:
+            if not exact_sections:
+                exact_sections.append([decision])
+                continue
+            previous = exact_sections[-1][-1]
+            assert previous.section_progress is not None
+            assert decision.section_progress is not None
+            if (
+                decision.section_role != previous.section_role
+                or decision.section_progress + _TIME_EPSILON
+                < previous.section_progress
+            ):
+                exact_sections.append([decision])
+            else:
+                exact_sections[-1].append(decision)
+
+    observed_early = 0
+    early_wide = 0
+    for selected in exact_sections:
+        if selected[0].section_role != SectionRole.CHORUS_LIKE.value:
+            continue
+        # Match the profile exactly: take the first three labelled shot
+        # positions, then exclude unknown shot-size evidence.  An unknown
+        # decision therefore still consumes an early-anchor slot.
+        early_known = tuple(
+            item for item in selected[:3] if item.shot_size != "unknown"
+        )
+        if early_known:
+            observed_early += 1
+            if any(item.shot_size in _WIDE_SHOT_SIZES for item in early_known):
+                early_wide += 1
+
+    phrases: list[list[StageEditBeamDecision]] = []
+    if missing_phrase_progress == 0:
+        for decision in decisions:
+            if not phrases:
+                phrases.append([decision])
+                continue
+            previous = phrases[-1][-1]
+            assert previous.phrase_progress is not None
+            assert decision.phrase_progress is not None
+            if (
+                decision.phrase_progress + _TIME_EPSILON
+                < previous.phrase_progress
+            ):
+                phrases.append([decision])
+            else:
+                phrases[-1].append(decision)
+
+    observed_phrase_entries = 0
+    phrase_entry_wide = 0
+    for phrase in phrases:
+        entry = phrase[0]
+        if entry.section_role != SectionRole.CHORUS_LIKE.value:
+            continue
+        if entry.shot_size == "unknown":
+            continue
+        observed_phrase_entries += 1
+        if entry.shot_size in _WIDE_SHOT_SIZES:
+            phrase_entry_wide += 1
+
+    return {
+        "evidence_contract": (
+            "serialized_inference_token_section_and_phrase_progress_reset_v1"
+        ),
+        "missing_section_progress_decision_count": missing_section_progress,
+        "missing_section_role_decision_count": missing_section_role,
+        "section_role_plan_mismatch_count": section_role_plan_mismatch,
+        "missing_phrase_progress_decision_count": missing_phrase_progress,
+        "observed_chorus_section_early_anchor_count": observed_early,
+        "chorus_section_early_wide_anchor_count": early_wide,
+        "chorus_section_early_wide_anchor_fraction": (
+            early_wide / observed_early if observed_early else None
+        ),
+        "observed_chorus_phrase_entry_anchor_count": observed_phrase_entries,
+        "chorus_phrase_entry_wide_anchor_count": phrase_entry_wide,
+        "chorus_phrase_entry_wide_anchor_fraction": (
+            phrase_entry_wide / observed_phrase_entries
+            if observed_phrase_entries
+            else None
+        ),
+    }
+
+
+def _evaluate_montage_grammar(
+    *,
+    decisions: Sequence[StageEditBeamDecision],
+    section_plan: SectionPlan,
+    support_by_section: Sequence[Mapping[str, Any]],
+    config: StageEditSemiMarkovConfig,
+) -> dict[str, Any]:
+    exact_anchor_metrics = _exact_chorus_anchor_metrics(
+        decisions=decisions,
+        section_plan=section_plan,
+    )
+    by_section: list[list[StageEditBeamDecision]] = [
+        [] for _section in section_plan.sections
+    ]
+    for decision in decisions:
+        section_index = _section_index_at_start(
+            section_plan, decision.master_start_seconds
+        )
+        by_section[section_index].append(decision)
+
+    all_failures: list[str] = []
+    section_metrics: list[dict[str, Any]] = []
+    for directive, selected, support in zip(
+        section_plan.sections,
+        by_section,
+        support_by_section,
+        strict=True,
+    ):
+        known = [item for item in selected if item.shot_size != "unknown"]
+        closeups = [
+            item for item in known if item.shot_size in _CLOSEUP_SHOT_SIZES
+        ]
+        nonwides = [
+            item for item in known if item.shot_size in _NONWIDE_SHOT_SIZES
+        ]
+        wides = [item for item in known if item.shot_size in _WIDE_SHOT_SIZES]
+        selected_duration = sum(item.duration_seconds for item in selected)
+        known_duration = sum(item.duration_seconds for item in known)
+        closeup_duration = sum(item.duration_seconds for item in closeups)
+        nonwide_duration = sum(item.duration_seconds for item in nonwides)
+        wide_duration = sum(item.duration_seconds for item in wides)
+        known_fraction = (
+            known_duration / selected_duration if selected_duration else 0.0
+        )
+        closeup_fraction = closeup_duration / known_duration if known_duration else 0.0
+        nonwide_fraction = nonwide_duration / known_duration if known_duration else 0.0
+        wide_fraction = wide_duration / known_duration if known_duration else 0.0
+        burst_boundaries = 0
+        burst_right_positions: list[int] = []
+        closeup_chain_boundaries = 0
+        source_switch_boundaries = 0
+        wide_involved_source_switch_boundaries = 0
+        for position, (left, right) in enumerate(zip(selected, selected[1:])):
+            if left.derivative_family_id == right.derivative_family_id:
+                continue
+            source_switch_boundaries += 1
+            if (
+                left.shot_size in _WIDE_SHOT_SIZES
+                or right.shot_size in _WIDE_SHOT_SIZES
+            ):
+                wide_involved_source_switch_boundaries += 1
+            if (
+                left.shot_size in _CLOSEUP_SHOT_SIZES
+                and right.shot_size in _CLOSEUP_SHOT_SIZES
+            ):
+                closeup_chain_boundaries += 1
+            if (
+                left.shot_size in _NONWIDE_SHOT_SIZES
+                and right.shot_size in _NONWIDE_SHOT_SIZES
+                and (
+                    left.shot_size in _CLOSEUP_SHOT_SIZES
+                    or right.shot_size in _CLOSEUP_SHOT_SIZES
+                )
+                and left.duration_seconds
+                <= config.highlight_burst_maximum_shot_seconds
+                and right.duration_seconds
+                <= config.highlight_burst_maximum_shot_seconds
+            ):
+                burst_boundaries += 1
+                burst_right_positions.append(position + 1)
+        wide_involved_source_switch_fraction = (
+            wide_involved_source_switch_boundaries / source_switch_boundaries
+            if source_switch_boundaries
+            else 0.0
+        )
+        anchor_window = selected[: config.formation_anchor_decision_window]
+        generic_wide_anchor_present = any(
+            item.shot_size in _WIDE_SHOT_SIZES for item in anchor_window
+        )
+        formation_anchor_present = any(
+            _formation_wide_evidence(
+                shot_size=item.shot_size,
+                formation_person_count_normalized=(
+                    item.formation_person_count_normalized
+                ),
+                formation_pose_coverage=item.formation_pose_coverage,
+                config=config,
+            )
+            for item in anchor_window
+        )
+        post_burst_formation_resets: set[int] = set()
+        for burst_right in burst_right_positions:
+            for candidate_position in range(burst_right + 1, len(selected)):
+                candidate = selected[candidate_position]
+                previous = selected[candidate_position - 1]
+                if (
+                    _formation_wide_evidence(
+                        shot_size=candidate.shot_size,
+                        formation_person_count_normalized=(
+                            candidate.formation_person_count_normalized
+                        ),
+                        formation_pose_coverage=(
+                            candidate.formation_pose_coverage
+                        ),
+                        config=config,
+                    )
+                    and previous.shot_size in _NONWIDE_SHOT_SIZES
+                    and previous.derivative_family_id
+                    != candidate.derivative_family_id
+                ):
+                    post_burst_formation_resets.add(candidate_position)
+                    break
+
+        strict_highlight = (
+            config.enforce_montage_grammar
+            and directive.role is SectionRole.CHORUS_LIKE
+            and directive.duration_seconds
+            >= config.highlight_minimum_duration_seconds
+        )
+        failures: list[str] = []
+        if strict_highlight:
+            if (
+                known_fraction + _TIME_EPSILON
+                < config.highlight_minimum_known_shot_fraction
+            ):
+                failures.append("highlight_shot_size_evidence_incomplete")
+            if (
+                float(support["closeup_supported_frame_fraction"])
+                + _TIME_EPSILON
+                < config.highlight_minimum_closeup_fraction
+            ):
+                failures.append("highlight_closeup_candidate_support_insufficient")
+            elif (
+                closeup_fraction + _TIME_EPSILON
+                < config.highlight_minimum_closeup_fraction
+            ):
+                failures.append("highlight_closeup_fraction_below_floor")
+            if (
+                float(support["nonwide_supported_frame_fraction"])
+                + _TIME_EPSILON
+                < config.highlight_minimum_nonwide_fraction
+            ):
+                failures.append("highlight_nonwide_candidate_support_insufficient")
+            elif nonwide_fraction + _TIME_EPSILON < (
+                config.highlight_minimum_nonwide_fraction
+            ):
+                failures.append("highlight_nonwide_fraction_below_floor")
+            if (
+                source_switch_boundaries > 0
+                and wide_involved_source_switch_fraction + _TIME_EPSILON
+                < config.highlight_minimum_wide_involved_source_switch_fraction
+            ):
+                failures.append(
+                    "highlight_wide_involved_source_switch_fraction_below_"
+                    "reference_floor"
+                )
+            if int(
+                support["multi_family_nonwide_supported_frame_count"]
+            ) < 2:
+                failures.append(
+                    "highlight_multi_source_nonwide_support_insufficient"
+                )
+            elif (
+                int(support["multi_family_nonwide_supported_frame_count"])
+                >= 2
+                and burst_boundaries
+                < config.highlight_minimum_nonwide_burst_boundaries
+            ):
+                failures.append("highlight_nonwide_burst_missing")
+            if (
+                burst_boundaries
+                >= config.highlight_minimum_nonwide_burst_boundaries
+                and len(post_burst_formation_resets)
+                < config.highlight_minimum_post_burst_formation_resets
+            ):
+                failures.append("post_burst_formation_wide_reset_missing")
+            if (
+                directive.establish_with_wide_shot
+                and not bool(support["early_wide_supported"])
+            ):
+                failures.append("formation_wide_candidate_support_insufficient")
+            elif (
+                directive.establish_with_wide_shot
+                and not generic_wide_anchor_present
+            ):
+                failures.append("formation_wide_anchor_missing")
+            elif (
+                directive.establish_with_wide_shot
+                and not bool(support["early_formation_wide_supported"])
+            ):
+                failures.append(
+                    "formation_wide_candidate_evidence_insufficient"
+                )
+            elif directive.establish_with_wide_shot and not formation_anchor_present:
+                failures.append("formation_wide_anchor_evidence_missing")
+        all_failures.extend(
+            f"section_{directive.section_index}:{value}" for value in failures
+        )
+        section_metrics.append(
+            {
+                "section_index": directive.section_index,
+                "role": directive.role.value,
+                "duration_seconds": directive.duration_seconds,
+                "strict_highlight_gate_applied": strict_highlight,
+                "selected_shot_count": len(selected),
+                "known_shot_size_count": len(known),
+                "known_shot_size_fraction": known_fraction,
+                "wide_shot_count": len(wides),
+                "wide_shot_fraction": wide_fraction,
+                "nonwide_shot_count": len(nonwides),
+                "nonwide_shot_fraction": nonwide_fraction,
+                "closeup_shot_count": len(closeups),
+                "closeup_shot_fraction": closeup_fraction,
+                "nonwide_burst_boundary_count": burst_boundaries,
+                "closeup_chain_boundary_count": closeup_chain_boundaries,
+                "source_switch_boundary_count": source_switch_boundaries,
+                "wide_involved_source_switch_boundary_count": (
+                    wide_involved_source_switch_boundaries
+                ),
+                "wide_involved_source_switch_fraction": (
+                    wide_involved_source_switch_fraction
+                ),
+                "formation_anchor_decision_window": (
+                    config.formation_anchor_decision_window
+                ),
+                "generic_wide_anchor_present": generic_wide_anchor_present,
+                "formation_wide_anchor_present": formation_anchor_present,
+                "post_burst_formation_wide_reset_count": len(
+                    post_burst_formation_resets
+                ),
+                "candidate_support": dict(support),
+                "failure_codes": failures,
+                "passed": not failures,
+            }
+        )
+    strict_chorus_present = any(
+        directive.role is SectionRole.CHORUS_LIKE
+        and directive.duration_seconds >= config.highlight_minimum_duration_seconds
+        for directive in section_plan.sections
+    )
+    if config.enforce_montage_grammar and strict_chorus_present:
+        if (
+            int(exact_anchor_metrics["missing_section_progress_decision_count"])
+            or int(exact_anchor_metrics["missing_section_role_decision_count"])
+        ):
+            all_failures.append("highlight_exact_section_progress_evidence_missing")
+        elif int(exact_anchor_metrics["section_role_plan_mismatch_count"]):
+            all_failures.append("highlight_exact_section_role_plan_mismatch")
+        elif not int(
+            exact_anchor_metrics["observed_chorus_section_early_anchor_count"]
+        ):
+            all_failures.append("highlight_early_wide_anchor_evidence_missing")
+        elif float(
+            exact_anchor_metrics["chorus_section_early_wide_anchor_fraction"]
+        ) + _TIME_EPSILON < config.highlight_minimum_early_wide_anchor_fraction:
+            all_failures.append(
+                "highlight_early_wide_anchor_fraction_below_reference_floor"
+            )
+        if int(exact_anchor_metrics["missing_phrase_progress_decision_count"]):
+            all_failures.append("highlight_exact_phrase_progress_evidence_missing")
+        elif not int(
+            exact_anchor_metrics["observed_chorus_phrase_entry_anchor_count"]
+        ):
+            all_failures.append("highlight_phrase_entry_wide_anchor_evidence_missing")
+        elif float(
+            exact_anchor_metrics["chorus_phrase_entry_wide_anchor_fraction"]
+        ) + _TIME_EPSILON < (
+            config.highlight_minimum_phrase_entry_wide_anchor_fraction
+        ):
+            all_failures.append(
+                "highlight_phrase_entry_wide_anchor_fraction_below_reference_floor"
+            )
+    return {
+        "schema_version": 1,
+        "contract": MONTAGE_GRAMMAR_CONTRACT,
+        "passed": not all_failures,
+        "failure_codes": all_failures,
+        "exact_anchor_metrics": exact_anchor_metrics,
+        "policy": {
+            "wide_shots": (
+                "formation_evidenced_anchor_and_post_burst_reset_not_full_"
+                "highlight_occupancy"
+            ),
+            "highlight_shots": (
+                "reference_closeup_and_wide_transition_floors_plus_explicit_"
+                "ive_product_nonwide_burst_requirement"
+            ),
+            "formation_evidence_semantics": (
+                "identity_free_nonzero_observed_person_and_pose_evidence_"
+                "not_proof_of_complete_group_formation"
+            ),
+            "insufficient_closeup_or_nonwide_candidates": (
+                "fail_before_render_instead_of_fabricating_a_flat_highlight"
+            ),
+            "learned_logits_remain_primary": True,
+            "chorus_wide_involved_family_switch_prior": {
+                "reference_p10_hard_floor": 0.37333333333333335,
+                "reference_median": 0.8,
+                "generic_wide_involved_switch_raw_bonus": 0.10,
+                "formation_evidenced_wide_additional_raw_bonus": 0.06,
+                "same_source_or_derivative_family_bonus": 0.0,
+                "applied_through_montage_grammar_weight": (
+                    config.montage_grammar_score_weight
+                ),
+            },
+        },
+        "thresholds": {
+            "highlight_minimum_duration_seconds": (
+                config.highlight_minimum_duration_seconds
+            ),
+            "highlight_minimum_known_shot_fraction": (
+                config.highlight_minimum_known_shot_fraction
+            ),
+            "highlight_minimum_closeup_fraction": (
+                config.highlight_minimum_closeup_fraction
+            ),
+            "highlight_minimum_nonwide_fraction": (
+                config.highlight_minimum_nonwide_fraction
+            ),
+            "highlight_minimum_wide_involved_source_switch_fraction": (
+                config.highlight_minimum_wide_involved_source_switch_fraction
+            ),
+            "highlight_minimum_early_wide_anchor_fraction": (
+                config.highlight_minimum_early_wide_anchor_fraction
+            ),
+            "highlight_minimum_phrase_entry_wide_anchor_fraction": (
+                config.highlight_minimum_phrase_entry_wide_anchor_fraction
+            ),
+            "highlight_burst_maximum_shot_seconds": (
+                config.highlight_burst_maximum_shot_seconds
+            ),
+            "highlight_minimum_nonwide_burst_boundaries": (
+                config.highlight_minimum_nonwide_burst_boundaries
+            ),
+            "formation_anchor_decision_window": (
+                config.formation_anchor_decision_window
+            ),
+            "minimum_formation_anchor_person_count_normalized": (
+                config.minimum_formation_anchor_person_count_normalized
+            ),
+            "highlight_minimum_post_burst_formation_resets": (
+                config.highlight_minimum_post_burst_formation_resets
+            ),
+        },
+        "sections": section_metrics,
+    }
+
+
 def _bounded_continuity_delta(left: float, right: float, scale: float) -> float:
     return min(1.0, abs(left - right) / scale)
 
@@ -1286,6 +2137,9 @@ def _build_stage_edit(
                     f"stageedit-semimarkov-r{rank:02d}-s{decision.shot_index:04d}"
                 ),
                 decision_confidence=decision.decision_confidence,
+                section_role=decision.section_role,
+                section_progress=decision.section_progress,
+                phrase_progress=decision.phrase_progress,
             )
         )
     boundaries = tuple(
@@ -1317,7 +2171,7 @@ def _build_stage_edit(
         output=_timeline_output_path(output, rank),
         candidate_history=(
             {
-                "decoder": "stage_edit_semimarkov_beam_v4",
+                "decoder": "stage_edit_semimarkov_beam_v5",
                 "timeline_rank": rank,
                 "checkpoint_path": checkpoint_path,
                 "score": state.score,
@@ -1552,6 +2406,13 @@ def decode_stage_edit_semimarkov_beam(
         derivative_family_ids,
         config,
     )
+    montage_support_by_section = _section_candidate_shot_support(
+        frames=frames,
+        source_metadata=normalized_metadata,
+        section_plan=section_plan,
+        derivative_family_ids=derivative_family_ids,
+        config=config,
+    )
     section_count = len(section_plan.sections)
     master_duration = section_plan.end_seconds - section_plan.start_seconds
     terminal_index = len(frames)
@@ -1690,6 +2551,11 @@ def decode_stage_edit_semimarkov_beam(
                     if not frame.effective_source_mask[source_index]:
                         reject("source_unavailable_or_hard_gated_at_start")
                         continue
+                    selected_continuity = (
+                        frame.source_continuity[source_index]
+                        if frame.source_continuity
+                        else StageEditSourceContinuity()
+                    )
                     span_rejection = _source_span_rejection(
                         source=metadata,
                         frames=frames,
@@ -1920,6 +2786,59 @@ def decode_stage_edit_semimarkov_beam(
                         occupancy_raw = -sum(
                             abs(value - occupancy_mean) for value in used_occupancy
                         ) / derivative_family_count
+                        previous_in_section = (
+                            state.decisions[-1]
+                            if state.decisions
+                            and _section_index_at_start(
+                                section_plan,
+                                state.decisions[-1].master_start_seconds,
+                            )
+                            == section_index
+                            else None
+                        )
+                        montage_grammar_raw = _montage_grammar_score_raw(
+                            directive=directive,
+                            shot_size=shot_size,
+                            start_seconds=start_time,
+                            duration_seconds=duration,
+                            previous_shot_size=(
+                                previous_in_section.shot_size
+                                if previous_in_section is not None
+                                else None
+                            ),
+                            previous_duration_seconds=(
+                                previous_in_section.duration_seconds
+                                if previous_in_section is not None
+                                else None
+                            ),
+                            derivative_family_source_switched=(
+                                previous_in_section is not None
+                                and previous_in_section.derivative_family_id
+                                != candidate_family
+                            ),
+                            previous_formation_wide_evidenced=(
+                                previous_in_section is not None
+                                and _formation_wide_evidence(
+                                    shot_size=previous_in_section.shot_size,
+                                    formation_person_count_normalized=(
+                                        previous_in_section
+                                        .formation_person_count_normalized
+                                    ),
+                                    formation_pose_coverage=(
+                                        previous_in_section
+                                        .formation_pose_coverage
+                                    ),
+                                    config=config,
+                                )
+                            ),
+                            formation_person_count_normalized=(
+                                selected_continuity.formation_person_count_normalized
+                            ),
+                            formation_pose_coverage=(
+                                selected_continuity.formation_pose_coverage
+                            ),
+                            config=config,
+                        )
                         components = (
                             _component("cut", cut_raw, config.cut_score_weight),
                             _component("source", source_raw, config.source_score_weight),
@@ -1956,6 +2875,11 @@ def decode_stage_edit_semimarkov_beam(
                                 "occupancy_balance",
                                 occupancy_raw,
                                 config.occupancy_balance_weight,
+                            ),
+                            _component(
+                                "montage_grammar",
+                                montage_grammar_raw,
+                                config.montage_grammar_score_weight,
                             ),
                         )
                         decision_score = sum(item.contribution for item in components)
@@ -2002,6 +2926,15 @@ def decode_stage_edit_semimarkov_beam(
                             source_index=source_index,
                             source_id=metadata.source_id,
                             shot_size=shot_size,
+                            detected_person_count_normalized=(
+                                selected_continuity.detected_person_count_normalized
+                            ),
+                            formation_person_count_normalized=(
+                                selected_continuity.formation_person_count_normalized
+                            ),
+                            formation_pose_coverage=(
+                                selected_continuity.formation_pose_coverage
+                            ),
                             duration_bucket=duration_bucket,
                             transition_label=transition_label,
                             crop_requested=requested_crop,
@@ -2024,6 +2957,9 @@ def decode_stage_edit_semimarkov_beam(
                             editorial_transform=editorial_transform,
                             dynamic_crop_decode=dynamic_crop_decode,
                             crop_contract=crop_contract,
+                            section_progress=frame.section_progress,
+                            phrase_progress=frame.phrase_progress,
+                            section_role=frame.section_role,
                         )
                         new_state = _BeamState(
                             current_index=end_index,
@@ -2062,14 +2998,39 @@ def decode_stage_edit_semimarkov_beam(
                                 ] += removed
                             beams[end_index] = unique
 
-    complete = sorted(beams[terminal_index], key=_state_sort_key)
-    endpoint_records[terminal_index]["incoming_state_count"] = len(complete)
-    if not complete:
+    raw_complete = sorted(beams[terminal_index], key=_state_sort_key)
+    endpoint_records[terminal_index]["incoming_state_count"] = len(raw_complete)
+    if not raw_complete:
         summary = ", ".join(
             f"{name}={count}" for name, count in sorted(rejection_counts.items())
         )
         raise StageEditNoValidTimelineError(
             "hard constraints eliminated every complete StageEdit timeline"
+            + (f": {summary}" if summary else "")
+        )
+
+    complete: list[_BeamState] = []
+    montage_rejected_count = 0
+    for state in raw_complete:
+        montage = _evaluate_montage_grammar(
+            decisions=state.decisions,
+            section_plan=section_plan,
+            support_by_section=montage_support_by_section,
+            config=config,
+        )
+        if not bool(montage["passed"]):
+            montage_rejected_count += 1
+            for failure in montage["failure_codes"]:
+                reason = str(failure).partition(":")[2] or str(failure)
+                reject(reason)
+            continue
+        complete.append(state)
+    if not complete:
+        summary = ", ".join(
+            f"{name}={count}" for name, count in sorted(rejection_counts.items())
+        )
+        raise StageEditNoValidTimelineError(
+            "montage grammar eliminated every complete StageEdit timeline"
             + (f": {summary}" if summary else "")
         )
 
@@ -2118,6 +3079,12 @@ def decode_stage_edit_semimarkov_beam(
                 edit=edit,
                 source_occupancy_seconds=state.source_occupancy_seconds,
                 recent_cut_density_per_minute=recent_density,
+                montage_grammar=_evaluate_montage_grammar(
+                    decisions=state.decisions,
+                    section_plan=section_plan,
+                    support_by_section=montage_support_by_section,
+                    config=config,
+                ),
                 derivative_family_occupancy_seconds=_family_occupancy(
                     state.source_occupancy_seconds,
                     derivative_family_ids,
@@ -2149,7 +3116,7 @@ def decode_stage_edit_semimarkov_beam(
             )
     audit = StageEditDecodeAudit(
         schema_version=DECODER_SCHEMA_VERSION,
-        decoder="stage_edit_semimarkov_beam_v4",
+        decoder="stage_edit_semimarkov_beam_v5",
         input_sha256=digest,
         readiness=readiness.to_dict(),
         config=asdict(config),
@@ -2157,10 +3124,11 @@ def decode_stage_edit_semimarkov_beam(
             "source_count": source_count,
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 2,
+                "supersedes": 4,
                 "reason": (
-                    "source diversity and occupancy are now verified "
-                    "derivative-family semantics"
+                    "source diversity/occupancy remain derivative-family "
+                    "semantics and complete timelines now carry an enforced "
+                    "highlight/formation montage grammar audit"
                 ),
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,
@@ -2182,6 +3150,14 @@ def decode_stage_edit_semimarkov_beam(
             "master_start_seconds": section_plan.start_seconds,
             "master_end_seconds": section_plan.end_seconds,
             "master_duration_seconds": master_duration,
+            "montage_grammar_contract": MONTAGE_GRAMMAR_CONTRACT,
+            "montage_grammar_candidate_support_by_section": [
+                dict(value) for value in montage_support_by_section
+            ],
+            "raw_complete_state_count_before_montage_grammar": len(raw_complete),
+            "montage_grammar_rejected_complete_state_count": (
+                montage_rejected_count
+            ),
             "token_schema_fingerprint": schema.fingerprint,
             "decision_history_owner": STAGE_EDIT_DECISION_HISTORY_OWNER,
             "owned_decision_history_state": [
@@ -2229,6 +3205,7 @@ def decode_stage_edit_semimarkov_beam(
 
 __all__ = [
     "DECODER_SCHEMA_VERSION",
+    "MONTAGE_GRAMMAR_CONTRACT",
     "StageEditBeamDecision",
     "StageEditBeamTimeline",
     "StageEditCheckpointNotReadyError",

@@ -26,6 +26,7 @@ from crosscut.stage_edit_semimarkov_beam import (
     StageEditSemiMarkovConfig,
     StageEditSourceContinuity,
     StageEditSourceMetadata,
+    _montage_grammar_score_raw,
     decode_stage_edit_semimarkov_beam,
     stage_edit_boundary_continuity_score,
 )
@@ -149,7 +150,33 @@ def _frames(
                 source_shot_sizes=tuple(
                     sizes[index % len(sizes)] for index in range(source_count)
                 ),
+                source_continuity=tuple(
+                    StageEditSourceContinuity(
+                        detected_person_count_normalized=(
+                            1.0
+                            if sizes[index % len(sizes)] in {"wide", "full"}
+                            else 2.0 / 6.0
+                        ),
+                        formation_person_count_normalized=(
+                            1.0
+                            if sizes[index % len(sizes)] in {"wide", "full"}
+                            else 0.0
+                        ),
+                        formation_pose_coverage=(
+                            5.0 / 6.0
+                            if sizes[index % len(sizes)] in {"wide", "full"}
+                            else 0.0
+                        ),
+                    )
+                    for index in range(source_count)
+                ),
                 candidate_id=f"beat-{time_index}",
+                section_progress=(time_index / max(1, duration - 1)),
+                # Exact serialized-token resets at indices 2 and 4.  This
+                # gives the professional phrase-entry gate real evidence in
+                # decoder tests instead of a wall-clock approximation.
+                phrase_progress=(time_index % 2) / 2.0,
+                section_role="chorus_like",
             )
         )
     return tuple(result)
@@ -179,6 +206,7 @@ def _decode(
             beam_width=16,
             timeline_count=8,
             minimum_unique_sources=3,
+            enforce_montage_grammar=False,
         ),
         aspect_ratio=AspectRatio.LANDSCAPE,
         width=1920,
@@ -200,6 +228,54 @@ def _assert_finite_tree(test: unittest.TestCase, value: object) -> None:
 
 
 class StageEditSemiMarkovBeamTests(unittest.TestCase):
+    @staticmethod
+    def _forced_frames(
+        source_sequence: tuple[int, ...],
+        *,
+        source_count: int = 6,
+    ) -> tuple[StageEditHeadFrame, ...]:
+        return tuple(
+            replace(
+                frame,
+                source_logits=tuple(
+                    20.0 if source_index == source_sequence[time_index] else -20.0
+                    for source_index in range(source_count)
+                ),
+            )
+            for time_index, frame in enumerate(
+                _frames(len(source_sequence), source_count)
+            )
+        )
+
+    def test_chorus_wide_involved_family_switch_has_small_bounded_prior(self) -> None:
+        directive = _section(0, 0.0, 6.0)
+        config = StageEditSemiMarkovConfig()
+
+        def score(*, switched: bool, formation: bool) -> float:
+            return _montage_grammar_score_raw(
+                directive=directive,
+                shot_size="medium",
+                start_seconds=3.0,
+                duration_seconds=1.0,
+                previous_shot_size="wide",
+                previous_duration_seconds=1.0,
+                derivative_family_source_switched=switched,
+                previous_formation_wide_evidenced=formation,
+                formation_person_count_normalized=0.0,
+                formation_pose_coverage=0.0,
+                config=config,
+            )
+
+        same_family = score(switched=False, formation=True)
+        generic_wide_switch = score(switched=True, formation=False)
+        formation_wide_switch = score(switched=True, formation=True)
+        self.assertAlmostEqual(0.10, generic_wide_switch - same_family)
+        self.assertAlmostEqual(0.06, formation_wide_switch - generic_wide_switch)
+        self.assertLess(
+            config.montage_grammar_score_weight * formation_wide_switch,
+            config.source_score_weight,
+        )
+
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
         return_value=_ready_report(),
@@ -448,9 +524,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             for decision in timeline.decisions:
                 self.assertGreaterEqual(decision.duration_seconds, 0.5)
                 self.assertLessEqual(decision.duration_seconds, 3.0)
-                self.assertEqual(10, len(decision.score_components))
+                self.assertEqual(11, len(decision.score_components))
                 self.assertIn(
                     "boundary_continuity",
+                    {item.name for item in decision.score_components},
+                )
+                self.assertIn(
+                    "montage_grammar",
                     {item.name for item in decision.score_components},
                 )
             self.assertTrue(
@@ -463,6 +543,315 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 )
             )
         _assert_finite_tree(self, first.to_dict())
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_all_wide_highlight_is_rejected_when_closeups_are_available(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 6.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        # 0=wide, 3=full, 5=wide.  Medium/close/extreme-close candidates are
+        # available at every beat, but a deliberately collapsed policy ranks
+        # only wides.  The professional grammar must fail instead of blessing
+        # the visually flat result.
+        frames = self._forced_frames((0, 3, 5, 0, 3, 5))
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_(closeup|nonwide)_fraction_below_floor",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 6.0),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_formation_anchor_then_short_closeup_burst_passes_and_is_audited(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 6.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        # wide anchor -> medium -> close, wide reset -> medium -> close.
+        frames = self._forced_frames((0, 1, 2, 3, 1, 2))
+        result = _decode(
+            duration=6,
+            source_count=6,
+            frames=frames,
+            metadata=_metadata(6, 6.0),
+            plan=plan,
+            config=StageEditSemiMarkovConfig(
+                beam_width=32,
+                timeline_count=8,
+                minimum_unique_sources=3,
+                enforce_montage_grammar=True,
+                maximum_global_switches_per_minute=60.0,
+            ),
+            constraints=(
+                StageEditSectionConstraint(
+                    section_index=0,
+                    minimum_shot_seconds=1.0,
+                    maximum_shot_seconds=1.0,
+                    maximum_switches_per_minute=60.0,
+                ),
+            ),
+        )
+
+        self.assertTrue(result.timelines)
+        grammar = result.timelines[0].montage_grammar
+        self.assertTrue(grammar["passed"])
+        self.assertEqual(
+            "ive_human_reference_wide_transition_floor_plus_"
+            "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
+            "highlight_burst_and_reset_v4",
+            grammar["contract"],
+        )
+        section = grammar["sections"][0]
+        self.assertTrue(section["formation_wide_anchor_present"])
+        self.assertGreaterEqual(section["closeup_shot_fraction"], 0.18)
+        self.assertGreaterEqual(section["nonwide_shot_fraction"], 0.35)
+        self.assertGreaterEqual(section["nonwide_burst_boundary_count"], 1)
+        self.assertGreaterEqual(
+            section["wide_involved_source_switch_fraction"],
+            0.37333333333333335,
+        )
+        self.assertIn("montage_grammar", result.timelines[0].score_components)
+        self.assertEqual(
+            0.8,
+            grammar["policy"]["chorus_wide_involved_family_switch_prior"][
+                "reference_median"
+            ],
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_two_shot_wide_to_close_highlight_cannot_bypass_burst_gate(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 6.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        frames = self._forced_frames((0, 1, 1, 2, 1, 1))
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_nonwide_burst_missing",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 6.0),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=2,
+                    enforce_montage_grammar=True,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=3.0,
+                        maximum_shot_seconds=3.0,
+                        maximum_switches_per_minute=20.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_unknown_in_first_three_consumes_exact_early_anchor_slot(
+        self, _mocked
+    ) -> None:
+        source_sequence = (1, 2, 4, 0, 3, 5)
+        frames = [
+            replace(
+                frame,
+                hard_source_gate_mask=tuple(
+                    source_index == source_sequence[time_index]
+                    for source_index in range(6)
+                ),
+            )
+            for time_index, frame in enumerate(
+                self._forced_frames(source_sequence)
+            )
+        ]
+        third = frames[2]
+        sizes = list(third.source_shot_sizes)
+        sizes[4] = "unknown"
+        frames[2] = replace(third, source_shot_sizes=tuple(sizes))
+
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_early_wide_anchor_fraction_below_reference_floor",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=tuple(frames),
+                metadata=_metadata(6, 6.0),
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_generic_wide_without_people_evidence_is_not_a_formation_anchor(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 6.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        frames = tuple(
+            replace(
+                frame,
+                source_continuity=tuple(
+                    StageEditSourceContinuity(
+                        detected_person_count_normalized=0.0,
+                        formation_person_count_normalized=0.0,
+                        formation_pose_coverage=0.0,
+                    )
+                    for _ in frame.source_continuity
+                ),
+            )
+            for frame in self._forced_frames((0, 1, 2, 3, 1, 2))
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "formation_wide_(candidate_evidence_insufficient|anchor_evidence_missing)",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 6.0),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_detected_person_without_formation_pose_is_not_an_anchor(
+        self, _mocked
+    ) -> None:
+        plan = SectionPlan(
+            (
+                replace(
+                    _section(0, 0.0, 6.0),
+                    establish_with_wide_shot=True,
+                ),
+            )
+        )
+        frames = tuple(
+            replace(
+                frame,
+                source_continuity=tuple(
+                    StageEditSourceContinuity(
+                        detected_person_count_normalized=1.0,
+                        formation_person_count_normalized=None,
+                        formation_pose_coverage=None,
+                    )
+                    for _ in frame.source_continuity
+                ),
+            )
+            for frame in self._forced_frames((0, 1, 2, 3, 1, 2))
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "formation_wide_(candidate_evidence_insufficient|anchor_evidence_missing)",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 6.0),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
+                    ),
+                ),
+            )
 
     def test_same_time_continuity_score_prefers_geometry_and_look_match(self) -> None:
         outgoing = StageEditSourceContinuity(
@@ -586,6 +975,7 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 timeline_count=32,
                 minimum_unique_sources=3,
                 maximum_global_switches_per_minute=30.0,
+                enforce_montage_grammar=False,
             ),
         )
         self.assertEqual(32, len(result.timelines))
@@ -714,13 +1104,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         result = _decode(frames=frames)
 
-        self.assertEqual(4, result.audit.schema_version)
+        self.assertEqual(7, result.audit.schema_version)
         self.assertEqual(
             "verified_derivative_family_not_file_source",
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            2,
+            4,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(

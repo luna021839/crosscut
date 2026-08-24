@@ -30,6 +30,7 @@ from .boundary_look_match import (
     verify_boundary_look_match_render_domain,
 )
 from .boundary_repair import BoundaryRepairConfig
+from .cut_local_sync import analyze_cut_local_sync
 from .audio import (
     DEFAULT_ANALYSIS_SAMPLE_RATE,
     AlignmentResult,
@@ -74,6 +75,10 @@ from .professional_reference_gate import ProfessionalReferenceProfile
 from .professional_reference_cadence import (
     ProfessionalReferenceCadenceProfile,
 )
+from .professional_montage_policy import (
+    ProfessionalMontagePolicy,
+    load_professional_montage_policy,
+)
 from .render import (
     RENDER_PLAN_SOURCE_INDEX_DOMAIN,
     RenderPlan,
@@ -97,7 +102,16 @@ from .rendered_candidate_selection import (
     RenderedCandidateSelection,
     review_rendered_candidates,
 )
-from .rendered_proxy_review import render_and_review_proxy
+from .rendered_proxy_review import (
+    PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS,
+    RenderedProxyReview,
+    render_and_review_proxy,
+)
+from .rendered_montage_grammar_review import (
+    EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT,
+    RenderedMontageGrammarConfig,
+    review_rendered_montage_grammar,
+)
 from .rhythm import RhythmAnalysis, analyze_rhythm
 from .section_director import SectionPlan, build_section_plan
 from .source_look_match import SourceLookMatchResult, analyze_source_look_match
@@ -126,6 +140,7 @@ from .stage_edit_pipeline_bridge import (
     preflight_stage_edit_pipeline_bridge,
     run_stage_edit_pipeline_bridge,
 )
+from .stage_edit_semimarkov_beam import StageEditSemiMarkovConfig
 from .stage_edit_production_registry import (
     RegisteredStageEditProductionBundle,
     discover_registered_stage_edit_production_bundle,
@@ -190,6 +205,10 @@ OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY = (
 AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT = (
     "automatic_registered_stage_edit_mandatory_post_render_qa_v1"
 )
+DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH = Path(
+    "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
+    "ive-professional-montage-grammar-v1.json"
+)
 _DIRECT_MEMBER_TARGET_RUN_SECONDS = 3.9
 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE = 13.5
 _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE = 17.5
@@ -229,7 +248,10 @@ def _enforce_automatic_stage_edit_post_render_qa(
         "등록된 StageEdit 최종 MP4를 전체 디코딩하고 "
         "전문 후처리 QA를 실행하는 중…"
     )
-    report, report_path = evaluate_and_write_post_render_qa(artifact_set)
+    report, report_path = evaluate_and_write_post_render_qa(
+        artifact_set,
+        trusted_registered_stage_edit=True,
+    )
     report_payload = report.to_dict()
     provenance = {
         "contract": AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
@@ -574,6 +596,12 @@ def _source_index_mapping(
             "render.final_segments[].request_source_index": REQUEST_SOURCE_INDEX_DOMAIN,
             "render.final_source_usage.used_source_indices[]": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
             "render.final_source_usage.sources[].source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.used_source_indices[]": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.source_decode_audit[].source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.per_boundary[].outgoing_source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.per_boundary[].incoming_source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.per_boundary[].renderer_frame_selection.outgoing.source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+            "render.cut_local_sync.per_boundary[].renderer_frame_selection.incoming.source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
             "render.editorial_motion.segments[].source_index": ELIGIBLE_SOURCE_INDEX_DOMAIN,
             "render.source_look_match.evidence[].source_index": ELIGIBLE_SOURCE_INDEX_DOMAIN,
             "render.source_look_match.target_source_index": ELIGIBLE_SOURCE_INDEX_DOMAIN,
@@ -2702,6 +2730,7 @@ class _GroupRenderCandidateBundle:
     diagnostics: tuple[str, ...] = ()
     candidate_origin: str = "ordinary_visual_baseline"
     candidate_lineage: tuple[dict[str, Any], ...] = ()
+    stage_edit_exact_shot_clock: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2752,6 +2781,11 @@ class _GroupRenderCandidateBundle:
             "candidate_lineage": [
                 dict(item) for item in self.candidate_lineage
             ],
+            "stage_edit_exact_shot_clock": (
+                deepcopy(dict(self.stage_edit_exact_shot_clock))
+                if self.stage_edit_exact_shot_clock is not None
+                else None
+            ),
         }
 
 
@@ -2793,7 +2827,10 @@ def _apply_stage_edit_candidate_render_contract(
             }
         )
     )
-    lineage = materialized.lineage + (
+    stripped_materialized_lineage, superseded_clock_hashes = (
+        _strip_superseded_exact_stage_edit_shot_clocks(materialized.lineage)
+    )
+    lineage = stripped_materialized_lineage + (
         {
             "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
             "stage": "dynamic_crop_v2_render_plan_overlay",
@@ -2805,6 +2842,9 @@ def _apply_stage_edit_candidate_render_contract(
                 face_dissolve_alignment_segments
             ),
             "deterministic_render_plan_validation_passed": True,
+            "superseded_candidate_history_exact_shot_clock_sha256": list(
+                superseded_clock_hashes
+            ),
         },
     )
     return replace(
@@ -2815,6 +2855,9 @@ def _apply_stage_edit_candidate_render_contract(
         + ("stage_edit_dynamic_crop_v2_render_contract_applied",),
         candidate_origin="explicit_stage_edit_generation",
         candidate_lineage=lineage,
+        stage_edit_exact_shot_clock=_stage_edit_exact_shot_clock_from_edit(
+            materialized.retained_candidate.edit
+        ),
     )
 
 
@@ -3114,6 +3157,143 @@ def _derive_complete_group_candidate(
     )
 
 
+def _stage_edit_montage_analysis_payload(
+    *,
+    bundle: _GroupRenderCandidateBundle,
+    proxy_review_payload: Mapping[str, Any],
+    section_plan: SectionPlan,
+    source_derivative_diversity: SourceDerivativeDiversityResult,
+    source_index_mapping: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one decoded proxy to its complete learned edit and source domains."""
+
+    plan_payload = bundle.render_plan.to_json()
+    exact_clock_value = getattr(bundle, "stage_edit_exact_shot_clock", None)
+    if not isinstance(exact_clock_value, Mapping):
+        raise RuntimeError(
+            "StageEdit rendered montage review requires the final edit's exact "
+            "serialized-token shot clock"
+        )
+    exact_clock = deepcopy(dict(exact_clock_value))
+    if exact_clock.get("contract") != EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT:
+        raise RuntimeError("StageEdit exact serialized-token shot clock changed")
+    return {
+        "section_plan": section_plan.to_dict(),
+        "visual_timeline": _with_index_domain(
+            bundle.visual_timeline.to_dict(),
+            ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ),
+        "source_derivative_diversity": _with_index_domain(
+            source_derivative_diversity.to_dict(),
+            ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        ),
+        "source_index_mapping": deepcopy(dict(source_index_mapping)),
+        "stage_edit_exact_shot_clock": exact_clock,
+        "editorial_motion": (
+            bundle.editorial_motion_plan.to_dict()
+            if bundle.editorial_motion_plan is not None
+            else None
+        ),
+        # Dynamic Crop v2 is attached directly to RenderSegment after the
+        # ordinary editorial-motion plan is intentionally discarded.
+        "render": {
+            "segments": deepcopy(plan_payload["segments"]),
+            "transitions": deepcopy(plan_payload["transitions"]),
+            "master_audio_start": plan_payload["master_audio_start"],
+            "fps": plan_payload["fps"],
+        },
+        "rendered_proxy_review": deepcopy(dict(proxy_review_payload)),
+    }
+
+
+def _stage_edit_exact_shot_clock_from_edit(edit: StageEdit) -> dict[str, Any]:
+    """Serialize the final edit's exact shot clock, including repaired shots."""
+
+    shots: list[dict[str, Any]] = []
+    for position, shot in enumerate(edit.shots):
+        if shot.shot_index != position:
+            raise RuntimeError("StageEdit exact shot clock indices changed")
+        if (
+            shot.section_role is None
+            or shot.section_progress is None
+            or shot.phrase_progress is None
+        ):
+            raise RuntimeError(
+                "StageEdit final shot lacks exact serialized-token music structure"
+            )
+        shots.append(
+            {
+                "shot_index": shot.shot_index,
+                "source_index": shot.segment.source_index,
+                "section_role": shot.section_role,
+                "section_progress": shot.section_progress,
+                "phrase_progress": shot.phrase_progress,
+            }
+        )
+    return {
+        "contract": EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT,
+        "source_index_domain": ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        "shots": shots,
+    }
+
+
+def _strip_superseded_exact_stage_edit_shot_clocks(
+    lineage: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
+    """Keep repair provenance without retaining two authoritative clocks."""
+
+    stripped: list[dict[str, Any]] = []
+    superseded_hashes: list[str] = []
+    for raw in lineage:
+        item = deepcopy(dict(raw))
+        exact = item.pop("exact_music_structure_shot_clock", None)
+        if exact is not None:
+            if not isinstance(exact, Mapping):
+                raise RuntimeError("superseded StageEdit shot clock is malformed")
+            encoded = json.dumps(
+                exact,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            superseded_hashes.append(digest)
+            item["superseded_exact_music_structure_shot_clock"] = {
+                "sha256": digest,
+                "authoritative": False,
+                "reason": "replaced_by_accepted_windowed_semimarkov_redecode",
+            }
+        stripped.append(item)
+    return tuple(stripped), tuple(superseded_hashes)
+
+
+def _review_stage_edit_bundle_montage(
+    *,
+    bundle: _GroupRenderCandidateBundle,
+    proxy_review_payload: Mapping[str, Any],
+    section_plan: SectionPlan,
+    source_derivative_diversity: SourceDerivativeDiversityResult,
+    source_index_mapping: Mapping[str, Any],
+    config: RenderedMontageGrammarConfig,
+    reference_profile: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    analysis = _stage_edit_montage_analysis_payload(
+        bundle=bundle,
+        proxy_review_payload=proxy_review_payload,
+        section_plan=section_plan,
+        source_derivative_diversity=source_derivative_diversity,
+        source_index_mapping=source_index_mapping,
+    )
+    review = review_rendered_montage_grammar(
+        analysis,
+        render_plan=bundle.render_plan.to_json(),
+        config=config,
+    )
+    review["reference_profile"] = deepcopy(dict(reference_profile))
+    return review, analysis
+
+
 def _review_complete_group_candidates(
     candidates: Sequence[_GroupRenderCandidateBundle],
     *,
@@ -3124,8 +3304,39 @@ def _review_complete_group_candidates(
         ProfessionalReferenceCadenceProfile | None
     ) = None,
     learned_reviewer_session: LearnedReviewerProductionSession | None = None,
+    stage_edit_montage_section_plan: SectionPlan | None = None,
+    stage_edit_source_derivative_diversity: (
+        SourceDerivativeDiversityResult | None
+    ) = None,
+    stage_edit_source_index_mapping: Mapping[str, Any] | None = None,
+    stage_edit_montage_config: RenderedMontageGrammarConfig | None = None,
+    stage_edit_montage_reference_profile: Mapping[str, Any] | None = None,
 ) -> RenderedCandidateSelection:
     """Rank complete bundles with actual decoded proxies, never metadata only."""
+
+    stage_edit_candidates = tuple(
+        item
+        for item in candidates
+        if getattr(item, "candidate_origin", "ordinary_visual_baseline")
+        == "explicit_stage_edit_generation"
+    )
+    stage_edit_montage_required = bool(stage_edit_candidates)
+    if stage_edit_montage_required:
+        if len(stage_edit_candidates) != len(candidates):
+            raise ValueError(
+                "StageEdit proxy review cannot mix learned and baseline candidates"
+            )
+        if (
+            stage_edit_montage_section_plan is None
+            or stage_edit_source_derivative_diversity is None
+            or stage_edit_source_index_mapping is None
+            or stage_edit_montage_config is None
+            or stage_edit_montage_reference_profile is None
+        ):
+            raise ValueError(
+                "StageEdit decoded candidates require montage grammar, source-family, "
+                "index-domain, and immutable reference-profile evidence"
+            )
 
     rendered = tuple(
         RenderedCandidate(
@@ -3148,17 +3359,52 @@ def _review_complete_group_candidates(
         )
         for item in candidates
     )
-    render_review = render_and_review_proxy
-    if professional_reference_profile is not None:
-        def render_review(
-            plan: RenderPlan,
-            proxy_output: Path,
-        ) -> Any:
-            return render_and_review_proxy(
-                plan,
-                proxy_output,
-                professional_reference_profile=professional_reference_profile,
+    bundles_by_plan_identity = {
+        id(item.render_plan): item for item in candidates
+    }
+
+    def render_review(
+        plan: RenderPlan,
+        proxy_output: Path,
+    ) -> Any:
+        proxy_plan, review = render_and_review_proxy(
+            plan,
+            proxy_output,
+            professional_reference_profile=professional_reference_profile,
+        )
+        if not stage_edit_montage_required:
+            return proxy_plan, review
+        bundle = bundles_by_plan_identity.get(id(plan))
+        if bundle is None:
+            raise ValueError(
+                "decoded StageEdit proxy plan is not bound to one candidate bundle"
             )
+        assert stage_edit_montage_section_plan is not None
+        assert stage_edit_source_derivative_diversity is not None
+        assert stage_edit_source_index_mapping is not None
+        assert stage_edit_montage_config is not None
+        assert stage_edit_montage_reference_profile is not None
+        payload = deepcopy(review.payload)
+        technical_passed = bool(payload.get("passed"))
+        montage_review, _montage_analysis = _review_stage_edit_bundle_montage(
+            bundle=bundle,
+            proxy_review_payload=payload,
+            section_plan=stage_edit_montage_section_plan,
+            source_derivative_diversity=(
+                stage_edit_source_derivative_diversity
+            ),
+            source_index_mapping=stage_edit_source_index_mapping,
+            config=stage_edit_montage_config,
+            reference_profile=stage_edit_montage_reference_profile,
+        )
+        payload["technical_proxy_passed_before_montage_grammar"] = (
+            technical_passed
+        )
+        payload["rendered_montage_grammar_review"] = montage_review
+        payload["passed"] = bool(
+            technical_passed and montage_review.get("passed") is True
+        )
+        return proxy_plan, RenderedProxyReview(payload)
 
     return review_rendered_candidates(
         rendered,
@@ -3737,17 +3983,508 @@ def _stage_edit_boundary_issues(
     return tuple(result)
 
 
+_STAGE_EDIT_PERCEPTUAL_REPAIR_INDEX_SOURCE_FIELD = (
+    "perceptual_source_admission.admission."
+    "repair_target_boundary_indices"
+)
+_STAGE_EDIT_PERCEPTUAL_SOURCE_INDEX_DOMAIN = RENDER_PLAN_SOURCE_INDEX_DOMAIN
+_STAGE_EDIT_PERCEPTUAL_BOUNDARY_INDEX_DOMAIN = (
+    "render_plan_transition_index"
+)
+_STAGE_EDIT_PERCEPTUAL_PASS_BONUS = 101.0
+_STAGE_EDIT_PERCEPTUAL_SOURCE_SUBSTITUTION_ANALYSIS_BASIS = (
+    "targeted_perceptual_source_sequence_substitution_v1"
+)
+
+
+def _stage_edit_source_path_in_window(
+    edit: StageEdit,
+    *,
+    start_seconds: float,
+    end_seconds: float,
+) -> tuple[int, ...]:
+    path: list[int] = []
+    for shot in edit.shots:
+        shot_start = edit.master_audio_start + shot.segment.master_start
+        shot_end = shot_start + shot.segment.duration
+        if (
+            shot_end <= start_seconds + 1e-6
+            or shot_start >= end_seconds - 1e-6
+        ):
+            continue
+        source_index = shot.segment.source_index
+        if not path or path[-1] != source_index:
+            path.append(source_index)
+    if not path:
+        raise ValueError(
+            "StageEdit perceptual target window has no candidate source path"
+        )
+    return tuple(path)
+
+
+def _stage_edit_targeted_source_substitution_evidence(
+    original: StageEdit,
+    candidate: StageEdit,
+    boundary_indices: Sequence[int],
+) -> dict[str, Any]:
+    """Prove a repair changed source decisions, not only cut/crop timing."""
+
+    raw_indices = tuple(boundary_indices)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(original.boundaries)
+        for value in raw_indices
+    ):
+        raise ValueError(
+            "StageEdit perceptual substitution target index is invalid"
+        )
+    normalized_indices = tuple(sorted(set(raw_indices)))
+    if (
+        tuple(Path(value).expanduser().resolve() for value in original.sources)
+        != tuple(Path(value).expanduser().resolve() for value in candidate.sources)
+    ):
+        raise ValueError(
+            "StageEdit perceptual substitution candidate changed its source list"
+        )
+    if (
+        not math.isclose(
+            original.master_audio_start,
+            candidate.master_audio_start,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            original.duration_seconds,
+            candidate.duration_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise ValueError(
+            "StageEdit perceptual substitution candidate changed the master range"
+        )
+    original_full_source_path = tuple(
+        shot.segment.source_index for shot in original.shots
+    )
+    candidate_full_source_path = tuple(
+        shot.segment.source_index for shot in candidate.shots
+    )
+    global_source_sequence_changed = (
+        candidate_full_source_path != original_full_source_path
+    )
+
+    windows: list[dict[str, Any]] = []
+    substituted_indices: list[int] = []
+    for boundary_index in normalized_indices:
+        outgoing = original.shots[boundary_index].segment
+        incoming = original.shots[boundary_index + 1].segment
+        start_seconds = original.master_audio_start + outgoing.master_start
+        end_seconds = (
+            original.master_audio_start
+            + incoming.master_start
+            + incoming.duration
+        )
+        original_path = _stage_edit_source_path_in_window(
+            original,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        candidate_path = _stage_edit_source_path_in_window(
+            candidate,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        window_path_changed = candidate_path != original_path
+        substituted = bool(
+            global_source_sequence_changed and window_path_changed
+        )
+        if substituted:
+            substituted_indices.append(boundary_index)
+        windows.append(
+            {
+                "boundary_index": boundary_index,
+                "boundary_index_domain": (
+                    _STAGE_EDIT_PERCEPTUAL_BOUNDARY_INDEX_DOMAIN
+                ),
+                "window_start_seconds": start_seconds,
+                "window_end_seconds": end_seconds,
+                "original_stage_edit_source_path": list(original_path),
+                "candidate_stage_edit_source_path": list(candidate_path),
+                "source_index_domain": ELIGIBLE_SOURCE_INDEX_DOMAIN,
+                "window_collapsed_source_path_changed": window_path_changed,
+                "source_sequence_substituted": substituted,
+            }
+        )
+    required = bool(normalized_indices)
+    satisfied = bool(substituted_indices) if required else True
+    return {
+        "analysis_basis": (
+            _STAGE_EDIT_PERCEPTUAL_SOURCE_SUBSTITUTION_ANALYSIS_BASIS
+        ),
+        "required": required,
+        "satisfied": satisfied,
+        "global_source_sequence_changed": global_source_sequence_changed,
+        "original_full_stage_edit_source_path": list(
+            original_full_source_path
+        ),
+        "candidate_full_stage_edit_source_path": list(
+            candidate_full_source_path
+        ),
+        "target_boundary_indices": list(normalized_indices),
+        "substituted_target_boundary_indices": substituted_indices,
+        "target_window_policy": (
+            "collapsed_source_path_over_original_two_shots_touching_boundary"
+        ),
+        "timing_or_crop_only_change_counts_as_substitution": False,
+        "serialized_media_paths": False,
+        "windows": windows,
+    }
+
+
+def _stage_edit_perceptual_repair_targets(
+    edit: StageEdit,
+    review_payload: Mapping[str, Any] | None,
+    *,
+    required: bool = False,
+    review_render_plan: RenderPlan | None = None,
+) -> tuple[tuple[int, ...], dict[str, Any]]:
+    """Strict-load scalar-only perceptual repair targets for one StageEdit.
+
+    Older/synthetic review payloads may omit this newly-added evidence.  Once
+    the initial selected proxy supplies it, however, every proposal review must
+    supply the same contract; silently falling back to timing-only evidence
+    would let a source-pumping candidate bypass the decoded gate.
+    """
+
+    audit: dict[str, Any] = {
+        "available": False,
+        "required_for_proposal_reviews": bool(required),
+        "index_source_field": (
+            _STAGE_EDIT_PERCEPTUAL_REPAIR_INDEX_SOURCE_FIELD
+        ),
+        "source_index_domain": None,
+        "stage_edit_source_index_domain": ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        "boundary_index_domain": None,
+        "review_render_plan_supplied_explicitly": (
+            review_render_plan is not None
+        ),
+        "admission_passed": None,
+        "reason_codes": [],
+        "reported_boundary_indices": [],
+        "used_boundary_indices": [],
+        "boundary_source_pairs": [],
+        "selection_penalty_points": None,
+        "weighted_score_before_perceptual_admission": None,
+        "penalized_weighted_score": None,
+        "decoded_pass_bonus_points": _STAGE_EDIT_PERCEPTUAL_PASS_BONUS,
+        "decoded_selection_gate": (
+            "admission_pass_first_bonus_101_then_penalized_weighted_score"
+        ),
+    }
+    if review_payload is None or "perceptual_source_admission" not in review_payload:
+        if required:
+            raise ValueError(
+                "StageEdit proposal review is missing required scalar payload "
+                "perceptual_source_admission"
+            )
+        return (), audit
+
+    raw_source_admission = review_payload["perceptual_source_admission"]
+    if not isinstance(raw_source_admission, Mapping):
+        raise ValueError(
+            "StageEdit perceptual_source_admission must be an object"
+        )
+    if (
+        raw_source_admission.get("analysis_basis")
+        != PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS
+    ):
+        raise ValueError(
+            "StageEdit perceptual_source_admission analysis_basis is invalid"
+        )
+    if raw_source_admission.get("raw_frames_persisted") is not False:
+        raise ValueError(
+            "StageEdit perceptual_source_admission must declare "
+            "raw_frames_persisted=false"
+        )
+    if raw_source_admission.get("original_pixels_serialized") is not False:
+        raise ValueError(
+            "StageEdit perceptual_source_admission must declare "
+            "original_pixels_serialized=false"
+        )
+
+    raw_domains = raw_source_admission.get("index_domains")
+    if not isinstance(raw_domains, Mapping):
+        raise ValueError(
+            "StageEdit perceptual_source_admission index_domains must be an object"
+        )
+    source_index_domain = raw_domains.get("source_index")
+    boundary_index_domain = raw_domains.get("boundary_index")
+    if source_index_domain != _STAGE_EDIT_PERCEPTUAL_SOURCE_INDEX_DOMAIN:
+        raise ValueError(
+            "StageEdit perceptual source_index domain does not match the "
+            "render-plan sources-array contract"
+        )
+    if boundary_index_domain != _STAGE_EDIT_PERCEPTUAL_BOUNDARY_INDEX_DOMAIN:
+        raise ValueError(
+            "StageEdit perceptual boundary_index domain does not match the "
+            "render-plan transition contract"
+        )
+
+    raw_admission = raw_source_admission.get("admission")
+    if not isinstance(raw_admission, Mapping):
+        raise ValueError(
+            "StageEdit perceptual_source_admission.admission must be an object"
+        )
+    admission_passed = raw_admission.get("passed")
+    if not isinstance(admission_passed, bool):
+        raise ValueError(
+            "StageEdit perceptual admission passed must be a boolean"
+        )
+    raw_reason_codes = raw_admission.get("reason_codes")
+    if (
+        not isinstance(raw_reason_codes, list)
+        or any(
+            not isinstance(value, str) or not value.strip()
+            for value in raw_reason_codes
+        )
+        or len(set(raw_reason_codes)) != len(raw_reason_codes)
+    ):
+        raise ValueError(
+            "StageEdit perceptual admission reason_codes must be unique "
+            "non-blank strings"
+        )
+    if admission_passed != (not raw_reason_codes):
+        raise ValueError(
+            "StageEdit perceptual admission passed/reason_codes disagree"
+        )
+    overall_passed = review_payload.get("passed")
+    if not isinstance(overall_passed, bool):
+        raise ValueError("StageEdit decoded proxy passed must be a boolean")
+    if not admission_passed and overall_passed:
+        raise ValueError(
+            "StageEdit decoded proxy cannot pass a failed perceptual admission"
+        )
+
+    raw_indices = raw_admission.get("repair_target_boundary_indices")
+    if not isinstance(raw_indices, list):
+        raise ValueError(
+            "StageEdit perceptual repair target boundary indices must be an array"
+        )
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(edit.boundaries)
+            for value in raw_indices
+        )
+        or raw_indices != sorted(set(raw_indices))
+    ):
+        raise ValueError(
+            "StageEdit perceptual repair target boundary indices must be "
+            "sorted unique in-range integers"
+        )
+    if not admission_passed and not raw_indices:
+        raise ValueError(
+            "StageEdit failing perceptual admission must identify at least "
+            "one repair target boundary"
+        )
+    checked_review_plan = (
+        review_render_plan
+        if review_render_plan is not None
+        else edit.to_render_plan()
+    )
+    if not isinstance(checked_review_plan, RenderPlan):
+        raise TypeError("StageEdit perceptual review_render_plan must be a RenderPlan")
+    if (
+        len(checked_review_plan.segments) != len(edit.shots)
+        or len(checked_review_plan.transitions) != len(edit.boundaries)
+    ):
+        raise ValueError(
+            "StageEdit perceptual review RenderPlan does not preserve the "
+            "one-shot/one-transition index contract"
+        )
+    segment_source_translation: list[tuple[int, int]] = []
+    for shot, render_segment in zip(
+        edit.shots,
+        checked_review_plan.segments,
+        strict=True,
+    ):
+        stage_edit_source_index = shot.segment.source_index
+        render_plan_source_index = render_segment.source_index
+        if (
+            Path(edit.sources[stage_edit_source_index]).expanduser().resolve()
+            != Path(
+                checked_review_plan.sources[render_plan_source_index]
+            ).expanduser().resolve()
+        ):
+            raise ValueError(
+                "StageEdit perceptual review RenderPlan source mapping does "
+                "not match the StageEdit media identity"
+            )
+        segment_source_translation.append(
+            (stage_edit_source_index, render_plan_source_index)
+        )
+
+    source_pairs: list[dict[str, int | str]] = []
+    for boundary_index in raw_indices:
+        outgoing_stage_edit_index, outgoing_render_plan_index = (
+            segment_source_translation[boundary_index]
+        )
+        incoming_stage_edit_index, incoming_render_plan_index = (
+            segment_source_translation[boundary_index + 1]
+        )
+        if (
+            outgoing_stage_edit_index == incoming_stage_edit_index
+            or outgoing_render_plan_index == incoming_render_plan_index
+        ):
+            raise ValueError(
+                "StageEdit perceptual repair target does not identify a "
+                "cross-source boundary"
+            )
+        source_pairs.append(
+            {
+                "boundary_index": boundary_index,
+                "boundary_index_domain": (
+                    _STAGE_EDIT_PERCEPTUAL_BOUNDARY_INDEX_DOMAIN
+                ),
+                "outgoing_render_plan_source_index": (
+                    outgoing_render_plan_index
+                ),
+                "incoming_render_plan_source_index": (
+                    incoming_render_plan_index
+                ),
+                "render_plan_source_index_domain": (
+                    RENDER_PLAN_SOURCE_INDEX_DOMAIN
+                ),
+                "outgoing_stage_edit_source_index": (
+                    outgoing_stage_edit_index
+                ),
+                "incoming_stage_edit_source_index": (
+                    incoming_stage_edit_index
+                ),
+                "stage_edit_source_index_domain": (
+                    ELIGIBLE_SOURCE_INDEX_DOMAIN
+                ),
+            }
+        )
+
+    def finite_number(value: Any, field: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"StageEdit {field} must be a finite number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"StageEdit {field} must be a finite number"
+            ) from exc
+        if not math.isfinite(number):
+            raise ValueError(f"StageEdit {field} must be a finite number")
+        return number
+
+    selection_penalty = finite_number(
+        raw_admission.get("selection_penalty_points"),
+        "perceptual admission selection_penalty_points",
+    )
+    mirrored_penalty = finite_number(
+        review_payload.get("perceptual_source_admission_penalty_points"),
+        "perceptual_source_admission_penalty_points",
+    )
+    weighted_score_before = finite_number(
+        review_payload.get(
+            "weighted_score_before_perceptual_source_admission"
+        ),
+        "weighted_score_before_perceptual_source_admission",
+    )
+    weighted_score = finite_number(
+        review_payload.get("weighted_score"),
+        "perceptual admission penalized weighted_score",
+    )
+    if not 0.0 <= selection_penalty <= 20.0:
+        raise ValueError(
+            "StageEdit perceptual admission selection penalty is out of range"
+        )
+    if not math.isclose(selection_penalty, mirrored_penalty, abs_tol=1e-9):
+        raise ValueError(
+            "StageEdit perceptual admission selection penalty mirror disagrees"
+        )
+    if not 0.0 <= weighted_score_before <= 100.0:
+        raise ValueError(
+            "StageEdit weighted score before perceptual admission is out of range"
+        )
+    if not 0.0 <= weighted_score <= 100.0:
+        raise ValueError(
+            "StageEdit perceptual admission penalized weighted_score is out of range"
+        )
+    if not math.isclose(
+        weighted_score,
+        max(0.0, weighted_score_before - selection_penalty),
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "StageEdit perceptual admission weighted score/penalty disagree"
+        )
+    if admission_passed and not math.isclose(
+        selection_penalty,
+        0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "StageEdit passing perceptual admission cannot retain a selection penalty"
+        )
+    if not admission_passed and selection_penalty <= 0.0:
+        raise ValueError(
+            "StageEdit failing perceptual admission must carry a positive "
+            "selection penalty"
+        )
+
+    used_indices = tuple(raw_indices) if not admission_passed else ()
+    audit.update(
+        {
+            "available": True,
+            "source_index_domain": source_index_domain,
+            "boundary_index_domain": boundary_index_domain,
+            "admission_passed": admission_passed,
+            "reason_codes": list(raw_reason_codes),
+            "reported_boundary_indices": list(raw_indices),
+            "used_boundary_indices": list(used_indices),
+            "boundary_source_pairs": source_pairs,
+            "selection_penalty_points": selection_penalty,
+            "weighted_score_before_perceptual_admission": (
+                weighted_score_before
+            ),
+            "penalized_weighted_score": weighted_score,
+        }
+    )
+    return used_indices, audit
+
+
 def _stage_edit_proxy_repair_review(
     edit: StageEdit,
     review_payload: Mapping[str, Any] | None,
+    *,
+    require_perceptual_source_admission: bool = False,
+    review_render_plan: RenderPlan | None = None,
 ) -> StageEditRepairReview:
+    (
+        perceptual_issue_indices,
+        perceptual_admission_audit,
+    ) = _stage_edit_perceptual_repair_targets(
+        edit,
+        review_payload,
+        required=require_perceptual_source_admission,
+        review_render_plan=review_render_plan,
+    )
     if review_payload is None:
         return StageEditRepairReview(
             decoded_objective=-1_000_000.0,
             professional_objective=-1_000_000.0,
             cadence_objective=-1_000_000.0,
             technical_errors=("decoded_proxy_review_unavailable",),
-            audit={"decoded_proxy_review_available": False},
+            audit={
+                "decoded_proxy_review_available": False,
+                "perceptual_source_admission": perceptual_admission_audit,
+            },
         )
 
     def finite_metric(value: Any, fallback: float) -> float:
@@ -3766,6 +4503,14 @@ def _stage_edit_proxy_repair_review(
     weighted_score = finite_metric(
         review_payload.get("weighted_score"),
         -1_000_000.0,
+    )
+    decoded_objective = weighted_score + (
+        _STAGE_EDIT_PERCEPTUAL_PASS_BONUS
+        if (
+            perceptual_admission_audit["available"]
+            and perceptual_admission_audit["admission_passed"] is True
+        )
+        else 0.0
     )
     visible_p10 = finite_metric(visible_payload.get("p10"), weighted_score)
     professional_objective = finite_metric(
@@ -3814,21 +4559,34 @@ def _stage_edit_proxy_repair_review(
         if isinstance(raw_issue_indices, (list, tuple))
         else ()
     )
+    visible_issues = _stage_edit_boundary_issues(
+        edit,
+        issue_indices,
+        prefix="decoded-proxy",
+        causes=("decoded_proxy_visible_boundary_failure",),
+    )
+    perceptual_issues = _stage_edit_boundary_issues(
+        edit,
+        perceptual_issue_indices,
+        prefix="decoded-proxy-perceptual-source-admission",
+        causes=("decoded_proxy_perceptual_source_admission_failure",),
+    )
     return StageEditRepairReview(
-        decoded_objective=weighted_score,
+        decoded_objective=decoded_objective,
         professional_objective=professional_objective,
         cadence_objective=cadence_objective,
         technical_errors=technical,
-        issue_windows=_stage_edit_boundary_issues(
-            edit,
-            issue_indices,
-            prefix="decoded-proxy",
-            causes=("decoded_proxy_visible_boundary_failure",),
-        ),
+        issue_windows=visible_issues + perceptual_issues,
         audit={
             "decoded_proxy_review_available": True,
             "decoded_proxy_passed": bool(review_payload.get("passed")),
             "weighted_score": weighted_score,
+            "decoded_objective": decoded_objective,
+            "decoded_objective_gate": (
+                "perceptual_admission_pass_first_bonus_101_then_"
+                "penalized_weighted_score"
+            ),
+            "perceptual_source_admission": perceptual_admission_audit,
             "professional_or_visible_p10": professional_objective,
             "source_switches_per_minute": switches_per_minute,
             "target_source_switches_per_minute": (
@@ -3876,6 +4634,7 @@ def _attempt_stage_edit_windowed_beam_reedit(
     base_retained = selected_materialized.retained_candidate
     base_edit = base_retained.edit
     deterministic_indices: tuple[int, ...] = ()
+    ignored_deterministic_indices: list[Any] = []
     if original_review_payload is not None:
         raw = original_review_payload.get(
             "partial_reedit_boundary_issue_indices",
@@ -3883,10 +4642,33 @@ def _attempt_stage_edit_windowed_beam_reedit(
         )
         if isinstance(raw, list):
             deterministic_indices = tuple(
+                sorted(
+                    {
+                        value
+                        for value in raw
+                        if isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value < len(base_edit.boundaries)
+                    }
+                )
+            )
+            ignored_deterministic_indices = [
                 value
                 for value in raw
-                if isinstance(value, int) and not isinstance(value, bool)
-            )
+                if not (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 0 <= value < len(base_edit.boundaries)
+                )
+            ]
+    (
+        perceptual_indices,
+        perceptual_admission_audit,
+    ) = _stage_edit_perceptual_repair_targets(
+        base_edit,
+        original_review_payload,
+        review_render_plan=selected_bundle.render_plan,
+    )
     issues_by_id: dict[str, StageEditRepairIssue] = {}
     for raw_issue in learned_repair_issues:
         issue = StageEditRepairIssue.from_mapping(raw_issue)
@@ -3896,6 +4678,13 @@ def _attempt_stage_edit_windowed_beam_reedit(
         deterministic_indices,
         prefix="decoded-proxy-initial",
         causes=("decoded_proxy_visible_boundary_failure",),
+    ):
+        issues_by_id.setdefault(issue.issue_id, issue)
+    for issue in _stage_edit_boundary_issues(
+        base_edit,
+        perceptual_indices,
+        prefix="decoded-proxy-perceptual-source-admission-initial",
+        causes=("decoded_proxy_perceptual_source_admission_failure",),
     ):
         issues_by_id.setdefault(issue.issue_id, issue)
     reviewer_issues = tuple(issues_by_id.values())
@@ -3908,6 +4697,23 @@ def _attempt_stage_edit_windowed_beam_reedit(
         "reason": None,
         "reviewer_issue_windows": [
             issue.to_dict() for issue in reviewer_issues
+        ],
+        "issue_index_source_fields": [
+            "partial_reedit_boundary_issue_indices",
+            _STAGE_EDIT_PERCEPTUAL_REPAIR_INDEX_SOURCE_FIELD,
+            "learned_repair_issues",
+        ],
+        "deterministic_visible_boundary_issue_indices": list(
+            deterministic_indices
+        ),
+        "ignored_deterministic_visible_boundary_issue_indices": (
+            ignored_deterministic_indices
+        ),
+        "perceptual_source_admission": perceptual_admission_audit,
+        "perceptual_repair_boundary_indices": list(perceptual_indices),
+        "learned_repair_issue_ids": [
+            StageEditRepairIssue.from_mapping(value).issue_id
+            for value in learned_repair_issues
         ],
         "before_review": deepcopy(original_review_payload),
         "after_review": None,
@@ -3950,6 +4756,10 @@ def _attempt_stage_edit_windowed_beam_reedit(
     original_repair_review = _stage_edit_proxy_repair_review(
         base_edit,
         original_review_payload,
+        require_perceptual_source_admission=bool(
+            perceptual_admission_audit["available"]
+        ),
+        review_render_plan=selected_bundle.render_plan,
     )
     cache[original_signature] = (
         selected_bundle,
@@ -4082,7 +4892,14 @@ def _attempt_stage_edit_windowed_beam_reedit(
             ),
         )
         payload = deepcopy(selection.selected.review_payload)
-        repair_review = _stage_edit_proxy_repair_review(edit, payload)
+        repair_review = _stage_edit_proxy_repair_review(
+            edit,
+            payload,
+            require_perceptual_source_admission=bool(
+                perceptual_admission_audit["available"]
+            ),
+            review_render_plan=bundle.render_plan,
+        )
         if learned_reviewer_session is not None and payload is not None:
             learned_review = learned_reviewer_session.review_candidate(
                 candidate_index=bundle.candidate_index,
@@ -4119,9 +4936,35 @@ def _attempt_stage_edit_windowed_beam_reedit(
     )
     audit["repair_loop"] = repair_result.audit.to_dict()
     audit["windowed_beam_redecode"] = redecoder.audit_payload()
-    audit["changed"] = repair_result.changed
+    source_substitution_evidence = (
+        _stage_edit_targeted_source_substitution_evidence(
+            base_edit,
+            repair_result.edit,
+            perceptual_indices,
+        )
+    )
+    audit["perceptual_targeted_source_substitution"] = (
+        source_substitution_evidence
+    )
+    audit["repair_loop_changed"] = repair_result.changed
+    audit["changed"] = bool(
+        repair_result.changed
+        and source_substitution_evidence["satisfied"]
+    )
     if not repair_result.changed:
         audit["reason"] = repair_result.audit.termination_reason
+        return _ProxyTriggeredPartialReeditResult(
+            selected_bundle,
+            original_review_payload,
+            audit,
+        )
+    if not source_substitution_evidence["satisfied"]:
+        audit["reason"] = (
+            "perceptual_source_repair_requires_targeted_source_substitution"
+        )
+        audit["rejected_repair_edit_sha256"] = (
+            repair_result.audit.final_edit_sha256
+        )
         return _ProxyTriggeredPartialReeditResult(
             selected_bundle,
             original_review_payload,
@@ -4139,6 +4982,23 @@ def _attempt_stage_edit_windowed_beam_reedit(
     proposal_lineage = tuple(
         dict(item) for item in final_bundle.candidate_lineage
     )
+    (
+        superseded_base_lineage,
+        superseded_exact_clock_hashes,
+    ) = _strip_superseded_exact_stage_edit_shot_clocks(
+        selected_bundle.candidate_lineage
+    )
+    expected_final_exact_clock = _stage_edit_exact_shot_clock_from_edit(
+        repair_result.edit
+    )
+    actual_final_exact_clock = getattr(
+        final_bundle, "stage_edit_exact_shot_clock", None
+    )
+    if actual_final_exact_clock != expected_final_exact_clock:
+        raise RuntimeError(
+            "accepted windowed StageEdit repair exact shot clock is stale or "
+            "does not match the final repaired source path"
+        )
     suppressed_dynamic_crop_indices = tuple(
         sorted(
             {
@@ -4163,6 +5023,17 @@ def _attempt_stage_edit_windowed_beam_reedit(
         learned_reviewer_session is not None
         and "learned_reviewer_issue_suggestions" in final_review.audit
     )
+    raw_final_perceptual_admission = final_review.audit.get(
+        "perceptual_source_admission"
+    )
+    final_perceptual_admission = (
+        raw_final_perceptual_admission
+        if isinstance(raw_final_perceptual_admission, Mapping)
+        else {}
+    )
+    source_sequence_changed = bool(
+        source_substitution_evidence["global_source_sequence_changed"]
+    )
     selected_redecode_evidence = {
         "actual_semimarkov_redecode": True,
         "new_proxy_review_available": final_payload is not None,
@@ -4173,10 +5044,39 @@ def _attempt_stage_edit_windowed_beam_reedit(
         "learned_reviewer_reinvoked_after_splice": (
             learned_reviewer_reinvoked
         ),
+        "perceptual_source_admission_required": bool(
+            perceptual_admission_audit["available"]
+        ),
+        "new_proxy_perceptual_source_admission_passed": (
+            final_perceptual_admission.get("admission_passed") is True
+            if perceptual_admission_audit["available"]
+            else None
+        ),
+        "new_proxy_penalized_weighted_score": (
+            final_perceptual_admission.get("penalized_weighted_score")
+            if perceptual_admission_audit["available"]
+            else None
+        ),
+        "source_sequence_changed_by_redecode": source_sequence_changed,
+        "perceptual_targeted_source_substitution_required": (
+            source_substitution_evidence["required"]
+        ),
+        "perceptual_targeted_source_substitution_satisfied": (
+            source_substitution_evidence["satisfied"]
+        ),
+        "perceptual_substituted_target_boundary_indices": (
+            source_substitution_evidence[
+                "substituted_target_boundary_indices"
+            ]
+        ),
         "dynamic_crop_v2_suppressed_segment_indices": list(
             suppressed_dynamic_crop_indices
         ),
         "proposal_materialization_lineage_preserved": True,
+        "final_authoritative_exact_shot_clock_count": 1,
+        "superseded_exact_shot_clock_sha256": list(
+            superseded_exact_clock_hashes
+        ),
     }
     lineage_event = {
         "stage": "reviewer_issue_window_actual_semimarkov_redecode",
@@ -4197,7 +5097,7 @@ def _attempt_stage_edit_windowed_beam_reedit(
         final_bundle,
         candidate_origin=selected_bundle.candidate_origin,
         candidate_lineage=(
-            selected_bundle.candidate_lineage
+            superseded_base_lineage
             + (
                 {
                     "stage": "windowed_semimarkov_proposal_lineage",
@@ -4394,6 +5294,128 @@ def _discover_automatic_stage_edit_production_bundle(
     return discover_registered_stage_edit_production_bundle()
 
 
+def _load_stage_edit_montage_policy(
+    *,
+    registered_bundle: RegisteredStageEditProductionBundle | None,
+    explicit_preflight: StageEditPipelineBridgePreflight | None,
+) -> ProfessionalMontagePolicy | None:
+    """Load the immutable IVE visual grammar whenever StageEdit is active."""
+
+    if registered_bundle is None and explicit_preflight is None:
+        return None
+    if registered_bundle is not None:
+        profile_path = getattr(
+            registered_bundle,
+            "professional_montage_grammar_profile_path",
+            None,
+        )
+        expected_sha256 = getattr(
+            registered_bundle,
+            "professional_montage_grammar_profile_file_sha256",
+            None,
+        )
+        if not isinstance(profile_path, Path) or not isinstance(
+            expected_sha256, str
+        ):
+            raise RuntimeError(
+                "registered StageEdit bundle lacks immutable professional "
+                "montage-grammar profile evidence"
+            )
+    else:
+        profile_path = DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        expected_sha256 = None
+    policy = load_professional_montage_policy(
+        profile_path,
+        expected_file_sha256=expected_sha256,
+    )
+    if registered_bundle is not None:
+        expected_identity = getattr(
+            registered_bundle,
+            "professional_montage_grammar_profile_identity",
+            None,
+        )
+        if callable(expected_identity):
+            expected_identity = expected_identity()
+        if not isinstance(expected_identity, Mapping):
+            raise RuntimeError(
+                "registered StageEdit montage profile identity is unavailable"
+            )
+        actual_without_path = {
+            key: value
+            for key, value in policy.profile_identity.items()
+            if key != "path"
+        }
+        expected_without_path = {
+            key: value
+            for key, value in dict(expected_identity).items()
+            if key != "path"
+        }
+        if actual_without_path != expected_without_path:
+            raise RuntimeError(
+                "registered StageEdit montage profile identity changed"
+            )
+    return policy
+
+
+def _stage_edit_semimarkov_config_from_montage_policy(
+    policy: ProfessionalMontagePolicy,
+) -> StageEditSemiMarkovConfig:
+    product = policy.product_editorial_requirements
+    return StageEditSemiMarkovConfig(
+        highlight_minimum_closeup_fraction=(
+            policy.minimum_close_duration_fraction.value
+        ),
+        # No non-wide duration reference floor exists.  This is an explicit
+        # IVE product editorial target, while close/burst/wide-transition
+        # floors below retain their profile provenance.
+        highlight_minimum_nonwide_fraction=0.35,
+        highlight_minimum_wide_involved_source_switch_fraction=(
+            policy.minimum_wide_involved_source_switch_fraction.value
+        ),
+        highlight_minimum_early_wide_anchor_fraction=(
+            policy.minimum_early_wide_anchor_fraction.value
+        ),
+        highlight_minimum_phrase_entry_wide_anchor_fraction=(
+            policy.minimum_phrase_entry_wide_anchor_fraction.value
+        ),
+        highlight_minimum_nonwide_burst_boundaries=(
+            product.minimum_nonwide_multi_family_burst_count
+        ),
+        minimum_formation_anchor_person_count_normalized=(
+            product.formation_evidence_threshold_normalized
+        ),
+        highlight_minimum_post_burst_formation_resets=(
+            product.minimum_post_burst_formation_evidenced_wide_reset_count
+        ),
+    )
+
+
+def _rendered_montage_config_from_policy(
+    policy: ProfessionalMontagePolicy,
+) -> RenderedMontageGrammarConfig:
+    product = policy.product_editorial_requirements
+    return RenderedMontageGrammarConfig(
+        minimum_closeup_fraction=policy.minimum_close_duration_fraction.value,
+        minimum_nonwide_fraction=0.35,
+        minimum_wide_involved_source_switch_fraction=(
+            policy.minimum_wide_involved_source_switch_fraction.value
+        ),
+        minimum_early_wide_anchor_fraction=(
+            policy.minimum_early_wide_anchor_fraction.value
+        ),
+        minimum_phrase_entry_wide_anchor_fraction=(
+            policy.minimum_phrase_entry_wide_anchor_fraction.value
+        ),
+        minimum_formation_anchor_person_count=1,
+        minimum_nonwide_burst_boundaries=(
+            product.minimum_nonwide_multi_family_burst_count
+        ),
+        minimum_post_burst_formation_reset_count=(
+            product.minimum_post_burst_formation_evidenced_wide_reset_count
+        ),
+    )
+
+
 def _materialize_registered_stage_edit_preflight(
     *,
     bundle: RegisteredStageEditProductionBundle,
@@ -4489,6 +5511,22 @@ def analyze(
     stage_edit_generation_preflight = _load_stage_edit_generation_preflight(
         request
     )
+    stage_edit_montage_policy = _load_stage_edit_montage_policy(
+        registered_bundle=registered_stage_edit_bundle,
+        explicit_preflight=stage_edit_generation_preflight,
+    )
+    stage_edit_semimarkov_config = (
+        _stage_edit_semimarkov_config_from_montage_policy(
+            stage_edit_montage_policy
+        )
+        if stage_edit_montage_policy is not None
+        else None
+    )
+    rendered_montage_config = (
+        _rendered_montage_config_from_policy(stage_edit_montage_policy)
+        if stage_edit_montage_policy is not None
+        else None
+    )
     if professional_reference_profile is not None:
         reporter.log(
             "인간 교차편집 상대 품질 프로필 "
@@ -4515,6 +5553,13 @@ def analyze(
             f"snapshot {stage_edit_generation_preflight.snapshot.snapshot_sha256[:12]} "
             f"· source {len(stage_edit_generation_preflight.source_ids)}개 · "
             "후보 8개 전수 시각·프록시 QA 통과 전에는 렌더 승격 없음"
+        )
+    if stage_edit_montage_policy is not None:
+        reporter.log(
+            "IVE 사람 편집본 몽타주 문법 프로필 엄격 검증 완료 · "
+            f"4곡/20편 · file SHA-256 "
+            f"{stage_edit_montage_policy.identity.file_sha256[:12]} · "
+            "대형 앵커→근접 연쇄→대형 복귀 게이트 활성화"
         )
     if registered_stage_edit_bundle is not None:
         reporter.log(
@@ -4919,8 +5964,11 @@ def analyze(
     editorial_motion_plan: EditorialMotionPlan | None = None
     member_editorial_motion_plan: EditorialMotionPlan | None = None
     member_draft: MemberDraftTimeline | None = None
+    cut_local_sync_payload: dict[str, Any] | None = None
     render_payload: dict[str, Any] | None = None
     rendered_proxy_review_payload: dict[str, Any] | None = None
+    rendered_montage_grammar_review_payload: dict[str, Any] | None = None
+    stage_edit_exact_shot_clock_payload: dict[str, Any] | None = None
     rendered_proxy_review_path: Path | None = None
     rendered_candidate_selection_payload: dict[str, Any] | None = None
     rendered_candidate_selection_path: Path | None = None
@@ -5133,6 +6181,15 @@ def analyze(
                 raise RuntimeError(
                     "StageEdit generation requires a completed section plan"
                 )
+            if (
+                stage_edit_montage_policy is None
+                or stage_edit_semimarkov_config is None
+                or rendered_montage_config is None
+            ):
+                raise RuntimeError(
+                    "StageEdit generation requires a verified IVE professional "
+                    "montage policy before decoding"
+                )
             if tuple(eligible_indices) != tuple(range(len(request.sources))):
                 raise RuntimeError(
                     "StageEdit generation requires every configured "
@@ -5171,6 +6228,7 @@ def analyze(
                 width=generation_width,
                 height=generation_height,
                 fps=29.97,
+                config=stage_edit_semimarkov_config,
             )
             stage_edit_generation_audit_path = (
                 request.output_directory
@@ -5857,6 +6915,34 @@ def analyze(
                     professional_reference_cadence_profile
                 ),
                 learned_reviewer_session=learned_reviewer_session,
+                stage_edit_montage_section_plan=(
+                    stage_edit_generation_result.learned_section_director.section_plan
+                    if stage_edit_generation_result is not None
+                    and stage_edit_generation_result.learned_section_director
+                    is not None
+                    else None
+                ),
+                stage_edit_source_derivative_diversity=(
+                    source_derivative_diversity_result
+                    if stage_edit_visual_candidate_batch is not None
+                    else None
+                ),
+                stage_edit_source_index_mapping=(
+                    _source_index_mapping(request.sources, eligible_indices)
+                    if stage_edit_visual_candidate_batch is not None
+                    else None
+                ),
+                stage_edit_montage_config=(
+                    rendered_montage_config
+                    if stage_edit_visual_candidate_batch is not None
+                    else None
+                ),
+                stage_edit_montage_reference_profile=(
+                    stage_edit_montage_policy.profile_identity
+                    if stage_edit_visual_candidate_batch is not None
+                    and stage_edit_montage_policy is not None
+                    else None
+                ),
                 progress_callback=lambda position, total, candidate_index: (
                     reporter.progress(
                         0.979 + 0.006 * position / max(1, total),
@@ -6070,7 +7156,12 @@ def analyze(
                     source_durations_seconds=local_durations,
                     beat_period_seconds=group_draft.beat_period_seconds,
                     phrase_times=phrase_times,
-                    section_plan=section_plan,
+                    section_plan=(
+                        stage_edit_generation_result.learned_section_director.section_plan
+                        if stage_edit_generation_result.learned_section_director
+                        is not None
+                        else section_plan
+                    ),
                     common_master_start=common_start,
                     width=width,
                     height=height,
@@ -6124,6 +7215,59 @@ def analyze(
             rendered_candidate_selection_payload[
                 "proxy_triggered_partial_reedit"
             ] = partial_reedit.audit_payload
+            if stage_edit_visual_candidate_batch is not None:
+                if (
+                    rendered_proxy_review_payload is None
+                    or stage_edit_generation_result is None
+                    or stage_edit_generation_result.learned_section_director
+                    is None
+                    or source_derivative_diversity_result is None
+                    or rendered_montage_config is None
+                    or stage_edit_montage_policy is None
+                ):
+                    raise RuntimeError(
+                        "final StageEdit selection lacks mandatory montage "
+                        "grammar evidence"
+                    )
+                technical_proxy_passed = bool(
+                    rendered_proxy_review_payload.get(
+                        "technical_proxy_passed_before_montage_grammar",
+                        rendered_proxy_review_payload.get("passed"),
+                    )
+                )
+                (
+                    rendered_montage_grammar_review_payload,
+                    _final_montage_analysis,
+                ) = _review_stage_edit_bundle_montage(
+                    bundle=selected_bundle,
+                    proxy_review_payload=rendered_proxy_review_payload,
+                    section_plan=(
+                        stage_edit_generation_result.learned_section_director.section_plan
+                    ),
+                    source_derivative_diversity=(
+                        source_derivative_diversity_result
+                    ),
+                    source_index_mapping=_source_index_mapping(
+                        request.sources,
+                        eligible_indices,
+                    ),
+                    config=rendered_montage_config,
+                    reference_profile=stage_edit_montage_policy.profile_identity,
+                )
+                stage_edit_exact_shot_clock_payload = deepcopy(
+                    _final_montage_analysis["stage_edit_exact_shot_clock"]
+                )
+                rendered_proxy_review_payload[
+                    "technical_proxy_passed_before_montage_grammar"
+                ] = technical_proxy_passed
+                rendered_proxy_review_payload[
+                    "rendered_montage_grammar_review"
+                ] = deepcopy(rendered_montage_grammar_review_payload)
+                rendered_proxy_review_payload["passed"] = bool(
+                    technical_proxy_passed
+                    and rendered_montage_grammar_review_payload.get("passed")
+                    is True
+                )
             final_proxy_passed = bool(
                 rendered_proxy_review_payload is not None
                 and rendered_proxy_review_payload.get("passed")
@@ -6150,6 +7294,9 @@ def analyze(
                     exact_complete_candidates_satisfied
                     and exact_decoded_reviews_satisfied
                     and final_proxy_passed
+                    and rendered_montage_grammar_review_payload is not None
+                    and rendered_montage_grammar_review_payload.get("passed")
+                    is True
                 )
                 selected_bundle = replace(
                     selected_bundle,
@@ -6167,6 +7314,14 @@ def analyze(
                                 exact_decoded_reviews_satisfied
                             ),
                             "decoded_selected_proxy_passed": final_proxy_passed,
+                            "rendered_montage_grammar_passed": bool(
+                                rendered_montage_grammar_review_payload
+                                is not None
+                                and rendered_montage_grammar_review_payload.get(
+                                    "passed"
+                                )
+                                is True
+                            ),
                             "promotion_state": (
                                 "eligible_for_final_render"
                                 if stage_edit_promotion_eligible
@@ -6205,6 +7360,12 @@ def analyze(
                         stage_edit_promotion_eligible
                     ),
                     "decoded_selected_proxy_passed": final_proxy_passed,
+                    "rendered_montage_grammar_required": True,
+                    "rendered_montage_grammar_passed": bool(
+                        rendered_montage_grammar_review_payload is not None
+                        and rendered_montage_grammar_review_payload.get("passed")
+                        is True
+                    ),
                     "promotion_state": (
                         "eligible_for_final_render"
                         if stage_edit_promotion_eligible
@@ -6426,6 +7587,58 @@ def analyze(
                         "실렌더 프록시 검수는 통과하지 못했지만 명시적인 비교용 "
                         "렌더 옵션으로 계속했습니다."
                     )
+        if registered_stage_edit_bundle is not None:
+            reporter.status(
+                "등록된 StageEdit 최종 컷을 실제 PTS·포즈·"
+                "바디 모션으로 로컬 동기 검증 중…"
+            )
+            try:
+                cut_local_sync_payload = analyze_cut_local_sync(
+                    plan,
+                    source_timewarps=source_timewarps,
+                    timewarp_payloads=local_timewarp_payloads,
+                )
+                reporter.log(
+                    "보존 교차소스 경계 "
+                    f"{cut_local_sync_payload['retained_cross_source_boundary_count']}개 · "
+                    f"측정 {cut_local_sync_payload['measured_boundary_count']}개 · "
+                    f"불확실 {cut_local_sync_payload['unknown_boundary_count']}개 · "
+                    "로컬 잔차 p95 "
+                    f"{cut_local_sync_payload['residual_p95_frames']} frame"
+                )
+            except (cv2.error, OSError, RuntimeError, TypeError, ValueError) as exc:
+                cut_local_sync_payload = {
+                    "schema_version": 2,
+                    "analysis": "actual_pts_renderer_bound_retained_cut_pose_body_motion_phase_v2",
+                    "activation": "automatic_registered_stage_edit_group",
+                    "required": True,
+                    "passed": False,
+                    "error_code": (
+                        "cut_local_sync_analysis_failed_"
+                        f"{type(exc).__name__}"
+                    ),
+                    "unknown_reason_counts": {
+                        "cut_local_sync_analysis_failed": 1,
+                    },
+                    "serialization_policy": {
+                        "raw_frames_persisted": False,
+                        "pose_embeddings_persisted": False,
+                        "formation_descriptors_persisted": False,
+                        "body_motion_series_persisted": False,
+                        "sample_pixels_persisted": False,
+                        "motion_timing_provenance_persisted": True,
+                        "scalar_aggregate_and_hash_provenance_only": True,
+                    },
+                }
+                reporter.emit(
+                    "log",
+                    level="warning",
+                    message=(
+                        "등록된 StageEdit 컷-로컬 동기 증거를 "
+                        "완성하지 못해 최종 QA에서 차단됩니다 "
+                        f"({type(exc).__name__})."
+                    ),
+                )
         write_plan(plan, render_plan_path)
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
         codec = render(plan)
@@ -6474,6 +7687,7 @@ def analyze(
                     else "global_scalar_offset"
                 )
             ),
+            "cut_local_sync": cut_local_sync_payload,
             "source_look_match": (
                 _with_index_domain(
                     source_look_match_result.to_dict(),
@@ -6534,6 +7748,16 @@ def analyze(
                 else None
             ),
             "rendered_proxy_review": rendered_proxy_review_payload,
+            "rendered_montage_grammar_review": (
+                deepcopy(rendered_montage_grammar_review_payload)
+                if rendered_montage_grammar_review_payload is not None
+                else None
+            ),
+            "stage_edit_exact_shot_clock": (
+                deepcopy(stage_edit_exact_shot_clock_payload)
+                if stage_edit_exact_shot_clock_payload is not None
+                else None
+            ),
             "rendered_candidate_selection": (
                 rendered_candidate_selection_payload
             ),
@@ -6993,7 +8217,14 @@ def analyze(
         },
         "scene_analysis": scene_payloads,
         "rhythm_analysis": rhythm_payload,
-        "section_plan": section_plan.to_dict() if section_plan is not None else None,
+        "section_plan": (
+            stage_edit_generation_result.learned_section_director.section_plan.to_dict()
+            if stage_edit_generation_result is not None
+            and stage_edit_generation_result.learned_section_director is not None
+            else section_plan.to_dict()
+            if section_plan is not None
+            else None
+        ),
         "source_look_match": (
             _with_index_domain(
                 source_look_match_result.to_dict(),
@@ -7024,6 +8255,16 @@ def analyze(
             else None
         ),
         "rendered_proxy_review": rendered_proxy_review_payload,
+        "rendered_montage_grammar_review": (
+            deepcopy(rendered_montage_grammar_review_payload)
+            if rendered_montage_grammar_review_payload is not None
+            else None
+        ),
+        "stage_edit_exact_shot_clock": (
+            deepcopy(stage_edit_exact_shot_clock_payload)
+            if stage_edit_exact_shot_clock_payload is not None
+            else None
+        ),
         "rendered_candidate_selection": rendered_candidate_selection_payload,
         "stage_edit_generation": (
             {
@@ -7040,6 +8281,16 @@ def analyze(
                 "inference_snapshot": (
                     stage_edit_inference_snapshot_result.to_dict()
                     if stage_edit_inference_snapshot_result is not None
+                    else None
+                ),
+                "professional_montage_grammar_profile": (
+                    deepcopy(stage_edit_montage_policy.profile_identity)
+                    if stage_edit_montage_policy is not None
+                    else None
+                ),
+                "professional_montage_policy": (
+                    stage_edit_montage_policy.to_dict()
+                    if stage_edit_montage_policy is not None
                     else None
                 ),
             }

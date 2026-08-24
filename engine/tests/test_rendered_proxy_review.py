@@ -411,6 +411,10 @@ class RenderedProxyReviewTests(unittest.TestCase):
             admission["admission"]["reason_codes"],
         )
         self.assertEqual(
+            admission["admission"]["repair_target_boundary_indices"],
+            [0],
+        )
+        self.assertEqual(
             review.payload["perceptual_source_admission_penalty_points"],
             20.0,
         )

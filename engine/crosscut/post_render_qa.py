@@ -21,9 +21,22 @@ import subprocess
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
+from .cut_local_sync import (
+    resolve_cut_local_sync_activation,
+    validate_cut_local_sync_evidence,
+)
 from .post_render_perceptual_quality import (
     PerceptualQualityConfig,
     evaluate_post_render_perceptual_quality,
+)
+from .professional_montage_grammar import (
+    PROFILE_ANALYSIS_BASIS as MONTAGE_PROFILE_ANALYSIS_BASIS,
+    PROFILE_SCHEMA_VERSION as MONTAGE_PROFILE_SCHEMA_VERSION,
+)
+from .rendered_montage_grammar_review import (
+    RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS,
+    RenderedMontageGrammarConfig,
+    review_rendered_montage_grammar,
 )
 
 
@@ -56,6 +69,15 @@ _BOUNDARY_REVIEW_DOMAINS = (
     _TIER_D_CONTINUITY_DOMAIN,
     _NATIVE_SOURCE_CUT_DOMAIN,
 )
+_MONTAGE_PROFILE_IDENTITY_KEYS = frozenset(
+    {
+        "analysis_basis",
+        "schema_version",
+        "file_sha256",
+        "content_sha256",
+    }
+)
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class PostRenderQAVerdict(str, Enum):
@@ -110,10 +132,20 @@ class PostRenderQAConfig:
     perceptual_quality: PerceptualQualityConfig = field(
         default_factory=PerceptualQualityConfig
     )
+    rendered_montage_grammar: RenderedMontageGrammarConfig = field(
+        default_factory=RenderedMontageGrammarConfig
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.perceptual_quality, PerceptualQualityConfig):
             raise TypeError("perceptual_quality must be PerceptualQualityConfig")
+        if not isinstance(
+            self.rendered_montage_grammar,
+            RenderedMontageGrammarConfig,
+        ):
+            raise TypeError(
+                "rendered_montage_grammar must be RenderedMontageGrammarConfig"
+            )
         if self.required_complete_candidate_count < 1:
             raise ValueError("required candidate count must be positive")
         if self.minimum_local_timewarp_anchor_count < 2:
@@ -159,6 +191,11 @@ class PostRenderQAConfig:
             name: (
                 value.to_dict()
                 if isinstance(value := getattr(self, name), PerceptualQualityConfig)
+                else {
+                    field_name: getattr(value, field_name)
+                    for field_name in value.__dataclass_fields__
+                }
+                if isinstance(value, RenderedMontageGrammarConfig)
                 else value
             )
             for name in self.__dataclass_fields__
@@ -4343,17 +4380,37 @@ def _sync_quality_metrics(
     plan: Mapping[str, Any],
     config: PostRenderQAConfig,
     collector: _IssueCollector,
+    *,
+    selection: Mapping[str, Any] | None = None,
+    trusted_registered_stage_edit: bool | None = None,
 ) -> dict[str, Any]:
     """Fail closed on the production PTS clock used by every rendered source.
 
-    ``local_timewarps`` is serialized in request-source index space while the
-    render plan uses its compact sources-array index.  The explicit mapping is
-    therefore part of the evidence; treating the two domains as interchangeable
+    ``local_timewarps`` is serialized in request-source index space.  Current
+    pipeline plans retain the full request sources array, while older imported
+    plans can use a compact eligible-source array.  The explicit domain
+    equivalence/mapping is therefore part of the evidence; guessing the domain
     could silently audit a different camera after an ineligible source is
     removed.  The residual is converted to output frames so the professional
     half-frame release target is independent of 29.97/30/59.94 fps delivery.
     """
 
+    activation = resolve_cut_local_sync_activation(
+        analysis,
+        selection,
+        trusted_registered_stage_edit=trusted_registered_stage_edit,
+    )
+    cut_local_required = bool(activation["required"])
+    activation_errors = list(activation["errors"])
+    if activation_errors:
+        collector.add(
+            "production_cut_local_sync_activation_contract_invalid",
+            QAIssueSeverity.FAIL,
+            "StageEdit activation markers are missing, malformed, or disagree.",
+            path="stage_edit_generation,selection.stage_edit_render_promotion,render",
+            value=activation_errors,
+            threshold=[],
+        )
     fps = _number(plan.get("fps"))
     usage = _mapping(plan.get("source_usage")) or {}
     raw_used_indices = _sequence(usage.get("used_source_indices"))
@@ -4364,6 +4421,12 @@ def _sync_quality_metrics(
     )
     mapping = _mapping(analysis.get("source_index_mapping")) or {}
     eligible_to_request = _sequence(mapping.get("eligible_to_request"))
+    domain_equivalences = _mapping(mapping.get("domain_equivalences")) or {}
+    render_indices_are_request_indices = (
+        domain_equivalences.get("render_plan_sources_array_index")
+        == "request_source_index"
+    )
+    plan_sources = _sequence(plan.get("sources"))
     local_timewarps = _sequence(analysis.get("local_timewarps"))
 
     domain_valid = (
@@ -4371,10 +4434,19 @@ def _sync_quality_metrics(
         and fps > 0.0
         and bool(used_render_indices)
         and all(index is not None and index >= 0 for index in used_render_indices)
-        and eligible_to_request is not None
-        and all(
-            index is not None and index < len(eligible_to_request)
-            for index in used_render_indices
+        and (
+            render_indices_are_request_indices
+            and plan_sources is not None
+            and all(
+                index is not None and index < len(plan_sources)
+                for index in used_render_indices
+            )
+            or not render_indices_are_request_indices
+            and eligible_to_request is not None
+            and all(
+                index is not None and index < len(eligible_to_request)
+                for index in used_render_indices
+            )
         )
         and local_timewarps is not None
     )
@@ -4385,6 +4457,15 @@ def _sync_quality_metrics(
             "Used render sources cannot be bound to their PTS time-warp evidence.",
             path="local_timewarps",
         )
+        if cut_local_required:
+            collector.add(
+                "production_cut_local_sync_required_gate_failed",
+                QAIssueSeverity.FAIL,
+                "Registered automatic StageEdit did not satisfy the retained-cut local synchronization gate.",
+                path="render.cut_local_sync",
+                value=False,
+                threshold=True,
+            )
         return {
             "basis": "used_source_piecewise_pts_residual_p95_frames_v1",
             "domain_mapping_valid": False,
@@ -4393,11 +4474,16 @@ def _sync_quality_metrics(
             ],
             "per_source": [],
             "maximum_residual_p95_frames": None,
+            "cut_local_sync": {
+                "required": cut_local_required,
+                "activation_contract": activation,
+                "available": False,
+                "passed": False if cut_local_required else None,
+            },
             "passed": False,
         }
 
     assert fps is not None
-    assert eligible_to_request is not None
     assert local_timewarps is not None
     timewarp_by_request: dict[int, dict[str, Any]] = {}
     duplicate_request_indices: set[int] = set()
@@ -4426,7 +4512,13 @@ def _sync_quality_metrics(
     residual_frames_values: list[float] = []
     for render_index_value in used_render_indices:
         assert render_index_value is not None
-        request_index = _integer(eligible_to_request[render_index_value])
+        request_index = (
+            render_index_value
+            if render_indices_are_request_indices
+            else _integer(eligible_to_request[render_index_value])
+            if eligible_to_request is not None
+            else None
+        )
         item = (
             timewarp_by_request.get(request_index)
             if request_index is not None
@@ -4526,13 +4618,105 @@ def _sync_quality_metrics(
             }
         )
 
+    source_clock_passed = (
+        len(per_source) == len(used_render_indices)
+        and all(item.get("passed") is True for item in per_source)
+        and not duplicate_request_indices
+    )
+    cut_local_metrics: dict[str, Any]
+    if cut_local_required:
+        render_payload = _mapping(analysis.get("render")) or {}
+        evidence = _mapping(render_payload.get("cut_local_sync"))
+        cut_local_metrics = validate_cut_local_sync_evidence(
+            evidence,
+            plan=plan,
+            timewarp_payloads=local_timewarps,
+            maximum_residual_p95_frames=(
+                config.maximum_sync_residual_p95_frames
+            ),
+        )
+        cut_local_metrics["required"] = True
+        errors = _sequence(cut_local_metrics.get("errors")) or []
+        unknown_count = _integer(
+            cut_local_metrics.get("unknown_boundary_count")
+        ) or 0
+        residual_p95 = _number(cut_local_metrics.get("residual_p95_frames"))
+        if not bool(cut_local_metrics.get("available")):
+            collector.add(
+                "production_cut_local_sync_evidence_missing",
+                QAIssueSeverity.FAIL,
+                "Registered automatic StageEdit lacks retained-cut local sync evidence.",
+                path="render.cut_local_sync",
+            )
+        if errors:
+            collector.add(
+                "production_cut_local_sync_binding_invalid",
+                QAIssueSeverity.FAIL,
+                "Retained-cut sync evidence is not bound to the final plan and clocks.",
+                path="render.cut_local_sync",
+                value=errors,
+                threshold=[],
+            )
+        if unknown_count > 0:
+            collector.add(
+                "production_cut_local_sync_unknown_boundaries",
+                QAIssueSeverity.FAIL,
+                "At least one retained source switch lacks unique pose/body-motion timing evidence.",
+                path="render.cut_local_sync.per_boundary",
+                value={
+                    "unknown_boundary_count": unknown_count,
+                    "unknown_reason_counts": cut_local_metrics.get(
+                        "unknown_reason_counts"
+                    ),
+                },
+                threshold={"unknown_boundary_count": 0},
+            )
+        if (
+            residual_p95 is not None
+            and residual_p95
+            > config.maximum_sync_residual_p95_frames + 1e-12
+        ):
+            collector.add(
+                "production_cut_local_sync_residual_exceeds_half_frame",
+                QAIssueSeverity.FAIL,
+                "Retained-cut pose/body motion phase exceeds the half-frame target.",
+                path="render.cut_local_sync.residual_p95_frames",
+                value=residual_p95,
+                threshold=config.maximum_sync_residual_p95_frames,
+            )
+        if cut_local_metrics.get("passed") is not True:
+            collector.add(
+                "production_cut_local_sync_required_gate_failed",
+                QAIssueSeverity.FAIL,
+                "Registered automatic StageEdit did not satisfy the retained-cut local synchronization gate.",
+                path="render.cut_local_sync",
+                value=cut_local_metrics.get("passed"),
+                threshold=True,
+            )
+        cut_local_metrics["activation_contract"] = activation
+    else:
+        cut_local_metrics = {
+            "required": False,
+            "activation": activation["mode"],
+            "activation_contract": activation,
+            "available": False,
+            "passed": None,
+        }
+
     return {
-        "basis": "used_source_piecewise_pts_residual_p95_frames_v1",
+        "basis": (
+            "used_source_piecewise_pts_plus_retained_cut_pose_body_motion_v2"
+            if cut_local_required
+            else "used_source_piecewise_pts_residual_p95_frames_v1"
+        ),
         "domain_mapping_valid": True,
         "fps": fps,
         "used_render_source_indices": [
             int(value) for value in used_render_indices if value is not None
         ],
+        "render_indices_are_request_indices": (
+            render_indices_are_request_indices
+        ),
         "maximum_allowed_residual_p95_frames": (
             config.maximum_sync_residual_p95_frames
         ),
@@ -4543,10 +4727,13 @@ def _sync_quality_metrics(
             max(residual_frames_values) if residual_frames_values else None
         ),
         "per_source": per_source,
-        "passed": (
-            len(per_source) == len(used_render_indices)
-            and all(item.get("passed") is True for item in per_source)
-            and not duplicate_request_indices
+        "cut_local_sync": cut_local_metrics,
+        "passed": source_clock_passed
+        and not activation_errors
+        and (
+            bool(cut_local_metrics.get("passed"))
+            if cut_local_required
+            else True
         ),
     }
 
@@ -4658,6 +4845,233 @@ def _perceptual_quality_metrics(
     return payload
 
 
+def _montage_profile_identity(
+    value: Any,
+    *,
+    name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile = _mapping(value)
+    if profile is None:
+        raise ValueError(f"{name} must be an object")
+    keys = frozenset(profile)
+    if keys not in {
+        _MONTAGE_PROFILE_IDENTITY_KEYS,
+        _MONTAGE_PROFILE_IDENTITY_KEYS | {"path"},
+    }:
+        raise ValueError(f"{name} keys are invalid")
+    if (
+        profile.get("analysis_basis") != MONTAGE_PROFILE_ANALYSIS_BASIS
+        or profile.get("schema_version") != MONTAGE_PROFILE_SCHEMA_VERSION
+    ):
+        raise ValueError(f"{name} schema identity is invalid")
+    for key in ("file_sha256", "content_sha256"):
+        digest = profile.get(key)
+        if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+            raise ValueError(f"{name}.{key} is invalid")
+    if "path" in profile:
+        path = profile.get("path")
+        if not isinstance(path, str) or not path or not Path(path).is_absolute():
+            raise ValueError(f"{name}.path must be an absolute non-empty path")
+    identity = {
+        key: profile[key]
+        for key in sorted(_MONTAGE_PROFILE_IDENTITY_KEYS)
+    }
+    return profile, identity
+
+
+def _rendered_montage_grammar_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+    *,
+    trusted_registered_stage_edit: bool | None = None,
+) -> dict[str, Any]:
+    """Recompute and hard-gate the final registered StageEdit montage grammar."""
+
+    activation = resolve_cut_local_sync_activation(
+        analysis,
+        selection,
+        trusted_registered_stage_edit=trusted_registered_stage_edit,
+    )
+    if not bool(activation["required"]):
+        return {
+            "required": False,
+            "activation_contract": activation,
+            "available": False,
+            "passed": None,
+        }
+
+    persisted = _mapping(analysis.get("rendered_montage_grammar_review"))
+    generation = _mapping(analysis.get("stage_edit_generation"))
+    generation_profile_raw = (
+        generation.get("professional_montage_grammar_profile")
+        if generation is not None
+        else None
+    )
+    evidence_valid = True
+    configuration_matches = False
+    serialized_review_matches = False
+    profile_identity_matches = False
+    recomputed: dict[str, Any] | None = None
+    generation_profile: dict[str, Any] | None = None
+    persisted_profile: dict[str, Any] | None = None
+    failure_details: list[str] = []
+
+    if persisted is None:
+        evidence_valid = False
+        failure_details.append("serialized_review_missing")
+        collector.add(
+            "production_rendered_montage_grammar_evidence_missing_or_invalid",
+            QAIssueSeverity.FAIL,
+            "Registered automatic StageEdit lacks a serialized final montage-grammar review.",
+            path="rendered_montage_grammar_review",
+        )
+
+    generation_identity: dict[str, Any] | None = None
+    persisted_identity: dict[str, Any] | None = None
+    try:
+        generation_profile, generation_identity = _montage_profile_identity(
+            generation_profile_raw,
+            name="stage_edit_generation.professional_montage_grammar_profile",
+        )
+        if persisted is None:
+            raise ValueError("rendered montage review is missing")
+        if (
+            persisted.get("schema_version") != 1
+            or persisted.get("analysis_basis")
+            != RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS
+            or not isinstance(persisted.get("passed"), bool)
+            or not isinstance(persisted.get("failure_codes"), list)
+        ):
+            raise ValueError("serialized rendered montage review contract is invalid")
+        persisted_profile, persisted_identity = _montage_profile_identity(
+            persisted.get("reference_profile"),
+            name="rendered_montage_grammar_review.reference_profile",
+        )
+    except (TypeError, ValueError) as exc:
+        evidence_valid = False
+        failure_details.append("profile_or_review_contract_invalid")
+        collector.add(
+            "production_rendered_montage_grammar_evidence_missing_or_invalid",
+            QAIssueSeverity.FAIL,
+            "Registered automatic StageEdit montage evidence is missing or malformed.",
+            path=(
+                "rendered_montage_grammar_review,"
+                "stage_edit_generation.professional_montage_grammar_profile"
+            ),
+            value=f"{type(exc).__name__}: {exc}",
+        )
+
+    if generation_identity is not None and persisted_identity is not None:
+        profile_identity_matches = generation_identity == persisted_identity
+        if not profile_identity_matches:
+            failure_details.append("reference_profile_identity_mismatch")
+            collector.add(
+                "production_rendered_montage_grammar_profile_identity_mismatch",
+                QAIssueSeverity.FAIL,
+                "The final montage review is bound to a different human-reference profile.",
+                path="rendered_montage_grammar_review.reference_profile",
+                value=persisted_identity,
+                threshold=generation_identity,
+            )
+
+    try:
+        recomputed = review_rendered_montage_grammar(
+            analysis,
+            render_plan=plan,
+            config=config.rendered_montage_grammar,
+        )
+    except Exception as exc:
+        evidence_valid = False
+        failure_details.append("independent_recompute_failed")
+        collector.add(
+            "production_rendered_montage_grammar_evidence_missing_or_invalid",
+            QAIssueSeverity.FAIL,
+            "The final montage grammar could not be recomputed from bound artifacts.",
+            path="rendered_montage_grammar_review",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+
+    if persisted is not None and recomputed is not None:
+        configuration_matches = (
+            persisted.get("configuration") == recomputed.get("configuration")
+        )
+        if not configuration_matches:
+            failure_details.append("configuration_mismatch")
+            collector.add(
+                "production_rendered_montage_grammar_configuration_mismatch",
+                QAIssueSeverity.FAIL,
+                "The serialized montage review used a different release policy.",
+                path="rendered_montage_grammar_review.configuration",
+                value=persisted.get("configuration"),
+                threshold=recomputed.get("configuration"),
+            )
+        persisted_core = dict(persisted)
+        persisted_core.pop("reference_profile", None)
+        serialized_review_matches = persisted_core == recomputed
+        if not serialized_review_matches:
+            failure_details.append("serialized_review_recompute_mismatch")
+            collector.add(
+                "production_rendered_montage_grammar_serialized_review_mismatch",
+                QAIssueSeverity.FAIL,
+                "The serialized final montage review does not match an independent recomputation.",
+                path="rendered_montage_grammar_review",
+            )
+
+    recomputed_passed = bool(
+        recomputed is not None and recomputed.get("passed") is True
+    )
+    persisted_passed = bool(
+        persisted is not None and persisted.get("passed") is True
+    )
+    passed = bool(
+        evidence_valid
+        and profile_identity_matches
+        and configuration_matches
+        and serialized_review_matches
+        and persisted_passed
+        and recomputed_passed
+    )
+    if not passed:
+        collector.add(
+            "production_rendered_montage_grammar_required_gate_failed",
+            QAIssueSeverity.FAIL,
+            "Registered automatic StageEdit did not satisfy the final rendered montage-grammar gate.",
+            path="rendered_montage_grammar_review",
+            value={
+                "failure_details": failure_details,
+                "persisted_passed": persisted_passed,
+                "recomputed_passed": recomputed_passed,
+                "recomputed_failure_codes": (
+                    recomputed.get("failure_codes")
+                    if recomputed is not None
+                    else None
+                ),
+            },
+            threshold={"passed": True},
+        )
+
+    recomputed_with_profile = dict(recomputed) if recomputed is not None else None
+    if recomputed_with_profile is not None and generation_profile is not None:
+        recomputed_with_profile["reference_profile"] = generation_profile
+    return {
+        "required": True,
+        "activation_contract": activation,
+        "available": persisted is not None,
+        "evidence_contract_valid": evidence_valid,
+        "configuration_matches": configuration_matches,
+        "serialized_review_matches_recomputation": serialized_review_matches,
+        "reference_profile_identity_matches": profile_identity_matches,
+        "generation_reference_profile": generation_profile,
+        "persisted_reference_profile": persisted_profile,
+        "persisted_review": persisted,
+        "recomputed_review": recomputed_with_profile,
+        "passed": passed,
+    }
+
+
 def evaluate_post_render_qa(
     artifact_set: PostRenderArtifactSet,
     *,
@@ -4665,6 +5079,7 @@ def evaluate_post_render_qa(
     runner: RunCommand = _run_command,
     perceptual_evaluator: PerceptualEvaluator | None = None,
     created_at: datetime | None = None,
+    trusted_registered_stage_edit: bool | None = None,
 ) -> PostRenderQAReport:
     """Evaluate one explicit completed set without modifying any input artifact."""
 
@@ -4720,7 +5135,20 @@ def evaluate_post_render_qa(
         perceptual_evaluator or evaluate_post_render_perceptual_quality,
     )
     metrics["production_sync"] = _sync_quality_metrics(
-        analysis, plan, settings, collector
+        analysis,
+        plan,
+        settings,
+        collector,
+        selection=selection,
+        trusted_registered_stage_edit=trusted_registered_stage_edit,
+    )
+    metrics["rendered_montage_grammar"] = _rendered_montage_grammar_metrics(
+        analysis,
+        plan,
+        selection,
+        settings,
+        collector,
+        trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
     metrics["cadence_and_repetition"] = _cadence_and_repetition_metrics(
         analysis, plan, settings, collector
@@ -4757,12 +5185,14 @@ def evaluate_and_write_post_render_qa(
     config: PostRenderQAConfig | None = None,
     runner: RunCommand = _run_command,
     created_at: datetime | None = None,
+    trusted_registered_stage_edit: bool | None = None,
 ) -> tuple[PostRenderQAReport, Path]:
     report = evaluate_post_render_qa(
         artifact_set,
         config=config,
         runner=runner,
         created_at=created_at,
+        trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
     return (report, report.write_atomic(output_path))
 

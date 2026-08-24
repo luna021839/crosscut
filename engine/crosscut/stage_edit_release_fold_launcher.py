@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
@@ -32,20 +32,33 @@ from .professional_montage_policy import (
     load_professional_montage_policy,
 )
 from .stage_edit_production_train_cli import main as production_train_main
-from .stage_edit_production_training import STAGE_EDIT_SELECTION_FREEZE_FILENAME
+from .stage_edit_production_training import (
+    STAGE_EDIT_SELECTION_FREEZE_FILENAME,
+    ProductionQualityThresholds,
+    _categorical_target_coverage,
+    production_song_split,
+)
+from .stage_edit_reference_adapter import load_reference_training_corpus
+from .stage_edit_dynamic_crop_head_v2 import DynamicCropV2LossContract
 from .stage_edit_transformer import (
+    DEFAULT_STAGE_EDIT_SCHEMA,
     PRODUCTION_TRAINING_REPORT_FILENAME,
     PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
     PRODUCTION_TRAINING_RUN_KIND,
+    StageEditLossContract,
+    StageEditTransformerConfig,
     production_stage_edit_config,
 )
 
 
-RELEASE_PLAN_SCHEMA_VERSION = 1
-FINAL_RELEASE_PLAN_SCHEMA_VERSION = 2
-DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v1"
-DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v1"
-FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v2"
+RELEASE_PLAN_SCHEMA_VERSION = 2
+FINAL_RELEASE_PLAN_SCHEMA_VERSION = 3
+DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v2"
+DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v2"
+FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v3"
+MODEL_TRAINING_CONTRACT_VERSION = 1
+STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 1
+RENDERER_OWNED_TRANSITION_CONTRACT_VERSION = 1
 
 BANG_BANG = "IVE-BANG-BANG"
 BLACKHOLE = "IVE-BLACKHOLE"
@@ -287,6 +300,142 @@ def _validate_training_config(value: object) -> dict[str, Any]:
     return config
 
 
+def _validate_model_training_contract(value: object) -> dict[str, Any]:
+    """Validate the immutable capacity and base-loss contract used by the CLI."""
+
+    contract = dict(_mapping(value, "release model/training contract"))
+    expected_keys = {
+        "contract_version",
+        "model_config",
+        "model_config_sha256",
+        "base_loss_contract",
+        "base_loss_contract_sha256",
+        "dynamic_crop_loss_contract",
+        "dynamic_crop_loss_contract_sha256",
+        "source_objective",
+    }
+    if set(contract) != expected_keys:
+        raise ReleaseFoldPreflightError(
+            "release model/training contract keys are not exact"
+        )
+    if contract.get("contract_version") != MODEL_TRAINING_CONTRACT_VERSION:
+        raise ReleaseFoldPreflightError(
+            "release model/training contract version is invalid"
+        )
+    model_payload = dict(_mapping(contract.get("model_config"), "model config"))
+    if contract.get("model_config_sha256") != _canonical_sha256(model_payload):
+        raise ReleaseFoldPreflightError("release model config hash mismatch")
+    try:
+        model = StageEditTransformerConfig.from_dict(model_payload)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"release model config is invalid: {exc}"
+        ) from exc
+    if (
+        model.token_schema_fingerprint != DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+        or model.max_sources != legacy.PRODUCTION_SAMPLING_CONTRACT["max_sources"]
+    ):
+        raise ReleaseFoldPreflightError(
+            "release model config differs from token/source capacity contract"
+        )
+
+    base_payload = dict(
+        _mapping(contract.get("base_loss_contract"), "base loss contract")
+    )
+    if contract.get("base_loss_contract_sha256") != _canonical_sha256(base_payload):
+        raise ReleaseFoldPreflightError("release base loss contract hash mismatch")
+    try:
+        base_loss = StageEditLossContract(**base_payload)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"release base loss contract is invalid: {exc}"
+        ) from exc
+    if contract.get("source_objective") != base_loss.source_objective:
+        raise ReleaseFoldPreflightError("release source objective binding mismatch")
+
+    dynamic_payload = dict(
+        _mapping(
+            contract.get("dynamic_crop_loss_contract"),
+            "dynamic crop loss contract",
+        )
+    )
+    if contract.get("dynamic_crop_loss_contract_sha256") != _canonical_sha256(
+        dynamic_payload
+    ):
+        raise ReleaseFoldPreflightError(
+            "release dynamic crop loss contract hash mismatch"
+        )
+    dynamic_base = dict(
+        _mapping(dynamic_payload.get("base"), "dynamic crop base loss contract")
+    )
+    try:
+        DynamicCropV2LossContract(
+            **{
+                **dynamic_payload,
+                "base": StageEditLossContract(**dynamic_base),
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"release dynamic crop loss contract is invalid: {exc}"
+        ) from exc
+    if dynamic_base != base_payload:
+        raise ReleaseFoldPreflightError(
+            "release dynamic crop and base source objectives differ"
+        )
+    return contract
+
+
+def _default_model_training_contract() -> dict[str, Any]:
+    model = production_stage_edit_config().to_dict()
+    base_loss = asdict(StageEditLossContract())
+    dynamic_loss = asdict(DynamicCropV2LossContract())
+    return _validate_model_training_contract(
+        {
+            "contract_version": MODEL_TRAINING_CONTRACT_VERSION,
+            "model_config": model,
+            "model_config_sha256": _canonical_sha256(model),
+            "base_loss_contract": base_loss,
+            "base_loss_contract_sha256": _canonical_sha256(base_loss),
+            "dynamic_crop_loss_contract": dynamic_loss,
+            "dynamic_crop_loss_contract_sha256": _canonical_sha256(dynamic_loss),
+            "source_objective": base_loss["source_objective"],
+        }
+    )
+
+
+def _structured_head_preflight_contract() -> dict[str, Any]:
+    thresholds = ProductionQualityThresholds()
+    return {
+        "contract_version": STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION,
+        "duration": {
+            "mode": "learned_multiclass",
+            "minimum_observed_classes": thresholds.minimum_duration_observed_classes,
+            "minimum_label_entropy_bits": thresholds.minimum_duration_label_entropy_bits,
+        },
+        "transition": {
+            "mode": "learned_multiclass",
+            "minimum_observed_classes": thresholds.minimum_transition_observed_classes,
+            "minimum_label_entropy_bits": thresholds.minimum_transition_label_entropy_bits,
+        },
+        "renderer_owned_single_class_transition": {
+            "contract_version": RENDERER_OWNED_TRANSITION_CONTRACT_VERSION,
+            "enabled": False,
+            "activation_requires_separate_evidence_audit": True,
+        },
+    }
+
+
+def _validate_structured_head_preflight_contract(value: object) -> dict[str, Any]:
+    contract = dict(_mapping(value, "structured head preflight contract"))
+    expected = _structured_head_preflight_contract()
+    if contract != expected:
+        raise ReleaseFoldPreflightError(
+            "structured head preflight contract is not exact"
+        )
+    return contract
+
+
 def _release_contract(
     *, training_song_ids: Sequence[str], held_out_song_id: str, stage: str
 ) -> dict[str, Any]:
@@ -356,6 +505,7 @@ def create_stage_edit_release_development_plan(
     checkpoint_directory: Path,
     output_directory: Path,
     training_config: Mapping[str, Any] = DEFAULT_RELEASE_TRAINING_CONFIG,
+    model_training_contract: Mapping[str, Any] | None = None,
 ) -> Path:
     """Bind the exact four-song development fold without activation authority."""
 
@@ -377,6 +527,14 @@ def create_stage_edit_release_development_plan(
         "required_volume": str(legacy.PRODUCTION_VOLUME_ROOT),
         "minimum_free_bytes": legacy.MINIMUM_FREE_BYTES,
         "training_config": _validate_training_config(training_config),
+        "model_training_contract": _validate_model_training_contract(
+            model_training_contract
+            if model_training_contract is not None
+            else _default_model_training_contract()
+        ),
+        "structured_head_preflight_contract": (
+            _structured_head_preflight_contract()
+        ),
         "checkpoint_directory": str(checkpoint),
         "songs": _song_records(
             DEVELOPMENT_SONG_IDS,
@@ -401,6 +559,8 @@ _DEVELOPMENT_PLAN_KEYS = {
     "required_volume",
     "minimum_free_bytes",
     "training_config",
+    "model_training_contract",
+    "structured_head_preflight_contract",
     "checkpoint_directory",
     "songs",
     "plan_sha256",
@@ -428,6 +588,10 @@ def _strict_development_plan(path: Path) -> dict[str, Any]:
     ):
         raise ReleaseFoldPreflightError("development storage contract mismatch")
     _validate_training_config(payload.get("training_config"))
+    _validate_model_training_contract(payload.get("model_training_contract"))
+    _validate_structured_head_preflight_contract(
+        payload.get("structured_head_preflight_contract")
+    )
     _indexed_song_records(payload, DEVELOPMENT_SONG_IDS)
     return payload
 
@@ -478,12 +642,29 @@ def _training_config_cli_args(config: Mapping[str, Any]) -> list[str]:
     return args
 
 
+def _model_training_cli_args(contract: object) -> list[str]:
+    validated = _validate_model_training_contract(contract)
+    return [
+        "--model-config-json",
+        _canonical_bytes(validated["model_config"]).decode("utf-8"),
+        "--base-loss-contract-json",
+        _canonical_bytes(validated["base_loss_contract"]).decode("utf-8"),
+        "--dynamic-crop-loss-contract-json",
+        _canonical_bytes(validated["dynamic_crop_loss_contract"]).decode("utf-8"),
+    ]
+
+
 def _manifest_cli_args(
     payload: Mapping[str, Any], song_ids: Sequence[str]
-) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+) -> tuple[
+    list[str],
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[Path, ...]],
+]:
     songs = _indexed_song_records(payload, song_ids)
     args: list[str] = []
     reference_ids: dict[str, tuple[str, ...]] = {}
+    supervision_paths: dict[str, tuple[Path, ...]] = {}
     for song_id in song_ids:
         item = songs[song_id]
         _, materialization = legacy._validate_materialization_manifest(
@@ -500,6 +681,10 @@ def _manifest_cli_args(
             materialization=materialization,
         )
         reference_ids[song_id] = materialization.reference_ids
+        supervision_paths[song_id] = tuple(
+            materialization.supervision_paths[reference_id]
+            for reference_id in materialization.reference_ids
+        )
         for reference_id in materialization.reference_ids:
             args.extend(
                 [
@@ -512,7 +697,104 @@ def _manifest_cli_args(
                 ]
             )
         args.extend(["--dynamic-crop-manifest", str(dynamic.path)])
-    return args, reference_ids
+    return args, reference_ids, supervision_paths
+
+
+def _preflight_structured_head_label_coverage(
+    supervision_paths_by_song: Mapping[str, Sequence[Path]],
+    *,
+    contract: object,
+) -> dict[str, Any]:
+    """Read only the frozen development labels and reject doomed heads early."""
+
+    validated = _validate_structured_head_preflight_contract(contract)
+    expected_songs = set(DEVELOPMENT_SONG_IDS)
+    if set(supervision_paths_by_song) != expected_songs:
+        raise ReleaseFoldPreflightError(
+            "structured head preflight did not receive the exact development fold"
+        )
+    paths: list[Path] = []
+    song_by_reference: dict[str, str] = {}
+    for song_id in DEVELOPMENT_SONG_IDS:
+        for raw_path in supervision_paths_by_song[song_id]:
+            path = Path(raw_path).expanduser().resolve()
+            paths.append(path)
+    try:
+        for song_id in DEVELOPMENT_SONG_IDS:
+            for raw_path in supervision_paths_by_song[song_id]:
+                path = Path(raw_path).expanduser().resolve()
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise ValueError(f"supervision root must be an object: {path}")
+                reference_id = str(payload.get("reference_id") or "").strip()
+                if not reference_id or reference_id in song_by_reference:
+                    raise ValueError(
+                        f"supervision reference id is missing or duplicated: {path}"
+                    )
+                song_by_reference[reference_id] = song_id
+        # The adapter derives duration/transition targets solely from the
+        # immutable supervision JSON. Feature snapshots affect input features,
+        # not these categorical labels, so preflight need not load video/crops.
+        corpus = load_reference_training_corpus(
+            paths,
+            song_id_by_reference=song_by_reference,
+            negative_samples_per_hold=int(
+                legacy.PRODUCTION_SAMPLING_CONTRACT["negative_samples_per_hold"]
+            ),
+            boundary_guard_seconds=float(
+                legacy.PRODUCTION_SAMPLING_CONTRACT["boundary_guard_seconds"]
+            ),
+            max_sources=int(legacy.PRODUCTION_SAMPLING_CONTRACT["max_sources"]),
+        )
+        split = production_song_split(
+            corpus,
+            held_out_song_ids=(XOXZ,),
+            required_training_song_ids=DEVELOPMENT_TRAINING_SONG_IDS,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"structured head label preflight could not inspect bound labels: {exc}"
+        ) from exc
+
+    evidence = {
+        "contract": validated,
+        "training": {
+            name: _categorical_target_coverage(split.train, field=field)
+            for name, field in (
+                ("duration", "duration_bucket"),
+                ("transition", "transition_label"),
+            )
+        },
+        "heldout": {
+            name: _categorical_target_coverage(split.held_out, field=field)
+            for name, field in (
+                ("duration", "duration_bucket"),
+                ("transition", "transition_label"),
+            )
+        },
+    }
+    reasons: list[str] = []
+    for side in ("training", "heldout"):
+        for name in ("duration", "transition"):
+            observed = evidence[side][name]
+            required = validated[name]
+            if observed["observed_class_count"] < required[
+                "minimum_observed_classes"
+            ]:
+                reasons.append(f"{side}_{name}_class_coverage_insufficient")
+            entropy = observed["label_entropy_bits"]
+            if entropy is None or entropy < required["minimum_label_entropy_bits"]:
+                reasons.append(f"{side}_{name}_label_entropy_insufficient")
+    evidence["passed"] = not reasons
+    evidence["reasons"] = reasons
+    if reasons:
+        raise ReleaseFoldPreflightError(
+            "structured head label preflight failed before training: "
+            + ", ".join(reasons)
+            + "; renderer-owned single-class transition mode remains explicitly "
+            "disabled pending a separate evidence audit"
+        )
+    return evidence
 
 
 def preflight_stage_edit_release_development(
@@ -521,7 +803,13 @@ def preflight_stage_edit_release_development(
     payload = _strict_development_plan(plan_path)
     checkpoint = Path(str(payload["checkpoint_directory"])).resolve()
     legacy._validate_storage(checkpoint)
-    args, references = _manifest_cli_args(payload, DEVELOPMENT_SONG_IDS)
+    args, references, supervision_paths = _manifest_cli_args(
+        payload, DEVELOPMENT_SONG_IDS
+    )
+    _preflight_structured_head_label_coverage(
+        supervision_paths,
+        contract=payload["structured_head_preflight_contract"],
+    )
     for song_id in DEVELOPMENT_TRAINING_SONG_IDS:
         args.extend(["--required-training-song", song_id])
     args.extend(
@@ -539,6 +827,7 @@ def preflight_stage_edit_release_development(
         ]
     )
     args.extend(_training_config_cli_args(_validate_training_config(payload["training_config"])))
+    args.extend(_model_training_cli_args(payload["model_training_contract"]))
     if "--authorize-production-activation" in args or "--production-registry" in args:
         raise ReleaseFoldPreflightError("development plan acquired activation authority")
     return ReleaseFoldPreflight(
@@ -619,15 +908,45 @@ def _assert_development_report(
     if not isinstance(config, Mapping):
         raise ReleaseFoldPreflightError("development model config is missing")
     config_fingerprint = _canonical_sha256(config)
+    planned_model_training = _validate_model_training_contract(
+        plan.get("model_training_contract")
+    )
     if (
-        selection.get("model_config") != config
+        config != planned_model_training["model_config"]
+        or selection.get("model_config") != config
         or selection.get("model_config_fingerprint_sha256") != config_fingerprint
     ):
         raise ReleaseFoldPreflightError("development model config freeze mismatch")
-    if _canonical_sha256(production_stage_edit_config().to_dict()) != config_fingerprint:
-        raise ReleaseFoldPreflightError("current production model config differs from development")
     expected_training = _validate_training_config(plan.get("training_config"))
     optimization = _mapping(report.get("optimization"), "development optimization")
+    cut_imbalance = _mapping(
+        report.get("cut_imbalance_contract"), "cut imbalance contract"
+    )
+    applied_positive_weight = cut_imbalance.get("applied_positive_weight")
+    if not isinstance(applied_positive_weight, (int, float)) or isinstance(
+        applied_positive_weight, bool
+    ):
+        raise ReleaseFoldPreflightError(
+            "development applied cut-positive weight is missing"
+        )
+    expected_effective_loss = dict(planned_model_training["base_loss_contract"])
+    expected_effective_loss["cut_positive_weight"] = float(
+        applied_positive_weight
+    )
+    expected_dynamic_loss = deepcopy(
+        planned_model_training["dynamic_crop_loss_contract"]
+    )
+    expected_dynamic_loss["base"]["cut_positive_weight"] = float(
+        applied_positive_weight
+    )
+    if (
+        optimization.get("effective_loss_contract") != expected_effective_loss
+        or optimization.get("effective_dynamic_crop_loss_contract")
+        != expected_dynamic_loss
+    ):
+        raise ReleaseFoldPreflightError(
+            "development effective loss/source objective differs from plan"
+        )
     schedule = _mapping(optimization.get("learning_rate_schedule"), "learning-rate schedule")
     observed_training = {
         "epochs": optimization.get("requested_epochs"),
@@ -708,6 +1027,10 @@ def freeze_stage_edit_release_development(
         "checkpoint_id": checkpoint_id,
         "model_config": config,
         "model_config_fingerprint_sha256": _canonical_sha256(config),
+        "model_training_contract": dict(plan["model_training_contract"]),
+        "structured_head_preflight_contract": dict(
+            plan["structured_head_preflight_contract"]
+        ),
         "training_config": dict(plan["training_config"]),
         "development_training_song_ids": list(DEVELOPMENT_TRAINING_SONG_IDS),
         "development_held_out_song_id": XOXZ,
@@ -735,6 +1058,8 @@ _DEVELOPMENT_FREEZE_KEYS = {
     "checkpoint_id",
     "model_config",
     "model_config_fingerprint_sha256",
+    "model_training_contract",
+    "structured_head_preflight_contract",
     "training_config",
     "development_training_song_ids",
     "development_held_out_song_id",
@@ -771,6 +1096,20 @@ def _strict_development_freeze(
     plan = _strict_development_plan(plan_path)
     if payload.get("training_config") != plan.get("training_config"):
         raise ReleaseFoldPreflightError("development training config freeze mismatch")
+    if payload.get("model_training_contract") != plan.get(
+        "model_training_contract"
+    ):
+        raise ReleaseFoldPreflightError("development model/loss contract freeze mismatch")
+    _validate_model_training_contract(payload.get("model_training_contract"))
+    if payload.get("structured_head_preflight_contract") != plan.get(
+        "structured_head_preflight_contract"
+    ):
+        raise ReleaseFoldPreflightError(
+            "development structured-head contract freeze mismatch"
+        )
+    _validate_structured_head_preflight_contract(
+        payload.get("structured_head_preflight_contract")
+    )
     checkpoint = Path(str(payload.get("development_checkpoint_directory") or "")).resolve()
     if checkpoint != Path(str(plan["checkpoint_directory"])).resolve():
         raise ReleaseFoldPreflightError("development checkpoint path freeze mismatch")
@@ -798,8 +1137,13 @@ def _strict_development_freeze(
     fingerprint = payload.get("model_config_fingerprint_sha256")
     if not isinstance(model_config, Mapping) or _canonical_sha256(model_config) != fingerprint:
         raise ReleaseFoldPreflightError("development frozen model config is invalid")
-    if _canonical_sha256(production_stage_edit_config().to_dict()) != fingerprint:
-        raise ReleaseFoldPreflightError("current production model config differs from frozen config")
+    model_training = _validate_model_training_contract(
+        payload.get("model_training_contract")
+    )
+    if model_config != model_training["model_config"]:
+        raise ReleaseFoldPreflightError(
+            "frozen model config differs from bound model/training contract"
+        )
     return payload
 
 
@@ -888,6 +1232,10 @@ def create_stage_edit_release_final_plan(
         "model_config_fingerprint_sha256": freeze[
             "model_config_fingerprint_sha256"
         ],
+        "model_training_contract": dict(freeze["model_training_contract"]),
+        "structured_head_preflight_contract": dict(
+            freeze["structured_head_preflight_contract"]
+        ),
         "development_plan": _pointer(resolved_development, "development plan"),
         "development_freeze": _pointer(
             Path(development_freeze_path).expanduser().resolve(),
@@ -916,6 +1264,8 @@ _FINAL_PLAN_KEYS = {
     "minimum_free_bytes",
     "training_config",
     "model_config_fingerprint_sha256",
+    "model_training_contract",
+    "structured_head_preflight_contract",
     "development_plan",
     "development_freeze",
     "checkpoint_directory",
@@ -959,6 +1309,22 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
         "model_config_fingerprint_sha256"
     ):
         raise ReleaseFoldPreflightError("final model config differs from development freeze")
+    if payload.get("model_training_contract") != freeze.get(
+        "model_training_contract"
+    ):
+        raise ReleaseFoldPreflightError(
+            "final model/loss contract differs from development freeze"
+        )
+    _validate_model_training_contract(payload.get("model_training_contract"))
+    if payload.get("structured_head_preflight_contract") != freeze.get(
+        "structured_head_preflight_contract"
+    ):
+        raise ReleaseFoldPreflightError(
+            "final structured-head contract differs from development freeze"
+        )
+    _validate_structured_head_preflight_contract(
+        payload.get("structured_head_preflight_contract")
+    )
     final_records = _indexed_song_records(payload, FINAL_SONG_IDS)
     development_records = _indexed_song_records(development, DEVELOPMENT_SONG_IDS)
     for song_id in DEVELOPMENT_SONG_IDS:
@@ -1034,7 +1400,7 @@ def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
         raise ReleaseFoldPreflightError(
             "ATTITUDE blind evaluation was already consumed for this release"
         )
-    args, references = _manifest_cli_args(payload, FINAL_SONG_IDS)
+    args, references, _ = _manifest_cli_args(payload, FINAL_SONG_IDS)
     for song_id in FINAL_TRAINING_SONG_IDS:
         args.extend(["--required-training-song", song_id])
     args.extend(
@@ -1052,6 +1418,7 @@ def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
         ]
     )
     args.extend(_training_config_cli_args(_validate_training_config(payload["training_config"])))
+    args.extend(_model_training_cli_args(payload["model_training_contract"]))
     args.extend(
         [
             "--professional-montage-grammar-profile",
@@ -1148,6 +1515,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_manifest_options(create_dev)
     create_dev.add_argument("--checkpoint-dir", required=True, type=Path)
     create_dev.add_argument("--output-directory", required=True, type=Path)
+    create_dev.add_argument(
+        "--model-training-contract",
+        type=Path,
+        help=(
+            "Optional probe-selected model/loss contract JSON. When omitted, "
+            "the current release candidate is still serialized and hash-bound; "
+            "a later capacity probe may supply its selected contract explicitly."
+        ),
+    )
     for name in ("preflight-development", "launch-development"):
         command = commands.add_parser(name)
         command.add_argument("--plan", required=True, type=Path)
@@ -1194,6 +1570,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
+            model_training_contract=(
+                _read_json_object(
+                    args.model_training_contract.expanduser().resolve(),
+                    "probe-selected model/training contract",
+                )
+                if args.model_training_contract is not None
+                else None
+            ),
         )
         print(json.dumps({"plan_path": str(path)}, ensure_ascii=False, indent=2))
         return 0

@@ -11,16 +11,39 @@ from typing import Callable
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
+from crosscut.cut_local_sync import (
+    ACTIVATION as CUT_LOCAL_SYNC_ACTIVATION,
+    ANALYSIS_BASIS as CUT_LOCAL_SYNC_ANALYSIS_BASIS,
+    SCHEMA_VERSION as CUT_LOCAL_SYNC_SCHEMA_VERSION,
+    CutLocalSyncConfig,
+    _SERIALIZATION_POLICY as CUT_LOCAL_SYNC_SERIALIZATION_POLICY,
+    _bound_timewarp_payloads,
+    _boundary_contracts,
+    _canonical_sha256,
+    _used_source_indices,
+)
 from crosscut.post_render_qa import (
     PostRenderArtifactSet,
     PostRenderQAConfig,
     PostRenderQAReport,
     PostRenderQAVerdict,
     _IssueCollector,
+    _sync_quality_metrics,
     _transform_metrics,
     _validate_plan_invariants,
     discover_completed_artifact_sets,
     evaluate_post_render_qa,
+)
+from crosscut.pipeline import _source_index_mapping
+from crosscut.professional_montage_grammar import (
+    PROFILE_ANALYSIS_BASIS as MONTAGE_PROFILE_ANALYSIS_BASIS,
+    PROFILE_SCHEMA_VERSION as MONTAGE_PROFILE_SCHEMA_VERSION,
+)
+from crosscut.rendered_montage_grammar_review import (
+    RenderedMontageGrammarConfig,
+    review_rendered_montage_grammar,
 )
 
 
@@ -30,6 +53,15 @@ _FPS = 30.0
 _DURATION = 32.0
 _FRAME_COUNT = 960
 _REGULAR_SEGMENT_DURATION = 3.5
+_MONTAGE_TEST_CONFIG = RenderedMontageGrammarConfig(
+    burst_maximum_run_seconds=4.0
+)
+
+
+def _registered_qa_config() -> PostRenderQAConfig:
+    return PostRenderQAConfig(
+        rendered_montage_grammar=_MONTAGE_TEST_CONFIG
+    )
 
 
 def _segment_bounds(index: int) -> tuple[float, float]:
@@ -754,6 +786,401 @@ def _perceptual_pass_payload() -> dict[str, object]:
     }
 
 
+def _install_valid_registered_montage_evidence(
+    analysis: dict,
+    plan: dict,
+    selection: dict,
+) -> None:
+    plan["source_index_domains"] = {
+        "sources[]": "render_plan_sources_array_index",
+        "reference_source": "render_plan_sources_array_index",
+        "segments[].source_index": "render_plan_sources_array_index",
+    }
+    analysis["source_index_mapping"] = _source_index_mapping(
+        tuple(Path(source) for source in plan["sources"]),
+        tuple(range(len(plan["sources"]))),
+    )
+    shot_types = (
+        "wide",
+        "close",
+        "medium",
+        "wide",
+        "close",
+        "medium",
+        "wide",
+        "close",
+        "wide",
+    )
+    choices = analysis["visual_timeline"]["choices"]
+    analysis["visual_timeline"]["index_domain"] = "eligible_source_index"
+    for index, (choice, shot_type) in enumerate(
+        zip(choices, shot_types, strict=True)
+    ):
+        choice.update(
+            {
+                "shot_type": shot_type,
+                "entry_shot_type": shot_type,
+                "exit_shot_type": shot_type,
+                "source_local_start": plan["segments"][index][
+                    "source_local_start"
+                ],
+                "source_local_end": plan["segments"][index][
+                    "source_local_end"
+                ],
+                "detected_person_counts": [6, 6, 6],
+                "formation_person_counts": [6, 6, 6],
+                "formation_upper_body_counts": [6, 6, 6],
+            }
+        )
+    analysis["stage_edit_exact_shot_clock"] = {
+        "contract": (
+            "serialized_inference_token_section_and_phrase_progress_"
+            "per_selected_shot_v1"
+        ),
+        "source_index_domain": "eligible_source_index",
+        "shots": [
+            {
+                "shot_index": index,
+                "source_index": choice["source_index"],
+                "section_role": "chorus_like",
+                "section_progress": index / max(1, len(choices) - 1),
+                # Phrase entries at shots 0, 3 and 6 are all wide in this
+                # production fixture.
+                "phrase_progress": (index % 3) / 3.0,
+            }
+            for index, choice in enumerate(choices)
+        ],
+    }
+    analysis["source_derivative_diversity"] = {
+        "index_domain": "eligible_source_index",
+        "source_count": 8,
+        "family_ids": list(range(8)),
+        "production_ready": True,
+        "clock_contract_complete": True,
+        "uncertain_pair_count": 0,
+        "family_consistency_conflict_count": 0,
+    }
+    analysis["section_plan"]["sections"][0][
+        "establish_with_wide_shot"
+    ] = True
+    profile_identity = {
+        "analysis_basis": MONTAGE_PROFILE_ANALYSIS_BASIS,
+        "schema_version": MONTAGE_PROFILE_SCHEMA_VERSION,
+        "path": "/fixture/checkpoint/professional-montage-profile.json",
+        "file_sha256": "a" * 64,
+        "content_sha256": "b" * 64,
+    }
+    analysis["stage_edit_generation"][
+        "professional_montage_grammar_profile"
+    ] = profile_identity
+    _promote_review_to_domain_aware_v3(
+        selection["final_selected_review"], plan
+    )
+    for candidate, complete_candidate in zip(
+        selection["candidates"],
+        selection["complete_candidates"],
+        strict=True,
+    ):
+        complete_candidate["visual_timeline"] = {
+            "choices": [deepcopy(segment) for segment in plan["segments"]]
+        }
+        complete_candidate["group_transitions"] = {
+            "transitions": deepcopy(plan["transitions"])
+        }
+        _promote_review_to_domain_aware_v3(candidate["review"], plan)
+    analysis["rendered_proxy_review"] = deepcopy(
+        selection["final_selected_review"]
+    )
+    review = review_rendered_montage_grammar(
+        analysis,
+        render_plan=plan,
+        config=_MONTAGE_TEST_CONFIG,
+    )
+    review["reference_profile"] = {
+        **profile_identity,
+        "path": "/fixture/stable/professional-montage-profile.json",
+    }
+    analysis["rendered_montage_grammar_review"] = review
+
+
+def _activate_registered_cut_local_sync(
+    analysis: dict,
+    plan: dict,
+    selection: dict,
+    *,
+    residual_frames: float = 0.10,
+    unknown_boundary_index: int | None = None,
+) -> None:
+    plan["source_index_domains"] = {
+        "sources[]": "render_plan_sources_array_index",
+        "reference_source": "render_plan_sources_array_index",
+        "segments[].source_index": "render_plan_sources_array_index",
+    }
+    analysis["source_index_mapping"]["domain_equivalences"] = {
+        "render_plan_sources_array_index": "request_source_index",
+    }
+    for timewarp in analysis["local_timewarps"]:
+        timewarp.update(
+            {
+                "global_offset_seconds": 0.0,
+                "master_duration_seconds": _DURATION,
+                "source_duration_seconds": _DURATION,
+                "fallback_reason": None,
+                "minimum_slope": 0.98,
+                "maximum_slope": 1.02,
+                "observed_minimum_slope": 1.0,
+                "observed_maximum_slope": 1.0,
+                "mean_slope": 1.0,
+                "estimated_drift_parts_per_million": 0.0,
+                "control_points": [
+                    {
+                        "master_seconds": 0.0,
+                        "source_seconds": 0.0,
+                        "offset_seconds": 0.0,
+                    },
+                    {
+                        "master_seconds": _DURATION,
+                        "source_seconds": _DURATION,
+                        "offset_seconds": 0.0,
+                    },
+                ],
+            }
+        )
+    boundaries = _boundary_contracts(plan)
+    used_sources = _used_source_indices(plan)
+    bound_timewarps = _bound_timewarp_payloads(
+        analysis["local_timewarps"], used_sources
+    )
+    records: list[dict[str, object]] = []
+    measured: list[float] = []
+    unknown_reasons: dict[str, int] = {}
+    selected_ordinals: dict[int, set[int]] = {
+        index: set() for index in used_sources
+    }
+    selected_pts: dict[int, dict[int, float]] = {
+        index: {} for index in used_sources
+    }
+    for boundary in boundaries:
+        record: dict[str, object] = {
+            **boundary.payload(),
+            "boundary_contract_sha256": boundary.sha256,
+        }
+        if boundary.boundary_index == unknown_boundary_index:
+            record.update(
+                {
+                    "status": "unknown",
+                    "reason": "ambiguous_motion_lag",
+                }
+            )
+            unknown_reasons["ambiguous_motion_lag"] = 1
+        else:
+            grids = list(range(-7, 8))
+            requested = [
+                boundary.canonical_master_seconds + grid / _FPS
+                for grid in grids
+            ]
+            outgoing_pts = list(requested)
+            incoming_pts = [
+                value + residual_frames / _FPS for value in requested
+            ]
+            outgoing_ordinals = [int(round(value * _FPS)) for value in outgoing_pts]
+            incoming_ordinals = [int(round(value * _FPS)) for value in incoming_pts]
+            selected_ordinals[boundary.outgoing_source_index].update(
+                outgoing_ordinals
+            )
+            selected_ordinals[boundary.incoming_source_index].update(
+                incoming_ordinals
+            )
+            selected_pts[boundary.outgoing_source_index].update(
+                zip(outgoing_ordinals, outgoing_pts, strict=True)
+            )
+            selected_pts[boundary.incoming_source_index].update(
+                zip(incoming_ordinals, incoming_pts, strict=True)
+            )
+            outgoing_timing = [
+                {
+                    "grid_index": grid,
+                    "actual_master_seconds": (
+                        outgoing_pts[position] + outgoing_pts[position + 1]
+                    )
+                    / 2.0,
+                    "basis": "actual_pose_motion",
+                }
+                for position, grid in enumerate(grids[:-1])
+            ]
+            incoming_timing = [
+                {
+                    "grid_index": grid,
+                    "actual_master_seconds": (
+                        incoming_pts[position] + incoming_pts[position + 1]
+                    )
+                    / 2.0,
+                    "basis": "actual_pose_motion",
+                }
+                for position, grid in enumerate(grids[:-1])
+            ]
+            candidates: list[dict[str, object]] = []
+            for lag, correlation in zip(
+                range(-2, 3), (0.40, 0.60, 0.95, 0.60, 0.40), strict=True
+            ):
+                pair_count = 14 - abs(lag)
+                candidates.append(
+                    {
+                        "lag_frames": lag,
+                        "pair_count": pair_count,
+                        "non_silhouette_pair_count": pair_count,
+                        "correlation": correlation,
+                        "outgoing_motion_stddev": 0.20,
+                        "incoming_motion_stddev": 0.20,
+                        "actual_pts_phase_frames": lag + residual_frames,
+                        "motion_basis_pair_counts": {
+                            "actual_pose_motion+actual_pose_motion": pair_count,
+                        },
+                        "eligible": True,
+                    }
+                )
+            record.update(
+                {
+                    "status": "measured",
+                    "reason": None,
+                    "sampling_domain": "hard_cut_symmetric_canonical_context",
+                    "renderer_frame_selection": {
+                        "outgoing": {
+                            "basis": "trim_lower_bound_setpts_first_pts_fps_round_near_tpad_clone_v1",
+                            "source_index": boundary.outgoing_source_index,
+                            "grid_indices": grids,
+                            "frame_ordinals": outgoing_ordinals,
+                            "normalized_pts_seconds": outgoing_pts,
+                            "requested_master_seconds": requested,
+                            "source_start_seconds": requested[0],
+                            "source_duration_seconds": 0.5,
+                            "timeline_duration_seconds": 0.5,
+                            "frame_count": 15,
+                        },
+                        "incoming": {
+                            "basis": "trim_lower_bound_setpts_first_pts_fps_round_near_tpad_clone_v1",
+                            "source_index": boundary.incoming_source_index,
+                            "grid_indices": grids,
+                            "frame_ordinals": incoming_ordinals,
+                            "normalized_pts_seconds": incoming_pts,
+                            "requested_master_seconds": requested,
+                            "source_start_seconds": requested[0],
+                            "source_duration_seconds": 0.5,
+                            "timeline_duration_seconds": 0.5,
+                            "frame_count": 15,
+                        },
+                    },
+                    "outgoing_motion_sample_count": 14,
+                    "incoming_motion_sample_count": 14,
+                    "best_lag_frames": 0,
+                    "subframe_peak_offset_frames": 0.0,
+                    "actual_pts_phase_frames": residual_frames,
+                    "signed_phase_residual_frames": residual_frames,
+                    "residual_frames": residual_frames,
+                    "best_correlation": 0.95,
+                    "runner_up_correlation": 0.60,
+                    "correlation_margin": 0.35,
+                    "matched_motion_pair_count": 14,
+                    "matched_non_silhouette_pair_count": 14,
+                    "motion_basis_pair_counts": {
+                        "actual_pose_motion+actual_pose_motion": 14,
+                    },
+                    "motion_timing_provenance": {
+                        "outgoing": outgoing_timing,
+                        "incoming": incoming_timing,
+                    },
+                    "lag_candidates": candidates,
+                }
+            )
+            measured.append(residual_frames)
+        records.append(record)
+    p95 = (
+        float(np.quantile(np.asarray(measured, dtype=np.float64), 0.95))
+        if measured
+        else None
+    )
+    passed = bool(
+        boundaries
+        and len(measured) == len(boundaries)
+        and not unknown_reasons
+        and p95 is not None
+        and p95 <= 0.5
+    )
+    analysis["stage_edit_generation"] = {
+        "activation": {
+            "activation": "automatic_registered_production_bundle",
+        }
+    }
+    selection["stage_edit_render_promotion"] = {
+        "activation": "automatic_registered_production_bundle",
+        "candidate_pool": "stage_edit_generation_only",
+    }
+    analysis["render"]["candidate_origin"] = "explicit_stage_edit_generation"
+    analysis["render"]["stage_edit_promotion_contract"] = "fixture_stage_edit"
+    payload = {
+        "schema_version": CUT_LOCAL_SYNC_SCHEMA_VERSION,
+        "analysis": CUT_LOCAL_SYNC_ANALYSIS_BASIS,
+        "activation": CUT_LOCAL_SYNC_ACTIVATION,
+        "required": True,
+        "plan_sha256": _canonical_sha256(plan),
+        "timewarp_contract_sha256": _canonical_sha256(bound_timewarps),
+        "boundary_clock_contract_sha256": _canonical_sha256(
+            [item.payload() for item in boundaries]
+        ),
+        "fps": _FPS,
+        "used_source_indices": list(used_sources),
+        "retained_cross_source_boundary_count": len(boundaries),
+        "measured_boundary_count": len(measured),
+        "unknown_boundary_count": sum(unknown_reasons.values()),
+        "unknown_reason_counts": unknown_reasons,
+        "threshold_exceeding_boundary_count": sum(
+            value > 0.5 for value in measured
+        ),
+        "residual_p95_frames": p95,
+        "maximum_allowed_residual_p95_frames": 0.5,
+        "passed": passed,
+        "policy": CutLocalSyncConfig().to_dict(),
+        "source_decode_audit": [
+            {
+                "source_index": index,
+                "source_name": Path(plan["sources"][index]).name,
+                "status": "decoded",
+                "pts_basis": "ffprobe_best_effort_timestamp_time",
+                "renderer_selection_basis": "trim_lower_bound_setpts_first_pts_fps_round_near_tpad_clone_v1",
+                "pts_frame_count": 2000,
+                "decoded_declared_frame_count": 2000,
+                "pts_decode_ordinal_count_match": True,
+                "pts_origin_seconds": 0.0,
+                "pts_sha256": f"{index:x}" * 64,
+                "median_pts_step_seconds": 1.0 / _FPS,
+                "requested_ordinal_count": len(selected_ordinals[index]),
+                "selected_ordinal_pts_sha256": _canonical_sha256(
+                    [
+                        {
+                            "frame_ordinal": ordinal,
+                            "normalized_pts_seconds": pts_value,
+                        }
+                        for ordinal, pts_value in sorted(selected_pts[index].items())
+                    ]
+                ),
+                "decoded_requested_ordinal_count": len(selected_ordinals[index]),
+                "decoded_frame_count": len(selected_ordinals[index]),
+                "described_frame_count": len(selected_ordinals[index]),
+                "descriptor_failure_count": 0,
+                "maximum_pts_lookup_residual_frames": residual_frames,
+                "raw_frames_persisted": False,
+                "motion_descriptors_persisted": False,
+            }
+            for index in used_sources
+        ],
+        "per_boundary": records,
+        "serialization_policy": dict(CUT_LOCAL_SYNC_SERIALIZATION_POLICY),
+    }
+    payload["proof_sha256"] = _canonical_sha256(payload)
+    analysis["render"]["cut_local_sync"] = payload
+    _install_valid_registered_montage_evidence(analysis, plan, selection)
+
+
 class _FakeRunner:
     def __init__(
         self,
@@ -1073,6 +1500,444 @@ class PostRenderQATests(unittest.TestCase):
             ],
             [0, 2, 3, 4, 5, 6, 7, 9],
         )
+
+    def test_sync_audit_honors_render_request_domain_equivalence_with_gap(
+        self,
+    ) -> None:
+        request_indices = (0, 2, 3, 4, 5, 6, 7, 9)
+        analysis = {
+            "source_index_mapping": {
+                "eligible_to_request": list(request_indices),
+                "domain_equivalences": {
+                    "render_plan_sources_array_index": "request_source_index",
+                },
+            },
+            "local_timewarps": [
+                {
+                    "source_index": index,
+                    "status": "local_monotonic_timewarp",
+                    "scalar_fallback": False,
+                    "accepted_anchor_count": 8,
+                    "residuals": {
+                        "p95_seconds": 0.004,
+                        "sample_count": 8,
+                        "definition": (
+                            "absolute_anchor_residual_to_robust_affine_trend"
+                        ),
+                    },
+                }
+                for index in request_indices
+            ],
+        }
+        plan = {
+            "fps": 30.0,
+            "sources": [f"source-{index}.mp4" for index in range(10)],
+            "source_usage": {
+                "used_source_indices": list(request_indices),
+            },
+        }
+        collector = _IssueCollector()
+
+        metrics = _sync_quality_metrics(
+            analysis,
+            plan,
+            PostRenderQAConfig(),
+            collector,
+        )
+
+        self.assertTrue(metrics["passed"])
+        self.assertTrue(metrics["render_indices_are_request_indices"])
+        self.assertEqual(
+            [item["request_source_index"] for item in metrics["per_source"]],
+            list(request_indices),
+        )
+        self.assertEqual(collector.issues, [])
+
+    def test_registered_stage_edit_requires_cut_local_sync_evidence(self) -> None:
+        def mutate(analysis: dict, _plan: dict, _selection: dict) -> None:
+            analysis["stage_edit_generation"] = {
+                "activation": {
+                    "activation": "automatic_registered_production_bundle",
+                }
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(artifacts, runner=_FakeRunner())
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_cut_local_sync_evidence_missing",
+            {issue.code for issue in report.issues},
+        )
+        self.assertIn(
+            "production_cut_local_sync_activation_contract_invalid",
+            {issue.code for issue in report.issues},
+        )
+        self.assertIn(
+            "production_cut_local_sync_required_gate_failed",
+            {issue.code for issue in report.issues},
+        )
+        cut_local = report.metrics["production_sync"]["cut_local_sync"]
+        self.assertTrue(cut_local["required"])
+        self.assertFalse(cut_local["passed"])
+
+    def test_registered_stage_edit_accepts_hash_bound_cut_local_half_frame_proof(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        sync = report.metrics["production_sync"]
+        self.assertTrue(sync["passed"])
+        self.assertEqual(
+            sync["basis"],
+            "used_source_piecewise_pts_plus_retained_cut_pose_body_motion_v2",
+        )
+        self.assertTrue(sync["cut_local_sync"]["hash_bindings_valid"])
+        self.assertAlmostEqual(
+            sync["cut_local_sync"]["residual_p95_frames"], 0.10
+        )
+        montage = report.metrics["rendered_montage_grammar"]
+        self.assertTrue(montage["required"])
+        self.assertTrue(montage["passed"])
+        self.assertTrue(montage["configuration_matches"])
+        self.assertTrue(montage["reference_profile_identity_matches"])
+        self.assertNotEqual(
+            montage["generation_reference_profile"]["path"],
+            montage["persisted_reference_profile"]["path"],
+        )
+        highlight = montage["recomputed_review"]["sections"][0]
+        self.assertGreaterEqual(
+            highlight["wide_involved_source_switch_fraction"],
+            _MONTAGE_TEST_CONFIG.minimum_wide_involved_source_switch_fraction,
+        )
+        self.assertTrue(
+            all(
+                max(choice["formation_upper_body_counts"]) >= 1
+                for choice in _analysis["visual_timeline"]["choices"]
+                if choice["shot_type"] == "wide"
+            )
+        )
+
+    def test_registered_stage_edit_flat_wide_montage_fails_closed(self) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            for choice in analysis["visual_timeline"]["choices"]:
+                choice.update(
+                    {
+                        "shot_type": "wide",
+                        "entry_shot_type": "wide",
+                        "exit_shot_type": "wide",
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        montage = report.metrics["rendered_montage_grammar"]
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertFalse(montage["passed"])
+        self.assertFalse(montage["recomputed_review"]["passed"])
+        self.assertIn(
+            "section_0:highlight_closeup_fraction_below_floor",
+            montage["recomputed_review"]["failure_codes"],
+        )
+        self.assertIn(
+            "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_missing_montage_review_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis.pop("rendered_montage_grammar_review")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_rendered_montage_grammar_evidence_missing_or_invalid",
+            codes,
+        )
+        self.assertIn(
+            "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_malformed_montage_profile_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["stage_edit_generation"][
+                "professional_montage_grammar_profile"
+            ]["content_sha256"] = "not-a-sha256"
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_rendered_montage_grammar_evidence_missing_or_invalid",
+            codes,
+        )
+        self.assertIn(
+            "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_montage_profile_mismatch_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["rendered_montage_grammar_review"]["reference_profile"][
+                "content_sha256"
+            ] = "c" * 64
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_rendered_montage_grammar_profile_identity_mismatch",
+            codes,
+        )
+        self.assertIn(
+            "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_montage_configuration_mismatch_fails_closed(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            analysis["rendered_montage_grammar_review"]["configuration"][
+                "burst_maximum_run_seconds"
+            ] = 99.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_rendered_montage_grammar_configuration_mismatch",
+            codes,
+        )
+        self.assertIn(
+            "production_rendered_montage_grammar_required_gate_failed",
+            codes,
+        )
+
+    def test_registered_stage_edit_unknown_cut_motion_fails_with_reason_count(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(
+                analysis,
+                plan,
+                selection,
+                unknown_boundary_index=3,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_cut_local_sync_unknown_boundaries",
+            {issue.code for issue in report.issues},
+        )
+        self.assertEqual(
+            report.metrics["production_sync"]["cut_local_sync"][
+                "unknown_reason_counts"
+            ],
+            {"ambiguous_motion_lag": 1},
+        )
+        self.assertIn(
+            "production_cut_local_sync_required_gate_failed",
+            {issue.code for issue in report.issues},
+        )
+
+    def test_registered_stage_edit_cut_local_p95_above_half_frame_fails(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(
+                analysis,
+                plan,
+                selection,
+                residual_frames=0.60,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_cut_local_sync_residual_exceeds_half_frame",
+            {issue.code for issue in report.issues},
+        )
+        self.assertAlmostEqual(
+            report.metrics["production_sync"]["cut_local_sync"][
+                "residual_p95_frames"
+            ],
+            0.60,
+        )
+        self.assertIn(
+            "production_cut_local_sync_required_gate_failed",
+            {issue.code for issue in report.issues},
+        )
+
+    def test_trusted_registered_online_path_fails_when_persisted_markers_are_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory)
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                runner=_FakeRunner(),
+                trusted_registered_stage_edit=True,
+            )
+
+        codes = {issue.code for issue in report.issues}
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_cut_local_sync_activation_contract_invalid", codes
+        )
+        self.assertIn("production_cut_local_sync_evidence_missing", codes)
+        self.assertIn("production_cut_local_sync_required_gate_failed", codes)
+
+    def test_registered_activation_marker_disagreement_fails_even_with_valid_proof(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            _activate_registered_cut_local_sync(analysis, plan, selection)
+            selection["stage_edit_render_promotion"]["activation"] = (
+                "explicit_stage_edit_generation_request_only"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "production_cut_local_sync_activation_contract_invalid",
+            {issue.code for issue in report.issues},
+        )
+        self.assertTrue(
+            report.metrics["production_sync"]["cut_local_sync"]["passed"]
+        )
+
+    def test_consistent_explicit_stage_edit_request_remains_cut_local_optional(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, _plan: dict, selection: dict) -> None:
+            analysis["stage_edit_generation"] = {
+                "activation": {"activation": "explicit_request_bundle"}
+            }
+            selection["stage_edit_render_promotion"] = {
+                "activation": "explicit_stage_edit_generation_request_only",
+                "candidate_pool": "stage_edit_generation_only",
+            }
+            analysis["render"]["candidate_origin"] = (
+                "explicit_stage_edit_generation"
+            )
+            analysis["render"]["stage_edit_promotion_contract"] = (
+                "fixture_stage_edit"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(artifacts, runner=_FakeRunner())
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        cut_local = report.metrics["production_sync"]["cut_local_sync"]
+        self.assertFalse(cut_local["required"])
+        self.assertIsNone(cut_local["passed"])
 
     def test_domain_aware_v3_exact_eight_reviews_are_plan_bound_and_accepted(self) -> None:
         def mutate(_analysis: dict, plan: dict, selection: dict) -> None:

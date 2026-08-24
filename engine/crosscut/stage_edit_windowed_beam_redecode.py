@@ -327,6 +327,9 @@ class StageEditWindowedBeamRedecoder:
                         f"r{timeline.rank:02d}-s{local_index:03d}"
                     ),
                     decision_confidence=decision.decision_confidence,
+                    section_role=decision.section_role,
+                    section_progress=decision.section_progress,
+                    phrase_progress=decision.phrase_progress,
                 )
             )
         return tuple(shots)
@@ -395,6 +398,8 @@ class StageEditWindowedBeamRedecoder:
             timeline_count=32,
             minimum_unique_sources=1,
             maximum_source_occupancy_fraction=1.0,
+            montage_grammar_score_weight=0.0,
+            enforce_montage_grammar=False,
         )
         call_audit: dict[str, Any] = {
             "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
@@ -411,6 +416,7 @@ class StageEditWindowedBeamRedecoder:
             "local_only_relaxations": [
                 "minimum_unique_sources_deferred_to_full_edit_recheck",
                 "source_occupancy_deferred_to_full_edit_recheck",
+                "section_montage_grammar_deferred_to_full_render_selection",
             ],
             "actual_public_decoder_invoked": True,
             "returned_timeline_count": 0,

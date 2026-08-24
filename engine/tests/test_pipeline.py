@@ -39,6 +39,7 @@ from crosscut.pipeline import (
     _direct_full_frame_shifted_partition_profiles,
     _direct_partition_failure_bottlenecks,
     _derive_complete_group_candidate,
+    _enforce_automatic_stage_edit_post_render_qa,
     _official_target_fancam_direct_full_frame_segments,
     _member_anchor_trim,
     _member_render_segments,
@@ -52,6 +53,8 @@ from crosscut.pipeline import (
     _report_direct_member_selection_failure,
     _safe_slug,
     _source_index_mapping,
+    _stage_edit_montage_analysis_payload,
+    _strip_superseded_exact_stage_edit_shot_clocks,
     _with_index_domain,
     analyze,
 )
@@ -67,6 +70,10 @@ from crosscut.render import (
     SourceLookAdjustment,
     TransitionKind,
 )
+from crosscut.rendered_montage_grammar_review import (
+    RenderedMontageGrammarConfig,
+)
+from crosscut.rendered_proxy_review import RenderedProxyReview
 from crosscut.request import AnalysisRequest, MemberAnchorRequest
 from crosscut.tracking import (
     MemberTrackObservation,
@@ -648,6 +655,181 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(kwargs["maximum_review_count"], 8)
             self.assertEqual(kwargs["minimum_required_candidate_count"], 8)
             self.assertIs(kwargs["learned_reviewer_session"], learned_session)
+
+    def test_stage_edit_candidate_batch_hard_gates_every_decoded_proxy_with_montage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source.mp4"
+            source.touch()
+            bundles = tuple(
+                SimpleNamespace(
+                    candidate_index=index,
+                    pre_render_score=float(100 - index),
+                    render_plan=RenderPlan(
+                        sources=(source,),
+                        segments=(RenderSegment(0, 0.0, 6.0, 0.0),),
+                        reference_source=0,
+                        aspect_ratio=AspectRatio.LANDSCAPE,
+                        output=root / f"candidate-{index}.mp4",
+                    ),
+                    timeline_review=SimpleNamespace(
+                        source_switches_per_minute=15.0
+                    ),
+                    visual_timeline=SimpleNamespace(
+                        to_dict=lambda: {"choices": []}
+                    ),
+                    editorial_motion_plan=None,
+                    candidate_origin="explicit_stage_edit_generation",
+                    candidate_lineage=(
+                        {
+                            "exact_music_structure_shot_clock": {
+                                "contract": (
+                                    "serialized_inference_token_section_and_"
+                                    "phrase_progress_per_selected_shot_v1"
+                                ),
+                                "source_index_domain": (
+                                    "eligible_source_index"
+                                ),
+                                "shots": [],
+                            }
+                        },
+                    ),
+                    stage_edit_exact_shot_clock={
+                        "contract": (
+                            "serialized_inference_token_section_and_phrase_"
+                            "progress_per_selected_shot_v1"
+                        ),
+                        "source_index_domain": "eligible_source_index",
+                        "shots": [],
+                    },
+                )
+                for index in range(8)
+            )
+            section_plan = SimpleNamespace(
+                to_dict=lambda: {"sections": []}
+            )
+            diversity = SimpleNamespace(
+                to_dict=lambda: {
+                    "source_count": 1,
+                    "family_ids": [0],
+                    "production_ready": True,
+                }
+            )
+            identity = {
+                "analysis_basis": "ive_human_reference_visual_montage_grammar_v1",
+                "schema_version": 1,
+                "path": str(root / "profile.json"),
+                "file_sha256": "a" * 64,
+                "content_sha256": "b" * 64,
+            }
+            reviewed_payloads: list[dict[str, object]] = []
+            sentinel = object()
+
+            def review_batch(rendered, **kwargs):
+                for item in rendered:
+                    _proxy, review = kwargs["render_review"](
+                        item.render_plan,
+                        root / f"proxy-{item.candidate_index}.mp4",
+                    )
+                    reviewed_payloads.append(review.payload)
+                return sentinel
+
+            with patch(
+                "crosscut.pipeline.review_rendered_candidates",
+                side_effect=review_batch,
+            ), patch(
+                "crosscut.pipeline.render_and_review_proxy",
+                side_effect=lambda plan, _output, **_kwargs: (
+                    plan,
+                    RenderedProxyReview(
+                        {"passed": True, "weighted_score": 91.0}
+                    ),
+                ),
+            ), patch(
+                "crosscut.pipeline.review_rendered_montage_grammar",
+                side_effect=lambda *_args, **_kwargs: {
+                    "schema_version": 1,
+                    "analysis_basis": "test_montage",
+                    "passed": True,
+                    "failure_codes": [],
+                    "configuration": {},
+                },
+            ) as montage_review:
+                result = _review_complete_group_candidates(
+                    bundles,  # type: ignore[arg-type]
+                    scratch_directory=root,
+                    stage_edit_montage_section_plan=section_plan,  # type: ignore[arg-type]
+                    stage_edit_source_derivative_diversity=diversity,  # type: ignore[arg-type]
+                    stage_edit_source_index_mapping={"bound": True},
+                    stage_edit_montage_config=RenderedMontageGrammarConfig(),
+                    stage_edit_montage_reference_profile=identity,
+                )
+
+            self.assertIs(result, sentinel)
+            self.assertEqual(montage_review.call_count, 8)
+            self.assertEqual(len(reviewed_payloads), 8)
+            self.assertTrue(all(item["passed"] for item in reviewed_payloads))
+            self.assertTrue(
+                all(
+                    item["rendered_montage_grammar_review"][
+                        "reference_profile"
+                    ]
+                    == identity
+                    for item in reviewed_payloads
+                )
+            )
+
+    def test_windowed_repair_keeps_only_final_exact_shot_clock_for_montage(
+        self,
+    ) -> None:
+        base_clock = {
+            "contract": (
+                "serialized_inference_token_section_and_phrase_progress_"
+                "per_selected_shot_v1"
+            ),
+            "source_index_domain": "eligible_source_index",
+            "shots": [{"shot_index": 0, "source_index": 0}],
+        }
+        final_clock = {
+            **base_clock,
+            "shots": [{"shot_index": 0, "source_index": 1}],
+        }
+        stripped, hashes = _strip_superseded_exact_stage_edit_shot_clocks(
+            ({"exact_music_structure_shot_clock": base_clock},)
+        )
+        self.assertEqual(1, len(hashes))
+        lineage = stripped + (
+            {"exact_music_structure_shot_clock": final_clock},
+        )
+        plan = RenderPlan(
+            sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+            segments=(RenderSegment(1, 0.0, 1.0, 0.0),),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("/tmp/out.mp4"),
+        )
+        bundle = SimpleNamespace(
+            render_plan=plan,
+            candidate_lineage=lineage,
+            visual_timeline=SimpleNamespace(to_dict=lambda: {"choices": []}),
+            editorial_motion_plan=None,
+            stage_edit_exact_shot_clock=final_clock,
+        )
+
+        payload = _stage_edit_montage_analysis_payload(
+            bundle=bundle,
+            proxy_review_payload={"passed": True},
+            section_plan=SimpleNamespace(to_dict=lambda: {"sections": []}),
+            source_derivative_diversity=SimpleNamespace(
+                to_dict=lambda: {"source_count": 2}
+            ),
+            source_index_mapping={"bound": True},
+        )
+
+        self.assertEqual(final_clock, payload["stage_edit_exact_shot_clock"])
+        self.assertNotEqual(base_clock, payload["stage_edit_exact_shot_clock"])
 
     def test_learned_reviewer_session_is_opt_in_and_configured_failure_is_fatal(
         self,
@@ -3212,6 +3394,12 @@ class PipelineTests(unittest.TestCase):
             "member_direct_full_frame.final_source_usage.sources[].source_index",
             "render.final_source_usage.used_source_indices[]",
             "render.final_source_usage.sources[].source_index",
+            "render.cut_local_sync.used_source_indices[]",
+            "render.cut_local_sync.source_decode_audit[].source_index",
+            "render.cut_local_sync.per_boundary[].outgoing_source_index",
+            "render.cut_local_sync.per_boundary[].incoming_source_index",
+            "render.cut_local_sync.per_boundary[].renderer_frame_selection.outgoing.source_index",
+            "render.cut_local_sync.per_boundary[].renderer_frame_selection.incoming.source_index",
         ):
             self.assertEqual(
                 domains[payload_path],
@@ -3260,6 +3448,45 @@ class PipelineTests(unittest.TestCase):
             "member_draft.audio_offsets[].position",
         ):
             self.assertNotIn(nonexistent_path, domains)
+
+    def test_registered_post_render_enforcement_passes_trusted_activation_authority(
+        self,
+    ) -> None:
+        report = SimpleNamespace(
+            verdict=SimpleNamespace(value="PASS"),
+            passed=True,
+            analysis_basis="fixture_post_render_qa",
+            to_dict=lambda: {
+                "issue_count": 0,
+                "fail_issue_count": 0,
+                "conditional_issue_count": 0,
+            },
+        )
+        reporter = _MemoryReporter()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "IVE-fixture-20260824-120000-analysis.json"
+            manifest: dict[str, object] = {
+                "render": {},
+                "stage_edit_generation": {},
+            }
+            manifest_path.write_text("{}", encoding="utf-8")
+            qa_path = root / "qa.json"
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa",
+                return_value=(report, qa_path),
+            ) as evaluate:
+                returned = _enforce_automatic_stage_edit_post_render_qa(
+                    registered_stage_edit_bundle=object(),  # type: ignore[arg-type]
+                    manifest=manifest,  # type: ignore[arg-type]
+                    manifest_path=manifest_path,
+                    reporter=reporter,  # type: ignore[arg-type]
+                )
+
+        self.assertEqual(returned, qa_path.resolve())
+        self.assertTrue(
+            evaluate.call_args.kwargs["trusted_registered_stage_edit"]
+        )
 
     def test_index_domain_helpers_reject_ambiguous_mappings(self) -> None:
         sources = (Path("/tmp/a.mp4"), Path("/tmp/b.mp4"))

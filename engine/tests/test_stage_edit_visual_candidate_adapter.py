@@ -31,6 +31,9 @@ from crosscut.render import (
     TransitionKind,
 )
 from crosscut.request import AnalysisRequest
+from crosscut.rendered_montage_grammar_review import (
+    EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT,
+)
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.stage_edit import StageBoundary, StageEdit, StageShot
 from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
@@ -297,7 +300,8 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             analysis, video, manifest = self._post_render_artifact_shell(root)
             report = self._post_render_report("PASS")
 
-            def evaluate(artifact_set):
+            def evaluate(artifact_set, *, trusted_registered_stage_edit):
+                self.assertTrue(trusted_registered_stage_edit)
                 self.assertTrue(artifact_set.analysis_path.is_file())
                 self.assertTrue(artifact_set.render_plan_path.is_file())
                 self.assertTrue(artifact_set.selection_path.is_file())
@@ -344,7 +348,8 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             analysis, video, manifest = self._post_render_artifact_shell(root)
             report = self._post_render_report("CONDITIONAL")
 
-            def evaluate(artifact_set):
+            def evaluate(artifact_set, *, trusted_registered_stage_edit):
+                self.assertTrue(trusted_registered_stage_edit)
                 report_path = artifact_set.default_report_path
                 report_path.write_text(
                     '{"verdict":"CONDITIONAL"}', encoding="utf-8"
@@ -1168,6 +1173,19 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                                 )
                             },
                         ),
+                        stage_edit_exact_shot_clock={
+                            "contract": EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT,
+                            "source_index_domain": "eligible_source_index",
+                            "shots": [
+                                {
+                                    "shot_index": 0,
+                                    "source_index": index,
+                                    "section_role": "chorus_like",
+                                    "section_progress": 0.0,
+                                    "phrase_progress": 0.0,
+                                }
+                            ],
+                        },
                     )
                 )
                 candidate = Mock(spec=StageEditMaterializedVisualCandidate)
@@ -1191,6 +1209,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 retained_candidates=tuple(object() for _ in range(8)),
                 learned_section_director=SimpleNamespace(
                     evidence=(object(),),
+                    section_plan=section_plan,
                     to_dict=lambda: {"section_count": 1},
                 ),
                 write_json=_write_generation,
@@ -1273,6 +1292,19 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     },
                 )
 
+            def _montage_review(*, bundle, **_kwargs):
+                self.assertIsNotNone(bundle.stage_edit_exact_shot_clock)
+                return (
+                    {"passed": True, "failures": []},
+                    {
+                        "stage_edit_exact_shot_clock": (
+                            bundle.stage_edit_exact_shot_clock
+                        )
+                    },
+                )
+
+            montage_review = Mock(side_effect=_montage_review)
+
             derivative_metadata = SimpleNamespace(
                 production_ready=True,
                 family_count=8,
@@ -1328,6 +1360,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     analyze_source_derivative_diversity=(
                         lambda *_args, **_kwargs: derivative_metadata
                     ),
+                    _review_stage_edit_bundle_montage=montage_review,
                 ),
                 patch(
                     "crosscut.pipeline.run_stage_edit_pipeline_bridge",
@@ -1390,6 +1423,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             self.assertEqual(8, apply_contract.call_count)
             review_candidates.assert_called_once()
             stage_beam_repair.assert_called_once()
+            montage_review.assert_called_once()
             reviewed = review_candidates.call_args.args[0]
             self.assertEqual(8, len(reviewed))
             self.assertIs(

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from crosscut import stage_edit_release_fold_launcher as launcher
@@ -72,6 +73,13 @@ def _write_passing_development_checkpoint(
     selection_path.write_text(json.dumps(selection), encoding="utf-8")
     selection_sha = hashlib.sha256(selection_path.read_bytes()).hexdigest()
     training = dict(launcher.DEFAULT_RELEASE_TRAINING_CONFIG)
+    model_training = launcher._default_model_training_contract()
+    effective_loss = dict(model_training["base_loss_contract"])
+    effective_loss["cut_positive_weight"] = 2.0
+    effective_dynamic_loss = json.loads(
+        json.dumps(model_training["dynamic_crop_loss_contract"])
+    )
+    effective_dynamic_loss["base"]["cut_positive_weight"] = 2.0
     report = {
         "schema_version": PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
         "run_kind": PRODUCTION_TRAINING_RUN_KIND,
@@ -107,6 +115,8 @@ def _write_passing_development_checkpoint(
             "learning_rate": training["learning_rate"],
             "weight_decay": training["weight_decay"],
             "gradient_clip_norm": training["gradient_clip_norm"],
+            "effective_loss_contract": effective_loss,
+            "effective_dynamic_crop_loss_contract": effective_dynamic_loss,
             "seed": training["seed"],
             "learning_rate_schedule": {
                 "cut_pretraining_steps": training["cut_pretrain_steps"],
@@ -128,7 +138,8 @@ def _write_passing_development_checkpoint(
         "cut_imbalance_contract": {
             "maximum_positive_weight": training[
                 "maximum_cut_positive_weight"
-            ]
+            ],
+            "applied_positive_weight": 2.0,
         },
         "model": {"config": config},
         "selection_freeze_evidence": {
@@ -220,6 +231,11 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         "_validate_dynamic_crop_manifest",
                         side_effect=dynamic,
                     ),
+                    patch.object(
+                        launcher,
+                        "_preflight_structured_head_label_coverage",
+                        return_value={"passed": True},
+                    ),
                 ):
                     result = launcher.preflight_stage_edit_release_development(
                         plan
@@ -236,7 +252,170 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 "--authorize-production-activation", result.train_cli_args
             )
             self.assertNotIn("--production-registry", result.train_cli_args)
+            self.assertIn("--model-config-json", result.train_cli_args)
+            self.assertIn("--base-loss-contract-json", result.train_cli_args)
+            self.assertIn(
+                "--dynamic-crop-loss-contract-json", result.train_cli_args
+            )
             self.assertEqual(launcher.XOXZ, result.held_out_song_id)
+
+    def test_single_class_transition_labels_fail_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            paths_by_song = {}
+            for song_index, song_id in enumerate(launcher.DEVELOPMENT_SONG_IDS):
+                paths = []
+                for reference_index in range(2):
+                    path = root / f"{song_index}-{reference_index}.json"
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "reference_id": (
+                                    f"ref-{song_index}-{reference_index}"
+                                )
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    paths.append(path)
+                paths_by_song[song_id] = tuple(paths)
+
+            def example() -> SimpleNamespace:
+                return SimpleNamespace(
+                    targets=SimpleNamespace(
+                        targets=(
+                            SimpleNamespace(
+                                duration_bucket=0,
+                                transition_label="hard_cut",
+                            ),
+                            SimpleNamespace(
+                                duration_bucket=1,
+                                transition_label="hard_cut",
+                            ),
+                        )
+                    )
+                )
+
+            split = SimpleNamespace(
+                train=(example(), example()),
+                held_out=(example(), example()),
+            )
+            with (
+                patch.object(
+                    launcher,
+                    "load_reference_training_corpus",
+                    return_value=SimpleNamespace(examples=()),
+                ),
+                patch.object(
+                    launcher, "production_song_split", return_value=split
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "training_transition_class_coverage_insufficient.*"
+                    "renderer-owned single-class transition mode remains "
+                    "explicitly disabled",
+                ):
+                    launcher._preflight_structured_head_label_coverage(
+                        paths_by_song,
+                        contract=launcher._structured_head_preflight_contract(),
+                    )
+
+    def test_model_capacity_and_source_objective_tampering_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                plan = _create_development_plan(root, root / "checkpoint")
+                payload = json.loads(plan.read_text(encoding="utf-8"))
+                payload.pop("plan_sha256")
+
+                changed_capacity = json.loads(json.dumps(payload))
+                changed_capacity["model_training_contract"]["model_config"][
+                    "model_dimension"
+                ] = 384
+                capacity_plan = launcher._write_content_addressed(
+                    changed_capacity,
+                    output_directory=root / "capacity-tamper",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "model config hash mismatch",
+                ):
+                    launcher._strict_development_plan(capacity_plan)
+
+                changed_objective = json.loads(json.dumps(payload))
+                changed_objective["model_training_contract"][
+                    "source_objective"
+                ] = "listwise"
+                objective_plan = launcher._write_content_addressed(
+                    changed_objective,
+                    output_directory=root / "objective-tamper",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "source objective binding mismatch",
+                ):
+                    launcher._strict_development_plan(objective_plan)
+
+    def test_probe_selected_model_and_loss_contract_can_be_bound_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            selected = json.loads(
+                json.dumps(launcher._default_model_training_contract())
+            )
+            selected["model_config"].update(
+                {
+                    "model_dimension": 384,
+                    "num_heads": 12,
+                    "num_layers": 8,
+                    "feed_forward_dimension": 1536,
+                }
+            )
+            selected["model_config_sha256"] = launcher._canonical_sha256(
+                selected["model_config"]
+            )
+            selected["base_loss_contract"]["source_objective"] = (
+                "eligible_all_hybrid"
+            )
+            selected["base_loss_contract_sha256"] = launcher._canonical_sha256(
+                selected["base_loss_contract"]
+            )
+            selected["dynamic_crop_loss_contract"]["base"] = json.loads(
+                json.dumps(selected["base_loss_contract"])
+            )
+            selected["dynamic_crop_loss_contract_sha256"] = (
+                launcher._canonical_sha256(
+                    selected["dynamic_crop_loss_contract"]
+                )
+            )
+            selected["source_objective"] = "eligible_all_hybrid"
+            manifests = _write_dummy_manifests(
+                root, launcher.DEVELOPMENT_SONG_IDS
+            )
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                plan = launcher.create_stage_edit_release_development_plan(
+                    materialization_manifests=manifests[0],
+                    feature_manifests=manifests[1],
+                    dynamic_crop_manifests=manifests[2],
+                    checkpoint_directory=root / "checkpoint",
+                    output_directory=root,
+                    model_training_contract=selected,
+                )
+                payload = launcher._strict_development_plan(plan)
+            self.assertEqual(
+                384,
+                payload["model_training_contract"]["model_config"][
+                    "model_dimension"
+                ],
+            )
+            self.assertEqual(
+                "eligible_all_hybrid",
+                payload["model_training_contract"]["source_objective"],
+            )
 
     def test_final_plan_is_impossible_before_development_freeze(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -45,9 +45,10 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 2
+STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 3
 STAGE_EDIT_HEAD_MATERIALIZER_CONTRACT = (
-    "production_dynamic_crop_v2_transformer_to_semimarkov_heads_with_pair_continuity_v2"
+    "production_dynamic_crop_v2_transformer_to_semimarkov_heads_with_pair_"
+    "continuity_and_exact_music_structure_v3"
 )
 
 
@@ -94,6 +95,83 @@ def _finite_tuple(values: Any, *, name: str, expected: int) -> tuple[float, ...]
     return result
 
 
+def _exact_progress_feature(
+    *,
+    values: Sequence[float],
+    missing_mask: Sequence[bool],
+    names: Sequence[str],
+    feature_name: str,
+    token_index: int,
+    missing_mask_offset: int,
+) -> float | None:
+    """Read one exact serialized token coordinate without time synthesis."""
+
+    try:
+        index = tuple(names).index(feature_name)
+    except ValueError as exc:
+        raise StageEditHeadMaterializerInputError(
+            f"schema lacks required {feature_name} feature"
+        ) from exc
+    if len(values) != len(names):
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} {feature_name} feature width changed"
+        )
+    missing_index = missing_mask_offset + index
+    if missing_mask and len(missing_mask) < missing_index + 1:
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} {feature_name} missing-mask width changed"
+        )
+    if missing_mask and bool(missing_mask[missing_index]):
+        return None
+    value = float(values[index])
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise StageEditHeadMaterializerInputError(
+            f"token {token_index} {feature_name} must lie in [0, 1]"
+        )
+    return value
+
+
+def _exact_section_role(
+    *,
+    values: Sequence[float],
+    missing_mask: Sequence[bool],
+    schema: StageEditTokenSchema,
+    token_index: int,
+) -> str | None:
+    role_features = (
+        ("intro_probability", "intro"),
+        ("verse_probability", "verse_like"),
+        ("prechorus_probability", "build"),
+        ("chorus_probability", "chorus_like"),
+        ("bridge_probability", "bridge_like"),
+        ("outro_probability", "outro"),
+    )
+    names = tuple(schema.section_feature_names)
+    offset = len(schema.music_feature_names)
+    positives: list[str] = []
+    for feature_name, role in role_features:
+        try:
+            index = names.index(feature_name)
+        except ValueError as exc:
+            raise StageEditHeadMaterializerInputError(
+                f"schema lacks required {feature_name} feature"
+            ) from exc
+        if missing_mask and len(missing_mask) <= offset + index:
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} section-role missing-mask width changed"
+            )
+        if missing_mask and bool(missing_mask[offset + index]):
+            return None
+        value = float(values[index])
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise StageEditHeadMaterializerInputError(
+                f"token {token_index} {feature_name} must lie in [0, 1]"
+            )
+        if value > 0.0:
+            positives.append(role)
+    return positives[0] if len(positives) == 1 else None
+
+
 _CONTINUITY_FEATURE_FIELDS = {
     "face_scale": "face_scale",
     "face_center_x": "face_center_x",
@@ -108,13 +186,20 @@ _CONTINUITY_FEATURE_FIELDS = {
     "sharpness": "sharpness",
     "exposure": "exposure",
     "color_temperature_normalized": "color_temperature_normalized",
+    "detected_person_count_normalized": "detected_person_count_normalized",
+    "formation_person_count_normalized": "formation_person_count_normalized",
+    "formation_pose_coverage": "formation_pose_coverage",
 }
 
+_SHOT_SCALE_FEATURE_NAME = "shot_scale"
+_GROUP_WIDE_MAX_EXCLUSIVE = 0.22
+_MEDIUM_MAX_EXCLUSIVE = 0.52
 
-def _source_continuity_from_candidate(
+
+def _source_feature_values(
     candidate: Any,
     schema: StageEditTokenSchema,
-) -> StageEditSourceContinuity:
+) -> dict[str, float | None]:
     if len(candidate.features) != len(schema.source_feature_names):
         raise StageEditHeadMaterializerInputError(
             "source candidate feature count differs from checkpoint schema"
@@ -130,10 +215,44 @@ def _source_continuity_from_candidate(
         if candidate.missing_mask
         else (False,) * len(candidate.features)
     )
-    by_name = {
+    return {
         name: None if missing[index] else float(candidate.features[index])
         for index, name in enumerate(schema.source_feature_names)
     }
+
+
+def _shot_size_from_candidate(
+    candidate: Any,
+    schema: StageEditTokenSchema,
+) -> str:
+    """Recover the inference-safe shot family already fed to the model.
+
+    Production callers do not have to duplicate a parallel shot-size map.  A
+    missing ``shot_scale`` remains unknown; it is never silently treated as a
+    wide or a close-up.
+    """
+
+    value = _source_feature_values(candidate, schema).get(
+        _SHOT_SCALE_FEATURE_NAME
+    )
+    if value is None:
+        return "unknown"
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise StageEditHeadMaterializerInputError(
+            "source candidate shot_scale must lie in [0, 1]"
+        )
+    if value < _GROUP_WIDE_MAX_EXCLUSIVE:
+        return "wide"
+    if value < _MEDIUM_MAX_EXCLUSIVE:
+        return "medium"
+    return "closeup"
+
+
+def _source_continuity_from_candidate(
+    candidate: Any,
+    schema: StageEditTokenSchema,
+) -> StageEditSourceContinuity:
+    by_name = _source_feature_values(candidate, schema)
     return StageEditSourceContinuity(
         **{
             destination: by_name.get(source)
@@ -367,7 +486,7 @@ def stage_edit_head_frames_from_dynamic_crop_output_v2(
             raise StageEditHeadMaterializerInputError(
                 f"token {token_index} has no source surviving hard gates"
             )
-        shot_size_map = (
+        supplied_shot_size_map = (
             source_shot_sizes_by_token[token_index]
             if source_shot_sizes_by_token
             else {}
@@ -401,7 +520,17 @@ def stage_edit_head_frames_from_dynamic_crop_output_v2(
                 available_source_mask=tuple(available),
                 hard_source_gate_mask=tuple(hard_gates),
                 source_shot_sizes=tuple(
-                    str(shot_size_map.get(source_id, "unknown"))
+                    str(
+                        supplied_shot_size_map[source_id]
+                        if source_id in supplied_shot_size_map
+                        else (
+                            _shot_size_from_candidate(
+                                candidate_by_id[source_id], schema
+                            )
+                            if source_id in candidate_by_id
+                            else "unknown"
+                        )
+                    )
                     for source_id in source_ids
                 ),
                 source_continuity=tuple(continuity),
@@ -410,6 +539,28 @@ def stage_edit_head_frames_from_dynamic_crop_output_v2(
                     f"{float(token.master_time_seconds):.6f}"
                 ),
                 dynamic_crop_v2=prediction,
+                section_progress=_exact_progress_feature(
+                    values=token.section_features,
+                    missing_mask=token.missing_mask,
+                    names=schema.section_feature_names,
+                    feature_name="section_progress",
+                    token_index=token_index,
+                    missing_mask_offset=len(schema.music_feature_names),
+                ),
+                phrase_progress=_exact_progress_feature(
+                    values=token.music_features,
+                    missing_mask=token.missing_mask,
+                    names=schema.music_feature_names,
+                    feature_name="phrase_progress",
+                    token_index=token_index,
+                    missing_mask_offset=0,
+                ),
+                section_role=_exact_section_role(
+                    values=token.section_features,
+                    missing_mask=token.missing_mask,
+                    schema=schema,
+                    token_index=token_index,
+                ),
             )
         )
     if len(frames) != token_count:

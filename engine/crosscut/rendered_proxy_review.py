@@ -774,9 +774,28 @@ def _proxy_perceptual_source_admission(
             for item in all_source_switch_boundaries
             if set(int(value) for value in item["source_indices"]) == pair_set
         ]
+    failing_source_indices = set(insufficient_source_indices)
+    for metric, pair in worst_source_pairs.items():
+        if (
+            pair is not None
+            and source_spans[metric] is not None
+            and float(source_spans[metric]) > metric_limits[metric]
+        ):
+            failing_source_indices.update(
+                int(value) for value in pair["source_indices"]
+            )
+    source_related_boundary_indices = [
+        int(item["boundary_index"])
+        for item in all_source_switch_boundaries
+        if failing_source_indices.intersection(
+            int(value) for value in item["source_indices"]
+        )
+    ]
     repair_target_boundary_indices = sorted(
         {
             *high_quality_shock_boundary_indices,
+            *missing_rapid_boundary_indices,
+            *source_related_boundary_indices,
             *(
                 boundary_index
                 for metric, boundary_indices in pair_target_boundaries.items()
@@ -814,7 +833,7 @@ def _proxy_perceptual_source_admission(
             "final_perceptual_quality_conditional_thresholds_proxy_preflight"
         ),
         "index_domains": {
-            "source_index": "render_plan_request_source_index",
+            "source_index": "render_plan_sources_array_index",
             "boundary_index": "render_plan_transition_index",
         },
         "raw_frames_persisted": False,
@@ -864,6 +883,10 @@ def _proxy_perceptual_source_admission(
             "passed": not reason_codes,
             "reason_codes": reason_codes,
             "repair_target_boundary_indices": repair_target_boundary_indices,
+            "repair_target_policy": (
+                "high_or_missing_rapid_boundaries_plus_all_switches_touching_"
+                "insufficient_or_failing_worst_pair_sources"
+            ),
             "selection_penalty_points": selection_penalty_points,
         },
     }

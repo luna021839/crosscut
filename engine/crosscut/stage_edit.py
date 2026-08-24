@@ -19,7 +19,7 @@ from .request import AspectRatio
 from .section_director import SectionPlan
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +30,13 @@ class StageShot:
     decision_id: str
     decision_confidence: float | None = None
     color_grade: Mapping[str, float] | None = None
+    # Exact serialized inference-token music structure for this selected shot.
+    # Repair code must preserve or replace these values with the corresponding
+    # newly decoded decision; downstream reviewers never synthesize them from
+    # wall-clock time.
+    section_role: str | None = None
+    section_progress: float | None = None
+    phrase_progress: float | None = None
 
     def __post_init__(self) -> None:
         if self.shot_index < 0 or self.section_index < 0:
@@ -48,6 +55,24 @@ class StageShot:
             for name, value in self.color_grade.items()
         ):
             raise ValueError("color grade must contain finite named scalars")
+        if self.section_role is not None:
+            role = str(self.section_role).strip()
+            if role not in {
+                "intro",
+                "verse_like",
+                "build",
+                "chorus_like",
+                "bridge_like",
+                "outro",
+            }:
+                raise ValueError("section_role is outside the editing-role schema")
+            object.__setattr__(self, "section_role", role)
+        for name in ("section_progress", "phrase_progress"):
+            value = getattr(self, name)
+            if value is not None and (
+                not math.isfinite(value) or not 0.0 <= value <= 1.0
+            ):
+                raise ValueError(f"{name} must lie in 0...1")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +89,9 @@ class StageShot:
             "has_pan_crop": self.segment.pan_crop is not None,
             "has_editorial_transform": self.segment.editorial_transform is not None,
             "color_grade": dict(self.color_grade) if self.color_grade else None,
+            "section_role": self.section_role,
+            "section_progress": self.section_progress,
+            "phrase_progress": self.phrase_progress,
         }
 
 

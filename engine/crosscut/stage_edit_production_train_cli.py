@@ -11,6 +11,7 @@ from typing import Sequence
 from .stage_edit_dynamic_crop_training import (
     build_stage_edit_dynamic_crop_training_corpus_v2,
 )
+from .stage_edit_dynamic_crop_head_v2 import DynamicCropV2LossContract
 from .reference_dynamic_crop_job import (
     validate_reference_dynamic_crop_manifest,
 )
@@ -29,6 +30,8 @@ from .stage_edit_production_registry import (
 from .stage_edit_reference_adapter import load_reference_training_corpus
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    StageEditLossContract,
+    StageEditTransformerConfig,
     production_stage_edit_config,
 )
 
@@ -115,6 +118,16 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _json_object_argument(raw: str, name: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return payload
 
 
 def _dynamic_artifact_map(
@@ -267,6 +280,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--negative-samples-per-hold", type=int, default=2)
     parser.add_argument("--boundary-guard-seconds", type=float, default=0.18)
     parser.add_argument("--max-sources", type=int, default=32)
+    parser.add_argument(
+        "--model-config-json",
+        help=(
+            "Canonical StageEditTransformerConfig JSON. Release launchers pass "
+            "this explicitly so model capacity cannot drift to a CLI default."
+        ),
+    )
+    parser.add_argument(
+        "--base-loss-contract-json",
+        help=(
+            "Canonical StageEditLossContract JSON, including the exact source "
+            "objective. Must be paired with the other explicit contracts."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-crop-loss-contract-json",
+        help=(
+            "Canonical DynamicCropV2LossContract JSON. Must be paired with the "
+            "other explicit release contracts."
+        ),
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto")
     parser.add_argument(
         "--authorize-production-activation",
@@ -299,6 +333,50 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    explicit_contract_values = (
+        args.model_config_json,
+        args.base_loss_contract_json,
+        args.dynamic_crop_loss_contract_json,
+    )
+    if any(value is not None for value in explicit_contract_values) and not all(
+        value is not None for value in explicit_contract_values
+    ):
+        raise ValueError(
+            "explicit model, base-loss, and dynamic-crop-loss contracts must "
+            "be supplied together"
+        )
+    if all(value is not None for value in explicit_contract_values):
+        model_config = StageEditTransformerConfig.from_dict(
+            _json_object_argument(args.model_config_json, "--model-config-json")
+        )
+        base_loss_contract = StageEditLossContract(
+            **_json_object_argument(
+                args.base_loss_contract_json, "--base-loss-contract-json"
+            )
+        )
+        dynamic_payload = _json_object_argument(
+            args.dynamic_crop_loss_contract_json,
+            "--dynamic-crop-loss-contract-json",
+        )
+        dynamic_base_payload = dynamic_payload.get("base")
+        if not isinstance(dynamic_base_payload, dict):
+            raise ValueError(
+                "--dynamic-crop-loss-contract-json base must be an object"
+            )
+        dynamic_crop_loss_contract = DynamicCropV2LossContract(
+            **{
+                **dynamic_payload,
+                "base": StageEditLossContract(**dynamic_base_payload),
+            }
+        )
+        if dynamic_crop_loss_contract.base != base_loss_contract:
+            raise ValueError(
+                "dynamic crop and base loss/source objective contracts differ"
+            )
+    else:
+        model_config = production_stage_edit_config()
+        base_loss_contract = StageEditLossContract()
+        dynamic_crop_loss_contract = DynamicCropV2LossContract()
     if args.production_registry is not None and not (
         args.authorize_production_activation
     ):
@@ -362,7 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.dynamic_crop_manifest,
         ),
     )
-    config = production_stage_edit_config()
+    config = model_config
     device = None
     if args.device != "auto":
         if mx is None:
@@ -389,7 +467,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         minimum_learning_rate_ratio=args.minimum_learning_rate_ratio,
         seed=args.seed,
         device=device,
+        loss_contract=base_loss_contract,
         dynamic_crop_corpus=dynamic_crop_corpus,
+        dynamic_crop_loss_contract=dynamic_crop_loss_contract,
         authorize_production_activation=args.authorize_production_activation,
     )
     registered_production_bundle = None

@@ -105,7 +105,7 @@ class StageEditTests(unittest.TestCase):
         reviewed = edit.with_reviewer_result({"score": 91.2, "passed": True})
         self.assertEqual(len(edit.reviewer_history), 0)
         self.assertEqual(reviewed.reviewer_history[0]["score"], 91.2)
-        self.assertEqual(reviewed.to_dict()["schema_version"], 1)
+        self.assertEqual(reviewed.to_dict()["schema_version"], 2)
 
 
 if __name__ == "__main__":

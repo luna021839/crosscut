@@ -49,7 +49,7 @@ def _sequence() -> StageEditSequence:
             (_candidate("B", 0.2), _candidate("A", 0.8)),
             (0.3,) * len(schema.recent_edit_feature_names),
             (0.4,) * len(schema.style_feature_names),
-            (False,) * schema.raw_context_dimension,
+            (),
         ),
         StageEditToken(
             0.5,
@@ -58,7 +58,7 @@ def _sequence() -> StageEditSequence:
             (_candidate("A", 0.7), _candidate("B", 0.1, hard_gate=False)),
             (0.4,) * len(schema.recent_edit_feature_names),
             (0.5,) * len(schema.style_feature_names),
-            (False,) * schema.raw_context_dimension,
+            (),
         ),
     )
     return StageEditSequence("ive:materializer", tokens)
@@ -152,6 +152,8 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             frames[0].source_continuity[0].camera_motion_x,
         )
         self.assertEqual((999.0, 999.0, 999.0, 999.0), frames[0].crop)
+        self.assertAlmostEqual(0.2, frames[0].section_progress)
+        self.assertAlmostEqual(0.1, frames[0].phrase_progress)
         assert frames[0].dynamic_crop_v2 is not None
         self.assertEqual(8, len(frames[0].dynamic_crop_v2.values))
         decoded = frames[0].dynamic_crop_v2.decode(2.0)
@@ -173,6 +175,27 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
                 schema=DEFAULT_STAGE_EDIT_SCHEMA,
                 metadata=self.metadata,
             )
+
+    def test_recovers_shot_family_and_formation_evidence_from_model_input(self) -> None:
+        frames = stage_edit_head_frames_from_dynamic_crop_output_v2(
+            sequence=self.sequence,
+            batch=self.batch,
+            output=self._output(),
+            canonical_source_ids=("A", "B"),
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            metadata=self.metadata,
+        )
+
+        self.assertEqual(("closeup", "wide"), frames[0].source_shot_sizes)
+        self.assertEqual(("closeup", "wide"), frames[1].source_shot_sizes)
+        self.assertAlmostEqual(
+            0.8,
+            frames[0].source_continuity[0].formation_person_count_normalized,
+        )
+        self.assertAlmostEqual(
+            0.2,
+            frames[0].source_continuity[1].formation_pose_coverage,
+        )
 
 
 if __name__ == "__main__":
