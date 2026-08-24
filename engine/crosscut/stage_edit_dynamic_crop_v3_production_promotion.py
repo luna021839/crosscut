@@ -33,6 +33,7 @@ from .professional_montage_policy import (
 )
 from .stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
 from .stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
@@ -60,6 +61,7 @@ from .stage_edit_dynamic_crop_v3_capacity_fold_launcher import (
 )
 from . import stage_edit_dynamic_crop_capacity_fold_launcher as provenance
 from . import stage_edit_production_fold_launcher as manifests
+from . import stage_edit_production_registry as production_registry
 from .stage_edit_production_registry import (
     load_registered_stage_edit_production_bundle,
     preferred_stage_edit_production_registry_path,
@@ -181,9 +183,13 @@ class DynamicCropV3ProductionPromotionPreflight:
     quality_thresholds: Mapping[str, Any]
     song_evidence: Mapping[str, PromotionSongEvidence]
     free_bytes: int
+    continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY
+    source_pair_scorer_path: Path | None = None
+    source_pair_production_report_path: Path | None = None
+    source_pair_production_identity: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "plan_path": str(self.plan_path),
             "plan_content_sha256": self.plan_content_sha256,
             "source_checkpoint_directory": str(
@@ -215,8 +221,14 @@ class DynamicCropV3ProductionPromotionPreflight:
             "model_threshold_or_policy_reselection_authorized": False,
             "blind_holdout_claim_authorized": False,
             "human_parity_claim_authorized": False,
-            "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+            "continuity_authority": self.continuity_authority,
         }
+        if self.source_pair_production_identity is not None:
+            payload["learned_source_pair_authority_present"] = True
+            payload["source_pair_production"] = deepcopy(
+                self.source_pair_production_identity
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +282,150 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
             f"{label} must be an object"
         )
     return dict(value)
+
+
+_SOURCE_PAIR_PRODUCTION_IDENTITY_KEYS = {
+    "scorer_path",
+    "production_report_path",
+    "scorer_file_sha256",
+    "production_report_file_sha256",
+    "production_report_sha256",
+    "cross_validation_sha256",
+    "scorer_fingerprint",
+    "checkpoint_sha256",
+    "corpus_sha256",
+}
+
+
+def _immutable_absolute_artifact_path(path: Path, label: str) -> Path:
+    """Reject relative paths and every lexical symlink in an artifact path."""
+
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raise DynamicCropV3ProductionPromotionError(
+            f"{label} path must be explicit and absolute"
+        )
+    # ``abspath`` normalizes ``.``/``..`` without resolving filesystem links.
+    # Comparing it with strict ``resolve`` then proves that neither the file
+    # nor any parent component is a mutable symlink alias.
+    lexical = Path(os.path.abspath(os.fspath(raw)))
+    try:
+        canonical = lexical.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DynamicCropV3ProductionPromotionError(
+            f"{label} is missing or unsafe: {exc}"
+        ) from exc
+    if canonical != lexical or any(
+        candidate.is_symlink() for candidate in (lexical, *lexical.parents)
+    ):
+        raise DynamicCropV3ProductionPromotionError(
+            f"{label} path must not traverse a symlink"
+        )
+    if not lexical.is_file():
+        raise DynamicCropV3ProductionPromotionError(
+            f"{label} must be a regular file"
+        )
+    return lexical
+
+
+def _source_pair_production_identity(
+    scorer_path: Path,
+    production_report_path: Path,
+) -> dict[str, Any]:
+    """Reuse the registry's production gate and return its exact identity."""
+
+    scorer = _immutable_absolute_artifact_path(
+        scorer_path, "source-pair scorer"
+    )
+    report = _immutable_absolute_artifact_path(
+        production_report_path, "source-pair production report"
+    )
+    try:
+        identity = production_registry._validated_source_pair_identity(
+            scorer, report
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise DynamicCropV3ProductionPromotionError(
+            f"source-pair production authority is invalid: {exc}"
+        ) from exc
+    if set(identity) != _SOURCE_PAIR_PRODUCTION_IDENTITY_KEYS:
+        raise DynamicCropV3ProductionPromotionError(
+            "source-pair production identity contract differs"
+        )
+    return dict(identity)
+
+
+def _validate_source_pair_production_identity(
+    value: object,
+) -> dict[str, Any]:
+    planned = _mapping(value, "source-pair production identity")
+    if set(planned) != _SOURCE_PAIR_PRODUCTION_IDENTITY_KEYS:
+        raise DynamicCropV3ProductionPromotionError(
+            "source-pair production identity keys are not exact"
+        )
+    scorer_path = planned.get("scorer_path")
+    report_path = planned.get("production_report_path")
+    if (
+        not isinstance(scorer_path, str)
+        or not Path(scorer_path).is_absolute()
+        or not isinstance(report_path, str)
+        or not Path(report_path).is_absolute()
+    ):
+        raise DynamicCropV3ProductionPromotionError(
+            "source-pair production paths must be explicit absolute paths"
+        )
+    observed = _source_pair_production_identity(
+        Path(scorer_path), Path(report_path)
+    )
+    if observed != planned:
+        raise DynamicCropV3ProductionPromotionError(
+            "source-pair production artifact identity changed"
+        )
+    return planned
+
+
+def _plan_source_pair_production_identity(
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    value = plan.get("source_pair_production")
+    if value is None:
+        return None
+    return _validate_source_pair_production_identity(value)
+
+
+def _validate_preflight_authority(
+    preflight: DynamicCropV3ProductionPromotionPreflight,
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    identity = _plan_source_pair_production_identity(plan)
+    expected_authority = (
+        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        if identity is not None
+        else HANDCRAFTED_CONTINUITY_AUTHORITY
+    )
+    expected_scorer = (
+        Path(identity["scorer_path"]) if identity is not None else None
+    )
+    expected_report = (
+        Path(identity["production_report_path"])
+        if identity is not None
+        else None
+    )
+    if (
+        preflight.continuity_authority != expected_authority
+        or preflight.source_pair_scorer_path != expected_scorer
+        or preflight.source_pair_production_report_path != expected_report
+        or (
+            dict(preflight.source_pair_production_identity)
+            if preflight.source_pair_production_identity is not None
+            else None
+        )
+        != identity
+    ):
+        raise DynamicCropV3ProductionPromotionError(
+            "promotion preflight continuity authority differs from plan"
+        )
+    return identity
 
 
 def _file_sha256(path: Path, label: str) -> str:
@@ -655,13 +811,21 @@ def _evidence_plan_record(
     return record
 
 
-def _promotion_authority_contract() -> dict[str, Any]:
+def _promotion_authority_contract(
+    *, learned_source_pair_authority_present: bool = False
+) -> dict[str, Any]:
     return {
         "production_ready": True,
         "production_registry_activation_authorized": True,
         "production_registry_activation_requested": True,
-        "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
-        "learned_source_pair_authority_present": False,
+        "continuity_authority": (
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            if learned_source_pair_authority_present
+            else HANDCRAFTED_CONTINUITY_AUTHORITY
+        ),
+        "learned_source_pair_authority_present": (
+            learned_source_pair_authority_present
+        ),
         "blind_holdout_quality_claim_authorized": False,
         "xoxz_evidence_status": EVIDENCE_STATUS[XOXZ],
         "attitude_evidence_status": EVIDENCE_STATUS[ATTITUDE],
@@ -706,6 +870,8 @@ def create_dynamic_crop_v3_production_promotion_plan(
     evidence_directory: Path,
     output_directory: Path,
     production_registry_path: Path | None = None,
+    source_pair_scorer_path: Path | None = None,
+    source_pair_production_report_path: Path | None = None,
 ) -> Path:
     """Predeclare both evaluation songs before any promotion inference."""
 
@@ -718,6 +884,23 @@ def create_dynamic_crop_v3_production_promotion_plan(
             raise DynamicCropV3ProductionPromotionError(
                 f"{label} must contain exactly XOXZ and ATTITUDE"
             )
+    if (source_pair_scorer_path is None) != (
+        source_pair_production_report_path is None
+    ):
+        raise DynamicCropV3ProductionPromotionError(
+            "source-pair learned authority requires both scorer and "
+            "production report paths"
+        )
+    source_pair_identity = (
+        _source_pair_production_identity(
+            source_pair_scorer_path,
+            source_pair_production_report_path,
+        )
+        if source_pair_scorer_path is not None
+        and source_pair_production_report_path is not None
+        else None
+    )
+    learned = source_pair_identity is not None
     lineage = _replay_lineage(final_fit_receipt_path)
     source = _capture_source_provenance()
     if lineage.get("source_commit") != source.get("head_commit_oid"):
@@ -798,9 +981,13 @@ def create_dynamic_crop_v3_production_promotion_plan(
         "evidence_directory": str(evidence),
         "production_registry_path": str(registry),
         "professional_montage_profile": policy.identity.to_dict(),
-        "authority": _promotion_authority_contract(),
+        "authority": _promotion_authority_contract(
+            learned_source_pair_authority_present=learned
+        ),
         "plan_content_sha256": None,
     }
+    if source_pair_identity is not None:
+        unsigned["source_pair_production"] = source_pair_identity
     return _write_content_addressed(
         output_directory=output,
         prefix=PROMOTION_PLAN_PREFIX,
@@ -824,12 +1011,17 @@ _PLAN_KEYS = {
     "authority",
     "plan_content_sha256",
 }
+# Keep the original handcrafted v1 shape byte-for-byte compatible.  Learned
+# authority is the other exact union member and must carry this sealed record.
+_LEARNED_PLAN_KEYS = _PLAN_KEYS | {"source_pair_production"}
 
 
 def _strict_plan(path: Path) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     payload = _read_json(resolved, "production promotion plan")
-    if set(payload) != _PLAN_KEYS:
+    learned = "source_pair_production" in payload
+    expected_keys = _LEARNED_PLAN_KEYS if learned else _PLAN_KEYS
+    if set(payload) != expected_keys:
         raise DynamicCropV3ProductionPromotionError(
             "production promotion plan keys are not exact"
         )
@@ -843,10 +1035,17 @@ def _strict_plan(path: Path) -> dict[str, Any]:
         or payload.get("schema_version") != PROMOTION_PLAN_SCHEMA_VERSION
         or payload.get("analysis_basis") != PROMOTION_PLAN_ANALYSIS_BASIS
         or payload.get("contract") != PROMOTION_PLAN_CONTRACT
-        or payload.get("authority") != _promotion_authority_contract()
+        or payload.get("authority")
+        != _promotion_authority_contract(
+            learned_source_pair_authority_present=learned
+        )
     ):
         raise DynamicCropV3ProductionPromotionError(
             "production promotion plan contract or content address differs"
+        )
+    if learned:
+        _validate_source_pair_production_identity(
+            payload.get("source_pair_production")
         )
     source = _validate_source_provenance(payload.get("source_provenance"))
     lineage_record = _mapping(payload.get("lineage"), "promotion lineage")
@@ -991,6 +1190,7 @@ def preflight_dynamic_crop_v3_production_promotion(
         _read_json(metadata_path, "source checkpoint metadata")
     )
     protocol = _mapping(plan["evaluation_protocol"], "evaluation protocol")
+    source_pair_identity = _plan_source_pair_production_identity(plan)
     return DynamicCropV3ProductionPromotionPreflight(
         plan_path=resolved,
         plan_content_sha256=str(plan["plan_content_sha256"]),
@@ -1009,6 +1209,18 @@ def preflight_dynamic_crop_v3_production_promotion(
         quality_thresholds=dict(protocol["quality_thresholds"]),
         song_evidence=song_evidence,
         free_bytes=free_bytes,
+        continuity_authority=str(plan["authority"]["continuity_authority"]),
+        source_pair_scorer_path=(
+            Path(source_pair_identity["scorer_path"])
+            if source_pair_identity is not None
+            else None
+        ),
+        source_pair_production_report_path=(
+            Path(source_pair_identity["production_report_path"])
+            if source_pair_identity is not None
+            else None
+        ),
+        source_pair_production_identity=source_pair_identity,
     )
 
 
@@ -1416,6 +1628,7 @@ _REPORT_KEYS = {
     "authority",
     "report_sha256",
 }
+_LEARNED_REPORT_KEYS = _REPORT_KEYS | {"source_pair_production"}
 
 
 def _light_pointer_errors(value: object, label: str) -> list[str]:
@@ -1626,7 +1839,9 @@ def production_promotion_report_errors(
     if not isinstance(payload, Mapping):
         return ("production promotion report root must be an object",)
     errors: list[str] = []
-    if set(payload) != _REPORT_KEYS:
+    learned = "source_pair_production" in payload
+    expected_keys = _LEARNED_REPORT_KEYS if learned else _REPORT_KEYS
+    if set(payload) != expected_keys:
         errors.append("production promotion report keys are not exact")
     if (
         payload.get("schema_version") != PRODUCTION_PROMOTION_REPORT_SCHEMA_VERSION
@@ -1649,6 +1864,17 @@ def production_promotion_report_errors(
             raise ValueError("timestamp lacks a UTC offset")
     except ValueError:
         errors.append("production promotion timestamp is invalid")
+
+    source_pair_identity: dict[str, Any] | None = None
+    if learned:
+        try:
+            source_pair_identity = _validate_source_pair_production_identity(
+                payload.get("source_pair_production")
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            errors.append(
+                f"production source-pair authority changed or is invalid: {exc}"
+            )
 
     plan: Mapping[str, Any] | None = None
     planned_song_evidence: dict[str, PromotionSongEvidence] = {}
@@ -1688,6 +1914,11 @@ def production_promotion_report_errors(
             errors.append("production promotion source commit differs from plan")
         if lineage != plan.get("lineage"):
             errors.append("production promotion lineage differs from plan")
+        planned_source_pair = plan.get("source_pair_production")
+        if source_pair_identity != planned_source_pair:
+            errors.append(
+                "production source-pair authority differs from plan"
+            )
 
     source_lineage = (
         lineage.get("source_checkpoint")
@@ -2196,7 +2427,9 @@ def production_promotion_report_errors(
         or aggregate != expected_aggregate
     ):
         errors.append("production promotion aggregate gate differs")
-    if payload.get("authority") != _promotion_authority_contract():
+    if payload.get("authority") != _promotion_authority_contract(
+        learned_source_pair_authority_present=learned
+    ):
         errors.append("production promotion authority or claims differ")
     if isinstance(plan, Mapping) and payload.get("authority") != plan.get(
         "authority"
@@ -2290,7 +2523,8 @@ def _expected_registry_binding(
     checkpoint_id: str,
     checkpoint_weight_sha256: str,
 ) -> dict[str, Any]:
-    return {
+    source_pair_identity = _plan_source_pair_production_identity(plan)
+    binding = {
         "path": str(Path(str(plan["production_registry_path"])).resolve()),
         "checkpoint_directory": str(
             Path(str(plan["destination_checkpoint_directory"])).resolve()
@@ -2298,12 +2532,82 @@ def _expected_registry_binding(
         "checkpoint_id": checkpoint_id,
         "checkpoint_weight_sha256": checkpoint_weight_sha256,
         "dynamic_crop_version": 3,
-        "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
-        "learned_source_pair_authority_present": False,
+        "continuity_authority": (
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            if source_pair_identity is not None
+            else HANDCRAFTED_CONTINUITY_AUTHORITY
+        ),
+        "learned_source_pair_authority_present": (
+            source_pair_identity is not None
+        ),
         "professional_montage_profile": deepcopy(
             plan["professional_montage_profile"]
         ),
     }
+    if source_pair_identity is not None:
+        binding["source_pair_production"] = deepcopy(source_pair_identity)
+    return binding
+
+
+def _registered_bundle_source_pair_identity(bundle: Any) -> dict[str, Any] | None:
+    fields = {
+        "scorer_path": bundle.source_pair_scorer_path,
+        "production_report_path": bundle.source_pair_production_report_path,
+        "scorer_file_sha256": bundle.source_pair_scorer_file_sha256,
+        "production_report_file_sha256": (
+            bundle.source_pair_production_report_file_sha256
+        ),
+        "production_report_sha256": (
+            bundle.source_pair_production_report_sha256
+        ),
+        "scorer_fingerprint": bundle.source_pair_scorer_fingerprint,
+        "checkpoint_sha256": bundle.source_pair_checkpoint_sha256,
+        "corpus_sha256": bundle.source_pair_corpus_sha256,
+    }
+    if bundle.continuity_authority != PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if any(value is not None for value in fields.values()):
+            raise DynamicCropV3ProductionPromotionError(
+                "registered handcrafted bundle unexpectedly binds source-pair evidence"
+            )
+        return None
+    scorer_path = fields["scorer_path"]
+    report_path = fields["production_report_path"]
+    if scorer_path is None or report_path is None:
+        raise DynamicCropV3ProductionPromotionError(
+            "registered learned bundle is missing source-pair paths"
+        )
+    observed = _source_pair_production_identity(
+        Path(scorer_path), Path(report_path)
+    )
+    declared = {
+        name: str(value) if name.endswith("_path") else value
+        for name, value in fields.items()
+    }
+    if any(declared[name] != observed[name] for name in declared):
+        raise DynamicCropV3ProductionPromotionError(
+            "registered bundle source-pair identity differs"
+        )
+    return observed
+
+
+def _register_promoted_bundle(
+    preflight: DynamicCropV3ProductionPromotionPreflight,
+) -> Path:
+    """Use one authority-bound registry call for launch and resume."""
+
+    return register_stage_edit_production_bundle(
+        preflight.destination_checkpoint_directory,
+        professional_montage_grammar_profile_path=(
+            preflight.professional_montage_profile_path
+        ),
+        registry_path=preflight.production_registry_path,
+        dynamic_crop_version=3,
+        continuity_authority=preflight.continuity_authority,
+        source_pair_scorer_path=preflight.source_pair_scorer_path,
+        source_pair_production_report_path=(
+            preflight.source_pair_production_report_path
+        ),
+    )
 
 
 def _promotion_receipt_unsigned(
@@ -2314,7 +2618,9 @@ def _promotion_receipt_unsigned(
 ) -> dict[str, Any]:
     checkpoint = preflight.destination_checkpoint_directory
     plan = _strict_plan(preflight.plan_path)
-    return {
+    source_pair_identity = _validate_preflight_authority(preflight, plan)
+    learned = source_pair_identity is not None
+    unsigned = {
         "schema_version": PROMOTION_RECEIPT_SCHEMA_VERSION,
         "analysis_basis": PROMOTION_RECEIPT_ANALYSIS_BASIS,
         "contract": PROMOTION_RECEIPT_CONTRACT,
@@ -2337,12 +2643,15 @@ def _promotion_receipt_unsigned(
         "checkpoint_id": preflight.checkpoint_id,
         "checkpoint_weight_sha256": preflight.checkpoint_weight_sha256,
         "report_sha256": report.get("report_sha256"),
-        "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
-        "learned_source_pair_authority_present": False,
+        "continuity_authority": preflight.continuity_authority,
+        "learned_source_pair_authority_present": learned,
         "blind_holdout_quality_claim_authorized": False,
         "human_parity_claim_authorized": False,
         "artifact_content_sha256": None,
     }
+    if source_pair_identity is not None:
+        unsigned["source_pair_production"] = deepcopy(source_pair_identity)
+    return unsigned
 
 
 def _record_promotion_receipt(
@@ -2438,6 +2747,7 @@ _RECEIPT_KEYS = {
     "human_parity_claim_authorized",
     "artifact_content_sha256",
 }
+_LEARNED_RECEIPT_KEYS = _RECEIPT_KEYS | {"source_pair_production"}
 
 
 def _load_dynamic_crop_v3_production_promotion_receipt(
@@ -2447,10 +2757,17 @@ def _load_dynamic_crop_v3_production_promotion_receipt(
 ) -> dict[str, Any]:
     resolved = Path(path).expanduser().resolve()
     payload = _read_json(resolved, "production promotion receipt")
-    if set(payload) != _RECEIPT_KEYS:
+    learned = "source_pair_production" in payload
+    expected_keys = _LEARNED_RECEIPT_KEYS if learned else _RECEIPT_KEYS
+    if set(payload) != expected_keys:
         raise DynamicCropV3ProductionPromotionError(
             "production promotion receipt keys are not exact"
         )
+    expected_authority = (
+        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        if learned
+        else HANDCRAFTED_CONTINUITY_AUTHORITY
+    )
     digest = payload.get("artifact_content_sha256")
     unsigned = deepcopy(payload)
     unsigned["artifact_content_sha256"] = None
@@ -2461,9 +2778,8 @@ def _load_dynamic_crop_v3_production_promotion_receipt(
         or payload.get("schema_version") != PROMOTION_RECEIPT_SCHEMA_VERSION
         or payload.get("analysis_basis") != PROMOTION_RECEIPT_ANALYSIS_BASIS
         or payload.get("contract") != PROMOTION_RECEIPT_CONTRACT
-        or payload.get("continuity_authority")
-        != HANDCRAFTED_CONTINUITY_AUTHORITY
-        or payload.get("learned_source_pair_authority_present") is not False
+        or payload.get("continuity_authority") != expected_authority
+        or payload.get("learned_source_pair_authority_present") is not learned
         or payload.get("blind_holdout_quality_claim_authorized") is not False
         or payload.get("human_parity_claim_authorized") is not False
     ):
@@ -2472,9 +2788,17 @@ def _load_dynamic_crop_v3_production_promotion_receipt(
         )
     plan_path = _verify_pointer(payload.get("plan"), "promotion plan")
     plan = _strict_plan(plan_path)
+    source_pair_identity = _plan_source_pair_production_identity(plan)
     if payload.get("plan_content_sha256") != plan.get("plan_content_sha256"):
         raise DynamicCropV3ProductionPromotionError(
             "production promotion receipt plan identity differs"
+        )
+    if (
+        (source_pair_identity is not None) != learned
+        or payload.get("source_pair_production") != source_pair_identity
+    ):
+        raise DynamicCropV3ProductionPromotionError(
+            "production promotion receipt source-pair identity differs"
         )
     report_path = _verify_pointer(
         payload.get("promotion_report"), "promotion report"
@@ -2518,22 +2842,25 @@ def _load_dynamic_crop_v3_production_promotion_receipt(
         or payload.get("checkpoint_weight_sha256") != metadata.weight_sha256
         or payload.get("checkpoint_weight_sha256") != weight_sha
         or payload.get("report_sha256") != report.get("report_sha256")
+        or report.get("source_pair_production") != source_pair_identity
+        or report.get("authority") != plan.get("authority")
     ):
         raise DynamicCropV3ProductionPromotionError(
             "production promotion receipt identity differs"
         )
     if require_registry:
         bundle = load_registered_stage_edit_production_bundle(registry_path)
+        bundle_source_pair_identity = _registered_bundle_source_pair_identity(
+            bundle
+        )
         if (
             bundle.registry_path != registry_path
             or bundle.checkpoint_directory != checkpoint
             or bundle.checkpoint_id != metadata.checkpoint_id
             or bundle.weights_sha256 != weight_sha
             or bundle.dynamic_crop_version != 3
-            or bundle.continuity_authority
-            != HANDCRAFTED_CONTINUITY_AUTHORITY
-            or bundle.source_pair_scorer_path is not None
-            or bundle.source_pair_production_report_path is not None
+            or bundle.continuity_authority != expected_authority
+            or bundle_source_pair_identity != source_pair_identity
             or bundle.professional_montage_grammar_profile_identity
             != plan["professional_montage_profile"]
         ):
@@ -2583,6 +2910,7 @@ def _preflight_from_existing_plan(
         and os.path.ismount(PRODUCTION_VOLUME_ROOT)
         else 0
     )
+    source_pair_identity = _plan_source_pair_production_identity(plan)
     return DynamicCropV3ProductionPromotionPreflight(
         plan_path=Path(plan_path).resolve(),
         plan_content_sha256=str(plan["plan_content_sha256"]),
@@ -2605,6 +2933,18 @@ def _preflight_from_existing_plan(
         quality_thresholds=dict(protocol["quality_thresholds"]),
         song_evidence=song_evidence,
         free_bytes=free_bytes,
+        continuity_authority=str(plan["authority"]["continuity_authority"]),
+        source_pair_scorer_path=(
+            Path(source_pair_identity["scorer_path"])
+            if source_pair_identity is not None
+            else None
+        ),
+        source_pair_production_report_path=(
+            Path(source_pair_identity["production_report_path"])
+            if source_pair_identity is not None
+            else None
+        ),
+        source_pair_production_identity=source_pair_identity,
     )
 
 
@@ -2641,6 +2981,7 @@ def _resume_or_return_existing_promotion(
     if not destination_present and not registry_present:
         return None
     preflight = _preflight_from_existing_plan(resolved_plan, plan)
+    _validate_preflight_authority(preflight, plan)
     destination = preflight.destination_checkpoint_directory
     registry = preflight.production_registry_path
     if not destination_present or destination.is_symlink() or not destination.is_dir():
@@ -2699,17 +3040,7 @@ def _resume_or_return_existing_promotion(
 
     if not registry_present:
         try:
-            registry = register_stage_edit_production_bundle(
-                destination,
-                professional_montage_grammar_profile_path=(
-                    preflight.professional_montage_profile_path
-                ),
-                registry_path=preflight.production_registry_path,
-                dynamic_crop_version=3,
-                continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
-                source_pair_scorer_path=None,
-                source_pair_production_report_path=None,
-            )
+            registry = _register_promoted_bundle(preflight)
         except BaseException as failure:
             if receipt_created:
                 try:
@@ -2749,6 +3080,7 @@ def launch_dynamic_crop_v3_production_promotion(
         return existing
     preflight = preflight_dynamic_crop_v3_production_promotion(plan_path)
     plan = _strict_plan(preflight.plan_path)
+    source_pair_identity = _validate_preflight_authority(preflight, plan)
     destination = preflight.destination_checkpoint_directory
     source = preflight.source_checkpoint_directory
     temporary = destination.with_name(
@@ -2883,8 +3215,12 @@ def launch_dynamic_crop_v3_production_promotion(
                 "all_evaluations_used_exact_copied_weight": True,
                 "registry_activation_authorized": True,
             },
-            "authority": _promotion_authority_contract(),
+            "authority": deepcopy(plan["authority"]),
         }
+        if source_pair_identity is not None:
+            unsigned_report["source_pair_production"] = deepcopy(
+                source_pair_identity
+            )
         report = {
             **unsigned_report,
             "report_sha256": _canonical_sha256(unsigned_report),
@@ -2963,17 +3299,7 @@ def launch_dynamic_crop_v3_production_promotion(
         # Registry activation is intentionally the last failure-capable side
         # effect.  Its public writer rolls back a newly installed record if
         # its own post-write replay fails.
-        registry = register_stage_edit_production_bundle(
-            destination,
-            professional_montage_grammar_profile_path=(
-                preflight.professional_montage_profile_path
-            ),
-            registry_path=preflight.production_registry_path,
-            dynamic_crop_version=3,
-            continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
-            source_pair_scorer_path=None,
-            source_pair_production_report_path=None,
-        )
+        registry = _register_promoted_bundle(preflight)
         return DynamicCropV3ProductionPromotionResult(
             checkpoint_directory=destination,
             report_path=report_path,
@@ -3078,6 +3404,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--evidence-directory", required=True, type=Path)
     create.add_argument("--output-directory", required=True, type=Path)
     create.add_argument("--production-registry", type=Path)
+    create.add_argument("--source-pair-scorer", type=Path)
+    create.add_argument("--source-pair-production-report", type=Path)
     for name in ("preflight", "launch"):
         command = commands.add_parser(name)
         command.add_argument("--plan", required=True, type=Path)
@@ -3104,6 +3432,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             evidence_directory=args.evidence_directory,
             output_directory=args.output_directory,
             production_registry_path=args.production_registry,
+            source_pair_scorer_path=args.source_pair_scorer,
+            source_pair_production_report_path=(
+                args.source_pair_production_report
+            ),
         )
         print(json.dumps({"promotion_plan": str(path)}, indent=2))
         return 0

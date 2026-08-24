@@ -23,6 +23,12 @@ from crosscut.stage_edit_production_registry import (
     StageEditProductionRegistryNotReadyError,
     _validate_v3_training_report_declarations,
 )
+from crosscut.professional_montage_policy import (
+    load_professional_montage_policy,
+)
+from crosscut.stage_edit_source_pair_production import (
+    produce_stage_edit_source_pair_checkpoint,
+)
 from crosscut.stage_edit_production_training import (
     ProductionQualityThresholds,
     evaluate_stage_edit_production_quality,
@@ -41,6 +47,10 @@ from tests.test_stage_edit_production_training import (
     _passing_dynamic_v3_metrics,
     _passing_metrics,
 )
+from tests.test_stage_edit_production_registry import _montage_profile
+from tests.test_stage_edit_source_pair_production import (
+    _corpus as _source_pair_production_corpus,
+)
 
 try:
     import mlx.core as mx
@@ -55,6 +65,68 @@ def _sha(path: Path) -> str:
 class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
     def _pointer(self, path: Path) -> dict[str, str]:
         return {"path": str(path.resolve()), "file_sha256": _sha(path)}
+
+    def _source_pair_identity(
+        self, root: Path
+    ) -> tuple[Path, Path, dict[str, str]]:
+        root = Path(root).resolve()
+        scorer = root / "source-pair-scorer.json"
+        scorer.write_text('{"scorer": "test"}', encoding="utf-8")
+        report = root / "source-pair-production-report.json"
+        report.write_text('{"report": "test"}', encoding="utf-8")
+        return scorer, report, {
+            "scorer_path": str(scorer),
+            "production_report_path": str(report),
+            "scorer_file_sha256": _sha(scorer),
+            "production_report_file_sha256": _sha(report),
+            "production_report_sha256": "1" * 64,
+            "cross_validation_sha256": "2" * 64,
+            "scorer_fingerprint": "3" * 64,
+            "checkpoint_sha256": "4" * 64,
+            "corpus_sha256": "5" * 64,
+        }
+
+    def _real_source_pair_identity(
+        self, root: Path
+    ) -> tuple[Path, Path, dict[str, object]]:
+        directory = Path(root).resolve() / "real-source-pair"
+        result = produce_stage_edit_source_pair_checkpoint(
+            _source_pair_production_corpus(),
+            directory,
+            checkpoint_id="promotion-integration-source-pair",
+            created_at="2026-08-25T12:00:00+09:00",
+            steps=60,
+            learning_rate=0.30,
+        )
+        identity = promotion._source_pair_production_identity(
+            result.checkpoint_path,
+            result.report_path,
+        )
+        return result.checkpoint_path, result.report_path, identity
+
+    def _learned_plan_and_preflight(
+        self,
+        *,
+        plan: dict,
+        preflight: promotion.DynamicCropV3ProductionPromotionPreflight,
+        identity: dict[str, str],
+    ) -> tuple[dict, promotion.DynamicCropV3ProductionPromotionPreflight]:
+        learned_plan = copy.deepcopy(plan)
+        learned_plan["source_pair_production"] = copy.deepcopy(identity)
+        learned_plan["authority"] = promotion._promotion_authority_contract(
+            learned_source_pair_authority_present=True
+        )
+        return learned_plan, replace(
+            preflight,
+            continuity_authority=(
+                promotion.PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ),
+            source_pair_scorer_path=Path(identity["scorer_path"]),
+            source_pair_production_report_path=Path(
+                identity["production_report_path"]
+            ),
+            source_pair_production_identity=copy.deepcopy(identity),
+        )
 
     def _checkpoint_and_report(self, root: Path):
         checkpoint = root / "promoted"
@@ -619,6 +691,324 @@ class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
             authority["attitude_evidence_status"],
         )
 
+    def test_create_cli_pairs_learned_artifacts_and_missing_half_fails_closed(self):
+        parsed = promotion.build_parser().parse_args(
+            [
+                "create",
+                "--final-fit-receipt",
+                "/tmp/final-fit.json",
+                "--materialization-manifest",
+                "IVE-XOXZ=/tmp/materialization.json",
+                "--feature-manifest",
+                "IVE-XOXZ=/tmp/features.json",
+                "--dynamic-crop-manifest",
+                "IVE-XOXZ=/tmp/dynamic.json",
+                "--checkpoint-directory",
+                "/tmp/checkpoint",
+                "--evidence-directory",
+                "/tmp/evidence",
+                "--output-directory",
+                "/tmp/output",
+                "--source-pair-scorer",
+                "/tmp/source-pair-scorer.json",
+                "--source-pair-production-report",
+                "/tmp/source-pair-production-report.json",
+            ]
+        )
+        self.assertEqual(
+            Path("/tmp/source-pair-scorer.json"), parsed.source_pair_scorer
+        )
+        self.assertEqual(
+            Path("/tmp/source-pair-production-report.json"),
+            parsed.source_pair_production_report,
+        )
+        placeholders = {
+            song_id: Path(f"/tmp/{song_id}.json")
+            for song_id in promotion.EVALUATION_SONG_IDS
+        }
+        with self.assertRaisesRegex(
+            promotion.DynamicCropV3ProductionPromotionError,
+            "requires both scorer and production report",
+        ):
+            promotion.create_dynamic_crop_v3_production_promotion_plan(
+                final_fit_receipt_path=Path("/tmp/final-fit.json"),
+                materialization_manifests=placeholders,
+                feature_manifests=placeholders,
+                dynamic_crop_manifests=placeholders,
+                checkpoint_directory=Path("/tmp/checkpoint"),
+                evidence_directory=Path("/tmp/evidence"),
+                output_directory=Path("/tmp/output"),
+                source_pair_scorer_path=Path(
+                    "/tmp/source-pair-scorer.json"
+                ),
+            )
+
+    def test_handcrafted_preflight_to_dict_retains_exact_v1_shape(self):
+        preflight = promotion.DynamicCropV3ProductionPromotionPreflight(
+            plan_path=Path("/absolute/promotion-plan.json"),
+            plan_content_sha256="1" * 64,
+            source_checkpoint_directory=Path("/absolute/source"),
+            destination_checkpoint_directory=Path("/absolute/destination"),
+            evidence_directory=Path("/absolute/evidence"),
+            production_registry_path=Path("/absolute/registry.json"),
+            professional_montage_profile_path=Path("/absolute/profile.json"),
+            checkpoint_id="handcrafted-v1",
+            checkpoint_weight_sha256="2" * 64,
+            frozen_cut_probability_threshold=0.5,
+            quality_thresholds={"minimum": 0.75},
+            song_evidence={},
+            free_bytes=123456,
+        )
+
+        self.assertEqual(
+            {
+                "plan_path": "/absolute/promotion-plan.json",
+                "plan_content_sha256": "1" * 64,
+                "source_checkpoint_directory": "/absolute/source",
+                "destination_checkpoint_directory": "/absolute/destination",
+                "evidence_directory": "/absolute/evidence",
+                "production_registry_path": "/absolute/registry.json",
+                "professional_montage_profile_path": "/absolute/profile.json",
+                "checkpoint_id": "handcrafted-v1",
+                "checkpoint_weight_sha256": "2" * 64,
+                "frozen_cut_probability_threshold": 0.5,
+                "quality_thresholds": {"minimum": 0.75},
+                "evaluation_songs": {},
+                "free_bytes": 123456,
+                "optimizer_or_gradient_step_authorized": False,
+                "model_threshold_or_policy_reselection_authorized": False,
+                "blind_holdout_claim_authorized": False,
+                "human_parity_claim_authorized": False,
+                "continuity_authority": (
+                    promotion.HANDCRAFTED_CONTINUITY_AUTHORITY
+                ),
+            },
+            preflight.to_dict(),
+        )
+
+    def test_source_pair_artifact_rejects_symlink_parent_before_registry_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            actual = root / "actual-source-pair"
+            actual.mkdir()
+            scorer = actual / "stage-edit-source-pair-scorer-v1.json"
+            report = actual / "stage-edit-source-pair-production-report-v1.json"
+            scorer.write_text("{}", encoding="utf-8")
+            report.write_text("{}", encoding="utf-8")
+            alias = root / "mutable-alias"
+            alias.symlink_to(actual, target_is_directory=True)
+
+            for scorer_path, report_path in (
+                (alias / scorer.name, report),
+                (scorer, alias / report.name),
+            ):
+                with self.subTest(
+                    scorer_path=scorer_path, report_path=report_path
+                ):
+                    with (
+                        patch.object(
+                            promotion.production_registry,
+                            "_validated_source_pair_identity",
+                        ) as registry_gate,
+                        self.assertRaisesRegex(
+                            promotion.DynamicCropV3ProductionPromotionError,
+                            "must not traverse a symlink",
+                        ),
+                    ):
+                        promotion._source_pair_production_identity(
+                            scorer_path, report_path
+                        )
+                    registry_gate.assert_not_called()
+
+    def test_source_pair_artifact_symlink_loop_uses_public_error_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            loop = root / "source-pair-loop"
+            loop.symlink_to(loop)
+            report = root / "source-pair-production-report.json"
+            report.write_text("{}", encoding="utf-8")
+
+            with (
+                patch.object(
+                    promotion.production_registry,
+                    "_validated_source_pair_identity",
+                ) as registry_gate,
+                self.assertRaisesRegex(
+                    promotion.DynamicCropV3ProductionPromotionError,
+                    "missing or unsafe",
+                ),
+            ):
+                promotion._source_pair_production_identity(loop, report)
+            registry_gate.assert_not_called()
+
+    def test_source_pair_identity_reuses_registry_gate_and_detects_swap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scorer, report, identity = self._source_pair_identity(
+                Path(directory)
+            )
+            with patch.object(
+                promotion.production_registry,
+                "_validated_source_pair_identity",
+                return_value=copy.deepcopy(identity),
+            ) as validator:
+                self.assertEqual(
+                    identity,
+                    promotion._source_pair_production_identity(scorer, report),
+                )
+                self.assertEqual(
+                    identity,
+                    promotion._validate_source_pair_production_identity(
+                        identity
+                    ),
+                )
+            self.assertEqual(2, validator.call_count)
+            changed = copy.deepcopy(identity)
+            changed["scorer_file_sha256"] = "f" * 64
+            with patch.object(
+                promotion.production_registry,
+                "_validated_source_pair_identity",
+                return_value=changed,
+            ):
+                with self.assertRaisesRegex(
+                    promotion.DynamicCropV3ProductionPromotionError,
+                    "identity changed",
+                ):
+                    promotion._validate_source_pair_production_identity(
+                        identity
+                    )
+
+    def test_receipt_bundle_replay_checks_every_registered_pair_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, identity = self._source_pair_identity(Path(directory))
+            bundle_values = {
+                "continuity_authority": (
+                    promotion.PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+                ),
+                "source_pair_scorer_path": Path(identity["scorer_path"]),
+                "source_pair_production_report_path": Path(
+                    identity["production_report_path"]
+                ),
+                "source_pair_scorer_file_sha256": identity[
+                    "scorer_file_sha256"
+                ],
+                "source_pair_production_report_file_sha256": identity[
+                    "production_report_file_sha256"
+                ],
+                "source_pair_production_report_sha256": identity[
+                    "production_report_sha256"
+                ],
+                "source_pair_scorer_fingerprint": identity[
+                    "scorer_fingerprint"
+                ],
+                "source_pair_checkpoint_sha256": identity[
+                    "checkpoint_sha256"
+                ],
+                "source_pair_corpus_sha256": identity["corpus_sha256"],
+            }
+
+            def bundle(values):
+                return type("RegisteredBundle", (), values)()
+
+            with patch.object(
+                promotion,
+                "_source_pair_production_identity",
+                return_value=copy.deepcopy(identity),
+            ):
+                self.assertEqual(
+                    identity,
+                    promotion._registered_bundle_source_pair_identity(
+                        bundle(bundle_values)
+                    ),
+                )
+                tamper_fields = tuple(
+                    name
+                    for name in bundle_values
+                    if name != "continuity_authority"
+                )
+                for field in tamper_fields:
+                    with self.subTest(field=field):
+                        tampered = dict(bundle_values)
+                        tampered[field] = (
+                            Path("/tmp/swapped.json")
+                            if field.endswith("_path")
+                            else "f" * 64
+                        )
+                        with self.assertRaisesRegex(
+                            promotion.DynamicCropV3ProductionPromotionError,
+                            "identity differs",
+                        ):
+                            promotion._registered_bundle_source_pair_identity(
+                                bundle(tampered)
+                            )
+
+    def test_learned_report_binds_plan_identity_and_rejects_resigned_tamper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, metadata, weight_sha, report, _ = (
+                self._checkpoint_and_report(root)
+            )
+            _, _, identity = self._source_pair_identity(root)
+            original_plan = self._promotion_plan
+            learned_plan = copy.deepcopy(original_plan)
+            learned_plan["source_pair_production"] = copy.deepcopy(identity)
+            learned_plan["authority"] = promotion._promotion_authority_contract(
+                learned_source_pair_authority_present=True
+            )
+            learned_report = copy.deepcopy(report)
+            learned_report["source_pair_production"] = copy.deepcopy(identity)
+            learned_report["authority"] = copy.deepcopy(
+                learned_plan["authority"]
+            )
+            self._resign(learned_report)
+            self._promotion_plan = learned_plan
+            try:
+                with (
+                    patch.object(
+                        promotion.production_registry,
+                        "_validated_source_pair_identity",
+                        return_value=copy.deepcopy(identity),
+                    ),
+                    self._patched_plan_replay(),
+                ):
+                    self.assertEqual(
+                        (),
+                        promotion.production_promotion_report_errors(
+                            learned_report,
+                            metadata=metadata,
+                            actual_weight_sha256=weight_sha,
+                            checkpoint_directory=checkpoint,
+                        ),
+                    )
+                    tampered = copy.deepcopy(learned_report)
+                    tampered["source_pair_production"][
+                        "cross_validation_sha256"
+                    ] = "e" * 64
+                    self._resign(tampered)
+                    errors = promotion.production_promotion_report_errors(
+                        tampered,
+                        metadata=metadata,
+                        actual_weight_sha256=weight_sha,
+                        checkpoint_directory=checkpoint,
+                    )
+                    self.assertTrue(
+                        any("source-pair" in error for error in errors), errors
+                    )
+
+                    mismatched = copy.deepcopy(learned_report)
+                    mismatched.pop("source_pair_production")
+                    self._resign(mismatched)
+                    mismatch_errors = (
+                        promotion.production_promotion_report_errors(
+                            mismatched,
+                            metadata=metadata,
+                            actual_weight_sha256=weight_sha,
+                            checkpoint_directory=checkpoint,
+                        )
+                    )
+                    self.assertTrue(mismatch_errors)
+            finally:
+                self._promotion_plan = original_plan
+
     def test_launch_copies_exact_bytes_and_never_runs_optimizer_or_reselection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -744,6 +1134,54 @@ class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
             self.assertIsNone(register_kwargs["source_pair_scorer_path"])
             self.assertIsNone(
                 register_kwargs["source_pair_production_report_path"]
+            )
+
+    def test_shared_registry_call_passes_exact_learned_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, metadata, weight_sha, _, _ = (
+                self._checkpoint_and_report(root)
+            )
+            scorer, pair_report, identity = self._source_pair_identity(root)
+            registry = root / "learned-registry.json"
+            preflight = promotion.DynamicCropV3ProductionPromotionPreflight(
+                plan_path=root / "learned-plan.json",
+                plan_content_sha256="1" * 64,
+                source_checkpoint_directory=checkpoint,
+                destination_checkpoint_directory=checkpoint,
+                evidence_directory=root,
+                production_registry_path=registry,
+                professional_montage_profile_path=root / "profile.json",
+                checkpoint_id=metadata.checkpoint_id,
+                checkpoint_weight_sha256=weight_sha,
+                frozen_cut_probability_threshold=0.5,
+                quality_thresholds=asdict(ProductionQualityThresholds()),
+                song_evidence={},
+                free_bytes=10 * 1024**3,
+                continuity_authority=(
+                    promotion.PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+                ),
+                source_pair_scorer_path=scorer,
+                source_pair_production_report_path=pair_report,
+                source_pair_production_identity=identity,
+            )
+            with patch.object(
+                promotion,
+                "register_stage_edit_production_bundle",
+                return_value=registry,
+            ) as register_mock:
+                self.assertEqual(
+                    registry, promotion._register_promoted_bundle(preflight)
+                )
+            register_kwargs = register_mock.call_args.kwargs
+            self.assertEqual(
+                promotion.PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                register_kwargs["continuity_authority"],
+            )
+            self.assertEqual(scorer, register_kwargs["source_pair_scorer_path"])
+            self.assertEqual(
+                pair_report,
+                register_kwargs["source_pair_production_report_path"],
             )
 
     def test_failed_quality_gate_removes_temporary_copy_and_never_registers(self):
@@ -1068,6 +1506,255 @@ class DynamicCropV3ProductionPromotionTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(2, receipt_loader.call_count)
             register_mock.assert_not_called()
+
+    def test_learned_existing_plan_resume_replays_receipt_and_registers_same_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint, metadata, weight_sha, report, report_path = (
+                self._checkpoint_and_report(root)
+            )
+            scorer, pair_report, identity = self._source_pair_identity(root)
+            registry = root / "learned-resume-registry.json"
+            receipt = root / "promotion-evidence" / "learned-receipt.json"
+            receipt.parent.mkdir()
+            receipt.write_text("{}", encoding="utf-8")
+            base_preflight = promotion.DynamicCropV3ProductionPromotionPreflight(
+                plan_path=Path(report["promotion_plan"]["path"]),
+                plan_content_sha256=report[
+                    "promotion_plan_content_sha256"
+                ],
+                source_checkpoint_directory=Path(
+                    report["lineage"]["source_checkpoint"]["directory"]
+                ),
+                destination_checkpoint_directory=checkpoint,
+                evidence_directory=receipt.parent,
+                production_registry_path=registry,
+                professional_montage_profile_path=root / "profile.json",
+                checkpoint_id=metadata.checkpoint_id,
+                checkpoint_weight_sha256=weight_sha,
+                frozen_cut_probability_threshold=0.5,
+                quality_thresholds=asdict(ProductionQualityThresholds()),
+                song_evidence={},
+                free_bytes=10 * 1024**3,
+            )
+            base_plan = copy.deepcopy(self._promotion_plan)
+            base_plan["production_registry_path"] = str(registry.resolve())
+            base_plan["destination_checkpoint_directory"] = str(checkpoint)
+            base_plan["evidence_directory"] = str(receipt.parent.resolve())
+            plan, preflight = self._learned_plan_and_preflight(
+                plan=base_plan,
+                preflight=base_preflight,
+                identity=identity,
+            )
+            ready = StageEditReadinessReport(
+                architecture_available=True,
+                learned_inference_ready=True,
+                status="production_checkpoint_ready",
+                reason="learned resume",
+                mlx_version="test",
+                checkpoint_path=str(checkpoint),
+                training_steps=metadata.training_steps,
+                checkpoint_format="dynamic_crop_v3",
+                dynamic_crop_version=3,
+                checkpoint_metadata_filename=(
+                    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+                ),
+            )
+            with (
+                patch.object(promotion, "_strict_plan", return_value=plan),
+                patch.object(
+                    promotion,
+                    "_preflight_from_existing_plan",
+                    return_value=preflight,
+                ),
+                patch.object(
+                    promotion.production_registry,
+                    "_validated_source_pair_identity",
+                    return_value=copy.deepcopy(identity),
+                ),
+                patch.object(
+                    promotion,
+                    "load_dynamic_crop_v3_production_promotion_report",
+                    return_value=report,
+                ),
+                patch.object(
+                    promotion, "stage_edit_readiness_report", return_value=ready
+                ),
+                patch.object(
+                    promotion, "_expected_receipt_path", return_value=receipt
+                ),
+                patch.object(
+                    promotion,
+                    "_load_dynamic_crop_v3_production_promotion_receipt",
+                    return_value={},
+                ) as receipt_loader,
+                patch.object(
+                    promotion,
+                    "register_stage_edit_production_bundle",
+                    return_value=registry,
+                ) as register_mock,
+            ):
+                result = promotion._resume_or_return_existing_promotion(
+                    preflight.plan_path
+                )
+            self.assertIsNotNone(result)
+            receipt_loader.assert_called_once_with(
+                receipt, require_registry=False
+            )
+            register_kwargs = register_mock.call_args.kwargs
+            self.assertEqual(
+                promotion.PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+                register_kwargs["continuity_authority"],
+            )
+            self.assertEqual(scorer, register_kwargs["source_pair_scorer_path"])
+            self.assertEqual(
+                pair_report,
+                register_kwargs["source_pair_production_report_path"],
+            )
+
+    def test_real_source_pair_artifacts_survive_receipt_registry_and_resume_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkpoint, metadata, weight_sha, report, report_path = (
+                self._checkpoint_and_report(root)
+            )
+            scorer, pair_report, identity = self._real_source_pair_identity(root)
+            profile = _montage_profile(root)
+            profile_identity = load_professional_montage_policy(
+                profile
+            ).identity.to_dict()
+            registry = root / "learned-production-registry.json"
+            evidence = root / "promotion-evidence"
+            evidence.mkdir(exist_ok=True)
+            plan_path = Path(report["promotion_plan"]["path"])
+
+            base_plan = copy.deepcopy(self._promotion_plan)
+            base_plan["destination_checkpoint_directory"] = str(checkpoint)
+            base_plan["evidence_directory"] = str(evidence)
+            base_plan["production_registry_path"] = str(registry)
+            base_plan["professional_montage_profile"] = profile_identity
+            base_preflight = promotion.DynamicCropV3ProductionPromotionPreflight(
+                plan_path=plan_path,
+                plan_content_sha256=report[
+                    "promotion_plan_content_sha256"
+                ],
+                source_checkpoint_directory=Path(
+                    report["lineage"]["source_checkpoint"]["directory"]
+                ),
+                destination_checkpoint_directory=checkpoint,
+                evidence_directory=evidence,
+                production_registry_path=registry,
+                professional_montage_profile_path=profile,
+                checkpoint_id=metadata.checkpoint_id,
+                checkpoint_weight_sha256=weight_sha,
+                frozen_cut_probability_threshold=0.5,
+                quality_thresholds=asdict(ProductionQualityThresholds()),
+                song_evidence={},
+                free_bytes=10 * 1024**3,
+            )
+            plan, preflight = self._learned_plan_and_preflight(
+                plan=base_plan,
+                preflight=base_preflight,
+                identity=identity,
+            )
+            plan_path.write_text(
+                json.dumps(plan, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            report["promotion_plan"] = self._pointer(plan_path)
+            report["source_pair_production"] = copy.deepcopy(identity)
+            report["authority"] = copy.deepcopy(plan["authority"])
+            self._resign(report)
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            ready = StageEditReadinessReport(
+                architecture_available=True,
+                learned_inference_ready=True,
+                status="production_checkpoint_ready",
+                reason="real learned source-pair promotion integration",
+                mlx_version="test",
+                checkpoint_path=str(checkpoint),
+                training_steps=metadata.training_steps,
+                checkpoint_format="dynamic_crop_v3",
+                dynamic_crop_version=3,
+                checkpoint_metadata_filename=(
+                    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+                ),
+            )
+
+            original_plan = self._promotion_plan
+            self._promotion_plan = plan
+            try:
+                with (
+                    self._patched_plan_replay(),
+                    patch.object(
+                        promotion,
+                        "stage_edit_readiness_report",
+                        return_value=ready,
+                    ),
+                    patch.object(
+                        promotion.production_registry,
+                        "stage_edit_readiness_report",
+                        return_value=ready,
+                    ),
+                ):
+                    self.assertEqual(
+                        identity,
+                        promotion._validate_source_pair_production_identity(
+                            identity
+                        ),
+                    )
+                    self.assertEqual(
+                        report,
+                        promotion.load_dynamic_crop_v3_production_promotion_report(
+                            report_path
+                        ),
+                    )
+                    receipt, created = promotion._record_promotion_receipt(
+                        preflight=preflight,
+                        report_path=report_path,
+                        report=report,
+                    )
+                    self.assertTrue(created)
+                    staged_receipt = (
+                        promotion._load_dynamic_crop_v3_production_promotion_receipt(
+                            receipt, require_registry=False
+                        )
+                    )
+                    self.assertEqual(identity, staged_receipt["source_pair_production"])
+
+                    result = promotion._resume_or_return_existing_promotion(
+                        plan_path
+                    )
+                    self.assertIsNotNone(result)
+                    assert result is not None
+                    self.assertEqual(receipt, result.receipt_path)
+                    self.assertEqual(registry, result.registry_path)
+                    bundle = promotion.load_registered_stage_edit_production_bundle(
+                        registry
+                    )
+                    self.assertEqual(
+                        identity,
+                        promotion._registered_bundle_source_pair_identity(bundle),
+                    )
+                    activated_receipt = (
+                        promotion.load_dynamic_crop_v3_production_promotion_receipt(
+                            receipt
+                        )
+                    )
+                    self.assertEqual(
+                        identity,
+                        activated_receipt["source_pair_production"],
+                    )
+
+                    resumed = promotion._resume_or_return_existing_promotion(
+                        plan_path
+                    )
+                    self.assertEqual(result, resumed)
+            finally:
+                self._promotion_plan = original_plan
 
     @unittest.skipIf(mx is None, "MLX is not installed")
     def test_mlx_checkpoint_survives_byte_identical_promotion_copy(self):
