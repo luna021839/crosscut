@@ -22,6 +22,11 @@ from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     DynamicCropHeadPredictionV3,
 )
 from crosscut.stage_edit_semimarkov_beam import (
+    CONTINUITY_AUTHORITY_CONTRACT,
+    DECODER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     StageEditCheckpointNotReadyError,
     StageEditDecodeInputError,
     StageEditHeadFrame,
@@ -35,6 +40,11 @@ from crosscut.stage_edit_semimarkov_beam import (
     _wide_switch_preferred_target_score_raw,
     decode_stage_edit_semimarkov_beam,
     stage_edit_boundary_continuity_score,
+)
+from crosscut.stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_FEATURE_NAMES,
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+    StageEditSourcePairScorer,
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
@@ -201,6 +211,7 @@ def _decode(
     config: StageEditSemiMarkovConfig | None = None,
     constraints: tuple[StageEditSectionConstraint, ...] = (),
     derivative_metadata: SourceDerivativeFamilyMetadata | None = None,
+    source_pair_scorer: StageEditSourcePairScorer | None = None,
 ):
     selected_plan = plan or _plan(duration)
     return decode_stage_edit_semimarkov_beam(
@@ -222,7 +233,14 @@ def _decode(
         height=1080,
         fps=30.0,
         source_derivative_metadata=derivative_metadata,
+        source_pair_scorer=source_pair_scorer,
     )
+
+
+def _single_feature_scorer(feature_name: str) -> StageEditSourcePairScorer:
+    weights = [0.0] * len(STAGE_EDIT_SOURCE_PAIR_FEATURE_NAMES)
+    weights[STAGE_EDIT_SOURCE_PAIR_FEATURE_NAMES.index(feature_name)] = 1.0
+    return StageEditSourcePairScorer(tuple(weights))
 
 
 def _assert_finite_tree(test: unittest.TestCase, value: object) -> None:
@@ -1266,6 +1284,363 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             )
         )
 
+    @staticmethod
+    def _continuity_authority_frames() -> tuple[StageEditHeadFrame, ...]:
+        # Handcrafted geometry prefers source 1 after the forced source-0
+        # opening. A camera-motion-only learned scorer prefers source 2.
+        continuity = (
+            StageEditSourceContinuity(
+                face_scale=0.20,
+                face_center_x=0.50,
+                face_center_y=0.50,
+                camera_motion_x=0.0,
+                camera_motion_y=0.0,
+            ),
+            StageEditSourceContinuity(
+                face_scale=0.20,
+                face_center_x=0.50,
+                face_center_y=0.50,
+                camera_motion_x=1.0,
+                camera_motion_y=1.0,
+            ),
+            StageEditSourceContinuity(
+                face_scale=0.80,
+                face_center_x=0.90,
+                face_center_y=0.10,
+                camera_motion_x=0.0,
+                camera_motion_y=0.0,
+            ),
+            StageEditSourceContinuity(
+                face_scale=0.35,
+                face_center_x=0.65,
+                face_center_y=0.65,
+                camera_motion_x=0.70,
+                camera_motion_y=0.70,
+            ),
+        )
+        frames = []
+        for index, frame in enumerate(_frames(6, 4)):
+            frames.append(
+                replace(
+                    frame,
+                    source_logits=(0.0,) * 4,
+                    available_source_mask=(True,) * 4,
+                    hard_source_gate_mask=(
+                        (True, False, False, False)
+                        if index == 0
+                        else (True,) * 4
+                    ),
+                    source_continuity=continuity,
+                )
+            )
+        return tuple(frames)
+
+    @staticmethod
+    def _continuity_authority_config(authority: str) -> StageEditSemiMarkovConfig:
+        return StageEditSemiMarkovConfig(
+            beam_width=32,
+            timeline_count=8,
+            minimum_shot_seconds=1.0,
+            maximum_shot_seconds=1.0,
+            minimum_unique_sources=3,
+            enforce_aba_exclusion=False,
+            enforce_montage_grammar=False,
+            maximum_global_switches_per_minute=120.0,
+            section_cut_density_multiplier=4.0,
+            cut_score_weight=0.0,
+            source_score_weight=0.0,
+            duration_score_weight=0.0,
+            transition_score_weight=0.0,
+            crop_correction_weight=0.0,
+            source_quality_weight=0.0,
+            boundary_continuity_weight=1.0,
+            cadence_score_weight=0.0,
+            diversity_score_weight=0.0,
+            occupancy_balance_weight=0.0,
+            montage_grammar_score_weight=0.0,
+            continuity_authority=authority,
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_learned_source_pair_scorer_changes_candidate_order_and_exact_component(
+        self, _mocked
+    ) -> None:
+        frames = self._continuity_authority_frames()
+        learned_scorer = _single_feature_scorer("camera_motion_distance")
+        handcrafted = _decode(
+            frames=frames,
+            config=self._continuity_authority_config(
+                HANDCRAFTED_CONTINUITY_AUTHORITY
+            ),
+        )
+        learned = _decode(
+            frames=frames,
+            config=self._continuity_authority_config(
+                PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ),
+            source_pair_scorer=learned_scorer,
+        )
+
+        handcrafted_path = tuple(
+            decision.source_index for decision in handcrafted.timelines[0].decisions
+        )
+        learned_path = tuple(
+            decision.source_index for decision in learned.timelines[0].decisions
+        )
+        self.assertEqual(0, handcrafted_path[0])
+        self.assertEqual(0, learned_path[0])
+        self.assertEqual(1, handcrafted_path[1])
+        self.assertEqual(2, learned_path[1])
+        self.assertNotEqual(handcrafted_path, learned_path)
+
+        decisions = learned.timelines[0].decisions
+        for decision_index, decision in enumerate(decisions):
+            component = next(
+                value
+                for value in decision.score_components
+                if value.name == "boundary_continuity"
+            )
+            if decision_index == 0:
+                expected = 0.0
+            else:
+                outgoing = decisions[decision_index - 1].source_index
+                incoming = decision.source_index
+                exact_frame = frames[decision.start_candidate_index]
+                expected = learned_scorer.score(
+                    exact_frame.source_continuity[outgoing],
+                    exact_frame.source_continuity[incoming],
+                )
+            self.assertAlmostEqual(expected, component.raw_value)
+            self.assertAlmostEqual(
+                expected * component.weight,
+                component.contribution,
+            )
+            self.assertGreaterEqual(component.raw_value, -1.0)
+            self.assertLessEqual(component.raw_value, 0.0)
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_continuity_authority_rejects_missing_or_unexpected_scorer(
+        self, _mocked
+    ) -> None:
+        scorer = StageEditSourcePairScorer.uniform()
+        learned_config = self._continuity_authority_config(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "requires a typed StageEditSourcePairScorer",
+        ):
+            _decode(config=learned_config)
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "rejects an unexpected learned source-pair scorer",
+        ):
+            _decode(source_pair_scorer=scorer)
+        missing_observations = tuple(
+            replace(frame, source_continuity=()) for frame in _frames(6, 4)
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "requires exact canonical source observations",
+        ):
+            _decode(
+                frames=missing_observations,
+                config=learned_config,
+                source_pair_scorer=scorer,
+            )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "configured continuity scorer fingerprint",
+        ):
+            _decode(
+                config=replace(
+                    learned_config,
+                    continuity_scorer_fingerprint="0" * 64,
+                ),
+                source_pair_scorer=scorer,
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_learned_continuity_is_neutral_on_same_derivative_family(
+        self, _mocked
+    ) -> None:
+        scorer = _single_feature_scorer("camera_motion_distance")
+        frames = list(self._continuity_authority_frames())
+        frames[1] = replace(
+            frames[1],
+            hard_source_gate_mask=(False, True, False, False),
+        )
+        derivative_metadata = SourceDerivativeFamilyMetadata(
+            source_count=4,
+            family_ids=(0, 0, 1, 2),
+            audit_sha256="d" * 64,
+            production_ready=True,
+            uncertain_pair_count=0,
+            clock_contract_complete=True,
+        )
+        config = replace(
+            self._continuity_authority_config(
+                PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            ),
+            allow_consecutive_same_source=True,
+        )
+        result = _decode(
+            frames=tuple(frames),
+            config=config,
+            derivative_metadata=derivative_metadata,
+            source_pair_scorer=scorer,
+        )
+        opening, same_family = result.timelines[0].decisions[:2]
+        self.assertEqual((0, 1), (opening.source_index, same_family.source_index))
+        component = next(
+            value
+            for value in same_family.score_components
+            if value.name == "boundary_continuity"
+        )
+        exact_frame = frames[same_family.start_candidate_index]
+        self.assertLess(
+            scorer.score(
+                exact_frame.source_continuity[0],
+                exact_frame.source_continuity[1],
+            ),
+            0.0,
+        )
+        self.assertEqual(0.0, component.raw_value)
+        self.assertEqual(0.0, component.contribution)
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_learned_continuity_fingerprint_is_deterministic_and_audited(
+        self, _mocked
+    ) -> None:
+        scorer = _single_feature_scorer("camera_motion_distance")
+        config = self._continuity_authority_config(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        )
+        frames = self._continuity_authority_frames()
+        first = _decode(
+            frames=frames, config=config, source_pair_scorer=scorer
+        )
+        second = _decode(
+            frames=frames, config=config, source_pair_scorer=scorer
+        )
+        provenance = first.audit.input_summary[
+            "boundary_continuity_score_provenance"
+        ]
+        self.assertEqual(
+            CONTINUITY_AUTHORITY_CONTRACT,
+            provenance["authority_contract"],
+        )
+        self.assertEqual(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            provenance["authority"],
+        )
+        self.assertEqual(
+            STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            provenance["scorer_contract"],
+        )
+        self.assertEqual(scorer.fingerprint, provenance["scorer_fingerprint"])
+        self.assertFalse(provenance["scorer_weights_embedded"])
+        self.assertNotIn("weights", provenance)
+        self.assertEqual(first.audit.input_sha256, second.audit.input_sha256)
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(
+            scorer.fingerprint,
+            first.audit.score_provenance["boundary_continuity"][
+                "scorer_fingerprint"
+            ],
+        )
+        self.assertEqual(
+            PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            first.audit.config["continuity_authority"],
+        )
+        self.assertEqual(
+            CONTINUITY_AUTHORITY_CONTRACT,
+            first.audit.config["continuity_authority_contract"],
+        )
+        self.assertEqual(
+            STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            first.audit.config["continuity_scorer_contract"],
+        )
+        self.assertEqual(
+            scorer.fingerprint,
+            first.audit.config["continuity_scorer_fingerprint"],
+        )
+        for timeline in first.timelines:
+            self.assertEqual(
+                scorer.fingerprint,
+                timeline.boundary_continuity_score_provenance[
+                    "scorer_fingerprint"
+                ],
+            )
+            self.assertEqual(
+                provenance,
+                timeline.to_dict()["score_provenance"]["boundary_continuity"],
+            )
+            self.assertEqual(
+                provenance,
+                timeline.edit.candidate_history[0][
+                    "boundary_continuity_score_provenance"
+                ],
+            )
+
+        different = _decode(
+            frames=frames,
+            config=config,
+            source_pair_scorer=StageEditSourcePairScorer.uniform(),
+        )
+        self.assertNotEqual(
+            first.audit.input_sha256, different.audit.input_sha256
+        )
+        self.assertNotEqual(
+            scorer.fingerprint,
+            different.audit.score_provenance["boundary_continuity"][
+                "scorer_fingerprint"
+            ],
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_default_handcrafted_authority_is_backward_compatible(
+        self, _mocked
+    ) -> None:
+        common = {
+            "beam_width": 16,
+            "timeline_count": 8,
+            "minimum_unique_sources": 3,
+            "enforce_montage_grammar": False,
+        }
+        implicit = _decode(config=StageEditSemiMarkovConfig(**common))
+        explicit = _decode(
+            config=StageEditSemiMarkovConfig(
+                **common,
+                continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
+            )
+        )
+        self.assertEqual(implicit.to_dict(), explicit.to_dict())
+        provenance = implicit.audit.input_summary[
+            "boundary_continuity_score_provenance"
+        ]
+        self.assertEqual(
+            HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            provenance["scorer_contract"],
+        )
+        self.assertEqual(HANDCRAFTED_CONTINUITY_AUTHORITY, provenance["authority"])
+        self.assertEqual(DECODER_CONTRACT, implicit.audit.decoder)
+
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
         return_value=_ready_report(),
@@ -1472,13 +1847,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         result = _decode(frames=frames)
 
-        self.assertEqual(9, result.audit.schema_version)
+        self.assertEqual(10, result.audit.schema_version)
         self.assertEqual(
             "verified_derivative_family_not_file_source",
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            8,
+            9,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(

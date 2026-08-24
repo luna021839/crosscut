@@ -39,6 +39,10 @@ from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     DynamicCropHeadPredictionV3,
     DynamicCropTrackDecodeV3,
 )
+from .stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+    StageEditSourcePairScorer,
+)
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_DECISION_HISTORY_OWNER,
@@ -53,7 +57,8 @@ from .stage_edit_transition_authority import (
 )
 
 
-DECODER_SCHEMA_VERSION = 9
+DECODER_SCHEMA_VERSION = 10
+DECODER_CONTRACT = "stage_edit_semimarkov_beam_v7"
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -68,6 +73,25 @@ MONTAGE_GRAMMAR_CONTRACT = (
 )
 HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
     "ive_20_human_reference_chorus_shot_boundary_rate_distribution_v1"
+)
+CONTINUITY_AUTHORITY_CONTRACT = (
+    "explicit_single_boundary_continuity_score_authority_v1"
+)
+HANDCRAFTED_CONTINUITY_AUTHORITY = "handcrafted_boundary_continuity_v1"
+PRODUCTION_LEARNED_CONTINUITY_AUTHORITY = (
+    "production_learned_source_pair_checkpoint_v1"
+)
+HANDCRAFTED_CONTINUITY_SCORER_CONTRACT = (
+    "semimarkov_boundary_continuity_handcrafted_v1"
+)
+HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT = hashlib.sha256(
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT.encode("utf-8")
+).hexdigest()
+_CONTINUITY_AUTHORITIES = frozenset(
+    {
+        HANDCRAFTED_CONTINUITY_AUTHORITY,
+        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+    }
 )
 
 
@@ -557,12 +581,71 @@ class StageEditSemiMarkovConfig:
     # identity-free evidence and is not proof that all six members are shown.
     strong_formation_anchor_person_count_normalized: float = 4.0 / 6.0
     highlight_minimum_post_burst_formation_resets: int = 1
+    # Appended for positional backwards compatibility. Exactly one boundary
+    # continuity authority is active for the entire decode.
+    continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY
+    continuity_authority_contract: str = CONTINUITY_AUTHORITY_CONTRACT
+    # Optional expected values let a caller bind a preloaded production scorer.
+    # The audit config always records the resolved non-optional values.
+    continuity_scorer_contract: str | None = None
+    continuity_scorer_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enforce_montage_grammar, bool):
             raise StageEditDecodeInputError(
                 "enforce_montage_grammar must be boolean"
             )
+        authority = str(self.continuity_authority).strip()
+        if authority not in _CONTINUITY_AUTHORITIES:
+            raise StageEditDecodeInputError(
+                "continuity_authority must select handcrafted or production "
+                "learned-checkpoint scoring"
+            )
+        object.__setattr__(self, "continuity_authority", authority)
+        if self.continuity_authority_contract != CONTINUITY_AUTHORITY_CONTRACT:
+            raise StageEditDecodeInputError(
+                "continuity_authority_contract is unsupported"
+            )
+        expected_contract = self.continuity_scorer_contract
+        if expected_contract is not None:
+            expected_contract = str(expected_contract).strip()
+            if not expected_contract:
+                raise StageEditDecodeInputError(
+                    "continuity_scorer_contract cannot be blank"
+                )
+            allowed_contract = (
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+                if authority == HANDCRAFTED_CONTINUITY_AUTHORITY
+                else STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+            )
+            if expected_contract != allowed_contract:
+                raise StageEditDecodeInputError(
+                    "continuity scorer contract conflicts with its authority"
+                )
+            object.__setattr__(
+                self, "continuity_scorer_contract", expected_contract
+            )
+        expected_fingerprint = self.continuity_scorer_fingerprint
+        if expected_fingerprint is not None:
+            if (
+                not isinstance(expected_fingerprint, str)
+                or len(expected_fingerprint) != 64
+                or any(
+                    value not in "0123456789abcdef"
+                    for value in expected_fingerprint
+                )
+            ):
+                raise StageEditDecodeInputError(
+                    "continuity_scorer_fingerprint must be lowercase SHA-256"
+                )
+            if (
+                authority == HANDCRAFTED_CONTINUITY_AUTHORITY
+                and expected_fingerprint
+                != HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+            ):
+                raise StageEditDecodeInputError(
+                    "handcrafted continuity scorer fingerprint mismatch"
+                )
         for name in ("beam_width", "timeline_count"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 8 <= value <= 32:
@@ -915,6 +998,9 @@ class StageEditBeamTimeline:
     recent_cut_density_per_minute: float
     montage_grammar: Mapping[str, Any] = field(default_factory=dict)
     derivative_family_occupancy_seconds: tuple[float, ...] = ()
+    boundary_continuity_score_provenance: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -927,6 +1013,11 @@ class StageEditBeamTimeline:
             ),
             "recent_cut_density_per_minute": self.recent_cut_density_per_minute,
             "montage_grammar": dict(self.montage_grammar),
+            "score_provenance": {
+                "boundary_continuity": dict(
+                    self.boundary_continuity_score_provenance
+                )
+            },
             "decisions": [item.to_dict() for item in self.decisions],
             "stage_edit": self.edit.to_dict(),
         }
@@ -950,6 +1041,7 @@ class StageEditDecodeAudit:
     requested_timeline_count: int
     returned_timeline_count: int
     request_fulfilled: bool
+    score_provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -969,6 +1061,7 @@ class StageEditDecodeAudit:
             "requested_timeline_count": self.requested_timeline_count,
             "returned_timeline_count": self.returned_timeline_count,
             "request_fulfilled": self.request_fulfilled,
+            "score_provenance": dict(self.score_provenance),
         }
 
 
@@ -2265,6 +2358,75 @@ def _bounded_continuity_delta(left: float, right: float, scale: float) -> float:
     return min(1.0, abs(left - right) / scale)
 
 
+def _continuity_score_provenance(
+    config: StageEditSemiMarkovConfig,
+    source_pair_scorer: StageEditSourcePairScorer | None,
+) -> dict[str, Any]:
+    """Resolve one unambiguous scorer authority without exposing weights."""
+
+    if config.continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
+        if source_pair_scorer is not None:
+            raise StageEditDecodeInputError(
+                "handcrafted continuity authority rejects an unexpected "
+                "learned source-pair scorer"
+            )
+        scorer_contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+        scorer_fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+    else:
+        if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
+            raise StageEditDecodeInputError(
+                "production learned continuity authority requires a typed "
+                "StageEditSourcePairScorer"
+            )
+        scorer_contract = source_pair_scorer.contract
+        scorer_fingerprint = source_pair_scorer.fingerprint
+        if scorer_contract != STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT:
+            raise StageEditDecodeInputError(
+                "learned source-pair scorer contract mismatch"
+            )
+    if (
+        config.continuity_scorer_contract is not None
+        and config.continuity_scorer_contract != scorer_contract
+    ):
+        raise StageEditDecodeInputError(
+            "configured continuity scorer contract does not match the scorer"
+        )
+    if (
+        config.continuity_scorer_fingerprint is not None
+        and config.continuity_scorer_fingerprint != scorer_fingerprint
+    ):
+        raise StageEditDecodeInputError(
+            "configured continuity scorer fingerprint does not match the scorer"
+        )
+    return {
+        "authority_contract": CONTINUITY_AUTHORITY_CONTRACT,
+        "authority": config.continuity_authority,
+        "scorer_contract": scorer_contract,
+        "scorer_fingerprint": scorer_fingerprint,
+        "scorer_weights_embedded": False,
+        "score_range": [-1.0, 0.0],
+        "applies_to": "actual_derivative_family_boundaries_only",
+        "opening_and_same_family_raw_score": 0.0,
+    }
+
+
+def _audit_config_payload(
+    config: StageEditSemiMarkovConfig,
+    boundary_continuity_score_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve optional scorer binding fields into a round-trippable config."""
+
+    return {
+        **asdict(config),
+        "continuity_scorer_contract": (
+            boundary_continuity_score_provenance["scorer_contract"]
+        ),
+        "continuity_scorer_fingerprint": (
+            boundary_continuity_score_provenance["scorer_fingerprint"]
+        ),
+    }
+
+
 def stage_edit_boundary_continuity_score(
     outgoing: StageEditSourceContinuity,
     incoming: StageEditSourceContinuity,
@@ -2400,13 +2562,44 @@ def _boundary_continuity_raw(
     frame: StageEditHeadFrame,
     outgoing_source_index: int | None,
     incoming_source_index: int,
+    derivative_family_ids: Sequence[int],
+    *,
+    continuity_authority: str,
+    source_pair_scorer: StageEditSourcePairScorer | None,
 ) -> float:
-    if outgoing_source_index is None or not frame.source_continuity:
+    if outgoing_source_index is None:
         return 0.0
-    return stage_edit_boundary_continuity_score(
-        frame.source_continuity[outgoing_source_index],
-        frame.source_continuity[incoming_source_index],
-    )
+    if (
+        derivative_family_ids[outgoing_source_index]
+        == derivative_family_ids[incoming_source_index]
+    ):
+        return 0.0
+    if not frame.source_continuity:
+        if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+            raise StageEditDecodeInputError(
+                "learned boundary scoring is missing exact source continuity"
+            )
+        return 0.0
+    outgoing = frame.source_continuity[outgoing_source_index]
+    incoming = frame.source_continuity[incoming_source_index]
+    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
+            raise StageEditDecodeInputError(
+                "learned boundary scoring is missing its source-pair scorer"
+            )
+        raw = source_pair_scorer.score(outgoing, incoming)
+    elif continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
+        raw = stage_edit_boundary_continuity_score(outgoing, incoming)
+    else:  # Config validation should make this unreachable.
+        raise StageEditDecodeInputError(
+            "boundary continuity authority is unsupported"
+        )
+    result = _finite(raw, "boundary_continuity_raw")
+    if not -1.0 <= result <= 0.0:
+        raise StageEditDecodeInputError(
+            "boundary continuity scorer violated its bounded [-1, 0] contract"
+        )
+    return result
 
 
 def _source_span_rejection(
@@ -2439,9 +2632,10 @@ def _input_digest(
     frames: Sequence[StageEditHeadFrame],
     section_plan: SectionPlan,
     constraints: Sequence[StageEditSectionConstraint],
-    config: StageEditSemiMarkovConfig,
+    config: Mapping[str, Any],
     schema: StageEditTokenSchema,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None,
+    boundary_continuity_score_provenance: Mapping[str, Any],
 ) -> str:
     payload = {
         "sources": [str(Path(value)) for value in sources],
@@ -2449,7 +2643,10 @@ def _input_digest(
         "frames": [value.to_dict() for value in frames],
         "section_plan": section_plan.to_dict(),
         "constraints": [asdict(value) for value in constraints],
-        "config": asdict(config),
+        "config": dict(config),
+        "boundary_continuity_score_provenance": dict(
+            boundary_continuity_score_provenance
+        ),
         "token_schema_fingerprint": schema.fingerprint,
         "source_derivative_metadata": (
             source_derivative_metadata.to_dict()
@@ -2511,6 +2708,7 @@ def _build_stage_edit(
     checkpoint_path: str,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None,
     config: StageEditSemiMarkovConfig,
+    boundary_continuity_score_provenance: Mapping[str, Any],
 ) -> StageEdit:
     transition_authority = StageEditTransitionAuthority(
         mode=config.transition_authority
@@ -2571,7 +2769,7 @@ def _build_stage_edit(
         output=_timeline_output_path(output, rank),
         candidate_history=(
             {
-                "decoder": "stage_edit_semimarkov_beam_v5",
+                "decoder": DECODER_CONTRACT,
                 "timeline_rank": rank,
                 "checkpoint_path": checkpoint_path,
                 "score": state.score,
@@ -2594,6 +2792,9 @@ def _build_stage_edit(
                     "uses duration-neutral hard cuts"
                 ),
                 "transition_authority": transition_authority.to_dict(),
+                "boundary_continuity_score_provenance": dict(
+                    boundary_continuity_score_provenance
+                ),
             },
         ),
     )
@@ -2702,6 +2903,15 @@ def _validate_decode_inputs(
             raise StageEditDecodeInputError(
                 f"frame {index} continuity count does not match sources"
             )
+        if (
+            config.continuity_authority
+            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            and len(frame.source_continuity) != source_count
+        ):
+            raise StageEditDecodeInputError(
+                f"frame {index} learned continuity authority requires exact "
+                "canonical source observations"
+            )
         if frame.dynamic_crop_v3_by_source:
             if len(frame.dynamic_crop_v3_by_source) != source_count:
                 raise StageEditDecodeInputError(
@@ -2771,6 +2981,7 @@ def decode_stage_edit_semimarkov_beam(
     height: int = 1080,
     fps: float = 29.97,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None = None,
+    source_pair_scorer: StageEditSourcePairScorer | None = None,
 ) -> StageEditSemiMarkovResult:
     """Decode StageEdit heads into ranked, renderer-valid StageEdit timelines.
 
@@ -2795,6 +3006,13 @@ def decode_stage_edit_semimarkov_beam(
             "StageEdit semi-Markov decoding requires a production-ready checkpoint: "
             f"{readiness.status}: {readiness.reason}"
         )
+
+    boundary_continuity_score_provenance = _continuity_score_provenance(
+        config, source_pair_scorer
+    )
+    audit_config = _audit_config_payload(
+        config, boundary_continuity_score_provenance
+    )
 
     normalized_sources = tuple(Path(value) for value in sources)
     normalized_metadata = tuple(source_metadata)
@@ -3278,6 +3496,9 @@ def decode_stage_edit_semimarkov_beam(
                             frame,
                             state.current_source,
                             source_index,
+                            derivative_family_ids,
+                            continuity_authority=config.continuity_authority,
+                            source_pair_scorer=source_pair_scorer,
                         )
                         quality_raw = metadata.quality_log_prior
                         novelty_raw = (
@@ -3607,6 +3828,9 @@ def decode_stage_edit_semimarkov_beam(
             checkpoint_path=checkpoint_path,
             source_derivative_metadata=source_derivative_metadata,
             config=config,
+            boundary_continuity_score_provenance=(
+                boundary_continuity_score_provenance
+            ),
         )
         recent_density = (
             len(state.recent_cut_times)
@@ -3632,6 +3856,9 @@ def decode_stage_edit_semimarkov_beam(
                     state.source_occupancy_seconds,
                     derivative_family_ids,
                 ),
+                boundary_continuity_score_provenance=(
+                    boundary_continuity_score_provenance
+                ),
             )
         )
 
@@ -3641,9 +3868,12 @@ def decode_stage_edit_semimarkov_beam(
         frames=frames,
         section_plan=section_plan,
         constraints=constraints,
-        config=config,
+        config=audit_config,
         schema=schema,
         source_derivative_metadata=source_derivative_metadata,
+        boundary_continuity_score_provenance=(
+            boundary_continuity_score_provenance
+        ),
     )
     selected_dynamic_v2_decodes = tuple(
         decision.dynamic_crop_decode
@@ -3669,20 +3899,26 @@ def decode_stage_edit_semimarkov_beam(
             )
     audit = StageEditDecodeAudit(
         schema_version=DECODER_SCHEMA_VERSION,
-        decoder="stage_edit_semimarkov_beam_v6",
+        decoder=DECODER_CONTRACT,
         input_sha256=digest,
         readiness=readiness.to_dict(),
-        config=asdict(config),
+        # Keep this exact dataclass payload round-trippable by the windowed
+        # redecoder. Detailed runtime scorer provenance lives in the explicit
+        # audit/timeline score-provenance records below.
+        config=audit_config,
         input_summary={
             "source_count": source_count,
             "transition_authority": transition_authority.to_dict(),
+            "boundary_continuity_score_provenance": dict(
+                boundary_continuity_score_provenance
+            ),
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 8,
+                "supersedes": 9,
                 "reason": (
-                    "source-exact Dynamic Crop v3 retains the camera axis until "
-                    "beam selection, and IVE highlight cadence now enforces the "
-                    "20-reference median product minimum with a P75 soft target"
+                    "explicit boundary-continuity authority binds either the "
+                    "backward-compatible handcrafted scorer or one production "
+                    "learned source-pair scorer fingerprint"
                 ),
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,
@@ -3782,13 +4018,24 @@ def decode_stage_edit_semimarkov_beam(
         requested_timeline_count=config.timeline_count,
         returned_timeline_count=len(timelines),
         request_fulfilled=len(timelines) == config.timeline_count,
+        score_provenance={
+            "boundary_continuity": dict(
+                boundary_continuity_score_provenance
+            )
+        },
     )
     return StageEditSemiMarkovResult(tuple(timelines), audit)
 
 
 __all__ = [
+    "CONTINUITY_AUTHORITY_CONTRACT",
+    "DECODER_CONTRACT",
     "DECODER_SCHEMA_VERSION",
+    "HANDCRAFTED_CONTINUITY_AUTHORITY",
+    "HANDCRAFTED_CONTINUITY_SCORER_CONTRACT",
+    "HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT",
     "MONTAGE_GRAMMAR_CONTRACT",
+    "PRODUCTION_LEARNED_CONTINUITY_AUTHORITY",
     "StageEditBeamDecision",
     "StageEditBeamTimeline",
     "StageEditCheckpointNotReadyError",
