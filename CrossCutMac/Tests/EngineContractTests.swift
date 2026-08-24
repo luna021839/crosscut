@@ -718,9 +718,53 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(event.acquisitionManifestPath, "/tmp/acquisition.json")
     }
 
+    func testRenderedVideoOutputDiscoveryRequiresNonemptyRegularVideo() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let empty = root.appendingPathComponent("empty.mp4")
+        XCTAssertTrue(FileManager.default.createFile(atPath: empty.path, contents: Data()))
+        let valid = root.appendingPathComponent("final.mp4")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: valid.path,
+                contents: Data([0, 0, 0, 24, 102, 116, 121, 112])
+            )
+        )
+        let symlink = root.appendingPathComponent("linked.mp4")
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: valid
+        )
+        let analysis = root.appendingPathComponent("analysis.json")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: analysis.path,
+                contents: Data("{}".utf8)
+            )
+        )
+
+        XCTAssertNil(
+            RenderedVideoOutputDiscovery.firstValidVideo(
+                in: [analysis, empty, symlink]
+            )
+        )
+        XCTAssertEqual(
+            RenderedVideoOutputDiscovery.firstValidVideo(
+                in: [analysis, empty, symlink, valid]
+            ),
+            valid.standardizedFileURL
+        )
+    }
+
     func testAutomaticAcquisitionProbeRequiresRequestedModeAndYTDLP() {
         let ready = Data(
-            #"{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}"#.utf8
+            #"{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false},"runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":true}}}"#.utf8
         )
         XCTAssertTrue(
             EngineLocator.automaticAcquisitionProbeReady(from: ready, editMode: .group)
@@ -744,14 +788,38 @@ final class EngineContractTests: XCTestCase {
                 editMode: .group
             )
         )
+        let missingProfessionalModel = Data(
+            #"{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":true},"runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":false}}}"#.utf8
+        )
+        XCTAssertFalse(
+            EngineLocator.automaticAcquisitionProbeReady(
+                from: missingProfessionalModel,
+                editMode: .group
+            )
+        )
+        XCTAssertTrue(
+            EngineLocator.automaticAcquisitionProbeReady(
+                from: missingProfessionalModel,
+                editMode: .member
+            )
+        )
+        let staleEngineWithoutStageEditField = Data(
+            #"{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":true}}"#.utf8
+        )
+        XCTAssertFalse(
+            EngineLocator.automaticAcquisitionProbeReady(
+                from: staleEngineWithoutStageEditField,
+                editMode: .group
+            )
+        )
     }
 
     func testAutomaticAcquisitionProbeUsesModeEvenWhenGlobalDoctorExitsNonzero() throws {
         let ready = try makeExecutableScript(
-            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}'; exit 0"#
+            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false},"runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":true}}}'; exit 0"#
         )
         let globalStrictFailure = try makeExecutableScript(
-            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}'; exit 1"#
+            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false},"runtime_contract":{"stage_edit_generation":{"automatic_group_generation_ready":true}}}'; exit 1"#
         )
         let invalid = try makeExecutableScript(
             "printf '%s\\n' 'doctor crashed'; exit 1"
@@ -830,6 +898,7 @@ final class EngineContractTests: XCTestCase {
     func testAutomaticAcquisitionFailureMessageHasActionableFallback() {
         let message = EngineRunner.automaticAcquisitionUnavailableMessage
         XCTAssertTrue(message.contains("yt-dlp"))
+        XCTAssertTrue(message.contains("StageEdit"))
         XCTAssertTrue(message.contains("내 영상 선택"))
     }
 
@@ -1145,6 +1214,22 @@ except KeyboardInterrupt:
                     atPath: engineDirectory.appendingPathComponent(relativePath).path
                 ),
                 "Missing bundled pose asset: \(relativePath)"
+            )
+        }
+        let requiredProfessionalStageEditModules = [
+            "crosscut/stage_edit_production_registry.py",
+            "crosscut/stage_edit_semimarkov_beam.py",
+            "crosscut/stage_edit_visual_candidate_adapter.py",
+            "crosscut/stage_edit_dynamic_crop_head_v2.py",
+            "crosscut/stage_edit_pipeline_bridge.py",
+            "crosscut/stage_edit_transition_authority.py",
+        ]
+        for relativePath in requiredProfessionalStageEditModules {
+            XCTAssertTrue(
+                FileManager.default.isReadableFile(
+                    atPath: engineDirectory.appendingPathComponent(relativePath).path
+                ),
+                "Missing bundled professional StageEdit module: \(relativePath)"
             )
         }
 

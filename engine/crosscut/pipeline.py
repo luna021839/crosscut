@@ -5362,9 +5362,14 @@ def _load_stage_edit_montage_policy(
 
 def _stage_edit_semimarkov_config_from_montage_policy(
     policy: ProfessionalMontagePolicy,
+    *,
+    minimum_unique_sources: int = 3,
+    maximum_source_occupancy_fraction: float = 0.60,
 ) -> StageEditSemiMarkovConfig:
     product = policy.product_editorial_requirements
     return StageEditSemiMarkovConfig(
+        minimum_unique_sources=minimum_unique_sources,
+        maximum_source_occupancy_fraction=maximum_source_occupancy_fraction,
         transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
         transition_score_weight=0.0,
         highlight_minimum_closeup_fraction=(
@@ -5491,6 +5496,21 @@ def analyze(
     registered_stage_edit_bundle = (
         _discover_automatic_stage_edit_production_bundle(request)
     )
+    automatic_group_requires_professional_generation = bool(
+        request.source_mode is SourceMode.AUTOMATIC
+        and request.edit_mode is EditMode.GROUP
+        and not bool(getattr(request, "acquire_only", False))
+    )
+    if (
+        automatic_group_requires_professional_generation
+        and registered_stage_edit_bundle is None
+        and request.stage_edit_generation_checkpoint_directory is None
+    ):
+        raise RuntimeError(
+            "automatic IVE group editing requires a verified registered "
+            "StageEdit production bundle; the ordinary visual baseline is "
+            "not an allowed fallback"
+        )
     if (
         (
             request.stage_edit_checkpoint_directory is not None
@@ -5534,7 +5554,19 @@ def analyze(
     )
     stage_edit_semimarkov_config = (
         _stage_edit_semimarkov_config_from_montage_policy(
-            stage_edit_montage_policy
+            stage_edit_montage_policy,
+            minimum_unique_sources=(
+                MINIMUM_AUTOMATIC_SOURCE_COUNT
+                if request.source_mode is SourceMode.AUTOMATIC
+                and request.edit_mode is EditMode.GROUP
+                else 3
+            ),
+            maximum_source_occupancy_fraction=(
+                0.45
+                if request.source_mode is SourceMode.AUTOMATIC
+                and request.edit_mode is EditMode.GROUP
+                else 0.60
+            ),
         )
         if stage_edit_montage_policy is not None
         else None

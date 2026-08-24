@@ -335,7 +335,9 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             )
 
             decode_config = _stage_edit_semimarkov_config_from_montage_policy(
-                policy
+                policy,
+                minimum_unique_sources=8,
+                maximum_source_occupancy_fraction=0.45,
             )
             rendered_config = _rendered_montage_config_from_policy(policy)
             self.assertEqual(
@@ -345,6 +347,11 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertEqual(
                 decode_config.highlight_wide_involved_source_switch_reference_count,
                 17,
+            )
+            self.assertEqual(decode_config.minimum_unique_sources, 8)
+            self.assertEqual(
+                decode_config.maximum_source_occupancy_fraction,
+                0.45,
             )
             self.assertEqual(
                 rendered_config.preferred_wide_involved_source_switch_fraction,

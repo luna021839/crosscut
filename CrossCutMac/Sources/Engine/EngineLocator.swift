@@ -262,7 +262,17 @@ enum EngineLocator {
             return false
         }
         let modeKey = editMode == .group ? "automatic_group" : "automatic_member"
-        return modeReadiness[modeKey] as? Bool == true
+        guard modeReadiness[modeKey] as? Bool == true else { return false }
+        if editMode == .group {
+            guard let runtimeContract = payload["runtime_contract"] as? [String: Any],
+                  let stageEdit = runtimeContract["stage_edit_generation"]
+                    as? [String: Any],
+                  stageEdit["automatic_group_generation_ready"] as? Bool == true
+            else {
+                return false
+            }
+        }
+        return true
     }
 
     static func localEditingProbeReady(from data: Data, editMode: EditMode) -> Bool {

@@ -141,7 +141,17 @@ def runtime_report() -> dict[str, object]:
     runtime_modes = runtime_contract["mode_readiness"]
     group_mode_ready = bool(media_tools_ready and runtime_modes["group"])
     member_mode_ready = bool(media_tools_ready and runtime_modes["member"])
-    automatic_group_ready = bool(group_mode_ready and acquisition_ready)
+    stage_edit_generation = runtime_contract.get("stage_edit_generation")
+    if not isinstance(stage_edit_generation, dict):
+        stage_edit_generation = {}
+    professional_group_generation_ready = bool(
+        stage_edit_generation.get("automatic_group_generation_ready") is True
+    )
+    automatic_group_ready = bool(
+        group_mode_ready
+        and acquisition_ready
+        and professional_group_generation_ready
+    )
     automatic_member_ready = bool(
         group_mode_ready
         and acquisition_ready
@@ -150,7 +160,11 @@ def runtime_report() -> dict[str, object]:
     # The native app exposes group and member modes behind one engine-ready
     # state. Keep top-level ready strict while still reporting that a partial
     # runtime can remain usable for group edits.
-    required_ready = bool(member_mode_ready and automatic_member_ready)
+    required_ready = bool(
+        member_mode_ready
+        and automatic_group_ready
+        and automatic_member_ready
+    )
 
     member_anchor_tracking = dict(runtime_contract["member_anchor_tracking"])
     member_anchor_tracking.update(
@@ -201,6 +215,20 @@ def runtime_report() -> dict[str, object]:
             },
         },
         "mode_capabilities": {
+            "professional_group_generation": {
+                "ready": professional_group_generation_ready,
+                "architecture_available": bool(
+                    stage_edit_generation.get("architecture_available") is True
+                ),
+                "installed_production_bundle": stage_edit_generation.get(
+                    "installed_production_bundle"
+                ),
+                "production_registry_error": stage_edit_generation.get(
+                    "production_registry_error"
+                ),
+                "required_for": ["automatic_group"],
+                "failure_policy": "fail_closed_no_silent_visual_fallback",
+            },
             # Confirmed-anchor tracking belongs only to the local member path;
             # automatic portrait edits use verified full-frame visual evidence.
             "member_anchor_tracking": member_anchor_tracking,

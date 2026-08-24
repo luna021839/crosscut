@@ -614,16 +614,34 @@ struct ContentView: View {
                             }
                             .disabled(runner.isRestoringCompletedOutputs)
                         }
-                        if !runner.outputURLs.isEmpty {
-                            Button {
-                                NSWorkspace.shared.activateFileViewerSelecting(
-                                    runner.outputURLs
-                                )
-                            } label: {
-                                Label(
-                                    "결과 보기",
-                                    systemImage: "folder.badge.checkmark"
-                                )
+                        if let renderedVideoURL = runner.renderedVideoURL {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(renderedVideoURL.path)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                                HStack(spacing: 8) {
+                                    Button {
+                                        NSWorkspace.shared.open(renderedVideoURL)
+                                    } label: {
+                                        Label(
+                                            "영상 열기",
+                                            systemImage: "play.rectangle"
+                                        )
+                                    }
+                                    Button {
+                                        NSWorkspace.shared.activateFileViewerSelecting(
+                                            [renderedVideoURL]
+                                        )
+                                    } label: {
+                                        Label(
+                                            "Finder에서 보기",
+                                            systemImage: "folder.badge.checkmark"
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

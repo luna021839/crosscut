@@ -38,6 +38,12 @@ def _ready_runtime_contract() -> dict[str, object]:
         "mode_readiness": {"group": True, "member": True},
         "full_ready": True,
         "member_anchor_tracking": tracking,
+        "stage_edit_generation": {
+            "architecture_available": True,
+            "installed_production_bundle": {"bundle_id": "test-production"},
+            "production_registry_error": None,
+            "automatic_group_generation_ready": True,
+        },
     }
 
 
@@ -160,6 +166,14 @@ class DoctorTests(unittest.TestCase):
                 "fallback": "local_group_and_ready_automatic_modes_remain_available",
                 "probe_error": None,
             },
+            "stage_edit_generation": {
+                "architecture_available": True,
+                "installed_production_bundle": {
+                    "bundle_id": "test-production"
+                },
+                "production_registry_error": None,
+                "automatic_group_generation_ready": True,
+            },
         }
         report = self._report_with_pose_statuses(
             _pose_statuses(_model_status(PERSON_DETECTOR_MODEL)),
@@ -195,6 +209,38 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(
             tracking["scope"],
             "user_anchor_forward_continuous_track_only",
+        )
+
+    def test_automatic_group_fails_closed_without_registered_stage_edit_bundle(
+        self,
+    ) -> None:
+        runtime_contract = _ready_runtime_contract()
+        runtime_contract["stage_edit_generation"] = {
+            "architecture_available": True,
+            "installed_production_bundle": None,
+            "production_registry_error": None,
+            "automatic_group_generation_ready": False,
+        }
+
+        report = self._report_with_pose_statuses(
+            _pose_statuses(_model_status(PERSON_DETECTOR_MODEL)),
+            runtime_contract=runtime_contract,
+        )
+
+        readiness = report["mode_readiness"]
+        self.assertFalse(readiness["automatic_group"])
+        self.assertTrue(readiness["automatic_member"])
+        self.assertFalse(report["ready"])
+        professional = report["mode_capabilities"][
+            "professional_group_generation"
+        ]
+        self.assertFalse(professional["ready"])
+        self.assertTrue(professional["architecture_available"])
+        self.assertIsNone(professional["installed_production_bundle"])
+        self.assertEqual(professional["required_for"], ["automatic_group"])
+        self.assertEqual(
+            professional["failure_policy"],
+            "fail_closed_no_silent_visual_fallback",
         )
 
     def test_automatic_member_requires_verified_person_detector(self) -> None:

@@ -130,6 +130,30 @@ struct CompletedEngineOutputSet: Equatable, Sendable {
     let outputURLs: [URL]
 }
 
+enum RenderedVideoOutputDiscovery {
+    private static let videoExtensions = Set(["mp4", "mov", "m4v"])
+
+    static func firstValidVideo(in urls: [URL]) -> URL? {
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+        ]
+        return urls.lazy
+            .map(\.standardizedFileURL)
+            .first { url in
+                guard videoExtensions.contains(url.pathExtension.lowercased()),
+                      let values = try? url.resourceValues(forKeys: keys)
+                else {
+                    return false
+                }
+                return values.isRegularFile == true
+                    && values.isSymbolicLink != true
+                    && (values.fileSize ?? 0) > 0
+            }
+    }
+}
+
 enum CompletedEngineOutputSetDiscovery {
     private static let selectionAnalysisBasis =
         "sequential_decoded_proxy_candidate_rerank_v1"
@@ -616,7 +640,10 @@ enum CompletedEngineOutputSetDiscovery {
 @MainActor
 final class EngineRunner: ObservableObject {
     static let automaticAcquisitionUnavailableMessage =
-        "자동 수집 또는 선택한 자동 편집 모드가 준비되지 않았습니다. yt-dlp, 네트워크 연결과 번들 시각 모델 진단을 확인하거나, ‘내 영상 선택’을 이용해 주세요."
+        "자동 수집 또는 선택한 자동 편집 모드가 준비되지 않았습니다. "
+        + "yt-dlp·네트워크·번들 시각 모델과 검증된 StageEdit "
+        + "프로덕션 모델 등록 상태를 확인해 주세요. 로컬 원본만 "
+        + "확인하려면 ‘내 영상 선택’을 이용할 수 있습니다."
     static let localGroupUnavailableMessage =
         "로컬 단체 편집이 준비되지 않았습니다. FFmpeg/ffprobe와 Python 런타임 진단을 확인해 주세요."
     static let localMemberTrackingUnavailableMessage =
@@ -627,6 +654,7 @@ final class EngineRunner: ObservableObject {
     @Published private(set) var statusMessage = "IVE 곡명을 입력하면 음방 10개를 목표로 찾고, 최소 8개부터 편집합니다."
     @Published private(set) var logs: [EngineLogEntry] = []
     @Published private(set) var outputURLs: [URL] = []
+    @Published private(set) var renderedVideoURL: URL?
     @Published private(set) var engineURL: URL?
     @Published private(set) var cancellationRequested = false
     @Published private(set) var isRestoringCompletedOutputs = false
@@ -756,6 +784,7 @@ final class EngineRunner: ObservableObject {
         progress = 0
         logs.removeAll()
         outputURLs.removeAll()
+        renderedVideoURL = nil
         cancellationRequested = false
         reportedError = nil
         resultMessage = nil
@@ -776,6 +805,7 @@ final class EngineRunner: ObservableObject {
         guard let result else {
             if clearExistingOutputsOnMissing {
                 outputURLs.removeAll()
+                renderedVideoURL = nil
                 if state == .completed {
                     progress = 0
                     state = .idle
@@ -791,6 +821,9 @@ final class EngineRunner: ObservableObject {
         }
 
         outputURLs = result.outputURLs
+        renderedVideoURL = RenderedVideoOutputDiscovery.firstValidVideo(
+            in: result.outputURLs
+        )
         reportedError = nil
         resultMessage = "외부에서 완성된 교차편집 결과를 불러왔습니다."
         cancellationRequested = false
@@ -1018,17 +1051,19 @@ final class EngineRunner: ObservableObject {
             return
         }
 
+        guard let renderedVideo = RenderedVideoOutputDiscovery.firstValidVideo(
+            in: outputURLs
+        ) else {
+            fail(
+                "엔진은 정상 종료했지만 읽을 수 있는 비어 있지 않은 "
+                    + "결과 영상을 확인하지 못했습니다."
+            )
+            return
+        }
+        renderedVideoURL = renderedVideo
         progress = 1
         state = .completed
-        let videoExtensions = Set(["mp4", "mov", "m4v"])
-        let hasRenderedVideo = outputURLs.contains {
-            videoExtensions.contains($0.pathExtension.lowercased())
-        }
-        if hasRenderedVideo {
-            statusMessage = "교차편집 결과가 준비되었습니다."
-        } else {
-            statusMessage = resultMessage ?? "교차편집 처리가 완료되었습니다."
-        }
+        statusMessage = "교차편집 결과가 준비되었습니다."
         appendLog(statusMessage, level: .info)
     }
 

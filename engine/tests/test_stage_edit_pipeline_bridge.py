@@ -517,6 +517,35 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 )
             discover.assert_not_called()
 
+    def test_automatic_group_refuses_unregistered_visual_baseline(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            request = AnalysisRequest.from_dict(
+                {
+                    "song": "BANG BANG",
+                    "edit_mode": "group",
+                    "aspect_ratio": "16:9",
+                    "source_mode": "automatic",
+                    "desired_source_count": 8,
+                    "sources": [],
+                    "output_directory": str(root / "output"),
+                }
+            )
+            with patch(
+                "crosscut.pipeline.discover_registered_stage_edit_production_bundle",
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires a verified registered StageEdit production bundle",
+                ):
+                    analyze(
+                        request,
+                        SimpleNamespace(),
+                        review_rendered_proxies=True,
+                    )
+            self.assertFalse((root / "output").exists())
+
     def test_registered_bundle_materializes_current_media_before_preflight(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
