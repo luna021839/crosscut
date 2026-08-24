@@ -19,6 +19,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
@@ -43,6 +44,7 @@ from .reference_supervision import build_reference_supervision
 from .reference_training_source_pool import (
     MINIMUM_SOURCE_COUNT,
     build_reference_training_source_manifest,
+    build_synchronized_training_source_catalog,
     build_synchronized_training_source_catalog_from_manifest,
     validate_reference_training_source_manifest,
 )
@@ -52,6 +54,12 @@ SCHEMA_VERSION = 1
 ANALYSIS_BASIS = "strict_professional_reference_training_bootstrap_v1"
 CATALOG_ANALYSIS_BASIS = "strict_synchronized_reference_training_source_catalog_v1"
 SEED_PURPOSE = "same_song_professional_reference_learning_10source_training_pool"
+PRODUCTION_SEED_PURPOSE = (
+    "same_song_professional_reference_learning_current_canonical_production_pool"
+)
+MINIMUM_PRODUCTION_SEED_CLOCK_OVERLAP_FRACTION = 0.80
+MINIMUM_PRODUCTION_SEED_CLOCK_SPAN_RATIO = 0.80
+MAXIMUM_PRODUCTION_SEED_CLOCK_SPAN_RATIO = 1.20
 DEFAULT_EXPECTED_REFERENCE_COUNT = 5
 DEFAULT_EXPECTED_SOURCE_COUNT = 10
 
@@ -93,6 +101,39 @@ def _load_json(path: Path, name: str) -> tuple[dict[str, Any], bytes]:
     if not isinstance(payload, dict):
         raise ValueError(f"{name} root must be an object")
     return payload, raw
+
+
+def _load_production_seed_evidence(
+    path: Path,
+    expected_sha256: str,
+) -> tuple[Path, dict[str, Any]]:
+    if not isinstance(expected_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ) is None:
+        raise ValueError(
+            "production seed evidence expected SHA-256 must be 64 lowercase hex"
+        )
+    requested = Path(path).expanduser()
+    if requested.is_symlink():
+        raise ValueError(
+            f"production seed evidence must not be a symlink: {requested}"
+        )
+    source = requested.resolve()
+    if not source.is_file() or source.is_symlink():
+        raise FileNotFoundError(
+            f"production seed evidence is not a regular file: {source}"
+        )
+    raw = source.read_bytes()
+    observed_sha256 = _sha256_bytes(raw)
+    if observed_sha256 != expected_sha256:
+        raise ValueError(
+            "production seed evidence SHA-256 mismatch: "
+            f"expected {expected_sha256}, observed {observed_sha256}"
+        )
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("production seed evidence root must be an object")
+    return source, payload
 
 
 def _mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -171,7 +212,13 @@ def _catalog_payload(
     song: str,
     manifest_path: Path,
     manifest_file_sha256: str,
+    production_seed_evidence_path: Path | None = None,
+    production_seed_evidence_file_sha256: str | None = None,
 ) -> dict[str, Any]:
+    if (production_seed_evidence_path is None) != (
+        production_seed_evidence_file_sha256 is None
+    ):
+        raise ValueError("production seed evidence path/hash must be paired")
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "analysis": CATALOG_ANALYSIS_BASIS,
@@ -186,6 +233,12 @@ def _catalog_payload(
             "content_sha256": None,
         },
     }
+    if production_seed_evidence_path is not None:
+        assert production_seed_evidence_file_sha256 is not None
+        payload["provenance"]["production_seed_evidence"] = {
+            "path": str(production_seed_evidence_path),
+            "file_sha256": production_seed_evidence_file_sha256,
+        }
     payload["provenance"]["content_sha256"] = _catalog_content_sha256(payload)
     return payload
 
@@ -198,6 +251,8 @@ def _validate_catalog_payload(
     training_manifest_file_sha256: str,
     artist: str,
     song: str,
+    production_seed_evidence_path: Path | None = None,
+    production_seed_evidence_file_sha256: str | None = None,
 ) -> tuple[Mapping[str, Any], ...]:
     source_ids = validate_reference_training_source_manifest(
         training_manifest,
@@ -226,6 +281,23 @@ def _validate_catalog_payload(
         or provenance.get("content_sha256") != _catalog_content_sha256(payload)
     ):
         raise ValueError("synchronized source catalog provenance/hash mismatch")
+    observed_seed_binding = provenance.get("production_seed_evidence")
+    if production_seed_evidence_path is None:
+        if production_seed_evidence_file_sha256 is not None:
+            raise ValueError("production seed evidence path/hash must be paired")
+        if observed_seed_binding is not None:
+            raise ValueError("source catalog unexpectedly binds production seed evidence")
+    else:
+        if production_seed_evidence_file_sha256 is None:
+            raise ValueError("production seed evidence path/hash must be paired")
+        expected_seed_binding = {
+            "path": str(production_seed_evidence_path),
+            "file_sha256": production_seed_evidence_file_sha256,
+        }
+        if _canonical_json_bytes(observed_seed_binding) != _canonical_json_bytes(
+            expected_seed_binding
+        ):
+            raise ValueError("source catalog production seed evidence binding mismatch")
     selected = _array(training_manifest.get("selected"), "manifest selected")
     sources = _array(payload.get("sources"), "catalog sources")
     if len(sources) != len(selected):
@@ -319,6 +391,229 @@ def _validate_seed_evidence(
         raise ValueError("seed evidence must remain unaugmented")
 
 
+def _finite_number(value: object, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be finite")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _validate_production_seed_evidence(
+    payload: Mapping[str, Any],
+    *,
+    reference: Mapping[str, Any],
+    reference_clock: Mapping[str, Any],
+    training_manifest: Mapping[str, Any],
+    acquisition_path: Path,
+    artist: str,
+    song: str,
+    master_duration_seconds: float,
+) -> tuple[Mapping[str, Any], ...]:
+    """Bind reusable production clocks to the current trusted input graph."""
+
+    pool = _mapping(
+        training_manifest.get("reference_training_source_pool"),
+        "training source pool",
+    )
+    production_ids = tuple(
+        str(value)
+        for value in _array(
+            pool.get("production_selected_source_ids"),
+            "production source ids",
+        )
+    )
+    selected = tuple(
+        _mapping(value, f"training source {index}")
+        for index, value in enumerate(
+            _array(training_manifest.get("selected"), "manifest selected")
+        )
+    )
+    selected_by_id = {
+        str(value.get("video_id") or ""): value for value in selected
+    }
+    if any(video_id not in selected_by_id for video_id in production_ids):
+        raise ValueError("production source ids are absent from training manifest")
+
+    current_acquisition_path = Path(acquisition_path).expanduser().resolve()
+    current_acquisition_sha256 = _sha256_file(current_acquisition_path)
+    acquisition_binding = _mapping(
+        pool.get("acquisition_manifest"), "training acquisition binding"
+    )
+    if (
+        Path(str(acquisition_binding.get("path") or "")).expanduser().resolve()
+        != current_acquisition_path
+        or acquisition_binding.get("file_sha256")
+        != current_acquisition_sha256
+    ):
+        raise ValueError("training manifest current acquisition binding mismatch")
+
+    expected_caller = {
+        "artist": artist,
+        "song": song,
+        "reference_video_id": str(reference.get("video_id") or ""),
+        "purpose": PRODUCTION_SEED_PURPOSE,
+        "acquisition_manifest": {
+            "path": str(current_acquisition_path),
+            "file_sha256": current_acquisition_sha256,
+        },
+        "production_source_ids": list(production_ids),
+        "production_render_admission_modified": False,
+    }
+    observed_sources = tuple(
+        _mapping(value, f"production seed source {index}")
+        for index, value in enumerate(
+            _array(payload.get("sources"), "production seed sources")
+        )
+    )
+    _validate_seed_evidence(
+        payload,
+        reference=reference,
+        reference_clock=reference_clock,
+        sources=observed_sources,
+        caller=expected_caller,
+    )
+    observed_ids = tuple(
+        str(source.get("video_id") or "") for source in observed_sources
+    )
+    if observed_ids != production_ids:
+        raise ValueError("production seed source order differs from current production")
+
+    statistics = _mapping(payload.get("statistics"), "seed statistics")
+    if statistics.get("source_count") != len(production_ids):
+        raise ValueError("production seed source-count statistic mismatch")
+    reference_path = Path(str(reference.get("media_path") or "")).resolve()
+    reference_video = _mapping(
+        payload.get("reference_video"), "production seed reference video"
+    )
+    if Path(str(reference_video.get("path") or "")).resolve() != reference_path:
+        raise ValueError("production seed reference-video path mismatch")
+
+    master_duration = _finite_number(
+        master_duration_seconds, "production seed master duration"
+    )
+    if master_duration <= 0.0:
+        raise ValueError("production seed master duration must be positive")
+    master_start = _finite_number(
+        payload.get("master_start_seconds"), "production seed master start"
+    )
+    master_end = _finite_number(
+        payload.get("master_end_seconds"), "production seed master end"
+    )
+    if not math.isclose(master_start, 0.0, abs_tol=1e-9) or master_end <= master_start:
+        raise ValueError("production seed master range is invalid")
+    clock_policy = _mapping(payload.get("clock_policy"), "seed clock policy")
+    policy_start = _finite_number(
+        clock_policy.get("master_start_seconds"), "seed clock-policy master start"
+    )
+    policy_end = _finite_number(
+        clock_policy.get("master_end_seconds"), "seed clock-policy master end"
+    )
+    attribution_end = _finite_number(
+        clock_policy.get("attribution_sample_master_end_seconds"),
+        "seed attribution master end",
+    )
+    if (
+        not math.isclose(policy_start, master_start, abs_tol=1e-9)
+        or not math.isclose(policy_end, master_end, abs_tol=1e-9)
+        or not math.isclose(attribution_end, master_duration, abs_tol=1e-6)
+    ):
+        raise ValueError("production seed master clock policy mismatch")
+    reference_duration = _finite_number(
+        reference.get("decoded_audio_duration_seconds"),
+        "production seed reference duration",
+    )
+    reference_clock_model = ReferenceSourceClock.from_mapping(reference_clock)
+    expected_reference_end = reference_clock_model.source_to_master(
+        reference_duration
+    )
+    if abs(master_end - expected_reference_end) > max(
+        0.25, reference_duration * 0.002
+    ):
+        raise ValueError("production seed reference duration/clock mismatch")
+
+    normalized: list[Mapping[str, Any]] = []
+    for index, (video_id, source) in enumerate(
+        zip(production_ids, observed_sources, strict=True)
+    ):
+        manifest_source = selected_by_id[video_id]
+        expected_path = Path(
+            str(manifest_source.get("local_path") or "")
+        ).expanduser().resolve()
+        if Path(str(source.get("path") or "")).expanduser().resolve() != expected_path:
+            raise ValueError(f"production seed source path mismatch: {video_id}")
+        integrity = _mapping(
+            manifest_source.get("content_integrity"),
+            f"training source integrity {video_id}",
+        )
+        provenance = _mapping(
+            source.get("provenance"), f"production seed provenance {video_id}"
+        )
+        if (
+            provenance.get("current_acquisition_selected") is not True
+            or provenance.get("content_sha256") != integrity.get("sha256")
+        ):
+            raise ValueError(
+                f"production seed source acquisition provenance mismatch: {video_id}"
+            )
+        probe = _mapping(
+            source.get("media_probe"), f"production seed media probe {video_id}"
+        )
+        if probe.get("size_bytes") != integrity.get("size_bytes"):
+            raise ValueError(f"production seed source media size mismatch: {video_id}")
+        frame_rate = _finite_number(
+            probe.get("frame_rate"), f"production seed frame rate {video_id}"
+        )
+        frame_count = probe.get("declared_frame_count")
+        if (
+            frame_rate <= 0.0
+            or isinstance(frame_count, bool)
+            or not isinstance(frame_count, int)
+            or frame_count <= 0
+        ):
+            raise ValueError(f"production seed media duration is invalid: {video_id}")
+        source_duration = frame_count / frame_rate
+
+        raw_clock = _mapping(
+            source.get("clock"), f"production seed clock {video_id}"
+        )
+        clock = ReferenceSourceClock.from_mapping(raw_clock)
+        if _canonical_json_bytes(clock.to_dict()) != _canonical_json_bytes(raw_clock):
+            raise ValueError(f"production seed clock is not canonical: {video_id}")
+        if index == 0 and (
+            clock.mapping_mode != "scalar_offset"
+            or not math.isclose(clock.global_offset_seconds, 0.0, abs_tol=1e-9)
+        ):
+            raise ValueError("production seed master-source clock is not identity")
+        mapped_start = clock.master_to_source(0.0)
+        mapped_end = clock.master_to_source(master_duration)
+        mapped_span = mapped_end - mapped_start
+        if not (
+            master_duration * MINIMUM_PRODUCTION_SEED_CLOCK_SPAN_RATIO
+            <= mapped_span
+            <= master_duration * MAXIMUM_PRODUCTION_SEED_CLOCK_SPAN_RATIO
+        ):
+            raise ValueError(
+                f"production seed clock span is implausible: {video_id}"
+            )
+        overlap = max(
+            0.0,
+            min(mapped_end, source_duration) - max(mapped_start, 0.0),
+        )
+        if overlap < (
+            master_duration * MINIMUM_PRODUCTION_SEED_CLOCK_OVERLAP_FRACTION
+        ):
+            raise ValueError(
+                f"production seed clock has insufficient media overlap: {video_id}"
+            )
+        normalized.append(source)
+    return tuple(normalized)
+
+
 def _planned_paths(
     output_directory: Path,
     *,
@@ -358,6 +653,10 @@ def run_reference_training_bootstrap(
     expected_reference_count: int = DEFAULT_EXPECTED_REFERENCE_COUNT,
     expected_source_count: int = DEFAULT_EXPECTED_SOURCE_COUNT,
     additional_source_ids: Sequence[str] = (),
+    supplemental_training_manifest_path: Path | None = None,
+    supplemental_source_ids: Sequence[str] = (),
+    production_seed_evidence_path: Path | None = None,
+    production_seed_evidence_sha256: str | None = None,
     seed_reference_id: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -373,6 +672,24 @@ def run_reference_training_bootstrap(
     profile_path = Path(cadence_profile_path).expanduser().resolve()
     acquisition_path = Path(acquisition_manifest_path).expanduser().resolve()
     output = Path(output_directory).expanduser().resolve()
+    if (production_seed_evidence_path is None) != (
+        production_seed_evidence_sha256 is None
+    ):
+        raise ValueError(
+            "production seed evidence path/expected SHA-256 must be paired"
+        )
+    production_seed_path: Path | None = None
+    production_seed_payload: dict[str, Any] | None = None
+    production_seed_file_sha256: str | None = None
+    if production_seed_evidence_path is not None:
+        assert production_seed_evidence_sha256 is not None
+        production_seed_path, production_seed_payload = (
+            _load_production_seed_evidence(
+                production_seed_evidence_path,
+                production_seed_evidence_sha256,
+            )
+        )
+        production_seed_file_sha256 = production_seed_evidence_sha256
     profile = ProfessionalReferenceCadenceProfile.from_file(
         profile_path,
         verify_input_hashes=False,
@@ -402,6 +719,8 @@ def run_reference_training_bootstrap(
         expected_artist=expected_artist,
         expected_song=expected_song,
         expected_source_count=expected_source_count,
+        supplemental_training_manifest_path=supplemental_training_manifest_path,
+        supplemental_source_ids=supplemental_source_ids,
     )
     source_ids = validate_reference_training_source_manifest(
         training_manifest,
@@ -417,6 +736,28 @@ def run_reference_training_bootstrap(
         profile.master_media_sha256
     ):
         raise ValueError("cadence master hash differs from training source manifest")
+    raw_reference_clock = _mapping(
+        chosen_reference.get("local_timewarp"), "seed reference local_timewarp"
+    )
+    if raw_reference_clock.get("scalar_fallback") is not False:
+        raise ValueError("seed reference used a forbidden scalar-fallback clock")
+    reference_clock = ReferenceSourceClock.from_mapping(raw_reference_clock).to_dict()
+    master = _mapping(
+        _mapping(profile_payload.get("provenance"), "profile provenance").get("master"),
+        "profile master",
+    )
+    master_end_seconds = float(master.get("decoded_audio_duration_seconds"))
+    if production_seed_payload is not None:
+        _validate_production_seed_evidence(
+            production_seed_payload,
+            reference=chosen_reference,
+            reference_clock=reference_clock,
+            training_manifest=training_manifest,
+            acquisition_path=acquisition_path,
+            artist=expected_artist,
+            song=expected_song,
+            master_duration_seconds=master_end_seconds,
+        )
 
     plan = {
         name: {
@@ -445,6 +786,12 @@ def run_reference_training_bootstrap(
         "artifacts": plan,
         "writes_performed": False,
     }
+    if production_seed_path is not None:
+        assert production_seed_file_sha256 is not None
+        base_result["production_seed_evidence"] = {
+            "path": str(production_seed_path),
+            "file_sha256": production_seed_file_sha256,
+        }
     if dry_run:
         base_result["status"] = "ready"
         return base_result
@@ -468,21 +815,37 @@ def run_reference_training_bootstrap(
             training_manifest_file_sha256=manifest_file_sha256,
             artist=expected_artist,
             song=expected_song,
+            production_seed_evidence_path=production_seed_path,
+            production_seed_evidence_file_sha256=(
+                production_seed_file_sha256
+            ),
         )
         catalog_action = "validated_existing"
         catalog_file_sha256 = _sha256_bytes(catalog_raw)
     else:
-        sources = build_synchronized_training_source_catalog_from_manifest(
-            training_manifest,
-            expected_artist=expected_artist,
-            expected_song=expected_song,
-        )
+        if production_seed_payload is not None:
+            sources = build_synchronized_training_source_catalog(
+                production_seed_payload,
+                training_manifest,
+                expected_artist=expected_artist,
+                expected_song=expected_song,
+            )
+        else:
+            sources = build_synchronized_training_source_catalog_from_manifest(
+                training_manifest,
+                expected_artist=expected_artist,
+                expected_song=expected_song,
+            )
         catalog = _catalog_payload(
             sources,
             artist=expected_artist,
             song=expected_song,
             manifest_path=paths["manifest"],
             manifest_file_sha256=manifest_file_sha256,
+            production_seed_evidence_path=production_seed_path,
+            production_seed_evidence_file_sha256=(
+                production_seed_file_sha256
+            ),
         )
         catalog_action, catalog_file_sha256 = _publish_json_no_replace(
             paths["catalog"], catalog
@@ -496,17 +859,6 @@ def run_reference_training_bootstrap(
         raise ValueError("seed reference media SHA-256 mismatch")
     if _sha256_file(audit_path) != chosen_reference.get("audit_sha256"):
         raise ValueError("seed reference audit SHA-256 mismatch")
-    raw_reference_clock = _mapping(
-        chosen_reference.get("local_timewarp"), "seed reference local_timewarp"
-    )
-    if raw_reference_clock.get("scalar_fallback") is not False:
-        raise ValueError("seed reference used a forbidden scalar-fallback clock")
-    reference_clock = ReferenceSourceClock.from_mapping(raw_reference_clock).to_dict()
-    master = _mapping(
-        _mapping(profile_payload.get("provenance"), "profile provenance").get("master"),
-        "profile master",
-    )
-    master_end_seconds = float(master.get("decoded_audio_duration_seconds"))
     caller = {
         "artist": expected_artist,
         "song": expected_song,
@@ -698,6 +1050,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EXPECTED_SOURCE_COUNT,
     )
     parser.add_argument("--additional-source-id", action="append", default=[])
+    parser.add_argument("--supplemental-training-manifest", type=Path)
+    parser.add_argument("--supplemental-source-id", action="append", default=[])
+    parser.add_argument("--production-seed-evidence", type=Path)
+    parser.add_argument("--production-seed-evidence-sha256")
     parser.add_argument("--seed-reference-id")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -715,6 +1071,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_reference_count=args.expected_reference_count,
         expected_source_count=args.expected_source_count,
         additional_source_ids=tuple(args.additional_source_id),
+        supplemental_training_manifest_path=args.supplemental_training_manifest,
+        supplemental_source_ids=tuple(args.supplemental_source_id),
+        production_seed_evidence_path=args.production_seed_evidence,
+        production_seed_evidence_sha256=(
+            args.production_seed_evidence_sha256
+        ),
         seed_reference_id=args.seed_reference_id,
         dry_run=args.dry_run,
     )
