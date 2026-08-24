@@ -6,6 +6,10 @@ import unittest
 
 from crosscut.ive import AspectRatio
 from crosscut.render import (
+    BoundaryLookKeyframe,
+    BoundaryLookTrack,
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
     NormalizedCrop,
     PanCropKeyframe,
     PanCropTrack,
@@ -13,10 +17,12 @@ from crosscut.render import (
     RenderPlan,
     RenderSegment,
     RenderTransition,
+    SourceLookAdjustment,
     TransitionKind,
     aligned_render_segment,
     build_filter_graph,
     output_size,
+    minimum_roll_safe_zoom,
     segment_frame_counts,
 )
 
@@ -49,6 +55,199 @@ class RenderTests(unittest.TestCase):
         self.assertIn("setsar=1", graph)
         self.assertIn("concat=n=2", graph)
 
+    def test_bounded_source_look_filters_run_before_geometry_without_retiming(self) -> None:
+        adjustment = SourceLookAdjustment(
+            brightness=0.02,
+            contrast=1.04,
+            saturation=0.96,
+            temperature_balance=0.015,
+        )
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    crop=NormalizedCrop(0.1, 0.1, 0.8, 0.8),
+                    look_adjustment=adjustment,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+        )
+
+        graph = build_filter_graph(plan)
+
+        eq = "eq=brightness=0.020000:contrast=1.040000:saturation=0.960000"
+        balance = (
+            "colorbalance=rs=0.015000:rm=0.015000:rh=0.015000:"
+            "bs=-0.015000:bm=-0.015000:bh=-0.015000:pl=1"
+        )
+        self.assertIn(eq, graph)
+        self.assertIn(balance, graph)
+        self.assertLess(graph.index(eq), graph.index("crop="))
+        self.assertLess(graph.index(balance), graph.index("crop="))
+        self.assertEqual(plan.output_frame_count, 30)
+        payload = plan.to_json()["segments"][0]  # type: ignore[index]
+        self.assertEqual(
+            payload["look_adjustment"],
+            {
+                "brightness": 0.02,
+                "contrast": 1.04,
+                "saturation": 0.96,
+                "temperature_balance": 0.015,
+            },
+        )
+
+    def test_identity_source_look_is_filter_free_and_contract_is_tightly_bounded(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    look_adjustment=SourceLookAdjustment(),
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+        )
+        graph = build_filter_graph(plan)
+        self.assertNotIn("eq=brightness", graph)
+        self.assertNotIn("colorbalance=", graph)
+        with self.assertRaisesRegex(ValueError, "brightness"):
+            SourceLookAdjustment(brightness=0.051)
+        with self.assertRaisesRegex(ValueError, "contrast"):
+            SourceLookAdjustment(contrast=1.061)
+        with self.assertRaisesRegex(ValueError, "saturation"):
+            SourceLookAdjustment(saturation=0.939)
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            SourceLookAdjustment(temperature_balance=0.031)
+        with self.assertRaisesRegex(TypeError, "look_adjustment"):
+            RenderSegment(
+                0,
+                0.0,
+                1.0,
+                0.0,
+                look_adjustment={"brightness": 0.01},  # type: ignore[arg-type]
+            )
+
+    def test_boundary_look_is_a_separate_post_global_smooth_eq_layer(self) -> None:
+        global_look = SourceLookAdjustment(brightness=0.01, saturation=0.98)
+        local_track = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(
+                    0.0,
+                    brightness=-0.025,
+                    saturation=1.04,
+                    temperature_balance=0.01,
+                ),
+                BoundaryLookKeyframe(0.2),
+                BoundaryLookKeyframe(0.9),
+            )
+        )
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    crop=NormalizedCrop(0.1, 0.1, 0.8, 0.8),
+                    look_adjustment=global_look,
+                    boundary_look_track=local_track,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+        )
+
+        graph = build_filter_graph(plan)
+
+        global_filter = (
+            "eq=brightness=0.010000:contrast=1.000000:saturation=0.980000"
+        )
+        self.assertIn(global_filter, graph)
+        self.assertIn(":eval=frame", graph)
+        self.assertIn("if(lt(t,0.2000000000)", graph)
+        self.assertIn("geq=lum='lum(X,Y)'", graph)
+        self.assertIn("cb='clip(cb(X,Y)-128*", graph)
+        self.assertIn("cr='clip(cr(X,Y)+128*", graph)
+        self.assertIn("if(lt(T,0.2000000000)", graph)
+        self.assertLess(graph.index(global_filter), graph.index(":eval=frame"))
+        self.assertLess(graph.index(":eval=frame"), graph.index("geq="))
+        self.assertLess(graph.index("geq="), graph.index("crop="))
+        payload = plan.to_json()["segments"][0]  # type: ignore[index]
+        self.assertEqual(
+            payload["boundary_look_track"]["reason"],
+            "boundary_local_post_global_look_residual",
+        )
+        self.assertEqual(
+            payload["boundary_look_track"]["keyframes"][0][
+                "temperature_balance"
+            ],
+            0.01,
+        )
+
+    def test_boundary_look_contract_rejects_unsafe_or_misplaced_tracks(self) -> None:
+        with self.assertRaisesRegex(ValueError, "brightness"):
+            BoundaryLookKeyframe(0.0, brightness=0.051)
+        with self.assertRaisesRegex(ValueError, "start"):
+            BoundaryLookTrack((BoundaryLookKeyframe(0.1, brightness=0.01),))
+        with self.assertRaisesRegex(ValueError, "inside the segment"):
+            RenderSegment(
+                0,
+                0.0,
+                0.5,
+                0.0,
+                boundary_look_track=BoundaryLookTrack(
+                    (
+                        BoundaryLookKeyframe(0.0),
+                        BoundaryLookKeyframe(0.6, brightness=0.01),
+                    )
+                ),
+            )
+
+    def test_dissolve_handle_reuses_the_same_static_source_look(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("zero.mp4"), Path("one.mp4")),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    0.5,
+                    0.0,
+                    look_adjustment=SourceLookAdjustment(brightness=0.01),
+                ),
+                RenderSegment(1, 0.5, 0.5, 0.5),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(TransitionKind.FACE_DISSOLVE, 3, "safe"),
+            ),
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertEqual(
+            graph.count("eq=brightness=0.010000:contrast=1.000000:saturation=1.000000"),
+            2,
+        )
+        self.assertEqual(plan.output_frame_count, 30)
+
     def test_global_frame_quantization_does_not_accumulate_per_cut_rounding(self) -> None:
         duration = 1.0 / 12.0
         segments = tuple(
@@ -72,6 +271,131 @@ class RenderTests(unittest.TestCase):
             build_filter_graph(plan),
         )
 
+    def test_identity_same_source_tier_d_and_native_boundaries_share_one_clock(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(0, 0.0, 0.4, 0.0),
+                RenderSegment(0, 0.4, 0.3, 0.4),
+                RenderSegment(0, 0.7, 0.5, 0.7),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="D", reason="same_source_hold_no_visible_switch"),
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertEqual(graph.count("[0:v]trim="), 1)
+        self.assertIn("trim=start=0.000000:duration=1.200000", graph)
+        self.assertIn("trim=end_frame=36", graph)
+        self.assertIn("[v0]null[vcat]", graph)
+        # Coalescing is a renderer implementation detail.  The authored
+        # boundaries remain available to QA and provenance.
+        self.assertEqual(len(plan.to_json()["transitions"]), 2)  # type: ignore[arg-type]
+
+    def test_same_source_coalescing_fails_closed_for_clock_or_geometry_change(self) -> None:
+        clock_gap = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(0, 0.0, 0.5, 0.0),
+                RenderSegment(0, 0.501, 0.5, 0.5),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("clock-gap.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
+        geometry_change = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(0, 0.0, 0.5, 0.0),
+                RenderSegment(
+                    0,
+                    0.5,
+                    0.5,
+                    0.5,
+                    crop=NormalizedCrop(0.1, 0.0, 0.8, 1.0),
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("geometry-change.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
+
+        self.assertEqual(build_filter_graph(clock_gap).count("[0:v]trim="), 2)
+        self.assertEqual(build_filter_graph(geometry_change).count("[0:v]trim="), 2)
+
+    def test_cross_cut_look_ramps_merge_with_adjacent_same_source_clocks(self) -> None:
+        last_frame = 5.0 / 30.0
+        outgoing = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(0.0),
+                BoundaryLookKeyframe(last_frame, brightness=0.02),
+            )
+        )
+        incoming = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(0.0, brightness=-0.02),
+                BoundaryLookKeyframe(last_frame),
+            )
+        )
+        plan = RenderPlan(
+            sources=(Path("a.mp4"), Path("b.mp4")),
+            segments=(
+                RenderSegment(0, 0.0, 0.2, 0.0),
+                RenderSegment(0, 0.2, 0.2, 0.2),
+                RenderSegment(
+                    0,
+                    0.4,
+                    0.2,
+                    0.4,
+                    boundary_look_track=outgoing,
+                ),
+                RenderSegment(
+                    1,
+                    0.6,
+                    0.2,
+                    0.6,
+                    boundary_look_track=incoming,
+                ),
+                RenderSegment(1, 0.8, 0.2, 0.8),
+                RenderSegment(1, 1.0, 0.2, 1.0),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("look-ramp.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="D", reason="same_source_hold_no_visible_switch"),
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+                RenderTransition(tier="C", reason="introduced_cross_source"),
+                RenderTransition(tier="D", reason="same_source_hold_no_visible_switch"),
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertEqual(graph.count("[0:v]trim="), 1)
+        self.assertEqual(graph.count("[1:v]trim="), 1)
+        self.assertIn("if(lt(t,0.4000000000)", graph)
+        self.assertIn("if(lt(t,0.5666666667)", graph)
+        self.assertIn("if(lt(t,0.1666666667)", graph)
+        self.assertEqual(len(plan.transitions), 5)
+
     def test_mixed_dissolve_runs_extend_outgoing_handles_then_concat(self) -> None:
         segments = tuple(
             RenderSegment(index, index * 0.5, 0.5, index * 0.5)
@@ -94,8 +418,15 @@ class RenderTests(unittest.TestCase):
         graph = build_filter_graph(plan)
 
         self.assertEqual(plan.output_frame_count, 60)
-        self.assertIn("[v0][v1]xfade=transition=fade:duration=0.366666667:offset=0.500000000,format=yuv420p[vx0]", graph)
-        self.assertIn("[v2][v3]xfade=transition=fade:duration=0.366666667:offset=0.500000000,format=yuv420p[vx1]", graph)
+        self.assertIn("[v0][v1]xfade=transition=custom:", graph)
+        self.assertIn("[v2][v3]xfade=transition=custom:", graph)
+        self.assertEqual(graph.count("exp(-12*(P-0.5))"), 4)
+        self.assertIn("duration=0.366666667:offset=0.500000000,format=yuv420p[vx0]", graph)
+        self.assertIn("duration=0.366666667:offset=0.500000000,format=yuv420p[vx1]", graph)
+        self.assertEqual(
+            plan.to_json()["transitions"][0]["alpha_curve"],  # type: ignore[index]
+            "normalized_logistic_sigmoid_k12_v1",
+        )
         self.assertIn("[vx0][vx1]concat=n=2:v=1:a=0[vcat]", graph)
         # Nominal shots retain their own quantization; only outgoing shots get
         # a separately-seeked 11-frame canonical-time handle.
@@ -125,6 +456,12 @@ class RenderTests(unittest.TestCase):
                 "sources[]": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
                 "reference_source": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
                 "segments[].source_index": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
+                "source_usage.used_source_indices[]": (
+                    RENDER_PLAN_SOURCE_INDEX_DOMAIN
+                ),
+                "source_usage.sources[].source_index": (
+                    RENDER_PLAN_SOURCE_INDEX_DOMAIN
+                ),
             },
         )
 
@@ -140,6 +477,48 @@ class RenderTests(unittest.TestCase):
                     RenderTransition(TransitionKind.FACE_DISSOLVE, 16, "unsafe"),
                 ),
             )
+
+    def test_plan_serializes_exact_local_endpoints_and_actual_source_usage(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("zero.mp4"), Path("one.mp4"), Path("two.mp4")),
+            segments=(
+                RenderSegment(
+                    source_index=0,
+                    source_start=1.0,
+                    duration=2.0,
+                    master_start=0.0,
+                    source_duration=2.008,
+                ),
+                RenderSegment(
+                    source_index=2,
+                    source_start=4.0,
+                    duration=3.0,
+                    master_start=2.0,
+                    source_duration=2.988,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+        )
+
+        payload = plan.to_json()
+        self.assertAlmostEqual(payload["segments"][0]["source_local_start"], 1.0)  # type: ignore[index]
+        self.assertAlmostEqual(payload["segments"][0]["source_local_end"], 3.008)  # type: ignore[index]
+        self.assertAlmostEqual(payload["segments"][1]["source_local_end"], 6.988)  # type: ignore[index]
+        usage = payload["source_usage"]  # type: ignore[assignment]
+        self.assertEqual(usage["distinct_source_count"], 2)  # type: ignore[index]
+        self.assertEqual(usage["used_source_indices"], [0, 2])  # type: ignore[index]
+        self.assertEqual(usage["total_segment_count"], 2)  # type: ignore[index]
+        self.assertAlmostEqual(usage["total_duration_seconds"], 5.0)  # type: ignore[index]
+        self.assertEqual(
+            [item["segment_count"] for item in usage["sources"]],  # type: ignore[index]
+            [1, 0, 1],
+        )
+        self.assertEqual(
+            [item["duration_seconds"] for item in usage["sources"]],  # type: ignore[index]
+            [2.0, 0.0, 3.0],
+        )
 
     def test_consecutive_dissolves_form_one_duration_neutral_xfade_chain(self) -> None:
         plan = RenderPlan(
@@ -237,6 +616,214 @@ class RenderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "inside the segment"):
             RenderSegment(0, 0.0, 1.0, 0.0, pan_crop=track)
+
+    def test_group_transform_emits_dynamic_zoom_pan_and_corner_safe_roll(self) -> None:
+        roll_zoom = minimum_roll_safe_zoom(1.0)
+        track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, roll_zoom, 0.50, 0.50, -1.0),
+                EditorialTransformKeyframe(0.5, 1.10, 0.50, 0.50, 0.0),
+                EditorialTransformKeyframe(1.0, 1.16, 0.52, 0.48, 1.0),
+            ),
+            reason="matched_subject_scale_with_phrase_push",
+        )
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(0, 0.0, 1.0, 0.0, editorial_transform=track),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertIn("fps=30.000000,rotate=angle=", graph)
+        self.assertIn("zoompan=z=", graph)
+        self.assertIn("on/30.0000000000", graph)
+        self.assertIn("d=1:s=1920x1080:fps=30.000000", graph)
+        payload = plan.to_json()["segments"][0]  # type: ignore[index]
+        self.assertEqual(
+            payload["editorial_transform"]["reason"],  # type: ignore[index]
+            "matched_subject_scale_with_phrase_push",
+        )
+
+    def test_group_transform_endpoint_tolerance_never_extrapolates_bounds(self) -> None:
+        fps = 29.97
+        exact_output_frame_time = 22.0 / fps
+        track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.065),
+                EditorialTransformKeyframe(
+                    exact_output_frame_time - 1.5e-15,
+                    1.0,
+                ),
+            )
+        )
+
+        endpoint = track.evaluate(exact_output_frame_time)
+
+        self.assertEqual(endpoint.time_seconds, exact_output_frame_time)
+        self.assertEqual(endpoint.zoom, 1.0)
+        self.assertEqual(endpoint.center_x, 0.5)
+        self.assertEqual(endpoint.center_y, 0.5)
+        self.assertEqual(endpoint.roll_degrees, 0.0)
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    23.0 / fps,
+                    0.0,
+                    editorial_transform=track,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=fps,
+        )
+        self.assertIs(plan.segments[0].editorial_transform, track)
+
+    def test_group_transform_rejects_black_corner_roll_and_mixed_crop_modes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "frame edges"):
+            EditorialTransformKeyframe(0.0, 1.0, roll_degrees=1.0)
+        track = EditorialTransformTrack((EditorialTransformKeyframe(0.0, 1.05),))
+        with self.assertRaisesRegex(ValueError, "both static and panning"):
+            RenderSegment(
+                0,
+                0.0,
+                1.0,
+                0.0,
+                crop=NormalizedCrop(0.0, 0.0, 0.9, 0.9),
+                pan_crop=PanCropTrack(
+                    (PanCropKeyframe(0.0, NormalizedCrop(0.0, 0.0, 0.9, 0.9)),)
+                ),
+                editorial_transform=track,
+            )
+        with self.assertRaisesRegex(ValueError, "inside the segment"):
+            RenderSegment(
+                0,
+                0.0,
+                0.5,
+                0.0,
+                editorial_transform=EditorialTransformTrack(
+                    (
+                        EditorialTransformKeyframe(0.0, 1.05),
+                        EditorialTransformKeyframe(1.0, 1.10),
+                    )
+                ),
+            )
+
+    def test_unreviewed_editorial_transform_is_forbidden_next_to_dissolve(self) -> None:
+        track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0),
+                EditorialTransformKeyframe(0.5, 1.06),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "unreviewed editorial"):
+            RenderPlan(
+                sources=(Path("zero.mp4"), Path("one.mp4")),
+                segments=(
+                    RenderSegment(0, 0.0, 0.5, 0.0, editorial_transform=track),
+                    RenderSegment(1, 0.5, 0.5, 0.5),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(
+                    RenderTransition(
+                        TransitionKind.FACE_DISSOLVE,
+                        11,
+                        "safe_without_transform",
+                        tier="A",
+                    ),
+                ),
+            )
+
+    def test_tier_d_same_source_hold_rejects_editorial_camera_reset(self) -> None:
+        transformed = EditorialTransformTrack(
+            (EditorialTransformKeyframe(0.0, 1.10),),
+            reason="constant_reframe",
+        )
+        with self.assertRaisesRegex(ValueError, "same-source hold"):
+            RenderPlan(
+                sources=(Path("one.mp4"),),
+                segments=(
+                    RenderSegment(
+                        0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        editorial_transform=transformed,
+                    ),
+                    RenderSegment(0, 1.0, 1.0, 1.0),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(RenderTransition(tier="D", reason="same shot"),),
+            )
+
+        with self.assertRaisesRegex(ValueError, "same source"):
+            RenderPlan(
+                sources=(Path("one.mp4"), Path("two.mp4")),
+                segments=(
+                    RenderSegment(0, 0.0, 1.0, 0.0),
+                    RenderSegment(1, 1.0, 1.0, 1.0),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(RenderTransition(tier="D", reason="invalid hold"),),
+            )
+        with self.assertRaisesRegex(ValueError, "one of A"):
+            RenderTransition(tier="X", reason="invalid tier")
+        with self.assertRaisesRegex(ValueError, "contiguous source clock"):
+            RenderPlan(
+                sources=(Path("one.mp4"),),
+                segments=(
+                    RenderSegment(0, 0.0, 1.0, 0.0),
+                    RenderSegment(0, 10.0, 1.0, 1.0),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(RenderTransition(tier="D", reason="clock jump"),),
+            )
+        with self.assertRaisesRegex(ValueError, "base crop"):
+            RenderPlan(
+                sources=(Path("one.mp4"),),
+                segments=(
+                    RenderSegment(
+                        0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        crop=NormalizedCrop(0.0, 0.0, 0.8, 0.8),
+                    ),
+                    RenderSegment(
+                        0,
+                        1.0,
+                        1.0,
+                        1.0,
+                        crop=NormalizedCrop(0.2, 0.2, 0.8, 0.8),
+                    ),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(RenderTransition(tier="D", reason="crop reset"),),
+            )
 
     def test_dense_pan_crop_is_simplified_below_ffmpeg_parser_limit(self) -> None:
         keyframes = tuple(

@@ -164,6 +164,12 @@ class AnchoredTrackingTests(unittest.TestCase):
             ],
         )
         self.assertIs(result.terminal_failure, TrackingFailure.BACKEND_UPDATE)
+        self.assertAlmostEqual(result.terminal_failure_time_seconds, 1.0 / 30.0)
+        self.assertIsNone(result.crop_failure_for_interval(0.0, 1.0 / 30.0))
+        self.assertIs(
+            result.crop_failure_for_interval(1.0 / 30.0, 1.0),
+            TrackingFailure.BACKEND_UPDATE,
+        )
         self.assertEqual(backend.update_calls, 1)
         self.assertEqual(
             [item.frame_index for item in result.to_dynamic_crop_keyframes()], [0]
@@ -201,7 +207,15 @@ class AnchoredTrackingTests(unittest.TestCase):
             [TrackingState.TRACKED, TrackingState.LOST, TrackingState.LOST],
         )
         self.assertIs(result.terminal_failure, TrackingFailure.SCENE_CHANGE)
+        self.assertAlmostEqual(result.terminal_failure_time_seconds, 1.0 / 30.0)
+        self.assertIs(
+            result.crop_failure_for_interval(0.0, 0.5),
+            TrackingFailure.SCENE_CHANGE,
+        )
         self.assertEqual(backend.update_calls, 0)
+
+        with self.assertRaisesRegex(ValueError, "source interval"):
+            result.crop_failure_for_interval(0.5, 0.5)
 
     def test_large_jump_fails_confidence_gate_and_cannot_switch_members(self) -> None:
         wrong_member_box = (0.70, 0.20, 0.90, 0.80)

@@ -12,7 +12,7 @@ gradient-structure fallback.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import math
 from pathlib import Path
@@ -120,6 +120,8 @@ class SubjectGeometryDescriptor:
     pose_embedding: tuple[float, ...] = ()
     pose_confidence: float = 0.0
     detected_person_count: int = 0
+    person_layout_embedding: tuple[float, ...] = ()
+    formation_people: tuple["FormationPersonDescriptor", ...] = ()
     pose_backend: str = "none"
     silhouette_embedding: tuple[float, ...] = ()
     silhouette_bbox_xywh: tuple[float, float, float, float] | None = None
@@ -133,6 +135,12 @@ class SubjectGeometryDescriptor:
             "pose_backend": self.pose_backend,
             "pose_confidence": self.pose_confidence,
             "detected_person_count": self.detected_person_count,
+            "person_layout_available": bool(self.person_layout_embedding),
+            "formation_person_count": len(self.formation_people),
+            "formation_upper_body_count": sum(
+                bool(person.upper_body_keypoints_xyc)
+                for person in self.formation_people
+            ),
             "pose_available": bool(self.pose_embedding),
             "silhouette_backend": self.silhouette_backend,
             "silhouette_confidence": self.silhouette_confidence,
@@ -149,6 +157,66 @@ class SubjectGeometryDescriptor:
             "silhouette_area_ratio": self.silhouette_area_ratio,
             "silhouette_available": bool(self.silhouette_embedding),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FormationPersonDescriptor:
+    """Non-identifying screen-space geometry for one detected performer.
+
+    Descriptors are ordered left-to-right by the caller.  The optional upper
+    body vector contains only shoulders, elbows, wrists, and hips normalized
+    around the torso; it deliberately excludes face landmarks and appearance
+    features.  This lets the timeline compare choreography without persisting
+    identity evidence.
+    """
+
+    bbox_xywh: tuple[float, float, float, float]
+    centroid_xy: tuple[float, float]
+    detection_confidence: float
+    upper_body_keypoints_xyc: tuple[tuple[float, float, float], ...] = field(
+        default=(), repr=False
+    )
+
+    def __post_init__(self) -> None:
+        left, top, width, height = self.bbox_xywh
+        if any(not math.isfinite(float(value)) for value in self.bbox_xywh):
+            raise ValueError("formation bbox values must be finite")
+        if (
+            left < 0.0
+            or top < 0.0
+            or width <= 0.0
+            or height <= 0.0
+            or left + width > 1.000001
+            or top + height > 1.000001
+        ):
+            raise ValueError("formation bbox must fit normalized image bounds")
+        if len(self.centroid_xy) != 2 or any(
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+            for value in self.centroid_xy
+        ):
+            raise ValueError("formation centroid must contain two unit values")
+        if (
+            not math.isfinite(float(self.detection_confidence))
+            or not 0.0 <= float(self.detection_confidence) <= 1.0
+        ):
+            raise ValueError("formation detection confidence must be normalized")
+        if self.upper_body_keypoints_xyc and len(
+            self.upper_body_keypoints_xyc
+        ) != len(_FORMATION_UPPER_BODY_JOINTS):
+            raise ValueError("formation upper-body descriptor has an invalid size")
+        for point in self.upper_body_keypoints_xyc:
+            if len(point) != 3:
+                raise ValueError("formation upper-body points require x/y/confidence")
+            x, y, confidence = point
+            if (
+                not math.isfinite(float(x))
+                or not math.isfinite(float(y))
+                or not math.isfinite(float(confidence))
+                or not -1.0 <= float(x) <= 1.0
+                or not -1.0 <= float(y) <= 1.0
+                or not 0.0 <= float(confidence) <= 1.0
+            ):
+                raise ValueError("formation upper-body values are outside bounds")
 
 
 def _pose_detector_anchors() -> np.ndarray:
@@ -245,6 +313,14 @@ class _MediaPipePersonDetector:
 class _PoseObservation:
     screen_landmarks: np.ndarray
     world_landmarks: np.ndarray
+    confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class PersonDetection:
+    """One normalized full-person candidate from the bundled detector."""
+
+    bbox_xyxy: tuple[float, float, float, float]
     confidence: float
 
 
@@ -370,6 +446,8 @@ class _PPHumanSegmenter:
 
 
 _POSE_JOINTS = (0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 31, 32)
+_FORMATION_UPPER_BODY_JOINTS = (11, 12, 13, 14, 15, 16, 23, 24)
+_MAXIMUM_FORMATION_PEOPLE = 6
 
 
 def _pose_embedding(observation: _PoseObservation) -> tuple[tuple[float, ...], float]:
@@ -399,6 +477,42 @@ def _pose_embedding(observation: _PoseObservation) -> tuple[tuple[float, ...], f
         values.append(joint_confidence)
     reliability_score = float(np.mean([reliability[index] for index in _POSE_JOINTS]))
     return tuple(values), _unit(observation.confidence * reliability_score)
+
+
+def _upper_body_shape(
+    observation: _PoseObservation,
+) -> tuple[tuple[float, float, float], ...]:
+    """Return a torso-normalized, non-facial upper-body skeleton."""
+
+    screen = observation.screen_landmarks
+    reliability = np.sqrt(np.clip(screen[:, 3], 0, 1) * np.clip(screen[:, 4], 0, 1))
+    shoulders = (11, 12)
+    hips = (23, 24)
+    if min(reliability[index] for index in (*shoulders, *hips)) < 0.28:
+        return ()
+    shoulder_center = (screen[11, :2] + screen[12, :2]) / 2.0
+    hip_center = (screen[23, :2] + screen[24, :2]) / 2.0
+    torso_center = (shoulder_center + hip_center) / 2.0
+    torso_height = float(np.linalg.norm(shoulder_center - hip_center))
+    shoulder_width = float(np.linalg.norm(screen[11, :2] - screen[12, :2]))
+    scale = max(torso_height * 1.65, shoulder_width, 1.0)
+    visible_count = sum(
+        reliability[index] >= 0.35 for index in _FORMATION_UPPER_BODY_JOINTS
+    )
+    if visible_count < 5:
+        return ()
+
+    points: list[tuple[float, float, float]] = []
+    for index in _FORMATION_UPPER_BODY_JOINTS:
+        relative = np.clip((screen[index, :2] - torso_center) / scale, -1.0, 1.0)
+        points.append(
+            (
+                float(relative[0]),
+                float(relative[1]),
+                _unit(reliability[index] * observation.confidence),
+            )
+        )
+    return tuple(points)
 
 
 def _silhouette_descriptor(
@@ -471,6 +585,132 @@ def _silhouette_descriptor(
         area_ratio,
         _unit(foreground_confidence),
     )
+
+
+def _person_layout_embedding(
+    persons: np.ndarray,
+    *,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[float, ...]:
+    """Encode the left-to-right on-screen formation of all detected dancers."""
+
+    boxes: list[tuple[float, float, float, float, float]] = []
+    for person in persons:
+        left = _unit(float(person[0]) / frame_width)
+        top = _unit(float(person[1]) / frame_height)
+        right = _unit(float(person[2]) / frame_width)
+        bottom = _unit(float(person[3]) / frame_height)
+        confidence = _unit(float(person[-1]))
+        if right - left < 0.03 or bottom - top < 0.08 or confidence < 0.44:
+            continue
+        boxes.append((left, top, right, bottom, confidence))
+    if not boxes:
+        return ()
+    boxes.sort(key=lambda item: ((item[0] + item[2]) / 2.0, item[1], -item[4]))
+
+    occupancy = np.zeros((72, 128), dtype=np.float32)
+    for left, top, right, bottom, confidence in boxes:
+        x1 = max(0, min(127, int(math.floor(left * 128))))
+        y1 = max(0, min(71, int(math.floor(top * 72))))
+        x2 = max(x1 + 1, min(128, int(math.ceil(right * 128))))
+        y2 = max(y1 + 1, min(72, int(math.ceil(bottom * 72))))
+        occupancy[y1:y2, x1:x2] = np.maximum(
+            occupancy[y1:y2, x1:x2], confidence
+        )
+    coarse = cv2.resize(occupancy, (12, 8), interpolation=cv2.INTER_AREA)
+
+    ordered_geometry: list[float] = []
+    for left, top, right, bottom, confidence in boxes[:6]:
+        ordered_geometry.extend(
+            (
+                (left + right) / 2.0,
+                (top + bottom) / 2.0,
+                right - left,
+                bottom - top,
+                confidence,
+            )
+        )
+    ordered_geometry.extend((0.0,) * (6 * 5 - len(ordered_geometry)))
+    count_value = min(1.0, len(boxes) / 6.0)
+    return (
+        tuple(float(value) for value in coarse.reshape(-1))
+        + tuple(ordered_geometry)
+        + (count_value,) * 8
+    )
+
+
+def _formation_people_descriptor(
+    persons: np.ndarray,
+    *,
+    frame_width: int,
+    frame_height: int,
+    pose_estimator: _MediaPipePoseEstimator | None = None,
+    image: np.ndarray | None = None,
+) -> tuple[
+    tuple[FormationPersonDescriptor, ...],
+    dict[int, _PoseObservation],
+]:
+    """Describe at most six strong detections in stable left-to-right order."""
+
+    valid: list[
+        tuple[
+            int,
+            np.ndarray,
+            tuple[float, float, float, float],
+            tuple[float, float],
+            float,
+            float,
+        ]
+    ] = []
+    for index, person in enumerate(persons):
+        left = _unit(float(person[0]) / frame_width)
+        top = _unit(float(person[1]) / frame_height)
+        right = _unit(float(person[2]) / frame_width)
+        bottom = _unit(float(person[3]) / frame_height)
+        confidence = _unit(float(person[-1]))
+        width = right - left
+        height = bottom - top
+        if width < 0.03 or height < 0.08 or confidence < 0.44:
+            continue
+        bbox = (left, top, width, height)
+        centroid = (left + width / 2.0, top + height / 2.0)
+        # Prefer real foreground people over a small detector duplicate when
+        # more than the six IVE members survive NMS.
+        rank = confidence * math.sqrt(width * height)
+        valid.append((index, person, bbox, centroid, confidence, rank))
+
+    selected = sorted(
+        valid,
+        key=lambda item: (item[5], item[4], item[2][2] * item[2][3]),
+        reverse=True,
+    )[:_MAXIMUM_FORMATION_PEOPLE]
+    selected.sort(key=lambda item: (item[3][0], item[3][1], -item[4]))
+
+    observations: dict[int, _PoseObservation] = {}
+    descriptors: list[FormationPersonDescriptor] = []
+    for index, person, bbox, centroid, confidence, _rank in selected:
+        observation = None
+        if pose_estimator is not None and image is not None:
+            try:
+                observation = pose_estimator.infer(image, person)
+            except (cv2.error, ValueError, FloatingPointError):
+                observation = None
+        if observation is not None:
+            observations[index] = observation
+        descriptors.append(
+            FormationPersonDescriptor(
+                bbox_xywh=bbox,
+                centroid_xy=centroid,
+                detection_confidence=confidence,
+                upper_body_keypoints_xyc=(
+                    _upper_body_shape(observation)
+                    if observation is not None
+                    else ()
+                ),
+            )
+        )
+    return tuple(descriptors), observations
 
 
 def _dominant_person(persons: np.ndarray) -> np.ndarray | None:
@@ -546,7 +786,12 @@ class SubjectGeometryAnalyzer:
         except cv2.error:
             self._segmenter = None
 
-    def describe(self, image: np.ndarray) -> SubjectGeometryDescriptor:
+    def describe(
+        self,
+        image: np.ndarray,
+        *,
+        include_formation_pose: bool = False,
+    ) -> SubjectGeometryDescriptor:
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("subject geometry expects a non-empty BGR image")
         with self._lock:
@@ -576,14 +821,44 @@ class SubjectGeometryAnalyzer:
             pose_embedding: tuple[float, ...] = ()
             pose_confidence = 0.0
             person_count = 0
+            person_layout_embedding: tuple[float, ...] = ()
+            formation_people: tuple[FormationPersonDescriptor, ...] = ()
             pose_backend = "none"
             if self._pose_detector is not None and self._pose_estimator is not None:
                 try:
                     persons = self._pose_detector.infer(image)
                     person_count = len(persons)
+                    person_layout_embedding = _person_layout_embedding(
+                        persons,
+                        frame_width=image.shape[1],
+                        frame_height=image.shape[0],
+                    )
+                    formation_people, formation_observations = (
+                        _formation_people_descriptor(
+                            persons,
+                            frame_width=image.shape[1],
+                            frame_height=image.shape[0],
+                            pose_estimator=(
+                                self._pose_estimator
+                                if include_formation_pose
+                                else None
+                            ),
+                            image=image if include_formation_pose else None,
+                        )
+                    )
                     dominant = _dominant_person(persons)
                     if dominant is not None:
-                        observation = self._pose_estimator.infer(image, dominant)
+                        dominant_index = next(
+                            (
+                                index
+                                for index, person in enumerate(persons)
+                                if np.array_equal(person, dominant)
+                            ),
+                            -1,
+                        )
+                        observation = formation_observations.get(dominant_index)
+                        if observation is None:
+                            observation = self._pose_estimator.infer(image, dominant)
                         if observation is not None:
                             pose_embedding, pose_confidence = _pose_embedding(observation)
                             if pose_embedding:
@@ -599,6 +874,8 @@ class SubjectGeometryAnalyzer:
                 pose_embedding=pose_embedding,
                 pose_confidence=pose_confidence,
                 detected_person_count=person_count,
+                person_layout_embedding=person_layout_embedding,
+                formation_people=formation_people,
                 pose_backend=pose_backend,
                 silhouette_embedding=silhouette_embedding,
                 silhouette_bbox_xywh=silhouette_bbox,
@@ -612,22 +889,87 @@ class SubjectGeometryAnalyzer:
 _DEFAULT_ANALYZER: SubjectGeometryAnalyzer | None = None
 
 
-def describe_subject_geometry(image: np.ndarray) -> SubjectGeometryDescriptor:
+def describe_subject_geometry(
+    image: np.ndarray,
+    *,
+    include_formation_pose: bool = False,
+) -> SubjectGeometryDescriptor:
     global _DEFAULT_ANALYZER
     if _DEFAULT_ANALYZER is None:
         _DEFAULT_ANALYZER = SubjectGeometryAnalyzer()
-    return _DEFAULT_ANALYZER.describe(image)
+    return _DEFAULT_ANALYZER.describe(
+        image,
+        include_formation_pose=include_formation_pose,
+    )
+
+
+def detect_people(image: np.ndarray) -> tuple[PersonDetection, ...]:
+    """Return clipped person boxes without selecting an identity.
+
+    Automatic member anchoring applies its own multi-frame ambiguity and
+    stability gates. This low-level function deliberately exposes every valid
+    detector result instead of choosing a performer.
+    """
+
+    global _DEFAULT_ANALYZER
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("person detection expects a non-empty BGR image")
+    if _DEFAULT_ANALYZER is None:
+        _DEFAULT_ANALYZER = SubjectGeometryAnalyzer()
+    analyzer = _DEFAULT_ANALYZER
+    with analyzer._lock:
+        analyzer._load_pose()
+        if analyzer._pose_detector is None:
+            return ()
+        try:
+            raw = analyzer._pose_detector.infer(image)
+        except (cv2.error, ValueError, FloatingPointError):
+            return ()
+    height, width = image.shape[:2]
+    detections: list[PersonDetection] = []
+    for person in raw:
+        left, top, right, bottom = (
+            float(person[0]) / width,
+            float(person[1]) / height,
+            float(person[2]) / width,
+            float(person[3]) / height,
+        )
+        left = max(0.0, min(1.0, left))
+        top = max(0.0, min(1.0, top))
+        right = max(0.0, min(1.0, right))
+        bottom = max(0.0, min(1.0, bottom))
+        confidence = _unit(float(person[-1]))
+        if right - left < 0.03 or bottom - top < 0.08 or confidence < 0.44:
+            continue
+        detections.append(
+            PersonDetection(
+                bbox_xyxy=(left, top, right, bottom),
+                confidence=confidence,
+            )
+        )
+    return tuple(
+        sorted(
+            detections,
+            key=lambda item: (
+                -item.confidence,
+                item.bbox_xyxy,
+            ),
+        )
+    )
 
 
 __all__ = [
+    "FormationPersonDescriptor",
     "HUMAN_SEGMENTER_MODEL",
     "ModelAssetStatus",
+    "PersonDetection",
     "PERSON_DETECTOR_MODEL",
     "POSE_BACKEND",
     "POSE_ESTIMATOR_MODEL",
     "SILHOUETTE_BACKEND",
     "SubjectGeometryAnalyzer",
     "SubjectGeometryDescriptor",
+    "detect_people",
     "describe_subject_geometry",
     "model_asset_status",
 ]

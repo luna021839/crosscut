@@ -46,6 +46,11 @@ class EditMode(StrEnum):
     MEMBER = "member"
 
 
+class SourceMode(StrEnum):
+    LOCAL = "local"
+    AUTOMATIC = "automatic"
+
+
 class AspectRatio(StrEnum):
     LANDSCAPE = "16:9"
     PORTRAIT = "9:16"

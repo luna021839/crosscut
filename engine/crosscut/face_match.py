@@ -8,7 +8,7 @@ produce an explicit raw-frame fallback.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Sequence
 
@@ -38,6 +38,8 @@ class FaceMatchConfig:
     maximum_silhouette_center_span: float = 0.15
     maximum_silhouette_scale_ratio: float = 1.42
     silhouette_target_screen_y: float = 0.50
+    maximum_partial_face_center_span: float = 0.16
+    maximum_partial_face_scale_ratio: float = 1.45
 
     def __post_init__(self) -> None:
         numeric = (
@@ -58,6 +60,8 @@ class FaceMatchConfig:
             self.maximum_silhouette_center_span,
             self.maximum_silhouette_scale_ratio,
             self.silhouette_target_screen_y,
+            self.maximum_partial_face_center_span,
+            self.maximum_partial_face_scale_ratio,
         )
         if any(not math.isfinite(value) for value in numeric):
             raise ValueError("face-match configuration must be finite")
@@ -95,6 +99,10 @@ class FaceMatchConfig:
             raise ValueError("silhouette scale ratio must be at least one")
         if not 0.0 < self.silhouette_target_screen_y < 1.0:
             raise ValueError("silhouette target y must be inside the frame")
+        if not 0.0 < self.maximum_partial_face_center_span <= 0.28:
+            raise ValueError("partial face center span must be in (0, 0.28]")
+        if not 1.0 <= self.maximum_partial_face_scale_ratio <= 1.8:
+            raise ValueError("partial face scale ratio must be in [1.0, 1.8]")
         if self.target_face_height_override is not None and not (
             math.isfinite(self.target_face_height_override)
             and 0.0 < self.target_face_height_override < 1.0
@@ -183,7 +191,9 @@ class FaceMatchPlan:
     )
     silhouette_target_candidate_count: int = 0
     eligible_silhouette_segment_count: int = 0
-    analysis_basis: str = "dominant_face_or_silhouette_safe_virtual_camera_v3"
+    analysis_basis: str = (
+        "boundary_local_partial_face_or_silhouette_safe_virtual_camera_v4"
+    )
 
     @property
     def applied_count(self) -> int:
@@ -195,7 +205,10 @@ class FaceMatchPlan:
 
     @property
     def silhouette_applied_count(self) -> int:
-        return sum(item.alignment_subject == "silhouette" for item in self.segments)
+        return sum(
+            item.applied and item.alignment_subject == "silhouette"
+            for item in self.segments
+        )
 
     @property
     def aligned_segment_count(self) -> int:
@@ -224,7 +237,10 @@ class FaceMatchPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "analysis_basis": self.analysis_basis,
-            "policy": "face_then_stable_silhouette_aligned_hard_cut_else_raw_full_frame",
+            "policy": (
+                "face_then_stable_silhouette_static_or_pan_crop; "
+                "one_sided_cross_source_edges_remain_tier_c_hard_cuts"
+            ),
             "target_face_height": self.target_face_height,
             "target_selection_policy": self.target_selection_policy,
             "target_candidate_count": self.target_candidate_count,
@@ -283,49 +299,174 @@ def _fallback(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _SampledGeometry:
+    """Two or three trustworthy samples with their segment-relative times."""
+
+    samples: tuple[tuple[float, float, float, float], ...]
+    centers: tuple[tuple[float, float], ...]
+    time_fractions: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not (
+            len(self.samples)
+            == len(self.centers)
+            == len(self.time_fractions)
+        ):
+            raise ValueError("sampled geometry lengths must match")
+        if len(self.samples) not in (2, 3):
+            raise ValueError("sampled geometry needs two or three observations")
+        if any(
+            not math.isfinite(value) or not 0.0 <= value <= 1.0
+            for value in self.time_fractions
+        ):
+            raise ValueError("sampled geometry times must be normalized")
+        if any(
+            left >= right
+            for left, right in zip(
+                self.time_fractions,
+                self.time_fractions[1:],
+            )
+        ):
+            raise ValueError("sampled geometry times must be strictly increasing")
+        if (
+            abs(self.time_fractions[0]) > 1e-9
+            or abs(self.time_fractions[-1] - 1.0) > 1e-9
+        ):
+            raise ValueError("sampled geometry must prove both segment boundaries")
+
+
+def _valid_normalized_box(
+    sample: tuple[float, float, float, float],
+) -> bool:
+    if len(sample) != 4 or any(
+        not math.isfinite(float(value)) for value in sample
+    ):
+        return False
+    x, y, width, height = (float(value) for value in sample)
+    return (
+        x >= 0.0
+        and y >= 0.0
+        and width > 0.0
+        and height > 0.0
+        and x + width <= 1.000001
+        and y + height <= 1.000001
+    )
+
+
+def _maximum_center_span(centers: Sequence[tuple[float, float]]) -> float:
+    return max(
+        math.hypot(left[0] - right[0], left[1] - right[1])
+        for left in centers
+        for right in centers
+    )
+
+
+def _safe_face_geometry(
+    choice: Any,
+    settings: FaceMatchConfig,
+) -> _SampledGeometry | None:
+    """Recover only a tightly stable two-of-three dominant-face observation.
+
+    The full three-sample decision remains authoritative.  Partial recovery is
+    limited to the two failure modes produced by one missing/ambiguous detector
+    observation, and it never crosses an internal source-camera cut.
+    """
+
+    failure = choice.face_match_candidate_failure
+    if failure == "internal_camera_cut":
+        return None
+    raw_samples = tuple(choice.face_samples_xywh)
+    available = tuple(
+        (index, sample)
+        for index, sample in enumerate(raw_samples)
+        if sample is not None and _valid_normalized_box(sample)
+    )
+    if len(available) == 3:
+        if failure is not None:
+            return None
+    elif len(available) == 2:
+        if failure not in ("face_not_detected", "ambiguous_multiple_faces"):
+            return None
+        # A crop may interpolate across a missing midpoint, but it must never
+        # invent its entry or exit framing: those are the visible edit edges.
+        if tuple(index for index, _sample in available) != (0, 2):
+            return None
+    else:
+        return None
+
+    samples = tuple(sample for _index, sample in available)
+    heights = tuple(float(sample[3]) for sample in samples)
+    if min(heights) < 0.035:
+        return None
+    centers = tuple(
+        (sample[0] + sample[2] / 2.0, sample[1] + sample[3] / 2.0)
+        for sample in samples
+    )
+    if len(samples) == 2 and (
+        _maximum_center_span(centers)
+        > settings.maximum_partial_face_center_span
+        or max(heights) / min(heights)
+        > settings.maximum_partial_face_scale_ratio
+    ):
+        return None
+    return _SampledGeometry(
+        samples=samples,
+        centers=centers,
+        time_fractions=tuple(index / 2.0 for index, _sample in available),
+    )
+
+
 def _safe_silhouette_geometry(
     choice: Any,
     settings: FaceMatchConfig,
-) -> tuple[
-    tuple[tuple[float, float, float, float], ...],
-    tuple[tuple[float, float], ...],
-] | None:
-    """Return a stable three-sample aggregate-human track or no crop signal."""
+) -> _SampledGeometry | None:
+    """Return a stable two/three-sample aggregate-human track or no signal."""
 
     if choice.face_match_candidate_failure == "internal_camera_cut":
         return None
-    if any(sample is None for sample in choice.silhouette_samples_xywh):
+    available = tuple(
+        (index, sample, center)
+        for index, (sample, center, backend, confidence) in enumerate(
+            zip(
+                choice.silhouette_samples_xywh,
+                choice.silhouette_centroid_samples_xy,
+                choice.silhouette_backends,
+                choice.silhouette_confidences,
+                strict=True,
+            )
+        )
+        if (
+            sample is not None
+            and center is not None
+            and _valid_normalized_box(sample)
+            and all(math.isfinite(float(value)) for value in center)
+            and backend == "opencv_zoo_pphumanseg_2023mar"
+            and math.isfinite(float(confidence))
+            and float(confidence) >= settings.minimum_silhouette_confidence
+        )
+    )
+    if len(available) not in (2, 3):
         return None
-    if any(center is None for center in choice.silhouette_centroid_samples_xy):
-        return None
-    if any(
-        backend != "opencv_zoo_pphumanseg_2023mar"
-        for backend in choice.silhouette_backends
+    if (
+        len(available) == 2
+        and tuple(index for index, _sample, _center in available) != (0, 2)
     ):
         return None
-    if min(choice.silhouette_confidences) < settings.minimum_silhouette_confidence:
-        return None
-    samples = tuple(
-        sample for sample in choice.silhouette_samples_xywh if sample is not None
-    )
-    centers = tuple(
-        center
-        for center in choice.silhouette_centroid_samples_xy
-        if center is not None
-    )
+    samples = tuple(sample for _index, sample, _center in available)
+    centers = tuple(center for _index, _sample, center in available)
     heights = tuple(sample[3] for sample in samples)
     if min(heights) < settings.minimum_silhouette_height:
         return None
     if max(heights) / min(heights) > settings.maximum_silhouette_scale_ratio:
         return None
-    maximum_center_span = max(
-        math.hypot(left[0] - right[0], left[1] - right[1])
-        for left in centers
-        for right in centers
-    )
-    if maximum_center_span > settings.maximum_silhouette_center_span:
+    if _maximum_center_span(centers) > settings.maximum_silhouette_center_span:
         return None
-    return samples, centers
+    return _SampledGeometry(
+        samples=samples,
+        centers=centers,
+        time_fractions=tuple(index / 2.0 for index, _sample, _center in available),
+    )
 
 
 def _positioned_crop_for_center(
@@ -419,7 +560,7 @@ def _alignment_metrics(
 ) -> tuple[float, float] | None:
     """Preview one fixed-scale crop using the same gates as the renderer path."""
 
-    if len(samples) != 3 or len(centers) != 3:
+    if len(samples) not in (2, 3) or len(samples) != len(centers):
         return None
     if abs(source_aspect - 16.0 / 9.0) > settings.maximum_source_aspect_deviation:
         return None
@@ -462,20 +603,12 @@ def _face_alignment_metrics(
 ) -> tuple[float, float] | None:
     """Preview whether one dominant-face crop is safe at a proposed target."""
 
-    if choice.face_match_candidate_failure is not None:
+    geometry = _safe_face_geometry(choice, settings)
+    if geometry is None:
         return None
-    if any(sample is None for sample in choice.face_samples_xywh):
-        return None
-    samples = tuple(
-        sample for sample in choice.face_samples_xywh if sample is not None
-    )
-    centers = tuple(
-        (sample[0] + sample[2] / 2.0, sample[1] + sample[3] / 2.0)
-        for sample in samples
-    )
     return _alignment_metrics(
-        samples=samples,
-        centers=centers,
+        samples=geometry.samples,
+        centers=geometry.centers,
         source_aspect=source_aspect,
         target=target,
         target_screen_y=settings.target_screen_y,
@@ -494,10 +627,9 @@ def _silhouette_alignment_metrics(
     geometry = _safe_silhouette_geometry(choice, settings)
     if geometry is None:
         return None
-    samples, centers = geometry
     return _alignment_metrics(
-        samples=samples,
-        centers=centers,
+        samples=geometry.samples,
+        centers=geometry.centers,
         source_aspect=source_aspect,
         target=target,
         target_screen_y=settings.silhouette_target_screen_y,
@@ -517,15 +649,14 @@ def _optimized_face_target(
     eligible_heights: list[float] = []
     for choice in visual_timeline.choices:
         source_aspect = float(source_aspect_ratios[choice.source_index])
-        samples = choice.face_samples_xywh
+        geometry = _safe_face_geometry(choice, settings)
         if (
-            choice.face_match_candidate_failure is not None
-            or any(sample is None for sample in samples)
+            geometry is None
             or abs(source_aspect - 16.0 / 9.0)
             > settings.maximum_source_aspect_deviation
         ):
             continue
-        heights = tuple(float(sample[3]) for sample in samples if sample is not None)
+        heights = tuple(float(sample[3]) for sample in geometry.samples)
         if heights and all(math.isfinite(value) and value > 0.0 for value in heights):
             eligible_heights.append(float(np.median(heights)))
     if not eligible_heights:
@@ -623,8 +754,9 @@ def _optimized_silhouette_target(
             > settings.maximum_source_aspect_deviation
         ):
             continue
-        samples, _centers = geometry
-        eligible_heights.append(float(np.median([sample[3] for sample in samples])))
+        eligible_heights.append(
+            float(np.median([sample[3] for sample in geometry.samples]))
+        )
     if not eligible_heights:
         return (None, 0, 0)
 
@@ -714,9 +846,34 @@ def _alignment_attempt(
     target_screen_y: float,
     maximum_zoom: float,
     settings: FaceMatchConfig,
+    sample_time_fractions: Sequence[float] | None = None,
 ) -> FaceMatchSegment:
     """Build one face/silhouette crop or an explicit raw-frame attempt result."""
 
+    if len(samples) not in (2, 3) or len(samples) != len(centers):
+        raise ValueError("alignment attempt needs two or three matched samples")
+    if sample_time_fractions is None:
+        if len(samples) != 3:
+            raise ValueError("partial alignment samples need explicit times")
+        time_fractions = (0.0, 0.5, 1.0)
+    else:
+        time_fractions = tuple(float(value) for value in sample_time_fractions)
+    if (
+        len(time_fractions) != len(samples)
+        or any(
+            not math.isfinite(value) or not 0.0 <= value <= 1.0
+            for value in time_fractions
+        )
+        or any(
+            left >= right
+            for left, right in zip(time_fractions, time_fractions[1:])
+        )
+        or abs(time_fractions[0]) > 1e-9
+        or abs(time_fractions[-1] - 1.0) > 1e-9
+    ):
+        raise ValueError(
+            "alignment sample times must be ordered and prove both boundaries"
+        )
     observed = float(np.median([sample[3] for sample in samples]))
 
     def failed(reason: str, required_zoom: float | None = None) -> FaceMatchSegment:
@@ -753,10 +910,9 @@ def _alignment_attempt(
     if crop_width > 1.0 + 1e-8 or crop_height > 1.0 + 1e-8:
         return failed("aspect_preserving_crop_does_not_fit", required_zoom)
 
-    keyframe_times = (0.0, choice.duration_seconds / 2.0, choice.duration_seconds)
     keyframes: list[PanCropKeyframe] = []
-    for time_seconds, sample, center in zip(
-        keyframe_times,
+    for time_fraction, sample, center in zip(
+        time_fractions,
         samples,
         centers,
         strict=True,
@@ -791,10 +947,23 @@ def _alignment_attempt(
         left, top, _width, _height = crop
         keyframes.append(
             PanCropKeyframe(
-                time_seconds,
+                time_fraction * choice.duration_seconds,
                 NormalizedCrop(left, top, crop_width, crop_height),
             )
         )
+
+    # Identical translations are a true static crop, not three redundant pan
+    # points. This also makes the static/pan distinction explicit in diagnostics.
+    first_crop = keyframes[0].crop
+    if all(
+        math.hypot(
+            keyframe.crop.x - first_crop.x,
+            keyframe.crop.y - first_crop.y,
+        )
+        <= 1e-7
+        for keyframe in keyframes[1:]
+    ):
+        keyframes = [PanCropKeyframe(0.0, first_crop)]
 
     return FaceMatchSegment(
         segment_index=choice.segment_index,
@@ -884,28 +1053,15 @@ def build_face_match_plan(
     for choice in visual_timeline.choices:
         failure = choice.face_match_candidate_failure
         source_aspect = float(source_aspect_ratios[choice.source_index])
-        face_geometry_is_safe = (
-            failure is None
-            and all(sample is not None for sample in choice.face_samples_xywh)
-            and target is not None
-        )
+        face_geometry = _safe_face_geometry(choice, settings)
         silhouette_geometry = _safe_silhouette_geometry(choice, settings)
         face_attempt: FaceMatchSegment | None = None
-        if face_geometry_is_safe:
-            face_samples = tuple(
-                sample
-                for sample in choice.face_samples_xywh
-                if sample is not None
-            )
-            face_centers = tuple(
-                (sample[0] + sample[2] / 2.0, sample[1] + sample[3] / 2.0)
-                for sample in face_samples
-            )
+        if face_geometry is not None and target is not None:
             face_attempt = _alignment_attempt(
                 choice=choice,
                 alignment_subject="face",
-                samples=face_samples,
-                centers=face_centers,
+                samples=face_geometry.samples,
+                centers=face_geometry.centers,
                 alignment_target=target,
                 face_target=target,
                 silhouette_target=target_silhouette,
@@ -913,6 +1069,7 @@ def build_face_match_plan(
                 target_screen_y=settings.target_screen_y,
                 maximum_zoom=settings.maximum_zoom,
                 settings=settings,
+                sample_time_fractions=face_geometry.time_fractions,
             )
             if face_attempt.applied:
                 decisions.append(face_attempt)
@@ -920,12 +1077,11 @@ def build_face_match_plan(
 
         silhouette_attempt: FaceMatchSegment | None = None
         if silhouette_geometry is not None and target_silhouette is not None:
-            silhouette_samples, silhouette_centers = silhouette_geometry
             silhouette_attempt = _alignment_attempt(
                 choice=choice,
                 alignment_subject="silhouette",
-                samples=silhouette_samples,
-                centers=silhouette_centers,
+                samples=silhouette_geometry.samples,
+                centers=silhouette_geometry.centers,
                 alignment_target=target_silhouette,
                 face_target=target,
                 silhouette_target=target_silhouette,
@@ -936,6 +1092,7 @@ def build_face_match_plan(
                     settings.maximum_silhouette_zoom,
                 ),
                 settings=settings,
+                sample_time_fractions=silhouette_geometry.time_fractions,
             )
             if silhouette_attempt.applied:
                 decisions.append(silhouette_attempt)
@@ -957,6 +1114,114 @@ def build_face_match_plan(
                     target=target,
                 )
             )
+
+    # Crop compatibility is a boundary property, not a timeline-wide state.
+    # Cross-source one-sided crop/raw edges remain ordinary Tier-C hard cuts in
+    # ``group_transition``; erasing their safe crop side would turn one detector
+    # miss into an all-raw fixed-point cascade. A mixed face/silhouette pair must
+    # not be advertised as aligned, though, so retain the stronger face crop and
+    # locally demote the silhouette side. Only a same-source/same-shot boundary
+    # is invisible and therefore requires exact local crop continuity.
+    choices = visual_timeline.choices
+    mixed_subject_demotions: set[int] = set()
+    for position, (left_choice, right_choice) in enumerate(
+        zip(choices, choices[1:])
+    ):
+        if left_choice.source_index == right_choice.source_index:
+            continue
+        left = decisions[position]
+        right = decisions[position + 1]
+        if (
+            left.applied
+            and right.applied
+            and left.alignment_subject != right.alignment_subject
+        ):
+            if left.alignment_subject == "silhouette":
+                mixed_subject_demotions.add(position)
+            if right.alignment_subject == "silhouette":
+                mixed_subject_demotions.add(position + 1)
+    for position in mixed_subject_demotions:
+        item = decisions[position]
+        decisions[position] = replace(
+            item,
+            applied=False,
+            fallback_reason="cross_source_alignment_subject_mismatch",
+            applied_zoom=None,
+            pan_crop=None,
+        )
+
+    def same_continuous_shot(left_choice: Any, right_choice: Any) -> bool:
+        if left_choice.source_index != right_choice.source_index:
+            return False
+        return (
+            not left_choice.shot_id
+            and not right_choice.shot_id
+        ) or (
+            bool(left_choice.shot_id)
+            and left_choice.shot_id == right_choice.shot_id
+        )
+
+    def crop_endpoint(
+        item: FaceMatchSegment,
+        *,
+        final: bool,
+    ) -> tuple[float, float, float, float] | None:
+        if not item.applied or item.pan_crop is None:
+            return None
+        width, height = item.pan_crop.fixed_crop_size
+        positions = item.pan_crop.fixed_crop_positions()
+        _time, x, y = positions[-1] if final else positions[0]
+        return (x, y, width, height)
+
+    def invisible_edge_is_compatible(
+        left: FaceMatchSegment,
+        right: FaceMatchSegment,
+    ) -> bool:
+        if not left.applied and not right.applied:
+            return True
+        if (
+            not left.applied
+            or not right.applied
+            or left.alignment_subject != right.alignment_subject
+        ):
+            return False
+        left_crop = crop_endpoint(left, final=True)
+        right_crop = crop_endpoint(right, final=False)
+        if left_crop is None or right_crop is None:
+            return False
+        # Roughly one percent of a normalized frame is already visible as a
+        # punch-in at an otherwise invisible boundary; fail closed at that run.
+        return max(
+            abs(left_value - right_value)
+            for left_value, right_value in zip(left_crop, right_crop, strict=True)
+        ) <= 0.01
+
+    run_start = 0
+    while run_start < len(choices):
+        run_end = run_start
+        while run_end + 1 < len(choices) and same_continuous_shot(
+            choices[run_end],
+            choices[run_end + 1],
+        ):
+            run_end += 1
+        if run_end > run_start and any(
+            not invisible_edge_is_compatible(
+                decisions[position],
+                decisions[position + 1],
+            )
+            for position in range(run_start, run_end)
+        ):
+            for position in range(run_start, run_end + 1):
+                item = decisions[position]
+                if item.applied:
+                    decisions[position] = replace(
+                        item,
+                        applied=False,
+                        fallback_reason="continuous_shot_crop_pair_incompatible",
+                        applied_zoom=None,
+                        pan_crop=None,
+                    )
+        run_start = run_end + 1
 
     return FaceMatchPlan(
         segments=tuple(decisions),

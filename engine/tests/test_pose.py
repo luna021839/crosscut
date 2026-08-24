@@ -8,13 +8,17 @@ import cv2
 import numpy as np
 
 from crosscut.pose import (
+    FormationPersonDescriptor,
     HUMAN_SEGMENTER_MODEL,
     SILHOUETTE_BACKEND,
     SubjectGeometryAnalyzer,
     _PoseObservation,
+    _formation_people_descriptor,
+    _person_layout_embedding,
     _pose_detector_anchors,
     _pose_embedding,
     _silhouette_descriptor,
+    _upper_body_shape,
     model_asset_status,
 )
 
@@ -65,6 +69,43 @@ class PoseModelTests(unittest.TestCase):
         np.testing.assert_allclose(original, shifted, atol=1e-12)
         self.assertAlmostEqual(original_confidence, shifted_confidence)
 
+        original_upper = _upper_body_shape(
+            _PoseObservation(landmarks, world, 0.9)
+        )
+        shifted_upper = _upper_body_shape(
+            _PoseObservation(transformed, world, 0.9)
+        )
+        self.assertEqual(len(original_upper), 8)
+        np.testing.assert_allclose(original_upper, shifted_upper, atol=1e-12)
+
+    def test_formation_descriptor_keeps_six_people_left_to_right(self) -> None:
+        persons = np.asarray(
+            [
+                (x, 20, x + 30, 190, 0.80 + index * 0.02)
+                for index, x in enumerate((250, 10, 210, 50, 170, 90, 130))
+            ],
+            dtype=np.float64,
+        )
+
+        formation, observations = _formation_people_descriptor(
+            persons,
+            frame_width=300,
+            frame_height=200,
+        )
+
+        self.assertEqual(len(formation), 6)
+        self.assertEqual(observations, {})
+        self.assertTrue(
+            all(
+                left.centroid_xy[0] <= right.centroid_xy[0]
+                for left, right in zip(formation, formation[1:])
+            )
+        )
+        self.assertTrue(
+            all(isinstance(person, FormationPersonDescriptor) for person in formation)
+        )
+        self.assertTrue(all(not person.upper_body_keypoints_xyc for person in formation))
+
     def test_silhouette_keeps_multiple_people_and_reports_union_geometry(self) -> None:
         probability = np.zeros((192, 192), dtype=np.float32)
         probability[30:165, 25:70] = 0.94
@@ -80,6 +121,58 @@ class PoseModelTests(unittest.TestCase):
         self.assertGreater(bbox[0] + bbox[2], 0.88)
         self.assertGreater(area, 0.30)
         self.assertGreater(confidence, 0.90)
+
+    def test_person_layout_embedding_distinguishes_left_right_formation(self) -> None:
+        tall_left = np.asarray(
+            (
+                (20, 20, 70, 190, 0.95),
+                (230, 70, 270, 190, 0.92),
+            ),
+            dtype=np.float64,
+        )
+        tall_right = np.asarray(
+            (
+                (20, 70, 60, 190, 0.92),
+                (220, 20, 270, 190, 0.95),
+            ),
+            dtype=np.float64,
+        )
+
+        left_embedding = _person_layout_embedding(
+            tall_left, frame_width=300, frame_height=200
+        )
+        right_embedding = _person_layout_embedding(
+            tall_right, frame_width=300, frame_height=200
+        )
+
+        self.assertEqual(len(left_embedding), 134)
+        self.assertEqual(len(right_embedding), 134)
+        self.assertGreater(left_embedding[99], left_embedding[104])
+        self.assertLess(right_embedding[99], right_embedding[104])
+        self.assertFalse(np.allclose(left_embedding, right_embedding))
+
+    def test_person_layout_embedding_distinguishes_person_count(self) -> None:
+        two_people = np.asarray(
+            (
+                (20, 25, 70, 190, 0.95),
+                (230, 30, 280, 190, 0.93),
+            ),
+            dtype=np.float64,
+        )
+        three_people = np.vstack(
+            (two_people, np.asarray((125, 45, 175, 190, 0.91), dtype=np.float64))
+        )
+
+        two_embedding = _person_layout_embedding(
+            two_people, frame_width=300, frame_height=200
+        )
+        three_embedding = _person_layout_embedding(
+            three_people, frame_width=300, frame_height=200
+        )
+
+        np.testing.assert_allclose(two_embedding[-8:], (2.0 / 6.0,) * 8)
+        np.testing.assert_allclose(three_embedding[-8:], (3.0 / 6.0,) * 8)
+        self.assertFalse(np.allclose(two_embedding, three_embedding))
 
     def test_missing_assets_produce_empty_deterministic_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

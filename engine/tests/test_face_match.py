@@ -207,6 +207,7 @@ class FaceMatchTests(unittest.TestCase):
             "moderate_confidence_aligned_hard_cut",
         )
         assert first.pan_crop is not None
+        self.assertEqual(len(first.pan_crop.keyframes), 1)
         crop = first.pan_crop.keyframes[0].crop
         self.assertAlmostEqual(crop.width / crop.height, 1.0, places=6)
         self.assertLessEqual(first.applied_zoom or 99.0, 1.35)
@@ -285,6 +286,338 @@ class FaceMatchTests(unittest.TestCase):
             "required_zoom_exceeds_limit",
         )
         self.assertGreater(plan.segments[0].required_zoom or 0.0, 1.35)
+
+    def test_cross_source_one_sided_crop_remains_a_local_hard_cut_candidate(self) -> None:
+        timeline = VisualTimelinePlan(
+            choices=(
+                _choice(0, face_height=0.13),
+                _choice(
+                    1,
+                    face_height=0.13,
+                    failure="ambiguous_multiple_faces",
+                ),
+            ),
+            optimizer_score=1.0,
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=timeline,
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 1)
+        self.assertTrue(plan.segments[0].applied)
+        self.assertIsNotNone(plan.segments[0].pan_crop)
+        self.assertIsNone(plan.segments[0].fallback_reason)
+        self.assertEqual(
+            plan.segments[1].fallback_reason,
+            "ambiguous_multiple_faces",
+        )
+
+    def test_cross_source_raw_neighbor_does_not_erase_safe_crop_chain(self) -> None:
+        timeline = VisualTimelinePlan(
+            choices=(
+                _choice(0, face_height=0.13),
+                _choice(1, face_height=0.13),
+                _choice(
+                    2,
+                    face_height=0.13,
+                    failure="ambiguous_multiple_faces",
+                ),
+            ),
+            optimizer_score=1.0,
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=timeline,
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 2)
+        self.assertEqual(
+            tuple(segment.fallback_reason for segment in plan.segments),
+            (
+                None,
+                None,
+                "ambiguous_multiple_faces",
+            ),
+        )
+        self.assertTrue(
+            all(segment.pan_crop is not None for segment in plan.segments[:2])
+        )
+        self.assertIsNone(plan.segments[2].pan_crop)
+
+    def test_two_of_three_face_samples_recover_fixed_zoom_pan(self) -> None:
+        base = _choice(0, face_height=0.13)
+        entry = base.face_samples_xywh[0]
+        assert entry is not None
+        exit_box = (entry[0] + 0.025, entry[1], entry[2], entry[3])
+        partial = replace(
+            base,
+            face_samples_xywh=(entry, None, exit_box),
+            face_match_candidate_failure="face_not_detected",
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(partial,),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 1)
+        segment = plan.segments[0]
+        self.assertEqual(segment.alignment_subject, "face")
+        assert segment.pan_crop is not None
+        self.assertEqual(
+            tuple(item.time_seconds for item in segment.pan_crop.keyframes),
+            (0.0, 1.0),
+        )
+        first, last = segment.pan_crop.keyframes
+        self.assertAlmostEqual(first.crop.width, last.crop.width)
+        self.assertAlmostEqual(first.crop.height, last.crop.height)
+        self.assertNotAlmostEqual(first.crop.x, last.crop.x)
+
+    def test_missing_face_boundary_sample_cannot_authorize_crop(self) -> None:
+        base = _choice(0, face_height=0.13)
+        middle = base.face_samples_xywh[1]
+        exit_box = base.face_samples_xywh[2]
+        partial = replace(
+            base,
+            face_samples_xywh=(None, middle, exit_box),
+            face_match_candidate_failure="face_not_detected",
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(partial,),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(plan.segments[0].fallback_reason, "face_not_detected")
+
+    def test_one_face_sample_cannot_authorize_crop(self) -> None:
+        base = _choice(0, face_height=0.13)
+        entry = base.face_samples_xywh[0]
+        partial = replace(
+            base,
+            face_samples_xywh=(entry, None, None),
+            face_match_candidate_failure="face_not_detected",
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(partial,),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(plan.segments[0].fallback_reason, "face_not_detected")
+
+    def test_two_of_three_silhouette_samples_recover_conservative_pan(self) -> None:
+        base = _choice(0, failure="ambiguous_multiple_faces")
+        box = (0.20, 0.18, 0.60, 0.62)
+        partial = replace(
+            base,
+            silhouette_samples_xywh=(box, None, box),
+            silhouette_centroid_samples_xy=((0.5, 0.49), None, (0.5, 0.50)),
+            silhouette_backends=(
+                "opencv_zoo_pphumanseg_2023mar",
+                "none",
+                "opencv_zoo_pphumanseg_2023mar",
+            ),
+            silhouette_confidences=(0.94, 0.0, 0.95),
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(partial,),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+        )
+
+        self.assertEqual(plan.silhouette_applied_count, 1)
+        self.assertEqual(plan.segments[0].alignment_subject, "silhouette")
+
+    def test_missing_silhouette_boundary_sample_cannot_authorize_crop(self) -> None:
+        base = _choice(0, failure="ambiguous_multiple_faces")
+        box = (0.20, 0.18, 0.60, 0.62)
+        partial = replace(
+            base,
+            silhouette_samples_xywh=(None, box, box),
+            silhouette_centroid_samples_xy=(None, (0.5, 0.49), (0.5, 0.50)),
+            silhouette_backends=(
+                "none",
+                "opencv_zoo_pphumanseg_2023mar",
+                "opencv_zoo_pphumanseg_2023mar",
+            ),
+            silhouette_confidences=(0.0, 0.94, 0.95),
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(partial,),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(
+            plan.segments[0].fallback_reason,
+            "ambiguous_multiple_faces",
+        )
+
+    def test_mixed_face_silhouette_boundary_demotes_only_silhouette_side(self) -> None:
+        silhouette = _with_silhouette(
+            _choice(1, failure="ambiguous_multiple_faces"),
+            height=0.62,
+        )
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(_choice(0, face_height=0.13), silhouette),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 1)
+        self.assertTrue(plan.segments[0].applied)
+        self.assertEqual(
+            plan.segments[1].fallback_reason,
+            "cross_source_alignment_subject_mismatch",
+        )
+
+    def test_continuous_shot_demotion_does_not_cross_visible_source_cut(self) -> None:
+        choices = (
+            replace(
+                _choice(0, face_height=0.13),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+            replace(
+                _choice(1, failure="ambiguous_multiple_faces"),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+            replace(_choice(2, face_height=0.13), source_index=1),
+        )
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=choices,
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 1)
+        self.assertFalse(plan.segments[0].applied)
+        self.assertFalse(plan.segments[1].applied)
+        self.assertTrue(plan.segments[2].applied)
+
+    def test_continuous_source_hold_cannot_hide_raw_to_crop_punch_in(self) -> None:
+        timeline = VisualTimelinePlan(
+            choices=(
+                replace(
+                    _choice(0, face_height=0.13),
+                    source_index=0,
+                    shot_id="source-0:shot-1",
+                ),
+                replace(
+                    _choice(
+                        1,
+                        face_height=0.13,
+                        failure="ambiguous_multiple_faces",
+                    ),
+                    source_index=0,
+                    shot_id="source-0:shot-1",
+                ),
+            ),
+            optimizer_score=1.0,
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=timeline,
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(
+            plan.segments[0].fallback_reason,
+            "continuous_shot_crop_pair_incompatible",
+        )
+        self.assertIsNone(plan.segments[0].pan_crop)
+
+    def test_continuous_source_hold_requires_matching_crop_endpoints(self) -> None:
+        choices = (
+            replace(
+                _choice(0, face_height=0.13, center_x=0.45),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+            replace(
+                _choice(1, face_height=0.13, center_x=0.55),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+        )
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=choices,
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertTrue(
+            all(
+                segment.fallback_reason
+                == "continuous_shot_crop_pair_incompatible"
+                for segment in plan.segments
+            )
+        )
+
+    def test_continuous_source_hold_preserves_matching_static_crop(self) -> None:
+        choices = (
+            replace(
+                _choice(0, face_height=0.13),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+            replace(
+                _choice(1, face_height=0.13),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+        )
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=choices,
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.applied_count, 2)
+        self.assertTrue(all(segment.applied for segment in plan.segments))
 
     def test_edge_clamping_that_cannot_align_face_falls_back(self) -> None:
         timeline = VisualTimelinePlan(

@@ -8,12 +8,14 @@ weaker current shot win when it avoids an awkward cut on the next beat.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from math import isfinite, log, pi, sqrt
+from math import ceil, isfinite, log, pi, sqrt
 from typing import Mapping, Sequence
 
+from .face_identity import cosine_similarity
 from .ive import EditMode, IVEMember
+from .pose import FormationPersonDescriptor
 
 
 def _score(value: float, name: str) -> float:
@@ -33,6 +35,96 @@ class ShotType(str, Enum):
     WIDE = "wide"
     MEDIUM = "medium"
     CLOSE_UP = "close_up"
+
+
+BOUNDARY_SIDE_MAX_SCALE_DELTA = 0.20
+BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH = 0.34
+BOUNDARY_SIDE_MAX_POSE_MISMATCH = 0.42
+BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH = 0.34
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySideStability:
+    """Multi-frame stability immediately inside one side of an edit boundary.
+
+    The values compare frames from the same source over a roughly three-frame
+    window.  They are deliberately scalar diagnostics: raw pose/appearance
+    embeddings never need to leave the transient candidate.
+    """
+
+    sample_span_seconds: float
+    scale_delta: float
+    structure_mismatch: float | None = None
+    pose_mismatch: float | None = None
+    shot_type_mismatch: float = 0.0
+
+    def __post_init__(self) -> None:
+        try:
+            sample_span = float(self.sample_span_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "boundary-side sample span must be positive and finite"
+            ) from exc
+        if not isfinite(sample_span) or sample_span <= 0.0:
+            raise ValueError("boundary-side sample span must be positive and finite")
+        object.__setattr__(self, "sample_span_seconds", sample_span)
+        for name in (
+            "scale_delta",
+            "structure_mismatch",
+            "pose_mismatch",
+            "shot_type_mismatch",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            object.__setattr__(self, name, _score(value, name))
+
+    @property
+    def available_metrics(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in (
+                "scale",
+                "structure",
+                "pose",
+                "shot_type",
+            )
+            if getattr(self, f"{name}_mismatch", None) is not None
+            or (name == "scale" and self.scale_delta is not None)
+        )
+
+    def to_dict(self) -> dict[str, float | list[str] | None]:
+        return {
+            "sample_span_seconds": self.sample_span_seconds,
+            "available_metrics": list(self.available_metrics),
+            "scale_delta": self.scale_delta,
+            "structure_mismatch": self.structure_mismatch,
+            "pose_mismatch": self.pose_mismatch,
+            "shot_type_mismatch": self.shot_type_mismatch,
+        }
+
+
+def boundary_side_stability_exceeded(
+    evidence: BoundarySideStability,
+    *,
+    maximum_scale_delta: float | None,
+    maximum_structure_mismatch: float | None,
+    maximum_pose_mismatch: float | None,
+    maximum_shot_type_mismatch: float | None,
+) -> tuple[str, ...]:
+    """Return same-source boundary-window metrics above configured hard gates."""
+
+    checks = (
+        ("scale", evidence.scale_delta, maximum_scale_delta),
+        ("structure", evidence.structure_mismatch, maximum_structure_mismatch),
+        ("pose", evidence.pose_mismatch, maximum_pose_mismatch),
+        ("shot_type", evidence.shot_type_mismatch, maximum_shot_type_mismatch),
+    )
+    return tuple(
+        name
+        for name, value, maximum in checks
+        if value is not None and maximum is not None and value > maximum + 1e-9
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +154,16 @@ class TimelineCandidate:
     composition_score: float = 0.5
     boundary_score: float = 0.5
     shot_scale: float = 0.5
+    entry_shot_scale: float | None = None
+    exit_shot_scale: float | None = None
     shot_type: ShotType | str = ShotType.MEDIUM
+    entry_shot_type: ShotType | str | None = None
+    exit_shot_type: ShotType | str | None = None
+    entry_scene_cut_near: bool = False
+    exit_scene_cut_near: bool = False
+    internal_scene_cut_master_seconds: tuple[float, ...] = ()
+    entry_boundary_side_stability: BoundarySideStability | None = None
+    exit_boundary_side_stability: BoundarySideStability | None = None
     target_member: IVEMember | str | None = None
     target_confidence: float = 0.0
     target_crop_available: bool = False
@@ -77,12 +178,41 @@ class TimelineCandidate:
     silhouette_embedding: tuple[float, ...] = ()
     entry_silhouette_embedding: tuple[float, ...] = ()
     exit_silhouette_embedding: tuple[float, ...] = ()
+    person_layout_embedding: tuple[float, ...] = ()
+    entry_person_layout_embedding: tuple[float, ...] = ()
+    exit_person_layout_embedding: tuple[float, ...] = ()
+    formation_people: tuple[FormationPersonDescriptor, ...] = field(
+        default=(), repr=False
+    )
+    entry_formation_people: tuple[FormationPersonDescriptor, ...] = field(
+        default=(), repr=False
+    )
+    exit_formation_people: tuple[FormationPersonDescriptor, ...] = field(
+        default=(), repr=False
+    )
+    face_identity_embedding: tuple[float, ...] = field(default=(), repr=False)
+    entry_face_identity_embedding: tuple[float, ...] = field(default=(), repr=False)
+    exit_face_identity_embedding: tuple[float, ...] = field(default=(), repr=False)
     color_embedding: tuple[float, ...] = ()
     entry_color_embedding: tuple[float, ...] = ()
     exit_color_embedding: tuple[float, ...] = ()
     entry_face_geometry_window: tuple[tuple[float, ...], ...] = ()
     exit_face_geometry_window: tuple[tuple[float, ...], ...] = ()
+    focus_bbox_xywh: tuple[float, float, float, float] | None = None
+    entry_focus_bbox_xywh: tuple[float, float, float, float] | None = None
+    exit_focus_bbox_xywh: tuple[float, float, float, float] | None = None
+    subject_bbox_xywh: tuple[float, float, float, float] | None = None
+    entry_subject_bbox_xywh: tuple[float, float, float, float] | None = None
+    exit_subject_bbox_xywh: tuple[float, float, float, float] | None = None
+    subject_centroid_xy: tuple[float, float] | None = None
+    entry_subject_centroid_xy: tuple[float, float] | None = None
+    exit_subject_centroid_xy: tuple[float, float] | None = None
+    detected_person_count: int = 0
+    entry_detected_person_count: int = 0
+    exit_detected_person_count: int = 0
     motion: tuple[float, float] | None = None
+    entry_motion: tuple[float, float] | None = None
+    exit_motion: tuple[float, float] | None = None
     candidate_id: str = ""
     shot_id: str = ""
 
@@ -103,8 +233,50 @@ class TimelineCandidate:
             "crop_stability_score",
         ):
             object.__setattr__(self, field_name, _score(getattr(self, field_name), field_name))
+        for field_name in ("entry_shot_scale", "exit_shot_scale"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _score(value, field_name))
         if not isinstance(self.shot_type, ShotType):
             object.__setattr__(self, "shot_type", ShotType(self.shot_type))
+        for field_name in ("entry_shot_type", "exit_shot_type"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, ShotType):
+                object.__setattr__(self, field_name, ShotType(value))
+        if not isinstance(self.entry_scene_cut_near, bool) or not isinstance(
+            self.exit_scene_cut_near, bool
+        ):
+            raise ValueError("scene-cut proximity flags must be booleans")
+        internal_cut_times = tuple(
+            float(value) for value in self.internal_scene_cut_master_seconds
+        )
+        if any(not isfinite(value) for value in internal_cut_times):
+            raise ValueError("internal scene-cut times must be finite")
+        if any(
+            not self.start_seconds < value < self.end_seconds
+            for value in internal_cut_times
+        ):
+            raise ValueError("internal scene-cut times must lie inside the candidate")
+        if any(
+            right <= left
+            for left, right in zip(internal_cut_times, internal_cut_times[1:])
+        ):
+            raise ValueError("internal scene-cut times must be strictly increasing")
+        object.__setattr__(
+            self,
+            "internal_scene_cut_master_seconds",
+            internal_cut_times,
+        )
+        for stability in (
+            self.entry_boundary_side_stability,
+            self.exit_boundary_side_stability,
+        ):
+            if stability is not None and not isinstance(
+                stability, BoundarySideStability
+            ):
+                raise ValueError(
+                    "boundary-side stability evidence must use BoundarySideStability"
+                )
         if self.target_member is not None:
             object.__setattr__(self, "target_member", IVEMember.parse(self.target_member))
         if self.is_group_wide and self.shot_type not in (
@@ -112,8 +284,9 @@ class TimelineCandidate:
             ShotType.WIDE,
         ):
             raise ValueError("is_group_wide candidates must use a wide shot type")
-        if self.motion is not None and len(self.motion) != 2:
-            raise ValueError("motion must contain x/y components")
+        for motion in (self.motion, self.entry_motion, self.exit_motion):
+            if motion is not None and len(motion) != 2:
+                raise ValueError("motion must contain x/y components")
         for embedding in (
             self.pose_embedding,
             self.entry_pose_embedding,
@@ -124,6 +297,12 @@ class TimelineCandidate:
             self.silhouette_embedding,
             self.entry_silhouette_embedding,
             self.exit_silhouette_embedding,
+            self.person_layout_embedding,
+            self.entry_person_layout_embedding,
+            self.exit_person_layout_embedding,
+            self.face_identity_embedding,
+            self.entry_face_identity_embedding,
+            self.exit_face_identity_embedding,
             self.color_embedding,
             self.entry_color_embedding,
             self.exit_color_embedding,
@@ -147,6 +326,61 @@ class TimelineCandidate:
                     raise ValueError("face geometry values must be finite numbers")
                 if geometry[4] <= 0.0:
                     raise ValueError("face eye scale must be positive")
+        for bbox in (
+            self.focus_bbox_xywh,
+            self.entry_focus_bbox_xywh,
+            self.exit_focus_bbox_xywh,
+            self.subject_bbox_xywh,
+            self.entry_subject_bbox_xywh,
+            self.exit_subject_bbox_xywh,
+        ):
+            if bbox is None:
+                continue
+            if len(bbox) != 4 or any(
+                not isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+                for value in bbox
+            ):
+                raise ValueError("normalized subject boxes must contain four unit values")
+            if bbox[2] <= 0.0 or bbox[3] <= 0.0:
+                raise ValueError("normalized subject boxes must have positive size")
+            if bbox[0] + bbox[2] > 1.000001 or bbox[1] + bbox[3] > 1.000001:
+                raise ValueError("normalized subject box exceeds frame bounds")
+        for centroid in (
+            self.subject_centroid_xy,
+            self.entry_subject_centroid_xy,
+            self.exit_subject_centroid_xy,
+        ):
+            if centroid is None:
+                continue
+            if len(centroid) != 2 or any(
+                not isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+                for value in centroid
+            ):
+                raise ValueError("subject centroids must contain two unit values")
+        for count in (
+            self.detected_person_count,
+            self.entry_detected_person_count,
+            self.exit_detected_person_count,
+        ):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("detected person counts must be non-negative integers")
+        for formation in (
+            self.formation_people,
+            self.entry_formation_people,
+            self.exit_formation_people,
+        ):
+            if len(formation) > 6:
+                raise ValueError("formation descriptors support at most six people")
+            if any(
+                not isinstance(person, FormationPersonDescriptor)
+                for person in formation
+            ):
+                raise ValueError("formation entries must be person descriptors")
+            if any(
+                right.centroid_xy[0] < left.centroid_xy[0]
+                for left, right in zip(formation, formation[1:])
+            ):
+                raise ValueError("formation descriptors must be ordered left-to-right")
 
     @property
     def duration_seconds(self) -> float:
@@ -167,6 +401,8 @@ class TimelineConfig:
     """Weights and editing constraints for Viterbi source selection."""
 
     quality_weight: float = 1.25
+    quality_soft_floor: float | None = None
+    quality_soft_floor_penalty: float = 0.0
     sync_weight: float = 1.7
     composition_weight: float = 0.65
     boundary_weight: float = 0.35
@@ -177,6 +413,8 @@ class TimelineConfig:
     early_cut_penalty: float = 0.65
     long_hold_penalty: float = 0.14
     source_hold_penalty: float = 0.0
+    source_switch_bonus: float = 0.0
+    ping_pong_penalty: float = 0.0
     preferred_source_bonus: float = 0.0
     preferred_source_max_score_sacrifice: float = 0.0
     pose_transition_weight: float = 0.85
@@ -185,12 +423,33 @@ class TimelineConfig:
     scale_transition_weight: float = 0.40
     color_transition_weight: float = 0.24
     face_geometry_transition_weight: float = 0.28
+    focus_position_transition_weight: float = 1.35
+    subject_geometry_transition_weight: float = 1.10
+    person_count_transition_weight: float = 0.42
+    person_layout_transition_weight: float = 1.55
+    formation_transition_weight: float = 1.90
+    shot_type_transition_weight: float = 0.72
+    face_identity_transition_weight: float = 1.60
+    maximum_cross_source_scale_delta: float | None = None
+    maximum_cross_source_focus_mismatch: float | None = None
+    maximum_cross_source_layout_mismatch: float | None = None
+    maximum_cross_source_formation_mismatch: float | None = None
+    maximum_cross_source_silhouette_mismatch: float | None = None
+    minimum_cross_source_face_similarity: float | None = None
+    require_cross_source_visual_evidence: bool = False
+    maximum_boundary_side_scale_delta: float | None = None
+    maximum_boundary_side_structure_mismatch: float | None = None
+    maximum_boundary_side_pose_mismatch: float | None = None
+    maximum_boundary_side_shot_type_mismatch: float | None = None
+    require_cross_source_boundary_side_stability: bool = False
     group_wide_fallback_penalty: float = 0.55
     minimum_member_confidence: float = 0.72
     minimum_hold_segments: int = 2
     preferred_max_hold_segments: int = 6
     preferred_max_source_hold_segments: int | None = None
     maximum_same_source_hold_segments: int | None = None
+    preferred_max_source_hold_seconds: float | None = None
+    maximum_same_source_hold_seconds: float | None = None
     maximum_switch_score_sacrifice: float = 0.0
 
     def __post_init__(self) -> None:
@@ -206,6 +465,7 @@ class TimelineConfig:
             "early_cut_penalty",
             "long_hold_penalty",
             "source_hold_penalty",
+            "ping_pong_penalty",
             "preferred_source_bonus",
             "preferred_source_max_score_sacrifice",
             "pose_transition_weight",
@@ -214,11 +474,64 @@ class TimelineConfig:
             "scale_transition_weight",
             "color_transition_weight",
             "face_geometry_transition_weight",
+            "focus_position_transition_weight",
+            "subject_geometry_transition_weight",
+            "person_count_transition_weight",
+            "person_layout_transition_weight",
+            "formation_transition_weight",
+            "shot_type_transition_weight",
+            "face_identity_transition_weight",
             "group_wide_fallback_penalty",
             "maximum_switch_score_sacrifice",
         )
         if any(getattr(self, name) < 0 for name in weight_names):
             raise ValueError("timeline weights and penalties cannot be negative")
+        if self.quality_soft_floor is not None and (
+            not isfinite(self.quality_soft_floor)
+            or not 0.0 <= self.quality_soft_floor <= 1.0
+        ):
+            raise ValueError("quality_soft_floor must be normalized or None")
+        if (
+            not isfinite(self.quality_soft_floor_penalty)
+            or self.quality_soft_floor_penalty < 0.0
+        ):
+            raise ValueError(
+                "quality_soft_floor_penalty must be finite and non-negative"
+            )
+        if (
+            self.quality_soft_floor is None
+            and self.quality_soft_floor_penalty > 0.0
+        ):
+            raise ValueError(
+                "quality_soft_floor_penalty requires quality_soft_floor"
+            )
+        if not isfinite(self.source_switch_bonus) or self.source_switch_bonus < 0.0:
+            raise ValueError("source_switch_bonus must be finite and non-negative")
+        for name in (
+            "maximum_cross_source_scale_delta",
+            "maximum_cross_source_focus_mismatch",
+            "maximum_cross_source_layout_mismatch",
+            "maximum_cross_source_formation_mismatch",
+            "maximum_cross_source_silhouette_mismatch",
+            "maximum_boundary_side_scale_delta",
+            "maximum_boundary_side_structure_mismatch",
+            "maximum_boundary_side_pose_mismatch",
+            "maximum_boundary_side_shot_type_mismatch",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isfinite(value) or not 0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be a normalized value or None")
+        if self.minimum_cross_source_face_similarity is not None and (
+            not isfinite(self.minimum_cross_source_face_similarity)
+            or not -1.0 <= self.minimum_cross_source_face_similarity <= 1.0
+        ):
+            raise ValueError(
+                "minimum_cross_source_face_similarity must be cosine similarity or None"
+            )
+        if not isinstance(self.require_cross_source_visual_evidence, bool) or not isinstance(
+            self.require_cross_source_boundary_side_stability, bool
+        ):
+            raise ValueError("cross-source evidence requirements must be booleans")
         _score(self.minimum_member_confidence, "minimum_member_confidence")
         if self.minimum_hold_segments < 1:
             raise ValueError("minimum_hold_segments must be at least 1")
@@ -243,6 +556,22 @@ class TimelineConfig:
             < self.preferred_max_source_hold_segments
         ):
             raise ValueError("maximum same-source hold cannot be below preferred source hold")
+        for name in (
+            "preferred_max_source_hold_seconds",
+            "maximum_same_source_hold_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be positive and finite or None")
+        if (
+            self.preferred_max_source_hold_seconds is not None
+            and self.maximum_same_source_hold_seconds is not None
+            and self.maximum_same_source_hold_seconds
+            < self.preferred_max_source_hold_seconds
+        ):
+            raise ValueError(
+                "maximum same-source hold seconds cannot be below preferred seconds"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,15 +606,25 @@ class TimelineResult:
 @dataclass(frozen=True, slots=True)
 class _Node:
     cumulative_score: float
-    previous_state: tuple[int, int, int] | None
+    previous_state: tuple[int, int, int, int] | None
     emission_score: float
     transition_score: float
     used_fallback: bool
 
 
 def _normalised_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    mismatch = _optional_normalised_distance(left, right)
+    return mismatch if mismatch is not None else 0.0
+
+
+def _optional_normalised_distance(
+    left: Sequence[float],
+    right: Sequence[float],
+) -> float | None:
+    """Return embedding RMS while preserving unavailable evidence as ``None``."""
+
     if not left or not right or len(left) != len(right):
-        return 0.0
+        return None
     squared = sum((float(a) - float(b)) ** 2 for a, b in zip(left, right))
     # RMS is less sensitive to embedding dimension. Clamp because landmark
     # vectors from third-party models are not guaranteed to be normalized.
@@ -303,6 +642,267 @@ def _motion_mismatch(
         return 0.0
     cosine = (left[0] * right[0] + left[1] * right[1]) / (left_norm * right_norm)
     return min(1.0, max(0.0, (1.0 - cosine) / 2.0))
+
+
+def _bbox_geometry_mismatch(
+    left: tuple[float, float, float, float] | None,
+    right: tuple[float, float, float, float] | None,
+    *,
+    left_centroid: tuple[float, float] | None = None,
+    right_centroid: tuple[float, float] | None = None,
+) -> float | None:
+    """Screen-space attention jump between two subject layouts."""
+
+    if left is None or right is None:
+        return None
+    left_center = left_centroid or (left[0] + left[2] / 2.0, left[1] + left[3] / 2.0)
+    right_center = right_centroid or (
+        right[0] + right[2] / 2.0,
+        right[1] + right[3] / 2.0,
+    )
+    center = min(1.0, sqrt(
+        (left_center[0] - right_center[0]) ** 2
+        + (left_center[1] - right_center[1]) ** 2
+    ) / 0.42)
+    left_area = max(left[2] * left[3], 1e-6)
+    right_area = max(right[2] * right[3], 1e-6)
+    scale = min(1.0, abs(log(left_area / right_area)) / log(3.2))
+    width = min(1.0, abs(left[2] - right[2]) / 0.55)
+    height = min(1.0, abs(left[3] - right[3]) / 0.55)
+    return min(1.0, 0.52 * center + 0.28 * scale + 0.10 * width + 0.10 * height)
+
+
+def screen_layout_mismatch(
+    left_embedding: Sequence[float],
+    right_embedding: Sequence[float],
+    *,
+    left_bbox: tuple[float, float, float, float] | None = None,
+    right_bbox: tuple[float, float, float, float] | None = None,
+    left_centroid: tuple[float, float] | None = None,
+    right_centroid: tuple[float, float] | None = None,
+) -> float | None:
+    """Return the reviewable person-layout mismatch for one source switch.
+
+    The richer layout embedding remains authoritative when both boundary
+    vectors are comparable.  If inference missed on either side, use the
+    exact subject-box/centroid scalar that survives serialization.  When
+    neither representation is complete the signal remains unavailable; a
+    missing detector result is never converted into evidence of compatibility.
+    """
+
+    embedding_mismatch = _optional_normalised_distance(
+        left_embedding,
+        right_embedding,
+    )
+    if embedding_mismatch is not None:
+        return embedding_mismatch
+    return _bbox_geometry_mismatch(
+        left_bbox,
+        right_bbox,
+        left_centroid=left_centroid,
+        right_centroid=right_centroid,
+    )
+
+
+def cross_source_layout_mismatch(
+    previous: TimelineCandidate,
+    current: TimelineCandidate,
+) -> float | None:
+    """Mirror ``timeline_review`` layout evidence for a candidate boundary."""
+
+    # Empty embedding tuples are explicit boundary detector misses and must
+    # not fall back to a segment midpoint.  Optional bbox/centroid fields use
+    # the reviewer's normal boundary-value fallback when the boundary sample
+    # itself is absent.
+    previous_embedding = previous.exit_person_layout_embedding
+    current_embedding = current.entry_person_layout_embedding
+    previous_bbox = (
+        previous.exit_subject_bbox_xywh
+        if previous.exit_subject_bbox_xywh is not None
+        else previous.subject_bbox_xywh
+    )
+    current_bbox = (
+        current.entry_subject_bbox_xywh
+        if current.entry_subject_bbox_xywh is not None
+        else current.subject_bbox_xywh
+    )
+    previous_centroid = (
+        previous.exit_subject_centroid_xy
+        if previous.exit_subject_centroid_xy is not None
+        else previous.subject_centroid_xy
+    )
+    current_centroid = (
+        current.entry_subject_centroid_xy
+        if current.entry_subject_centroid_xy is not None
+        else current.subject_centroid_xy
+    )
+    return screen_layout_mismatch(
+        previous_embedding,
+        current_embedding,
+        left_bbox=previous_bbox,
+        right_bbox=current_bbox,
+        left_centroid=previous_centroid,
+        right_centroid=current_centroid,
+    )
+
+
+def _person_count_mismatch(left: int, right: int) -> float:
+    if left <= 0 or right <= 0:
+        return 0.0
+    return min(1.0, abs(log((left + 1.0) / (right + 1.0))) / log(4.0))
+
+
+def _upper_body_shape_mismatch(
+    left: FormationPersonDescriptor,
+    right: FormationPersonDescriptor,
+) -> float | None:
+    left_points = left.upper_body_keypoints_xyc
+    right_points = right.upper_body_keypoints_xyc
+    if not left_points or not right_points or len(left_points) != len(right_points):
+        return None
+    weighted_squared = 0.0
+    total_weight = 0.0
+    visibility_delta = 0.0
+    comparable = 0
+    for left_point, right_point in zip(left_points, right_points, strict=True):
+        left_confidence = float(left_point[2])
+        right_confidence = float(right_point[2])
+        visibility_delta += abs(left_confidence - right_confidence)
+        weight = min(left_confidence, right_confidence)
+        if weight < 0.20:
+            continue
+        weighted_squared += weight * (
+            (float(left_point[0]) - float(right_point[0])) ** 2
+            + (float(left_point[1]) - float(right_point[1])) ** 2
+        )
+        total_weight += weight
+        comparable += 1
+    if comparable < 4 or total_weight <= 1e-9:
+        return None
+    # Coordinates are torso-normalized to [-1, 1]. A 0.72 RMS displacement is
+    # already a visibly different arm/shoulder pose at a hard cut.
+    shape = min(1.0, sqrt(weighted_squared / total_weight) / 0.72)
+    visibility = min(1.0, visibility_delta / len(left_points))
+    return min(1.0, 0.88 * shape + 0.12 * visibility)
+
+
+def _formation_pair_cost(
+    left: FormationPersonDescriptor,
+    right: FormationPersonDescriptor,
+    *,
+    left_rank: int,
+    right_rank: int,
+    left_count: int,
+    right_count: int,
+) -> float:
+    center = min(
+        1.0,
+        sqrt(
+            (left.centroid_xy[0] - right.centroid_xy[0]) ** 2
+            + (left.centroid_xy[1] - right.centroid_xy[1]) ** 2
+        )
+        / 0.52,
+    )
+    left_width = max(1e-5, left.bbox_xywh[2])
+    left_height = max(1e-5, left.bbox_xywh[3])
+    right_width = max(1e-5, right.bbox_xywh[2])
+    right_height = max(1e-5, right.bbox_xywh[3])
+    scale = min(
+        1.0,
+        (
+            abs(log(left_width / right_width))
+            + abs(log(left_height / right_height))
+        )
+        / (2.0 * log(2.4)),
+    )
+    shape = _upper_body_shape_mismatch(left, right)
+    if shape is None:
+        base = 0.72 * center + 0.28 * scale
+    else:
+        # When two dancers exchange left/right while keeping different arm
+        # poses, a shape-only assignment wants to cross the pairs and a
+        # position-only assignment wants to ignore the choreography. Keeping
+        # both terms strong makes either explanation pay for the visible jump.
+        base = 0.36 * center + 0.08 * scale + 0.56 * shape
+    left_fraction = left_rank / max(1, left_count - 1)
+    right_fraction = right_rank / max(1, right_count - 1)
+    rank = abs(left_fraction - right_fraction)
+    return min(1.0, 0.92 * base + 0.08 * rank)
+
+
+def formation_assignment_mismatch(
+    left: Sequence[FormationPersonDescriptor],
+    right: Sequence[FormationPersonDescriptor],
+) -> float | None:
+    """Minimum-cost one-to-one formation mismatch for at most six people.
+
+    A small bitmask dynamic program is equivalent to Hungarian assignment at
+    this fixed IVE-sized problem.  Unmatched detections retain an explicit
+    penalty, while each pair jointly compares position, scale, left-to-right
+    rank, and optional non-facial upper-body shape.
+    """
+
+    if not left or not right:
+        return None
+    if len(left) > 6 or len(right) > 6:
+        raise ValueError("formation matching supports at most six people")
+
+    # Assign every item from the smaller side to a unique item on the larger
+    # side.  Keep original left/right ranks even when the sides are swapped.
+    if len(left) <= len(right):
+        smaller = tuple(left)
+        larger = tuple(right)
+        swapped = False
+    else:
+        smaller = tuple(right)
+        larger = tuple(left)
+        swapped = True
+    states: dict[int, float] = {0: 0.0}
+    for smaller_index in range(len(smaller)):
+        next_states: dict[int, float] = {}
+        for mask, accumulated in states.items():
+            for larger_index in range(len(larger)):
+                bit = 1 << larger_index
+                if mask & bit:
+                    continue
+                if swapped:
+                    pair = _formation_pair_cost(
+                        larger[larger_index],
+                        smaller[smaller_index],
+                        left_rank=larger_index,
+                        right_rank=smaller_index,
+                        left_count=len(left),
+                        right_count=len(right),
+                    )
+                else:
+                    pair = _formation_pair_cost(
+                        smaller[smaller_index],
+                        larger[larger_index],
+                        left_rank=smaller_index,
+                        right_rank=larger_index,
+                        left_count=len(left),
+                        right_count=len(right),
+                    )
+                new_mask = mask | bit
+                score = accumulated + pair
+                previous = next_states.get(new_mask)
+                if previous is None or score < previous:
+                    next_states[new_mask] = score
+        states = next_states
+    matched_cost = min(states.values())
+    unmatched_count = abs(len(left) - len(right))
+    unmatched_cost = 0.82 * unmatched_count
+    return min(1.0, (matched_cost + unmatched_cost) / max(len(left), len(right)))
+
+
+def _shot_type_mismatch(left: ShotType, right: ShotType) -> float:
+    rank = {
+        ShotType.GROUP_WIDE: 0,
+        ShotType.WIDE: 1,
+        ShotType.MEDIUM: 2,
+        ShotType.CLOSE_UP: 3,
+    }
+    return abs(rank[left] - rank[right]) / 3.0
 
 
 def _angle_distance(left: float, right: float) -> float:
@@ -380,11 +980,25 @@ def _candidate_emission(
     target: IVEMember | None,
     config: TimelineConfig,
 ) -> tuple[float, bool] | None:
+    quality_floor_penalty = 0.0
+    if (
+        config.quality_soft_floor is not None
+        and candidate.quality_score < config.quality_soft_floor
+    ):
+        # Normalize by the configured floor so the maximum penalty remains the
+        # reviewable config value.  A quadratic shoulder keeps near-floor
+        # measurements from causing source churn while strongly discouraging
+        # genuinely soft/compressed shots.
+        deficit = (
+            config.quality_soft_floor - candidate.quality_score
+        ) / max(config.quality_soft_floor, 1e-9)
+        quality_floor_penalty = config.quality_soft_floor_penalty * deficit**2
     base = (
         config.quality_weight * candidate.quality_score
         + config.sync_weight * candidate.sync_score
         + config.composition_weight * candidate.composition_score
         + config.boundary_weight * candidate.boundary_score
+        - quality_floor_penalty
     )
     if mode is TimelineMode.GENERAL:
         return (base, False)
@@ -405,16 +1019,233 @@ def _candidate_emission(
     return None
 
 
+def _has_exit_boundary_descriptor(candidate: TimelineCandidate) -> bool:
+    """Whether the caller supplied boundary-specific outgoing evidence."""
+
+    return bool(
+        candidate.exit_shot_scale is not None
+        or candidate.exit_shot_type is not None
+        or candidate.exit_scene_cut_near
+        or candidate.exit_focus_bbox_xywh is not None
+        or candidate.exit_subject_bbox_xywh is not None
+        or candidate.exit_subject_centroid_xy is not None
+        or candidate.exit_pose_embedding
+        or candidate.exit_structure_embedding
+        or candidate.exit_silhouette_embedding
+        or candidate.exit_person_layout_embedding
+        or candidate.exit_formation_people
+        or candidate.exit_face_identity_embedding
+        or candidate.exit_color_embedding
+        or candidate.exit_face_geometry_window
+        or candidate.exit_motion is not None
+    )
+
+
+def _has_entry_boundary_descriptor(candidate: TimelineCandidate) -> bool:
+    """Whether the caller supplied boundary-specific incoming evidence."""
+
+    return bool(
+        candidate.entry_shot_scale is not None
+        or candidate.entry_shot_type is not None
+        or candidate.entry_scene_cut_near
+        or candidate.entry_focus_bbox_xywh is not None
+        or candidate.entry_subject_bbox_xywh is not None
+        or candidate.entry_subject_centroid_xy is not None
+        or candidate.entry_pose_embedding
+        or candidate.entry_structure_embedding
+        or candidate.entry_silhouette_embedding
+        or candidate.entry_person_layout_embedding
+        or candidate.entry_formation_people
+        or candidate.entry_face_identity_embedding
+        or candidate.entry_color_embedding
+        or candidate.entry_face_geometry_window
+        or candidate.entry_motion is not None
+    )
+
+
+def _boundary_side_stability_allowed(
+    evidence: BoundarySideStability | None,
+    config: TimelineConfig,
+) -> bool:
+    if evidence is None:
+        return not config.require_cross_source_boundary_side_stability
+    return not boundary_side_stability_exceeded(
+        evidence,
+        maximum_scale_delta=config.maximum_boundary_side_scale_delta,
+        maximum_structure_mismatch=(
+            config.maximum_boundary_side_structure_mismatch
+        ),
+        maximum_pose_mismatch=config.maximum_boundary_side_pose_mismatch,
+        maximum_shot_type_mismatch=(
+            config.maximum_boundary_side_shot_type_mismatch
+        ),
+    )
+
+
+def _cross_source_transition_allowed(
+    previous: TimelineCandidate,
+    current: TimelineCandidate,
+    config: TimelineConfig,
+) -> bool:
+    """Reject attention-jumping cross-source edges before Viterbi scoring."""
+
+    if not _boundary_side_stability_allowed(
+        previous.exit_boundary_side_stability,
+        config,
+    ) or not _boundary_side_stability_allowed(
+        current.entry_boundary_side_stability,
+        config,
+    ):
+        return False
+    evidence_available = False
+    if previous.exit_scene_cut_near or current.entry_scene_cut_near:
+        return False
+    previous_scale = (
+        previous.exit_shot_scale
+        if previous.exit_shot_scale is not None
+        else previous.shot_scale
+    )
+    current_scale = (
+        current.entry_shot_scale
+        if current.entry_shot_scale is not None
+        else current.shot_scale
+    )
+    scale_delta = abs(previous_scale - current_scale)
+    if (
+        config.maximum_cross_source_scale_delta is not None
+        and scale_delta > config.maximum_cross_source_scale_delta
+    ):
+        return False
+
+    # ``entry/exit_shot_scale`` doubles as a compatibility marker for callers
+    # that provide full boundary descriptors.  Once that marker is present, a
+    # missed boundary detector must stay missing: falling back to the segment
+    # midpoint can be seconds away and would falsely certify a visually unknown
+    # cut as safe. Legacy callers that only populate midpoint fields retain the
+    # old fallback behavior.
+    previous_has_boundary_descriptor = _has_exit_boundary_descriptor(previous)
+    current_has_boundary_descriptor = _has_entry_boundary_descriptor(current)
+    previous_focus = (
+        previous.exit_focus_bbox_xywh
+        if previous_has_boundary_descriptor
+        else previous.focus_bbox_xywh
+    )
+    current_focus = (
+        current.entry_focus_bbox_xywh
+        if current_has_boundary_descriptor
+        else current.focus_bbox_xywh
+    )
+    focus_mismatch = _bbox_geometry_mismatch(previous_focus, current_focus)
+    if focus_mismatch is not None:
+        evidence_available = True
+        if (
+            config.maximum_cross_source_focus_mismatch is not None
+            and focus_mismatch > config.maximum_cross_source_focus_mismatch
+        ):
+            return False
+
+    previous_identity = (
+        previous.exit_face_identity_embedding
+        if previous_has_boundary_descriptor
+        else previous.face_identity_embedding
+    )
+    current_identity = (
+        current.entry_face_identity_embedding
+        if current_has_boundary_descriptor
+        else current.face_identity_embedding
+    )
+    face_similarity = cosine_similarity(previous_identity, current_identity)
+    if face_similarity is not None:
+        evidence_available = True
+    previous_shot_type = previous.exit_shot_type or previous.shot_type
+    current_shot_type = current.entry_shot_type or current.shot_type
+    both_close = (
+        previous_shot_type is ShotType.CLOSE_UP
+        and current_shot_type is ShotType.CLOSE_UP
+    )
+    if config.minimum_cross_source_face_similarity is not None and both_close:
+        # A close-up switch without same-face evidence is the most noticeable
+        # member jump.  Hold the current broadcaster instead of guessing.
+        if (
+            face_similarity is None
+            or face_similarity < config.minimum_cross_source_face_similarity
+        ):
+            return False
+
+    layout_mismatch = cross_source_layout_mismatch(previous, current)
+    if layout_mismatch is not None:
+        evidence_available = True
+        if (
+            config.maximum_cross_source_layout_mismatch is not None
+            and layout_mismatch > config.maximum_cross_source_layout_mismatch
+        ):
+            return False
+
+    previous_formation = (
+        previous.exit_formation_people
+        if previous_has_boundary_descriptor
+        else previous.formation_people
+    )
+    current_formation = (
+        current.entry_formation_people
+        if current_has_boundary_descriptor
+        else current.formation_people
+    )
+    formation_mismatch = formation_assignment_mismatch(
+        previous_formation,
+        current_formation,
+    )
+    if formation_mismatch is not None:
+        evidence_available = True
+        if (
+            config.maximum_cross_source_formation_mismatch is not None
+            and formation_mismatch
+            > config.maximum_cross_source_formation_mismatch
+        ):
+            return False
+
+    previous_silhouette = (
+        previous.exit_silhouette_embedding
+        if previous_has_boundary_descriptor
+        else previous.silhouette_embedding
+    )
+    current_silhouette = (
+        current.entry_silhouette_embedding
+        if current_has_boundary_descriptor
+        else current.silhouette_embedding
+    )
+    silhouette_mismatch = (
+        _normalised_distance(previous_silhouette, current_silhouette)
+        if previous_silhouette and current_silhouette
+        else None
+    )
+    if silhouette_mismatch is not None:
+        evidence_available = True
+        if (
+            config.maximum_cross_source_silhouette_mismatch is not None
+            and silhouette_mismatch
+            > config.maximum_cross_source_silhouette_mismatch
+        ):
+            return False
+    return evidence_available or not config.require_cross_source_visual_evidence
+
+
 def _transition_score(
     previous: TimelineCandidate,
     current: TimelineCandidate,
     previous_run_length: int,
     config: TimelineConfig,
-) -> tuple[float, int]:
+) -> tuple[float, int] | None:
     same_source = previous.source_id == current.source_id
     same_continuous_shot = same_source and (
         (not previous.shot_id and not current.shot_id)
         or (previous.shot_id and previous.shot_id == current.shot_id)
+    )
+    same_source_native_cut = bool(
+        same_source
+        and previous.shot_id
+        and current.shot_id
+        and previous.shot_id != current.shot_id
     )
     if same_continuous_shot:
         run_length = previous_run_length + 1
@@ -423,7 +1254,21 @@ def _transition_score(
             score -= config.long_hold_penalty * (
                 run_length - config.preferred_max_hold_segments
             )
+    elif same_source_native_cut:
+        # The broadcaster already made this edit inside one source. Preserve
+        # the source-continuity reward, but apply neither a cut/early penalty
+        # nor visual mismatch penalties as if the cross-cut engine introduced
+        # it. The shot run still resets, while the separate same-source run
+        # remains uninterrupted and therefore cannot evade source-rotation caps.
+        run_length = 1
+        score = config.continuity_bonus
     else:
+        if not same_source and not _cross_source_transition_allowed(
+            previous,
+            current,
+            config,
+        ):
+            return None
         run_length = 1
         score = -config.cut_penalty
         if previous_run_length < config.minimum_hold_segments:
@@ -448,22 +1293,146 @@ def _transition_score(
         score -= config.pose_transition_weight * _normalised_distance(
             previous_pose, current_pose
         )
+        previous_has_boundary_descriptor = _has_exit_boundary_descriptor(previous)
+        current_has_boundary_descriptor = _has_entry_boundary_descriptor(current)
         previous_silhouette = (
-            previous.exit_silhouette_embedding or previous.silhouette_embedding
+            previous.exit_silhouette_embedding
+            if previous_has_boundary_descriptor
+            else previous.silhouette_embedding
         )
         current_silhouette = (
-            current.entry_silhouette_embedding or current.silhouette_embedding
+            current.entry_silhouette_embedding
+            if current_has_boundary_descriptor
+            else current.silhouette_embedding
         )
         score -= config.silhouette_transition_weight * _normalised_distance(
             previous_silhouette,
             current_silhouette,
         )
         score -= config.motion_transition_weight * _motion_mismatch(
-            previous.motion, current.motion
+            previous.exit_motion or previous.motion,
+            current.entry_motion or current.motion,
+        )
+        previous_scale = (
+            previous.exit_shot_scale
+            if previous.exit_shot_scale is not None
+            else previous.shot_scale
+        )
+        current_scale = (
+            current.entry_shot_scale
+            if current.entry_shot_scale is not None
+            else current.shot_scale
         )
         score -= config.scale_transition_weight * abs(
-            previous.shot_scale - current.shot_scale
+            previous_scale - current_scale
         )
+        score -= config.shot_type_transition_weight * _shot_type_mismatch(
+            previous.exit_shot_type or previous.shot_type,
+            current.entry_shot_type or current.shot_type,
+        )
+        previous_focus = (
+            previous.exit_focus_bbox_xywh
+            if previous_has_boundary_descriptor
+            else previous.focus_bbox_xywh
+        )
+        current_focus = (
+            current.entry_focus_bbox_xywh
+            if current_has_boundary_descriptor
+            else current.focus_bbox_xywh
+        )
+        focus_mismatch = _bbox_geometry_mismatch(previous_focus, current_focus)
+        if focus_mismatch is not None:
+            score -= config.focus_position_transition_weight * focus_mismatch
+        elif (previous_focus is None) != (current_focus is None) and (
+            previous.shot_type is ShotType.CLOSE_UP
+            or current.shot_type is ShotType.CLOSE_UP
+        ):
+            # A close-up with no comparable incoming/outgoing focal subject is
+            # exactly the viewer-attention jump that makes a synced cut feel
+            # like a random compilation.
+            score -= config.focus_position_transition_weight * 0.72
+        previous_subject = (
+            previous.exit_subject_bbox_xywh
+            if previous_has_boundary_descriptor
+            else previous.subject_bbox_xywh
+        )
+        current_subject = (
+            current.entry_subject_bbox_xywh
+            if current_has_boundary_descriptor
+            else current.subject_bbox_xywh
+        )
+        subject_mismatch = _bbox_geometry_mismatch(
+            previous_subject,
+            current_subject,
+            left_centroid=(
+                previous.exit_subject_centroid_xy
+                if previous_has_boundary_descriptor
+                else previous.subject_centroid_xy
+            ),
+            right_centroid=(
+                current.entry_subject_centroid_xy
+                if current_has_boundary_descriptor
+                else current.subject_centroid_xy
+            ),
+        )
+        if subject_mismatch is not None:
+            score -= config.subject_geometry_transition_weight * subject_mismatch
+        score -= config.person_count_transition_weight * _person_count_mismatch(
+            (
+                previous.exit_detected_person_count
+                if previous_has_boundary_descriptor
+                else previous.detected_person_count
+            ),
+            (
+                current.entry_detected_person_count
+                if current_has_boundary_descriptor
+                else current.detected_person_count
+            ),
+        )
+        previous_layout = (
+            previous.exit_person_layout_embedding
+            if previous_has_boundary_descriptor
+            else previous.person_layout_embedding
+        )
+        current_layout = (
+            current.entry_person_layout_embedding
+            if current_has_boundary_descriptor
+            else current.person_layout_embedding
+        )
+        score -= config.person_layout_transition_weight * _normalised_distance(
+            previous_layout,
+            current_layout,
+        )
+        previous_formation = (
+            previous.exit_formation_people
+            if previous_has_boundary_descriptor
+            else previous.formation_people
+        )
+        current_formation = (
+            current.entry_formation_people
+            if current_has_boundary_descriptor
+            else current.formation_people
+        )
+        formation_mismatch = formation_assignment_mismatch(
+            previous_formation,
+            current_formation,
+        )
+        if formation_mismatch is not None:
+            score -= config.formation_transition_weight * formation_mismatch
+        previous_identity = (
+            previous.exit_face_identity_embedding
+            if previous_has_boundary_descriptor
+            else previous.face_identity_embedding
+        )
+        current_identity = (
+            current.entry_face_identity_embedding
+            if current_has_boundary_descriptor
+            else current.face_identity_embedding
+        )
+        face_similarity = cosine_similarity(previous_identity, current_identity)
+        if face_similarity is not None:
+            identity_mismatch = max(0.0, 0.55 - face_similarity) / 0.55
+            score -= config.face_identity_transition_weight * identity_mismatch
         previous_color = previous.exit_color_embedding or previous.color_embedding
         current_color = current.entry_color_embedding or current.color_embedding
         score -= config.color_transition_weight * _normalised_distance(
@@ -532,7 +1501,6 @@ def _resolved_preferred_sources(
     )
     if not source_order:
         return requested
-    cycle_size = len(source_order)
     resolved: list[str | None] = [None] * len(segments)
 
     def source_score(position: int, source_id: str) -> float | None:
@@ -550,69 +1518,59 @@ def _resolved_preferred_sources(
         best = max(value for value, _fallback in emissions[position].values())
         return score >= best - config.preferred_source_max_score_sacrifice
 
-    for cycle_start in range(0, len(segments), cycle_size):
-        positions = tuple(
-            range(cycle_start, min(len(segments), cycle_start + cycle_size))
-        )
-        requested_cycle = tuple(requested[position] for position in positions)
-        is_complete_cycle = (
-            len(positions) == cycle_size
-            and set(requested_cycle) == set(source_order)
-        )
-        if not is_complete_cycle:
-            for position in positions:
-                source_id = requested[position]
-                if source_id is not None and is_comparable(position, source_id):
-                    resolved[position] = source_id
-            continue
+    # Coverage is a whole-song objective.  Repeating a forced ten-source cycle
+    # every few seconds overwhelmed body-layout continuity in real edits.  Give
+    # each source one well-spaced anchor across the complete song instead; the
+    # Viterbi pass may extend that source around the anchor to enter/leave on a
+    # visually safer boundary.
+    target_position: dict[str, int] = {}
+    for rank, source_id in enumerate(source_order):
+        if len(source_order) == 1:
+            position = len(segments) // 2
+        else:
+            position = round(rank * (len(segments) - 1) / (len(source_order) - 1))
+        target_position[source_id] = position
 
-        original_position = {
-            source_id: position
-            for position, source_id in zip(positions, requested_cycle)
-            if source_id is not None
-        }
-        options: dict[str, tuple[int, ...]] = {}
-        for source_id in source_order:
-            ranked: list[tuple[int, float, int, int]] = []
-            for position in positions:
-                score = source_score(position, source_id)
-                if score is None or not is_comparable(position, source_id):
-                    continue
-                best = max(
-                    value for value, _fallback in emissions[position].values()
+    options: dict[str, tuple[int, ...]] = {}
+    for source_id in source_order:
+        ranked: list[tuple[float, int, int]] = []
+        target = target_position[source_id]
+        for position in range(len(segments)):
+            score = source_score(position, source_id)
+            if score is None or not is_comparable(position, source_id):
+                continue
+            best = max(value for value, _fallback in emissions[position].values())
+            ranked.append(
+                (
+                    best - score,
+                    abs(position - target),
+                    position,
                 )
-                ranked.append(
-                    (
-                        0 if original_position.get(source_id) == position else 1,
-                        best - score,
-                        abs(position - original_position[source_id]),
-                        position,
-                    )
-                )
-            options[source_id] = tuple(item[-1] for item in sorted(ranked))
+            )
+        options[source_id] = tuple(item[-1] for item in sorted(ranked))
 
-        owner_by_position: dict[int, str] = {}
+    owner_by_position: dict[int, str] = {}
 
-        def assign(source_id: str, visited: set[int]) -> bool:
-            for position in options[source_id]:
-                if position in visited:
-                    continue
-                visited.add(position)
-                owner = owner_by_position.get(position)
-                if owner is None or assign(owner, visited):
-                    owner_by_position[position] = source_id
-                    return True
-            return False
+    def assign(source_id: str, visited: set[int]) -> bool:
+        for position in options[source_id]:
+            if position in visited:
+                continue
+            visited.add(position)
+            owner = owner_by_position.get(position)
+            if owner is None or assign(owner, visited):
+                owner_by_position[position] = source_id
+                return True
+        return False
 
-        source_rank = {source_id: rank for rank, source_id in enumerate(source_order)}
-        for source_id in sorted(
-            source_order,
-            key=lambda value: (len(options[value]), source_rank[value]),
-        ):
-            if options[source_id]:
-                assign(source_id, set())
-        for position, source_id in owner_by_position.items():
-            resolved[position] = source_id
+    source_rank = {source_id: rank for rank, source_id in enumerate(source_order)}
+    for source_id in sorted(
+        source_order,
+        key=lambda value: (len(options[value]), source_rank[value]),
+    ):
+        if options[source_id]:
+            assign(source_id, set())
+    for position, source_id in owner_by_position.items():
+        resolved[position] = source_id
 
     return tuple(resolved)
 
@@ -625,6 +1583,7 @@ def select_timeline(
     target_member: IVEMember | str | None = None,
     config: TimelineConfig | None = None,
     preferred_source_ids: Sequence[str | None] | None = None,
+    emission_adjustments: Mapping[tuple[int, str], float] | None = None,
 ) -> TimelineResult:
     """Select one candidate per segment with global DP/Viterbi optimisation.
 
@@ -649,6 +1608,41 @@ def select_timeline(
         raise ValueError("target_member is required in member mode")
     settings = config or TimelineConfig()
     segments = _normalise_segments(candidates_by_segment)
+    if settings.maximum_same_source_hold_seconds is not None:
+        oversized_segment = next(
+            (
+                segment[0]
+                for segment in segments
+                if segment[0].end_seconds - segment[0].start_seconds
+                > settings.maximum_same_source_hold_seconds
+            ),
+            None,
+        )
+        if oversized_segment is not None:
+            raise ValueError(
+                f"segment {oversized_segment.segment_index} is longer than the "
+                "maximum same-source hold seconds"
+            )
+    adjustments = dict(emission_adjustments or {})
+    for key, value in adjustments.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or isinstance(key[0], bool)
+            or not isinstance(key[0], int)
+            or not isinstance(key[1], str)
+        ):
+            raise ValueError(
+                "emission adjustment keys must be (segment_index, source_id)"
+            )
+        if not isfinite(float(value)) or float(value) > 0.0:
+            raise ValueError("emission adjustments must be finite non-positive values")
+    ordered_source_ids = tuple(
+        sorted({candidate.source_id for segment in segments for candidate in segment})
+    )
+    source_rank_by_id = {
+        source_id: rank for rank, source_id in enumerate(ordered_source_ids)
+    }
     preferred_sources = (
         tuple(preferred_source_ids) if preferred_source_ids is not None else None
     )
@@ -669,7 +1663,17 @@ def select_timeline(
                 config=settings,
             )
             if emission is not None:
-                eligible[candidate_index] = emission
+                score, used_fallback = emission
+                eligible[candidate_index] = (
+                    score
+                    + float(
+                        adjustments.get(
+                            (candidate.segment_index, candidate.source_id),
+                            0.0,
+                        )
+                    ),
+                    used_fallback,
+                )
         if not eligible:
             raise ValueError(
                 f"segment {segment[0].segment_index} has no safe candidate for "
@@ -696,14 +1700,17 @@ def select_timeline(
                         used_fallback,
                     )
 
-    # State carries both the continuous-shot run and the same-source run.
-    # A camera cut inside one source resets the former (so normal cut safety
-    # scoring still applies) but not the latter (so it cannot bypass an opted-in
-    # source-rotation policy).
-    layers: list[dict[tuple[int, int, int], _Node]] = []
-    first_layer: dict[tuple[int, int, int], _Node] = {}
+    # State carries the continuous-shot run, the same-source run and the source
+    # used immediately before that run.  The last value lets the global pass
+    # discourage A -> B -> A ping-pong without retaining the whole history.
+    # A camera cut inside one source resets the former while preserving the
+    # same-source continuity reward because it was authored by the broadcaster,
+    # not this edit. It does not reset the latter, so it cannot bypass an
+    # opted-in source-rotation policy.
+    layers: list[dict[tuple[int, int, int, int], _Node]] = []
+    first_layer: dict[tuple[int, int, int, int], _Node] = {}
     for candidate_index, (emission_score, used_fallback) in emissions[0].items():
-        first_layer[(candidate_index, 1, 1)] = _Node(
+        first_layer[(candidate_index, 1, 1, -1)] = _Node(
             cumulative_score=emission_score,
             previous_state=None,
             emission_score=emission_score,
@@ -716,28 +1723,41 @@ def select_timeline(
         previous_segment = segments[segment_position - 1]
         current_segment = segments[segment_position]
         previous_layer = layers[-1]
-        current_layer: dict[tuple[int, int, int], _Node] = {}
+        current_layer: dict[tuple[int, int, int, int], _Node] = {}
 
         for previous_state, previous_node in previous_layer.items():
-            previous_index, previous_shot_run, previous_source_run = previous_state
+            (
+                previous_index,
+                previous_shot_run,
+                previous_source_run,
+                source_before_previous_run,
+            ) = previous_state
             previous_candidate = previous_segment[previous_index]
             local_options: list[
-                tuple[int, float, bool, float, int, int]
+                tuple[int, float, bool, float, int, int, int]
             ] = []
             for current_index, (emission_score, used_fallback) in emissions[
                 segment_position
             ].items():
                 current_candidate = current_segment[current_index]
-                transition_score, shot_run = _transition_score(
+                transition_result = _transition_score(
                     previous_candidate,
                     current_candidate,
                     previous_shot_run,
                     settings,
                 )
+                if transition_result is None:
+                    continue
+                transition_score, shot_run = transition_result
                 source_run = (
                     previous_source_run + 1
                     if previous_candidate.source_id == current_candidate.source_id
                     else 1
+                )
+                source_before_run = (
+                    source_before_previous_run
+                    if previous_candidate.source_id == current_candidate.source_id
+                    else source_rank_by_id[previous_candidate.source_id]
                 )
                 local_options.append(
                     (
@@ -747,6 +1767,7 @@ def select_timeline(
                         transition_score,
                         shot_run,
                         source_run,
+                        source_before_run,
                     )
                 )
 
@@ -757,15 +1778,22 @@ def select_timeline(
                 transition_score,
                 shot_run,
                 source_run,
+                source_before_run,
             ) in local_options:
                 current_candidate = current_segment[current_index]
                 same_source = previous_candidate.source_id == current_candidate.source_id
-                local_score = emission_score + transition_score
+                # Comparable means the alternate picture itself is not a
+                # material quality sacrifice.  Including the fixed hold bonus
+                # and cut penalty here made the test self-referential: after a
+                # long hold, an otherwise identical safe camera could never be
+                # considered comparable precisely because switching is a cut.
+                # Cross-source hard gates have already rejected unsafe edges;
+                # use emission quality for the adaptive cadence escape hatch.
                 comparable_alternate_exists = any(
                     previous_candidate.source_id
                     != current_segment[alternate_index].source_id
-                    and alternate_emission + alternate_transition
-                    >= local_score - settings.maximum_switch_score_sacrifice
+                    and alternate_emission
+                    >= emission_score - settings.maximum_switch_score_sacrifice
                     for (
                         alternate_index,
                         alternate_emission,
@@ -773,7 +1801,13 @@ def select_timeline(
                         alternate_transition,
                         _alternate_shot_run,
                         _alternate_source_run,
+                        _alternate_source_before_run,
                     ) in local_options
+                )
+                source_run_start_position = segment_position - source_run + 1
+                source_run_seconds = (
+                    current_candidate.end_seconds
+                    - segments[source_run_start_position][0].start_seconds
                 )
                 if (
                     same_source
@@ -782,8 +1816,21 @@ def select_timeline(
                     and comparable_alternate_exists
                 ):
                     continue
+                if (
+                    same_source
+                    and settings.maximum_same_source_hold_seconds is not None
+                    and source_run_seconds
+                    > settings.maximum_same_source_hold_seconds
+                ):
+                    continue
 
-                cadence_score = 0.0
+                # Only edges already admitted by _transition_score reach this
+                # point, so the switch incentive can never bypass a visual
+                # hard gate.  Same-source shot changes are internal cuts and
+                # deliberately receive no source-switch cadence bonus.
+                cadence_score = (
+                    settings.source_switch_bonus if not same_source else 0.0
+                )
                 if (
                     same_source
                     and settings.preferred_max_source_hold_segments is not None
@@ -793,8 +1840,31 @@ def select_timeline(
                     cadence_score = -settings.source_hold_penalty * (
                         source_run - settings.preferred_max_source_hold_segments
                     )
+                if (
+                    same_source
+                    and settings.preferred_max_source_hold_seconds is not None
+                    and source_run_seconds
+                    > settings.preferred_max_source_hold_seconds
+                    and comparable_alternate_exists
+                ):
+                    cadence_score -= settings.source_hold_penalty * (
+                        source_run_seconds
+                        - settings.preferred_max_source_hold_seconds
+                    )
+                if (
+                    not same_source
+                    and source_before_previous_run >= 0
+                    and current_candidate.source_id
+                    == ordered_source_ids[source_before_previous_run]
+                ):
+                    cadence_score -= settings.ping_pong_penalty
                 transition_with_cadence = transition_score + cadence_score
-                state = (current_index, shot_run, source_run)
+                state = (
+                    current_index,
+                    shot_run,
+                    source_run,
+                    source_before_run,
+                )
                 cumulative = (
                     previous_node.cumulative_score
                     + transition_with_cadence
@@ -824,9 +1894,10 @@ def select_timeline(
             -item[0][0],
             -item[0][1],
             -item[0][2],
+            -item[0][3],
         ),
     )
-    states: list[tuple[int, int, int]] = [final_state]
+    states: list[tuple[int, int, int, int]] = [final_state]
     for layer_position in range(len(layers) - 1, 0, -1):
         previous_state = layers[layer_position][states[-1]].previous_state
         assert previous_state is not None
@@ -853,18 +1924,105 @@ def select_timeline(
     )
 
 
+def select_timeline_candidates(
+    candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
+    | Sequence[Sequence[TimelineCandidate]],
+    *,
+    mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
+    target_member: IVEMember | str | None = None,
+    config: TimelineConfig | None = None,
+    preferred_source_ids: Sequence[str | None] | None = None,
+    maximum_results: int = 8,
+    diversity_penalty: float = 0.10,
+    minimum_hamming_fraction: float = 0.035,
+) -> tuple[TimelineResult, ...]:
+    """Generate several globally safe, meaningfully different edit paths.
+
+    Each pass is a full constrained Viterbi optimisation.  Previously selected
+    source/segment pairs receive a small deterministic negative adjustment on
+    the next pass, which exposes near-optimal alternatives without weakening
+    any visual/member hard gate.  A later reviewer can therefore compare whole
+    timelines instead of accepting the first argmax unconditionally.
+    """
+
+    if (
+        isinstance(maximum_results, bool)
+        or not isinstance(maximum_results, int)
+        or not 1 <= maximum_results <= 32
+    ):
+        raise ValueError("maximum_results must be an integer from 1 to 32")
+    if not isfinite(diversity_penalty) or diversity_penalty <= 0.0:
+        raise ValueError("diversity_penalty must be positive and finite")
+    if (
+        not isfinite(minimum_hamming_fraction)
+        or not 0.0 <= minimum_hamming_fraction <= 1.0
+    ):
+        raise ValueError("minimum_hamming_fraction must be between zero and one")
+
+    adjustments: dict[tuple[int, str], float] = {}
+    results: list[TimelineResult] = []
+    signatures: list[tuple[str, ...]] = []
+    attempts = 0
+    maximum_attempts = maximum_results * 4
+    while len(results) < maximum_results and attempts < maximum_attempts:
+        attempts += 1
+        result = select_timeline(
+            candidates_by_segment,
+            mode=mode,
+            target_member=target_member,
+            config=config,
+            preferred_source_ids=preferred_source_ids,
+            emission_adjustments=adjustments,
+        )
+        signature = tuple(candidate.source_id for candidate in result.candidates)
+        minimum_distance = max(1, ceil(len(signature) * minimum_hamming_fraction))
+        sufficiently_different = all(
+            sum(left != right for left, right in zip(signature, existing, strict=True))
+            >= minimum_distance
+            for existing in signatures
+        )
+        if sufficiently_different:
+            results.append(result)
+            signatures.append(signature)
+
+        # Penalize even a rejected duplicate. Repeated passes then push the DP
+        # far enough away to expose a genuinely different near-optimal path.
+        for candidate in result.candidates:
+            key = (candidate.segment_index, candidate.source_id)
+            # A small segment-dependent phase prevents perfectly symmetric test
+            # footage from yielding only one all-A, all-B and all-C path.  It is
+            # deterministic and too small to overwhelm actual quality scores.
+            phase = (candidate.segment_index * 5 + attempts * 3) % 11
+            phased_penalty = diversity_penalty * (0.85 + 0.30 * phase / 10.0)
+            adjustments[key] = adjustments.get(key, 0.0) - phased_penalty
+
+    if not results:
+        raise ValueError("timeline candidate generation produced no result")
+    return tuple(results)
+
+
 # A name that reads naturally at call sites which think in terms of Viterbi.
 optimize_timeline = select_timeline
 
 
 __all__ = [
+    "BOUNDARY_SIDE_MAX_POSE_MISMATCH",
+    "BOUNDARY_SIDE_MAX_SCALE_DELTA",
+    "BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH",
+    "BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH",
+    "BoundarySideStability",
     "ShotType",
     "TimelineCandidate",
     "TimelineChoice",
     "TimelineConfig",
     "TimelineMode",
     "TimelineResult",
+    "boundary_side_stability_exceeded",
+    "cross_source_layout_mismatch",
     "face_geometry_minimax_mismatch",
+    "formation_assignment_mismatch",
     "optimize_timeline",
+    "screen_layout_mismatch",
     "select_timeline",
+    "select_timeline_candidates",
 ]

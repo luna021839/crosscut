@@ -1,0 +1,3023 @@
+"""Non-identifying visual path selection for direct member fancams.
+
+The direct portrait member path intentionally does not crop or identify a face.
+It still needs a real edit decision: a beat-synchronized round-robin can jump
+between different screen positions, scales, poses, or formations.  This module
+samples every eligible source on both sides of each proposed hard cut and finds
+a balanced, no-repeat source path that minimizes those visible geometry jumps.
+
+Only normalized screen geometry and aggregate mismatch scores are serialized.
+Pose, silhouette, layout, and structure vectors are transient and no face
+appearance embedding or named identity inference is used.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+import heapq
+import math
+from pathlib import Path
+from statistics import median
+from typing import Any, Callable, Sequence
+
+import cv2
+
+from .timeline import formation_assignment_mismatch
+from .timewarp import TimeWarpMap
+from .visual_score import FrameVisualDescriptor, describe_frame
+
+
+DescriptorProvider = Callable[
+    [int, Path, float],
+    FrameVisualDescriptor | None,
+]
+
+
+_DIRECT_CONTENT_SAMPLE_COUNT = 6
+
+
+class DirectMemberVisualSelectionError(RuntimeError):
+    """Fail-closed visual/quota conflict with JSON-safe diagnostics."""
+
+    def __init__(self, message: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class DirectMemberVisualConfig:
+    """Thresholds and weights for one direct-member visual optimization."""
+
+    sample_frame_step_seconds: float = 1.0 / 29.97
+    early_interior_sample_seconds: float = 0.20
+    beam_width: int = 12_000
+    span_interior_inset_seconds: float = 0.18
+    minimum_pose_confidence: float = 0.25
+    minimum_silhouette_confidence: float = 0.30
+    minimum_evidence_component_count: int = 2
+    attention_position_weight: float = 2.20
+    attention_scale_weight: float = 1.60
+    dominant_pose_weight: float = 2.00
+    structure_pose_weight: float = 0.65
+    formation_weight: float = 2.10
+    silhouette_weight: float = 1.45
+    person_layout_weight: float = 1.65
+    person_count_weight: float = 0.45
+    attention_position_warning: float = 0.32
+    attention_scale_warning: float = 0.30
+    dominant_pose_warning: float = 0.42
+    formation_warning: float = 0.30
+    silhouette_warning: float = 0.36
+    person_layout_warning: float = 0.32
+    person_count_warning: float = 0.65
+    total_mismatch_warning: float = 0.45
+    severe_risk_margin: float = 0.20
+    total_mismatch_severe: float = 0.68
+    warning_penalty: float = 0.45
+    severe_penalty: float = 1.25
+    insufficient_evidence_penalty: float = 0.35
+    missing_descriptor_cost: float = 2.75
+    ping_pong_penalty: float = 0.14
+    duration_balance_weight: float = 4.0
+    maximum_source_duration_relative_deviation: float = 0.08
+    minimum_face_sample_count: int = 1
+    minimum_human_sample_count: int = 2
+    minimum_acceptable_quality_score: float = 0.72
+    minimum_acceptable_quality_sample_count: int = 5
+    foreground_obstruction_rejection_score: float = 0.85
+    terminal_composite_exit_quality_maximum: float = 0.50
+    terminal_composite_pre_exit_quality_maximum: float = 0.90
+    terminal_composite_first_quality_drop_minimum: float = 0.07
+    terminal_composite_exit_quality_drop_minimum: float = 0.25
+    terminal_composite_first_contrast_drop_minimum: float = 0.06
+    terminal_composite_exit_contrast_drop_minimum: float = 0.15
+    persistent_entry_overexposure_quality_maximum: float = 0.74
+    persistent_entry_overexposure_gray_mean_minimum: float = 0.80
+    persistent_entry_overexposure_gray_contrast_maximum: float = 0.35
+    persistent_entry_overexposure_highlight_minimum: float = 0.20
+    require_entry_exit_human_evidence: bool = True
+    native_scene_cut_boundary_tolerance_seconds: float = 1.0 / 29.97
+    blank_gray_std_maximum: float = 0.045
+    blank_extreme_mean_minimum: float = 0.05
+    blank_extreme_mean_maximum: float = 0.95
+    static_structure_mismatch_maximum: float = 0.018
+    static_color_mismatch_maximum: float = 0.018
+    maximum_adaptive_beam_width: int = 96_000
+    maximum_generated_beam_state_count: int = 500_000
+    feasibility_lifeline_state_limit: int = 250_000
+
+    def __post_init__(self) -> None:
+        finite = (
+            self.sample_frame_step_seconds,
+            self.early_interior_sample_seconds,
+            self.span_interior_inset_seconds,
+            self.minimum_pose_confidence,
+            self.minimum_silhouette_confidence,
+            self.attention_position_weight,
+            self.attention_scale_weight,
+            self.dominant_pose_weight,
+            self.structure_pose_weight,
+            self.formation_weight,
+            self.silhouette_weight,
+            self.person_layout_weight,
+            self.person_count_weight,
+            self.attention_position_warning,
+            self.attention_scale_warning,
+            self.dominant_pose_warning,
+            self.formation_warning,
+            self.silhouette_warning,
+            self.person_layout_warning,
+            self.person_count_warning,
+            self.total_mismatch_warning,
+            self.severe_risk_margin,
+            self.total_mismatch_severe,
+            self.warning_penalty,
+            self.severe_penalty,
+            self.insufficient_evidence_penalty,
+            self.missing_descriptor_cost,
+            self.ping_pong_penalty,
+            self.duration_balance_weight,
+            self.maximum_source_duration_relative_deviation,
+            self.minimum_acceptable_quality_score,
+            self.foreground_obstruction_rejection_score,
+            self.terminal_composite_exit_quality_maximum,
+            self.terminal_composite_pre_exit_quality_maximum,
+            self.terminal_composite_first_quality_drop_minimum,
+            self.terminal_composite_exit_quality_drop_minimum,
+            self.terminal_composite_first_contrast_drop_minimum,
+            self.terminal_composite_exit_contrast_drop_minimum,
+            self.persistent_entry_overexposure_quality_maximum,
+            self.persistent_entry_overexposure_gray_mean_minimum,
+            self.persistent_entry_overexposure_gray_contrast_maximum,
+            self.persistent_entry_overexposure_highlight_minimum,
+            self.native_scene_cut_boundary_tolerance_seconds,
+            self.blank_gray_std_maximum,
+            self.blank_extreme_mean_minimum,
+            self.blank_extreme_mean_maximum,
+            self.static_structure_mismatch_maximum,
+            self.static_color_mismatch_maximum,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in finite):
+            raise ValueError("direct member visual configuration must be finite and non-negative")
+        if self.sample_frame_step_seconds <= 0.0:
+            raise ValueError("sample_frame_step_seconds must be positive")
+        if self.early_interior_sample_seconds <= 0.0:
+            raise ValueError("early_interior_sample_seconds must be positive")
+        if self.span_interior_inset_seconds <= 0.0:
+            raise ValueError("span_interior_inset_seconds must be positive")
+        if (
+            isinstance(self.beam_width, bool)
+            or not isinstance(self.beam_width, int)
+            or self.beam_width < 100
+        ):
+            raise ValueError("beam_width must be an integer of at least 100")
+        for name, value, minimum in (
+            ("maximum_adaptive_beam_width", self.maximum_adaptive_beam_width, 100),
+            (
+                "maximum_generated_beam_state_count",
+                self.maximum_generated_beam_state_count,
+                1_000,
+            ),
+            (
+                "feasibility_lifeline_state_limit",
+                self.feasibility_lifeline_state_limit,
+                1,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"{name} must be an integer of at least {minimum}")
+        if (
+            isinstance(self.minimum_evidence_component_count, bool)
+            or not isinstance(self.minimum_evidence_component_count, int)
+            or self.minimum_evidence_component_count < 1
+        ):
+            raise ValueError(
+                "minimum_evidence_component_count must be a positive integer"
+            )
+        if (
+            isinstance(self.minimum_face_sample_count, bool)
+            or not isinstance(self.minimum_face_sample_count, int)
+            or not 0
+            <= self.minimum_face_sample_count
+            <= _DIRECT_CONTENT_SAMPLE_COUNT
+        ):
+            raise ValueError("minimum_face_sample_count must be between zero and six")
+        if (
+            isinstance(self.minimum_human_sample_count, bool)
+            or not isinstance(self.minimum_human_sample_count, int)
+            or not 1
+            <= self.minimum_human_sample_count
+            <= _DIRECT_CONTENT_SAMPLE_COUNT
+        ):
+            raise ValueError("minimum_human_sample_count must be between one and six")
+        if (
+            isinstance(self.minimum_acceptable_quality_sample_count, bool)
+            or not isinstance(self.minimum_acceptable_quality_sample_count, int)
+            or not 1
+            <= self.minimum_acceptable_quality_sample_count
+            <= _DIRECT_CONTENT_SAMPLE_COUNT
+        ):
+            raise ValueError(
+                "minimum_acceptable_quality_sample_count must be between one and six"
+            )
+        if not isinstance(self.require_entry_exit_human_evidence, bool):
+            raise TypeError("require_entry_exit_human_evidence must be boolean")
+        if self.foreground_obstruction_rejection_score <= 0.0:
+            raise ValueError(
+                "foreground_obstruction_rejection_score must be positive"
+            )
+        if not (
+            0.0
+            <= self.blank_extreme_mean_minimum
+            < self.blank_extreme_mean_maximum
+            <= 1.0
+        ):
+            raise ValueError("blank extreme mean thresholds are invalid")
+        for value in (
+            self.minimum_pose_confidence,
+            self.minimum_silhouette_confidence,
+            self.attention_position_warning,
+            self.attention_scale_warning,
+            self.dominant_pose_warning,
+            self.formation_warning,
+            self.silhouette_warning,
+            self.person_layout_warning,
+            self.person_count_warning,
+            self.total_mismatch_warning,
+            self.severe_risk_margin,
+            self.total_mismatch_severe,
+            self.maximum_source_duration_relative_deviation,
+            self.minimum_acceptable_quality_score,
+            self.foreground_obstruction_rejection_score,
+            self.terminal_composite_exit_quality_maximum,
+            self.terminal_composite_pre_exit_quality_maximum,
+            self.terminal_composite_first_quality_drop_minimum,
+            self.terminal_composite_exit_quality_drop_minimum,
+            self.terminal_composite_first_contrast_drop_minimum,
+            self.terminal_composite_exit_contrast_drop_minimum,
+            self.persistent_entry_overexposure_quality_maximum,
+            self.persistent_entry_overexposure_gray_mean_minimum,
+            self.persistent_entry_overexposure_gray_contrast_maximum,
+            self.persistent_entry_overexposure_highlight_minimum,
+        ):
+            if value > 1.0:
+                raise ValueError("direct member visual thresholds must be at most 1")
+
+    def warning_thresholds(self) -> dict[str, float]:
+        return {
+            "attention_position": self.attention_position_warning,
+            "attention_scale": self.attention_scale_warning,
+            "dominant_pose": self.dominant_pose_warning,
+            "formation": self.formation_warning,
+            "silhouette": self.silhouette_warning,
+            "person_layout": self.person_layout_warning,
+            "person_count": self.person_count_warning,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sample_frame_step_seconds": self.sample_frame_step_seconds,
+            "early_interior_sample_seconds": self.early_interior_sample_seconds,
+            "sample_policy": (
+                "outgoing_boundary_minus_one_frame_and_"
+                "incoming_boundary_plus_one_frame"
+            ),
+            "span_content_sample_policy": (
+                "cut_plus_one_output_frame_cut_plus_0_20_seconds_quarter_midpoint_"
+                "three_quarter_exit_interior"
+            ),
+            "span_interior_inset_seconds": self.span_interior_inset_seconds,
+            "beam_width": self.beam_width,
+            "maximum_adaptive_beam_width": self.maximum_adaptive_beam_width,
+            "maximum_generated_beam_state_count": (
+                self.maximum_generated_beam_state_count
+            ),
+            "feasibility_lifeline_state_limit": (
+                self.feasibility_lifeline_state_limit
+            ),
+            "minimum_pose_confidence": self.minimum_pose_confidence,
+            "minimum_silhouette_confidence": (
+                self.minimum_silhouette_confidence
+            ),
+            "minimum_evidence_component_count": (
+                self.minimum_evidence_component_count
+            ),
+            "weights": {
+                "attention_position": self.attention_position_weight,
+                "attention_scale": self.attention_scale_weight,
+                "dominant_pose": self.dominant_pose_weight,
+                "structure_pose_fallback": self.structure_pose_weight,
+                "formation": self.formation_weight,
+                "silhouette": self.silhouette_weight,
+                "person_layout": self.person_layout_weight,
+                "person_count": self.person_count_weight,
+            },
+            "warning_thresholds": self.warning_thresholds(),
+            "total_mismatch_warning": self.total_mismatch_warning,
+            "severe_risk_margin": self.severe_risk_margin,
+            "total_mismatch_severe": self.total_mismatch_severe,
+            "warning_penalty": self.warning_penalty,
+            "severe_penalty": self.severe_penalty,
+            "severe_edge_effect": "ineligible_fail_closed_if_quota_path_exhausted",
+            "insufficient_evidence_penalty": (
+                self.insufficient_evidence_penalty
+            ),
+            "missing_descriptor_cost": self.missing_descriptor_cost,
+            "ping_pong_penalty": self.ping_pong_penalty,
+            "duration_balance": {
+                "target_policy": (
+                    "total_duration_times_source_quota_divided_by_span_count"
+                ),
+                "normalized_squared_load_weight": self.duration_balance_weight,
+                "maximum_source_relative_deviation": (
+                    self.maximum_source_duration_relative_deviation
+                ),
+                "threshold_effect": "terminal_fail_closed",
+            },
+            "content_validity": {
+                "sample_count": _DIRECT_CONTENT_SAMPLE_COUNT,
+                "sample_policy": (
+                    "cut_plus_one_output_frame_cut_plus_0_20_seconds_"
+                    "quarter_midpoint_three_quarter_exit_minus_0_18_seconds"
+                ),
+                "minimum_face_sample_count": self.minimum_face_sample_count,
+                "minimum_face_sample_backend": "verified_yunet",
+                "minimum_human_sample_count": self.minimum_human_sample_count,
+                "minimum_acceptable_quality_score": (
+                    self.minimum_acceptable_quality_score
+                ),
+                "minimum_acceptable_quality_sample_count": (
+                    self.minimum_acceptable_quality_sample_count
+                ),
+                "foreground_obstruction_rejection_score": (
+                    self.foreground_obstruction_rejection_score
+                ),
+                "foreground_obstruction_policy": (
+                    "hard_reject_any_of_six_temporal_samples_with_"
+                    "dark_edge_connected_camera_equipment_over_subject_"
+                    "or_performance_area"
+                ),
+                "terminal_broadcast_composite_policy": {
+                    "exit_quality_maximum": (
+                        self.terminal_composite_exit_quality_maximum
+                    ),
+                    "pre_exit_quality_maximum": (
+                        self.terminal_composite_pre_exit_quality_maximum
+                    ),
+                    "first_quality_drop_minimum": (
+                        self.terminal_composite_first_quality_drop_minimum
+                    ),
+                    "exit_quality_drop_minimum": (
+                        self.terminal_composite_exit_quality_drop_minimum
+                    ),
+                    "first_gray_contrast_drop_minimum": (
+                        self.terminal_composite_first_contrast_drop_minimum
+                    ),
+                    "exit_gray_contrast_drop_minimum": (
+                        self.terminal_composite_exit_contrast_drop_minimum
+                    ),
+                    "effect": "hard_reject",
+                },
+                "persistent_entry_overexposure_policy": {
+                    "early_interior_seconds": self.early_interior_sample_seconds,
+                    "quality_maximum": (
+                        self.persistent_entry_overexposure_quality_maximum
+                    ),
+                    "gray_mean_minimum": (
+                        self.persistent_entry_overexposure_gray_mean_minimum
+                    ),
+                    "gray_contrast_maximum": (
+                        self.persistent_entry_overexposure_gray_contrast_maximum
+                    ),
+                    "highlight_clipping_minimum": (
+                        self.persistent_entry_overexposure_highlight_minimum
+                    ),
+                    "required_consecutive_samples": 2,
+                    "effect": "hard_reject",
+                },
+                "require_entry_exit_human_evidence": (
+                    self.require_entry_exit_human_evidence
+                ),
+                "native_scene_cut_policy": (
+                    "hard_reject_source_native_cut_strictly_inside_"
+                    "coarsened_span_after_one_output_frame_"
+                    "boundary_quantization_tolerance"
+                ),
+                "native_scene_cut_boundary_tolerance_seconds": (
+                    self.native_scene_cut_boundary_tolerance_seconds
+                ),
+                "blank_gray_std_maximum": self.blank_gray_std_maximum,
+                "blank_extreme_mean_range": [
+                    self.blank_extreme_mean_minimum,
+                    self.blank_extreme_mean_maximum,
+                ],
+                "static_structure_mismatch_maximum": (
+                    self.static_structure_mismatch_maximum
+                ),
+                "static_color_mismatch_maximum": (
+                    self.static_color_mismatch_maximum
+                ),
+                "invalid_candidate_effect": "hard_reject",
+                "quota_conflict_effect": "fail_closed",
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _AttentionGeometry:
+    bbox_xywh: tuple[float, float, float, float]
+    centroid_xy: tuple[float, float]
+    basis: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundarySample:
+    master_seconds: float
+    source_local_seconds: float
+    descriptor: FrameVisualDescriptor | None
+    attention: _AttentionGeometry | None
+
+    def to_dict(self) -> dict[str, Any]:
+        descriptor = self.descriptor
+        return {
+            "canonical_master_seconds": self.master_seconds,
+            "source_local_seconds": self.source_local_seconds,
+            "descriptor_available": descriptor is not None,
+            "attention_basis": (
+                self.attention.basis if self.attention is not None else None
+            ),
+            "attention_bbox_xywh": (
+                list(self.attention.bbox_xywh)
+                if self.attention is not None
+                else None
+            ),
+            "attention_centroid_xy": (
+                list(self.attention.centroid_xy)
+                if self.attention is not None
+                else None
+            ),
+            "pose_backend": descriptor.pose_backend if descriptor else "none",
+            "face_count": descriptor.face_count if descriptor else 0,
+            "face_detector_backend": (
+                descriptor.face_detector_backend if descriptor else "none"
+            ),
+            "pose_confidence": descriptor.pose_confidence if descriptor else 0.0,
+            "detected_person_count": (
+                descriptor.detected_person_count if descriptor else 0
+            ),
+            "formation_person_count": (
+                len(descriptor.formation_people) if descriptor else 0
+            ),
+            "formation_upper_body_count": (
+                sum(
+                    bool(person.upper_body_keypoints_xyc)
+                    for person in descriptor.formation_people
+                )
+                if descriptor
+                else 0
+            ),
+            "silhouette_backend": (
+                descriptor.silhouette_backend if descriptor else "none"
+            ),
+            "silhouette_confidence": (
+                descriptor.silhouette_confidence if descriptor else 0.0
+            ),
+            "foreground_obstruction_score": (
+                descriptor.foreground_obstruction_score if descriptor else 0.0
+            ),
+            "highlight_clipping_ratio": (
+                descriptor.highlight_clipping_ratio if descriptor else 0.0
+            ),
+            "raw_embeddings_persisted": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DirectSpanSourceValidity:
+    eligible_source_index: int
+    valid: bool
+    rejection_reasons: tuple[str, ...]
+    samples: tuple[_BoundarySample, ...]
+    human_evidence_sample_count: int
+    face_evidence_sample_count: int
+    acceptable_quality_sample_count: int
+    blank_sample_count: int
+    static_visual_candidate: bool
+    native_scene_cut_source_seconds: tuple[float, ...]
+    native_scene_cut_master_seconds: tuple[float, ...]
+    maximum_structure_mismatch: float | None
+    maximum_color_mismatch: float | None
+    mean_quality_score: float | None
+    quality_sample_scores: tuple[float, ...]
+    foreground_obstruction_sample_count: int
+    foreground_obstruction_sample_scores: tuple[float, ...]
+    terminal_composite_transition_candidate: bool
+    gray_contrast_sample_scores: tuple[float | None, ...]
+    persistent_entry_overexposure_candidate: bool
+    gray_mean_sample_scores: tuple[float | None, ...]
+    highlight_clipping_sample_scores: tuple[float, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "eligible_source_index": self.eligible_source_index,
+            "valid": self.valid,
+            "rejection_reasons": list(self.rejection_reasons),
+            "human_evidence_sample_count": self.human_evidence_sample_count,
+            "face_evidence_sample_count": self.face_evidence_sample_count,
+            "acceptable_quality_sample_count": (
+                self.acceptable_quality_sample_count
+            ),
+            "blank_sample_count": self.blank_sample_count,
+            "static_visual_candidate": self.static_visual_candidate,
+            "native_scene_cut_source_seconds": list(
+                self.native_scene_cut_source_seconds
+            ),
+            "native_scene_cut_master_seconds": list(
+                self.native_scene_cut_master_seconds
+            ),
+            "maximum_structure_mismatch": self.maximum_structure_mismatch,
+            "maximum_color_mismatch": self.maximum_color_mismatch,
+            "mean_quality_score": self.mean_quality_score,
+            "quality_sample_scores": list(self.quality_sample_scores),
+            "foreground_obstruction_sample_count": (
+                self.foreground_obstruction_sample_count
+            ),
+            "foreground_obstruction_sample_scores": list(
+                self.foreground_obstruction_sample_scores
+            ),
+            "terminal_composite_transition_candidate": (
+                self.terminal_composite_transition_candidate
+            ),
+            "gray_contrast_sample_scores": list(
+                self.gray_contrast_sample_scores
+            ),
+            "persistent_entry_overexposure_candidate": (
+                self.persistent_entry_overexposure_candidate
+            ),
+            "gray_mean_sample_scores": list(self.gray_mean_sample_scores),
+            "highlight_clipping_sample_scores": list(
+                self.highlight_clipping_sample_scores
+            ),
+            "samples": [sample.to_dict() for sample in self.samples],
+            "raw_embeddings_persisted": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DirectSpanVisualDiagnostic:
+    segment_index: int
+    canonical_master_start: float
+    canonical_master_end: float
+    sources: tuple[DirectSpanSourceValidity, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_index": self.segment_index,
+            "canonical_master_start": self.canonical_master_start,
+            "canonical_master_end": self.canonical_master_end,
+            "sources": [source.to_dict() for source in self.sources],
+            "valid_source_count": sum(source.valid for source in self.sources),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DirectBoundaryMismatch:
+    cost: float
+    base_mismatch: float
+    attention_position_mismatch: float | None
+    attention_scale_mismatch: float | None
+    dominant_pose_mismatch: float | None
+    pose_basis: str | None
+    formation_mismatch: float | None
+    silhouette_mismatch: float | None
+    person_layout_mismatch: float | None
+    person_count_mismatch: float | None
+    evidence_component_count: int
+    warning_flags: tuple[str, ...]
+    severe_flags: tuple[str, ...]
+
+    def components(self) -> dict[str, float | None]:
+        return {
+            "attention_position": self.attention_position_mismatch,
+            "attention_scale": self.attention_scale_mismatch,
+            "dominant_pose": self.dominant_pose_mismatch,
+            "formation": self.formation_mismatch,
+            "silhouette": self.silhouette_mismatch,
+            "person_layout": self.person_layout_mismatch,
+            "person_count": self.person_count_mismatch,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cost": self.cost,
+            "base_mismatch": self.base_mismatch,
+            "components": self.components(),
+            "pose_basis": self.pose_basis,
+            "evidence_component_count": self.evidence_component_count,
+            "warning_flags": list(self.warning_flags),
+            "severe_flags": list(self.severe_flags),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DirectBoundaryVisualDiagnostic:
+    boundary_index: int
+    canonical_master_seconds: float
+    outgoing_eligible_source_index: int
+    incoming_eligible_source_index: int
+    outgoing_sample: _BoundarySample
+    incoming_sample: _BoundarySample
+    mismatch: DirectBoundaryMismatch
+    selected_pair_rank: int
+    candidate_pair_count: int
+    raw_cross_source_pair_count: int
+    invalid_content_pair_count: int
+    severe_pair_count: int
+    minimum_pair_cost: float
+    selected_pair_cost_delta: float
+    ping_pong_penalty_applied: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "boundary_index": self.boundary_index,
+            "canonical_master_seconds": self.canonical_master_seconds,
+            "outgoing_eligible_source_index": (
+                self.outgoing_eligible_source_index
+            ),
+            "incoming_eligible_source_index": (
+                self.incoming_eligible_source_index
+            ),
+            "outgoing_sample": self.outgoing_sample.to_dict(),
+            "incoming_sample": self.incoming_sample.to_dict(),
+            "mismatch": self.mismatch.to_dict(),
+            "selected_pair_rank": self.selected_pair_rank,
+            "candidate_pair_count": self.candidate_pair_count,
+            "raw_cross_source_pair_count": self.raw_cross_source_pair_count,
+            "invalid_content_pair_count": self.invalid_content_pair_count,
+            "severe_pair_count": self.severe_pair_count,
+            "minimum_pair_cost": self.minimum_pair_cost,
+            "selected_pair_cost_delta": self.selected_pair_cost_delta,
+            "ping_pong_penalty_applied": self.ping_pong_penalty_applied,
+        }
+
+
+def _distribution(values: Sequence[float]) -> dict[str, float | None]:
+    ordered = sorted(float(value) for value in values if math.isfinite(value))
+    if not ordered:
+        return {"p50": None, "p95": None, "max": None}
+    p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
+    return {
+        "p50": median(ordered),
+        "p95": ordered[p95_index],
+        "max": ordered[-1],
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class DirectMemberVisualSelection:
+    source_indices: tuple[int, ...]
+    source_quotas: tuple[int, ...]
+    source_counts: tuple[int, ...]
+    source_durations_seconds: tuple[float, ...]
+    source_target_durations_seconds: tuple[float, ...]
+    source_duration_relative_deviations: tuple[float, ...]
+    span_validity: tuple[DirectSpanVisualDiagnostic, ...]
+    boundaries: tuple[DirectBoundaryVisualDiagnostic, ...]
+    optimizer_cost: float
+    sample_count: int
+    failed_sample_count: int
+    native_scene_cut_evidence_available: bool
+    config: DirectMemberVisualConfig
+    optimizer_search_diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.source_indices:
+            raise ValueError("direct member visual selection cannot be empty")
+        if len(self.source_quotas) != len(self.source_counts):
+            raise ValueError("source quota/count lengths must match")
+        if not (
+            len(self.source_durations_seconds)
+            == len(self.source_target_durations_seconds)
+            == len(self.source_duration_relative_deviations)
+            == len(self.source_counts)
+        ):
+            raise ValueError("source duration-balance lengths must match")
+        if self.source_counts != self.source_quotas:
+            raise ValueError("direct member visual selection must satisfy every quota")
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in self.source_durations_seconds
+        ):
+            raise ValueError("source durations must be finite and non-negative")
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in self.source_target_durations_seconds
+        ):
+            raise ValueError("source target durations must be finite and positive")
+        for actual, target, reported_deviation in zip(
+            self.source_durations_seconds,
+            self.source_target_durations_seconds,
+            self.source_duration_relative_deviations,
+        ):
+            expected_deviation = abs(actual - target) / target
+            if (
+                not math.isfinite(reported_deviation)
+                or reported_deviation < 0.0
+                or not math.isclose(
+                    reported_deviation,
+                    expected_deviation,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError("source relative duration deviation is inconsistent")
+        if (
+            max(self.source_duration_relative_deviations)
+            > self.config.maximum_source_duration_relative_deviation + 1e-9
+        ):
+            raise ValueError("direct member visual duration balance threshold failed")
+        if any(
+            left == right
+            for left, right in zip(self.source_indices, self.source_indices[1:])
+        ):
+            raise ValueError("direct member visual selection cannot repeat a source")
+        if len(self.boundaries) != len(self.source_indices) - 1:
+            raise ValueError("direct member visual boundaries must match the path")
+        if len(self.span_validity) != len(self.source_indices):
+            raise ValueError("direct member span validity must match the path")
+        if any(
+            not self.span_validity[index].sources[source_index].valid
+            for index, source_index in enumerate(self.source_indices)
+        ):
+            raise ValueError("direct member visual path selected invalid content")
+        if any(boundary.mismatch.severe_flags for boundary in self.boundaries):
+            raise ValueError("direct member visual path selected a severe boundary")
+
+    def aggregate_diagnostics(self) -> dict[str, Any]:
+        component_names = tuple(
+            DirectBoundaryMismatch(
+                0.0, 0.0, None, None, None, None, None, None, None, None, 0, (), ()
+            ).components()
+        )
+        warning_counts: Counter[str] = Counter()
+        severe_counts: Counter[str] = Counter()
+        for boundary in self.boundaries:
+            warning_counts.update(boundary.mismatch.warning_flags)
+            severe_counts.update(boundary.mismatch.severe_flags)
+        validity_reasons: Counter[str] = Counter(
+            reason
+            for span in self.span_validity
+            for source in span.sources
+            for reason in source.rejection_reasons
+        )
+        return {
+            "selected_boundary_count": len(self.boundaries),
+            "cost": _distribution(
+                [boundary.mismatch.cost for boundary in self.boundaries]
+            ),
+            "base_mismatch": _distribution(
+                [
+                    boundary.mismatch.base_mismatch
+                    for boundary in self.boundaries
+                ]
+            ),
+            "components": {
+                name: _distribution(
+                    [
+                        value
+                        for boundary in self.boundaries
+                        if (value := boundary.mismatch.components()[name])
+                        is not None
+                    ]
+                )
+                for name in component_names
+            },
+            "selected_pair_rank": _distribution(
+                [float(boundary.selected_pair_rank) for boundary in self.boundaries]
+            ),
+            "eligible_candidate_pair_count": _distribution(
+                [float(boundary.candidate_pair_count) for boundary in self.boundaries]
+            ),
+            "invalid_content_pair_count": {
+                "total": sum(
+                    boundary.invalid_content_pair_count
+                    for boundary in self.boundaries
+                ),
+                "max": max(
+                    (
+                        boundary.invalid_content_pair_count
+                        for boundary in self.boundaries
+                    ),
+                    default=0,
+                ),
+            },
+            "severe_ineligible_pair_count": {
+                "total": sum(
+                    boundary.severe_pair_count for boundary in self.boundaries
+                ),
+                "max": max(
+                    (boundary.severe_pair_count for boundary in self.boundaries),
+                    default=0,
+                ),
+            },
+            "warning_boundary_count": sum(
+                bool(boundary.mismatch.warning_flags)
+                for boundary in self.boundaries
+            ),
+            "severe_boundary_count": sum(
+                bool(boundary.mismatch.severe_flags)
+                for boundary in self.boundaries
+            ),
+            "warning_flag_counts": dict(sorted(warning_counts.items())),
+            "severe_flag_counts": dict(sorted(severe_counts.items())),
+            "sample_count": self.sample_count,
+            "failed_sample_count": self.failed_sample_count,
+            "descriptor_success_fraction": (
+                (self.sample_count - self.failed_sample_count) / self.sample_count
+                if self.sample_count
+                else 0.0
+            ),
+            "content_validity": {
+                "evaluated_candidate_count": sum(
+                    len(span.sources) for span in self.span_validity
+                ),
+                "invalid_candidate_count": sum(
+                    not source.valid
+                    for span in self.span_validity
+                    for source in span.sources
+                ),
+                "native_scene_cut_invalid_candidate_count": sum(
+                    bool(source.native_scene_cut_master_seconds)
+                    for span in self.span_validity
+                    for source in span.sources
+                ),
+                "native_scene_cut_count": sum(
+                    len(source.native_scene_cut_master_seconds)
+                    for span in self.span_validity
+                    for source in span.sources
+                ),
+                "rejection_reason_counts": dict(sorted(validity_reasons.items())),
+                "minimum_valid_source_count_per_span": min(
+                    sum(source.valid for source in span.sources)
+                    for span in self.span_validity
+                ),
+                "valid_span_count_by_source": [
+                    sum(span.sources[index].valid for span in self.span_validity)
+                    for index in range(len(self.source_counts))
+                ],
+            },
+            "duration_balance": {
+                "passed": (
+                    max(self.source_duration_relative_deviations)
+                    <= self.config.maximum_source_duration_relative_deviation
+                    + 1e-9
+                ),
+                "target_policy": (
+                    "total_duration_times_source_quota_divided_by_span_count"
+                ),
+                "total_duration_seconds": sum(self.source_durations_seconds),
+                "maximum_relative_deviation": max(
+                    self.source_duration_relative_deviations
+                ),
+                "maximum_allowed_relative_deviation": (
+                    self.config.maximum_source_duration_relative_deviation
+                ),
+                "normalized_squared_load_cost": (
+                    self.config.duration_balance_weight
+                    * sum(
+                        (actual / target) ** 2
+                        for actual, target in zip(
+                            self.source_durations_seconds,
+                            self.source_target_durations_seconds,
+                        )
+                    )
+                ),
+            },
+            "raw_embeddings_persisted": False,
+            "face_identity_inference_used": False,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "analysis_basis": (
+                "timewarp_boundary_native_cut_non_identity_geometry_"
+                "adaptive_beam_exact_feasibility_lifeline_v4"
+            ),
+            "selection_objective": (
+                "minimum_real_boundary_geometry_mismatch_subject_to_"
+                "all_source_count_duration_no_adjacent_repeat_constraints"
+            ),
+            "selected_source_indices": list(self.source_indices),
+            "distinct_source_count": len(set(self.source_indices)),
+            "source_usage": [
+                {
+                    "eligible_source_index": source_index,
+                    "quota": self.source_quotas[source_index],
+                    "segment_count": self.source_counts[source_index],
+                    "duration_seconds": self.source_durations_seconds[source_index],
+                    "target_duration_seconds": (
+                        self.source_target_durations_seconds[source_index]
+                    ),
+                    "duration_deviation_seconds": (
+                        self.source_durations_seconds[source_index]
+                        - self.source_target_durations_seconds[source_index]
+                    ),
+                    "duration_relative_deviation": (
+                        self.source_duration_relative_deviations[source_index]
+                    ),
+                }
+                for source_index in range(len(self.source_counts))
+            ],
+            "counts_differ_by_at_most_one": (
+                max(self.source_counts) - min(self.source_counts) <= 1
+            ),
+            "same_source_adjacent_count": sum(
+                left == right
+                for left, right in zip(
+                    self.source_indices,
+                    self.source_indices[1:],
+                )
+            ),
+            "optimizer_cost": self.optimizer_cost,
+            "optimizer_search": dict(self.optimizer_search_diagnostics),
+            "native_scene_cut_evidence": {
+                "available": self.native_scene_cut_evidence_available,
+                "policy_applied": self.native_scene_cut_evidence_available,
+            },
+            "config": self.config.to_dict(),
+            "aggregate": self.aggregate_diagnostics(),
+            "span_content_validity": [
+                span.to_dict() for span in self.span_validity
+            ],
+            "boundaries": [boundary.to_dict() for boundary in self.boundaries],
+            "privacy": {
+                "face_identity_inference_used": False,
+                "face_appearance_embeddings_computed": False,
+                "raw_pose_silhouette_layout_embeddings_persisted": False,
+                "persisted_evidence": (
+                    "normalized_attention_geometry_backend_confidence_"
+                    "foreground_obstruction_highlight_clipping_gray_summary_"
+                    "scalars_and_aggregate_mismatch_only"
+                ),
+            },
+        }
+
+
+class _VideoDescriptorProvider:
+    """Sequential random-access decoder for all boundary samples."""
+
+    def __init__(self, sources: Sequence[Path]) -> None:
+        self._captures: list[cv2.VideoCapture | None] = []
+        self._descriptor_cache: dict[
+            tuple[int, int], FrameVisualDescriptor | None
+        ] = {}
+        self._request_count = 0
+        self._cache_hit_count = 0
+        self._decode_count = 0
+        for source in sources:
+            capture = cv2.VideoCapture(str(source))
+            if capture.isOpened():
+                self._captures.append(capture)
+            else:
+                capture.release()
+                self._captures.append(None)
+
+    def __call__(
+        self,
+        source_index: int,
+        _source: Path,
+        source_local_seconds: float,
+    ) -> FrameVisualDescriptor | None:
+        self._request_count += 1
+        key = (source_index, int(round(source_local_seconds * 1000.0)))
+        if key in self._descriptor_cache:
+            self._cache_hit_count += 1
+            return self._descriptor_cache[key]
+        capture = self._captures[source_index]
+        if capture is None:
+            self._descriptor_cache[key] = None
+            return None
+        self._decode_count += 1
+        capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, source_local_seconds) * 1000.0)
+        success, frame = capture.read()
+        if not success or frame is None:
+            self._descriptor_cache[key] = None
+            return None
+        try:
+            descriptor = describe_frame(
+                frame,
+                include_subject_geometry=True,
+                include_formation_pose=True,
+            )
+        except (cv2.error, ValueError, FloatingPointError):
+            descriptor = None
+        self._descriptor_cache[key] = descriptor
+        return descriptor
+
+    def cache_diagnostics(self) -> dict[str, int]:
+        """Return non-media counters proving cross-profile sample reuse."""
+
+        return {
+            "descriptor_request_count": self._request_count,
+            "descriptor_cache_hit_count": self._cache_hit_count,
+            "descriptor_decode_count": self._decode_count,
+            "descriptor_cache_entry_count": len(self._descriptor_cache),
+        }
+
+    def close(self) -> None:
+        for capture in self._captures:
+            if capture is not None:
+                capture.release()
+
+
+def _attention_geometry(
+    descriptor: FrameVisualDescriptor | None,
+) -> _AttentionGeometry | None:
+    if descriptor is None:
+        return None
+    if descriptor.primary_face_bbox is not None:
+        bbox = descriptor.primary_face_bbox
+        return _AttentionGeometry(
+            bbox_xywh=bbox,
+            centroid_xy=(bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0),
+            basis="unambiguous_dominant_face_bbox_geometry_only",
+        )
+    if descriptor.silhouette_bbox_xywh is not None:
+        bbox = descriptor.silhouette_bbox_xywh
+        centroid = descriptor.silhouette_centroid_xy or (
+            bbox[0] + bbox[2] / 2.0,
+            bbox[1] + bbox[3] / 2.0,
+        )
+        return _AttentionGeometry(
+            bbox_xywh=bbox,
+            centroid_xy=centroid,
+            basis="aggregate_human_silhouette",
+        )
+    people = tuple(descriptor.formation_people)
+    if not people:
+        return None
+    ranked = sorted(
+        people,
+        key=lambda person: person.bbox_xywh[2] * person.bbox_xywh[3],
+        reverse=True,
+    )
+    largest = ranked[0]
+    largest_area = largest.bbox_xywh[2] * largest.bbox_xywh[3]
+    if len(ranked) > 1:
+        second_area = ranked[1].bbox_xywh[2] * ranked[1].bbox_xywh[3]
+        if second_area >= largest_area * 0.78:
+            return None
+    return _AttentionGeometry(
+        bbox_xywh=largest.bbox_xywh,
+        centroid_xy=largest.centroid_xy,
+        basis="unambiguous_dominant_person_box_geometry_only",
+    )
+
+
+def _embedding_distance(
+    left: Sequence[float],
+    right: Sequence[float],
+) -> float | None:
+    if not left or not right or len(left) != len(right):
+        return None
+    squared = sum(
+        (float(left_value) - float(right_value)) ** 2
+        for left_value, right_value in zip(left, right, strict=True)
+    )
+    return min(1.0, math.sqrt(squared / len(left)))
+
+
+def _sample_has_human_evidence(
+    sample: _BoundarySample,
+    config: DirectMemberVisualConfig,
+) -> bool:
+    descriptor = sample.descriptor
+    if descriptor is None:
+        return False
+    return bool(
+        sample.attention is not None
+        or descriptor.face_count > 0
+        or descriptor.detected_person_count > 0
+        or (
+            descriptor.silhouette_bbox_xywh is not None
+            and descriptor.silhouette_confidence
+            >= config.minimum_silhouette_confidence
+        )
+    )
+
+
+def _sample_has_verified_yunet_face(sample: _BoundarySample) -> bool:
+    descriptor = sample.descriptor
+    return bool(
+        descriptor is not None
+        and descriptor.face_count > 0
+        and descriptor.face_detector_backend.casefold() == "yunet"
+    )
+
+
+def _sample_is_blank_or_flat(
+    sample: _BoundarySample,
+    config: DirectMemberVisualConfig,
+) -> bool:
+    descriptor = sample.descriptor
+    if descriptor is None or _sample_has_human_evidence(sample, config):
+        return False
+    color = descriptor.color_embedding
+    if len(color) < 8:
+        return False
+    gray_mean = float(color[6])
+    gray_std = float(color[7])
+    chroma_spread = sum(float(value) for value in color[3:6])
+    flat = (
+        gray_std <= config.blank_gray_std_maximum
+        and chroma_spread <= config.blank_gray_std_maximum * 3.0
+    )
+    extreme = (
+        gray_mean <= config.blank_extreme_mean_minimum
+        or gray_mean >= config.blank_extreme_mean_maximum
+    ) and gray_std <= config.blank_gray_std_maximum * 2.0
+    return flat or extreme
+
+
+def _span_source_validity(
+    *,
+    source_index: int,
+    samples: tuple[_BoundarySample, ...],
+    native_scene_cuts: tuple[tuple[float, float], ...],
+    config: DirectMemberVisualConfig,
+) -> DirectSpanSourceValidity:
+    descriptors = tuple(
+        sample.descriptor for sample in samples if sample.descriptor is not None
+    )
+    human = tuple(_sample_has_human_evidence(sample, config) for sample in samples)
+    blank = tuple(_sample_is_blank_or_flat(sample, config) for sample in samples)
+    structure_distances = tuple(
+        value
+        for left, right in zip(descriptors, descriptors[1:])
+        if (
+            value := _embedding_distance(
+                left.structure_embedding,
+                right.structure_embedding,
+            )
+        )
+        is not None
+    )
+    color_distances = tuple(
+        value
+        for left, right in zip(descriptors, descriptors[1:])
+        if (
+            value := _embedding_distance(
+                left.color_embedding,
+                right.color_embedding,
+            )
+        )
+        is not None
+    )
+    maximum_structure = max(structure_distances) if structure_distances else None
+    maximum_color = max(color_distances) if color_distances else None
+    static = bool(
+        maximum_structure is not None
+        and maximum_color is not None
+        and maximum_structure <= config.static_structure_mismatch_maximum
+        and maximum_color <= config.static_color_mismatch_maximum
+    )
+    reasons: list[str] = []
+    if (
+        len(samples) != _DIRECT_CONTENT_SAMPLE_COUNT
+        or len(descriptors) != _DIRECT_CONTENT_SAMPLE_COUNT
+    ):
+        reasons.append("span_frame_decode_failed")
+    human_count = sum(human)
+    # Automatic member selection is advertised and diagnosed as fail-closed on
+    # the bundled, integrity-checked YuNet model.  Haar is intentionally still
+    # useful as a weak local composition hint, but it must never satisfy this
+    # hard performance-evidence gate if YuNet inference fails at frame time.
+    face_evidence_count = sum(
+        _sample_has_verified_yunet_face(sample) for sample in samples
+    )
+    quality = tuple(descriptor.quality_score for descriptor in descriptors)
+    acceptable_quality_count = sum(
+        score >= config.minimum_acceptable_quality_score for score in quality
+    )
+    obstruction_scores = tuple(
+        descriptor.foreground_obstruction_score for descriptor in descriptors
+    )
+    obstruction_count = sum(
+        score >= config.foreground_obstruction_rejection_score
+        for score in obstruction_scores
+    )
+    gray_contrast_scores = tuple(
+        (
+            float(descriptor.color_embedding[7])
+            if len(descriptor.color_embedding) >= 8
+            else None
+        )
+        for descriptor in descriptors
+    )
+    gray_mean_scores = tuple(
+        (
+            float(descriptor.color_embedding[6])
+            if len(descriptor.color_embedding) >= 8
+            else None
+        )
+        for descriptor in descriptors
+    )
+    highlight_clipping_scores = tuple(
+        descriptor.highlight_clipping_ratio for descriptor in descriptors
+    )
+    terminal_composite = False
+    if (
+        len(quality) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and len(gray_contrast_scores) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and all(value is not None for value in gray_contrast_scores[-3:])
+    ):
+        before_quality, pre_exit_quality, exit_quality = quality[-3:]
+        before_contrast, pre_exit_contrast, exit_contrast = (
+            float(value) for value in gray_contrast_scores[-3:]
+        )
+        terminal_composite = bool(
+            exit_quality <= config.terminal_composite_exit_quality_maximum
+            and pre_exit_quality
+            <= config.terminal_composite_pre_exit_quality_maximum
+            and before_quality - pre_exit_quality
+            >= config.terminal_composite_first_quality_drop_minimum
+            and pre_exit_quality - exit_quality
+            >= config.terminal_composite_exit_quality_drop_minimum
+            and before_contrast - pre_exit_contrast
+            >= config.terminal_composite_first_contrast_drop_minimum
+            and pre_exit_contrast - exit_contrast
+            >= config.terminal_composite_exit_contrast_drop_minimum
+        )
+    persistent_entry_overexposure = False
+    if (
+        len(quality) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and len(gray_mean_scores) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and len(gray_contrast_scores) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and len(highlight_clipping_scores) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and all(value is not None for value in gray_mean_scores[:2])
+        and all(value is not None for value in gray_contrast_scores[:2])
+    ):
+        persistent_entry_overexposure = all(
+            quality[index]
+            <= config.persistent_entry_overexposure_quality_maximum
+            and float(gray_mean_scores[index])
+            >= config.persistent_entry_overexposure_gray_mean_minimum
+            and float(gray_contrast_scores[index])
+            <= config.persistent_entry_overexposure_gray_contrast_maximum
+            and highlight_clipping_scores[index]
+            >= config.persistent_entry_overexposure_highlight_minimum
+            for index in range(2)
+        )
+    if face_evidence_count < config.minimum_face_sample_count:
+        reasons.append("no_face_performance_evidence")
+    if (
+        acceptable_quality_count
+        < config.minimum_acceptable_quality_sample_count
+    ):
+        reasons.append("persistent_low_visual_quality_or_foreground_obstruction")
+    if obstruction_count:
+        reasons.append("foreground_camera_equipment_or_subject_obstruction")
+    if terminal_composite:
+        reasons.append("terminal_broadcast_composite_or_unreported_native_transition")
+    if persistent_entry_overexposure:
+        reasons.append("persistent_entry_stage_light_overexposure")
+    if native_scene_cuts:
+        reasons.append("source_native_scene_cut_inside_rendered_span")
+    if human_count < config.minimum_human_sample_count:
+        reasons.append("no_person_performance_evidence")
+    if config.require_entry_exit_human_evidence:
+        if not human[0]:
+            reasons.append("no_person_at_span_entry")
+        if not human[-1]:
+            reasons.append("no_person_at_span_exit")
+    blank_count = sum(blank)
+    if blank_count:
+        reasons.append("blank_or_flat_frame")
+    # Pose/person/silhouette models can fire on large logo shapes.  A static
+    # six-sample candidate therefore needs independent face evidence before
+    # those weaker human signals can keep it eligible.  A held close-up with a
+    # detected face remains valid; a static wide performance without any face
+    # can fail closed, which is preferable to rendering a branded end card.
+    if static and face_evidence_count == 0:
+        reasons.append("static_nonface_graphic_or_end_card")
+        reasons.append("static_logo_or_end_card_candidate")
+        if human_count == 0:
+            reasons.append("static_logo_or_end_card_without_person")
+    return DirectSpanSourceValidity(
+        eligible_source_index=source_index,
+        valid=not reasons,
+        rejection_reasons=tuple(dict.fromkeys(reasons)),
+        samples=samples,
+        human_evidence_sample_count=human_count,
+        face_evidence_sample_count=face_evidence_count,
+        acceptable_quality_sample_count=acceptable_quality_count,
+        blank_sample_count=blank_count,
+        static_visual_candidate=static,
+        native_scene_cut_source_seconds=tuple(
+            source_seconds for source_seconds, _master_seconds in native_scene_cuts
+        ),
+        native_scene_cut_master_seconds=tuple(
+            master_seconds for _source_seconds, master_seconds in native_scene_cuts
+        ),
+        maximum_structure_mismatch=maximum_structure,
+        maximum_color_mismatch=maximum_color,
+        mean_quality_score=(sum(quality) / len(quality) if quality else None),
+        quality_sample_scores=quality,
+        foreground_obstruction_sample_count=obstruction_count,
+        foreground_obstruction_sample_scores=obstruction_scores,
+        terminal_composite_transition_candidate=terminal_composite,
+        gray_contrast_sample_scores=gray_contrast_scores,
+        persistent_entry_overexposure_candidate=(
+            persistent_entry_overexposure
+        ),
+        gray_mean_sample_scores=gray_mean_scores,
+        highlight_clipping_sample_scores=highlight_clipping_scores,
+    )
+
+
+def _attention_mismatch(
+    left: _AttentionGeometry | None,
+    right: _AttentionGeometry | None,
+) -> tuple[float | None, float | None]:
+    if left is None or right is None:
+        return (None, None)
+    position = min(
+        1.0,
+        math.hypot(
+            left.centroid_xy[0] - right.centroid_xy[0],
+            left.centroid_xy[1] - right.centroid_xy[1],
+        )
+        / 0.42,
+    )
+    left_area = max(1e-6, left.bbox_xywh[2] * left.bbox_xywh[3])
+    right_area = max(1e-6, right.bbox_xywh[2] * right.bbox_xywh[3])
+    scale = min(1.0, abs(math.log(left_area / right_area)) / math.log(3.2))
+    return (position, scale)
+
+
+def _person_count_mismatch(left: int, right: int) -> float | None:
+    if left <= 0 or right <= 0:
+        return None
+    return min(
+        1.0,
+        abs(math.log((left + 1.0) / (right + 1.0))) / math.log(4.0),
+    )
+
+
+def _boundary_mismatch(
+    outgoing: _BoundarySample,
+    incoming: _BoundarySample,
+    config: DirectMemberVisualConfig,
+) -> DirectBoundaryMismatch:
+    left = outgoing.descriptor
+    right = incoming.descriptor
+    if left is None or right is None:
+        return DirectBoundaryMismatch(
+            cost=config.missing_descriptor_cost,
+            base_mismatch=1.0,
+            attention_position_mismatch=None,
+            attention_scale_mismatch=None,
+            dominant_pose_mismatch=None,
+            pose_basis=None,
+            formation_mismatch=None,
+            silhouette_mismatch=None,
+            person_layout_mismatch=None,
+            person_count_mismatch=None,
+            evidence_component_count=0,
+            warning_flags=("missing_visual_descriptor",),
+            severe_flags=("missing_visual_descriptor",),
+        )
+
+    attention_position, attention_scale = _attention_mismatch(
+        outgoing.attention,
+        incoming.attention,
+    )
+    actual_pose = (
+        left.pose_backend != "structure_hog_fallback"
+        and right.pose_backend != "structure_hog_fallback"
+        and left.pose_confidence >= config.minimum_pose_confidence
+        and right.pose_confidence >= config.minimum_pose_confidence
+        and bool(left.pose_embedding)
+        and len(left.pose_embedding) == len(right.pose_embedding)
+    )
+    if actual_pose:
+        pose_basis = "opencv_zoo_mediapipe_dominant_pose"
+        pose = _embedding_distance(left.pose_embedding, right.pose_embedding)
+        pose_weight = config.dominant_pose_weight
+    else:
+        pose_basis = "structure_hog_pose_fallback"
+        pose = _embedding_distance(
+            left.structure_embedding,
+            right.structure_embedding,
+        )
+        pose_weight = config.structure_pose_weight
+    formation = formation_assignment_mismatch(
+        left.formation_people,
+        right.formation_people,
+    )
+    silhouette = (
+        _embedding_distance(
+            left.silhouette_embedding,
+            right.silhouette_embedding,
+        )
+        if left.silhouette_confidence >= config.minimum_silhouette_confidence
+        and right.silhouette_confidence >= config.minimum_silhouette_confidence
+        else None
+    )
+    layout = _embedding_distance(
+        left.person_layout_embedding,
+        right.person_layout_embedding,
+    )
+    person_count = _person_count_mismatch(
+        left.detected_person_count,
+        right.detected_person_count,
+    )
+    weighted_components = (
+        (attention_position, config.attention_position_weight),
+        (attention_scale, config.attention_scale_weight),
+        (pose, pose_weight),
+        (formation, config.formation_weight),
+        (silhouette, config.silhouette_weight),
+        (layout, config.person_layout_weight),
+        (person_count, config.person_count_weight),
+    )
+    available = tuple(
+        (float(value), weight)
+        for value, weight in weighted_components
+        if value is not None
+    )
+    base = (
+        sum(value * weight for value, weight in available)
+        / sum(weight for _value, weight in available)
+        if available
+        else 1.0
+    )
+    components = {
+        "attention_position": attention_position,
+        "attention_scale": attention_scale,
+        "dominant_pose": pose,
+        "formation": formation,
+        "silhouette": silhouette,
+        "person_layout": layout,
+        "person_count": person_count,
+    }
+    warning_flags = [
+        name
+        for name, threshold in config.warning_thresholds().items()
+        if components[name] is not None and float(components[name]) > threshold
+    ]
+    if base > config.total_mismatch_warning:
+        warning_flags.append("total_mismatch")
+    if len(available) < config.minimum_evidence_component_count:
+        warning_flags.append("insufficient_geometry_evidence")
+    severe_flags = [
+        name
+        for name, threshold in config.warning_thresholds().items()
+        if components[name] is not None
+        and float(components[name])
+        > min(1.0, threshold + config.severe_risk_margin)
+    ]
+    if base > config.total_mismatch_severe:
+        severe_flags.append("total_mismatch")
+    if not available:
+        severe_flags.append("no_geometry_evidence")
+    cost = base
+    cost += config.warning_penalty * len(warning_flags)
+    cost += config.severe_penalty * len(severe_flags)
+    if len(available) < config.minimum_evidence_component_count:
+        missing_count = config.minimum_evidence_component_count - len(available)
+        cost += config.insufficient_evidence_penalty * missing_count
+    return DirectBoundaryMismatch(
+        cost=cost,
+        base_mismatch=base,
+        attention_position_mismatch=attention_position,
+        attention_scale_mismatch=attention_scale,
+        dominant_pose_mismatch=pose,
+        pose_basis=pose_basis if pose is not None else None,
+        formation_mismatch=formation,
+        silhouette_mismatch=silhouette,
+        person_layout_mismatch=layout,
+        person_count_mismatch=person_count,
+        evidence_component_count=len(available),
+        warning_flags=tuple(warning_flags),
+        severe_flags=tuple(severe_flags),
+    )
+
+
+def _source_local_time(
+    master_seconds: float,
+    *,
+    source_index: int,
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
+) -> float:
+    timewarp = source_timewarps[source_index]
+    if timewarp is None:
+        return master_seconds + float(audio_offsets[source_index])
+    return timewarp.master_to_source(master_seconds)
+
+
+def _source_master_time(
+    source_seconds: float,
+    *,
+    source_index: int,
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
+) -> float:
+    timewarp = source_timewarps[source_index]
+    if timewarp is None:
+        return source_seconds - float(audio_offsets[source_index])
+    return timewarp.source_to_master(source_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamNode:
+    cost: float
+    path: tuple[int, ...]
+    duration_totals: tuple[float, ...]
+
+
+_BeamStateKey = tuple[
+    tuple[int, ...],
+    int,
+    int,
+    tuple[float, ...],
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _BeamAttemptResult:
+    beam_width: int
+    states: dict[_BeamStateKey, _BeamNode]
+    pruned_state_count: int
+    pruned_segment_indices: tuple[int, ...]
+    peak_generated_state_count: int
+    failed_at_segment_index: int | None
+    generated_state_capacity_exhausted: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        if self.generated_state_capacity_exhausted:
+            outcome = "generated_state_capacity_exhausted"
+        elif self.failed_at_segment_index is not None:
+            outcome = "frontier_exhausted"
+        else:
+            outcome = "terminal_frontier_reached"
+        return {
+            "beam_width": self.beam_width,
+            "outcome": outcome,
+            "failed_at_segment_index": self.failed_at_segment_index,
+            "peak_generated_state_count": self.peak_generated_state_count,
+            "pruned_state_count": self.pruned_state_count,
+            "pruned_segment_indices": list(self.pruned_segment_indices),
+            "terminal_state_count": len(self.states),
+            "generated_state_capacity_exhausted": (
+                self.generated_state_capacity_exhausted
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _FeasibilityLifelineResult:
+    node: _BeamNode | None
+    explored_state_count: int
+    memoized_failed_state_count: int
+    state_capacity_exhausted: bool
+    root_candidate_diagnostics: tuple[dict[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": "exact_backward_memoized_hard_feasibility",
+            "path_found": self.node is not None,
+            "explored_state_count": self.explored_state_count,
+            "memoized_failed_state_count": self.memoized_failed_state_count,
+            "state_capacity_exhausted": self.state_capacity_exhausted,
+            "duration_state_quantization_applied": False,
+            "root_candidate_diagnostics": [
+                dict(item) for item in self.root_candidate_diagnostics
+            ],
+        }
+
+
+def _adaptive_beam_widths(initial: int, maximum: int) -> tuple[int, ...]:
+    effective_maximum = max(initial, maximum)
+    widths: list[int] = []
+    width = initial
+    while True:
+        widths.append(width)
+        if width >= effective_maximum:
+            break
+        width = min(effective_maximum, width * 2)
+    return tuple(widths)
+
+
+def _path_optimizer_cost(
+    path: Sequence[int],
+    *,
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    durations: Sequence[float],
+    duration_targets: Sequence[float],
+    config: DirectMemberVisualConfig,
+) -> tuple[float, tuple[float, ...]]:
+    duration_totals = [0.0] * len(duration_targets)
+    cost = 0.0
+    for position, source_index in enumerate(path):
+        if position:
+            cost += matrices[position - 1][path[position - 1]][source_index].cost
+        if position >= 2 and source_index == path[position - 2]:
+            cost += config.ping_pong_penalty
+        previous_duration = duration_totals[source_index]
+        updated_duration = previous_duration + float(durations[position])
+        duration_totals[source_index] = updated_duration
+        target = duration_targets[source_index]
+        cost += config.duration_balance_weight * (
+            (updated_duration / target) ** 2
+            - (previous_duration / target) ** 2
+        )
+    return (cost, tuple(duration_totals))
+
+
+def _run_bounded_beam_attempt(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    durations: Sequence[float],
+    duration_targets: Sequence[float],
+    future_valid_counts: Sequence[Sequence[int]],
+    beam_width: int,
+    generated_state_limit: int,
+    config: DirectMemberVisualConfig,
+) -> _BeamAttemptResult:
+    span_count = len(candidate_validity)
+    source_count = len(source_quotas)
+    states: dict[_BeamStateKey, _BeamNode] = {}
+    for source_index in source_order:
+        if not candidate_validity[0][source_index]:
+            continue
+        counts = [0] * source_count
+        counts[source_index] = 1
+        duration_totals = [0.0] * source_count
+        duration_totals[source_index] = durations[0]
+        normalized_load = durations[0] / duration_targets[source_index]
+        cost = config.duration_balance_weight * normalized_load**2
+        key = (
+            tuple(counts),
+            source_index,
+            -1,
+            _duration_signature(duration_totals),
+        )
+        states[key] = _BeamNode(cost, (source_index,), tuple(duration_totals))
+
+    pruned_state_count = 0
+    pruned_segments: list[int] = []
+    peak_generated_state_count = len(states)
+    for position in range(1, span_count):
+        matrix = matrices[position - 1]
+        next_states: dict[_BeamStateKey, _BeamNode] = {}
+        remaining_after = span_count - position - 1
+        capacity_exhausted = False
+        for (
+            counts,
+            previous,
+            previous_previous,
+            _duration_state,
+        ), node in states.items():
+            for source_index in source_order:
+                if source_index == previous:
+                    continue
+                if not candidate_validity[position][source_index]:
+                    continue
+                if matrix[previous][source_index].severe_flags:
+                    continue
+                if counts[source_index] >= source_quotas[source_index]:
+                    continue
+                updated = list(counts)
+                updated[source_index] += 1
+                deficits = tuple(
+                    source_quotas[index] - updated[index]
+                    for index in range(source_count)
+                )
+                feasible = True
+                for index, deficit in enumerate(deficits):
+                    if deficit > future_valid_counts[position + 1][index]:
+                        feasible = False
+                        break
+                    maximum_slots = (
+                        remaining_after // 2
+                        if index == source_index
+                        else (remaining_after + 1) // 2
+                    )
+                    if deficit > maximum_slots:
+                        feasible = False
+                        break
+                if not feasible:
+                    continue
+                ping_pong = source_index == previous_previous
+                cost = node.cost + matrix[previous][source_index].cost
+                if ping_pong:
+                    cost += config.ping_pong_penalty
+                duration_totals = list(node.duration_totals)
+                previous_duration = duration_totals[source_index]
+                updated_duration = previous_duration + durations[position]
+                duration_totals[source_index] = updated_duration
+                target_duration = duration_targets[source_index]
+                cost += config.duration_balance_weight * (
+                    (updated_duration / target_duration) ** 2
+                    - (previous_duration / target_duration) ** 2
+                )
+                path = node.path + (source_index,)
+                key = (
+                    tuple(updated),
+                    source_index,
+                    previous,
+                    _duration_signature(duration_totals),
+                )
+                existing = next_states.get(key)
+                if existing is None and len(next_states) >= generated_state_limit:
+                    capacity_exhausted = True
+                    break
+                if existing is None or (cost, path) < (existing.cost, existing.path):
+                    next_states[key] = _BeamNode(
+                        cost,
+                        path,
+                        tuple(duration_totals),
+                    )
+            if capacity_exhausted:
+                break
+        peak_generated_state_count = max(
+            peak_generated_state_count,
+            len(next_states),
+        )
+        if capacity_exhausted:
+            return _BeamAttemptResult(
+                beam_width=beam_width,
+                states=states,
+                pruned_state_count=pruned_state_count,
+                pruned_segment_indices=tuple(pruned_segments),
+                peak_generated_state_count=peak_generated_state_count,
+                failed_at_segment_index=position,
+                generated_state_capacity_exhausted=True,
+            )
+        if not next_states:
+            return _BeamAttemptResult(
+                beam_width=beam_width,
+                states={},
+                pruned_state_count=pruned_state_count,
+                pruned_segment_indices=tuple(pruned_segments),
+                peak_generated_state_count=peak_generated_state_count,
+                failed_at_segment_index=position,
+                generated_state_capacity_exhausted=False,
+            )
+        if len(next_states) > beam_width:
+            pruned_state_count += len(next_states) - beam_width
+            pruned_segments.append(position)
+            states = dict(
+                heapq.nsmallest(
+                    beam_width,
+                    next_states.items(),
+                    key=lambda item: (item[1].cost, item[1].path),
+                )
+            )
+        else:
+            states = next_states
+    return _BeamAttemptResult(
+        beam_width=beam_width,
+        states=states,
+        pruned_state_count=pruned_state_count,
+        pruned_segment_indices=tuple(pruned_segments),
+        peak_generated_state_count=peak_generated_state_count,
+        failed_at_segment_index=None,
+        generated_state_capacity_exhausted=False,
+    )
+
+
+def _exact_feasibility_lifeline(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    durations: Sequence[float],
+    duration_targets: Sequence[float],
+    state_limit: int,
+    config: DirectMemberVisualConfig,
+) -> _FeasibilityLifelineResult:
+    """Find one exact hard-feasible path without lossy beam pruning.
+
+    Search runs backward so a restrictive final boundary constrains its
+    predecessor immediately.  The memo key retains exact duration totals;
+    unlike the quality beam, it applies no rounded duration signature.  A
+    capacity hit is reported as search exhaustion and never mislabeled as
+    constraint infeasibility.
+    """
+
+    span_count = len(candidate_validity)
+    source_count = len(source_quotas)
+    maximum_quota = max(int(value) for value in source_quotas)
+    prefix_valid_counts: list[tuple[int, ...]] = [(0,) * source_count]
+    for position in range(span_count):
+        previous = prefix_valid_counts[-1]
+        prefix_valid_counts.append(
+            tuple(
+                previous[source_index]
+                + int(bool(candidate_validity[position][source_index]))
+                for source_index in range(source_count)
+            )
+        )
+    prefix_duration_bounds: list[tuple[tuple[float, float], ...]] = []
+    for position in range(span_count + 1):
+        ordered = sorted(float(value) for value in durations[:position])
+        # These are deliberately optimistic necessary bounds: they ignore
+        # content validity, adjacency, and severe-edge restrictions.  The
+        # smallest/largest N durations from the entire remaining prefix can
+        # only widen the achievable interval, so this check cannot discard a
+        # duration-feasible assignment.
+        prefix_duration_bounds.append(
+            tuple(
+                (
+                    sum(ordered[:count]),
+                    sum(ordered[-count:]) if count else 0.0,
+                )
+                for count in range(maximum_quota + 1)
+            )
+        )
+    lower_duration = tuple(
+        target * (1.0 - config.maximum_source_duration_relative_deviation)
+        for target in duration_targets
+    )
+    upper_duration = tuple(
+        target * (1.0 + config.maximum_source_duration_relative_deviation)
+        for target in duration_targets
+    )
+    order_rank = {source_index: rank for rank, source_index in enumerate(source_order)}
+    failed_states: set[
+        tuple[int, tuple[int, ...], int, tuple[float, ...]]
+    ] = set()
+    explored_state_count = 0
+    capacity_exhausted = False
+
+    def _prefix_prune_reasons(
+        position: int,
+        counts: Sequence[int],
+        current_source: int,
+        duration_totals: Sequence[float],
+    ) -> tuple[dict[str, Any], ...]:
+        reasons: list[dict[str, Any]] = []
+        quota_deficit_sum = sum(
+            source_quotas[index] - counts[index]
+            for index in range(source_count)
+        )
+        if quota_deficit_sum != position:
+            reasons.append(
+                {
+                    "reason": "quota_deficit_sum_mismatch",
+                    "required_prefix_assignment_count": position,
+                    "quota_deficit_sum": quota_deficit_sum,
+                }
+            )
+        for source_index in range(source_count):
+            deficit = source_quotas[source_index] - counts[source_index]
+            if deficit < 0:
+                reasons.append(
+                    {
+                        "reason": "source_quota_exceeded",
+                        "eligible_source_index": source_index,
+                        "quota": int(source_quotas[source_index]),
+                        "assigned_suffix_count": int(counts[source_index]),
+                        "quota_deficit": int(deficit),
+                    }
+                )
+                continue
+            prefix_valid_slot_count = prefix_valid_counts[position][source_index]
+            if deficit > prefix_valid_slot_count:
+                reasons.append(
+                    {
+                        "reason": "prefix_valid_slot_shortfall",
+                        "eligible_source_index": source_index,
+                        "quota_deficit": int(deficit),
+                        "prefix_valid_slot_count": int(prefix_valid_slot_count),
+                        "shortfall": int(deficit - prefix_valid_slot_count),
+                        "prefix_position_count": position,
+                    }
+                )
+            maximum_slots = (
+                position // 2
+                if source_index == current_source
+                else (position + 1) // 2
+            )
+            if deficit > maximum_slots:
+                reasons.append(
+                    {
+                        "reason": "prefix_adjacency_slot_shortfall",
+                        "eligible_source_index": source_index,
+                        "quota_deficit": int(deficit),
+                        "maximum_nonadjacent_prefix_slots": int(maximum_slots),
+                        "shortfall": int(deficit - maximum_slots),
+                        "prefix_position_count": position,
+                        "current_suffix_source_index": current_source,
+                    }
+                )
+            minimum_addition, maximum_addition = prefix_duration_bounds[position][
+                deficit
+            ]
+            projected_minimum = duration_totals[source_index] + minimum_addition
+            projected_maximum = duration_totals[source_index] + maximum_addition
+            if projected_minimum > upper_duration[source_index] + 1e-9:
+                reasons.append(
+                    {
+                        "reason": "duration_upper_bound_exceeded",
+                        "eligible_source_index": source_index,
+                        "quota_deficit": int(deficit),
+                        "assigned_suffix_duration_seconds": (
+                            duration_totals[source_index]
+                        ),
+                        "minimum_prefix_addition_seconds": minimum_addition,
+                        "projected_minimum_duration_seconds": projected_minimum,
+                        "allowed_upper_duration_seconds": upper_duration[
+                            source_index
+                        ],
+                    }
+                )
+            if projected_maximum < lower_duration[source_index] - 1e-9:
+                reasons.append(
+                    {
+                        "reason": "duration_lower_bound_unreachable",
+                        "eligible_source_index": source_index,
+                        "quota_deficit": int(deficit),
+                        "assigned_suffix_duration_seconds": (
+                            duration_totals[source_index]
+                        ),
+                        "maximum_prefix_addition_seconds": maximum_addition,
+                        "projected_maximum_duration_seconds": projected_maximum,
+                        "required_lower_duration_seconds": lower_duration[
+                            source_index
+                        ],
+                    }
+                )
+        return tuple(reasons)
+
+    def _search(
+        position: int,
+        counts: tuple[int, ...],
+        current_source: int,
+        duration_totals: tuple[float, ...],
+        suffix_path: tuple[int, ...],
+    ) -> _BeamNode | None:
+        nonlocal explored_state_count, capacity_exhausted
+        if capacity_exhausted:
+            return None
+        key = (position, counts, current_source, duration_totals)
+        if key in failed_states:
+            return None
+        if explored_state_count >= state_limit:
+            capacity_exhausted = True
+            return None
+        explored_state_count += 1
+        if _prefix_prune_reasons(
+            position,
+            counts,
+            current_source,
+            duration_totals,
+        ):
+            failed_states.add(key)
+            return None
+        if position == 0:
+            cost, verified_totals = _path_optimizer_cost(
+                suffix_path,
+                matrices=matrices,
+                durations=durations,
+                duration_targets=duration_targets,
+                config=config,
+            )
+            return _BeamNode(cost, suffix_path, verified_totals)
+
+        preceding_position = position - 1
+        candidates = [
+            source_index
+            for source_index in source_order
+            if source_index != current_source
+            and candidate_validity[preceding_position][source_index]
+            and counts[source_index] < source_quotas[source_index]
+            and not matrices[preceding_position][source_index][
+                current_source
+            ].severe_flags
+        ]
+        candidates.sort(
+            key=lambda source_index: (
+                matrices[preceding_position][source_index][current_source].cost,
+                order_rank[source_index],
+            )
+        )
+        for source_index in candidates:
+            updated_counts = list(counts)
+            updated_counts[source_index] += 1
+            updated_durations = list(duration_totals)
+            updated_durations[source_index] += durations[preceding_position]
+            result = _search(
+                preceding_position,
+                tuple(updated_counts),
+                source_index,
+                tuple(updated_durations),
+                (source_index,) + suffix_path,
+            )
+            if result is not None:
+                return result
+            if capacity_exhausted:
+                return None
+        failed_states.add(key)
+        return None
+
+    node: _BeamNode | None = None
+    final_position = span_count - 1
+    final_candidates = [
+        source_index
+        for source_index in source_order
+        if candidate_validity[final_position][source_index]
+        and source_quotas[source_index] > 0
+    ]
+    root_candidate_diagnostics: list[dict[str, Any]] = []
+    for source_index in final_candidates:
+        counts = [0] * source_count
+        counts[source_index] = 1
+        duration_totals = [0.0] * source_count
+        duration_totals[source_index] = durations[final_position]
+        root_prune_reasons = _prefix_prune_reasons(
+            final_position,
+            counts,
+            source_index,
+            duration_totals,
+        )
+        predecessor_diagnostics: list[dict[str, Any]] = []
+        if final_position > 0:
+            for predecessor_source_index in source_order:
+                rejection_reasons: list[str] = []
+                if predecessor_source_index == source_index:
+                    rejection_reasons.append("adjacent_source_repeat")
+                if not candidate_validity[final_position - 1][
+                    predecessor_source_index
+                ]:
+                    rejection_reasons.append("preceding_content_invalid")
+                if (
+                    counts[predecessor_source_index]
+                    >= source_quotas[predecessor_source_index]
+                ):
+                    rejection_reasons.append("source_quota_already_full")
+                severe_flags = list(
+                    matrices[final_position - 1][predecessor_source_index][
+                        source_index
+                    ].severe_flags
+                )
+                if severe_flags:
+                    rejection_reasons.append("severe_boundary_mismatch")
+                predecessor_diagnostics.append(
+                    {
+                        "eligible_source_index": predecessor_source_index,
+                        "eligible": not rejection_reasons,
+                        "rejection_reasons": rejection_reasons,
+                        "severe_flags": severe_flags,
+                    }
+                )
+        eligible_predecessors = [
+            item["eligible_source_index"]
+            for item in predecessor_diagnostics
+            if item["eligible"]
+        ]
+        node = _search(
+            final_position,
+            tuple(counts),
+            source_index,
+            tuple(duration_totals),
+            (source_index,),
+        )
+        if node is not None:
+            search_outcome = "witness_found"
+        elif capacity_exhausted:
+            search_outcome = "state_capacity_exhausted"
+        elif root_prune_reasons:
+            search_outcome = "root_prefix_pruned"
+        elif not eligible_predecessors:
+            search_outcome = "root_predecessor_exhausted"
+        else:
+            search_outcome = "subtree_infeasible"
+        root_candidate_diagnostics.append(
+            {
+                "final_candidate_source_index": source_index,
+                "final_segment_index": final_position,
+                "prefix_position_count": final_position,
+                "root_prefix_feasible": not root_prune_reasons,
+                "search_outcome": search_outcome,
+                "prune_reasons": list(root_prune_reasons),
+                "eligible_predecessor_source_indices": eligible_predecessors,
+                "predecessor_diagnostics": predecessor_diagnostics,
+            }
+        )
+        if node is not None or capacity_exhausted:
+            break
+    return _FeasibilityLifelineResult(
+        node=node,
+        explored_state_count=explored_state_count,
+        memoized_failed_state_count=len(failed_states),
+        state_capacity_exhausted=capacity_exhausted,
+        root_candidate_diagnostics=tuple(root_candidate_diagnostics),
+    )
+
+
+def _source_duration_balance(
+    source_indices: Sequence[int],
+    span_durations: Sequence[float],
+    source_quotas: Sequence[int],
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    """Return actual, quota-adjusted target, and relative source exposures."""
+
+    if len(source_indices) != len(span_durations):
+        raise ValueError("duration balance path and span lengths must match")
+    span_count = len(span_durations)
+    source_count = len(source_quotas)
+    if span_count == 0 or source_count == 0:
+        raise ValueError("duration balance needs spans and sources")
+    durations = tuple(float(value) for value in span_durations)
+    if any(not math.isfinite(value) or value <= 0.0 for value in durations):
+        raise ValueError("duration balance spans must be finite and positive")
+    if sum(int(value) for value in source_quotas) != span_count:
+        raise ValueError("duration balance quotas must cover every span")
+    totals = [0.0] * source_count
+    for source_index, duration in zip(source_indices, durations):
+        if not 0 <= int(source_index) < source_count:
+            raise ValueError("duration balance path references an unknown source")
+        totals[int(source_index)] += duration
+    total_duration = sum(durations)
+    targets = tuple(
+        total_duration * int(quota) / span_count for quota in source_quotas
+    )
+    if any(target <= 0.0 for target in targets):
+        raise ValueError("duration balance targets must be positive")
+    actual = tuple(totals)
+    deviations = tuple(
+        abs(value - target) / target
+        for value, target in zip(actual, targets)
+    )
+    return (actual, targets, deviations)
+
+
+def _duration_signature(values: Sequence[float]) -> tuple[float, ...]:
+    """Coalesce near-equal duration states inside the lossy quality beam only."""
+
+    return tuple(round(float(value), 6) for value in values)
+
+
+def _balanced_quotas(
+    span_count: int,
+    source_count: int,
+    preferred_source_order: Sequence[int],
+) -> tuple[int, ...]:
+    if span_count < source_count:
+        raise ValueError("direct visual path needs at least one span per source")
+    order = tuple(int(index) for index in preferred_source_order)
+    if len(order) != source_count or set(order) != set(range(source_count)):
+        raise ValueError("preferred_source_order must be a source permutation")
+    base, extra = divmod(span_count, source_count)
+    quotas = [base] * source_count
+    for source_index in order[:extra]:
+        quotas[source_index] += 1
+    return tuple(quotas)
+
+
+def _balanced_visual_path(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    span_durations: Sequence[float],
+    config: DirectMemberVisualConfig,
+) -> tuple[tuple[int, ...], float, dict[str, Any]]:
+    span_count = len(matrices) + 1
+    source_count = len(source_quotas)
+    order = tuple(source_order)
+    durations = tuple(float(value) for value in span_durations)
+    if len(durations) != span_count:
+        raise ValueError("direct visual span durations must match matrices")
+    if any(not math.isfinite(value) or value <= 0.0 for value in durations):
+        raise ValueError("direct visual span durations must be finite and positive")
+    total_duration = sum(durations)
+    duration_targets = tuple(
+        total_duration * int(quota) / span_count for quota in source_quotas
+    )
+    future_valid_counts: list[tuple[int, ...]] = [
+        (0,) * source_count for _ in range(span_count + 1)
+    ]
+    for position in range(span_count - 1, -1, -1):
+        following = future_valid_counts[position + 1]
+        future_valid_counts[position] = tuple(
+            following[source_index]
+            + int(bool(candidate_validity[position][source_index]))
+            for source_index in range(source_count)
+        )
+    attempts: list[dict[str, Any]] = []
+    closest_complete: tuple[
+        float,
+        float,
+        _BeamNode,
+        tuple[float, ...],
+        int,
+    ] | None = None
+    last_attempt: _BeamAttemptResult | None = None
+    for width in _adaptive_beam_widths(
+        config.beam_width,
+        config.maximum_adaptive_beam_width,
+    ):
+        attempt = _run_bounded_beam_attempt(
+            matrices,
+            source_quotas=source_quotas,
+            source_order=order,
+            candidate_validity=candidate_validity,
+            durations=durations,
+            duration_targets=duration_targets,
+            future_valid_counts=future_valid_counts,
+            beam_width=width,
+            generated_state_limit=max(
+                width,
+                config.maximum_generated_beam_state_count,
+            ),
+            config=config,
+        )
+        last_attempt = attempt
+        attempt_payload = attempt.to_dict()
+        complete = [
+            node
+            for (
+                counts,
+                _last,
+                _previous,
+                _duration_state,
+            ), node in attempt.states.items()
+            if counts == tuple(source_quotas)
+        ]
+        balanced: list[_BeamNode] = []
+        complete_diagnostics: list[
+            tuple[float, float, _BeamNode, tuple[float, ...]]
+        ] = []
+        for node in complete:
+            deviations = tuple(
+                abs(actual - target) / target
+                for actual, target in zip(
+                    node.duration_totals,
+                    duration_targets,
+                )
+            )
+            maximum_deviation = max(deviations)
+            squared_deviation = sum(value**2 for value in deviations)
+            complete_diagnostics.append(
+                (maximum_deviation, squared_deviation, node, deviations)
+            )
+            if (
+                maximum_deviation
+                <= config.maximum_source_duration_relative_deviation + 1e-9
+            ):
+                balanced.append(node)
+        attempt_payload["complete_quota_path_count"] = len(complete)
+        attempt_payload["duration_eligible_path_count"] = len(balanced)
+        attempts.append(attempt_payload)
+        if complete_diagnostics:
+            observed = min(
+                complete_diagnostics,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    item[2].cost,
+                    item[2].path,
+                ),
+            )
+            observed_with_count = (*observed, len(complete))
+            if closest_complete is None or (
+                observed_with_count[0],
+                observed_with_count[1],
+                observed_with_count[2].cost,
+                observed_with_count[2].path,
+            ) < (
+                closest_complete[0],
+                closest_complete[1],
+                closest_complete[2].cost,
+                closest_complete[2].path,
+            ):
+                closest_complete = observed_with_count
+        if balanced:
+            best = min(balanced, key=lambda node: (node.cost, node.path))
+            return (
+                best.path,
+                best.cost,
+                {
+                    "strategy": "bounded_adaptive_cost_beam_with_exact_lifeline",
+                    "selection_basis": "adaptive_cost_beam",
+                    "adaptive_widening_used": len(attempts) > 1,
+                    "attempted_beam_widths": [
+                        item["beam_width"] for item in attempts
+                    ],
+                    "attempts": attempts,
+                    "exact_lifeline": {"invoked": False},
+                    "search_capacity_exhausted": False,
+                    "constraint_infeasibility_proven": False,
+                },
+            )
+        if attempt.generated_state_capacity_exhausted:
+            break
+        # A wider cost beam cannot add states when this attempt never pruned.
+        # The exact lifeline still runs because the beam duration key is
+        # deliberately rounded and must not be used as an infeasibility proof.
+        if attempt.pruned_state_count == 0:
+            break
+
+    lifeline = _exact_feasibility_lifeline(
+        matrices,
+        source_quotas=source_quotas,
+        source_order=order,
+        candidate_validity=candidate_validity,
+        durations=durations,
+        duration_targets=duration_targets,
+        state_limit=config.feasibility_lifeline_state_limit,
+        config=config,
+    )
+    search_diagnostics = {
+        "strategy": "bounded_adaptive_cost_beam_with_exact_lifeline",
+        "selection_basis": (
+            "exact_feasibility_lifeline" if lifeline.node is not None else None
+        ),
+        "adaptive_widening_used": len(attempts) > 1,
+        "attempted_beam_widths": [item["beam_width"] for item in attempts],
+        "attempts": attempts,
+        "exact_lifeline": {"invoked": True, **lifeline.to_dict()},
+        "search_capacity_exhausted": lifeline.state_capacity_exhausted,
+        "constraint_infeasibility_proven": (
+            lifeline.node is None and not lifeline.state_capacity_exhausted
+        ),
+    }
+    if lifeline.node is not None:
+        return (
+            lifeline.node.path,
+            lifeline.node.cost,
+            search_diagnostics,
+        )
+    if lifeline.state_capacity_exhausted:
+        raise DirectMemberVisualSelectionError(
+            "direct visual selector exhausted bounded search capacity",
+            {
+                "failure": "search_capacity_exhausted",
+                "source_quotas": list(source_quotas),
+                "constraint_infeasibility_proven": False,
+                "visual_gates_relaxed": False,
+                "search": search_diagnostics,
+            },
+        )
+    if closest_complete is not None:
+        (
+            maximum_deviation,
+            _squared,
+            closest,
+            deviations,
+            complete_count,
+        ) = closest_complete
+        raise DirectMemberVisualSelectionError(
+            "balanced direct visual selector exceeded the source-duration threshold",
+            {
+                "failure": "duration_balance_threshold_unsatisfied",
+                "target_policy": (
+                    "total_duration_times_source_quota_divided_by_span_count"
+                ),
+                "maximum_allowed_relative_deviation": (
+                    config.maximum_source_duration_relative_deviation
+                ),
+                "best_maximum_relative_deviation": maximum_deviation,
+                "source_usage": [
+                    {
+                        "eligible_source_index": source_index,
+                        "quota": int(source_quotas[source_index]),
+                        "duration_seconds": closest.duration_totals[source_index],
+                        "target_duration_seconds": duration_targets[source_index],
+                        "duration_relative_deviation": deviations[source_index],
+                    }
+                    for source_index in range(source_count)
+                ],
+                "complete_quota_path_count_in_beam": complete_count,
+                "duration_threshold_effect": "fail_closed_before_render",
+                "constraint_infeasibility_proven": True,
+                "search": search_diagnostics,
+            },
+        )
+    failure_position = (
+        last_attempt.failed_at_segment_index
+        if last_attempt is not None
+        and last_attempt.failed_at_segment_index is not None
+        else span_count - 1
+    )
+    failure_matrix = matrices[max(0, failure_position - 1)]
+    raise DirectMemberVisualSelectionError(
+        "balanced direct visual selector proved no hard-feasible quota path",
+        {
+            "failure": "validity_quota_path_exhausted",
+            "failed_at_segment_index": failure_position,
+            "source_quotas": list(source_quotas),
+            "valid_source_indices": [
+                index
+                for index, valid in enumerate(candidate_validity[failure_position])
+                if valid
+            ],
+            "severe_edge_pair_count": sum(
+                bool(failure_matrix[left][right].severe_flags)
+                for left in range(source_count)
+                for right in range(source_count)
+                if left != right
+            ),
+            "severe_edges_are_ineligible": True,
+            "constraint_infeasibility_proven": True,
+            "search": search_diagnostics,
+        },
+    )
+
+
+def _hard_boundary_connectivity_diagnostics(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    candidate_validity: Sequence[Sequence[bool]],
+) -> dict[str, Any]:
+    """Summarize fail-closed source connectivity at every fixed boundary.
+
+    This deliberately ignores quota and duration state.  It is therefore not a
+    proof that a complete balanced path exists, but a zero reachable edge is a
+    sound proof that the current musical partition cannot be crossed without
+    relaxing either content validity, the severe-boundary gate, or the
+    no-adjacent-repeat rule.  The pipeline may move that musical boundary and
+    run every hard gate again; it must never turn this diagnostic into a gate
+    relaxation.
+    """
+
+    validity = tuple(tuple(bool(value) for value in row) for row in candidate_validity)
+    if not validity:
+        return {
+            "analysis_basis": "content_valid_nonsevere_no_repeat_reachability_v1",
+            "boundaries": [],
+            "zero_local_nonsevere_transition_boundary_indices": [],
+            "zero_reachable_transition_boundary_indices": [],
+        }
+    source_count = len(validity[0])
+    forward: list[set[int]] = [
+        {index for index, valid in enumerate(validity[0]) if valid}
+    ]
+    for boundary_index, matrix in enumerate(matrices):
+        following = {
+            right
+            for right in range(source_count)
+            if validity[boundary_index + 1][right]
+            and any(
+                left != right
+                and not matrix[left][right].severe_flags
+                for left in forward[-1]
+            )
+        }
+        forward.append(following)
+
+    backward: list[set[int]] = [set() for _ in validity]
+    backward[-1] = {
+        index for index, valid in enumerate(validity[-1]) if valid
+    }
+    for boundary_index in range(len(matrices) - 1, -1, -1):
+        matrix = matrices[boundary_index]
+        backward[boundary_index] = {
+            left
+            for left in range(source_count)
+            if validity[boundary_index][left]
+            and any(
+                left != right
+                and not matrix[left][right].severe_flags
+                for right in backward[boundary_index + 1]
+            )
+        }
+
+    boundaries: list[dict[str, Any]] = []
+    for boundary_index, matrix in enumerate(matrices):
+        content_valid_edges = [
+            (left, right)
+            for left in range(source_count)
+            for right in range(source_count)
+            if left != right
+            and validity[boundary_index][left]
+            and validity[boundary_index + 1][right]
+        ]
+        nonsevere_edges = [
+            (left, right)
+            for left, right in content_valid_edges
+            if not matrix[left][right].severe_flags
+        ]
+        reachable_edges = [
+            (left, right)
+            for left, right in nonsevere_edges
+            if left in forward[boundary_index]
+            and right in backward[boundary_index + 1]
+        ]
+        boundaries.append(
+            {
+                "boundary_index": boundary_index,
+                "left_valid_source_indices": [
+                    index
+                    for index, valid in enumerate(validity[boundary_index])
+                    if valid
+                ],
+                "right_valid_source_indices": [
+                    index
+                    for index, valid in enumerate(validity[boundary_index + 1])
+                    if valid
+                ],
+                "forward_reachable_left_source_indices": sorted(
+                    forward[boundary_index]
+                ),
+                "backward_reachable_right_source_indices": sorted(
+                    backward[boundary_index + 1]
+                ),
+                "content_valid_cross_source_edge_count": len(content_valid_edges),
+                "nonsevere_cross_source_edge_count": len(nonsevere_edges),
+                "reachable_nonsevere_transition_count": len(reachable_edges),
+            }
+        )
+    return {
+        "analysis_basis": "content_valid_nonsevere_no_repeat_reachability_v1",
+        "quota_and_duration_considered": False,
+        "zero_local_nonsevere_edge_is_partition_infeasibility_proof": True,
+        "global_reachable_edge_counts_are_localization_diagnostics_only": True,
+        "boundaries": boundaries,
+        "zero_local_nonsevere_transition_boundary_indices": [
+            item["boundary_index"]
+            for item in boundaries
+            if item["nonsevere_cross_source_edge_count"] == 0
+        ],
+        "zero_reachable_transition_boundary_indices": [
+            item["boundary_index"]
+            for item in boundaries
+            if item["reachable_nonsevere_transition_count"] == 0
+        ],
+    }
+
+
+def select_balanced_direct_member_sources(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    source_scene_cut_times: Sequence[Sequence[float]] | None = None,
+    preferred_source_order: Sequence[int] | None = None,
+    config: DirectMemberVisualConfig | None = None,
+    descriptor_provider: DescriptorProvider | None = None,
+) -> DirectMemberVisualSelection:
+    """Select a balanced visual path over already-fixed musical spans.
+
+    Every eligible source is decoded immediately before and after every coarse
+    boundary. Source-local sample times and source-native scene cuts are mapped
+    through the accepted ``TimeWarpMap`` when present and retain scalar offsets
+    otherwise. Any native cut that survives strictly inside a coarsened span is
+    a hard-invalid source/span candidate even when six sampled frames miss it.
+    """
+
+    resolved_sources = tuple(Path(source) for source in sources)
+    source_count = len(resolved_sources)
+    if source_count < 2:
+        raise ValueError("direct visual selection needs at least two sources")
+    spans = tuple((float(start), float(end)) for start, end in canonical_spans)
+    if len(spans) < source_count:
+        raise ValueError("direct visual selection needs at least one span per source")
+    for index, (start, end) in enumerate(spans):
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError("direct visual spans must be finite and positive")
+        if index and not math.isclose(
+            spans[index - 1][1],
+            start,
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        ):
+            raise ValueError("direct visual spans must be contiguous")
+    if len(audio_offsets) != source_count:
+        raise ValueError("direct visual audio_offsets must match sources")
+    offsets = tuple(float(value) for value in audio_offsets)
+    if any(not math.isfinite(value) for value in offsets):
+        raise ValueError("direct visual audio offsets must be finite")
+    clocks = (
+        (None,) * source_count
+        if source_timewarps is None
+        else tuple(source_timewarps)
+    )
+    if len(clocks) != source_count:
+        raise ValueError("direct visual source_timewarps must match sources")
+    for index, timewarp in enumerate(clocks):
+        if timewarp is None:
+            continue
+        if not isinstance(timewarp, TimeWarpMap):
+            raise TypeError("direct visual source_timewarps entries must be maps")
+        if not math.isclose(
+            timewarp.global_offset_seconds,
+            offsets[index],
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError("direct visual timewarp offset does not match audio offset")
+    scene_cut_evidence_available = source_scene_cut_times is not None
+    local_scene_cuts = (
+        ((),) * source_count
+        if source_scene_cut_times is None
+        else tuple(tuple(float(value) for value in cuts) for cuts in source_scene_cut_times)
+    )
+    if len(local_scene_cuts) != source_count:
+        raise ValueError("direct visual scene cut times must match sources")
+    for source_index, cuts in enumerate(local_scene_cuts):
+        if any(not math.isfinite(value) or value < 0.0 for value in cuts):
+            raise ValueError("direct visual scene cut times must be finite and non-negative")
+        if any(left >= right for left, right in zip(cuts, cuts[1:])):
+            raise ValueError(
+                f"direct visual scene cut times for source {source_index} "
+                "must be strictly increasing"
+            )
+    mapped_scene_cuts = tuple(
+        tuple(
+            (
+                source_seconds,
+                _source_master_time(
+                    source_seconds,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                ),
+            )
+            for source_seconds in cuts
+        )
+        for source_index, cuts in enumerate(local_scene_cuts)
+    )
+    order = (
+        tuple(range(source_count))
+        if preferred_source_order is None
+        else tuple(int(index) for index in preferred_source_order)
+    )
+    resolved_config = config or DirectMemberVisualConfig()
+    quotas = _balanced_quotas(len(spans), source_count, order)
+
+    owned_provider: _VideoDescriptorProvider | None = None
+    provider = descriptor_provider
+    if provider is None:
+        owned_provider = _VideoDescriptorProvider(resolved_sources)
+        provider = owned_provider
+    outgoing_samples: list[tuple[_BoundarySample, ...]] = []
+    incoming_samples: list[tuple[_BoundarySample, ...]] = []
+    matrices: list[tuple[tuple[DirectBoundaryMismatch, ...], ...]] = []
+    span_diagnostics: list[DirectSpanVisualDiagnostic] = []
+    sample_count = 0
+    failed_sample_count = 0
+    try:
+        for segment_index, (span_start, span_end) in enumerate(spans):
+            duration = span_end - span_start
+            exit_inset = min(
+                resolved_config.span_interior_inset_seconds,
+                duration * 0.20,
+            )
+            # The first content sample is deliberately the actual cut plus one
+            # output frame.  A rig that clears 0.2 seconds later is still a
+            # visible bad cut and must not be hidden by the deeper interior
+            # sample used historically.
+            entry_inset = min(
+                resolved_config.sample_frame_step_seconds,
+                duration * 0.08,
+            )
+            # The second sample distinguishes a one-frame flash from a stage
+            # light or near-lens obstruction that visibly persists after the
+            # cut but clears before the quarter-span sample.
+            early_interior_inset = min(
+                resolved_config.early_interior_sample_seconds,
+                duration * 0.18,
+            )
+            master_times = (
+                span_start + entry_inset,
+                span_start + early_interior_inset,
+                span_start + duration * 0.25,
+                (span_start + span_end) / 2.0,
+                span_start + duration * 0.75,
+                span_end - exit_inset,
+            )
+            source_validity: list[DirectSpanSourceValidity] = []
+            for source_index, source in enumerate(resolved_sources):
+                cut_tolerance = min(
+                    resolved_config.native_scene_cut_boundary_tolerance_seconds,
+                    duration * 0.20,
+                )
+                internal_native_cuts = tuple(
+                    (source_seconds, master_seconds)
+                    for source_seconds, master_seconds in mapped_scene_cuts[source_index]
+                    if span_start + cut_tolerance
+                    < master_seconds
+                    < span_end - cut_tolerance
+                )
+                samples: list[_BoundarySample] = []
+                for master_seconds in master_times:
+                    local_seconds = _source_local_time(
+                        master_seconds,
+                        source_index=source_index,
+                        audio_offsets=offsets,
+                        source_timewarps=clocks,
+                    )
+                    descriptor = provider(source_index, source, local_seconds)
+                    sample_count += 1
+                    failed_sample_count += int(descriptor is None)
+                    samples.append(
+                        _BoundarySample(
+                            master_seconds=master_seconds,
+                            source_local_seconds=local_seconds,
+                            descriptor=descriptor,
+                            attention=_attention_geometry(descriptor),
+                        )
+                    )
+                source_validity.append(
+                    _span_source_validity(
+                        source_index=source_index,
+                        samples=tuple(samples),  # type: ignore[arg-type]
+                        native_scene_cuts=internal_native_cuts,
+                        config=resolved_config,
+                    )
+                )
+            span_diagnostics.append(
+                DirectSpanVisualDiagnostic(
+                    segment_index=segment_index,
+                    canonical_master_start=span_start,
+                    canonical_master_end=span_end,
+                    sources=tuple(source_validity),
+                )
+            )
+
+        for boundary_index in range(len(spans) - 1):
+            boundary = spans[boundary_index][1]
+            outgoing_master = max(
+                spans[boundary_index][0],
+                boundary - resolved_config.sample_frame_step_seconds,
+            )
+            incoming_master = min(
+                spans[boundary_index + 1][1],
+                boundary + resolved_config.sample_frame_step_seconds,
+            )
+            outgoing: list[_BoundarySample] = []
+            incoming: list[_BoundarySample] = []
+            for source_index, source in enumerate(resolved_sources):
+                outgoing_local = _source_local_time(
+                    outgoing_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
+                incoming_local = _source_local_time(
+                    incoming_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
+                outgoing_descriptor = provider(
+                    source_index,
+                    source,
+                    outgoing_local,
+                )
+                incoming_descriptor = provider(
+                    source_index,
+                    source,
+                    incoming_local,
+                )
+                sample_count += 2
+                failed_sample_count += int(outgoing_descriptor is None)
+                failed_sample_count += int(incoming_descriptor is None)
+                outgoing.append(
+                    _BoundarySample(
+                        master_seconds=outgoing_master,
+                        source_local_seconds=outgoing_local,
+                        descriptor=outgoing_descriptor,
+                        attention=_attention_geometry(outgoing_descriptor),
+                    )
+                )
+                incoming.append(
+                    _BoundarySample(
+                        master_seconds=incoming_master,
+                        source_local_seconds=incoming_local,
+                        descriptor=incoming_descriptor,
+                        attention=_attention_geometry(incoming_descriptor),
+                    )
+                )
+            outgoing_tuple = tuple(outgoing)
+            incoming_tuple = tuple(incoming)
+            outgoing_samples.append(outgoing_tuple)
+            incoming_samples.append(incoming_tuple)
+            matrices.append(
+                tuple(
+                    tuple(
+                        _boundary_mismatch(
+                            outgoing_tuple[left_index],
+                            incoming_tuple[right_index],
+                            resolved_config,
+                        )
+                        for right_index in range(source_count)
+                    )
+                    for left_index in range(source_count)
+                )
+            )
+    finally:
+        if owned_provider is not None:
+            owned_provider.close()
+
+    candidate_validity = tuple(
+        tuple(source.valid for source in span.sources)
+        for span in span_diagnostics
+    )
+    hard_boundary_connectivity = _hard_boundary_connectivity_diagnostics(
+        matrices,
+        candidate_validity,
+    )
+    valid_counts = tuple(
+        sum(span[source_index] for span in candidate_validity)
+        for source_index in range(source_count)
+    )
+    valid_count_by_source = [
+        {
+            "eligible_source_index": source_index,
+            "quota": int(quotas[source_index]),
+            "valid_span_count": int(valid_counts[source_index]),
+            "invalid_span_count": int(len(spans) - valid_counts[source_index]),
+            "valid_segment_indices": [
+                segment_index
+                for segment_index, validity in enumerate(candidate_validity)
+                if validity[source_index]
+            ],
+        }
+        for source_index in range(source_count)
+    ]
+    quota_shortfalls = tuple(
+        {
+            "eligible_source_index": source_index,
+            "quota": quotas[source_index],
+            "valid_span_count": valid_counts[source_index],
+        }
+        for source_index in range(source_count)
+        if valid_counts[source_index] < quotas[source_index]
+    )
+    empty_spans = tuple(
+        index for index, validity in enumerate(candidate_validity) if not any(validity)
+    )
+    if quota_shortfalls or empty_spans:
+        raise DirectMemberVisualSelectionError(
+            "direct member content validity cannot satisfy balanced source quotas",
+            {
+                "failure": "content_validity_quota_precheck_failed",
+                "quota_shortfalls": list(quota_shortfalls),
+                "empty_segment_indices": list(empty_spans),
+                "span_content_validity": [
+                    span.to_dict() for span in span_diagnostics
+                ],
+                "valid_count_by_source": valid_count_by_source,
+                "hard_boundary_connectivity": hard_boundary_connectivity,
+            },
+        )
+    try:
+        path, optimizer_cost, optimizer_search_diagnostics = (
+            _balanced_visual_path(
+                matrices,
+                source_quotas=quotas,
+                source_order=order,
+                candidate_validity=candidate_validity,
+                span_durations=tuple(end - start for start, end in spans),
+                config=resolved_config,
+            )
+        )
+    except DirectMemberVisualSelectionError as error:
+        # Persist the already-computed scalar evidence with every optimizer
+        # failure.  This is intentionally added here, where the complete
+        # 50x10 validity diagnostics still exist, so a failed run never needs
+        # another expensive frame-descriptor pass just to diagnose feasibility.
+        diagnostics = dict(error.diagnostics)
+        diagnostics.setdefault(
+            "span_content_validity",
+            [span.to_dict() for span in span_diagnostics],
+        )
+        diagnostics.setdefault("valid_count_by_source", valid_count_by_source)
+        diagnostics.setdefault(
+            "hard_boundary_connectivity",
+            hard_boundary_connectivity,
+        )
+        diagnostics.setdefault(
+            "privacy",
+            {
+                "face_identity_inference_used": False,
+                "face_appearance_embeddings_persisted": False,
+                "raw_pose_silhouette_layout_embeddings_persisted": False,
+                "validity_evidence_is_scalar_only": True,
+            },
+        )
+        raise DirectMemberVisualSelectionError(
+            str(error),
+            diagnostics,
+        ) from error
+    optimizer_search_diagnostics = {
+        **optimizer_search_diagnostics,
+        "hard_boundary_connectivity": hard_boundary_connectivity,
+    }
+    counts = tuple(path.count(index) for index in range(source_count))
+    source_durations, source_duration_targets, source_duration_deviations = (
+        _source_duration_balance(
+            path,
+            tuple(end - start for start, end in spans),
+            quotas,
+        )
+    )
+    diagnostics: list[DirectBoundaryVisualDiagnostic] = []
+    raw_cross_source_pair_count = source_count * (source_count - 1)
+    for boundary_index, (outgoing_index, incoming_index) in enumerate(
+        zip(path, path[1:])
+    ):
+        mismatch = matrices[boundary_index][outgoing_index][incoming_index]
+        content_valid_pairs = tuple(
+            (left, right)
+            for left in range(source_count)
+            for right in range(source_count)
+            if left != right
+            and candidate_validity[boundary_index][left]
+            and candidate_validity[boundary_index + 1][right]
+        )
+        severe_pair_count = sum(
+            bool(matrices[boundary_index][left][right].severe_flags)
+            for left, right in content_valid_pairs
+        )
+        ranked_pairs = sorted(
+            (
+                (matrices[boundary_index][left][right].cost, left, right)
+                for left, right in content_valid_pairs
+                if not matrices[boundary_index][left][right].severe_flags
+            ),
+        )
+        if not ranked_pairs:
+            raise DirectMemberVisualSelectionError(
+                "selected direct visual boundary has no eligible diagnostic pairs",
+                {
+                    "failure": "boundary_diagnostic_eligible_pair_exhausted",
+                    "boundary_index": boundary_index,
+                    "invalid_content_pair_count": (
+                        raw_cross_source_pair_count - len(content_valid_pairs)
+                    ),
+                    "severe_pair_count": severe_pair_count,
+                },
+            )
+        selected_rank = next(
+            rank
+            for rank, (_cost, left, right) in enumerate(ranked_pairs, start=1)
+            if left == outgoing_index and right == incoming_index
+        )
+        minimum_cost = ranked_pairs[0][0]
+        diagnostics.append(
+            DirectBoundaryVisualDiagnostic(
+                boundary_index=boundary_index,
+                canonical_master_seconds=spans[boundary_index][1],
+                outgoing_eligible_source_index=outgoing_index,
+                incoming_eligible_source_index=incoming_index,
+                outgoing_sample=outgoing_samples[boundary_index][outgoing_index],
+                incoming_sample=incoming_samples[boundary_index][incoming_index],
+                mismatch=mismatch,
+                selected_pair_rank=selected_rank,
+                candidate_pair_count=len(ranked_pairs),
+                raw_cross_source_pair_count=raw_cross_source_pair_count,
+                invalid_content_pair_count=(
+                    raw_cross_source_pair_count - len(content_valid_pairs)
+                ),
+                severe_pair_count=severe_pair_count,
+                minimum_pair_cost=minimum_cost,
+                selected_pair_cost_delta=mismatch.cost - minimum_cost,
+                ping_pong_penalty_applied=(
+                    boundary_index >= 1
+                    and incoming_index == path[boundary_index - 1]
+                ),
+            )
+        )
+    return DirectMemberVisualSelection(
+        source_indices=path,
+        source_quotas=quotas,
+        source_counts=counts,
+        source_durations_seconds=source_durations,
+        source_target_durations_seconds=source_duration_targets,
+        source_duration_relative_deviations=source_duration_deviations,
+        span_validity=tuple(span_diagnostics),
+        boundaries=tuple(diagnostics),
+        optimizer_cost=optimizer_cost,
+        sample_count=sample_count,
+        failed_sample_count=failed_sample_count,
+        native_scene_cut_evidence_available=scene_cut_evidence_available,
+        config=resolved_config,
+        optimizer_search_diagnostics=optimizer_search_diagnostics,
+    )
+
+
+__all__ = [
+    "DescriptorProvider",
+    "DirectBoundaryMismatch",
+    "DirectBoundaryVisualDiagnostic",
+    "DirectMemberVisualConfig",
+    "DirectMemberVisualSelection",
+    "DirectMemberVisualSelectionError",
+    "DirectSpanSourceValidity",
+    "DirectSpanVisualDiagnostic",
+    "select_balanced_direct_member_sources",
+]

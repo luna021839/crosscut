@@ -361,6 +361,48 @@ class MemberTrackingResult:
     def is_terminally_lost(self) -> bool:
         return self.terminal_failure is not None
 
+    @property
+    def terminal_failure_time_seconds(self) -> float | None:
+        """Return the first source-local time at which cropping became unsafe.
+
+        A terminal failure is intentionally diagnostic only: callers may use it
+        to choose a non-cropped rendering fallback, but it must never be treated
+        as permission to re-identify a person later in the same source track.
+        Backend initialization can fail immediately after the accepted anchor;
+        in that case the anchor time is the conservative failure boundary.
+        """
+
+        if self.terminal_failure is None:
+            return None
+        for observation in self.observations:
+            if observation.failure is self.terminal_failure:
+                return observation.timestamp_seconds
+        if self.observations:
+            return self.observations[0].timestamp_seconds
+        return None
+
+    def crop_failure_for_interval(
+        self,
+        source_start_seconds: float,
+        source_end_seconds: float,
+    ) -> TrackingFailure | None:
+        """Report a terminal failure affecting a half-open source interval.
+
+        This does not claim that the interval can be cropped, nor does it
+        restart the tracker.  It lets the member-render pipeline explain why an
+        automatic target-member fancam segment was safely downgraded to its
+        uncropped full frame.
+        """
+
+        start = float(source_start_seconds)
+        end = float(source_end_seconds)
+        if not isfinite(start) or not isfinite(end) or start < 0 or end <= start:
+            raise ValueError("source interval must be finite, non-negative, and ordered")
+        failure_time = self.terminal_failure_time_seconds
+        if failure_time is None or failure_time >= end:
+            return None
+        return self.terminal_failure
+
     def to_dynamic_crop_keyframes(
         self,
         *,

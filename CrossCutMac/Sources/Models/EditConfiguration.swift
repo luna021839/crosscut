@@ -26,8 +26,8 @@ enum EditMode: String, CaseIterable, Codable, Identifiable {
 
     var detail: String {
         switch self {
-        case .group: "박자·포즈·실루엣을 맞춘 교차컷에, 얼굴이 확실한 경계만 짧은 블렌드를 씁니다. 완곡은 9개 이상을 권장합니다."
-        case .member: "선택 멤버가 계속 담긴 무편집·고정 직캠을 연결합니다. 추적은 각 앵커에서 앞으로만 진행하며, 완곡은 9개 이상을 권장합니다."
+        case .group: "박자·포즈·실루엣을 맞춘 교차컷에, 얼굴이 확실한 경계만 짧은 블렌드를 씁니다. 자동 모드는 10개를 목표로 하고 8개부터 진행합니다."
+        case .member: "선택 멤버의 공식 세로 직캠을 원본 그대로 연결합니다. 자동 모드는 10개를 우선 찾고, 최소 8개부터 균등하게 돌려 씁니다."
         }
     }
 
@@ -35,6 +35,27 @@ enum EditMode: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .group: "rectangle.stack"
         case .member: "person.crop.rectangle.stack"
+        }
+    }
+}
+
+enum SourceMode: String, CaseIterable, Codable, Identifiable {
+    case automatic
+    case local
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "자동으로 찾기"
+        case .local: "내 영상 선택 · 고급"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .automatic: "sparkle.magnifyingglass"
+        case .local: "folder"
         }
     }
 }
@@ -61,13 +82,20 @@ enum OutputAspectRatio: String, CaseIterable, Codable, Identifiable {
 }
 
 struct EditRequest: Codable, Equatable {
+    static let automaticMemberSourceCount = 10
+    static let minimumAutomaticMemberSourceCount = 8
+
     let song: String
-    let targetMember: String
+    let targetMember: String?
     let editMode: String
     let aspectRatio: String
     let sources: [String]
     let outputDirectory: String
     let memberAnchors: [MemberAnchorRequest]
+    let sourceMode: String
+    let desiredSourceCount: Int
+    let sourceCacheDirectory: String
+    let acquireOnly: Bool
 
     init(
         song: String,
@@ -76,15 +104,36 @@ struct EditRequest: Codable, Equatable {
         aspectRatio: OutputAspectRatio,
         sources: [URL],
         outputDirectory: URL,
-        memberAnchors: [MemberAnchorRequest] = []
+        memberAnchors: [MemberAnchorRequest] = [],
+        sourceMode: SourceMode = .local,
+        desiredSourceCount: Int = 10,
+        sourceCacheDirectory: URL? = nil,
+        acquireOnly: Bool = false
     ) {
         self.song = song
-        self.targetMember = targetMember.rawValue
+        self.targetMember = editMode == .member ? targetMember.rawValue : nil
         self.editMode = editMode.rawValue
-        self.aspectRatio = aspectRatio.rawValue
+        if editMode == .group {
+            self.aspectRatio = OutputAspectRatio.landscape.rawValue
+        } else if sourceMode == .automatic {
+            self.aspectRatio = OutputAspectRatio.portrait.rawValue
+        } else {
+            self.aspectRatio = aspectRatio.rawValue
+        }
         self.sources = sources.map(\.path)
         self.outputDirectory = outputDirectory.path
-        self.memberAnchors = editMode == .member ? memberAnchors : []
+        self.memberAnchors = editMode == .member && sourceMode == .local
+            ? memberAnchors
+            : []
+        self.sourceMode = sourceMode.rawValue
+        self.desiredSourceCount = (
+            editMode == .member && sourceMode == .automatic
+                ? Self.automaticMemberSourceCount
+                : min(max(desiredSourceCount, 8), 24)
+        )
+        self.sourceCacheDirectory = (sourceCacheDirectory ?? outputDirectory
+            .appendingPathComponent("CrossCut Sources", isDirectory: true)).path
+        self.acquireOnly = acquireOnly
     }
 
     enum CodingKeys: String, CodingKey {
@@ -95,6 +144,35 @@ struct EditRequest: Codable, Equatable {
         case sources
         case outputDirectory = "output_directory"
         case memberAnchors = "member_anchors"
+        case sourceMode = "source_mode"
+        case desiredSourceCount = "desired_source_count"
+        case sourceCacheDirectory = "source_cache_directory"
+        case acquireOnly = "acquire_only"
+    }
+}
+
+enum EditStartPolicy {
+    static func canStart(
+        song: String,
+        sourceMode: SourceMode,
+        editMode: EditMode,
+        sourceCount: Int,
+        anchoredSourceCount: Int
+    ) -> Bool {
+        guard !song.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        switch (sourceMode, editMode) {
+        case (.automatic, .group):
+            return true
+        case (.automatic, .member):
+            return true
+        case (.local, .group):
+            return sourceCount >= 2
+        case (.local, .member):
+            return sourceCount >= 2 && anchoredSourceCount == sourceCount
+        }
     }
 }
 

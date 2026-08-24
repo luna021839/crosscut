@@ -2,15 +2,52 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum MemberAspectRatioPolicy {
+    static func resolvedRatio(
+        current: OutputAspectRatio,
+        editMode: EditMode,
+        sourceMode: SourceMode,
+        manuallySelectedMemberRatio: OutputAspectRatio?
+    ) -> OutputAspectRatio {
+        guard editMode == .member else { return .landscape }
+        if sourceMode == .automatic { return .portrait }
+        if let manuallySelectedMemberRatio {
+            return manuallySelectedMemberRatio
+        }
+        return current
+    }
+}
+
+enum ProjectSettingsControlPolicy {
+    static func canSelectMember(editMode: EditMode, isRunning: Bool) -> Bool {
+        editMode == .member && !isRunning
+    }
+
+    static func canSelectAspectRatio(
+        editMode: EditMode,
+        sourceMode: SourceMode,
+        isRunning: Bool
+    ) -> Bool {
+        editMode == .member && sourceMode == .local && !isRunning
+    }
+}
+
 struct ContentView: View {
+    private static let defaultStorageDirectories =
+        LargeMediaStoragePolicy.defaultDirectories()
+
     @StateObject private var runner = EngineRunner()
 
     @State private var song = ""
     @State private var targetMember = IVEMember.anYujin
     @State private var editMode = EditMode.group
     @State private var aspectRatio = OutputAspectRatio.landscape
+    @State private var manuallySelectedMemberAspectRatio: OutputAspectRatio?
+    @State private var sourceMode = SourceMode.automatic
+    @State private var desiredSourceCount = 10
     @State private var selectedVideos: [SelectedVideo] = []
     @State private var outputDirectory = Self.defaultOutputDirectory
+    @State private var sourceCacheRootDirectory = Self.defaultSourceCacheRootDirectory
     @State private var isChoosingVideos = false
     @State private var isDropTargeted = false
     @State private var validationMessage: String?
@@ -22,11 +59,20 @@ struct ContentView: View {
 
             ScrollView {
                 HStack(alignment: .top, spacing: 18) {
-                    settingsCard
-                        .frame(minWidth: 300, maxWidth: 340)
+                    VStack(spacing: 18) {
+                        sourceModeCard
+                        settingsCard
+                    }
+                    .frame(minWidth: 300, maxWidth: 340)
 
-                    sourcesCard
-                        .frame(minWidth: 320, maxWidth: .infinity)
+                    Group {
+                        if sourceMode == .automatic {
+                            automaticSourcesCard
+                        } else {
+                            sourcesCard
+                        }
+                    }
+                    .frame(minWidth: 320, maxWidth: .infinity)
 
                     activityCard
                         .frame(minWidth: 300, maxWidth: 360)
@@ -52,13 +98,30 @@ struct ContentView: View {
                 validationMessage = nil
             }
         }
+        .onAppear {
+            runner.restoreLatestCompletedGroupResult(
+                in: outputDirectory,
+                reportMissing: false,
+                clearExistingOutputsOnMissing: true
+            )
+        }
+        .onChange(of: outputDirectory) {
+            runner.restoreLatestCompletedGroupResult(
+                in: outputDirectory,
+                reportMissing: false,
+                clearExistingOutputsOnMissing: true
+            )
+        }
         .onChange(of: editMode) {
-            if editMode == .group {
-                aspectRatio = .landscape
-            }
+            applyAspectRatioPolicy()
+            validationMessage = nil
+        }
+        .onChange(of: sourceMode) {
+            applyAspectRatioPolicy()
+            validationMessage = nil
         }
         .onChange(of: targetMember) {
-            guard editMode == .member else { return }
+            guard editMode == .member, sourceMode == .local else { return }
             for index in selectedVideos.indices {
                 selectedVideos[index].memberAnchor = nil
             }
@@ -108,9 +171,9 @@ struct ContentView: View {
         } label: {
             HStack(spacing: 7) {
                 Circle()
-                    .fill(runner.engineURL == nil ? Color.orange : Color.green)
+                    .fill(runner.engineURL == nil ? Color.orange : Color.blue)
                     .frame(width: 8, height: 8)
-                Text(runner.engineURL == nil ? "엔진 연결 대기" : "엔진 준비됨")
+                Text(runner.engineURL == nil ? "엔진 연결 대기" : "엔진 연결됨")
                     .font(.caption.weight(.medium))
             }
             .padding(.horizontal, 11)
@@ -118,7 +181,33 @@ struct ContentView: View {
             .background(.quaternary, in: Capsule())
         }
         .buttonStyle(.plain)
-        .help(runner.engineURL?.path ?? "클릭하여 crosscut_cli.py를 다시 찾습니다.")
+        .help(
+            runner.engineURL.map {
+                "엔진 경로 연결됨: \($0.path)\n자동 모드는 시작할 때 yt-dlp 준비 상태를 별도로 검사합니다."
+            } ?? "클릭하여 crosscut_cli.py를 다시 찾습니다."
+        )
+    }
+
+    private var sourceModeCard: some View {
+        Card(title: "영상 준비", systemImage: "tray.and.arrow.down") {
+            VStack(alignment: .leading, spacing: 9) {
+                Picker("영상 준비", selection: $sourceMode) {
+                    ForEach(SourceMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(runner.state.isRunning)
+
+                Text(sourceMode == .automatic
+                    ? "곡명을 넣으면 IVE 영상을 찾고 받아 바로 교차편집합니다."
+                    : "이미 가지고 있는 원본을 직접 가져옵니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var settingsCard: some View {
@@ -144,6 +233,7 @@ struct ContentView: View {
                 labeled("곡명") {
                     TextField("예: I AM", text: $song)
                         .textFieldStyle(.roundedBorder)
+                        .disabled(runner.state.isRunning)
                 }
 
                 labeled("출력 모드") {
@@ -155,13 +245,18 @@ struct ContentView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
-                    Text(editMode.detail)
+                    .disabled(runner.state.isRunning)
+                    Text(editModeDetail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
                 labeled("대상 멤버") {
+                    let canSelectMember = ProjectSettingsControlPolicy.canSelectMember(
+                        editMode: editMode,
+                        isRunning: runner.state.isRunning
+                    )
                     Picker("대상 멤버", selection: $targetMember) {
                         ForEach(IVEMember.allCases) { member in
                             Text(member.rawValue).tag(member)
@@ -169,12 +264,17 @@ struct ContentView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
-                    .disabled(editMode == .group)
-                    .opacity(editMode == .group ? 0.55 : 1)
+                    .disabled(!canSelectMember)
+                    .opacity(canSelectMember ? 1 : 0.55)
                 }
 
                 labeled("화면 비율") {
-                    Picker("화면 비율", selection: $aspectRatio) {
+                    let canSelectAspectRatio = ProjectSettingsControlPolicy.canSelectAspectRatio(
+                        editMode: editMode,
+                        sourceMode: sourceMode,
+                        isRunning: runner.state.isRunning
+                    )
+                    Picker("화면 비율", selection: aspectRatioSelection) {
                         ForEach(OutputAspectRatio.allCases) { ratio in
                             Label(ratio.title, systemImage: ratio.systemImage)
                                 .tag(ratio)
@@ -182,8 +282,8 @@ struct ContentView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .disabled(editMode == .group)
-                    .opacity(editMode == .group ? 0.55 : 1)
+                    .disabled(!canSelectAspectRatio)
+                    .opacity(canSelectAspectRatio ? 1 : 0.55)
                 }
 
                 labeled("저장 위치") {
@@ -197,9 +297,139 @@ struct ContentView: View {
                         Spacer(minLength: 0)
                         Button("변경…", action: chooseOutputDirectory)
                             .controlSize(.small)
+                            .disabled(runner.state.isRunning)
                     }
                 }
             }
+        }
+    }
+
+    private var aspectRatioSelection: Binding<OutputAspectRatio> {
+        Binding(
+            get: { aspectRatio },
+            set: { selectedRatio in
+                if editMode == .member, sourceMode == .local {
+                    aspectRatio = selectedRatio
+                    manuallySelectedMemberAspectRatio = selectedRatio
+                } else {
+                    applyAspectRatioPolicy()
+                }
+            }
+        )
+    }
+
+    private func applyAspectRatioPolicy() {
+        aspectRatio = MemberAspectRatioPolicy.resolvedRatio(
+            current: aspectRatio,
+            editMode: editMode,
+            sourceMode: sourceMode,
+            manuallySelectedMemberRatio: manuallySelectedMemberAspectRatio
+        )
+    }
+
+    private var automaticSourcesCard: some View {
+        Card(title: "IVE 영상 자동 수집", systemImage: "sparkle.magnifyingglass") {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(spacing: 10) {
+                    Image(systemName: editMode == .group
+                        ? "rectangle.stack.badge.play"
+                        : "person.crop.rectangle.stack")
+                        .font(.system(size: 34, weight: .light))
+                        .foregroundStyle(.purple)
+                    Text(automaticSourceTitle)
+                        .font(.headline)
+                    Text(automaticWorkflowText)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.purple)
+                        .multilineTextAlignment(.center)
+                    Text(automaticSourceDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 18)
+                .padding(.horizontal, 12)
+                .background(.purple.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.purple.opacity(0.22))
+                }
+
+                if editMode == .member {
+                    HStack {
+                        Label("자동 수집 목표", systemImage: "lock.fill")
+                        Spacer()
+                        Text("최대 \(EditRequest.automaticMemberSourceCount)개")
+                            .font(.body.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.purple)
+                    }
+                } else {
+                    Stepper(value: $desiredSourceCount, in: 8...24) {
+                        HStack {
+                            Label("자동 수집 목표", systemImage: "number.square")
+                            Spacer()
+                            Text(
+                                desiredSourceCount == 10
+                                    ? "10개 목표 · 최소 8개"
+                                    : "\(desiredSourceCount)개 필수"
+                            )
+                                .font(.body.monospacedDigit().weight(.semibold))
+                                .foregroundStyle(.purple)
+                        }
+                    }
+                    .disabled(runner.state.isRunning)
+                }
+
+                Text(
+                    editMode == .member
+                        ? "공식 세로 직캠 10개를 우선 찾고, 부족하면 최소 8개를 전부 균등하게 돌려 씁니다."
+                        : desiredSourceCount == 10
+                            ? "공식 음방 10개를 먼저 찾고, 검증을 통과한 영상이 8개뿐이면 8개로 진행합니다."
+                            : "직접 선택한 \(desiredSourceCount)개는 모두 확보해야 진행합니다."
+                )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Label(
+                    "시작할 때 엔진과 yt-dlp 자동 수집 준비 상태를 별도로 검사합니다.",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Label("대용량 원본 저장 위치", systemImage: "externaldrive")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text(automaticCacheDirectory.path)
+                            .font(.caption2)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                        Spacer(minLength: 0)
+                        Button("변경…", action: chooseSourceCacheRootDirectory)
+                            .controlSize(.small)
+                            .disabled(runner.state.isRunning)
+                    }
+                }
+
+                if editMode == .member {
+                    Label(
+                        "\(targetMember.rawValue) 공식 세로 직캠만 수집합니다. 자동 모드는 인물 재식별·임의 크롭 없이 원본 9:16 화면을 그대로 동기화해 교차편집합니다. 직접 앵커와 추적 크롭을 쓰려면 ‘내 영상 선택 · 고급’을 이용하세요.",
+                        systemImage: "shield.checkered"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .frame(minHeight: 420)
         }
     }
 
@@ -207,6 +437,7 @@ struct ContentView: View {
         Card(title: "원본 영상", systemImage: "film.stack") {
             VStack(spacing: 12) {
                 Button {
+                    guard !runner.state.isRunning else { return }
                     isChoosingVideos = true
                 } label: {
                     VStack(spacing: 9) {
@@ -234,6 +465,7 @@ struct ContentView: View {
                     }
                 }
                 .buttonStyle(.plain)
+                .disabled(runner.state.isRunning)
                 .onDrop(
                     of: [UTType.fileURL.identifier],
                     isTargeted: $isDropTargeted,
@@ -363,12 +595,37 @@ struct ContentView: View {
                     }
                 }
 
-                if !runner.outputURLs.isEmpty {
+                if !runner.state.isRunning || !runner.outputURLs.isEmpty {
                     Divider()
-                    Button {
-                        NSWorkspace.shared.activateFileViewerSelecting(runner.outputURLs)
-                    } label: {
-                        Label("결과 보기", systemImage: "folder.badge.checkmark")
+                    HStack(spacing: 10) {
+                        if !runner.state.isRunning {
+                            Button {
+                                runner.restoreLatestCompletedGroupResult(
+                                    in: outputDirectory,
+                                    clearExistingOutputsOnMissing: true
+                                )
+                            } label: {
+                                Label(
+                                    runner.isRestoringCompletedOutputs
+                                        ? "찾는 중…"
+                                        : "완성 결과 찾기",
+                                    systemImage: "arrow.clockwise.circle"
+                                )
+                            }
+                            .disabled(runner.isRestoringCompletedOutputs)
+                        }
+                        if !runner.outputURLs.isEmpty {
+                            Button {
+                                NSWorkspace.shared.activateFileViewerSelecting(
+                                    runner.outputURLs
+                                )
+                            } label: {
+                                Label(
+                                    "결과 보기",
+                                    systemImage: "folder.badge.checkmark"
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -391,17 +648,21 @@ struct ContentView: View {
             Spacer()
 
             if runner.state.isRunning {
-                Button("취소", role: .cancel) {
+                Button(
+                    runner.cancellationRequested ? "취소 중…" : "취소",
+                    role: .cancel
+                ) {
                     runner.cancel()
                 }
                 .keyboardShortcut(.cancelAction)
+                .disabled(runner.cancellationRequested)
             }
 
             Button {
                 startAnalysis()
             } label: {
                 Label(
-                    runner.state.isRunning ? "편집 중…" : "교차편집 시작",
+                    runner.state.isRunning ? "편집 중…" : startButtonTitle,
                     systemImage: runner.state.isRunning ? "hourglass" : "sparkles.tv"
                 )
                 .frame(minWidth: 100)
@@ -409,7 +670,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(.purple)
             .controlSize(.large)
-            .disabled(runner.state.isRunning || song.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedVideos.count < 2)
+            .disabled(runner.state.isRunning || !canStart)
             .keyboardShortcut(.return, modifiers: [.command])
         }
         .padding(.horizontal, 22)
@@ -431,7 +692,28 @@ struct ContentView: View {
     }
 
     private func startAnalysis() {
+        guard !runner.state.isRunning else { return }
         let trimmedSong = song.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sourceMode == .automatic {
+            guard !trimmedSong.isEmpty else {
+                validationMessage = "곡명을 입력해 주세요."
+                return
+            }
+            validationMessage = nil
+            let request = EditRequest(
+                song: trimmedSong,
+                targetMember: targetMember,
+                editMode: editMode,
+                aspectRatio: aspectRatio,
+                sources: [],
+                outputDirectory: outputDirectory,
+                sourceMode: .automatic,
+                desiredSourceCount: automaticSourceCount,
+                sourceCacheDirectory: automaticCacheDirectory
+            )
+            runner.start(request: request)
+            return
+        }
         guard !trimmedSong.isEmpty else {
             validationMessage = "곡명을 입력해 주세요."
             return
@@ -465,6 +747,7 @@ struct ContentView: View {
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
+        guard !runner.state.isRunning else { return }
         switch result {
         case .success(let urls):
             addVideos(urls)
@@ -474,6 +757,7 @@ struct ContentView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !runner.state.isRunning else { return false }
         let supportedProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
         guard !supportedProviders.isEmpty else { return false }
 
@@ -487,13 +771,17 @@ struct ContentView: View {
                 }
 
                 guard let url else { return }
-                Task { @MainActor in addVideos([url]) }
+                Task { @MainActor in
+                    guard !runner.state.isRunning else { return }
+                    addVideos([url])
+                }
             }
         }
         return true
     }
 
     private func addVideos(_ urls: [URL]) {
+        guard !runner.state.isRunning else { return }
         let allowedExtensions = Set(["mp4", "mov", "m4v", "mkv", "webm", "avi", "ts"])
         let videos = urls
             .filter { allowedExtensions.contains($0.pathExtension.lowercased()) }
@@ -513,6 +801,7 @@ struct ContentView: View {
     }
 
     private func chooseOutputDirectory() {
+        guard !runner.state.isRunning else { return }
         let panel = NSOpenPanel()
         panel.title = "결과를 저장할 폴더 선택"
         panel.prompt = "선택"
@@ -523,7 +812,116 @@ struct ContentView: View {
         panel.directoryURL = outputDirectory
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        let previousDefaultCacheRoot = outputDirectory
+            .appendingPathComponent("CrossCut Sources", isDirectory: true)
+            .standardizedFileURL
+        let followsOutputDirectory =
+            sourceCacheRootDirectory.standardizedFileURL == previousDefaultCacheRoot
         outputDirectory = url
+        if followsOutputDirectory {
+            sourceCacheRootDirectory = url
+                .appendingPathComponent("CrossCut Sources", isDirectory: true)
+        }
+    }
+
+    private func chooseSourceCacheRootDirectory() {
+        guard !runner.state.isRunning else { return }
+        let panel = NSOpenPanel()
+        panel.title = "IVE 원본 영상을 저장할 폴더 선택"
+        panel.prompt = "선택"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = sourceCacheRootDirectory
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        sourceCacheRootDirectory = url
+    }
+
+    private var startButtonTitle: String {
+        guard sourceMode == .automatic else { return "교차편집 시작" }
+        switch editMode {
+        case .group:
+            return automaticSourceCount == 10
+                ? "음방 10개를 목표로 찾아서 편집"
+                : "음방 \(automaticSourceCount)개 찾아서 편집"
+        case .member:
+            return "\(targetMember.rawValue) 직캠 \(automaticSourceCount)개 찾아서 편집"
+        }
+    }
+
+    private var canStart: Bool {
+        EditStartPolicy.canStart(
+            song: song,
+            sourceMode: sourceMode,
+            editMode: editMode,
+            sourceCount: selectedVideos.count,
+            anchoredSourceCount: selectedVideos.lazy.filter { $0.memberAnchor != nil }.count
+        )
+    }
+
+    private var automaticSourceTitle: String {
+        switch editMode {
+        case .group:
+            return automaticSourceCount == 10
+                ? "음방 10개 목표 · 최소 8개로 교차편집"
+                : "음방 \(automaticSourceCount)개를 찾아 교차편집"
+        case .member:
+            return "\(targetMember.rawValue) 직캠 \(automaticSourceCount)개를 찾아 교차편집"
+        }
+    }
+
+    private var automaticSourceDescription: String {
+        switch editMode {
+        case .group:
+            return "IVE·곡명 제목으로 공식 음방 채널을 우선하고, 같은 곡 영상만 수집한 다음 음원으로 맞추고 편집합니다."
+        case .member:
+            return "IVE·곡명 제목으로 \(targetMember.rawValue) 공식 세로 직캠만 수집합니다. 원본 화면을 유지한 채 같은 안무 시각과 컷 전후 위치·동작이 자연스러운 소스를 골라 편집합니다."
+        }
+    }
+
+    private var editModeDetail: String {
+        if sourceMode == .automatic, editMode == .member {
+            return "공식 대상 멤버 세로 직캠을 최대 10개, 최소 8개 확보해 같은 곡 시각으로 맞춘 뒤, 모든 소스를 균등하게 돌려 쓰며 위치·동작이 자연스러운 하드 컷으로 연결합니다."
+        }
+        return editMode.detail
+    }
+
+    private var automaticWorkflowText: String {
+        switch editMode {
+        case .group:
+            return automaticSourceCount == 10
+                ? "곡명 입력 → 공식 음악방송 메타데이터 수집 → 10개 목표·최소 8개 자동 다운로드 → 자동 교차편집"
+                : "곡명 입력 → 공식 음악방송 메타데이터 수집 → 음방 \(automaticSourceCount)개 자동 다운로드 → 자동 교차편집"
+        case .member:
+            return "곡명 입력 → 대상 멤버 공식 직캠 메타데이터 수집 → 직캠 \(automaticSourceCount)개 자동 다운로드 → 자동 교차직캠"
+        }
+    }
+
+    private var automaticSourceCount: Int {
+        editMode == .member ? EditRequest.automaticMemberSourceCount : desiredSourceCount
+    }
+
+    private var automaticCacheDirectory: URL {
+        let songComponent = safePathComponent(
+            song.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "곡명 미지정" : song
+        )
+        let modeComponent = editMode == .group
+            ? "group"
+            : "member-\(safePathComponent(targetMember.rawValue))"
+        return sourceCacheRootDirectory
+            .appendingPathComponent("IVE", isDirectory: true)
+            .appendingPathComponent(songComponent, isDirectory: true)
+            .appendingPathComponent(modeComponent, isDirectory: true)
+    }
+
+    private func safePathComponent(_ value: String) -> String {
+        let forbidden = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        let pieces = value.components(separatedBy: forbidden)
+        let joined = pieces.joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? "untitled" : joined
     }
 
     private var stateTitle: String {
@@ -559,9 +957,11 @@ struct ContentView: View {
     }
 
     private static var defaultOutputDirectory: URL {
-        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        return movies.appendingPathComponent("CrossCut", isDirectory: true)
+        defaultStorageDirectories.output
+    }
+
+    private static var defaultSourceCacheRootDirectory: URL {
+        defaultStorageDirectories.sourceCache
     }
 
     private var sourceRequirementText: String {

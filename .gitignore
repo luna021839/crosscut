@@ -1,7 +1,15 @@
 .DS_Store
 DerivedData/
 .derivedData/
+.derivedData
 .releaseData/
+.releaseData
+.swift-test-data/
+.swift-test-data
+.swift-contract-test-data/
+.swift-contract-test-data
+.swift-storage-test-data/
+.swift-storage-test-data
 build/
 dist/
 *.app/
@@ -15,6 +23,9 @@ __pycache__/
 .venv/
 
 .crosscut-cache/
+.crosscut-cache
+.playwright-mcp/
 outputs/
+tmp/
 *.wav
 *.pcm

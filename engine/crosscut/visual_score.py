@@ -10,24 +10,46 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
 
 from .face_identity import SFACE_BACKEND, extract_sface_embedding
-from .pose import SubjectGeometryDescriptor, describe_subject_geometry
+from .pose import (
+    FormationPersonDescriptor,
+    SubjectGeometryDescriptor,
+    describe_subject_geometry,
+    model_asset_status as pose_model_asset_status,
+)
 from .timeline import (
+    BOUNDARY_SIDE_MAX_POSE_MISMATCH,
+    BOUNDARY_SIDE_MAX_SCALE_DELTA,
+    BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH,
+    BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH,
+    BoundarySideStability,
     ShotType,
     TimelineCandidate,
     TimelineConfig,
     TimelineResult,
+    cross_source_layout_mismatch,
     face_geometry_minimax_mismatch,
-    select_timeline,
+    formation_assignment_mismatch,
+    select_timeline_candidates,
+)
+from .timeline_review import TimelineReview, review_timeline
+from .timewarp import TimeWarpMap
+from .visual_feature_cache import (
+    AnalyzerFingerprint,
+    CanonicalFrameIdentity,
+    DescriptorRequestIdentity,
+    PersistentVisualFeatureCache,
+    build_analyzer_fingerprint,
 )
 
 
@@ -35,12 +57,73 @@ def _unit(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
 
 
+def _source_clock_maps(
+    source_timewarps: Sequence[TimeWarpMap | None] | None,
+    *,
+    audio_offsets: Sequence[float],
+    source_count: int,
+) -> tuple[TimeWarpMap | None, ...]:
+    """Validate optional per-source maps while retaining the scalar contract."""
+
+    if source_timewarps is None:
+        return (None,) * source_count
+    if len(source_timewarps) != source_count:
+        raise ValueError("source_timewarps must match the source count")
+    normalized = tuple(source_timewarps)
+    for index, timewarp in enumerate(normalized):
+        if timewarp is None:
+            continue
+        if not isinstance(timewarp, TimeWarpMap):
+            raise TypeError("source_timewarps entries must be TimeWarpMap or None")
+        if not math.isclose(
+            timewarp.global_offset_seconds,
+            float(audio_offsets[index]),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"source_timewarps[{index}] global offset does not match audio_offsets"
+            )
+    return normalized
+
+
+def _source_clock_time(
+    master_seconds: float,
+    *,
+    source_index: int,
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
+) -> float:
+    timewarp = source_timewarps[source_index]
+    if timewarp is None:
+        return master_seconds + float(audio_offsets[source_index])
+    return timewarp.master_to_source(master_seconds)
+
+
+def _master_clock_time(
+    source_seconds: float,
+    *,
+    source_index: int,
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
+) -> float:
+    """Map detector timestamps back to the canonical song clock exactly."""
+
+    timewarp = source_timewarps[source_index]
+    if timewarp is None:
+        return source_seconds - float(audio_offsets[source_index])
+    return timewarp.source_to_master(source_seconds)
+
+
 @dataclass(frozen=True, slots=True)
 class VisualDiversityConfig:
     """Safe preference strength for the metadata source-coverage order."""
 
-    preferred_source_bonus: float = 0.72
-    maximum_preferred_score_sacrifice: float = 0.58
+    # Coverage is a whole-song preference, never permission to take an
+    # attention-jumping cut.  The original stronger cycle bonus produced a
+    # technically diverse but visibly random source rotation.
+    preferred_source_bonus: float = 1.30
+    maximum_preferred_score_sacrifice: float = 0.16
 
     def __post_init__(self) -> None:
         if (
@@ -55,6 +138,207 @@ class VisualDiversityConfig:
             raise ValueError(
                 "maximum preferred score sacrifice must be finite and non-negative"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _CadenceProfile:
+    name: str
+    config: TimelineConfig
+
+
+# The selected-shot fifth percentile across the existing IVE BLACKHOLE, BANG
+# BANG, and XOXZ production analyses is 0.854--0.880.  A 0.84 shoulder targets
+# only the visibly weakest tail while leaving at least 95% of those real edits
+# untouched; this remains a soft score penalty, never a source rejection.
+PROFESSIONAL_QUALITY_SOFT_FLOOR = 0.84
+PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY = 0.65
+
+
+def _quality_soft_floor_policy() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "scope": "per_shot_entry_mid_exit_mean_quality",
+        "floor": PROFESSIONAL_QUALITY_SOFT_FLOOR,
+        "maximum_penalty": PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY,
+        "curve": "normalized_quadratic_deficit_below_floor",
+        "calibration": (
+            "IVE_BLACKHOLE_BANG_BANG_XOXZ_selected_shot_p05_0.854_to_0.880"
+        ),
+        "above_floor_emission_unchanged": True,
+        "hard_rejection": False,
+    }
+
+
+def _safe_cadence_profiles(
+    diversity: VisualDiversityConfig,
+) -> tuple[_CadenceProfile, ...]:
+    """Build soft cadence variants around one shared set of visual hard gates."""
+
+    balanced = TimelineConfig(
+        quality_weight=0.82,
+        quality_soft_floor=PROFESSIONAL_QUALITY_SOFT_FLOOR,
+        quality_soft_floor_penalty=(
+            PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY
+        ),
+        sync_weight=0.55,
+        composition_weight=0.30,
+        boundary_weight=0.62,
+        continuity_bonus=0.30,
+        cut_penalty=0.22,
+        early_cut_penalty=0.48,
+        long_hold_penalty=0.22,
+        pose_transition_weight=1.35,
+        silhouette_transition_weight=1.65,
+        motion_transition_weight=0.42,
+        scale_transition_weight=1.75,
+        color_transition_weight=0.10,
+        face_geometry_transition_weight=0.72,
+        focus_position_transition_weight=1.80,
+        subject_geometry_transition_weight=1.65,
+        person_count_transition_weight=0.60,
+        person_layout_transition_weight=2.10,
+        formation_transition_weight=2.45,
+        shot_type_transition_weight=1.20,
+        maximum_cross_source_scale_delta=0.20,
+        maximum_cross_source_focus_mismatch=0.24,
+        maximum_cross_source_layout_mismatch=0.32,
+        maximum_cross_source_formation_mismatch=0.30,
+        maximum_cross_source_silhouette_mismatch=0.36,
+        minimum_cross_source_face_similarity=0.36,
+        require_cross_source_visual_evidence=True,
+        maximum_boundary_side_scale_delta=BOUNDARY_SIDE_MAX_SCALE_DELTA,
+        maximum_boundary_side_structure_mismatch=(
+            BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH
+        ),
+        maximum_boundary_side_pose_mismatch=BOUNDARY_SIDE_MAX_POSE_MISMATCH,
+        maximum_boundary_side_shot_type_mismatch=(
+            BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH
+        ),
+        require_cross_source_boundary_side_stability=True,
+        minimum_hold_segments=2,
+        preferred_max_hold_segments=6,
+        preferred_max_source_hold_segments=5,
+        maximum_same_source_hold_segments=6,
+        preferred_max_source_hold_seconds=4.2,
+        maximum_same_source_hold_seconds=7.2,
+        source_hold_penalty=0.22,
+        source_switch_bonus=0.20,
+        ping_pong_penalty=0.42,
+        maximum_switch_score_sacrifice=0.65,
+        preferred_source_bonus=diversity.preferred_source_bonus,
+        preferred_source_max_score_sacrifice=(
+            diversity.maximum_preferred_score_sacrifice
+        ),
+    )
+    return (
+        _CadenceProfile("balanced", balanced),
+        _CadenceProfile(
+            "reference",
+            replace(
+                balanced,
+                continuity_bonus=0.18,
+                cut_penalty=0.18,
+                early_cut_penalty=0.38,
+                preferred_max_source_hold_seconds=3.8,
+                source_hold_penalty=0.32,
+                source_switch_bonus=0.48,
+                ping_pong_penalty=0.52,
+                maximum_switch_score_sacrifice=0.75,
+            ),
+        ),
+        _CadenceProfile(
+            "dense_safe",
+            replace(
+                balanced,
+                continuity_bonus=0.12,
+                cut_penalty=0.14,
+                early_cut_penalty=0.30,
+                preferred_max_source_hold_seconds=3.2,
+                maximum_same_source_hold_seconds=6.5,
+                source_hold_penalty=0.44,
+                source_switch_bonus=0.85,
+                ping_pong_penalty=0.68,
+                maximum_switch_score_sacrifice=0.90,
+            ),
+        ),
+    )
+
+
+def _timeline_path_signature(result: TimelineResult) -> tuple[str, ...]:
+    return tuple(
+        candidate.candidate_id
+        or f"{candidate.segment_index}:{candidate.source_id}"
+        for candidate in result.candidates
+    )
+
+
+def _review_ranked_candidate_indices(
+    candidate_reviews: Sequence[TimelineReview],
+) -> tuple[int, ...]:
+    """Return the reviewer order used for both selection and materialization.
+
+    The final index term is intentionally part of the sort key.  Equal
+    candidates therefore keep their deterministic generation order instead of
+    depending on object identity or an unordered container.
+    """
+
+    if not candidate_reviews:
+        raise ValueError("candidate_reviews cannot be empty")
+    return tuple(
+        sorted(
+            range(len(candidate_reviews)),
+            key=lambda index: (
+                candidate_reviews[index].passed,
+                -len(candidate_reviews[index].hard_failures),
+                candidate_reviews[index].weighted_score,
+                -len(candidate_reviews[index].warnings),
+                -index,
+            ),
+            reverse=True,
+        )
+    )
+
+
+def _select_safe_cadence_candidates(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    preferred_source_ids: Sequence[str | None] | None,
+    diversity: VisualDiversityConfig,
+    maximum_results: int = 32,
+) -> tuple[tuple[TimelineResult, ...], tuple[str, ...]]:
+    """Generate profile-local alternatives, then interleave unique paths."""
+
+    profiles = _safe_cadence_profiles(diversity)
+    pools = tuple(
+        select_timeline_candidates(
+            candidates_by_segment,
+            config=profile.config,
+            preferred_source_ids=preferred_source_ids,
+            maximum_results=16,
+            diversity_penalty=0.12,
+            minimum_hamming_fraction=0.02,
+        )
+        for profile in profiles
+    )
+    candidates: list[TimelineResult] = []
+    cadence_profiles: list[str] = []
+    signatures: set[tuple[str, ...]] = set()
+    for rank in range(max(len(pool) for pool in pools)):
+        for profile, pool in zip(profiles, pools, strict=True):
+            if rank >= len(pool):
+                continue
+            result = pool[rank]
+            signature = _timeline_path_signature(result)
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            candidates.append(result)
+            cadence_profiles.append(profile.name)
+            if len(candidates) >= maximum_results:
+                return (tuple(candidates), tuple(cadence_profiles))
+    if not candidates:
+        raise ValueError("safe cadence candidate generation produced no result")
+    return (tuple(candidates), tuple(cadence_profiles))
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +364,10 @@ class FrameVisualDescriptor:
     pose_embedding: tuple[float, ...] = ()
     pose_confidence: float = 0.0
     detected_person_count: int = 0
+    person_layout_embedding: tuple[float, ...] = ()
+    formation_people: tuple[FormationPersonDescriptor, ...] = field(
+        default=(), repr=False
+    )
     pose_backend: str = "structure_hog_fallback"
     silhouette_embedding: tuple[float, ...] = ()
     silhouette_bbox_xywh: tuple[float, float, float, float] | None = None
@@ -87,6 +375,15 @@ class FrameVisualDescriptor:
     silhouette_area_ratio: float = 0.0
     silhouette_confidence: float = 0.0
     silhouette_backend: str = "none"
+    # Non-identifying raw-frame geometry: a high value means a dark, thick
+    # edge-connected foreground object crosses the performance area.  This is
+    # deliberately not an appearance embedding and is used to reject camera
+    # booms/rigs before direct-member rendering.
+    foreground_obstruction_score: float = 0.0
+    # Non-identifying raw-frame scalar used only to distinguish a persistent
+    # blown-out stage-light entry from a legitimate one-frame flash.  No
+    # pixels, appearance vectors, or identity evidence are retained.
+    highlight_clipping_ratio: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +425,12 @@ class FrameVisualDescriptor:
             "pose_confidence": self.pose_confidence,
             "pose_available": self.pose_backend != "structure_hog_fallback",
             "detected_person_count": self.detected_person_count,
+            "person_layout_available": bool(self.person_layout_embedding),
+            "formation_person_count": len(self.formation_people),
+            "formation_upper_body_count": sum(
+                bool(person.upper_body_keypoints_xyc)
+                for person in self.formation_people
+            ),
             "silhouette_backend": self.silhouette_backend,
             "silhouette_confidence": self.silhouette_confidence,
             "silhouette_bbox_xywh": (
@@ -141,6 +444,8 @@ class FrameVisualDescriptor:
                 else None
             ),
             "silhouette_area_ratio": self.silhouette_area_ratio,
+            "foreground_obstruction_score": self.foreground_obstruction_score,
+            "highlight_clipping_ratio": self.highlight_clipping_ratio,
             "motion": list(self.motion) if self.motion is not None else None,
         }
 
@@ -159,6 +464,15 @@ class VisualTimelineChoice:
     shot_scale: float
     shot_type: ShotType
     shot_id: str
+    entry_shot_scale: float | None = None
+    exit_shot_scale: float | None = None
+    entry_shot_type: ShotType | None = None
+    exit_shot_type: ShotType | None = None
+    entry_scene_cut_near: bool = False
+    exit_scene_cut_near: bool = False
+    internal_scene_cut_master_seconds: tuple[float, ...] = ()
+    entry_boundary_side_stability: BoundarySideStability | None = None
+    exit_boundary_side_stability: BoundarySideStability | None = None
     face_samples_xywh: tuple[
         tuple[float, float, float, float] | None,
         tuple[float, float, float, float] | None,
@@ -196,8 +510,12 @@ class VisualTimelineChoice:
     # Raw appearance/body vectors are transient safety evidence. ``to_dict``
     # intentionally records only backend/count/confidence metadata; biometric
     # embeddings are never persisted to the analysis manifest.
-    dissolve_entry_face_identity_window: tuple[tuple[float, ...], ...] = ()
-    dissolve_exit_face_identity_window: tuple[tuple[float, ...], ...] = ()
+    dissolve_entry_face_identity_window: tuple[tuple[float, ...], ...] = field(
+        default=(), repr=False
+    )
+    dissolve_exit_face_identity_window: tuple[tuple[float, ...], ...] = field(
+        default=(), repr=False
+    )
     dissolve_entry_pose_embedding_window: tuple[tuple[float, ...], ...] = ()
     dissolve_exit_pose_embedding_window: tuple[tuple[float, ...], ...] = ()
     dissolve_entry_pose_backend_window: tuple[str, ...] = ()
@@ -222,6 +540,8 @@ class VisualTimelineChoice:
     )
     pose_confidences: tuple[float, float, float] = (0.0, 0.0, 0.0)
     detected_person_counts: tuple[int, int, int] = (0, 0, 0)
+    formation_person_counts: tuple[int, int, int] = (0, 0, 0)
+    formation_upper_body_counts: tuple[int, int, int] = (0, 0, 0)
     silhouette_samples_xywh: tuple[
         tuple[float, float, float, float] | None,
         tuple[float, float, float, float] | None,
@@ -234,13 +554,23 @@ class VisualTimelineChoice:
     ] = (None, None, None)
     silhouette_backends: tuple[str, str, str] = ("none", "none", "none")
     silhouette_confidences: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    layout_transition_mismatch_from_previous: float | None = None
     pose_transition_basis_from_previous: str | None = None
     pose_transition_mismatch_from_previous: float | None = None
     silhouette_transition_mismatch_from_previous: float | None = None
+    formation_transition_mismatch_from_previous: float | None = None
 
     @property
     def duration_seconds(self) -> float:
         return self.canonical_master_end - self.canonical_master_start
+
+    @property
+    def source_duration_seconds(self) -> float:
+        return self.source_local_end - self.source_local_start
+
+    @property
+    def source_playback_rate(self) -> float:
+        return self.source_duration_seconds / self.duration_seconds
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,12 +581,41 @@ class VisualTimelineChoice:
             "source_local_start": self.source_local_start,
             "source_local_end": self.source_local_end,
             "duration_seconds": self.duration_seconds,
+            "source_duration_seconds": self.source_duration_seconds,
+            "source_playback_rate": self.source_playback_rate,
             "quality_score": self.quality_score,
             "composition_score": self.composition_score,
             "boundary_score": self.boundary_score,
             "shot_scale": self.shot_scale,
             "shot_type": self.shot_type.value,
             "shot_id": self.shot_id,
+            "entry_shot_scale": self.entry_shot_scale,
+            "exit_shot_scale": self.exit_shot_scale,
+            "entry_shot_type": (
+                self.entry_shot_type.value
+                if self.entry_shot_type is not None
+                else None
+            ),
+            "exit_shot_type": (
+                self.exit_shot_type.value
+                if self.exit_shot_type is not None
+                else None
+            ),
+            "entry_scene_cut_near": self.entry_scene_cut_near,
+            "exit_scene_cut_near": self.exit_scene_cut_near,
+            "internal_scene_cut_master_seconds": list(
+                self.internal_scene_cut_master_seconds
+            ),
+            "entry_boundary_side_stability": (
+                self.entry_boundary_side_stability.to_dict()
+                if self.entry_boundary_side_stability is not None
+                else None
+            ),
+            "exit_boundary_side_stability": (
+                self.exit_boundary_side_stability.to_dict()
+                if self.exit_boundary_side_stability is not None
+                else None
+            ),
             "face_samples_xywh": [
                 list(sample) if sample is not None else None
                 for sample in self.face_samples_xywh
@@ -333,6 +692,10 @@ class VisualTimelineChoice:
             "pose_backends": list(self.pose_backends),
             "pose_confidences": list(self.pose_confidences),
             "detected_person_counts": list(self.detected_person_counts),
+            "formation_person_counts": list(self.formation_person_counts),
+            "formation_upper_body_counts": list(
+                self.formation_upper_body_counts
+            ),
             "silhouette_samples_xywh": [
                 list(sample) if sample is not None else None
                 for sample in self.silhouette_samples_xywh
@@ -343,6 +706,9 @@ class VisualTimelineChoice:
             ],
             "silhouette_backends": list(self.silhouette_backends),
             "silhouette_confidences": list(self.silhouette_confidences),
+            "layout_transition_mismatch_from_previous": (
+                self.layout_transition_mismatch_from_previous
+            ),
             "pose_transition_basis_from_previous": (
                 self.pose_transition_basis_from_previous
             ),
@@ -352,6 +718,305 @@ class VisualTimelineChoice:
             "silhouette_transition_mismatch_from_previous": (
                 self.silhouette_transition_mismatch_from_previous
             ),
+            "formation_transition_mismatch_from_previous": (
+                self.formation_transition_mismatch_from_previous
+            ),
+        }
+
+
+def _candidate_review_summary(
+    *,
+    candidate_index: int,
+    cadence_profile: str,
+    selected: bool,
+    candidate: TimelineResult,
+    review: TimelineReview,
+) -> dict[str, Any]:
+    """Return the stable compact summary already exposed by timeline plans."""
+
+    return {
+        "candidate_index": candidate_index,
+        "cadence_profile": cadence_profile,
+        "selected": selected,
+        "optimizer_score": candidate.total_score,
+        "passed": review.passed,
+        "weighted_score": review.weighted_score,
+        "hard_failure_codes": [item.code for item in review.hard_failures],
+        "warning_codes": [item.code for item in review.warnings],
+        "source_switch_count": review.source_switch_count,
+        "source_switch_rate_on_visual_boundaries": review.source_switch_rate,
+        "source_switches_per_minute": review.source_switches_per_minute,
+        "comparable_visual_boundary_count": (
+            review.comparable_visual_boundary_count
+        ),
+        "unique_source_count": review.unique_source_count,
+        "longest_source_run_seconds": review.longest_source_run_seconds,
+        "source_run_median_seconds": review.source_run_median_seconds,
+        "visual_shot_median_seconds": review.visual_shot_median_seconds,
+        "ping_pong_count": len(review.ping_pongs),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class VisualTimelineCandidateRecord:
+    """One fully retained optimizer alternative and its reviewer result.
+
+    ``TimelineResult`` intentionally remains available to trusted in-process
+    consumers so a rejected or runner-up path can be materialized later.  It
+    is excluded from ``repr`` and :meth:`to_dict` because candidates can carry
+    transient face-appearance embeddings used by visual gates.
+    """
+
+    candidate_index: int
+    cadence_profile: str
+    timeline_result: TimelineResult = field(repr=False)
+    review: TimelineReview = field(repr=False)
+    review_rank: int
+    selected: bool = False
+    path_signature: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.candidate_index, bool)
+            or not isinstance(self.candidate_index, int)
+            or self.candidate_index < 0
+        ):
+            raise ValueError("candidate_index must be a non-negative integer")
+        if (
+            isinstance(self.review_rank, bool)
+            or not isinstance(self.review_rank, int)
+            or self.review_rank < 0
+        ):
+            raise ValueError("review_rank must be a non-negative integer")
+        if not self.cadence_profile.strip():
+            raise ValueError("cadence_profile cannot be blank")
+        if not isinstance(self.timeline_result, TimelineResult):
+            raise TypeError("timeline_result must be a TimelineResult")
+        if not isinstance(self.review, TimelineReview):
+            raise TypeError("review must be a TimelineReview")
+        if not self.timeline_result.candidates:
+            raise ValueError("timeline_result cannot be empty")
+        if not math.isfinite(self.timeline_result.total_score):
+            raise ValueError("timeline optimizer score must be finite")
+        signature = tuple(self.path_signature) or _timeline_path_signature(
+            self.timeline_result
+        )
+        if signature != _timeline_path_signature(self.timeline_result):
+            raise ValueError("path_signature does not match timeline_result")
+        object.__setattr__(self, "path_signature", signature)
+
+    @property
+    def optimizer_score(self) -> float:
+        return self.timeline_result.total_score
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        return _candidate_review_summary(
+            candidate_index=self.candidate_index,
+            cadence_profile=self.cadence_profile,
+            selected=self.selected,
+            candidate=self.timeline_result,
+            review=self.review,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.to_summary_dict()
+        payload.update(
+            {
+                "review_rank": self.review_rank,
+                "path_signature": list(self.path_signature),
+                "source_sequence": [
+                    candidate.source_id
+                    for candidate in self.timeline_result.candidates
+                ],
+                "review": self.review.to_dict(),
+                "raw_candidate_embeddings_persisted": False,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class VisualTimelineCandidateSet:
+    """Deterministic top-N alternatives before selected-only post-processing."""
+
+    candidates: tuple[VisualTimelineCandidateRecord, ...]
+    selected_candidate_index: int
+    sources: tuple[Path, ...]
+    audio_offsets: tuple[float, ...]
+    source_timewarps: tuple[TimeWarpMap | None, ...]
+    source_clock_basis: str
+    requested_maximum_results: int
+    scene_cut_times: tuple[tuple[float, ...], ...] = ()
+    face_metadata_by_candidate: Mapping[str, _CandidateFaceMetadata] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    subject_metadata_by_candidate: Mapping[str, _CandidateSubjectMetadata] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    candidate_generation_basis: str = (
+        "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
+    )
+    minimum_materialization_target: int = 8
+
+    def __post_init__(self) -> None:
+        records = tuple(self.candidates)
+        sources = tuple(Path(path) for path in self.sources)
+        offsets = tuple(float(value) for value in self.audio_offsets)
+        timewarps = tuple(self.source_timewarps)
+        scene_cuts = tuple(
+            tuple(float(value) for value in source_cuts)
+            for source_cuts in self.scene_cut_times
+        )
+        face_metadata = MappingProxyType(dict(self.face_metadata_by_candidate))
+        subject_metadata = MappingProxyType(dict(self.subject_metadata_by_candidate))
+        object.__setattr__(self, "candidates", records)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "audio_offsets", offsets)
+        object.__setattr__(self, "source_timewarps", timewarps)
+        object.__setattr__(self, "scene_cut_times", scene_cuts)
+        object.__setattr__(self, "face_metadata_by_candidate", face_metadata)
+        object.__setattr__(self, "subject_metadata_by_candidate", subject_metadata)
+        if (
+            isinstance(self.requested_maximum_results, bool)
+            or not isinstance(self.requested_maximum_results, int)
+            or not 8 <= self.requested_maximum_results <= 32
+        ):
+            raise ValueError("requested_maximum_results must be between 8 and 32")
+        if not records:
+            raise ValueError("visual timeline candidate set cannot be empty")
+        if len(records) > self.requested_maximum_results:
+            raise ValueError("candidate set exceeds requested_maximum_results")
+        if len(sources) < 2:
+            raise ValueError("visual timeline candidate set needs at least two sources")
+        if len(offsets) != len(sources) or len(timewarps) != len(sources):
+            raise ValueError("candidate set source clock inputs must match sources")
+        if any(not math.isfinite(value) for value in offsets):
+            raise ValueError("candidate set audio offsets must be finite")
+        _source_clock_maps(
+            timewarps,
+            audio_offsets=offsets,
+            source_count=len(sources),
+        )
+        if scene_cuts and len(scene_cuts) != len(sources):
+            raise ValueError("candidate set scene cuts must match sources")
+        if any(
+            not math.isfinite(value)
+            or any(right <= left for left, right in zip(cuts, cuts[1:]))
+            for cuts in scene_cuts
+            for value in cuts
+        ):
+            raise ValueError("candidate set scene cuts must be finite and ordered")
+        if not self.source_clock_basis.strip():
+            raise ValueError("source_clock_basis cannot be blank")
+        if (
+            isinstance(self.minimum_materialization_target, bool)
+            or not isinstance(self.minimum_materialization_target, int)
+            or self.minimum_materialization_target < 1
+        ):
+            raise ValueError("minimum_materialization_target must be positive")
+        expected_indices = tuple(range(len(records)))
+        if tuple(record.candidate_index for record in records) != expected_indices:
+            raise ValueError("candidate indices must be contiguous generation order")
+        signatures = tuple(record.path_signature for record in records)
+        if len(set(signatures)) != len(signatures):
+            raise ValueError("candidate set cannot contain duplicate timeline paths")
+        if not 0 <= self.selected_candidate_index < len(records):
+            raise ValueError("selected_candidate_index is outside the candidate set")
+        selected_indices = tuple(
+            record.candidate_index for record in records if record.selected
+        )
+        if selected_indices != (self.selected_candidate_index,):
+            raise ValueError("candidate set must mark exactly the selected candidate")
+        ranked_indices = _review_ranked_candidate_indices(
+            tuple(record.review for record in records)
+        )
+        rank_by_index = {
+            candidate_index: rank
+            for rank, candidate_index in enumerate(ranked_indices)
+        }
+        if any(
+            record.review_rank != rank_by_index[record.candidate_index]
+            for record in records
+        ):
+            raise ValueError("candidate review ranks do not match reviewer ordering")
+        reference_spans = tuple(
+            (
+                item.segment_index,
+                item.start_seconds,
+                item.end_seconds,
+            )
+            for item in records[0].timeline_result.candidates
+        )
+        for record in records:
+            spans = tuple(
+                (item.segment_index, item.start_seconds, item.end_seconds)
+                for item in record.timeline_result.candidates
+            )
+            if spans != reference_spans:
+                raise ValueError("candidate alternatives must share canonical spans")
+            for item in record.timeline_result.candidates:
+                try:
+                    source_index = int(item.source_id)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "visual candidate source_id must be an integer index"
+                    ) from exc
+                if str(source_index) != item.source_id or not 0 <= source_index < len(
+                    sources
+                ):
+                    raise ValueError(
+                        "visual candidate source_id is outside the source list"
+                    )
+
+    @property
+    def selected(self) -> VisualTimelineCandidateRecord:
+        return self.candidates[self.selected_candidate_index]
+
+    @property
+    def ranked_candidates(self) -> tuple[VisualTimelineCandidateRecord, ...]:
+        return tuple(sorted(self.candidates, key=lambda item: item.review_rank))
+
+    @property
+    def minimum_materialization_target_satisfied(self) -> bool:
+        return len(self.candidates) >= self.minimum_materialization_target
+
+    @property
+    def candidate_review_summaries(self) -> tuple[dict[str, Any], ...]:
+        return tuple(record.to_summary_dict() for record in self.candidates)
+
+    def materialize(
+        self,
+        candidate: int | VisualTimelineCandidateRecord | None = None,
+    ) -> VisualTimelinePlan:
+        """Materialize the selected path or any retained runner-up completely."""
+
+        return materialize_visual_timeline_candidate(self, candidate=candidate)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_generation_basis": self.candidate_generation_basis,
+            "candidate_count": len(self.candidates),
+            "requested_maximum_results": self.requested_maximum_results,
+            "minimum_materialization_target": self.minimum_materialization_target,
+            "minimum_materialization_target_satisfied": (
+                self.minimum_materialization_target_satisfied
+            ),
+            "selected_candidate_index": self.selected_candidate_index,
+            "source_count": len(self.sources),
+            "source_clock_basis": self.source_clock_basis,
+            "per_shot_quality_soft_floor": _quality_soft_floor_policy(),
+            "transient_materialization_metadata": {
+                "scene_cut_source_count": len(self.scene_cut_times),
+                "face_candidate_count": len(self.face_metadata_by_candidate),
+                "subject_candidate_count": len(self.subject_metadata_by_candidate),
+                "raw_metadata_persisted": False,
+            },
+            "candidates": [record.to_dict() for record in self.candidates],
+            "raw_candidate_embeddings_persisted": False,
         }
 
 
@@ -360,19 +1025,36 @@ class VisualTimelinePlan:
     choices: tuple[VisualTimelineChoice, ...]
     optimizer_score: float
     analysis_basis: str = (
-        "frame_quality_pose_silhouette_motion_color_face_minimax_coverage_v6"
+        "reviewed_thirty_two_candidate_native_cut_and_boundary_stability_safe_v12"
     )
+    selected_candidate_index: int = 0
+    candidate_generation_basis: str = (
+        "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
+    )
+    candidate_review_summaries: tuple[dict[str, Any], ...] = ()
+    source_clock_basis: str = "global_scalar_offset"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "analysis_basis": self.analysis_basis,
             "optimizer_score": self.optimizer_score,
+            "selected_candidate_index": self.selected_candidate_index,
+            "candidate_generation_basis": self.candidate_generation_basis,
+            "candidate_count": len(self.candidate_review_summaries) or 1,
+            "candidate_review_summaries": list(self.candidate_review_summaries),
+            "source_clock_basis": self.source_clock_basis,
+            "per_shot_quality_soft_floor": _quality_soft_floor_policy(),
             "face_transition_policy": {
                 "detector": "opencv_zoo_yunet_2023mar",
+                "appearance_model": SFACE_BACKEND,
                 "window": "three_consecutive_synchronized_frame_pairs",
                 "objective": "worst_pair_mismatch_penalty",
-                "missing_or_ambiguous_face": "neutral",
-                "selection_effect": "penalty_only_never_eligibility_gate",
+                "closeup_appearance_gate": "compatible_face_evidence_required",
+                "missing_or_ambiguous_face": (
+                    "closeup_cross_source_rejected_otherwise_body_layout_fallback"
+                ),
+                "selection_effect": "screen_geometry_penalty_plus_closeup_appearance_gate",
+                "raw_appearance_embeddings_persisted": False,
                 "provenance": "independent_modern_adaptation_of_cross_cutting_eye_minimax",
             },
             "dissolve_safety_window": {
@@ -398,11 +1080,32 @@ class VisualTimelinePlan:
             "body_transition_policy": {
                 "pose": "opencv_zoo_mediapipe_33_keypoints_when_one_subject_is_dominant",
                 "silhouette": "opencv_zoo_pphumanseg_aggregate_human_layout",
+                "person_layout": "all_detected_people_screen_space_occupancy_and_boxes",
+                "formation_assignment": (
+                    "up_to_six_left_to_right_boxes_centroids_and_optional_upper_body"
+                ),
+                "formation_identity": "not_established_geometry_only",
                 "pose_missing": "deterministic_structure_hog_fallback",
-                "silhouette_missing": "neutral_not_an_eligibility_gate",
-                "selection_effect": "penalty_only_never_eligibility_gate",
+                "silhouette_missing": "require_other_screen_space_visual_evidence",
+                "selection_effect": (
+                    "scale_focus_formation_and_silhouette_hard_gates_plus_dp_penalties"
+                ),
+                "motion_window": "actual_outgoing_exit_to_incoming_entry",
                 "dissolve_effect": (
                     "future_model_evidence_required_for_tier_a_only"
+                ),
+            },
+            "native_scene_cut_policy": {
+                "detector_clock": "source_local_seconds",
+                "serialized_clock": "canonical_master_seconds",
+                "clock_conversion": (
+                    "exact_inverse_local_timewarp_or_scalar_offset"
+                ),
+                "same_source_selection_effect": (
+                    "preserve_continuity_bonus_reset_shot_run_skip_crosscut_penalties"
+                ),
+                "review_effect": (
+                    "split_actual_visual_shots_without_midpoint_shot_id_double_count"
                 ),
             },
             "choices": [choice.to_dict() for choice in self.choices],
@@ -578,6 +1281,440 @@ def _working_frame(frame: np.ndarray, maximum_width: int = 480) -> np.ndarray:
     return frame
 
 
+def _dark_foreground_obstruction_score(
+    gray: np.ndarray,
+    *,
+    attention_bbox_xywh: tuple[float, float, float, float] | None,
+    secondary_attention_bbox_xywh: (
+        tuple[float, float, float, float] | None
+    ) = None,
+) -> float:
+    """Score unmistakable dark foreground camera equipment.
+
+    Two deliberately narrow shapes are recognized.  A boom is a thick,
+    shallow-angle connected component spanning both horizontal edges.  A
+    camera rig is a large top-edge component that overlaps the detected
+    subject/face attention box.  Requiring edge contact, component thickness,
+    normalized elongation, boundary contrast, and performance-area overlap
+    avoids treating black clothing or a dark stage background as equipment.
+
+    Only the final scalar is retained by :class:`FrameVisualDescriptor`.
+    """
+
+    if not isinstance(gray, np.ndarray) or gray.ndim != 2 or gray.size == 0:
+        raise ValueError("obstruction scoring needs a non-empty grayscale frame")
+    height, width = gray.shape
+    if min(height, width) < 32:
+        return 0.0
+
+    # True foreground equipment in the target fancams is nearly black.  An
+    # absolute threshold is intentionally conservative: adapting to each
+    # frame's percentile would turn ordinary dark stages into foreground.
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0.0)
+    dark = (blurred <= 20).astype(np.uint8)
+    dark = cv2.morphologyEx(
+        dark,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+    component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        dark,
+        connectivity=8,
+    )
+    frame_area = float(height * width)
+    best_score = 0.0
+
+    def _maximum_attention_overlap(component: np.ndarray) -> float:
+        overlap = 0.0
+        for attention_bbox in (
+            attention_bbox_xywh,
+            secondary_attention_bbox_xywh,
+        ):
+            if attention_bbox is None:
+                continue
+            attention_x, attention_y, attention_width, attention_height = (
+                float(value) for value in attention_bbox
+            )
+            x0 = max(0, min(width, int(attention_x * width)))
+            y0 = max(0, min(height, int(attention_y * height)))
+            x1 = max(
+                x0,
+                min(width, int((attention_x + attention_width) * width)),
+            )
+            y1 = max(
+                y0,
+                min(height, int((attention_y + attention_height) * height)),
+            )
+            attention_component = component[y0:y1, x0:x1]
+            if attention_component.size:
+                overlap = max(overlap, float(attention_component.mean()))
+        return overlap
+
+    for component_index in range(1, component_count):
+        x, y, component_width, component_height, component_area = (
+            int(value) for value in stats[component_index]
+        )
+        area_ratio = component_area / frame_area
+        if not 0.05 <= area_ratio <= 0.36:
+            continue
+
+        component = labels == component_index
+        moments = cv2.moments(component.astype(np.uint8), binaryImage=True)
+        if moments["m00"] <= 1.0:
+            continue
+        covariance_xx = moments["mu20"] / moments["m00"] / (width * width)
+        covariance_yy = moments["mu02"] / moments["m00"] / (height * height)
+        covariance_xy = moments["mu11"] / moments["m00"] / (width * height)
+        trace = covariance_xx + covariance_yy
+        discriminant = math.sqrt(
+            max(
+                0.0,
+                (covariance_xx - covariance_yy) ** 2
+                + 4.0 * covariance_xy * covariance_xy,
+            )
+        )
+        major_variance = max(0.0, (trace + discriminant) / 2.0)
+        minor_variance = max(1e-9, (trace - discriminant) / 2.0)
+        elongation = math.sqrt(major_variance / minor_variance)
+        angle_degrees = abs(
+            math.degrees(
+                0.5
+                * math.atan2(
+                    2.0 * covariance_xy,
+                    covariance_xx - covariance_yy,
+                )
+            )
+        )
+        angle_from_horizontal = min(angle_degrees, 180.0 - angle_degrees)
+
+        width_ratio = component_width / width
+        height_ratio = component_height / height
+        touches_left = x <= 2
+        touches_right = x + component_width >= width - 2
+        touches_top = y <= 2
+        touches_top_region = y <= int(round(0.04 * height))
+
+        center_component = component[
+            int(0.08 * height) : int(0.60 * height),
+            int(0.20 * width) : int(0.80 * width),
+        ]
+        center_coverage = (
+            float(center_component.mean()) if center_component.size else 0.0
+        )
+
+        attention_overlap = _maximum_attention_overlap(component)
+
+        expanded = cv2.dilate(
+            component.astype(np.uint8),
+            np.ones((7, 7), dtype=np.uint8),
+        ).astype(bool)
+        outside_ring = expanded & ~component
+        boundary_contrast = (
+            float(gray[outside_ring].mean() - gray[component].mean())
+            if outside_ring.any()
+            else 0.0
+        )
+
+        boom = bool(
+            width_ratio >= 0.94
+            and touches_left
+            and touches_right
+            and area_ratio >= 0.13
+            and elongation >= 2.9
+            and 4.0 <= angle_from_horizontal <= 35.0
+            and center_coverage >= 0.22
+            and boundary_contrast >= 25.0
+        )
+        rig = bool(
+            touches_top
+            and 0.62 <= width_ratio <= 0.92
+            and 0.11 <= area_ratio <= 0.28
+            and 0.34 <= height_ratio <= 0.72
+            and angle_from_horizontal <= 30.0
+            and center_coverage >= 0.23
+            and attention_overlap >= 0.10
+            and boundary_contrast >= 28.0
+        )
+        # Some broadcast rigs fill almost the complete top width, so their
+        # irregular housing is not elongated enough to look like a boom.  The
+        # stronger central/subject overlap and bounded top-region geometry
+        # distinguish that case from a normal black backdrop.
+        large_rig = bool(
+            touches_top_region
+            and 0.13 <= area_ratio <= 0.25
+            and width_ratio >= 0.80
+            and 0.45 <= height_ratio <= 0.70
+            and center_coverage >= 0.31
+            and attention_overlap >= 0.12
+            and boundary_contrast >= 30.0
+        )
+
+        # A boom can also enter from below.  Once it merges with a dark stage
+        # band, component PCA looks almost horizontal even though the visible
+        # foreground edge still sweeps diagonally across the frame.  Measure
+        # robust per-column component envelopes to retain that directional
+        # evidence while rejecting a genuinely horizontal black backdrop.
+        edge_envelope_slope = 0.0
+        lower_crossing_geometry = bool(
+            touches_left
+            and touches_right
+            and width_ratio >= 0.94
+            and 0.16 <= area_ratio <= 0.33
+            and 0.30 <= height_ratio <= 0.72
+            and 0.08 <= y / height <= 0.50
+            and (y + component_height) / height <= 0.87
+            and 0.40
+            <= moments["m01"] / moments["m00"] / height
+            <= 0.66
+            and elongation >= 1.9
+            and angle_from_horizontal <= 12.0
+            and center_coverage >= 0.19
+            and attention_overlap >= 0.18
+            and boundary_contrast >= 35.0
+        )
+        if lower_crossing_geometry:
+            bin_centers: list[float] = []
+            top_envelope: list[float] = []
+            bottom_envelope: list[float] = []
+            for bin_index in range(24):
+                bin_start = bin_index * width // 24
+                bin_end = (bin_index + 1) * width // 24
+                component_rows = np.nonzero(component[:, bin_start:bin_end])[0]
+                if component_rows.size == 0:
+                    continue
+                bin_centers.append((bin_start + bin_end) / (2.0 * width))
+                top_envelope.append(
+                    float(np.quantile(component_rows, 0.03)) / height
+                )
+                bottom_envelope.append(
+                    float(np.quantile(component_rows, 0.97)) / height
+                )
+
+            def _envelope_slope(values: Sequence[float]) -> float:
+                if len(values) != len(bin_centers) or len(values) < 12:
+                    return 0.0
+                center_mean = sum(bin_centers) / len(bin_centers)
+                value_mean = sum(values) / len(values)
+                denominator = sum(
+                    (center - center_mean) ** 2 for center in bin_centers
+                )
+                if denominator <= 1e-9:
+                    return 0.0
+                return sum(
+                    (center - center_mean) * (value - value_mean)
+                    for center, value in zip(bin_centers, values, strict=True)
+                ) / denominator
+
+            edge_envelope_slope = max(
+                abs(_envelope_slope(top_envelope)),
+                abs(_envelope_slope(bottom_envelope)),
+            )
+        lower_crossing_boom = bool(
+            lower_crossing_geometry and edge_envelope_slope >= 0.165
+        )
+
+        # Near-lens broadcast cameras can be tall rather than elongated and
+        # need not touch the top or both side edges.  Their unusually large
+        # central coverage, subject overlap, boundary contrast and bounded
+        # area distinguish them from black clothing and distant stage pieces.
+        near_lens_rig = bool(
+            touches_top_region
+            and 0.20 <= area_ratio <= 0.34
+            and 0.65 <= width_ratio <= 0.92
+            and 0.70 <= height_ratio <= 0.96
+            and 0.28
+            <= moments["m01"] / moments["m00"] / height
+            <= 0.56
+            and center_coverage >= 0.35
+            and attention_overlap >= 0.20
+            and boundary_contrast >= 40.0
+        )
+
+        edge_cable_shape = bool(
+            (touches_left or touches_top_region)
+            and 0.06 <= area_ratio <= 0.13
+            and 0.40 <= width_ratio <= 0.68
+            and 0.42 <= height_ratio <= 0.62
+            and center_coverage >= 0.10
+            and attention_overlap >= 0.06
+            and boundary_contrast >= 40.0
+        )
+        large_loop_shape = bool(
+            touches_left
+            and touches_right
+            and 0.13 <= area_ratio <= 0.22
+            and width_ratio >= 0.95
+            and 0.70 <= height_ratio <= 0.90
+            and 0.08 <= y / height <= 0.18
+            and center_coverage >= 0.25
+            and attention_overlap >= 0.15
+            and boundary_contrast >= 55.0
+        )
+        edge_cable_rig = False
+        large_loop_rig = False
+        if edge_cable_shape or large_loop_shape:
+            component_u8 = component.astype(np.uint8)
+            contours, _hierarchy = cv2.findContours(
+                component_u8,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            if contours:
+                contour = max(contours, key=cv2.contourArea)
+                hull = cv2.convexHull(contour)
+                hull_area = float(cv2.contourArea(hull))
+                solidity = (
+                    float(cv2.contourArea(contour)) / hull_area
+                    if hull_area > 1.0
+                    else 1.0
+                )
+                rectangle = cv2.minAreaRect(contour)
+                rectangle_area = float(rectangle[1][0] * rectangle[1][1])
+                rectangle_fill = (
+                    component_area / rectangle_area
+                    if rectangle_area > 1.0
+                    else 1.0
+                )
+                edge_cable_rig = bool(
+                    edge_cable_shape
+                    and 0.35 <= solidity <= 0.60
+                    and 0.25 <= rectangle_fill <= 0.45
+                )
+                large_loop_rig = bool(
+                    large_loop_shape
+                    and solidity <= 0.45
+                    and rectangle_fill <= 0.30
+                )
+
+        if boom or lower_crossing_boom:
+            best_score = max(best_score, 1.0)
+        elif edge_cable_rig or large_loop_rig:
+            best_score = max(best_score, 0.93)
+        elif rig or large_rig or near_lens_rig:
+            # Preserve a little scalar confidence variation for diagnostics;
+            # the strict geometric gates above carry the classification.
+            best_score = max(
+                best_score,
+                _unit(0.88 + 0.12 * (center_coverage - 0.23) / 0.25),
+            )
+    if best_score < 0.85:
+        # Dark textured housings can contain enough reflections that the
+        # strict near-black mask fragments them.  A second, still-conservative
+        # threshold is used only for a wide, irregular top-edge assembly that
+        # overlaps the subject.  The low solidity/fill requirements keep LED
+        # panels, vertical lighting trusses, and black costumes out.
+        soft_dark = (blurred <= 32).astype(np.uint8)
+        soft_dark = cv2.morphologyEx(
+            soft_dark,
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8),
+        )
+        (
+            soft_component_count,
+            soft_labels,
+            soft_stats,
+            _soft_centroids,
+        ) = cv2.connectedComponentsWithStats(soft_dark, connectivity=8)
+        for component_index in range(1, soft_component_count):
+            x, y, component_width, component_height, component_area = (
+                int(value) for value in soft_stats[component_index]
+            )
+            area_ratio = component_area / frame_area
+            width_ratio = component_width / width
+            height_ratio = component_height / height
+            touches_left = x <= 2
+            touches_right = x + component_width >= width - 2
+            touches_top = y <= 2
+            if not (
+                touches_top
+                and (touches_left or touches_right)
+                and 0.025 <= area_ratio <= 0.065
+                and 0.72 <= width_ratio <= 0.90
+                and 0.18 <= height_ratio <= 0.40
+            ):
+                continue
+            component = soft_labels == component_index
+            top_center = component[
+                : int(0.45 * height),
+                int(0.10 * width) : int(0.90 * width),
+            ]
+            top_center_coverage = (
+                float(top_center.mean()) if top_center.size else 0.0
+            )
+            attention_overlap = _maximum_attention_overlap(component)
+            if top_center_coverage < 0.08 or attention_overlap < 0.035:
+                continue
+            moments = cv2.moments(component.astype(np.uint8), binaryImage=True)
+            if moments["m00"] <= 1.0:
+                continue
+            covariance_xx = moments["mu20"] / moments["m00"] / (width * width)
+            covariance_yy = moments["mu02"] / moments["m00"] / (height * height)
+            covariance_xy = moments["mu11"] / moments["m00"] / (width * height)
+            trace = covariance_xx + covariance_yy
+            discriminant = math.sqrt(
+                max(
+                    0.0,
+                    (covariance_xx - covariance_yy) ** 2
+                    + 4.0 * covariance_xy * covariance_xy,
+                )
+            )
+            major_variance = max(0.0, (trace + discriminant) / 2.0)
+            minor_variance = max(1e-9, (trace - discriminant) / 2.0)
+            elongation = math.sqrt(major_variance / minor_variance)
+            angle_degrees = abs(
+                math.degrees(
+                    0.5
+                    * math.atan2(
+                        2.0 * covariance_xy,
+                        covariance_xx - covariance_yy,
+                    )
+                )
+            )
+            angle_from_horizontal = min(angle_degrees, 180.0 - angle_degrees)
+            if not (
+                2.2 <= elongation <= 5.0
+                and 5.0 <= angle_from_horizontal <= 35.0
+            ):
+                continue
+            expanded = cv2.dilate(
+                component.astype(np.uint8),
+                np.ones((7, 7), dtype=np.uint8),
+            ).astype(bool)
+            outside_ring = expanded & ~component
+            boundary_contrast = (
+                float(gray[outside_ring].mean() - gray[component].mean())
+                if outside_ring.any()
+                else 0.0
+            )
+            contours, _hierarchy = cv2.findContours(
+                component.astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(contour)
+            hull_area = float(cv2.contourArea(hull))
+            solidity = (
+                float(cv2.contourArea(contour)) / hull_area
+                if hull_area > 1.0
+                else 1.0
+            )
+            rectangle = cv2.minAreaRect(contour)
+            rectangle_area = float(rectangle[1][0] * rectangle[1][1])
+            rectangle_fill = (
+                component_area / rectangle_area if rectangle_area > 1.0 else 1.0
+            )
+            if (
+                boundary_contrast >= 40.0
+                and 0.20 <= solidity <= 0.45
+                and 0.12 <= rectangle_fill <= 0.32
+            ):
+                best_score = max(best_score, 0.94)
+    return best_score
+
+
 def _structure_embedding(gray: np.ndarray) -> tuple[float, ...]:
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -646,6 +1783,16 @@ def _motion(gray: np.ndarray, following: np.ndarray | None) -> tuple[float, floa
     return (max(-1.0, min(1.0, x)), max(-1.0, min(1.0, y)))
 
 
+def _motion_between_frames(
+    frame: np.ndarray,
+    following_frame: np.ndarray | None,
+) -> tuple[float, float] | None:
+    """Measure forward-time motion without re-running face/body models."""
+
+    gray = cv2.cvtColor(_working_frame(frame), cv2.COLOR_BGR2GRAY)
+    return _motion(gray, following_frame)
+
+
 def _dominant_face(faces: Sequence[_DetectedFace]) -> _DetectedFace | None:
     """Return one unambiguous dominant face without guessing in group shots."""
 
@@ -692,11 +1839,17 @@ def _normalized_face_metadata(
     if face is None:
         return (None, None, None, None, None)
     x, y, width, height = face.bbox_xywh
+    left_px = max(0.0, min(float(frame_width), x))
+    top_px = max(0.0, min(float(frame_height), y))
+    right_px = max(0.0, min(float(frame_width), x + width))
+    bottom_px = max(0.0, min(float(frame_height), y + height))
+    if right_px <= left_px or bottom_px <= top_px:
+        return (None, None, None, None, None)
     bbox = (
-        _unit(x / frame_width),
-        _unit(y / frame_height),
-        _unit(width / frame_width),
-        _unit(height / frame_height),
+        left_px / frame_width,
+        top_px / frame_height,
+        (right_px - left_px) / frame_width,
+        (bottom_px - top_px) / frame_height,
     )
     if face.landmarks_xy is None or len(face.landmarks_xy) != 5:
         return (bbox, None, None, None, None)
@@ -765,12 +1918,16 @@ def describe_frame(
     *,
     following_frame: np.ndarray | None = None,
     include_subject_geometry: bool = True,
+    include_formation_pose: bool = False,
 ) -> FrameVisualDescriptor:
     working = _working_frame(frame)
     gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
     structure_embedding = _structure_embedding(gray)
     subject = (
-        describe_subject_geometry(working)
+        describe_subject_geometry(
+            working,
+            include_formation_pose=include_formation_pose,
+        )
         if include_subject_geometry
         else SubjectGeometryDescriptor()
     )
@@ -779,6 +1936,7 @@ def describe_frame(
     mean = float(gray.mean())
     contrast = float(gray.std())
     clipped = float(np.mean((gray < 8) | (gray > 247)))
+    highlight_clipping_ratio = float(np.mean(gray > 247))
     exposure = math.exp(-((mean - 118.0) / 105.0) ** 2) * (1.0 - min(0.8, clipped))
     contrast_score = min(1.0, contrast / 58.0)
     quality = _unit(0.45 * sharpness + 0.32 * exposure + 0.23 * contrast_score)
@@ -813,6 +1971,11 @@ def describe_frame(
         dominant_face,
         frame_width=gray.shape[1],
         frame_height=gray.shape[0],
+    )
+    foreground_obstruction_score = _dark_foreground_obstruction_score(
+        gray,
+        attention_bbox_xywh=primary_face_bbox,
+        secondary_attention_bbox_xywh=subject.silhouette_bbox_xywh,
     )
     if face_count:
         largest = max(
@@ -859,6 +2022,8 @@ def describe_frame(
         ),
         pose_confidence=subject.pose_confidence,
         detected_person_count=subject.detected_person_count,
+        person_layout_embedding=subject.person_layout_embedding,
+        formation_people=subject.formation_people,
         pose_backend=(
             subject.pose_backend
             if subject.pose_embedding
@@ -870,6 +2035,8 @@ def describe_frame(
         silhouette_area_ratio=subject.silhouette_area_ratio,
         silhouette_confidence=subject.silhouette_confidence,
         silhouette_backend=subject.silhouette_backend,
+        foreground_obstruction_score=foreground_obstruction_score,
+        highlight_clipping_ratio=highlight_clipping_ratio,
     )
 
 
@@ -954,6 +2121,8 @@ class _CandidateSubjectMetadata:
     pose_backends: tuple[str, str, str]
     pose_confidences: tuple[float, float, float]
     person_counts: tuple[int, int, int]
+    formation_person_counts: tuple[int, int, int]
+    formation_upper_body_counts: tuple[int, int, int]
     silhouette_boxes: tuple[
         tuple[float, float, float, float] | None,
         tuple[float, float, float, float] | None,
@@ -972,30 +2141,527 @@ _BOUNDARY_WINDOW_FRAMES = 3
 _BOUNDARY_FRAME_STEP_SECONDS = 1.0 / 29.97
 _DISSOLVE_HANDLE_FRAMES = 11
 _DISSOLVE_HANDLE_SECONDS = _DISSOLVE_HANDLE_FRAMES / 29.97
+_VISUAL_ANALYZER_FINGERPRINT: AnalyzerFingerprint | None = None
+
+
+def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
+    """Bind persisted descriptors to code, models, schema, and runtime."""
+
+    global _VISUAL_ANALYZER_FINGERPRINT
+    if _VISUAL_ANALYZER_FINGERPRINT is not None:
+        return _VISUAL_ANALYZER_FINGERPRINT
+    yunet = yunet_model_asset_status(verify_load=True)
+    pose_assets = pose_model_asset_status(verify_load=True)
+    model_assets = {
+        f"pose:{status.name}": (
+            f"{status.actual_sha256 or 'missing'}:loadable={status.loadable}"
+        )
+        for status in pose_assets
+    }
+    model_assets[f"face:{YUNET_MODEL_NAME}"] = str(
+        f"{yunet.get('actual_sha256') or 'missing'}:"
+        f"loadable={yunet.get('loadable')}"
+    )
+    haar_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    if haar_path.is_file():
+        haar_digest = hashlib.sha256(haar_path.read_bytes()).hexdigest()
+    else:
+        haar_digest = "missing"
+    model_assets["face:haarcascade_frontalface_default.xml"] = haar_digest
+    opencv_build_digest = hashlib.sha256(
+        cv2.getBuildInformation().encode("utf-8")
+    ).hexdigest()
+    _VISUAL_ANALYZER_FINGERPRINT = build_analyzer_fingerprint(
+        descriptor_schema=(
+            "frame_visual_descriptor_v1_numeric_geometry_pose_silhouette_"
+            "formation_motion_no_sface_no_raw_frame"
+        ),
+        code_paths=(Path(__file__), Path(__file__).with_name("pose.py")),
+        model_assets=model_assets,
+        runtime_components={
+            "opencv": str(cv2.__version__),
+            "opencv_build_sha256": opencv_build_digest,
+            "numpy": str(np.__version__),
+        },
+    )
+    return _VISUAL_ANALYZER_FINGERPRINT
+
+
+def _descriptor_cache_payload(
+    descriptor: FrameVisualDescriptor,
+) -> dict[str, Any]:
+    """Serialize only derived numeric/geometry features, never frame pixels."""
+
+    return {
+        "quality_score": descriptor.quality_score,
+        "composition_score": descriptor.composition_score,
+        "shot_scale": descriptor.shot_scale,
+        "shot_type": descriptor.shot_type.value,
+        "face_count": descriptor.face_count,
+        "structure_embedding": list(descriptor.structure_embedding),
+        "motion": list(descriptor.motion) if descriptor.motion is not None else None,
+        "primary_face_bbox": (
+            list(descriptor.primary_face_bbox)
+            if descriptor.primary_face_bbox is not None
+            else None
+        ),
+        "color_embedding": list(descriptor.color_embedding),
+        "face_detector_backend": descriptor.face_detector_backend,
+        "primary_face_landmarks_xy": (
+            [list(point) for point in descriptor.primary_face_landmarks_xy]
+            if descriptor.primary_face_landmarks_xy is not None
+            else None
+        ),
+        "primary_face_head_roll_radians": (
+            descriptor.primary_face_head_roll_radians
+        ),
+        "primary_face_eye_scale": descriptor.primary_face_eye_scale,
+        "primary_face_geometry": (
+            list(descriptor.primary_face_geometry)
+            if descriptor.primary_face_geometry is not None
+            else None
+        ),
+        "pose_embedding": list(descriptor.pose_embedding),
+        "pose_confidence": descriptor.pose_confidence,
+        "detected_person_count": descriptor.detected_person_count,
+        "person_layout_embedding": list(descriptor.person_layout_embedding),
+        "formation_people": [
+            {
+                "bbox_xywh": list(person.bbox_xywh),
+                "centroid_xy": list(person.centroid_xy),
+                "detection_confidence": person.detection_confidence,
+                "upper_body_keypoints_xyc": [
+                    list(point) for point in person.upper_body_keypoints_xyc
+                ],
+            }
+            for person in descriptor.formation_people
+        ],
+        "pose_backend": descriptor.pose_backend,
+        "silhouette_embedding": list(descriptor.silhouette_embedding),
+        "silhouette_bbox_xywh": (
+            list(descriptor.silhouette_bbox_xywh)
+            if descriptor.silhouette_bbox_xywh is not None
+            else None
+        ),
+        "silhouette_centroid_xy": (
+            list(descriptor.silhouette_centroid_xy)
+            if descriptor.silhouette_centroid_xy is not None
+            else None
+        ),
+        "silhouette_area_ratio": descriptor.silhouette_area_ratio,
+        "silhouette_confidence": descriptor.silhouette_confidence,
+        "silhouette_backend": descriptor.silhouette_backend,
+        "foreground_obstruction_score": descriptor.foreground_obstruction_score,
+        "highlight_clipping_ratio": descriptor.highlight_clipping_ratio,
+    }
+
+
+def frame_visual_numeric_features(
+    descriptor: FrameVisualDescriptor,
+) -> dict[str, Any]:
+    """Return the persisted, inference-safe numeric descriptor payload.
+
+    StageEdit feature snapshots must consume the exact same derived fields as
+    the production visual-feature cache.  Keeping this narrow public adapter
+    here prevents a second serializer from drifting or accidentally retaining
+    frames/identity embeddings.
+    """
+
+    if not isinstance(descriptor, FrameVisualDescriptor):
+        raise TypeError("descriptor must use FrameVisualDescriptor")
+    return _descriptor_cache_payload(descriptor)
+
+
+def visual_analyzer_fingerprint_sha256() -> str:
+    """Return the content-bound fingerprint of the active visual analyzer."""
+
+    return _visual_analyzer_fingerprint().digest
+
+
+_DESCRIPTOR_CACHE_PAYLOAD_KEYS = frozenset(
+    _descriptor_cache_payload(
+        FrameVisualDescriptor(
+            quality_score=0.0,
+            composition_score=0.0,
+            shot_scale=0.0,
+            shot_type=ShotType.GROUP_WIDE,
+            face_count=0,
+            structure_embedding=(),
+        )
+    )
+)
+
+
+def _cache_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"cached {label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"cached {label} must be finite")
+    return result
+
+
+def _cache_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"cached {label} must be a non-negative integer")
+    return value
+
+
+def _cache_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 160:
+        raise ValueError(f"cached {label} must be a non-empty bounded string")
+    return value
+
+
+def _cache_vector(
+    value: Any,
+    label: str,
+    *,
+    length: int | None = None,
+) -> tuple[float, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"cached {label} must be a numeric list")
+    result = tuple(_cache_float(item, f"{label}[]") for item in value)
+    if length is not None and len(result) != length:
+        raise ValueError(f"cached {label} must contain {length} values")
+    return result
+
+
+def _cache_optional_vector(
+    value: Any,
+    label: str,
+    *,
+    length: int,
+) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    return _cache_vector(value, label, length=length)
+
+
+def _descriptor_from_cache_payload(
+    payload: Mapping[str, Any],
+) -> FrameVisualDescriptor:
+    """Reconstruct one exact descriptor or reject the cache record entirely."""
+
+    if set(payload) != _DESCRIPTOR_CACHE_PAYLOAD_KEYS:
+        raise ValueError("cached visual descriptor schema does not match")
+    try:
+        shot_type = ShotType(_cache_string(payload["shot_type"], "shot_type"))
+    except ValueError as exc:
+        raise ValueError("cached shot_type is invalid") from exc
+    raw_landmarks = payload["primary_face_landmarks_xy"]
+    landmarks = (
+        None
+        if raw_landmarks is None
+        else tuple(
+            _cache_vector(point, "primary_face_landmarks_xy[]", length=2)
+            for point in raw_landmarks
+        )
+        if isinstance(raw_landmarks, list)
+        else None
+    )
+    if raw_landmarks is not None and (
+        landmarks is None or len(landmarks) != 5
+    ):
+        raise ValueError("cached face landmarks must contain five points")
+    raw_people = payload["formation_people"]
+    if not isinstance(raw_people, list):
+        raise ValueError("cached formation_people must be a list")
+    formation_people: list[FormationPersonDescriptor] = []
+    for raw_person in raw_people:
+        if not isinstance(raw_person, dict) or set(raw_person) != {
+            "bbox_xywh",
+            "centroid_xy",
+            "detection_confidence",
+            "upper_body_keypoints_xyc",
+        }:
+            raise ValueError("cached formation person schema does not match")
+        raw_keypoints = raw_person["upper_body_keypoints_xyc"]
+        if not isinstance(raw_keypoints, list):
+            raise ValueError("cached formation keypoints must be a list")
+        formation_people.append(
+            FormationPersonDescriptor(
+                bbox_xywh=_cache_vector(
+                    raw_person["bbox_xywh"], "formation bbox", length=4
+                ),
+                centroid_xy=_cache_vector(
+                    raw_person["centroid_xy"], "formation centroid", length=2
+                ),
+                detection_confidence=_cache_float(
+                    raw_person["detection_confidence"],
+                    "formation detection confidence",
+                ),
+                upper_body_keypoints_xyc=tuple(
+                    _cache_vector(point, "formation keypoint", length=3)
+                    for point in raw_keypoints
+                ),
+            )
+        )
+    roll = payload["primary_face_head_roll_radians"]
+    eye_scale = payload["primary_face_eye_scale"]
+    motion = _cache_optional_vector(payload["motion"], "motion", length=2)
+    descriptor = FrameVisualDescriptor(
+        quality_score=_cache_float(payload["quality_score"], "quality_score"),
+        composition_score=_cache_float(
+            payload["composition_score"], "composition_score"
+        ),
+        shot_scale=_cache_float(payload["shot_scale"], "shot_scale"),
+        shot_type=shot_type,
+        face_count=_cache_integer(payload["face_count"], "face_count"),
+        structure_embedding=_cache_vector(
+            payload["structure_embedding"], "structure_embedding"
+        ),
+        motion=(motion[0], motion[1]) if motion is not None else None,
+        primary_face_bbox=_cache_optional_vector(
+            payload["primary_face_bbox"], "primary_face_bbox", length=4
+        ),
+        color_embedding=_cache_vector(
+            payload["color_embedding"], "color_embedding"
+        ),
+        face_detector_backend=_cache_string(
+            payload["face_detector_backend"], "face_detector_backend"
+        ),
+        primary_face_landmarks_xy=landmarks,
+        primary_face_head_roll_radians=(
+            _cache_float(roll, "primary_face_head_roll_radians")
+            if roll is not None
+            else None
+        ),
+        primary_face_eye_scale=(
+            _cache_float(eye_scale, "primary_face_eye_scale")
+            if eye_scale is not None
+            else None
+        ),
+        primary_face_geometry=_cache_optional_vector(
+            payload["primary_face_geometry"],
+            "primary_face_geometry",
+            length=10,
+        ),
+        pose_embedding=_cache_vector(payload["pose_embedding"], "pose_embedding"),
+        pose_confidence=_cache_float(
+            payload["pose_confidence"], "pose_confidence"
+        ),
+        detected_person_count=_cache_integer(
+            payload["detected_person_count"], "detected_person_count"
+        ),
+        person_layout_embedding=_cache_vector(
+            payload["person_layout_embedding"], "person_layout_embedding"
+        ),
+        formation_people=tuple(formation_people),
+        pose_backend=_cache_string(payload["pose_backend"], "pose_backend"),
+        silhouette_embedding=_cache_vector(
+            payload["silhouette_embedding"], "silhouette_embedding"
+        ),
+        silhouette_bbox_xywh=_cache_optional_vector(
+            payload["silhouette_bbox_xywh"], "silhouette_bbox_xywh", length=4
+        ),
+        silhouette_centroid_xy=_cache_optional_vector(
+            payload["silhouette_centroid_xy"],
+            "silhouette_centroid_xy",
+            length=2,
+        ),
+        silhouette_area_ratio=_cache_float(
+            payload["silhouette_area_ratio"], "silhouette_area_ratio"
+        ),
+        silhouette_confidence=_cache_float(
+            payload["silhouette_confidence"], "silhouette_confidence"
+        ),
+        silhouette_backend=_cache_string(
+            payload["silhouette_backend"], "silhouette_backend"
+        ),
+        foreground_obstruction_score=_cache_float(
+            payload["foreground_obstruction_score"],
+            "foreground_obstruction_score",
+        ),
+        highlight_clipping_ratio=_cache_float(
+            payload["highlight_clipping_ratio"], "highlight_clipping_ratio"
+        ),
+    )
+    if len(descriptor.structure_embedding) != 96:
+        raise ValueError("cached structure embedding must contain 96 values")
+    if len(descriptor.color_embedding) != 8:
+        raise ValueError("cached color embedding must contain 8 values")
+    if len(descriptor.pose_embedding) not in {60, 96}:
+        raise ValueError("cached pose embedding must contain 60 or 96 values")
+    if len(descriptor.person_layout_embedding) not in {0, 134}:
+        raise ValueError("cached person layout must be empty or contain 134 values")
+    if len(descriptor.silhouette_embedding) not in {0, 121}:
+        raise ValueError("cached silhouette must be empty or contain 121 values")
+    if len(descriptor.formation_people) > 6:
+        raise ValueError("cached formation cannot contain more than six people")
+    if (
+        descriptor.pose_backend == "structure_hog_fallback"
+        and len(descriptor.pose_embedding) != 96
+    ):
+        raise ValueError("cached HOG fallback must carry the structure embedding")
+    if (
+        descriptor.pose_backend != "structure_hog_fallback"
+        and len(descriptor.pose_embedding) != 60
+    ):
+        raise ValueError("cached model pose must contain 60 values")
+    if descriptor.silhouette_embedding and descriptor.silhouette_backend == "none":
+        raise ValueError("cached silhouette vector has no model backend")
+    normalized_boxes = (
+        descriptor.primary_face_bbox,
+        descriptor.silhouette_bbox_xywh,
+        *(person.bbox_xywh for person in descriptor.formation_people),
+    )
+    for box in normalized_boxes:
+        if box is None:
+            continue
+        left, top, width, height = box
+        if (
+            left < 0.0
+            or top < 0.0
+            or width <= 0.0
+            or height <= 0.0
+            or left + width > 1.000001
+            or top + height > 1.000001
+        ):
+            raise ValueError("cached normalized bbox is outside the frame")
+    if descriptor.primary_face_landmarks_xy is not None and any(
+        not 0.0 <= coordinate <= 1.0
+        for point in descriptor.primary_face_landmarks_xy
+        for coordinate in point
+    ):
+        raise ValueError("cached face landmarks are outside the frame")
+    unit_vectors = (
+        descriptor.color_embedding,
+        descriptor.person_layout_embedding,
+        descriptor.silhouette_embedding,
+    )
+    if any(
+        not 0.0 <= value <= 1.0
+        for vector in unit_vectors
+        for value in vector
+    ):
+        raise ValueError("cached unit feature vector is outside [0, 1]")
+    if descriptor.motion is not None and any(
+        not -1.0 <= value <= 1.0 for value in descriptor.motion
+    ):
+        raise ValueError("cached motion vector is outside [-1, 1]")
+    bounded_units = (
+        descriptor.quality_score,
+        descriptor.composition_score,
+        descriptor.shot_scale,
+        descriptor.pose_confidence,
+        descriptor.silhouette_area_ratio,
+        descriptor.silhouette_confidence,
+        descriptor.foreground_obstruction_score,
+        descriptor.highlight_clipping_ratio,
+    )
+    if any(not 0.0 <= value <= 1.0 for value in bounded_units):
+        raise ValueError("cached normalized descriptor value is outside [0, 1]")
+    return descriptor
+
+
+def _working_frame_sha256(frame: np.ndarray) -> str:
+    """Identify decoded working-frame content without persisting any pixels."""
+
+    contiguous = np.ascontiguousarray(frame)
+    digest = hashlib.sha256()
+    digest.update(str(contiguous.dtype).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(",".join(str(value) for value in contiguous.shape).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(contiguous.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _descriptor_matches_analyzer_runtime(
+    descriptor: FrameVisualDescriptor,
+    *,
+    analyzer: AnalyzerFingerprint,
+    include_subject_geometry: bool,
+) -> bool:
+    """Do not persist a transient model failure under a healthy fingerprint."""
+
+    raw_models = analyzer.components.get("model_asset_sha256_or_state")
+    if not isinstance(raw_models, Mapping):
+        return True
+    models = {str(key): str(value) for key, value in raw_models.items()}
+    yunet_healthy = any(
+        key == f"face:{YUNET_MODEL_NAME}" and "loadable=True" in value
+        for key, value in models.items()
+    )
+    if yunet_healthy and descriptor.face_detector_backend != "yunet":
+        return False
+    segmenter_healthy = any(
+        "human_segmentation_pphumanseg" in key and "loadable=True" in value
+        for key, value in models.items()
+    )
+    if (
+        include_subject_geometry
+        and segmenter_healthy
+        and descriptor.silhouette_backend == "none"
+    ):
+        return False
+    return True
 
 
 class _VideoSampler:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        feature_cache_directory: Path | None = None,
+    ) -> None:
         self.path = path
         self.capture = cv2.VideoCapture(str(path))
         if not self.capture.isOpened():
             raise ValueError(f"cannot open video for visual scoring: {path}")
+        reported_frame_rate = float(self.capture.get(cv2.CAP_PROP_FPS))
+        self.frame_rate = (
+            reported_frame_rate
+            if math.isfinite(reported_frame_rate) and reported_frame_rate > 0.0
+            else 29.97
+        )
         # A full song with nine sources can touch thousands of frames. Keep a
         # small per-source LRU: adjacent segments reuse boundary frames without
         # retaining the complete decoded performance in RAM.
-        self.cache: OrderedDict[int, np.ndarray | None] = OrderedDict()
+        self.cache: OrderedDict[
+            CanonicalFrameIdentity, np.ndarray | None
+        ] = OrderedDict()
+        self.frame_digest_cache: OrderedDict[
+            CanonicalFrameIdentity, str
+        ] = OrderedDict()
         self.descriptor_cache: OrderedDict[
-            int, FrameVisualDescriptor | None
+            DescriptorRequestIdentity, FrameVisualDescriptor | None
         ] = OrderedDict()
-        self.transition_descriptor_cache: OrderedDict[
-            int, FrameVisualDescriptor | None
+        self.sface_cache: OrderedDict[
+            CanonicalFrameIdentity, tuple[float, ...]
         ] = OrderedDict()
-        self.sface_cache: OrderedDict[int, tuple[float, ...]] = OrderedDict()
+        self.persistent_feature_cache: PersistentVisualFeatureCache | None = None
+        if feature_cache_directory is not None:
+            try:
+                self.persistent_feature_cache = PersistentVisualFeatureCache(
+                    source_cache_directory=feature_cache_directory,
+                    source_path=path,
+                    analyzer=_visual_analyzer_fingerprint(),
+                )
+            except (OSError, TypeError, ValueError):
+                # Cache setup is strictly optional.  Any unsafe path, changing
+                # source, or unreadable fingerprint falls back to fresh
+                # in-memory analysis rather than weakening visual gates.
+                self.persistent_feature_cache = None
+
+    def frame_identity(self, seconds: float) -> CanonicalFrameIdentity:
+        return CanonicalFrameIdentity.from_seconds(
+            seconds,
+            frame_rate=self.frame_rate,
+        )
 
     def frame_at(self, seconds: float) -> np.ndarray | None:
-        key = int(round(seconds * 1000.0))
+        key = self.frame_identity(seconds)
         if key not in self.cache:
-            self.capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, seconds) * 1000.0)
+            # Preserve source-time seeking (important for VFR media) while the
+            # LRU key retains the exact rational request rather than a rounded
+            # millisecond.  The persistent key additionally verifies decoded
+            # working-frame SHA-256 before reusing numeric features.
+            self.capture.set(
+                cv2.CAP_PROP_POS_MSEC,
+                key.canonical_seconds * 1000.0,
+            )
             success, frame = self.capture.read()
             self.cache[key] = _working_frame(frame) if success else None
             while len(self.cache) > 32:
@@ -1004,39 +2670,116 @@ class _VideoSampler:
             self.cache.move_to_end(key)
         return self.cache[key]
 
-    def descriptor_at(self, seconds: float) -> FrameVisualDescriptor | None:
-        key = int(round(seconds * 1000.0))
-        if key not in self.descriptor_cache:
-            frame = self.frame_at(seconds)
-            self.descriptor_cache[key] = (
-                describe_frame(frame, include_subject_geometry=False)
-                if frame is not None
-                else None
-            )
-            while len(self.descriptor_cache) > 64:
-                self.descriptor_cache.popitem(last=False)
+    def frame_digest_at(self, seconds: float, frame: np.ndarray) -> str:
+        key = self.frame_identity(seconds)
+        if key not in self.frame_digest_cache:
+            self.frame_digest_cache[key] = _working_frame_sha256(frame)
+            while len(self.frame_digest_cache) > 96:
+                self.frame_digest_cache.popitem(last=False)
         else:
-            self.descriptor_cache.move_to_end(key)
-        return self.descriptor_cache[key]
+            self.frame_digest_cache.move_to_end(key)
+        return self.frame_digest_cache[key]
+
+    def feature_descriptor_at(
+        self,
+        seconds: float,
+        *,
+        following_seconds: float | None = None,
+        include_subject_geometry: bool = True,
+        include_formation_pose: bool = False,
+    ) -> FrameVisualDescriptor | None:
+        """Return one exact descriptor with optional persistent reuse."""
+
+        frame = self.frame_at(seconds)
+        if frame is None:
+            return None
+        primary = self.frame_identity(seconds)
+        following = (
+            self.frame_identity(following_seconds)
+            if following_seconds is not None
+            else None
+        )
+        following_frame = (
+            self.frame_at(following_seconds)
+            if following_seconds is not None
+            else None
+        )
+        if following_seconds is not None and following_frame is None:
+            return None
+        request = DescriptorRequestIdentity(
+            primary=primary,
+            following=following,
+            primary_working_frame_sha256=self.frame_digest_at(seconds, frame),
+            following_working_frame_sha256=(
+                self.frame_digest_at(following_seconds, following_frame)
+                if following_frame is not None
+                and following_seconds is not None
+                else None
+            ),
+            include_subject_geometry=include_subject_geometry,
+            include_formation_pose=include_formation_pose,
+        )
+        if request in self.descriptor_cache:
+            self.descriptor_cache.move_to_end(request)
+            return self.descriptor_cache[request]
+        descriptor: FrameVisualDescriptor | None = None
+        persistent = self.persistent_feature_cache
+        if persistent is not None:
+            cached = persistent.get(request)
+            if cached is not None:
+                try:
+                    descriptor = _descriptor_from_cache_payload(cached)
+                except (TypeError, ValueError):
+                    descriptor = None
+                if descriptor is not None and not _descriptor_matches_analyzer_runtime(
+                    descriptor,
+                    analyzer=persistent.analyzer,
+                    include_subject_geometry=include_subject_geometry,
+                ):
+                    descriptor = None
+        if descriptor is None:
+            describe_arguments: dict[str, Any] = {
+                "following_frame": following_frame,
+            }
+            if not include_subject_geometry:
+                describe_arguments["include_subject_geometry"] = False
+            if include_formation_pose:
+                describe_arguments["include_formation_pose"] = True
+            descriptor = describe_frame(frame, **describe_arguments)
+            if persistent is not None and _descriptor_matches_analyzer_runtime(
+                descriptor,
+                analyzer=persistent.analyzer,
+                include_subject_geometry=include_subject_geometry,
+            ):
+                try:
+                    persistent.put(
+                        request,
+                        _descriptor_cache_payload(descriptor),
+                    )
+                except (OSError, TypeError, ValueError):
+                    # A cache write can never make a freshly computed
+                    # descriptor unusable for the current analysis.
+                    pass
+        self.descriptor_cache[request] = descriptor
+        while len(self.descriptor_cache) > 64:
+            self.descriptor_cache.popitem(last=False)
+        return descriptor
+
+    def descriptor_at(self, seconds: float) -> FrameVisualDescriptor | None:
+        return self.feature_descriptor_at(
+            seconds,
+            include_subject_geometry=False,
+        )
 
     def transition_descriptor_at(
         self, seconds: float
     ) -> FrameVisualDescriptor | None:
         """Describe one selected handle frame with full body evidence."""
 
-        key = int(round(seconds * 1000.0))
-        if key not in self.transition_descriptor_cache:
-            frame = self.frame_at(seconds)
-            self.transition_descriptor_cache[key] = (
-                describe_frame(frame, include_subject_geometry=True)
-                if frame is not None
-                else None
-            )
-            while len(self.transition_descriptor_cache) > 16:
-                self.transition_descriptor_cache.popitem(last=False)
-        else:
-            self.transition_descriptor_cache.move_to_end(key)
-        return self.transition_descriptor_cache[key]
+        return self.feature_descriptor_at(
+            seconds,
+            include_subject_geometry=True,
+        )
 
     def sface_embedding_at(
         self,
@@ -1045,7 +2788,7 @@ class _VideoSampler:
     ) -> tuple[float, ...]:
         """Embed an already-unambiguous YuNet face in one selected frame."""
 
-        key = int(round(seconds * 1000.0))
+        key = self.frame_identity(seconds)
         if key not in self.sface_cache:
             frame = self.frame_at(seconds)
             bbox = descriptor.primary_face_bbox
@@ -1072,6 +2815,19 @@ class _VideoSampler:
 
     def close(self) -> None:
         self.capture.release()
+        self.cache.clear()
+        self.frame_digest_cache.clear()
+        self.descriptor_cache.clear()
+        # SFace appearance vectors are RAM-only and explicitly dropped as soon
+        # as the sampler closes; they never enter PersistentVisualFeatureCache.
+        self.sface_cache.clear()
+
+    def feature_cache_diagnostics(self) -> dict[str, Any] | None:
+        return (
+            self.persistent_feature_cache.diagnostics()
+            if self.persistent_feature_cache is not None
+            else None
+        )
 
 
 def _face_geometry_boundary_window(
@@ -1136,16 +2892,27 @@ def _face_geometry_boundary_window(
 def _dissolve_evidence_window(
     sampler: _VideoSampler,
     *,
-    boundary_seconds: float,
     scene_cut_times: Sequence[float],
+    boundary_seconds: float | None = None,
+    sample_times_seconds: Sequence[float] | None = None,
 ) -> _DissolveEvidence:
     """Sample actual cut/mid/end frames from one selected dissolve handle."""
 
-    times = (
-        boundary_seconds,
-        boundary_seconds + _DISSOLVE_HANDLE_SECONDS / 2.0,
-        boundary_seconds + _DISSOLVE_HANDLE_SECONDS,
-    )
+    if (boundary_seconds is None) == (sample_times_seconds is None):
+        raise ValueError("provide exactly one dissolve boundary or sample-time set")
+    if sample_times_seconds is None:
+        assert boundary_seconds is not None
+        times = (
+            boundary_seconds,
+            boundary_seconds + _DISSOLVE_HANDLE_SECONDS / 2.0,
+            boundary_seconds + _DISSOLVE_HANDLE_SECONDS,
+        )
+    else:
+        times = tuple(float(value) for value in sample_times_seconds)
+        if len(times) != 3 or any(not math.isfinite(value) for value in times):
+            raise ValueError("dissolve sample times must contain three finite values")
+        if not times[0] < times[1] < times[2]:
+            raise ValueError("dissolve sample times must be strictly increasing")
     half_frame = _BOUNDARY_FRAME_STEP_SECONDS / 2.0
     if any(
         times[0] - half_frame <= float(cut) <= times[-1] + half_frame
@@ -1238,6 +3005,47 @@ def _embedding_rms_distance(
     return min(1.0, math.sqrt(squared / len(left)))
 
 
+def describe_boundary_side_stability(
+    earlier: FrameVisualDescriptor,
+    later: FrameVisualDescriptor,
+    *,
+    sample_span_seconds: float,
+) -> BoundarySideStability:
+    """Summarize a same-source three-frame neighborhood without raw vectors."""
+
+    shot_order = {
+        ShotType.GROUP_WIDE: 0,
+        ShotType.WIDE: 1,
+        ShotType.MEDIUM: 2,
+        ShotType.CLOSE_UP: 3,
+    }
+    actual_pose_pair = (
+        earlier.pose_backend != "structure_hog_fallback"
+        and later.pose_backend != "structure_hog_fallback"
+        and bool(earlier.pose_embedding)
+        and len(earlier.pose_embedding) == len(later.pose_embedding)
+    )
+    return BoundarySideStability(
+        sample_span_seconds=sample_span_seconds,
+        scale_delta=abs(earlier.shot_scale - later.shot_scale),
+        structure_mismatch=_embedding_rms_distance(
+            earlier.structure_embedding,
+            later.structure_embedding,
+        ),
+        pose_mismatch=(
+            _embedding_rms_distance(
+                earlier.pose_embedding,
+                later.pose_embedding,
+            )
+            if actual_pose_pair
+            else None
+        ),
+        shot_type_mismatch=(
+            abs(shot_order[earlier.shot_type] - shot_order[later.shot_type]) / 3.0
+        ),
+    )
+
+
 def _candidate_can_enter_dissolve_postpass(
     metadata: _CandidateFaceMetadata | None,
 ) -> bool:
@@ -1259,14 +3067,17 @@ def _selected_dissolve_evidence(
     sources: Sequence[Path],
     optimized: TimelineResult,
     audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
     scene_cut_times: Sequence[Sequence[float]],
     face_metadata_by_candidate: dict[str, _CandidateFaceMetadata],
 ) -> tuple[dict[str, _DissolveEvidence], dict[str, _DissolveEvidence]]:
-    """Run expensive safety models only on DP-selected switch boundaries.
+    """Run future-overlap safety models only on DP-selected switch boundaries.
 
     The first result is entry evidence keyed by the incoming candidate id; the
     second is exit evidence keyed by the outgoing candidate id.  Candidate
-    scoring stays independent of SFace and future body inference.
+    Candidate scoring already has one-frame SFace evidence for close-up source
+    switches. This post-pass alone stays independent of *future-handle* SFace
+    and body inference so rejected candidates do not pay that extra cost.
     """
 
     entry: dict[str, _DissolveEvidence] = {}
@@ -1292,17 +3103,39 @@ def _selected_dissolve_evidence(
         for outgoing, incoming in eligible_boundaries:
             outgoing_source = int(outgoing.source_id)
             incoming_source = int(incoming.source_id)
+            handle_master_times = (
+                outgoing.end_seconds,
+                outgoing.end_seconds + _DISSOLVE_HANDLE_SECONDS / 2.0,
+                outgoing.end_seconds + _DISSOLVE_HANDLE_SECONDS,
+            )
             exit_[outgoing.candidate_id] = _dissolve_evidence_window(
                 samplers[outgoing_source],
-                boundary_seconds=(
-                    outgoing.end_seconds + float(audio_offsets[outgoing_source])
+                sample_times_seconds=tuple(
+                    _source_clock_time(
+                        master_time,
+                        source_index=outgoing_source,
+                        audio_offsets=audio_offsets,
+                        source_timewarps=source_timewarps,
+                    )
+                    for master_time in handle_master_times
                 ),
                 scene_cut_times=scene_cut_times[outgoing_source],
             )
+            handle_master_times = (
+                incoming.start_seconds,
+                incoming.start_seconds + _DISSOLVE_HANDLE_SECONDS / 2.0,
+                incoming.start_seconds + _DISSOLVE_HANDLE_SECONDS,
+            )
             entry[incoming.candidate_id] = _dissolve_evidence_window(
                 samplers[incoming_source],
-                boundary_seconds=(
-                    incoming.start_seconds + float(audio_offsets[incoming_source])
+                sample_times_seconds=tuple(
+                    _source_clock_time(
+                        master_time,
+                        source_index=incoming_source,
+                        audio_offsets=audio_offsets,
+                        source_timewarps=source_timewarps,
+                    )
+                    for master_time in handle_master_times
                 ),
                 scene_cut_times=scene_cut_times[incoming_source],
             )
@@ -1312,7 +3145,348 @@ def _selected_dissolve_evidence(
     return (entry, exit_)
 
 
-def build_visual_timeline(
+def _resolve_visual_timeline_candidate_record(
+    candidate_set: VisualTimelineCandidateSet,
+    candidate: int | VisualTimelineCandidateRecord | None,
+) -> VisualTimelineCandidateRecord:
+    if candidate is None:
+        return candidate_set.selected
+    if isinstance(candidate, bool):
+        raise TypeError("candidate must be an index or candidate record")
+    if isinstance(candidate, int):
+        if not 0 <= candidate < len(candidate_set.candidates):
+            raise IndexError("visual timeline candidate index is out of range")
+        return candidate_set.candidates[candidate]
+    if not isinstance(candidate, VisualTimelineCandidateRecord):
+        raise TypeError("candidate must be an index or candidate record")
+    index = candidate.candidate_index
+    if (
+        not 0 <= index < len(candidate_set.candidates)
+        or candidate_set.candidates[index] is not candidate
+    ):
+        raise ValueError("candidate record does not belong to candidate set")
+    return candidate
+
+
+def _missing_candidate_face_metadata() -> _CandidateFaceMetadata:
+    return _CandidateFaceMetadata(
+        boxes=(None, None, None),
+        failure="face_metadata_unavailable",
+        backends=("none", "none", "none"),
+        landmarks=(None, None, None),
+        rolls=(None, None, None),
+        eye_scales=(None, None, None),
+    )
+
+
+def _missing_candidate_subject_metadata() -> _CandidateSubjectMetadata:
+    return _CandidateSubjectMetadata(
+        pose_backends=(
+            "structure_hog_fallback",
+            "structure_hog_fallback",
+            "structure_hog_fallback",
+        ),
+        pose_confidences=(0.0, 0.0, 0.0),
+        person_counts=(0, 0, 0),
+        formation_person_counts=(0, 0, 0),
+        formation_upper_body_counts=(0, 0, 0),
+        silhouette_boxes=(None, None, None),
+        silhouette_centroids=(None, None, None),
+        silhouette_backends=("none", "none", "none"),
+        silhouette_confidences=(0.0, 0.0, 0.0),
+    )
+
+
+def materialize_visual_timeline_candidate(
+    candidate_set: VisualTimelineCandidateSet,
+    *,
+    candidate: int | VisualTimelineCandidateRecord | None = None,
+) -> VisualTimelinePlan:
+    """Materialize any retained alternative into a complete visual plan.
+
+    The candidate set shares frame descriptors across all paths.  Only the
+    requested path pays for the transient post-DP dissolve-handle inference,
+    so runner-up review remains exact without multiplying the retained frame
+    metadata by the candidate count.
+    """
+
+    if not isinstance(candidate_set, VisualTimelineCandidateSet):
+        raise TypeError("candidate_set must be a VisualTimelineCandidateSet")
+    record = _resolve_visual_timeline_candidate_record(candidate_set, candidate)
+    optimized = record.timeline_result
+    scene_cut_times: tuple[tuple[float, ...], ...] = (
+        candidate_set.scene_cut_times
+        if candidate_set.scene_cut_times
+        else ((),) * len(candidate_set.sources)
+    )
+    dissolve_entry_evidence, dissolve_exit_evidence = (
+        _selected_dissolve_evidence(
+            sources=candidate_set.sources,
+            optimized=optimized,
+            audio_offsets=candidate_set.audio_offsets,
+            source_timewarps=candidate_set.source_timewarps,
+            scene_cut_times=scene_cut_times,
+            face_metadata_by_candidate=candidate_set.face_metadata_by_candidate,
+        )
+    )
+    choices: list[VisualTimelineChoice] = []
+    for optimized_index, choice in enumerate(optimized.candidates):
+        source_index = int(choice.source_id)
+        source_local_start = _source_clock_time(
+            choice.start_seconds,
+            source_index=source_index,
+            audio_offsets=candidate_set.audio_offsets,
+            source_timewarps=candidate_set.source_timewarps,
+        )
+        source_local_end = _source_clock_time(
+            choice.end_seconds,
+            source_index=source_index,
+            audio_offsets=candidate_set.audio_offsets,
+            source_timewarps=candidate_set.source_timewarps,
+        )
+        face_metadata = candidate_set.face_metadata_by_candidate.get(
+            choice.candidate_id,
+            _missing_candidate_face_metadata(),
+        )
+        subject_metadata = candidate_set.subject_metadata_by_candidate.get(
+            choice.candidate_id,
+            _missing_candidate_subject_metadata(),
+        )
+        entry_evidence = dissolve_entry_evidence.get(
+            choice.candidate_id,
+            _DissolveEvidence(),
+        )
+        exit_evidence = dissolve_exit_evidence.get(
+            choice.candidate_id,
+            _DissolveEvidence(),
+        )
+        if optimized_index == 0:
+            face_transition_mismatch = None
+            layout_transition_mismatch = None
+            pose_transition_basis = None
+            pose_transition_mismatch = None
+            silhouette_transition_mismatch = None
+            formation_transition_mismatch = None
+        else:
+            previous = optimized.candidates[optimized_index - 1]
+            previous_subject_metadata = (
+                candidate_set.subject_metadata_by_candidate.get(
+                    previous.candidate_id
+                )
+            )
+            mismatch = face_geometry_minimax_mismatch(
+                previous.exit_face_geometry_window,
+                choice.entry_face_geometry_window,
+            )
+            face_transition_mismatch = (
+                mismatch
+                if previous.exit_face_geometry_window
+                and choice.entry_face_geometry_window
+                else None
+            )
+            previous_pose = previous.exit_pose_embedding or previous.pose_embedding
+            current_pose = choice.entry_pose_embedding or choice.pose_embedding
+            actual_pose_pair = (
+                previous_subject_metadata is not None
+                and previous_subject_metadata.pose_backends[2]
+                != "structure_hog_fallback"
+                and subject_metadata.pose_backends[0]
+                != "structure_hog_fallback"
+                and bool(previous_pose)
+                and bool(current_pose)
+                and len(previous_pose) == len(current_pose)
+            )
+            if actual_pose_pair:
+                pose_transition_basis = "opencv_zoo_mediapipe_pose"
+            else:
+                pose_transition_basis = "structure_hog_fallback"
+                previous_pose = (
+                    previous.exit_structure_embedding
+                    or previous.structure_embedding
+                )
+                current_pose = (
+                    choice.entry_structure_embedding
+                    or choice.structure_embedding
+                )
+            pose_transition_mismatch = _embedding_rms_distance(
+                previous_pose,
+                current_pose,
+            )
+            silhouette_transition_mismatch = _embedding_rms_distance(
+                previous.exit_silhouette_embedding
+                or previous.silhouette_embedding,
+                choice.entry_silhouette_embedding
+                or choice.silhouette_embedding,
+            )
+            layout_transition_mismatch = cross_source_layout_mismatch(
+                previous,
+                choice,
+            )
+            formation_transition_mismatch = formation_assignment_mismatch(
+                previous.exit_formation_people,
+                choice.entry_formation_people,
+            )
+        choices.append(
+            VisualTimelineChoice(
+                segment_index=choice.segment_index,
+                source_index=source_index,
+                canonical_master_start=choice.start_seconds,
+                canonical_master_end=choice.end_seconds,
+                source_local_start=source_local_start,
+                source_local_end=source_local_end,
+                quality_score=choice.quality_score,
+                composition_score=choice.composition_score,
+                boundary_score=choice.boundary_score,
+                shot_scale=choice.shot_scale,
+                shot_type=choice.shot_type,
+                shot_id=choice.shot_id,
+                entry_shot_scale=choice.entry_shot_scale,
+                exit_shot_scale=choice.exit_shot_scale,
+                entry_shot_type=choice.entry_shot_type,
+                exit_shot_type=choice.exit_shot_type,
+                entry_scene_cut_near=choice.entry_scene_cut_near,
+                exit_scene_cut_near=choice.exit_scene_cut_near,
+                internal_scene_cut_master_seconds=(
+                    choice.internal_scene_cut_master_seconds
+                ),
+                entry_boundary_side_stability=(
+                    choice.entry_boundary_side_stability
+                ),
+                exit_boundary_side_stability=choice.exit_boundary_side_stability,
+                face_samples_xywh=face_metadata.boxes,
+                face_match_candidate_failure=face_metadata.failure,
+                face_detector_backends=face_metadata.backends,
+                face_landmark_samples_xy=face_metadata.landmarks,
+                face_head_roll_samples_radians=face_metadata.rolls,
+                face_eye_scale_samples=face_metadata.eye_scales,
+                entry_face_geometry_window=choice.entry_face_geometry_window,
+                exit_face_geometry_window=choice.exit_face_geometry_window,
+                dissolve_entry_face_geometry_window=entry_evidence.face_geometry,
+                dissolve_exit_face_geometry_window=exit_evidence.face_geometry,
+                dissolve_entry_face_box_window=entry_evidence.face_boxes,
+                dissolve_exit_face_box_window=exit_evidence.face_boxes,
+                dissolve_entry_face_identity_window=(
+                    entry_evidence.face_identity_embeddings
+                ),
+                dissolve_exit_face_identity_window=(
+                    exit_evidence.face_identity_embeddings
+                ),
+                dissolve_entry_pose_embedding_window=(
+                    entry_evidence.pose_embeddings
+                ),
+                dissolve_exit_pose_embedding_window=exit_evidence.pose_embeddings,
+                dissolve_entry_pose_backend_window=entry_evidence.pose_backends,
+                dissolve_exit_pose_backend_window=exit_evidence.pose_backends,
+                dissolve_entry_pose_confidence_window=(
+                    entry_evidence.pose_confidences
+                ),
+                dissolve_exit_pose_confidence_window=(
+                    exit_evidence.pose_confidences
+                ),
+                dissolve_entry_silhouette_embedding_window=(
+                    entry_evidence.silhouette_embeddings
+                ),
+                dissolve_exit_silhouette_embedding_window=(
+                    exit_evidence.silhouette_embeddings
+                ),
+                dissolve_entry_silhouette_backend_window=(
+                    entry_evidence.silhouette_backends
+                ),
+                dissolve_exit_silhouette_backend_window=(
+                    exit_evidence.silhouette_backends
+                ),
+                dissolve_entry_silhouette_confidence_window=(
+                    entry_evidence.silhouette_confidences
+                ),
+                dissolve_exit_silhouette_confidence_window=(
+                    exit_evidence.silhouette_confidences
+                ),
+                face_transition_minimax_mismatch_from_previous=(
+                    face_transition_mismatch
+                ),
+                pose_backends=subject_metadata.pose_backends,
+                pose_confidences=subject_metadata.pose_confidences,
+                detected_person_counts=subject_metadata.person_counts,
+                formation_person_counts=subject_metadata.formation_person_counts,
+                formation_upper_body_counts=(
+                    subject_metadata.formation_upper_body_counts
+                ),
+                silhouette_samples_xywh=subject_metadata.silhouette_boxes,
+                silhouette_centroid_samples_xy=(
+                    subject_metadata.silhouette_centroids
+                ),
+                silhouette_backends=subject_metadata.silhouette_backends,
+                silhouette_confidences=subject_metadata.silhouette_confidences,
+                layout_transition_mismatch_from_previous=(
+                    layout_transition_mismatch
+                ),
+                pose_transition_basis_from_previous=pose_transition_basis,
+                pose_transition_mismatch_from_previous=pose_transition_mismatch,
+                silhouette_transition_mismatch_from_previous=(
+                    silhouette_transition_mismatch
+                ),
+                formation_transition_mismatch_from_previous=(
+                    formation_transition_mismatch
+                ),
+            )
+        )
+    candidate_review_summaries = tuple(
+        _candidate_review_summary(
+            candidate_index=item.candidate_index,
+            cadence_profile=item.cadence_profile,
+            selected=item.candidate_index == record.candidate_index,
+            candidate=item.timeline_result,
+            review=item.review,
+        )
+        for item in candidate_set.candidates
+    )
+    return VisualTimelinePlan(
+        choices=tuple(choices),
+        optimizer_score=optimized.total_score,
+        selected_candidate_index=record.candidate_index,
+        candidate_generation_basis=candidate_set.candidate_generation_basis,
+        candidate_review_summaries=candidate_review_summaries,
+        source_clock_basis=candidate_set.source_clock_basis,
+    )
+
+
+def _describe_sampler_frame(
+    sampler: Any,
+    seconds: float,
+    *,
+    following_seconds: float | None = None,
+    include_subject_geometry: bool = True,
+    include_formation_pose: bool = False,
+) -> FrameVisualDescriptor | None:
+    """Use persistent-aware sampling while retaining lightweight test providers."""
+
+    feature_method = getattr(sampler, "feature_descriptor_at", None)
+    if callable(feature_method):
+        return feature_method(
+            seconds,
+            following_seconds=following_seconds,
+            include_subject_geometry=include_subject_geometry,
+            include_formation_pose=include_formation_pose,
+        )
+    frame = sampler.frame_at(seconds)
+    if frame is None:
+        return None
+    following = (
+        sampler.frame_at(following_seconds)
+        if following_seconds is not None
+        else None
+    )
+    if following_seconds is not None and following is None:
+        return None
+    describe_arguments: dict[str, Any] = {"following_frame": following}
+    if not include_subject_geometry:
+        describe_arguments["include_subject_geometry"] = False
+    if include_formation_pose:
+        describe_arguments["include_formation_pose"] = True
+    return describe_frame(frame, **describe_arguments)
+
+
+def _build_visual_timeline(
     *,
     sources: Sequence[Path],
     canonical_spans: Sequence[tuple[float, float]],
@@ -1321,9 +3495,26 @@ def build_visual_timeline(
     scene_cut_times: Sequence[Sequence[float]],
     preferred_source_indices: Sequence[int] | None = None,
     diversity_config: VisualDiversityConfig | None = None,
-) -> VisualTimelinePlan:
-    """Score every synchronized source option and globally select the edit."""
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    feature_cache_directory: Path | None = None,
+    prescribed_source_indices: Sequence[int] | None = None,
+    maximum_candidate_results: int,
+    candidate_set_only: bool,
+) -> VisualTimelinePlan | VisualTimelineCandidateSet:
+    """Score synchronized source options and globally select the edit.
 
+    ``source_timewarps`` is optional and positional to the source arrays.  A
+    ``None`` entry retains ``master + audio_offset``; a supplied map controls
+    every decoded sample and the persisted source-local span.
+    """
+
+    if (
+        isinstance(maximum_candidate_results, bool)
+        or not isinstance(maximum_candidate_results, int)
+        or not 8 <= maximum_candidate_results <= 32
+    ):
+        raise ValueError("maximum_candidate_results must be between 8 and 32")
     source_count = len(sources)
     if source_count < 2:
         raise ValueError("visual timeline needs at least two sources")
@@ -1336,6 +3527,11 @@ def build_visual_timeline(
         raise ValueError("per-source visual inputs must have matching lengths")
     if not canonical_spans:
         raise ValueError("canonical_spans cannot be empty")
+    clock_maps = _source_clock_maps(
+        source_timewarps,
+        audio_offsets=audio_offsets,
+        source_count=source_count,
+    )
     preferred_indices = (
         tuple(preferred_source_indices)
         if preferred_source_indices is not None
@@ -1361,8 +3557,38 @@ def build_visual_timeline(
                     "preferred source assignments must cover every source before reuse"
                 )
             preferred_source_ids = tuple(str(index) for index in preferred_indices)
+    prescribed_indices = (
+        tuple(prescribed_source_indices)
+        if prescribed_source_indices is not None
+        else None
+    )
+    if prescribed_indices is not None:
+        if len(prescribed_indices) != len(canonical_spans):
+            raise ValueError("prescribed source path must match canonical spans")
+        if any(
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+            or source_index >= source_count
+            for source_index in prescribed_indices
+        ):
+            raise ValueError("prescribed source path contains an invalid index")
+        if preferred_indices is not None:
+            raise ValueError(
+                "prescribed source path cannot be combined with soft preferences"
+            )
     diversity = diversity_config or VisualDiversityConfig()
-    samplers = [_VideoSampler(Path(path)) for path in sources]
+    samplers = [
+        (
+            _VideoSampler(Path(path))
+            if feature_cache_directory is None
+            else _VideoSampler(
+                Path(path),
+                feature_cache_directory=feature_cache_directory,
+            )
+        )
+        for path in sources
+    ]
     candidates_by_segment: list[list[TimelineCandidate]] = []
     face_metadata_by_candidate: dict[str, _CandidateFaceMetadata] = {}
     subject_metadata_by_candidate: dict[str, _CandidateSubjectMetadata] = {}
@@ -1373,33 +3599,216 @@ def build_visual_timeline(
             duration = master_end - master_start
             candidates: list[TimelineCandidate] = []
             for source_index, sampler in enumerate(samplers):
-                offset = float(audio_offsets[source_index])
-                source_start = master_start + offset
-                source_end = master_end + offset
+                source_start = _source_clock_time(
+                    master_start,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                source_end = _source_clock_time(
+                    master_end,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
                 inset = min(0.05, duration * 0.12)
-                entry_time = source_start + inset
-                exit_time = source_end - inset
-                middle_time = (source_start + source_end) / 2.0
-                entry_frame = sampler.frame_at(entry_time)
-                middle_frame = sampler.frame_at(middle_time)
-                exit_frame = sampler.frame_at(exit_time)
-                if entry_frame is None or middle_frame is None or exit_frame is None:
+                entry_master = master_start + inset
+                exit_master = master_end - inset
+                middle_master = (master_start + master_end) / 2.0
+                entry_time = _source_clock_time(
+                    entry_master,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                exit_time = _source_clock_time(
+                    exit_master,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                middle_time = _source_clock_time(
+                    middle_master,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                entry_following_master = min(master_end, entry_master + 0.08)
+                entry_following_time = _source_clock_time(
+                    entry_following_master,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                middle_following_time = _source_clock_time(
+                    min(master_end, middle_master + 0.08),
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                # Outgoing motion must end before the rendered cut. Sampling
+                # exit -> exit+80ms looked into footage the viewer never sees
+                # and could reverse direction on a beat. Use a preceding frame
+                # to measure forward-time motion into the actual exit sample.
+                exit_preceding_master = max(master_start, exit_master - 0.08)
+                exit_preceding_time = _source_clock_time(
+                    exit_preceding_master,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                entry = _describe_sampler_frame(
+                    sampler,
+                    entry_time,
+                    following_seconds=entry_following_time,
+                    include_formation_pose=True,
+                )
+                middle = _describe_sampler_frame(
+                    sampler,
+                    middle_time,
+                    following_seconds=middle_following_time,
+                )
+                exit_descriptor = _describe_sampler_frame(
+                    sampler,
+                    exit_time,
+                    include_formation_pose=True,
+                )
+                entry_following_descriptor = _describe_sampler_frame(
+                    sampler,
+                    entry_following_time,
+                )
+                exit_preceding_descriptor = _describe_sampler_frame(
+                    sampler,
+                    exit_preceding_time,
+                    following_seconds=exit_time,
+                )
+                if (
+                    entry is None
+                    or middle is None
+                    or exit_descriptor is None
+                ):
                     continue
-                following = sampler.frame_at(min(source_end - 0.001, entry_time + 0.08))
-                entry = describe_frame(entry_frame, following_frame=following)
-                middle = describe_frame(middle_frame)
-                exit_descriptor = describe_frame(exit_frame)
-                cuts = tuple(float(value) for value in scene_cut_times[source_index])
+                entry_boundary_stability = (
+                    describe_boundary_side_stability(
+                        entry,
+                        entry_following_descriptor,
+                        sample_span_seconds=(
+                            entry_following_master - entry_master
+                        ),
+                    )
+                    if entry_following_descriptor is not None
+                    and entry_following_master > entry_master
+                    else None
+                )
+                exit_boundary_stability = (
+                    describe_boundary_side_stability(
+                        exit_preceding_descriptor,
+                        exit_descriptor,
+                        sample_span_seconds=(
+                            exit_master - exit_preceding_master
+                        ),
+                    )
+                    if exit_preceding_descriptor is not None
+                    and exit_master > exit_preceding_master
+                    else None
+                )
+                exit_motion = (
+                    exit_preceding_descriptor.motion
+                    if exit_preceding_descriptor is not None
+                    else None
+                )
+                cuts = tuple(
+                    sorted({float(value) for value in scene_cut_times[source_index]})
+                )
+                internal_scene_cut_master_seconds = tuple(
+                    master_cut
+                    for source_cut in cuts
+                    if source_start + 1e-6 < source_cut < source_end - 1e-6
+                    for master_cut in (
+                        _master_clock_time(
+                            source_cut,
+                            source_index=source_index,
+                            audio_offsets=audio_offsets,
+                            source_timewarps=clock_maps,
+                        ),
+                    )
+                    if master_start + 1e-6 < master_cut < master_end - 1e-6
+                )
                 tolerance = min(0.14, max(0.06, duration * 0.12))
-                near_boundary = any(
-                    abs(cut - source_start) <= tolerance
-                    or abs(cut - source_end) <= tolerance
+                boundary_risk_window = max(0.16, tolerance)
+                entry_risk_end = _source_clock_time(
+                    master_start + boundary_risk_window,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                exit_risk_start = _source_clock_time(
+                    master_end - boundary_risk_window,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                entry_safe_start = _source_clock_time(
+                    master_start - tolerance,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                exit_safe_end = _source_clock_time(
+                    master_end + tolerance,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                # Camera cuts have a direction at an edit boundary. A source
+                # cut just *before* an incoming segment or just *after* an
+                # outgoing segment is hidden by the cross-edit and is often a
+                # useful professional edit point. Only a cut that lands inside
+                # the rendered handle creates the objectionable two-step jump.
+                # Treat one decoded frame around the nominal boundary as the
+                # same quantized cut rather than rejecting it for sub-frame
+                # timestamp noise.
+                boundary_frame_seconds = 1.0 / max(
+                    float(getattr(sampler, "frame_rate", 29.97)),
+                    1.0,
+                )
+                entry_scene_cut_near = any(
+                    source_start + boundary_frame_seconds
+                    < cut
+                    <= entry_risk_end
                     for cut in cuts
                 )
-                boundary_score = 0.92 if near_boundary else 0.52
+                exit_scene_cut_near = any(
+                    exit_risk_start
+                    <= cut
+                    < source_end - boundary_frame_seconds
+                    for cut in cuts
+                )
+                safely_aligned_boundary = any(
+                    entry_safe_start
+                    <= cut
+                    <= source_start + boundary_frame_seconds
+                    or source_end - boundary_frame_seconds
+                    <= cut
+                    <= exit_safe_end
+                    for cut in cuts
+                )
+                boundary_score = 0.92 if safely_aligned_boundary else 0.52
                 shot_number = bisect_right(cuts, middle_time)
+                internal_start = _source_clock_time(
+                    master_start + tolerance,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
+                internal_end = _source_clock_time(
+                    master_end - tolerance,
+                    source_index=source_index,
+                    audio_offsets=audio_offsets,
+                    source_timewarps=clock_maps,
+                )
                 has_internal_camera_cut = any(
-                    source_start + tolerance < cut < source_end - tolerance
+                    internal_start < cut < internal_end
                     for cut in cuts
                 )
                 candidate_id = f"{source_index}:{segment_index}"
@@ -1451,6 +3860,25 @@ def build_visual_timeline(
                         middle.detected_person_count,
                         exit_descriptor.detected_person_count,
                     ),
+                    formation_person_counts=(
+                        len(entry.formation_people),
+                        len(middle.formation_people),
+                        len(exit_descriptor.formation_people),
+                    ),
+                    formation_upper_body_counts=(
+                        sum(
+                            bool(person.upper_body_keypoints_xyc)
+                            for person in entry.formation_people
+                        ),
+                        sum(
+                            bool(person.upper_body_keypoints_xyc)
+                            for person in middle.formation_people
+                        ),
+                        sum(
+                            bool(person.upper_body_keypoints_xyc)
+                            for person in exit_descriptor.formation_people
+                        ),
+                    ),
                     silhouette_boxes=(
                         entry.silhouette_bbox_xywh,
                         middle.silhouette_bbox_xywh,
@@ -1488,6 +3916,12 @@ def build_visual_timeline(
                 else:
                     entry_face_window = ()
                     exit_face_window = ()
+                entry_identity = sampler.sface_embedding_at(entry_time, entry)
+                middle_identity = sampler.sface_embedding_at(middle_time, middle)
+                exit_identity = sampler.sface_embedding_at(
+                    exit_time,
+                    exit_descriptor,
+                )
                 quality = (entry.quality_score + middle.quality_score + exit_descriptor.quality_score) / 3.0
                 composition = (
                     entry.composition_score
@@ -1505,7 +3939,22 @@ def build_visual_timeline(
                         composition_score=composition,
                         boundary_score=boundary_score,
                         shot_scale=middle.shot_scale,
+                        entry_shot_scale=entry.shot_scale,
+                        exit_shot_scale=exit_descriptor.shot_scale,
                         shot_type=middle.shot_type,
+                        entry_shot_type=entry.shot_type,
+                        exit_shot_type=exit_descriptor.shot_type,
+                        entry_scene_cut_near=entry_scene_cut_near,
+                        exit_scene_cut_near=exit_scene_cut_near,
+                        internal_scene_cut_master_seconds=(
+                            internal_scene_cut_master_seconds
+                        ),
+                        entry_boundary_side_stability=(
+                            entry_boundary_stability
+                        ),
+                        exit_boundary_side_stability=(
+                            exit_boundary_stability
+                        ),
                         is_group_wide=middle.shot_type is ShotType.GROUP_WIDE,
                         pose_embedding=(
                             middle.pose_embedding
@@ -1529,12 +3978,35 @@ def build_visual_timeline(
                         silhouette_embedding=middle.silhouette_embedding,
                         entry_silhouette_embedding=entry.silhouette_embedding,
                         exit_silhouette_embedding=exit_descriptor.silhouette_embedding,
+                        person_layout_embedding=middle.person_layout_embedding,
+                        entry_person_layout_embedding=entry.person_layout_embedding,
+                        exit_person_layout_embedding=exit_descriptor.person_layout_embedding,
+                        formation_people=middle.formation_people,
+                        entry_formation_people=entry.formation_people,
+                        exit_formation_people=exit_descriptor.formation_people,
+                        face_identity_embedding=middle_identity,
+                        entry_face_identity_embedding=entry_identity,
+                        exit_face_identity_embedding=exit_identity,
                         color_embedding=middle.color_embedding,
                         entry_color_embedding=entry.color_embedding,
                         exit_color_embedding=exit_descriptor.color_embedding,
                         entry_face_geometry_window=entry_face_window,
                         exit_face_geometry_window=exit_face_window,
-                        motion=entry.motion,
+                        focus_bbox_xywh=middle.primary_face_bbox,
+                        entry_focus_bbox_xywh=entry.primary_face_bbox,
+                        exit_focus_bbox_xywh=exit_descriptor.primary_face_bbox,
+                        subject_bbox_xywh=middle.silhouette_bbox_xywh,
+                        entry_subject_bbox_xywh=entry.silhouette_bbox_xywh,
+                        exit_subject_bbox_xywh=exit_descriptor.silhouette_bbox_xywh,
+                        subject_centroid_xy=middle.silhouette_centroid_xy,
+                        entry_subject_centroid_xy=entry.silhouette_centroid_xy,
+                        exit_subject_centroid_xy=exit_descriptor.silhouette_centroid_xy,
+                        detected_person_count=middle.detected_person_count,
+                        entry_detected_person_count=entry.detected_person_count,
+                        exit_detected_person_count=exit_descriptor.detected_person_count,
+                        motion=middle.motion,
+                        entry_motion=entry.motion,
+                        exit_motion=exit_motion,
                         candidate_id=candidate_id,
                         shot_id=f"{source_index}:shot-{shot_number}",
                     )
@@ -1542,254 +4014,247 @@ def build_visual_timeline(
             if not candidates:
                 raise ValueError(f"no source frame is readable for segment {segment_index}")
             candidates_by_segment.append(candidates)
+            if progress_callback is not None:
+                progress_callback(segment_index + 1, len(canonical_spans))
     finally:
         for sampler in samplers:
             sampler.close()
 
-    optimized: TimelineResult = select_timeline(
-        candidates_by_segment,
-        config=TimelineConfig(
-            quality_weight=1.15,
-            sync_weight=1.25,
-            composition_weight=0.55,
-            boundary_weight=0.62,
-            continuity_bonus=0.14,
-            cut_penalty=0.10,
-            early_cut_penalty=0.18,
-            long_hold_penalty=0.22,
-            pose_transition_weight=0.68,
-            silhouette_transition_weight=0.72,
-            motion_transition_weight=0.32,
-            scale_transition_weight=0.42,
-            color_transition_weight=0.26,
-            face_geometry_transition_weight=0.32,
-            minimum_hold_segments=1,
-            preferred_max_hold_segments=4,
-            # Rhythm spans are edit opportunities.  Track source hold separately
-            # from shot hold so a broadcaster's internal camera cut cannot reset
-            # the cross-edit cadence.  The cap is adaptive: it applies only when
-            # another source's local emission + transition score is within the
-            # configured sacrifice, so a broken/poor camera is never selected
-            # solely to satisfy rotation.
-            preferred_max_source_hold_segments=3,
-            maximum_same_source_hold_segments=4,
-            source_hold_penalty=0.34,
-            maximum_switch_score_sacrifice=0.58,
-            preferred_source_bonus=diversity.preferred_source_bonus,
-            preferred_source_max_score_sacrifice=(
-                diversity.maximum_preferred_score_sacrifice
-            ),
+    candidate_generation_basis = (
+        "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
+    )
+    minimum_materialization_target = 8
+    if prescribed_indices is None:
+        timeline_candidates, candidate_cadence_profiles = (
+            _select_safe_cadence_candidates(
+                candidates_by_segment,
+                preferred_source_ids=preferred_source_ids,
+                diversity=diversity,
+                maximum_results=maximum_candidate_results,
+            )
+        )
+    else:
+        restricted_candidates: list[tuple[TimelineCandidate, ...]] = []
+        for segment_index, (candidates, source_index) in enumerate(
+            zip(candidates_by_segment, prescribed_indices, strict=True)
+        ):
+            exact = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.source_id == str(source_index)
+            )
+            if len(exact) != 1:
+                raise ValueError(
+                    "prescribed source is not visually readable for segment "
+                    f"{segment_index}"
+                )
+            restricted_candidates.append(exact)
+        timeline_candidates = select_timeline_candidates(
+            restricted_candidates,
+            config=_safe_cadence_profiles(diversity)[0].config,
+            maximum_results=1,
+            diversity_penalty=0.12,
+            minimum_hamming_fraction=0.02,
+        )
+        candidate_cadence_profiles = ("prescribed_balanced_hard_gates",)
+        candidate_generation_basis = (
+            "prescribed_source_path_visual_hard_gates_then_reference_review_v1"
+        )
+        minimum_materialization_target = 1
+    candidate_reviews: tuple[TimelineReview, ...] = tuple(
+        review_timeline(
+            candidate,
+            available_source_count=source_count,
+        )
+        for candidate in timeline_candidates
+    )
+    ranked_candidate_indices = _review_ranked_candidate_indices(
+        candidate_reviews
+    )
+    selected_candidate_index = ranked_candidate_indices[0]
+    optimized: TimelineResult = timeline_candidates[selected_candidate_index]
+    review_rank_by_index = {
+        candidate_index: review_rank
+        for review_rank, candidate_index in enumerate(ranked_candidate_indices)
+    }
+    source_clock_basis = (
+        "local_monotonic_timewarp_with_per_source_scalar_fallback"
+        if any(
+            timewarp is not None and not timewarp.scalar_fallback
+            for timewarp in clock_maps
+        )
+        else "global_scalar_offset"
+    )
+    candidate_records = tuple(
+        VisualTimelineCandidateRecord(
+            candidate_index=index,
+            cadence_profile=candidate_cadence_profiles[index],
+            timeline_result=candidate,
+            review=review,
+            review_rank=review_rank_by_index[index],
+            selected=index == selected_candidate_index,
+        )
+        for index, (candidate, review) in enumerate(
+            zip(timeline_candidates, candidate_reviews, strict=True)
+        )
+    )
+    candidate_set = VisualTimelineCandidateSet(
+        candidates=candidate_records,
+        selected_candidate_index=selected_candidate_index,
+        sources=tuple(Path(path) for path in sources),
+        audio_offsets=tuple(float(value) for value in audio_offsets),
+        source_timewarps=clock_maps,
+        source_clock_basis=source_clock_basis,
+        requested_maximum_results=maximum_candidate_results,
+        scene_cut_times=tuple(
+            tuple(float(value) for value in source_cuts)
+            for source_cuts in scene_cut_times
         ),
-        preferred_source_ids=preferred_source_ids,
+        face_metadata_by_candidate=face_metadata_by_candidate,
+        subject_metadata_by_candidate=subject_metadata_by_candidate,
+        candidate_generation_basis=candidate_generation_basis,
+        minimum_materialization_target=minimum_materialization_target,
     )
-    dissolve_entry_evidence, dissolve_exit_evidence = (
-        _selected_dissolve_evidence(
-            sources=sources,
-            optimized=optimized,
-            audio_offsets=audio_offsets,
-            scene_cut_times=scene_cut_times,
-            face_metadata_by_candidate=face_metadata_by_candidate,
-        )
+    if candidate_set_only:
+        return candidate_set
+    return materialize_visual_timeline_candidate(candidate_set)
+
+
+
+def build_visual_timeline(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    audio_offsets: Sequence[float],
+    sync_scores: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    preferred_source_indices: Sequence[int] | None = None,
+    diversity_config: VisualDiversityConfig | None = None,
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    feature_cache_directory: Path | None = None,
+) -> VisualTimelinePlan:
+    """Build the selected visual plan while preserving the existing API."""
+
+    result = _build_visual_timeline(
+        sources=sources,
+        canonical_spans=canonical_spans,
+        audio_offsets=audio_offsets,
+        sync_scores=sync_scores,
+        scene_cut_times=scene_cut_times,
+        preferred_source_indices=preferred_source_indices,
+        diversity_config=diversity_config,
+        source_timewarps=source_timewarps,
+        progress_callback=progress_callback,
+        feature_cache_directory=feature_cache_directory,
+        maximum_candidate_results=32,
+        candidate_set_only=False,
     )
-    choices: list[VisualTimelineChoice] = []
-    for optimized_index, choice in enumerate(optimized.candidates):
-        source_index = int(choice.source_id)
-        offset = float(audio_offsets[source_index])
-        face_metadata = face_metadata_by_candidate.get(
-            choice.candidate_id,
-            _CandidateFaceMetadata(
-                boxes=(None, None, None),
-                failure="face_metadata_unavailable",
-                backends=("none", "none", "none"),
-                landmarks=(None, None, None),
-                rolls=(None, None, None),
-                eye_scales=(None, None, None),
-            ),
-        )
-        entry_evidence = dissolve_entry_evidence.get(
-            choice.candidate_id, _DissolveEvidence()
-        )
-        exit_evidence = dissolve_exit_evidence.get(
-            choice.candidate_id, _DissolveEvidence()
-        )
-        subject_metadata = subject_metadata_by_candidate.get(
-            choice.candidate_id,
-            _CandidateSubjectMetadata(
-                pose_backends=(
-                    "structure_hog_fallback",
-                    "structure_hog_fallback",
-                    "structure_hog_fallback",
-                ),
-                pose_confidences=(0.0, 0.0, 0.0),
-                person_counts=(0, 0, 0),
-                silhouette_boxes=(None, None, None),
-                silhouette_centroids=(None, None, None),
-                silhouette_backends=("none", "none", "none"),
-                silhouette_confidences=(0.0, 0.0, 0.0),
-            ),
-        )
-        if optimized_index == 0:
-            face_transition_mismatch = None
-            pose_transition_basis = None
-            pose_transition_mismatch = None
-            silhouette_transition_mismatch = None
-        else:
-            previous = optimized.candidates[optimized_index - 1]
-            previous_subject_metadata = subject_metadata_by_candidate.get(
-                previous.candidate_id
-            )
-            mismatch = face_geometry_minimax_mismatch(
-                previous.exit_face_geometry_window,
-                choice.entry_face_geometry_window,
-            )
-            face_transition_mismatch = (
-                mismatch
-                if previous.exit_face_geometry_window
-                and choice.entry_face_geometry_window
-                else None
-            )
-            previous_pose = previous.exit_pose_embedding or previous.pose_embedding
-            current_pose = choice.entry_pose_embedding or choice.pose_embedding
-            actual_pose_pair = (
-                previous_subject_metadata is not None
-                and previous_subject_metadata.pose_backends[2]
-                != "structure_hog_fallback"
-                and subject_metadata.pose_backends[0] != "structure_hog_fallback"
-                and bool(previous_pose)
-                and bool(current_pose)
-                and len(previous_pose) == len(current_pose)
-            )
-            if actual_pose_pair:
-                pose_transition_basis = "opencv_zoo_mediapipe_pose"
-            else:
-                pose_transition_basis = "structure_hog_fallback"
-                previous_pose = (
-                    previous.exit_structure_embedding
-                    or previous.structure_embedding
-                )
-                current_pose = (
-                    choice.entry_structure_embedding or choice.structure_embedding
-                )
-            pose_transition_mismatch = _embedding_rms_distance(
-                previous_pose,
-                current_pose,
-            )
-            silhouette_transition_mismatch = _embedding_rms_distance(
-                previous.exit_silhouette_embedding
-                or previous.silhouette_embedding,
-                choice.entry_silhouette_embedding or choice.silhouette_embedding,
-            )
-        choices.append(
-            VisualTimelineChoice(
-                segment_index=choice.segment_index,
-                source_index=source_index,
-                canonical_master_start=choice.start_seconds,
-                canonical_master_end=choice.end_seconds,
-                source_local_start=choice.start_seconds + offset,
-                source_local_end=choice.end_seconds + offset,
-                quality_score=choice.quality_score,
-                composition_score=choice.composition_score,
-                boundary_score=choice.boundary_score,
-                shot_scale=choice.shot_scale,
-                shot_type=choice.shot_type,
-                shot_id=choice.shot_id,
-                face_samples_xywh=face_metadata.boxes,
-                face_match_candidate_failure=face_metadata.failure,
-                face_detector_backends=face_metadata.backends,
-                face_landmark_samples_xy=face_metadata.landmarks,
-                face_head_roll_samples_radians=face_metadata.rolls,
-                face_eye_scale_samples=face_metadata.eye_scales,
-                entry_face_geometry_window=choice.entry_face_geometry_window,
-                exit_face_geometry_window=choice.exit_face_geometry_window,
-                dissolve_entry_face_geometry_window=(
-                    entry_evidence.face_geometry
-                ),
-                dissolve_exit_face_geometry_window=(
-                    exit_evidence.face_geometry
-                ),
-                dissolve_entry_face_box_window=(
-                    entry_evidence.face_boxes
-                ),
-                dissolve_exit_face_box_window=(
-                    exit_evidence.face_boxes
-                ),
-                dissolve_entry_face_identity_window=(
-                    entry_evidence.face_identity_embeddings
-                ),
-                dissolve_exit_face_identity_window=(
-                    exit_evidence.face_identity_embeddings
-                ),
-                dissolve_entry_pose_embedding_window=(
-                    entry_evidence.pose_embeddings
-                ),
-                dissolve_exit_pose_embedding_window=(
-                    exit_evidence.pose_embeddings
-                ),
-                dissolve_entry_pose_backend_window=(
-                    entry_evidence.pose_backends
-                ),
-                dissolve_exit_pose_backend_window=(
-                    exit_evidence.pose_backends
-                ),
-                dissolve_entry_pose_confidence_window=(
-                    entry_evidence.pose_confidences
-                ),
-                dissolve_exit_pose_confidence_window=(
-                    exit_evidence.pose_confidences
-                ),
-                dissolve_entry_silhouette_embedding_window=(
-                    entry_evidence.silhouette_embeddings
-                ),
-                dissolve_exit_silhouette_embedding_window=(
-                    exit_evidence.silhouette_embeddings
-                ),
-                dissolve_entry_silhouette_backend_window=(
-                    entry_evidence.silhouette_backends
-                ),
-                dissolve_exit_silhouette_backend_window=(
-                    exit_evidence.silhouette_backends
-                ),
-                dissolve_entry_silhouette_confidence_window=(
-                    entry_evidence.silhouette_confidences
-                ),
-                dissolve_exit_silhouette_confidence_window=(
-                    exit_evidence.silhouette_confidences
-                ),
-                face_transition_minimax_mismatch_from_previous=(
-                    face_transition_mismatch
-                ),
-                pose_backends=subject_metadata.pose_backends,
-                pose_confidences=subject_metadata.pose_confidences,
-                detected_person_counts=subject_metadata.person_counts,
-                silhouette_samples_xywh=subject_metadata.silhouette_boxes,
-                silhouette_centroid_samples_xy=(
-                    subject_metadata.silhouette_centroids
-                ),
-                silhouette_backends=subject_metadata.silhouette_backends,
-                silhouette_confidences=subject_metadata.silhouette_confidences,
-                pose_transition_basis_from_previous=pose_transition_basis,
-                pose_transition_mismatch_from_previous=(
-                    pose_transition_mismatch
-                ),
-                silhouette_transition_mismatch_from_previous=(
-                    silhouette_transition_mismatch
-                ),
-            )
-        )
-    return VisualTimelinePlan(
-        choices=tuple(choices),
-        optimizer_score=optimized.total_score,
+    if not isinstance(result, VisualTimelinePlan):  # pragma: no cover - invariant
+        raise TypeError("selected visual timeline builder returned a candidate set")
+    return result
+
+
+def build_visual_timeline_candidate_set(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    audio_offsets: Sequence[float],
+    sync_scores: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    preferred_source_indices: Sequence[int] | None = None,
+    diversity_config: VisualDiversityConfig | None = None,
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    feature_cache_directory: Path | None = None,
+    maximum_results: int = 32,
+) -> VisualTimelineCandidateSet:
+    """Retain reviewed top-N alternatives without selected-only postpasses.
+
+    At least eight alternatives are requested so callers can perform a useful
+    proxy-review batch; the optimizer can still return fewer when the visual
+    search space contains fewer than eight unique safe paths.
+    """
+
+    result = _build_visual_timeline(
+        sources=sources,
+        canonical_spans=canonical_spans,
+        audio_offsets=audio_offsets,
+        sync_scores=sync_scores,
+        scene_cut_times=scene_cut_times,
+        preferred_source_indices=preferred_source_indices,
+        diversity_config=diversity_config,
+        source_timewarps=source_timewarps,
+        progress_callback=progress_callback,
+        feature_cache_directory=feature_cache_directory,
+        maximum_candidate_results=maximum_results,
+        candidate_set_only=True,
     )
+    if not isinstance(
+        result, VisualTimelineCandidateSet
+    ):  # pragma: no cover - invariant
+        raise TypeError("candidate-set builder returned a selected visual plan")
+    return result
+
+
+def build_prescribed_visual_timeline_candidate_set(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    prescribed_source_indices: Sequence[int],
+    audio_offsets: Sequence[float],
+    sync_scores: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    diversity_config: VisualDiversityConfig | None = None,
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    feature_cache_directory: Path | None = None,
+) -> VisualTimelineCandidateSet:
+    """Materialize one externally proposed path through existing visual gates.
+
+    Every frame descriptor and transition constraint is identical to the normal
+    visual optimizer.  Restricting each span to the prescribed source means an
+    unsafe learned edge raises instead of being replaced by a baseline source.
+    """
+
+    result = _build_visual_timeline(
+        sources=sources,
+        canonical_spans=canonical_spans,
+        audio_offsets=audio_offsets,
+        sync_scores=sync_scores,
+        scene_cut_times=scene_cut_times,
+        preferred_source_indices=None,
+        diversity_config=diversity_config,
+        source_timewarps=source_timewarps,
+        progress_callback=progress_callback,
+        feature_cache_directory=feature_cache_directory,
+        prescribed_source_indices=prescribed_source_indices,
+        maximum_candidate_results=8,
+        candidate_set_only=True,
+    )
+    if not isinstance(
+        result, VisualTimelineCandidateSet
+    ):  # pragma: no cover - invariant
+        raise TypeError("prescribed candidate builder returned a visual plan")
+    return result
 
 
 __all__ = [
     "FrameVisualDescriptor",
     "VisualDiversityConfig",
+    "VisualTimelineCandidateRecord",
+    "VisualTimelineCandidateSet",
     "VisualTimelineChoice",
     "VisualTimelinePlan",
     "YUNET_EXPECTED_SHA256",
     "YUNET_MODEL_NAME",
     "build_visual_timeline",
+    "build_visual_timeline_candidate_set",
+    "build_prescribed_visual_timeline_candidate_set",
+    "describe_boundary_side_stability",
     "describe_frame",
+    "frame_visual_numeric_features",
+    "materialize_visual_timeline_candidate",
+    "visual_analyzer_fingerprint_sha256",
     "yunet_model_asset_status",
 ]

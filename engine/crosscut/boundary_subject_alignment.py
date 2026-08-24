@@ -1,0 +1,1625 @@
+"""Exact-frame, boundary-local subject alignment for GROUP hard cuts.
+
+The older group crop planner reasons about whole selected segments.  A single
+missing detector sample can therefore demote a long same-source run, while an
+endpoint-only affine estimate cannot prove that the short settle is safe on
+the intervening frames.  This module deliberately owns a much smaller unit:
+the last ``window_frames`` of the outgoing selected segment and the first
+``window_frames`` of the incoming selected segment.
+
+Every eligible decision is based on the decoded cut endpoints in the exact
+canonical output space.  ORB/background correspondence is not required: a
+single dominant face is matched by face/eye geometry and a group view by its
+high-confidence silhouette.  Any authored track is then checked on every
+transformed output frame after the same base ``PanCropTrack`` used by the
+renderer.  Missing geometry, exposed frame edges, clipped subjects, native
+camera cuts and dissolve overlaps all fail closed.  Pixels and appearance
+descriptors are never serialized.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+import math
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+import cv2
+import numpy as np
+
+from .face_match import FaceMatchPlan, FaceMatchSegment
+from .render import (
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    PanCropTrack,
+    RenderTransition,
+    TransitionKind,
+    minimum_roll_safe_zoom,
+)
+from .visual_score import VisualTimelineChoice, VisualTimelinePlan
+
+
+ANALYSIS_BASIS = "exact_cut_frame_boundary_local_subject_alignment_v1"
+FrameProvider = Callable[[int, float], np.ndarray | None]
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySubjectObservation:
+    """Non-identifying subject geometry in canonical output coordinates."""
+
+    face_count: int = 0
+    face_box_xywh: tuple[float, float, float, float] | None = None
+    face_landmarks_xy: tuple[tuple[float, float], ...] | None = None
+    face_head_roll_radians: float | None = None
+    face_eye_scale: float | None = None
+    silhouette_box_xywh: tuple[float, float, float, float] | None = None
+    silhouette_confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.face_count, bool)
+            or not isinstance(self.face_count, int)
+            or self.face_count < 0
+        ):
+            raise ValueError("face_count must be a non-negative integer")
+        for name in ("face_box_xywh", "silhouette_box_xywh"):
+            raw = getattr(self, name)
+            if raw is None:
+                continue
+            if len(raw) != 4:
+                raise ValueError(f"{name} needs four normalized values")
+            box = tuple(float(value) for value in raw)
+            if not all(math.isfinite(value) for value in box):
+                raise ValueError(f"{name} must be finite")
+            x_value, y_value, width, height = box
+            if not (
+                0.0 <= x_value <= 1.0
+                and 0.0 <= y_value <= 1.0
+                and 0.0 < width <= 1.0
+                and 0.0 < height <= 1.0
+                and x_value + width <= 1.000001
+                and y_value + height <= 1.000001
+            ):
+                raise ValueError(f"{name} must fit normalized output bounds")
+            object.__setattr__(self, name, box)
+        if self.face_landmarks_xy is not None:
+            landmarks = tuple(
+                (float(point[0]), float(point[1]))
+                for point in self.face_landmarks_xy
+            )
+            if len(landmarks) < 2 or any(
+                not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in point)
+                for point in landmarks
+            ):
+                raise ValueError("face landmarks must be normalized and finite")
+            object.__setattr__(self, "face_landmarks_xy", landmarks)
+        for name in ("face_head_roll_radians", "face_eye_scale"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"{name} must be finite")
+            if name == "face_eye_scale" and number <= 0.0:
+                raise ValueError("face_eye_scale must be positive")
+            object.__setattr__(self, name, number)
+        confidence = float(self.silhouette_confidence)
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("silhouette confidence must be normalized")
+        object.__setattr__(self, "silhouette_confidence", confidence)
+
+
+ObservationProvider = Callable[[np.ndarray], BoundarySubjectObservation]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceResolutionHeadroom:
+    source_index: int
+    width: int | None
+    height: int | None
+    native_zoom_headroom: float | None
+    quality_profile: str
+    quality_profile_max_zoom: float
+    renderer_schema_max_zoom: float
+    effective_max_zoom: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_index": self.source_index,
+            "width": self.width,
+            "height": self.height,
+            "native_zoom_headroom": self.native_zoom_headroom,
+            "quality_profile": self.quality_profile,
+            "quality_profile_max_zoom": self.quality_profile_max_zoom,
+            "renderer_schema_max_zoom": self.renderer_schema_max_zoom,
+            "effective_max_zoom": self.effective_max_zoom,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySubjectAlignmentConfig:
+    window_frames: int = 14
+    analysis_width: int = 854
+    analysis_height: int = 480
+    renderer_schema_max_zoom: float = 1.18
+    conservative_1080_max_zoom: float = 1.10
+    native_1440_max_zoom: float = 1.33
+    native_2160_max_zoom: float = 2.0
+    unknown_resolution_max_zoom: float = 1.06
+    maximum_center_shift: float = 0.040
+    maximum_roll_degrees: float = 1.60
+    minimum_silhouette_confidence: float = 0.72
+    minimum_face_visible_fraction: float = 0.995
+    minimum_silhouette_visible_fraction: float = 0.92
+    minimum_geometry_improvement: float = 0.015
+    minimum_geometry_improvement_fraction: float = 0.10
+    already_matched_scale_ratio: float = 1.015
+    already_matched_center_distance: float = 0.025
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.window_frames, bool)
+            or not isinstance(self.window_frames, int)
+            or not 8 <= self.window_frames <= 24
+        ):
+            raise ValueError("boundary alignment window must be 8...24 frames")
+        if self.analysis_width < 320 or self.analysis_height < 180:
+            raise ValueError("boundary alignment analysis space is too small")
+        if abs(self.analysis_width / self.analysis_height - 16.0 / 9.0) > 0.01:
+            raise ValueError("boundary alignment analysis space must be 16:9")
+        values = tuple(
+            float(getattr(self, name))
+            for name in (
+                "renderer_schema_max_zoom",
+                "conservative_1080_max_zoom",
+                "native_1440_max_zoom",
+                "native_2160_max_zoom",
+                "unknown_resolution_max_zoom",
+                "maximum_center_shift",
+                "maximum_roll_degrees",
+                "minimum_silhouette_confidence",
+                "minimum_face_visible_fraction",
+                "minimum_silhouette_visible_fraction",
+                "minimum_geometry_improvement",
+                "minimum_geometry_improvement_fraction",
+                "already_matched_scale_ratio",
+                "already_matched_center_distance",
+            )
+        )
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("boundary alignment configuration must be finite")
+        if not 1.0 < self.renderer_schema_max_zoom <= 1.18:
+            raise ValueError("v1 renderer schema zoom cannot exceed 1.18")
+        if not (
+            1.0 < self.conservative_1080_max_zoom
+            <= self.native_1440_max_zoom
+            <= self.native_2160_max_zoom
+            <= 2.0
+        ):
+            raise ValueError("resolution headroom profiles must be ordered")
+        if not 1.0 < self.unknown_resolution_max_zoom <= self.conservative_1080_max_zoom:
+            raise ValueError("unknown-resolution zoom must be conservative")
+        if not 0.0 <= self.maximum_center_shift <= 0.040:
+            raise ValueError("boundary pan exceeds the renderer schema")
+        if not 0.0 <= self.maximum_roll_degrees <= 1.60:
+            raise ValueError("boundary roll exceeds the renderer schema")
+        if not 0.0 <= self.minimum_silhouette_confidence <= 1.0:
+            raise ValueError("silhouette confidence must be normalized")
+        if not 0.8 <= self.minimum_face_visible_fraction <= 1.0:
+            raise ValueError("face containment threshold is invalid")
+        if not 0.8 <= self.minimum_silhouette_visible_fraction <= 1.0:
+            raise ValueError("silhouette containment threshold is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class _TransformState:
+    zoom: float = 1.0
+    center_x: float = 0.5
+    center_y: float = 0.5
+    roll_degrees: float = 0.0
+
+    @property
+    def neutral(self) -> bool:
+        return (
+            abs(self.zoom - 1.0) <= 1e-9
+            and abs(self.center_x - 0.5) <= 1e-9
+            and abs(self.center_y - 0.5) <= 1e-9
+            and abs(self.roll_degrees) <= 1e-9
+        )
+
+    def keyframe(self, time_seconds: float) -> EditorialTransformKeyframe:
+        return EditorialTransformKeyframe(
+            time_seconds,
+            self.zoom,
+            self.center_x,
+            self.center_y,
+            self.roll_degrees,
+        )
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "zoom": self.zoom,
+            "center_x": self.center_x,
+            "center_y": self.center_y,
+            "roll_degrees": self.roll_degrees,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySubjectAlignmentDecision:
+    boundary_index: int
+    outgoing_segment_index: int
+    incoming_segment_index: int
+    outgoing_source_index: int
+    incoming_source_index: int
+    outgoing_source_seconds: float
+    incoming_source_seconds: float
+    eligible: bool
+    rejection_reason: str | None
+    subject_kind: str | None = None
+    transformed_side: str | None = None
+    outgoing_state: _TransformState = _TransformState()
+    incoming_state: _TransformState = _TransformState()
+    baseline_geometry_mismatch: float | None = None
+    transformed_geometry_mismatch: float | None = None
+    exact_scale_ratio: float | None = None
+    roll_evidence_available: bool = False
+    roll_applied: bool = False
+    partial_scale_alignment: bool = False
+    validated_output_frame_count: int = 0
+    optical_flow_containment_frame_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.boundary_index < 0 or min(
+            self.outgoing_segment_index,
+            self.incoming_segment_index,
+            self.outgoing_source_index,
+            self.incoming_source_index,
+        ) < 0:
+            raise ValueError("boundary alignment indices must be non-negative")
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (self.outgoing_source_seconds, self.incoming_source_seconds)
+        ):
+            raise ValueError("boundary source clocks must be finite and non-negative")
+        if self.eligible == bool(self.rejection_reason):
+            raise ValueError("eligible decision and rejection reason disagree")
+        if self.subject_kind is not None and self.subject_kind not in {"face", "silhouette"}:
+            raise ValueError("boundary subject kind is invalid")
+        if self.transformed_side is not None and self.transformed_side not in {
+            "outgoing",
+            "incoming",
+        }:
+            raise ValueError("transformed side is invalid")
+        if min(
+            self.validated_output_frame_count,
+            self.optical_flow_containment_frame_count,
+        ) < 0:
+            raise ValueError("validated frame counts cannot be negative")
+        if self.optical_flow_containment_frame_count > self.validated_output_frame_count:
+            raise ValueError("tracked containment frames must be a validated subset")
+
+    @property
+    def uses_pan(self) -> bool:
+        state = (
+            self.outgoing_state
+            if self.transformed_side == "outgoing"
+            else self.incoming_state
+        )
+        return math.hypot(state.center_x - 0.5, state.center_y - 0.5) > 0.003
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "boundary_index": self.boundary_index,
+            "outgoing_segment_index": self.outgoing_segment_index,
+            "incoming_segment_index": self.incoming_segment_index,
+            "outgoing_source_index": self.outgoing_source_index,
+            "incoming_source_index": self.incoming_source_index,
+            "outgoing_source_seconds": self.outgoing_source_seconds,
+            "incoming_source_seconds": self.incoming_source_seconds,
+            "eligible": self.eligible,
+            "rejection_reason": self.rejection_reason,
+            "subject_kind": self.subject_kind,
+            "transformed_side": self.transformed_side,
+            "outgoing_state": self.outgoing_state.to_dict(),
+            "incoming_state": self.incoming_state.to_dict(),
+            "baseline_geometry_mismatch": self.baseline_geometry_mismatch,
+            "transformed_geometry_mismatch": self.transformed_geometry_mismatch,
+            "exact_scale_ratio": self.exact_scale_ratio,
+            "roll_evidence_available": self.roll_evidence_available,
+            "roll_applied": self.roll_applied,
+            "partial_scale_alignment": self.partial_scale_alignment,
+            "validated_output_frame_count": self.validated_output_frame_count,
+            "optical_flow_containment_frame_count": (
+                self.optical_flow_containment_frame_count
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySubjectAlignmentSegment:
+    segment_index: int
+    source_index: int
+    track: EditorialTransformTrack | None
+    boundary_indices: tuple[int, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_index": self.segment_index,
+            "source_index": self.source_index,
+            "applied": self.track is not None,
+            "boundary_indices": list(self.boundary_indices),
+            "keyframes": (
+                [
+                    {
+                        "time_seconds": keyframe.time_seconds,
+                        "zoom": keyframe.zoom,
+                        "center_x": keyframe.center_x,
+                        "center_y": keyframe.center_y,
+                        "roll_degrees": keyframe.roll_degrees,
+                    }
+                    for keyframe in self.track.keyframes
+                ]
+                if self.track is not None
+                else []
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundarySubjectAlignmentPlan:
+    decisions: tuple[BoundarySubjectAlignmentDecision, ...]
+    segments: tuple[BoundarySubjectAlignmentSegment, ...]
+    source_headroom: tuple[SourceResolutionHeadroom, ...]
+    window_frames: int
+    analysis_basis: str = ANALYSIS_BASIS
+
+    @property
+    def eligible_count(self) -> int:
+        return sum(item.eligible for item in self.decisions)
+
+    @property
+    def applied_segment_count(self) -> int:
+        return sum(item.track is not None for item in self.segments)
+
+    @property
+    def pan_event_count(self) -> int:
+        return sum(item.eligible and item.uses_pan for item in self.decisions)
+
+    @property
+    def roll_event_count(self) -> int:
+        return sum(item.eligible and item.roll_applied for item in self.decisions)
+
+    @property
+    def validated_output_frame_count(self) -> int:
+        return sum(item.validated_output_frame_count for item in self.decisions)
+
+    @property
+    def optical_flow_containment_frame_count(self) -> int:
+        return sum(
+            item.optical_flow_containment_frame_count for item in self.decisions
+        )
+
+    def track_for(self, segment_index: int) -> EditorialTransformTrack | None:
+        matches = [
+            item.track for item in self.segments if item.segment_index == segment_index
+        ]
+        if len(matches) != 1:
+            raise ValueError("boundary alignment plan must cover every segment once")
+        return matches[0]
+
+    def decision_for(self, boundary_index: int) -> BoundarySubjectAlignmentDecision | None:
+        matches = [
+            item for item in self.decisions if item.boundary_index == boundary_index
+        ]
+        if len(matches) > 1:
+            raise ValueError("boundary alignment plan has duplicate decisions")
+        return matches[0] if matches else None
+
+    def to_dict(self) -> dict[str, Any]:
+        rejections: dict[str, int] = {}
+        for item in self.decisions:
+            if item.rejection_reason is not None:
+                rejections[item.rejection_reason] = rejections.get(item.rejection_reason, 0) + 1
+        return {
+            "analysis_basis": self.analysis_basis,
+            "policy": {
+                "scope": "cross_source_hard_cut_last_and_first_local_windows_only",
+                "window_frames_each_side": self.window_frames,
+                "orb_required": False,
+                "native_internal_cuts_transformed": False,
+                "dissolve_overlap_transformed": False,
+                "frame_validation": "every_transformed_output_frame_after_base_crop",
+                "legacy_editorial_schema_globally_relaxed": False,
+            },
+            "decision_count": len(self.decisions),
+            "eligible_count": self.eligible_count,
+            "applied_segment_count": self.applied_segment_count,
+            "pan_event_count": self.pan_event_count,
+            "roll_event_count": self.roll_event_count,
+            "validated_output_frame_count": self.validated_output_frame_count,
+            "optical_flow_containment_frame_count": (
+                self.optical_flow_containment_frame_count
+            ),
+            "rejection_counts": [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(rejections.items())
+            ],
+            "source_resolution_headroom": [item.to_dict() for item in self.source_headroom],
+            "storage_policy": {
+                "decoded_pixels_serialized": False,
+                "appearance_or_identity_embeddings_serialized": False,
+                "landmarks_serialized": False,
+            },
+            "decisions": [item.to_dict() for item in self.decisions],
+            "segments": [item.to_dict() for item in self.segments],
+        }
+
+
+class _CaptureProvider:
+    def __init__(self, sources: Sequence[Path], maximum_cache_size: int = 192) -> None:
+        self._captures: list[cv2.VideoCapture | None] = []
+        self._cache: OrderedDict[tuple[int, int], np.ndarray | None] = OrderedDict()
+        self._maximum_cache_size = maximum_cache_size
+        try:
+            for source in sources:
+                capture = cv2.VideoCapture(str(source))
+                self._captures.append(capture if capture.isOpened() else None)
+        except Exception:
+            self.close()
+            raise
+
+    def resolution(self, source_index: int) -> tuple[int, int] | None:
+        capture = self._captures[source_index]
+        if capture is None:
+            return None
+        width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        return (width, height) if width > 0 and height > 0 else None
+
+    def frame_at(self, source_index: int, seconds: float) -> np.ndarray | None:
+        key = (source_index, int(round(max(0.0, seconds) * 1000.0)))
+        if key in self._cache:
+            value = self._cache.pop(key)
+            self._cache[key] = value
+            return None if value is None else value.copy()
+        capture = self._captures[source_index]
+        frame: np.ndarray | None = None
+        if capture is not None:
+            capture.set(cv2.CAP_PROP_POS_MSEC, key[1])
+            success, decoded = capture.read()
+            if success and isinstance(decoded, np.ndarray) and decoded.size:
+                frame = decoded
+        self._cache[key] = frame
+        while len(self._cache) > self._maximum_cache_size:
+            self._cache.popitem(last=False)
+        return None if frame is None else frame.copy()
+
+    def close(self) -> None:
+        for capture in self._captures:
+            if capture is not None:
+                capture.release()
+        self._captures.clear()
+        self._cache.clear()
+
+
+def _default_observation_provider(frame: np.ndarray) -> BoundarySubjectObservation:
+    from .visual_score import describe_frame
+
+    descriptor = describe_frame(
+        frame,
+        include_subject_geometry=True,
+        include_formation_pose=False,
+    )
+    return BoundarySubjectObservation(
+        face_count=descriptor.face_count,
+        face_box_xywh=descriptor.primary_face_bbox,
+        face_landmarks_xy=descriptor.primary_face_landmarks_xy,
+        face_head_roll_radians=descriptor.primary_face_head_roll_radians,
+        face_eye_scale=descriptor.primary_face_eye_scale,
+        silhouette_box_xywh=descriptor.silhouette_bbox_xywh,
+        silhouette_confidence=descriptor.silhouette_confidence,
+    )
+
+
+def _frame_counts(
+    choices: Sequence[VisualTimelineChoice], fps: float
+) -> tuple[int, ...]:
+    counts: list[int] = []
+    cumulative = 0.0
+    previous = 0
+    for choice in choices:
+        cumulative += choice.duration_seconds
+        boundary = int(round(cumulative * fps))
+        count = boundary - previous
+        if count < 2:
+            raise ValueError("boundary alignment segment is shorter than two frames")
+        counts.append(count)
+        previous = boundary
+    return tuple(counts)
+
+
+def _face_matches(face_match_plan: FaceMatchPlan | None) -> dict[int, FaceMatchSegment]:
+    if face_match_plan is None:
+        return {}
+    if not isinstance(face_match_plan, FaceMatchPlan):
+        raise TypeError("face_match_plan must be a FaceMatchPlan")
+    matches = {item.segment_index: item for item in face_match_plan.segments}
+    if len(matches) != len(face_match_plan.segments):
+        raise ValueError("face-match plan contains duplicate segment indices")
+    return matches
+
+
+def _fixed_crop_at(
+    track: PanCropTrack,
+    time_seconds: float,
+) -> tuple[float, float, float, float]:
+    width, height = track.fixed_crop_size
+    positions = track.fixed_crop_positions()
+    if time_seconds <= positions[0][0] + 1e-9:
+        return (positions[0][1], positions[0][2], width, height)
+    for left, right in zip(positions, positions[1:]):
+        if time_seconds <= right[0] + 1e-9:
+            alpha = (time_seconds - left[0]) / max(1e-9, right[0] - left[0])
+            return (
+                left[1] + (right[1] - left[1]) * alpha,
+                left[2] + (right[2] - left[2]) * alpha,
+                width,
+                height,
+            )
+    return (positions[-1][1], positions[-1][2], width, height)
+
+
+def _canonical_frame(
+    frame: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    base_crop: tuple[float, float, float, float] | None,
+) -> np.ndarray:
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError("boundary alignment expects a BGR frame")
+    working = frame
+    if base_crop is not None:
+        left, top, crop_width, crop_height = base_crop
+        source_height, source_width = working.shape[:2]
+        # Mirror render.py's ``trunc(iw*ratio/2)*2`` dimensions and bounded
+        # integer crop origin instead of letting a one-pixel round-up create
+        # geometry the actual FFmpeg chain never displays.
+        crop_pixel_width = max(2, int(source_width * crop_width) // 2 * 2)
+        crop_pixel_height = max(2, int(source_height * crop_height) // 2 * 2)
+        crop_pixel_width = min(source_width, crop_pixel_width)
+        crop_pixel_height = min(source_height, crop_pixel_height)
+        x0 = max(
+            0,
+            min(source_width - crop_pixel_width, int(left * source_width)),
+        )
+        y0 = max(
+            0,
+            min(source_height - crop_pixel_height, int(top * source_height)),
+        )
+        x1 = x0 + crop_pixel_width
+        y1 = y0 + crop_pixel_height
+        working = working[y0:y1, x0:x1]
+    source_height, source_width = working.shape[:2]
+    scale = max(width / source_width, height / source_height)
+    scaled_width = max(width, int(math.ceil(source_width * scale)))
+    scaled_height = max(height, int(math.ceil(source_height * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(
+        working,
+        (scaled_width, scaled_height),
+        interpolation=interpolation,
+    )
+    offset_x = (scaled_width - width) // 2
+    offset_y = (scaled_height - height) // 2
+    return resized[offset_y : offset_y + height, offset_x : offset_x + width]
+
+
+def _source_seconds(
+    choice: VisualTimelineChoice,
+    frame_index: int,
+    *,
+    fps: float,
+) -> float:
+    return min(
+        choice.source_local_end,
+        choice.source_local_start + frame_index * choice.source_playback_rate / fps,
+    )
+
+
+def _subject(
+    observation: BoundarySubjectObservation,
+    *,
+    preferred_kind: str | None,
+    settings: BoundarySubjectAlignmentConfig,
+) -> tuple[
+    str,
+    tuple[float, float, float, float],
+    float | None,
+    float | None,
+] | None:
+    if preferred_kind in (None, "face") and (
+        observation.face_count == 1 and observation.face_box_xywh is not None
+    ):
+        return (
+            "face",
+            observation.face_box_xywh,
+            observation.face_eye_scale,
+            observation.face_head_roll_radians,
+        )
+    if preferred_kind in (None, "silhouette") and (
+        observation.silhouette_box_xywh is not None
+        and observation.silhouette_confidence >= settings.minimum_silhouette_confidence
+    ):
+        return (
+            "silhouette",
+            observation.silhouette_box_xywh,
+            None,
+            None,
+        )
+    return None
+
+
+def _center(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    return (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
+
+
+def _geometry_mismatch(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    left_center = _center(left)
+    right_center = _center(right)
+    center = min(1.0, math.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1]) / 0.35)
+    height = min(1.0, abs(math.log(left[3] / right[3])) / math.log(1.8))
+    width = min(1.0, abs(math.log(left[2] / right[2])) / math.log(1.8))
+    return 0.58 * center + 0.24 * height + 0.18 * width
+
+
+def _project_point(
+    point: tuple[float, float],
+    state: _TransformState,
+    *,
+    aspect: float = 16.0 / 9.0,
+) -> tuple[float, float]:
+    dx = point[0] - 0.5
+    dy = point[1] - 0.5
+    radians = math.radians(state.roll_degrees)
+    cosine = math.cos(radians)
+    sine = math.sin(radians)
+    rotated_x = 0.5 + cosine * dx - sine * dy / aspect
+    rotated_y = 0.5 + sine * aspect * dx + cosine * dy
+    return (
+        state.zoom * (rotated_x - state.center_x) + 0.5,
+        state.zoom * (rotated_y - state.center_y) + 0.5,
+    )
+
+
+def _project_box(
+    box: tuple[float, float, float, float],
+    state: _TransformState,
+) -> tuple[tuple[float, float, float, float], float]:
+    x_value, y_value, width, height = box
+    points = tuple(
+        _project_point(point, state)
+        for point in (
+            (x_value, y_value),
+            (x_value + width, y_value),
+            (x_value, y_value + height),
+            (x_value + width, y_value + height),
+        )
+    )
+    left = min(point[0] for point in points)
+    right = max(point[0] for point in points)
+    top = min(point[1] for point in points)
+    bottom = max(point[1] for point in points)
+    projected = (left, top, right - left, bottom - top)
+    area = max(1e-12, projected[2] * projected[3])
+    visible_width = max(0.0, min(1.0, right) - max(0.0, left))
+    visible_height = max(0.0, min(1.0, bottom) - max(0.0, top))
+    return (projected, min(1.0, visible_width * visible_height / area))
+
+
+def _optical_flow_box(
+    reference_frame: np.ndarray,
+    target_frame: np.ndarray,
+    reference_box: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    """Track one nearby-frame box with strict forward/backward evidence.
+
+    This is a containment fallback, never endpoint alignment evidence.  It is
+    accepted only across at most two output frames by the caller and retains no
+    keypoints or appearance descriptor in the plan.
+    """
+
+    if reference_frame.shape != target_frame.shape:
+        return None
+    reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_frame, cv2.COLOR_BGR2GRAY)
+    height, width = reference_gray.shape
+    x_value, y_value, box_width, box_height = reference_box
+    x0 = max(0, min(width - 2, int(math.floor(x_value * width))))
+    y0 = max(0, min(height - 2, int(math.floor(y_value * height))))
+    x1 = max(x0 + 2, min(width, int(math.ceil((x_value + box_width) * width))))
+    y1 = max(y0 + 2, min(height, int(math.ceil((y_value + box_height) * height))))
+    mask = np.zeros_like(reference_gray)
+    mask[y0:y1, x0:x1] = 255
+    points = cv2.goodFeaturesToTrack(
+        reference_gray,
+        maxCorners=80,
+        qualityLevel=0.012,
+        minDistance=4.0,
+        mask=mask,
+        blockSize=5,
+    )
+    if points is None or len(points) < 12:
+        return None
+    forward, forward_status, _forward_error = cv2.calcOpticalFlowPyrLK(
+        reference_gray,
+        target_gray,
+        points,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    if forward is None or forward_status is None:
+        return None
+    backward, backward_status, _backward_error = cv2.calcOpticalFlowPyrLK(
+        target_gray,
+        reference_gray,
+        forward,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    if backward is None or backward_status is None:
+        return None
+    original = points.reshape(-1, 2)
+    tracked = forward.reshape(-1, 2)
+    returned = backward.reshape(-1, 2)
+    valid = (
+        forward_status.reshape(-1).astype(bool)
+        & backward_status.reshape(-1).astype(bool)
+        & (np.linalg.norm(returned - original, axis=1) <= 1.25)
+    )
+    if int(valid.sum()) < 10:
+        return None
+    cv2.setRNGSeed(1937)
+    affine, inlier_mask = cv2.estimateAffinePartial2D(
+        original[valid],
+        tracked[valid],
+        method=cv2.RANSAC,
+        ransacReprojThreshold=1.8,
+        maxIters=2000,
+        confidence=0.995,
+        refineIters=15,
+    )
+    if affine is None or inlier_mask is None:
+        return None
+    inliers = int(inlier_mask.reshape(-1).sum())
+    if inliers < 8 or inliers / int(valid.sum()) < 0.65:
+        return None
+    linear = affine[:, :2].astype(np.float64)
+    determinant = float(np.linalg.det(linear))
+    scale = math.sqrt(max(0.0, float(linear[0, 0] ** 2 + linear[1, 0] ** 2)))
+    if determinant <= 0.0 or not 0.85 <= scale <= 1.18:
+        return None
+    center = np.asarray(
+        [[[(x_value + box_width / 2.0) * width, (y_value + box_height / 2.0) * height]]],
+        dtype=np.float32,
+    )
+    projected_center = cv2.transform(center, affine)[0, 0]
+    center_shift = math.hypot(
+        float(projected_center[0]) / width - (x_value + box_width / 2.0),
+        float(projected_center[1]) / height - (y_value + box_height / 2.0),
+    )
+    if center_shift > 0.08:
+        return None
+    corners = np.asarray(
+        [[
+            [x_value * width, y_value * height],
+            [(x_value + box_width) * width, y_value * height],
+            [x_value * width, (y_value + box_height) * height],
+            [(x_value + box_width) * width, (y_value + box_height) * height],
+        ]],
+        dtype=np.float32,
+    )
+    projected = cv2.transform(corners, affine)[0]
+    left, top = projected.min(axis=0)
+    right, bottom = projected.max(axis=0)
+    box = (
+        float(left / width),
+        float(top / height),
+        float((right - left) / width),
+        float((bottom - top) / height),
+    )
+    if (
+        box[0] < -1e-6
+        or box[1] < -1e-6
+        or box[2] <= 0.0
+        or box[3] <= 0.0
+        or box[0] + box[2] > 1.000001
+        or box[1] + box[3] > 1.000001
+    ):
+        return None
+    return tuple(min(1.0, max(0.0, value)) for value in box)
+
+
+def _clamp_center(
+    desired_x: float,
+    desired_y: float,
+    *,
+    zoom: float,
+    maximum_shift: float,
+) -> tuple[float, float]:
+    half = 0.5 / zoom
+    low = half
+    high = 1.0 - half
+    center_x = min(high, max(low, desired_x))
+    center_y = min(high, max(low, desired_y))
+    dx = center_x - 0.5
+    dy = center_y - 0.5
+    distance = math.hypot(dx, dy)
+    if distance > maximum_shift and distance > 1e-12:
+        scale = maximum_shift / distance
+        center_x = 0.5 + dx * scale
+        center_y = 0.5 + dy * scale
+    return (center_x, center_y)
+
+
+def _target_state(
+    *,
+    box: tuple[float, float, float, float],
+    target_box: tuple[float, float, float, float],
+    zoom: float,
+    roll_degrees: float,
+    settings: BoundarySubjectAlignmentConfig,
+) -> tuple[_TransformState | None, bool]:
+    source_center = _center(box)
+    target_center = _center(target_box)
+    desired_x = source_center[0] - (target_center[0] - 0.5) / zoom
+    desired_y = source_center[1] - (target_center[1] - 0.5) / zoom
+    center_x, center_y = _clamp_center(
+        desired_x,
+        desired_y,
+        zoom=zoom,
+        maximum_shift=settings.maximum_center_shift,
+    )
+    roll_applied = abs(roll_degrees) > 1e-6
+    candidate = _TransformState(zoom, center_x, center_y, roll_degrees)
+    try:
+        candidate.keyframe(0.0)
+    except ValueError:
+        if not roll_applied:
+            return (None, False)
+        # Roll evidence is optional.  Scale/position still improve a cut when
+        # the renderer cannot hide the rotated corners inside this source's
+        # quality-safe zoom ceiling.
+        candidate = _TransformState(zoom, center_x, center_y, 0.0)
+        try:
+            candidate.keyframe(0.0)
+        except ValueError:
+            return (None, False)
+        roll_applied = False
+    return (candidate, roll_applied)
+
+
+def _headroom(
+    source_index: int,
+    resolution: tuple[int, int] | None,
+    *,
+    output_width: int,
+    output_height: int,
+    base_crop_scale: float,
+    settings: BoundarySubjectAlignmentConfig,
+) -> SourceResolutionHeadroom:
+    if resolution is None:
+        profile = "unknown_resolution_conservative"
+        profile_max = settings.unknown_resolution_max_zoom
+        native: float | None = None
+        width: int | None = None
+        height: int | None = None
+    else:
+        width, height = resolution
+        native = min(width / output_width, height / output_height) * base_crop_scale
+        if height >= 2000 and native >= 1.75:
+            profile = "2160p_native_crop_headroom"
+            profile_max = settings.native_2160_max_zoom
+        elif height >= 1300 and native >= 1.20:
+            profile = "1440p_native_crop_headroom"
+            profile_max = settings.native_1440_max_zoom
+        else:
+            profile = "1080p_or_lower_conservative"
+            profile_max = settings.conservative_1080_max_zoom
+    effective = min(settings.renderer_schema_max_zoom, profile_max)
+    if native is not None and native < 1.0:
+        # A pre-existing crop already consumes native pixels.  Keep only a very
+        # small output-space correction; this is still explicitly reported as
+        # resampling rather than native crop headroom.
+        effective = min(effective, settings.unknown_resolution_max_zoom)
+    return SourceResolutionHeadroom(
+        source_index,
+        width,
+        height,
+        native,
+        profile,
+        profile_max,
+        settings.renderer_schema_max_zoom,
+        effective,
+    )
+
+
+def _dedupe_points(
+    points: Sequence[tuple[float, _TransformState]],
+) -> tuple[tuple[float, _TransformState], ...]:
+    ordered: dict[float, _TransformState] = {}
+    for time_value, state in sorted(points, key=lambda item: item[0]):
+        ordered[round(float(time_value), 9)] = state
+    return tuple((time_value, state) for time_value, state in ordered.items())
+
+
+def _track_for_segment(
+    *,
+    last_frame_time: float,
+    ramp_frames: int,
+    fps: float,
+    entry: tuple[int, _TransformState] | None,
+    exit: tuple[int, _TransformState] | None,
+) -> EditorialTransformTrack | None:
+    if entry is None and exit is None:
+        return None
+    ramp = (ramp_frames - 1) / fps
+    points: list[tuple[float, _TransformState]] = []
+    neutral = _TransformState()
+    if entry is not None:
+        points.append((0.0, entry[1]))
+    else:
+        points.append((0.0, neutral))
+    if entry is not None and exit is not None:
+        if last_frame_time > 2.0 * ramp + 1e-9:
+            points.extend(((ramp, neutral), (last_frame_time - ramp, neutral)))
+        # A short segment interpolates directly between its two verified cut
+        # states.  Dense validation below reviews that exact composite curve.
+    elif entry is not None and last_frame_time > ramp + 1e-9:
+        points.append((ramp, neutral))
+    elif exit is not None and last_frame_time > ramp + 1e-9:
+        points.append((last_frame_time - ramp, neutral))
+    points.append((last_frame_time, exit[1] if exit is not None else neutral))
+    deduped = _dedupe_points(points)
+    if all(state.neutral for _time, state in deduped):
+        return None
+    reason_indices = sorted(
+        {value[0] for value in (entry, exit) if value is not None}
+    )
+    return EditorialTransformTrack(
+        tuple(state.keyframe(time_value) for time_value, state in deduped),
+        reason=(
+            "boundary_local_exact_subject_alignment_b"
+            + "_b".join(str(index) for index in reason_indices)
+        ),
+    )
+
+
+def build_boundary_subject_alignment_plan(
+    *,
+    visual_timeline: VisualTimelinePlan,
+    sources: Sequence[Path],
+    transitions: Sequence[RenderTransition],
+    face_match_plan: FaceMatchPlan | None = None,
+    fps: float = 29.97,
+    output_width: int = 1920,
+    output_height: int = 1080,
+    frame_provider: FrameProvider | None = None,
+    observation_provider: ObservationProvider | None = None,
+    source_resolutions: Sequence[tuple[int, int] | None] | None = None,
+    config: BoundarySubjectAlignmentConfig | None = None,
+) -> BoundarySubjectAlignmentPlan:
+    """Build exact-cut local tracks and validate every transformed frame."""
+
+    settings = config or BoundarySubjectAlignmentConfig()
+    choices = visual_timeline.choices
+    if not choices:
+        raise ValueError("visual timeline cannot be empty")
+    if len(transitions) != len(choices) - 1:
+        raise ValueError("boundary alignment needs one transition per boundary")
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError("boundary alignment fps must be positive and finite")
+    if output_width < 320 or output_height < 180:
+        raise ValueError("boundary alignment output size is too small")
+    if abs(output_width / output_height - 16.0 / 9.0) > 0.01:
+        raise ValueError("boundary subject alignment currently requires 16:9 output")
+    if any(not 0 <= item.source_index < len(sources) for item in choices):
+        raise ValueError("visual timeline references an unknown source")
+    if source_resolutions is not None and len(source_resolutions) != len(sources):
+        raise ValueError("source resolution array must match sources")
+
+    counts = _frame_counts(choices, fps)
+    face_matches = _face_matches(face_match_plan)
+    capture: _CaptureProvider | None = None
+    if frame_provider is None:
+        capture = _CaptureProvider(tuple(Path(item) for item in sources))
+        frames = capture.frame_at
+    else:
+        frames = frame_provider
+    observations = observation_provider or _default_observation_provider
+    if source_resolutions is None:
+        resolutions = tuple(
+            capture.resolution(index) if capture is not None else None
+            for index in range(len(sources))
+        )
+    else:
+        resolutions = tuple(source_resolutions)
+
+    def base_crop_for(choice_index: int, frame_index: int) -> tuple[float, float, float, float] | None:
+        match = face_matches.get(choices[choice_index].segment_index)
+        if match is None or not match.applied or match.pan_crop is None:
+            return None
+        return _fixed_crop_at(match.pan_crop, frame_index / fps)
+
+    # The serialized source-level value describes untouched source pixels.
+    # A segment-specific base crop is accounted for again at the exact side we
+    # intend to transform; one cropped close-up must not penalize every raw shot
+    # selected from the same broadcast.
+    headroom_items = [
+        _headroom(
+            source_index,
+            resolutions[source_index],
+            output_width=output_width,
+            output_height=output_height,
+            base_crop_scale=1.0,
+            settings=settings,
+        )
+        for source_index in range(len(sources))
+    ]
+
+    canonical_frame_cache: dict[tuple[int, int], np.ndarray | None] = {}
+    observation_cache: dict[tuple[int, int], BoundarySubjectObservation | None] = {}
+
+    def canonical_frame_at(choice_index: int, frame_index: int) -> np.ndarray | None:
+        key = (choice_index, frame_index)
+        if key in canonical_frame_cache:
+            value = canonical_frame_cache[key]
+            return None if value is None else value.copy()
+        choice = choices[choice_index]
+        source_seconds = _source_seconds(choice, frame_index, fps=fps)
+        decoded = frames(choice.source_index, source_seconds)
+        if decoded is None:
+            canonical_frame_cache[key] = None
+            return None
+        try:
+            canonical = _canonical_frame(
+                decoded,
+                width=settings.analysis_width,
+                height=settings.analysis_height,
+                base_crop=base_crop_for(choice_index, frame_index),
+            )
+        except (TypeError, ValueError, cv2.error):
+            canonical = None
+        canonical_frame_cache[key] = canonical
+        return None if canonical is None else canonical.copy()
+
+    def observation_at(choice_index: int, frame_index: int) -> BoundarySubjectObservation | None:
+        key = (choice_index, frame_index)
+        if key in observation_cache:
+            return observation_cache[key]
+        canonical = canonical_frame_at(choice_index, frame_index)
+        if canonical is None:
+            observation_cache[key] = None
+            return None
+        try:
+            result = observations(canonical)
+        except (TypeError, ValueError, cv2.error):
+            result = None
+        observation_cache[key] = result
+        return result
+
+    def optical_subject_at(
+        choice_index: int,
+        frame_index: int,
+        preferred_kind: str,
+    ) -> tuple[
+        str,
+        tuple[float, float, float, float],
+        float | None,
+        float | None,
+    ] | None:
+        target = canonical_frame_at(choice_index, frame_index)
+        if target is None:
+            return None
+        for distance in (1, 2):
+            for reference_index in (frame_index - distance, frame_index + distance):
+                if not 0 <= reference_index < counts[choice_index]:
+                    continue
+                reference_observation = observation_at(
+                    choice_index,
+                    reference_index,
+                )
+                if reference_observation is None:
+                    continue
+                reference_subject = _subject(
+                    reference_observation,
+                    preferred_kind=preferred_kind,
+                    settings=settings,
+                )
+                if reference_subject is None:
+                    continue
+                reference = canonical_frame_at(choice_index, reference_index)
+                if reference is None:
+                    continue
+                tracked_box = _optical_flow_box(
+                    reference,
+                    target,
+                    reference_subject[1],
+                )
+                if tracked_box is not None:
+                    return (
+                        preferred_kind,
+                        tracked_box,
+                        None,
+                        None,
+                    )
+        return None
+
+    decisions: list[BoundarySubjectAlignmentDecision] = []
+    candidate_by_boundary: dict[int, BoundarySubjectAlignmentDecision] = {}
+
+    def rejected(
+        boundary_index: int,
+        reason: str,
+        *,
+        subject_kind: str | None = None,
+        baseline: float | None = None,
+        ratio: float | None = None,
+    ) -> BoundarySubjectAlignmentDecision:
+        left = choices[boundary_index]
+        right = choices[boundary_index + 1]
+        return BoundarySubjectAlignmentDecision(
+            boundary_index,
+            left.segment_index,
+            right.segment_index,
+            left.source_index,
+            right.source_index,
+            _source_seconds(left, counts[boundary_index] - 1, fps=fps),
+            _source_seconds(right, 0, fps=fps),
+            False,
+            reason,
+            subject_kind=subject_kind,
+            baseline_geometry_mismatch=baseline,
+            exact_scale_ratio=ratio,
+        )
+
+    try:
+        for boundary_index, (left, right) in enumerate(zip(choices, choices[1:])):
+            if left.source_index == right.source_index:
+                continue
+            transition = transitions[boundary_index]
+            if transition.kind is not TransitionKind.HARD_CUT:
+                decisions.append(rejected(boundary_index, "unreviewed_dissolve_overlap"))
+                continue
+            if (
+                left.internal_scene_cut_master_seconds
+                or right.internal_scene_cut_master_seconds
+                or left.exit_scene_cut_near
+                or right.entry_scene_cut_near
+                or left.face_match_candidate_failure == "internal_camera_cut"
+                or right.face_match_candidate_failure == "internal_camera_cut"
+            ):
+                decisions.append(rejected(boundary_index, "broadcaster_native_internal_cut"))
+                continue
+            if min(counts[boundary_index], counts[boundary_index + 1]) < settings.window_frames:
+                decisions.append(rejected(boundary_index, "local_window_shorter_than_required_frames"))
+                continue
+            outgoing_observation = observation_at(boundary_index, counts[boundary_index] - 1)
+            incoming_observation = observation_at(boundary_index + 1, 0)
+            if outgoing_observation is None or incoming_observation is None:
+                decisions.append(rejected(boundary_index, "exact_cut_frame_decode_or_geometry_failed"))
+                continue
+            outgoing_shot_type = left.exit_shot_type or left.shot_type
+            incoming_shot_type = right.entry_shot_type or right.shot_type
+            group_context = bool(
+                outgoing_shot_type.value in {"group_wide", "wide"}
+                or incoming_shot_type.value in {"group_wide", "wide"}
+                or left.detected_person_counts[2] > 1
+                or right.detected_person_counts[0] > 1
+                or left.formation_person_counts[2] > 1
+                or right.formation_person_counts[0] > 1
+            )
+            preferred_endpoint_kind = "silhouette" if group_context else None
+            outgoing_subject = _subject(
+                outgoing_observation,
+                preferred_kind=preferred_endpoint_kind,
+                settings=settings,
+            )
+            incoming_subject = _subject(
+                incoming_observation,
+                preferred_kind=(outgoing_subject[0] if outgoing_subject is not None else None),
+                settings=settings,
+            )
+            if outgoing_subject is None or incoming_subject is None:
+                decisions.append(rejected(boundary_index, "exact_common_subject_geometry_unavailable"))
+                continue
+            if outgoing_subject[0] != incoming_subject[0]:
+                # Retry a group silhouette when one side happened to expose a
+                # single dominant face but the other did not.
+                outgoing_subject = _subject(
+                    outgoing_observation,
+                    preferred_kind="silhouette",
+                    settings=settings,
+                )
+                incoming_subject = _subject(
+                    incoming_observation,
+                    preferred_kind="silhouette",
+                    settings=settings,
+                )
+            if outgoing_subject is None or incoming_subject is None or outgoing_subject[0] != incoming_subject[0]:
+                decisions.append(rejected(boundary_index, "exact_common_subject_geometry_unavailable"))
+                continue
+            subject_kind = outgoing_subject[0]
+            outgoing_box = outgoing_subject[1]
+            incoming_box = incoming_subject[1]
+            baseline = _geometry_mismatch(outgoing_box, incoming_box)
+            outgoing_scale = (
+                outgoing_subject[2]
+                if subject_kind == "face" and outgoing_subject[2] is not None
+                else outgoing_box[3]
+            )
+            incoming_scale = (
+                incoming_subject[2]
+                if subject_kind == "face" and incoming_subject[2] is not None
+                else incoming_box[3]
+            )
+            assert outgoing_scale is not None and incoming_scale is not None
+            ratio = max(outgoing_scale, incoming_scale) / max(
+                1e-9, min(outgoing_scale, incoming_scale)
+            )
+            center_distance = math.hypot(
+                _center(outgoing_box)[0] - _center(incoming_box)[0],
+                _center(outgoing_box)[1] - _center(incoming_box)[1],
+            )
+            if (
+                ratio <= settings.already_matched_scale_ratio
+                and center_distance <= settings.already_matched_center_distance
+            ):
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        "exact_subject_already_matched",
+                        subject_kind=subject_kind,
+                        baseline=baseline,
+                        ratio=ratio,
+                    )
+                )
+                continue
+            if outgoing_scale < incoming_scale:
+                transformed_side = "outgoing"
+                source_index = left.source_index
+                box = outgoing_box
+                target_box = incoming_box
+                raw_roll = (
+                    math.degrees(incoming_subject[3] - outgoing_subject[3])
+                    if outgoing_subject[3] is not None and incoming_subject[3] is not None
+                    else 0.0
+                )
+            else:
+                transformed_side = "incoming"
+                source_index = right.source_index
+                box = incoming_box
+                target_box = outgoing_box
+                raw_roll = (
+                    math.degrees(outgoing_subject[3] - incoming_subject[3])
+                    if outgoing_subject[3] is not None and incoming_subject[3] is not None
+                    else 0.0
+                )
+            transformed_choice_index = (
+                boundary_index
+                if transformed_side == "outgoing"
+                else boundary_index + 1
+            )
+            transformed_frame_index = (
+                counts[transformed_choice_index] - 1
+                if transformed_side == "outgoing"
+                else 0
+            )
+            transformed_base_crop = base_crop_for(
+                transformed_choice_index,
+                transformed_frame_index,
+            )
+            maximum_zoom = _headroom(
+                source_index,
+                resolutions[source_index],
+                output_width=output_width,
+                output_height=output_height,
+                base_crop_scale=(
+                    transformed_base_crop[3]
+                    if transformed_base_crop is not None
+                    else 1.0
+                ),
+                settings=settings,
+            ).effective_max_zoom
+            desired_zoom = ratio
+            if ratio <= settings.already_matched_scale_ratio:
+                desired_zoom = 1.02
+            zoom = min(maximum_zoom, max(1.0, desired_zoom))
+            roll_available = bool(
+                subject_kind == "face"
+                and outgoing_subject[3] is not None
+                and incoming_subject[3] is not None
+            )
+            roll = (
+                max(-settings.maximum_roll_degrees, min(settings.maximum_roll_degrees, raw_roll))
+                if roll_available
+                else 0.0
+            )
+            if abs(roll) > 1e-6:
+                zoom = max(zoom, minimum_roll_safe_zoom(roll))
+            if zoom > maximum_zoom + 1e-9:
+                roll = 0.0
+                zoom = min(maximum_zoom, max(1.0, desired_zoom))
+            state, roll_applied = _target_state(
+                box=box,
+                target_box=target_box,
+                zoom=zoom,
+                roll_degrees=roll,
+                settings=settings,
+            )
+            if state is None:
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        "renderer_edge_safety_rejection",
+                        subject_kind=subject_kind,
+                        baseline=baseline,
+                        ratio=ratio,
+                    )
+                )
+                continue
+            if transformed_side == "outgoing":
+                outgoing_state = state
+                incoming_state = _TransformState()
+                projected_outgoing, visibility = _project_box(outgoing_box, state)
+                transformed = _geometry_mismatch(projected_outgoing, incoming_box)
+            else:
+                outgoing_state = _TransformState()
+                incoming_state = state
+                projected_incoming, visibility = _project_box(incoming_box, state)
+                transformed = _geometry_mismatch(outgoing_box, projected_incoming)
+            minimum_visibility = (
+                settings.minimum_face_visible_fraction
+                if subject_kind == "face"
+                else settings.minimum_silhouette_visible_fraction
+            )
+            improvement = baseline - transformed
+            improvement_fraction = improvement / max(1e-9, baseline)
+            if visibility + 1e-9 < minimum_visibility:
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        "exact_subject_would_be_clipped",
+                        subject_kind=subject_kind,
+                        baseline=baseline,
+                        ratio=ratio,
+                    )
+                )
+                continue
+            if (
+                improvement < settings.minimum_geometry_improvement
+                or improvement_fraction < settings.minimum_geometry_improvement_fraction
+            ):
+                decisions.append(
+                    rejected(
+                        boundary_index,
+                        "geometry_improvement_too_small",
+                        subject_kind=subject_kind,
+                        baseline=baseline,
+                        ratio=ratio,
+                    )
+                )
+                continue
+            candidate = BoundarySubjectAlignmentDecision(
+                boundary_index,
+                left.segment_index,
+                right.segment_index,
+                left.source_index,
+                right.source_index,
+                _source_seconds(left, counts[boundary_index] - 1, fps=fps),
+                _source_seconds(right, 0, fps=fps),
+                True,
+                None,
+                subject_kind,
+                transformed_side,
+                outgoing_state,
+                incoming_state,
+                baseline,
+                transformed,
+                ratio,
+                roll_available,
+                roll_applied,
+                desired_zoom > zoom + 1e-9,
+                0,
+            )
+            decisions.append(candidate)
+            candidate_by_boundary[boundary_index] = candidate
+
+        # Build segment-local curves.  Only the two choices adjacent to an
+        # eligible boundary can receive a transform; Tier-D neighbors never
+        # inherit, reset, or demote this curve.
+        invalid_boundaries: dict[int, str] = {}
+        segment_tracks: dict[int, EditorialTransformTrack] = {}
+        segment_boundaries: dict[int, tuple[int, ...]] = {}
+        for choice_index, choice in enumerate(choices):
+            entry_decision = candidate_by_boundary.get(choice_index - 1)
+            exit_decision = candidate_by_boundary.get(choice_index)
+            entry = (
+                (entry_decision.boundary_index, entry_decision.incoming_state)
+                if entry_decision is not None
+                and entry_decision.transformed_side == "incoming"
+                else None
+            )
+            exit = (
+                (exit_decision.boundary_index, exit_decision.outgoing_state)
+                if exit_decision is not None
+                and exit_decision.transformed_side == "outgoing"
+                else None
+            )
+            if entry is None and exit is None:
+                continue
+            last_frame_time = (counts[choice_index] - 1) / fps
+            try:
+                track = _track_for_segment(
+                    last_frame_time=last_frame_time,
+                    ramp_frames=settings.window_frames,
+                    fps=fps,
+                    entry=entry,
+                    exit=exit,
+                )
+            except ValueError:
+                for boundary in (entry, exit):
+                    if boundary is not None:
+                        invalid_boundaries[boundary[0]] = "composite_track_renderer_safety_rejection"
+                continue
+            if track is None:
+                continue
+            touched = tuple(
+                boundary[0] for boundary in (entry, exit) if boundary is not None
+            )
+            failure: str | None = None
+            validated = 0
+            optical_flow_validated = 0
+            preferred_kind = next(
+                candidate_by_boundary[index].subject_kind for index in touched
+            )
+            for frame_index in range(counts[choice_index]):
+                state_keyframe = track.evaluate(frame_index / fps)
+                state = _TransformState(
+                    state_keyframe.zoom,
+                    state_keyframe.center_x,
+                    state_keyframe.center_y,
+                    state_keyframe.roll_degrees,
+                )
+                if state.neutral:
+                    continue
+                validated += 1
+                try:
+                    state.keyframe(frame_index / fps)
+                except ValueError:
+                    failure = "per_frame_renderer_edge_safety_rejection"
+                    break
+                observation = observation_at(choice_index, frame_index)
+                if observation is None:
+                    failure = "per_frame_decode_or_geometry_failed"
+                    break
+                subject = _subject(
+                    observation,
+                    preferred_kind=preferred_kind,
+                    settings=settings,
+                )
+                if subject is None and preferred_kind == "face":
+                    # A transient face-detector miss must not become a blind
+                    # crop.  A high-confidence *whole performer* silhouette is
+                    # a stricter containment envelope and can safely validate
+                    # that frame without changing the face-derived endpoint
+                    # target.  The inverse fallback is forbidden: one face does
+                    # not prove that a group silhouette remains visible.
+                    subject = _subject(
+                        observation,
+                        preferred_kind="silhouette",
+                        settings=settings,
+                    )
+                if subject is None:
+                    subject = optical_subject_at(
+                        choice_index,
+                        frame_index,
+                        preferred_kind,
+                    )
+                    if subject is not None:
+                        optical_flow_validated += 1
+                if subject is None:
+                    failure = "per_frame_subject_geometry_unavailable"
+                    break
+                _projected, visibility = _project_box(subject[1], state)
+                threshold = (
+                    settings.minimum_face_visible_fraction
+                    if subject[0] == "face"
+                    else settings.minimum_silhouette_visible_fraction
+                )
+                if visibility + 1e-9 < threshold:
+                    failure = "per_frame_subject_containment_failed"
+                    break
+            if failure is not None:
+                for boundary_index in touched:
+                    invalid_boundaries[boundary_index] = failure
+                continue
+            segment_tracks[choice.segment_index] = track
+            segment_boundaries[choice.segment_index] = touched
+            for boundary_index in touched:
+                candidate_by_boundary[boundary_index] = replace(
+                    candidate_by_boundary[boundary_index],
+                    validated_output_frame_count=(
+                        candidate_by_boundary[boundary_index].validated_output_frame_count
+                        + validated
+                    ),
+                    optical_flow_containment_frame_count=(
+                        candidate_by_boundary[
+                            boundary_index
+                        ].optical_flow_containment_frame_count
+                        + optical_flow_validated
+                    ),
+                )
+
+        if invalid_boundaries:
+            for boundary_index, reason in invalid_boundaries.items():
+                candidate = candidate_by_boundary[boundary_index]
+                candidate_by_boundary[boundary_index] = replace(
+                    candidate,
+                    eligible=False,
+                    rejection_reason=reason,
+                    validated_output_frame_count=0,
+                )
+            # Remove every segment touching a failed boundary.  A surviving
+            # neighbor is rebuilt without it so one bad detector frame cannot
+            # cascade beyond the explicitly adjacent segment.
+            for segment_index, touched in tuple(segment_boundaries.items()):
+                if any(index in invalid_boundaries for index in touched):
+                    segment_tracks.pop(segment_index, None)
+                    segment_boundaries.pop(segment_index, None)
+
+        final_decisions = tuple(
+            candidate_by_boundary.get(item.boundary_index, item)
+            for item in decisions
+        )
+        final_segments = tuple(
+            BoundarySubjectAlignmentSegment(
+                choice.segment_index,
+                choice.source_index,
+                segment_tracks.get(choice.segment_index),
+                segment_boundaries.get(choice.segment_index, ()),
+            )
+            for choice in choices
+        )
+        return BoundarySubjectAlignmentPlan(
+            final_decisions,
+            final_segments,
+            tuple(headroom_items),
+            settings.window_frames,
+        )
+    finally:
+        if capture is not None:
+            capture.close()
+
+
+__all__ = [
+    "ANALYSIS_BASIS",
+    "BoundarySubjectAlignmentConfig",
+    "BoundarySubjectAlignmentDecision",
+    "BoundarySubjectAlignmentPlan",
+    "BoundarySubjectAlignmentSegment",
+    "BoundarySubjectObservation",
+    "FrameProvider",
+    "ObservationProvider",
+    "SourceResolutionHeadroom",
+    "build_boundary_subject_alignment_plan",
+]

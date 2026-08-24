@@ -40,6 +40,7 @@ class OffsetEstimate:
     second_best_score: float | None
     score_margin: float
     overlap_ratio: float
+    backend: str = "waveform_ncc"
 
     def to_dict(self) -> dict[str, int | float]:
         return {
@@ -52,6 +53,7 @@ class OffsetEstimate:
             "second_best_score": self.second_best_score,
             "score_margin": self.score_margin,
             "overlap_ratio": self.overlap_ratio,
+            "backend": self.backend,
         }
 
 
@@ -67,6 +69,7 @@ class SourceAlignment:
     second_best_score: float | None = None
     score_margin: float = 1.0
     overlap_ratio: float = 1.0
+    backend: str = "waveform_ncc"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +83,7 @@ class SourceAlignment:
             "second_best_score": self.second_best_score,
             "score_margin": self.score_margin,
             "overlap_ratio": self.overlap_ratio,
+            "backend": self.backend,
         }
 
 
@@ -302,6 +306,49 @@ def normalized_cross_correlation_offset(
         second_best_score=second_best_score,
         score_margin=score_margin,
         overlap_ratio=best_overlap / shortest,
+    )
+
+
+def spectral_flux_alignment_offset(
+    reference: ArrayLike,
+    source: ArrayLike,
+    *,
+    sample_rate: int,
+    max_offset_seconds: float | None = None,
+    min_overlap_seconds: float | None = None,
+) -> OffsetEstimate:
+    """Align broadcast mixes using locally normalized rhythmic transients.
+
+    Different music shows often use the same instrumental with substantially
+    different vocal, audience, compression, and loudness mixes. Waveform NCC
+    can then lock onto a repeated chorus even though the videos contain the
+    same performance. Spectral-flux envelopes discard that mix-specific detail
+    while retaining enough transient timing to identify the song position.
+    """
+
+    from .rhythm import spectral_flux_onset_envelope
+
+    reference_envelope = spectral_flux_onset_envelope(reference, sample_rate)
+    source_envelope = spectral_flux_onset_envelope(source, sample_rate)
+    envelope_rate = int(round(reference_envelope.frame_rate))
+    envelope_estimate = normalized_cross_correlation_offset(
+        reference_envelope.values,
+        source_envelope.values,
+        sample_rate=envelope_rate,
+        max_offset_seconds=max_offset_seconds,
+        min_overlap_seconds=min_overlap_seconds,
+    )
+    return OffsetEstimate(
+        offset_samples=int(round(envelope_estimate.offset_seconds * sample_rate)),
+        offset_seconds=envelope_estimate.offset_seconds,
+        score=envelope_estimate.score,
+        overlap_samples=int(round(envelope_estimate.overlap_seconds * sample_rate)),
+        overlap_seconds=envelope_estimate.overlap_seconds,
+        sample_rate=sample_rate,
+        second_best_score=envelope_estimate.second_best_score,
+        score_margin=envelope_estimate.score_margin,
+        overlap_ratio=envelope_estimate.overlap_ratio,
+        backend="spectral_flux_ncc",
     )
 
 

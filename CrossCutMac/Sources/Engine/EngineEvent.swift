@@ -7,6 +7,8 @@ struct EngineEvent: Decodable, Equatable {
     let level: String?
     let progress: Double?
     let outputPaths: [String]
+    let sourcePaths: [String]
+    let acquisitionManifestPath: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -19,6 +21,8 @@ struct EngineEvent: Decodable, Equatable {
         case output
         case outputPath = "output_path"
         case outputs
+        case sourcePaths = "source_paths"
+        case acquisitionManifest = "acquisition_manifest"
     }
 
     init(from decoder: Decoder) throws {
@@ -43,6 +47,11 @@ struct EngineEvent: Decodable, Equatable {
             paths.append(path)
         }
         outputPaths = paths
+        sourcePaths = try container.decodeIfPresent([String].self, forKey: .sourcePaths) ?? []
+        acquisitionManifestPath = try container.decodeIfPresent(
+            String.self,
+            forKey: .acquisitionManifest
+        )
     }
 }
 private extension KeyedDecodingContainer where Key == EngineEvent.CodingKeys {

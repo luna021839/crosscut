@@ -468,7 +468,8 @@ def build_group_transition_plan(
             transitions.append(_hard("B", "incoming_segment_shorter_than_handle"))
             continue
         if (
-            outgoing.source_local_end + handle_seconds
+            outgoing.source_local_end
+            + handle_seconds * outgoing.source_playback_rate
             > source_durations_seconds[outgoing.source_index] + 1e-6
         ):
             transitions.append(_hard("B", "outgoing_source_handle_unavailable"))

@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import CrossCutMac
 
@@ -25,6 +26,341 @@ final class EngineContractTests: XCTestCase {
         return script
     }
 
+    @discardableResult
+    private func makeCompletedAutomaticGroupOutputSet(
+        in directory: URL,
+        timestamp: String,
+        selectionPassed: Bool = true,
+        videoData: Data? = Data([0, 0, 0, 1]),
+        proxySchemaVersion: Int = 2
+    ) throws -> [URL] {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let prefix = "IVE-BANG-BANG-\(timestamp)"
+        let analysisURL = directory.appendingPathComponent("\(prefix)-analysis.json")
+        let planURL = directory.appendingPathComponent("\(prefix)-render-plan.json")
+        let selectionURL = directory.appendingPathComponent(
+            "\(prefix)-rendered-candidate-selection.json"
+        )
+        let fcpxmlURL = directory.appendingPathComponent(
+            "\(prefix)-group-timeline.fcpxml"
+        )
+        let otioURL = directory.appendingPathComponent(
+            "\(prefix)-group-timeline.otio"
+        )
+        let edlURL = directory.appendingPathComponent(
+            "\(prefix)-group-timeline.edl"
+        )
+        let interchangeAuditURL = directory.appendingPathComponent(
+            "\(prefix)-group-timeline-interchange-audit.json"
+        )
+        let videoURL = directory.appendingPathComponent("\(prefix)-group-crosscut.mp4")
+        let interchangeFiles: [(String, URL, Data)] = [
+            ("fcpxml", fcpxmlURL, Data("<fcpxml/>".utf8)),
+            ("otio", otioURL, Data("{\"OTIO_SCHEMA\":\"Timeline.1\"}".utf8)),
+            ("edl", edlURL, Data("TITLE: TEST\n".utf8)),
+        ]
+        for (_, url, data) in interchangeFiles {
+            try data.write(to: url, options: .atomic)
+        }
+        let interchangeAudit: [String: Any] = [
+            "schema_version": 1,
+            "analysis_basis": "reviewed_render_plan_interchange_bundle_v1",
+            "authoritative_output": videoURL.path,
+            "output_frame_count": 2_997,
+            "content_sha256": String(repeating: "d", count: 64),
+            "artifacts": Dictionary(
+                uniqueKeysWithValues: interchangeFiles.map { name, _, data in
+                    (
+                        name,
+                        [
+                            "sha256": String(repeating: "a", count: 64),
+                            "size_bytes": data.count,
+                        ] as [String: Any]
+                    )
+                }
+            ),
+        ]
+
+        let proxyReview: [String: Any] = [
+            "schema_version": proxySchemaVersion,
+            "analysis": proxySchemaVersion == 3
+                ? "decoded_output_proxy_domain_aware_quality_review_v3"
+                : "decoded_output_proxy_all_transition_quality_review_v2",
+            "proxy": [
+                "path": NSNull(),
+                "temporary_proxy_removed_after_review": true,
+            ],
+            "transition_count": 1,
+            "reviewed_boundary_count": 1,
+            "hard_cut_count": 1,
+            "dissolve_count": 0,
+            "passed": true,
+        ]
+        let selectedIndex = 3
+        let candidates: [[String: Any]] = (0..<8).map { index in
+            [
+                "candidate_index": index,
+                "selected": index == selectedIndex,
+                "error": NSNull(),
+                "review": proxyReview,
+            ]
+        }
+        let selection: [String: Any] = [
+            "analysis_basis": "sequential_decoded_proxy_candidate_rerank_v1",
+            "storage_policy": [
+                "one_proxy_at_a_time": true,
+                "temporary_proxy_removed_after_each_review": true,
+                "decoded_frames_persisted": false,
+            ],
+            "requested_review_count": 8,
+            "reviewed_candidate_count": 8,
+            "minimum_required_candidate_count": 8,
+            "minimum_candidate_count_satisfied": true,
+            "successful_review_count": 8,
+            "selected_candidate_index": selectedIndex,
+            "passed": selectionPassed,
+            "candidates": candidates,
+            "complete_candidate_count": 8,
+            "structure_passing_materialized_count": 8,
+            "exact_successful_decoded_review_count_satisfied": true,
+            "exact_complete_candidate_count_satisfied": true,
+            "final_selected_review": proxyReview,
+            "final_selected_version": "original",
+        ]
+
+        let filenameFormatter = DateFormatter()
+        filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
+        filenameFormatter.calendar = Calendar(identifier: .gregorian)
+        filenameFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        filenameFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        let creationDate = try XCTUnwrap(filenameFormatter.date(from: timestamp))
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let analysis: [String: Any] = [
+            "schema_version": 1,
+            "created_at": isoFormatter.string(from: creationDate),
+            "request": [
+                "edit_mode": "group",
+                "source_mode": "automatic",
+                "output_directory": directory.path,
+            ],
+            "rendered_proxy_review": proxyReview,
+            "rendered_candidate_selection": selection,
+            "render": [
+                "video_path": videoURL.path,
+                "plan_path": planURL.path,
+                "video_codec": "libx264",
+                "interchange": [
+                    "fcpxml_path": fcpxmlURL.path,
+                    "otio_path": otioURL.path,
+                    "edl_path": edlURL.path,
+                    "fidelity_audit_path": interchangeAuditURL.path,
+                    "authoritative_pixels": videoURL.path,
+                ],
+                "rendered_proxy_review": proxyReview,
+                "rendered_candidate_selection": selection,
+            ],
+            "capabilities": ["group_video_rendered": true],
+        ]
+        let fps = 29.97
+        let outputFrameCount = 2_997
+        let plan: [String: Any] = [
+            "aspect_ratio": "16:9",
+            "output": videoURL.path,
+            "width": 1_920,
+            "height": 1_080,
+            "fps": fps,
+            "render_duration": Double(outputFrameCount) / fps,
+            "output_frame_count": outputFrameCount,
+        ]
+
+        for (object, url) in [
+            (analysis, analysisURL),
+            (plan, planURL),
+            (selection, selectionURL),
+            (interchangeAudit, interchangeAuditURL),
+        ] {
+            let data = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try data.write(to: url, options: .atomic)
+        }
+        if let videoData {
+            try videoData.write(to: videoURL, options: .atomic)
+        }
+        return [
+            analysisURL,
+            planURL,
+            selectionURL,
+            fcpxmlURL,
+            otioURL,
+            edlURL,
+            interchangeAuditURL,
+            videoURL,
+        ]
+    }
+
+    func testCompletedOutputDiscoveryUsesLatestValidSameTimestampSet() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-output-discovery-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let expected = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-010101"
+        )
+        _ = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-020202",
+            selectionPassed: false
+        )
+        _ = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-030303",
+            videoData: nil
+        )
+        try Data("temporary".utf8).write(
+            to: root.appendingPathComponent(".partial-candidate-03.mp4")
+        )
+        try Data("temporary".utf8).write(
+            to: root.appendingPathComponent(".ive-crosscut-candidate-proxy-00.mp4")
+        )
+
+        let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.latest(in: root))
+        XCTAssertEqual(result.timestamp, "20260823-010101")
+        XCTAssertEqual(
+            result.outputURLs,
+            expected.map(\.standardizedFileURL)
+        )
+    }
+
+    func testCompletedOutputDiscoveryAcceptsDomainAwareProxySchemaV3() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-output-v3-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let expected = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-060606",
+            proxySchemaVersion: 3
+        )
+
+        let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.latest(in: root))
+        XCTAssertEqual(result.timestamp, "20260823-060606")
+        XCTAssertEqual(result.outputURLs, expected.map(\.standardizedFileURL))
+    }
+
+    func testCompletedOutputDiscoveryRejectsEmptyOrSymlinkedVideo() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-output-failclosed-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        _ = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-040404",
+            videoData: Data()
+        )
+        var symlinked = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-050505",
+            videoData: nil
+        )
+        let realVideo = root.appendingPathComponent("unrelated.mp4")
+        try Data([0, 0, 0, 1]).write(to: realVideo)
+        try FileManager.default.createSymbolicLink(
+            at: symlinked.removeLast(),
+            withDestinationURL: realVideo
+        )
+
+        XCTAssertNil(CompletedEngineOutputSetDiscovery.latest(in: root))
+    }
+
+    @MainActor
+    func testEngineRunnerRestoresDiscoveredOutputsAndClearsThemForEmptyFolder() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-runner-restore-\(UUID().uuidString)")
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let expected = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260823-060606"
+        )
+        let runner = EngineRunner(locateEngine: { nil })
+
+        runner.restoreLatestCompletedGroupResult(in: root)
+        for _ in 0..<100 {
+            if !runner.isRestoringCompletedOutputs { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(runner.isRestoringCompletedOutputs)
+        XCTAssertEqual(runner.state, .completed)
+        XCTAssertEqual(runner.progress, 1)
+        XCTAssertEqual(runner.outputURLs, expected.map(\.standardizedFileURL))
+
+        runner.restoreLatestCompletedGroupResult(
+            in: empty,
+            reportMissing: false,
+            clearExistingOutputsOnMissing: true
+        )
+        for _ in 0..<100 {
+            if !runner.isRestoringCompletedOutputs { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(runner.isRestoringCompletedOutputs)
+        XCTAssertEqual(runner.state, .idle)
+        XCTAssertTrue(runner.outputURLs.isEmpty)
+    }
+
+    func testLargeMediaDefaultsUseDedicatedExternalVolumeWhenMounted() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-storage-\(UUID().uuidString)")
+        let external = root.appendingPathComponent("ssd", isDirectory: true)
+        let fallback = root.appendingPathComponent("Movies", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: external,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+
+        let directories = LargeMediaStoragePolicy.defaultDirectories(
+            preferredVolume: external,
+            fallbackMoviesDirectory: fallback
+        )
+
+        XCTAssertTrue(directories.usesPreferredExternalVolume)
+        XCTAssertEqual(
+            directories.output.standardizedFileURL.path,
+            external.appendingPathComponent("CrossCut/Outputs").path
+        )
+        XCTAssertEqual(
+            directories.sourceCache.standardizedFileURL.path,
+            external.appendingPathComponent("CrossCut/Sources").path
+        )
+    }
+
+    func testLargeMediaDefaultsFallBackOnlyWhenExternalVolumeIsUnavailable() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-storage-\(UUID().uuidString)")
+        let missingExternal = root.appendingPathComponent("missing-ssd")
+        let fallback = root.appendingPathComponent("Movies", isDirectory: true)
+
+        let directories = LargeMediaStoragePolicy.defaultDirectories(
+            preferredVolume: missingExternal,
+            fallbackMoviesDirectory: fallback
+        )
+
+        XCTAssertFalse(directories.usesPreferredExternalVolume)
+        XCTAssertEqual(
+            directories.output.standardizedFileURL.path,
+            fallback.appendingPathComponent("CrossCut").path
+        )
+    }
+
     func testRequestUsesEngineContractKeys() throws {
         let box = try XCTUnwrap(
             NormalizedBoundingBox(left: 0.1, top: 0.2, right: 0.7, bottom: 0.9)
@@ -49,11 +385,254 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(object["edit_mode"] as? String, "member")
         XCTAssertEqual(object["aspect_ratio"] as? String, "9:16")
         XCTAssertEqual(object["output_directory"] as? String, "/tmp/output")
+        XCTAssertEqual(object["source_mode"] as? String, "local")
+        XCTAssertEqual(object["desired_source_count"] as? Int, 10)
+        XCTAssertEqual(object["acquire_only"] as? Bool, false)
         let anchors = try XCTUnwrap(object["member_anchors"] as? [[String: Any]])
         XCTAssertEqual(anchors.count, 1)
         XCTAssertEqual(anchors[0]["source_index"] as? Int, 0)
         XCTAssertEqual(anchors[0]["time_seconds"] as? Double, 12.5)
         XCTAssertEqual(anchors[0]["bbox_xyxy"] as? [Double], [0.1, 0.2, 0.7, 0.9])
+    }
+
+    func testAutomaticRequestAllowsZeroManualSourcesAndUsesTenByDefault() throws {
+        let request = EditRequest(
+            song: "ATTITUDE",
+            targetMember: .rei,
+            editMode: .member,
+            aspectRatio: .portrait,
+            sources: [],
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceMode: .automatic,
+            sourceCacheDirectory: URL(fileURLWithPath: "/tmp/ive-cache")
+        )
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual(object["source_mode"] as? String, "automatic")
+        XCTAssertEqual(object["desired_source_count"] as? Int, 10)
+        XCTAssertEqual(object["source_cache_directory"] as? String, "/tmp/ive-cache")
+        XCTAssertEqual(object["acquire_only"] as? Bool, false)
+        XCTAssertEqual((object["sources"] as? [Any])?.count, 0)
+        XCTAssertEqual((object["member_anchors"] as? [Any])?.count, 0)
+    }
+
+    func testAutomaticSourceCountIsClampedToSupportedQualityRange() {
+        let base = (
+            song: "I AM",
+            targetMember: IVEMember.anYujin,
+            editMode: EditMode.group,
+            aspectRatio: OutputAspectRatio.landscape,
+            sources: [URL](),
+            outputDirectory: URL(fileURLWithPath: "/tmp/output")
+        )
+        let tooLow = EditRequest(
+            song: base.song,
+            targetMember: base.targetMember,
+            editMode: base.editMode,
+            aspectRatio: base.aspectRatio,
+            sources: base.sources,
+            outputDirectory: base.outputDirectory,
+            sourceMode: .automatic,
+            desiredSourceCount: 2
+        )
+        let tooHigh = EditRequest(
+            song: base.song,
+            targetMember: base.targetMember,
+            editMode: base.editMode,
+            aspectRatio: base.aspectRatio,
+            sources: base.sources,
+            outputDirectory: base.outputDirectory,
+            sourceMode: .automatic,
+            desiredSourceCount: 99
+        )
+
+        XCTAssertEqual(tooLow.desiredSourceCount, 8)
+        XCTAssertEqual(tooHigh.desiredSourceCount, 24)
+    }
+
+    func testAutomaticMemberSourceCountIsAlwaysExactlyTen() {
+        for requestedCount in [2, 9, 10, 24, 99] {
+            let request = EditRequest(
+                song: "I AM",
+                targetMember: .gaeul,
+                editMode: .member,
+                aspectRatio: .landscape,
+                sources: [],
+                outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+                sourceMode: .automatic,
+                desiredSourceCount: requestedCount
+            )
+
+            XCTAssertEqual(request.desiredSourceCount, 10)
+            XCTAssertEqual(request.aspectRatio, OutputAspectRatio.portrait.rawValue)
+        }
+    }
+
+    func testAutomaticModeCanStartWithoutManualVideosButLocalModeCannot() {
+        for mode in EditMode.allCases {
+            XCTAssertTrue(
+                EditStartPolicy.canStart(
+                    song: "LOVE DIVE",
+                    sourceMode: .automatic,
+                    editMode: mode,
+                    sourceCount: 0,
+                    anchoredSourceCount: 0
+                )
+            )
+            XCTAssertFalse(
+                EditStartPolicy.canStart(
+                    song: "LOVE DIVE",
+                    sourceMode: .local,
+                    editMode: mode,
+                    sourceCount: 0,
+                    anchoredSourceCount: 0
+                )
+            )
+        }
+
+        XCTAssertFalse(
+            EditStartPolicy.canStart(
+                song: "LOVE DIVE",
+                sourceMode: .local,
+                editMode: .member,
+                sourceCount: 3,
+                anchoredSourceCount: 2
+            )
+        )
+        XCTAssertTrue(
+            EditStartPolicy.canStart(
+                song: "LOVE DIVE",
+                sourceMode: .local,
+                editMode: .member,
+                sourceCount: 3,
+                anchoredSourceCount: 3
+            )
+        )
+    }
+
+    func testAutomaticMemberAspectDefaultsToPortraitWithoutManualPreference() {
+        XCTAssertEqual(
+            MemberAspectRatioPolicy.resolvedRatio(
+                current: .landscape,
+                editMode: .member,
+                sourceMode: .automatic,
+                manuallySelectedMemberRatio: nil
+            ),
+            .portrait
+        )
+        XCTAssertEqual(
+            MemberAspectRatioPolicy.resolvedRatio(
+                current: .landscape,
+                editMode: .member,
+                sourceMode: .local,
+                manuallySelectedMemberRatio: nil
+            ),
+            .landscape
+        )
+    }
+
+    func testMemberAspectPolicyLocksAutomaticPortraitAndPreservesLocalChoice() {
+        XCTAssertEqual(
+            MemberAspectRatioPolicy.resolvedRatio(
+                current: .portrait,
+                editMode: .member,
+                sourceMode: .automatic,
+                manuallySelectedMemberRatio: .landscape
+            ),
+            .portrait
+        )
+        XCTAssertEqual(
+            MemberAspectRatioPolicy.resolvedRatio(
+                current: .landscape,
+                editMode: .member,
+                sourceMode: .local,
+                manuallySelectedMemberRatio: .portrait
+            ),
+            .portrait
+        )
+        XCTAssertEqual(
+            MemberAspectRatioPolicy.resolvedRatio(
+                current: .portrait,
+                editMode: .group,
+                sourceMode: .automatic,
+                manuallySelectedMemberRatio: .portrait
+            ),
+            .landscape
+        )
+    }
+
+    func testAutomaticMemberKeepsMemberPickerEnabledAndAspectPickerLocked() {
+        XCTAssertTrue(
+            ProjectSettingsControlPolicy.canSelectMember(
+                editMode: .member,
+                isRunning: false
+            )
+        )
+        XCTAssertFalse(
+            ProjectSettingsControlPolicy.canSelectMember(
+                editMode: .group,
+                isRunning: false
+            )
+        )
+        XCTAssertFalse(
+            ProjectSettingsControlPolicy.canSelectMember(
+                editMode: .member,
+                isRunning: true
+            )
+        )
+        XCTAssertFalse(
+            ProjectSettingsControlPolicy.canSelectAspectRatio(
+                editMode: .member,
+                sourceMode: .automatic,
+                isRunning: false
+            )
+        )
+        XCTAssertTrue(
+            ProjectSettingsControlPolicy.canSelectAspectRatio(
+                editMode: .member,
+                sourceMode: .local,
+                isRunning: false
+            )
+        )
+    }
+
+    func testAutomaticMemberRequestCannotSerializeLandscape() throws {
+        let request = EditRequest(
+            song: "I AM",
+            targetMember: .gaeul,
+            editMode: .member,
+            aspectRatio: .landscape,
+            sources: [],
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            sourceMode: .automatic
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual(object["aspect_ratio"] as? String, "9:16")
+    }
+
+    func testAutomaticMemberRequestCannotSerializeConfirmedAnchors() throws {
+        let box = try XCTUnwrap(
+            NormalizedBoundingBox(left: 0.1, top: 0.2, right: 0.7, bottom: 0.9)
+        )
+        let selection = try XCTUnwrap(MemberAnchorSelection(timeSeconds: 2, bbox: box))
+        let request = EditRequest(
+            song: "I AM",
+            targetMember: .gaeul,
+            editMode: .member,
+            aspectRatio: .portrait,
+            sources: [],
+            outputDirectory: URL(fileURLWithPath: "/tmp/output"),
+            memberAnchors: [MemberAnchorRequest(sourceIndex: 0, selection: selection)],
+            sourceMode: .automatic
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual((object["member_anchors"] as? [Any])?.count, 0)
     }
 
     func testGroupRequestAlwaysOmitsSelectionsAsEmptyArray() throws {
@@ -75,6 +654,7 @@ final class EngineContractTests: XCTestCase {
             JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
         )
         XCTAssertEqual((object["member_anchors"] as? [Any])?.count, 0)
+        XCTAssertNil(object["target_member"])
     }
 
     func testAspectFitCoordinateMappingExcludesLetterboxBars() throws {
@@ -128,6 +708,176 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(event.outputPaths, ["/tmp/b.mp4", "/tmp/a.mp4"])
     }
 
+    func testResultEventDecodesExplicitAcquiredSourcesAndManifest() throws {
+        let data = Data(
+            #"{"type":"result","outputs":["/tmp/compat.mp4"],"source_paths":["/tmp/01.mp4","/tmp/02.mp4"],"acquisition_manifest":"/tmp/acquisition.json"}"#.utf8
+        )
+        let event = try JSONDecoder().decode(EngineEvent.self, from: data)
+
+        XCTAssertEqual(event.sourcePaths, ["/tmp/01.mp4", "/tmp/02.mp4"])
+        XCTAssertEqual(event.acquisitionManifestPath, "/tmp/acquisition.json")
+    }
+
+    func testAutomaticAcquisitionProbeRequiresRequestedModeAndYTDLP() {
+        let ready = Data(
+            #"{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}"#.utf8
+        )
+        XCTAssertTrue(
+            EngineLocator.automaticAcquisitionProbeReady(from: ready, editMode: .group)
+        )
+        XCTAssertFalse(
+            EngineLocator.automaticAcquisitionProbeReady(from: ready, editMode: .member)
+        )
+
+        let missingYTDLP = Data(
+            #"{"automatic_acquisition":{"ready":false},"mode_readiness":{"automatic_group":true,"automatic_member":true}}"#.utf8
+        )
+        XCTAssertFalse(
+            EngineLocator.automaticAcquisitionProbeReady(
+                from: missingYTDLP,
+                editMode: .group
+            )
+        )
+        XCTAssertFalse(
+            EngineLocator.automaticAcquisitionProbeReady(
+                from: Data("warning only".utf8),
+                editMode: .group
+            )
+        )
+    }
+
+    func testAutomaticAcquisitionProbeUsesModeEvenWhenGlobalDoctorExitsNonzero() throws {
+        let ready = try makeExecutableScript(
+            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}'; exit 0"#
+        )
+        let globalStrictFailure = try makeExecutableScript(
+            #"printf '%s\n' '{"automatic_acquisition":{"ready":true},"mode_readiness":{"automatic_group":true,"automatic_member":false}}'; exit 1"#
+        )
+        let invalid = try makeExecutableScript(
+            "printf '%s\\n' 'doctor crashed'; exit 1"
+        )
+        let engine = ready.deletingLastPathComponent()
+            .appendingPathComponent("crosscut_cli.py")
+
+        XCTAssertTrue(
+            EngineLocator.supportsAutomaticAcquisition(
+                pythonURL: ready,
+                engineURL: engine,
+                editMode: .group,
+                timeout: 1
+            )
+        )
+        XCTAssertFalse(
+            EngineLocator.supportsAutomaticAcquisition(
+                pythonURL: ready,
+                engineURL: engine,
+                editMode: .member,
+                timeout: 1
+            )
+        )
+        XCTAssertTrue(
+            EngineLocator.supportsAutomaticAcquisition(
+                pythonURL: globalStrictFailure,
+                engineURL: engine,
+                editMode: .group,
+                timeout: 1
+            )
+        )
+        XCTAssertFalse(
+            EngineLocator.supportsAutomaticAcquisition(
+                pythonURL: invalid,
+                engineURL: engine,
+                editMode: .group,
+                timeout: 1
+            )
+        )
+    }
+
+    func testLocalEditingProbeRequiresOnlyTheRequestedLocalMode() throws {
+        let report = Data(
+            #"{"mode_readiness":{"local_group":true,"local_member":false}}"#.utf8
+        )
+        XCTAssertTrue(
+            EngineLocator.localEditingProbeReady(from: report, editMode: .group)
+        )
+        XCTAssertFalse(
+            EngineLocator.localEditingProbeReady(from: report, editMode: .member)
+        )
+
+        let globalStrictFailure = try makeExecutableScript(
+            #"printf '%s\n' '{"ready":false,"mode_readiness":{"local_group":true,"local_member":false}}'; exit 1"#
+        )
+        let engine = globalStrictFailure.deletingLastPathComponent()
+            .appendingPathComponent("crosscut_cli.py")
+        XCTAssertTrue(
+            EngineLocator.supportsLocalEditing(
+                pythonURL: globalStrictFailure,
+                engineURL: engine,
+                editMode: .group,
+                timeout: 1
+            )
+        )
+        XCTAssertFalse(
+            EngineLocator.supportsLocalEditing(
+                pythonURL: globalStrictFailure,
+                engineURL: engine,
+                editMode: .member,
+                timeout: 1
+            )
+        )
+    }
+
+    func testAutomaticAcquisitionFailureMessageHasActionableFallback() {
+        let message = EngineRunner.automaticAcquisitionUnavailableMessage
+        XCTAssertTrue(message.contains("yt-dlp"))
+        XCTAssertTrue(message.contains("내 영상 선택"))
+    }
+
+    func testLocalMemberFailureMessageNamesConfirmedAnchorTracking() {
+        let message = EngineRunner.localMemberTrackingUnavailableMessage
+        XCTAssertTrue(message.contains("확인 앵커"))
+        XCTAssertTrue(message.contains("트래커"))
+    }
+
+    @MainActor
+    func testEnginePreparationDoesNotBlockUIAndIgnoresLateResultAfterCancel() async throws {
+        let engine = URL(fileURLWithPath: "/tmp/crosscut-test-engine.py")
+        let runner = EngineRunner(
+            locateEngine: { engine },
+            preparationProbe: { _, _, _ in
+                Thread.sleep(forTimeInterval: 0.30)
+                return .pythonUnavailable
+            }
+        )
+        let request = EditRequest(
+            song: "I AM",
+            targetMember: .anYujin,
+            editMode: .group,
+            aspectRatio: .landscape,
+            sources: [
+                URL(fileURLWithPath: "/tmp/a.mp4"),
+                URL(fileURLWithPath: "/tmp/b.mp4"),
+            ],
+            outputDirectory: URL(fileURLWithPath: "/tmp/crosscut-test-output")
+        )
+
+        let startTime = Date()
+        runner.start(request: request)
+        XCTAssertLessThan(Date().timeIntervalSince(startTime), 0.15)
+        XCTAssertEqual(runner.state, .preparing)
+
+        // A second start while preparation is active must remain a no-op.
+        runner.start(request: request)
+        XCTAssertEqual(runner.state, .preparing)
+
+        runner.cancel()
+        XCTAssertEqual(runner.state, .cancelled)
+        XCTAssertEqual(runner.statusMessage, "작업이 취소되었습니다.")
+
+        try await Task.sleep(nanoseconds: 450_000_000)
+        XCTAssertEqual(runner.state, .cancelled)
+    }
+
     func testAugmentedPathAlwaysIncludesHomebrewMediaTools() {
         let path = EngineLocator.augmentedPath(existing: "/custom/bin:/usr/bin")
         let parts = path.split(separator: ":").map(String.init)
@@ -137,15 +887,19 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(parts.filter { $0 == "/usr/bin" }.count, 1)
     }
 
-    func testRuntimeProbeRequiresMachineReadableFullReady() {
+    func testRuntimeProbeRequiresMachineReadableBaseRuntimeReady() {
         XCTAssertTrue(
             EngineLocator.runtimeProbeReady(
-                from: Data(#"{"full_ready":true}"#.utf8)
+                from: Data(
+                    #"{"base_runtime_ready":true,"full_ready":false}"#.utf8
+                )
             )
         )
         XCTAssertFalse(
             EngineLocator.runtimeProbeReady(
-                from: Data(#"{"full_ready":false}"#.utf8)
+                from: Data(
+                    #"{"base_runtime_ready":false,"full_ready":true}"#.utf8
+                )
             )
         )
         XCTAssertFalse(
@@ -155,20 +909,22 @@ final class EngineContractTests: XCTestCase {
         )
         XCTAssertTrue(
             EngineLocator.runtimeProbeReady(
-                from: Data("ignored warning\n{\"full_ready\":true}\n".utf8)
+                from: Data(
+                    "ignored warning\n{\"base_runtime_ready\":true}\n".utf8
+                )
             )
         )
     }
 
     func testRuntimeProbeHonorsJSONResultAndExitStatus() throws {
         let ready = try makeExecutableScript(
-            "printf '%s\\n' '{\"full_ready\":true}'; exit 0"
+            "printf '%s\\n' '{\"base_runtime_ready\":true,\"full_ready\":false}'; exit 0"
         )
         let falseReport = try makeExecutableScript(
-            "printf '%s\\n' '{\"full_ready\":false}'; exit 0"
+            "printf '%s\\n' '{\"base_runtime_ready\":false,\"full_ready\":true}'; exit 0"
         )
         let failed = try makeExecutableScript(
-            "printf '%s\\n' '{\"full_ready\":true}'; exit 1"
+            "printf '%s\\n' '{\"base_runtime_ready\":true}'; exit 1"
         )
         let engine = URL(fileURLWithPath: "/tmp/engine/crosscut_cli.py")
 
@@ -195,6 +951,44 @@ final class EngineContractTests: XCTestCase {
         )
     }
 
+    func testPythonLocatorAcceptsBaseRuntimeWhenTrackersAreUnavailable() throws {
+        let baseOnly = try makeExecutableScript(
+            "printf '%s\\n' '{\"base_runtime_ready\":true,\"full_ready\":false}'; exit 0"
+        )
+        let previous = ProcessInfo.processInfo.environment[
+            EngineLocator.pythonEnvironmentKey
+        ]
+        setenv(EngineLocator.pythonEnvironmentKey, baseOnly.path, 1)
+        defer {
+            if let previous {
+                setenv(EngineLocator.pythonEnvironmentKey, previous, 1)
+            } else {
+                unsetenv(EngineLocator.pythonEnvironmentKey)
+            }
+        }
+
+        let located = EngineLocator.locatePython(
+            near: URL(fileURLWithPath: "/tmp/engine/crosscut_cli.py")
+        )
+        XCTAssertEqual(located?.standardizedFileURL, baseOnly.standardizedFileURL)
+    }
+
+    func testRuntimeProbeCannotWriteBytecodeIntoBundledEngine() throws {
+        let guardedProbe = try makeExecutableScript(
+            "test \"$1\" = '-B' || exit 11; "
+                + "test \"$PYTHONDONTWRITEBYTECODE\" = '1' || exit 12; "
+                + "printf '%s\\n' '{\"base_runtime_ready\":true}'"
+        )
+
+        XCTAssertTrue(
+            EngineLocator.supportsEngineModules(
+                pythonURL: guardedProbe,
+                engineURL: URL(fileURLWithPath: "/tmp/engine/crosscut_cli.py"),
+                timeout: 1
+            )
+        )
+    }
+
     func testRuntimeProbeTimesOutInsteadOfBlockingLocator() throws {
         let hanging = try makeExecutableScript(
             "trap 'exit 0' TERM; while :; do :; done"
@@ -207,6 +1001,97 @@ final class EngineContractTests: XCTestCase {
                 timeout: 0.05
             )
         )
+    }
+
+    func testProcessTreeCancellationTerminatesMediaChild() throws {
+        let program = #"""
+import os, signal, subprocess, sys
+os.setpgid(0, 0)
+def cancel(_signum, _frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, cancel)
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+print(child.pid, flush=True)
+try:
+    child.wait()
+except KeyboardInterrupt:
+    child.wait(timeout=5)
+    raise SystemExit(130)
+"""#
+        let process = Process()
+        let stdoutPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", program]
+        process.standardOutput = stdoutPipe
+        try process.run()
+        addTeardownBlock {
+            if process.isRunning { process.terminate() }
+        }
+
+        let output = stdoutPipe.fileHandleForReading.availableData
+        let childText = try XCTUnwrap(String(data: output, encoding: .utf8))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let childPID = try XCTUnwrap(pid_t(childText))
+        XCTAssertEqual(getpgid(process.processIdentifier), process.processIdentifier)
+        XCTAssertTrue(
+            EngineProcessTree.requestTermination(
+                process,
+                forceKillDelayNanoseconds: 500_000_000
+            )
+        )
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 130)
+        XCTAssertEqual(Darwin.kill(childPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testProcessTreeCancellationForceKillsStubbornMediaChild() throws {
+        let program = #"""
+import os, signal, subprocess, sys
+os.setpgid(0, 0)
+def cancel(_signum, _frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, cancel)
+child = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)",
+    ],
+    stdout=subprocess.PIPE,
+    text=True,
+)
+assert child.stdout.readline().strip() == "ready"
+print(child.pid, flush=True)
+try:
+    child.wait()
+except KeyboardInterrupt:
+    child.wait()
+"""#
+        let process = Process()
+        let stdoutPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", program]
+        process.standardOutput = stdoutPipe
+        try process.run()
+        addTeardownBlock {
+            if process.isRunning { process.terminate() }
+        }
+
+        let output = stdoutPipe.fileHandleForReading.availableData
+        let childText = try XCTUnwrap(String(data: output, encoding: .utf8))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let childPID = try XCTUnwrap(pid_t(childText))
+        XCTAssertTrue(
+            EngineProcessTree.requestTermination(
+                process,
+                forceKillDelayNanoseconds: 100_000_000
+            )
+        )
+        process.waitUntilExit()
+        XCTAssertNotEqual(process.terminationStatus, 0)
+        XCTAssertEqual(Darwin.kill(childPID, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
     }
 
     func testApplicationBundleContainsCleanRunnableEngineSource() throws {

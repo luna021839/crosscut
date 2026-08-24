@@ -123,10 +123,14 @@ enum EngineLocator {
         let process = Process()
         process.executableURL = pythonURL
         process.arguments = [
+            "-B",
             "-c",
-            "import json,sys;sys.path.insert(0,sys.argv[1]);from crosscut.runtime_contract import runtime_contract_report;r=runtime_contract_report();print(json.dumps(r,separators=(',',':')));raise SystemExit(0 if r.get('full_ready') else 1)",
+            "import json,sys;sys.path.insert(0,sys.argv[1]);from crosscut.runtime_contract import runtime_contract_report;r=runtime_contract_report();print(json.dumps(r,separators=(',',':')));raise SystemExit(0 if r.get('base_runtime_ready') else 1)",
             engineURL.deletingLastPathComponent().path,
         ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        process.environment = environment
         let standardOutput = Pipe()
         process.standardOutput = standardOutput
         process.standardError = FileHandle.nullDevice
@@ -159,11 +163,121 @@ enum EngineLocator {
             guard let lineData = String(line).data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: lineData),
                   let payload = object as? [String: Any],
-                  let ready = payload["full_ready"] as? Bool else {
+                  let ready = payload["base_runtime_ready"] as? Bool else {
                 continue
             }
             return ready
         }
         return false
+    }
+
+    static func supportsAutomaticAcquisition(
+        pythonURL: URL,
+        engineURL: URL,
+        editMode: EditMode,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        supportsDoctorMode(
+            pythonURL: pythonURL,
+            engineURL: engineURL,
+            timeout: timeout
+        ) { data in
+            automaticAcquisitionProbeReady(from: data, editMode: editMode)
+        }
+    }
+
+    static func supportsLocalEditing(
+        pythonURL: URL,
+        engineURL: URL,
+        editMode: EditMode,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        supportsDoctorMode(
+            pythonURL: pythonURL,
+            engineURL: engineURL,
+            timeout: timeout
+        ) { data in
+            localEditingProbeReady(from: data, editMode: editMode)
+        }
+    }
+
+    private static func supportsDoctorMode(
+        pythonURL: URL,
+        engineURL: URL,
+        timeout: TimeInterval,
+        resultReady: (Data) -> Bool
+    ) -> Bool {
+        guard timeout.isFinite, timeout > 0 else { return false }
+        let process = Process()
+        process.executableURL = pythonURL
+        process.arguments = ["-B", engineURL.path, "doctor"]
+        process.currentDirectoryURL = engineURL.deletingLastPathComponent()
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = augmentedPath(existing: environment["PATH"])
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        process.environment = environment
+
+        let standardOutput = Pipe()
+        process.standardOutput = standardOutput
+        process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+            let milliseconds = max(1, Int((timeout * 1_000).rounded()))
+            if finished.wait(timeout: .now() + .milliseconds(milliseconds)) == .timedOut {
+                _ = EngineProcessTree.requestTermination(
+                    process,
+                    forceKillDelayNanoseconds: 200_000_000
+                )
+                if finished.wait(timeout: .now() + .seconds(1)) == .timedOut {
+                    if !EngineProcessTree.forceTermination(process) {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                    _ = finished.wait(timeout: .now() + .seconds(1))
+                }
+                return false
+            }
+            return resultReady(
+                standardOutput.fileHandleForReading.readDataToEndOfFile()
+            )
+        } catch {
+            return false
+        }
+    }
+
+    static func automaticAcquisitionProbeReady(from data: Data, editMode: EditMode) -> Bool {
+        guard let text = String(data: data, encoding: .utf8),
+              let openingBrace = text.firstIndex(of: "{") else {
+            return false
+        }
+        let jsonText = String(text[openingBrace...])
+        guard let jsonData = jsonText.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: jsonData),
+              let payload = object as? [String: Any],
+              let modeReadiness = payload["mode_readiness"] as? [String: Any],
+              let acquisition = payload["automatic_acquisition"] as? [String: Any],
+              acquisition["ready"] as? Bool == true else {
+            return false
+        }
+        let modeKey = editMode == .group ? "automatic_group" : "automatic_member"
+        return modeReadiness[modeKey] as? Bool == true
+    }
+
+    static func localEditingProbeReady(from data: Data, editMode: EditMode) -> Bool {
+        guard let text = String(data: data, encoding: .utf8),
+              let openingBrace = text.firstIndex(of: "{") else {
+            return false
+        }
+        let jsonText = String(text[openingBrace...])
+        guard let jsonData = jsonText.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: jsonData),
+              let payload = object as? [String: Any],
+              let modeReadiness = payload["mode_readiness"] as? [String: Any] else {
+            return false
+        }
+        let modeKey = editMode == .group ? "local_group" : "local_member"
+        return modeReadiness[modeKey] as? Bool == true
     }
 }

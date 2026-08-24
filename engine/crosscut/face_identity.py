@@ -1,10 +1,13 @@
-"""Local SFace appearance embeddings for Tier-A transition safety.
+"""Local SFace appearance embeddings for transition safety.
 
 This module does not identify a named person and must not be described as an
 authentication system. It only asks whether two already unambiguous dominant
-YuNet face tracks have sufficiently similar SFace appearance embeddings to
-permit a short dissolve. Missing model/detection evidence returns an empty
-embedding, which always downgrades the boundary to a hard cut.
+YuNet face tracks have sufficiently similar SFace appearance embeddings. The
+global selector uses that evidence to avoid a conspicuous different-face jump
+between two close-ups; the transition post-pass uses a stricter three-frame
+window before permitting a short dissolve. Missing model/detection evidence
+returns an empty embedding, so a close-up source switch is rejected and a
+dissolve is downgraded to a hard cut.
 
 The bundled OpenCV Zoo SFace model and its official example code are Apache
 License 2.0. The compact wrapper below independently follows OpenCV's public

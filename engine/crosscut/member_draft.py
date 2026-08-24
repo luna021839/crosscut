@@ -8,11 +8,11 @@ observations never become crops; when no source passes the interval gate, the
 result explicitly requests a caller-designated group-wide source or marks the
 span unavailable.
 
-Three clocks are kept separate throughout::
-
-    source_local_time = canonical_master_time + audio_offset
-    output_time = canonical_master_time - common_master_start
-    crop_sample_time = source_local_time - source_local_span_start
+Three clocks are kept separate throughout.  The legacy scalar clock remains
+``source_local_time = canonical_master_time + audio_offset``; when a checked
+local time-warp is available, both source-span endpoints come from that map.
+Crop observations are then placed on the renderer's canonical segment clock
+using the mapped source span's playback rate.
 
 All crop rectangles use normalized source coordinates ``(x, y, width,
 height)``.  In particular, a 9:16 pixel crop from a 16:9 source has normalized
@@ -28,6 +28,7 @@ from statistics import median, pstdev
 from typing import Any, Mapping, Sequence
 
 from .ive import AspectRatio, IVEMember
+from .timewarp import TimeWarpMap
 from .tracking import MemberTrackObservation, MemberTrackingResult, TrackingState
 from .vision import TrackObservation, VirtualCameraConfig, plan_virtual_camera
 
@@ -180,6 +181,46 @@ class SegmentCropSample:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentSubjectSample:
+    """Confirmed target-member geometry on the canonical segment clock."""
+
+    time_seconds: float
+    bbox_xyxy: tuple[float, float, float, float]
+    confidence: float
+
+    def __post_init__(self) -> None:
+        time = _finite(self.time_seconds, "subject sample time")
+        if time < 0.0:
+            raise ValueError("subject sample time cannot be negative")
+        if len(self.bbox_xyxy) != 4:
+            raise ValueError("subject bbox must contain four values")
+        left, top, right, bottom = tuple(
+            _finite(value, "subject bbox coordinate")
+            for value in self.bbox_xyxy
+        )
+        if not (
+            0.0 <= left < right <= 1.0
+            and 0.0 <= top < bottom <= 1.0
+        ):
+            raise ValueError("subject bbox must fit inside normalized source bounds")
+        object.__setattr__(self, "time_seconds", time)
+        object.__setattr__(self, "bbox_xyxy", (left, top, right, bottom))
+        object.__setattr__(
+            self,
+            "confidence",
+            _probability(self.confidence, "subject sample confidence"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "time_seconds": self.time_seconds,
+            "bbox_xyxy": list(self.bbox_xyxy),
+            "confidence": self.confidence,
+            "basis": "confirmed_member_anchor_tracking",
+        }
+
+
 class MemberSegmentKind(StrEnum):
     TARGET_CROP = "target_crop"
     GROUP_WIDE_FALLBACK = "group_wide_fallback"
@@ -204,6 +245,8 @@ class MemberDraftSegment:
     mean_confidence: float
     stability: float
     selection_score: float | None
+    source_timewarp_applied: bool = False
+    subject_samples: tuple[SegmentSubjectSample, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -227,6 +270,8 @@ class MemberDraftSegment:
                 "selection_score",
                 _finite(self.selection_score, "selection_score"),
             )
+        if not isinstance(self.source_timewarp_applied, bool):
+            raise TypeError("source_timewarp_applied must be boolean")
 
         if self.kind is MemberSegmentKind.UNAVAILABLE:
             if any(
@@ -237,8 +282,10 @@ class MemberDraftSegment:
                     self.source_local_end,
                     self.audio_offset_seconds,
                 )
-            ) or self.crop_samples:
+            ) or self.crop_samples or self.subject_samples:
                 raise ValueError("unavailable segments cannot claim a source or crop")
+            if self.source_timewarp_applied:
+                raise ValueError("unavailable segments cannot claim a source time-warp")
             return
 
         if (
@@ -261,10 +308,11 @@ class MemberDraftSegment:
         offset = _finite(self.audio_offset_seconds, "audio offset")
         if local_start < -_EPSILON or local_end <= local_start:
             raise ValueError("source-local timing is invalid")
-        if not math.isclose(local_start, start + offset, abs_tol=1e-7):
-            raise ValueError("source_local_start violates master + offset contract")
-        if not math.isclose(local_end, end + offset, abs_tol=1e-7):
-            raise ValueError("source_local_end violates master + offset contract")
+        if not self.source_timewarp_applied:
+            if not math.isclose(local_start, start + offset, abs_tol=1e-7):
+                raise ValueError("source_local_start violates master + offset contract")
+            if not math.isclose(local_end, end + offset, abs_tol=1e-7):
+                raise ValueError("source_local_end violates master + offset contract")
         if self.kind is MemberSegmentKind.TARGET_CROP:
             if not self.crop_samples:
                 raise ValueError("target crop segments need crop samples")
@@ -277,8 +325,19 @@ class MemberDraftSegment:
                 if sample.time_seconds > end - start + 1e-7:
                     raise ValueError("crop sample lies outside its segment")
                 previous = sample.time_seconds
-        elif self.crop_samples:
-            raise ValueError("group-wide fallback must not claim a member crop")
+            previous = -1.0
+            for sample in self.subject_samples:
+                if sample.time_seconds <= previous:
+                    raise ValueError("subject sample times must be strictly increasing")
+                if sample.time_seconds > end - start + 1e-7:
+                    raise ValueError("subject sample lies outside its segment")
+                previous = sample.time_seconds
+            if self.subject_samples and abs(self.subject_samples[0].time_seconds) > 1e-7:
+                raise ValueError("subject samples must start at segment-relative zero")
+        elif self.crop_samples or self.subject_samples:
+            raise ValueError(
+                "group-wide fallback must not claim a member crop or subject"
+            )
 
     @property
     def duration_seconds(self) -> float:
@@ -322,11 +381,24 @@ class MemberDraftSegment:
             "source_local_start": self.source_local_start,
             "source_local_end": self.source_local_end,
             "audio_offset_seconds": self.audio_offset_seconds,
+            "source_clock_basis": (
+                None
+                if self.kind is MemberSegmentKind.UNAVAILABLE
+                else (
+                    "local_monotonic_timewarp"
+                    if self.source_timewarp_applied
+                    else "global_scalar_offset"
+                )
+            ),
+            "source_timewarp_applied": self.source_timewarp_applied,
             "interval_coverage": self.interval_coverage,
             "mean_confidence": self.mean_confidence,
             "stability": self.stability,
             "selection_score": self.selection_score,
             "crop_samples": [sample.to_dict() for sample in self.crop_samples],
+            "subject_samples": [
+                sample.to_dict() for sample in self.subject_samples
+            ],
         }
 
 
@@ -545,6 +617,8 @@ class _Candidate:
     crop_samples: tuple[SegmentCropSample, ...]
     entry_framing: tuple[float, float, float]
     exit_framing: tuple[float, float, float]
+    subject_samples: tuple[SegmentSubjectSample, ...] = ()
+    source_timewarp_applied: bool = False
 
 
 def _coerce_span(value: object) -> CanonicalSpan:
@@ -759,20 +833,46 @@ def _stability(observations: Sequence[TrackObservation]) -> float:
     return max(0.0, min(1.0, 0.75 * motion_stability + 0.25 * confidence_stability))
 
 
+def _source_span_for_clock(
+    span: CanonicalSpan,
+    *,
+    offset: float,
+    timewarp: TimeWarpMap | None,
+) -> tuple[float, float, bool]:
+    """Resolve one canonical span on the same source clock used by rendering."""
+
+    if timewarp is None or timewarp.scalar_fallback:
+        return (
+            span.start_seconds + offset,
+            span.end_seconds + offset,
+            False,
+        )
+    local_start, local_end = timewarp.master_span_to_source(
+        span.start_seconds,
+        span.end_seconds,
+    )
+    return (local_start, local_end, True)
+
+
 def _candidate_for_span(
     track: _PreparedTrack,
     *,
     offset: float,
+    timewarp: TimeWarpMap | None,
     span: CanonicalSpan,
     target: IVEMember,
     output_aspect: AspectRatio,
     source_aspect_ratio: float,
     config: MemberDraftConfig,
 ) -> _Candidate | None:
-    local_start = span.start_seconds + offset
-    local_end = span.end_seconds + offset
+    local_start, local_end, timewarp_applied = _source_span_for_clock(
+        span,
+        offset=offset,
+        timewarp=timewarp,
+    )
     if local_start < -_EPSILON:
         return None
+    local_playback_rate = (local_end - local_start) / span.duration_seconds
     radius = 0.51 / track.fps
     in_range = tuple(
         item
@@ -826,6 +926,7 @@ def _candidate_for_span(
         frame_indices=frame_indices,
     )
     samples: list[SegmentCropSample] = []
+    subject_samples: list[SegmentSubjectSample] = []
     camera_safe_timestamps: list[float] = []
     entry_framing: tuple[float, float, float] | None = None
     exit_framing: tuple[float, float, float] | None = None
@@ -847,7 +948,13 @@ def _candidate_for_span(
         if entry_framing is None:
             entry_framing = framing
         exit_framing = framing
-        relative = min(max(timestamp - local_start, 0.0), span.duration_seconds)
+        # The renderer trims the mapped endpoints and applies one constant
+        # setpts rate over this canonical segment. Put each source-clock
+        # tracking observation on that exact post-retime clock.
+        relative = min(
+            max((timestamp - local_start) / local_playback_rate, 0.0),
+            span.duration_seconds,
+        )
         sample = SegmentCropSample(
             time_seconds=relative,
             x=frame.crop.left,
@@ -855,12 +962,19 @@ def _candidate_for_span(
             width=frame.crop.width,
             height=frame.crop.height,
         )
+        subject_sample = SegmentSubjectSample(
+            time_seconds=relative,
+            bbox_xyxy=frame.observation.bbox_xyxy,
+            confidence=frame.observation.tracking_confidence,
+        )
         if samples and math.isclose(
             samples[-1].time_seconds, sample.time_seconds, abs_tol=1e-9
         ):
             samples[-1] = sample
+            subject_samples[-1] = subject_sample
         elif not samples or sample.time_seconds > samples[-1].time_seconds:
             samples.append(sample)
+            subject_samples.append(subject_sample)
     if not samples or entry_framing is None or exit_framing is None:
         return None
     camera_coverage, camera_largest_gap = _covered_interval_metrics(
@@ -885,10 +999,25 @@ def _candidate_for_span(
             0,
             SegmentCropSample(0.0, first.x, first.y, first.width, first.height),
         )
+        first_subject = subject_samples[0]
+        subject_samples.insert(
+            0,
+            SegmentSubjectSample(
+                0.0,
+                first_subject.bbox_xyxy,
+                first_subject.confidence,
+            ),
+        )
     elif samples[0].time_seconds != 0.0:
         first = samples[0]
         samples[0] = SegmentCropSample(
             0.0, first.x, first.y, first.width, first.height
+        )
+        first_subject = subject_samples[0]
+        subject_samples[0] = SegmentSubjectSample(
+            0.0,
+            first_subject.bbox_xyxy,
+            first_subject.confidence,
         )
 
     mean_confidence = sum(item.tracking_confidence for item in safe) / len(safe)
@@ -910,8 +1039,10 @@ def _candidate_for_span(
         stability=stability,
         base_score=base_score,
         crop_samples=tuple(samples),
+        subject_samples=tuple(subject_samples),
         entry_framing=entry_framing,
         exit_framing=exit_framing,
+        source_timewarp_applied=timewarp_applied,
     )
 
 
@@ -1360,11 +1491,13 @@ def build_member_draft(
     group_wide_fallback_source: int | None = None,
     source_aspect_ratio: float = 16.0 / 9.0,
     source_fps: Sequence[float | None] | Mapping[int, float] | None = None,
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     config: MemberDraftConfig | None = None,
 ) -> MemberDraftTimeline:
     """Build a deterministic, confidence-gated target-member edit draft.
 
-    ``tracking_by_source`` and ``audio_offsets`` share the same source indices.
+    ``tracking_by_source``, ``audio_offsets``, and optional
+    ``source_timewarps`` share the same source indices.
     A raw observation sequence may contain either anchored
     :class:`MemberTrackObservation` values or identity-resolved
     :class:`~crosscut.vision.TrackObservation` values.  Raw observations need
@@ -1383,6 +1516,28 @@ def build_member_draft(
     )
     if not offsets:
         raise ValueError("audio_offsets cannot be empty")
+    if source_timewarps is None:
+        timewarps: tuple[TimeWarpMap | None, ...] = (None,) * len(offsets)
+    else:
+        if len(source_timewarps) != len(offsets):
+            raise ValueError("source_timewarps length must match audio_offsets")
+        normalized_timewarps: list[TimeWarpMap | None] = []
+        for index, (timewarp, offset) in enumerate(
+            zip(source_timewarps, offsets, strict=True)
+        ):
+            if timewarp is not None and not isinstance(timewarp, TimeWarpMap):
+                raise TypeError(f"source_timewarps[{index}] must be a TimeWarpMap")
+            if timewarp is not None and not math.isclose(
+                timewarp.global_offset_seconds,
+                offset,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    f"source_timewarps[{index}] does not match audio_offsets"
+                )
+            normalized_timewarps.append(timewarp)
+        timewarps = tuple(normalized_timewarps)
     target = IVEMember.parse(target_member)
     aspect = (
         output_aspect
@@ -1434,6 +1589,7 @@ def build_member_draft(
                 candidate := _candidate_for_span(
                     track,
                     offset=offsets[track.source_index],
+                    timewarp=timewarps[track.source_index],
                     span=span,
                     target=target,
                     output_aspect=aspect,
@@ -1488,31 +1644,55 @@ def build_member_draft(
                 mean_confidence=chosen.mean_confidence,
                 stability=chosen.stability,
                 selection_score=effective_score,
+                source_timewarp_applied=chosen.source_timewarp_applied,
+                subject_samples=chosen.subject_samples,
             )
             use_counts[source_index] += 1
             previous_candidate = chosen
-        elif (
-            group_wide_fallback_source is not None
-            and span.start_seconds + offsets[group_wide_fallback_source] >= -_EPSILON
-        ):
+        elif group_wide_fallback_source is not None:
             source_index = group_wide_fallback_source
-            segment = MemberDraftSegment(
-                segment_index=segment_index,
-                canonical_master_start=span.start_seconds,
-                canonical_master_end=span.end_seconds,
-                output_start_seconds=span.start_seconds - common_start,
-                kind=MemberSegmentKind.GROUP_WIDE_FALLBACK,
-                source_index=source_index,
-                source_local_start=max(0.0, span.start_seconds + offsets[source_index]),
-                source_local_end=span.end_seconds + offsets[source_index],
-                audio_offset_seconds=offsets[source_index],
-                crop_samples=(),
-                interval_coverage=0.0,
-                mean_confidence=0.0,
-                stability=0.0,
-                selection_score=None,
+            local_start, local_end, timewarp_applied = _source_span_for_clock(
+                span,
+                offset=offsets[source_index],
+                timewarp=timewarps[source_index],
             )
-            previous_candidate = None
+            if local_start >= -_EPSILON:
+                segment = MemberDraftSegment(
+                    segment_index=segment_index,
+                    canonical_master_start=span.start_seconds,
+                    canonical_master_end=span.end_seconds,
+                    output_start_seconds=span.start_seconds - common_start,
+                    kind=MemberSegmentKind.GROUP_WIDE_FALLBACK,
+                    source_index=source_index,
+                    source_local_start=max(0.0, local_start),
+                    source_local_end=local_end,
+                    audio_offset_seconds=offsets[source_index],
+                    crop_samples=(),
+                    interval_coverage=0.0,
+                    mean_confidence=0.0,
+                    stability=0.0,
+                    selection_score=None,
+                    source_timewarp_applied=timewarp_applied,
+                )
+                previous_candidate = None
+            else:
+                segment = MemberDraftSegment(
+                    segment_index=segment_index,
+                    canonical_master_start=span.start_seconds,
+                    canonical_master_end=span.end_seconds,
+                    output_start_seconds=span.start_seconds - common_start,
+                    kind=MemberSegmentKind.UNAVAILABLE,
+                    source_index=None,
+                    source_local_start=None,
+                    source_local_end=None,
+                    audio_offset_seconds=None,
+                    crop_samples=(),
+                    interval_coverage=0.0,
+                    mean_confidence=0.0,
+                    stability=0.0,
+                    selection_score=None,
+                )
+                previous_candidate = None
         else:
             segment = MemberDraftSegment(
                 segment_index=segment_index,
@@ -1554,5 +1734,6 @@ __all__ = [
     "MemberDraftTimeline",
     "MemberSegmentKind",
     "SegmentCropSample",
+    "SegmentSubjectSample",
     "build_member_draft",
 ]

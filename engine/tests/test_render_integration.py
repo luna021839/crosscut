@@ -12,6 +12,10 @@ import numpy as np
 from crosscut.face_match import FaceMatchConfig, build_face_match_plan
 from crosscut.ive import AspectRatio
 from crosscut.render import (
+    BoundaryLookKeyframe,
+    BoundaryLookTrack,
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
     NormalizedCrop,
     PanCropKeyframe,
     PanCropTrack,
@@ -19,6 +23,8 @@ from crosscut.render import (
     RenderSegment,
     RenderTransition,
     TransitionKind,
+    _boundary_look_filters,
+    minimum_roll_safe_zoom,
     render,
 )
 from crosscut.timeline import ShotType
@@ -27,6 +33,44 @@ from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class RenderIntegrationTests(unittest.TestCase):
+    def test_boundary_temperature_identity_tail_is_sample_exact(self) -> None:
+        track = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(0.0, temperature_balance=0.02),
+                BoundaryLookKeyframe(1.0 / 30.0, temperature_balance=0.02),
+                BoundaryLookKeyframe(7.0 / 30.0),
+                BoundaryLookKeyframe(29.0 / 30.0),
+            )
+        )
+        source = "testsrc2=size=160x90:rate=30:duration=1"
+
+        def decode(filters: list[str]) -> np.ndarray:
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+            ]
+            if filters:
+                command.extend(("-vf", ",".join(filters)))
+            command.extend(("-pix_fmt", "yuv420p", "-f", "rawvideo", "-"))
+            decoded = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+            ).stdout
+            return np.frombuffer(decoded, dtype=np.uint8).reshape(30, -1)
+
+        baseline = decode([])
+        adjusted = decode(_boundary_look_filters(track))
+
+        self.assertGreater(np.count_nonzero(baseline[0] != adjusted[0]), 0)
+        np.testing.assert_array_equal(adjusted[8:], baseline[8:])
+
     def _source(self, path: Path, color: str, duration: float = 1.0) -> None:
         subprocess.run(
             [
@@ -70,6 +114,43 @@ class RenderIntegrationTests(unittest.TestCase):
                 "lavfi",
                 "-i",
                 "sine=frequency=440:sample_rate=48000:duration=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(path),
+            ],
+            check=True,
+        )
+
+    def _member_marker_source(self, path: Path, duration: float = 2.0) -> None:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=magenta:s=160x90:r=30:d={duration}",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=white:s=24x28:r=30:d={duration}",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=440:sample_rate=48000:duration={duration}",
+                "-filter_complex",
+                "[0:v][1:v]overlay=x='20+50*t':y=28:shortest=1[v]",
+                "-map",
+                "[v]",
+                "-map",
+                "2:a",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -186,6 +267,103 @@ class RenderIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(colors), 66)
         self.assertEqual(transitions, [15, 36, 48])
+
+    def test_split_identity_same_source_render_matches_unsplit_moving_h264(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "moving-source.mp4"
+            self._member_marker_source(source, duration=2.0)
+            baseline_output = root / "unsplit.mp4"
+            split_output = root / "split.mp4"
+            durations = (0.2, 0.3, 0.4, 0.2, 0.3)
+            source_start = 0.1
+            master_start = 0.0
+            split_segments: list[RenderSegment] = []
+            for duration in durations:
+                split_segments.append(
+                    RenderSegment(
+                        0,
+                        source_start,
+                        duration,
+                        master_start,
+                    )
+                )
+                source_start += duration
+                master_start += duration
+            transitions = tuple(
+                RenderTransition(
+                    tier=("D" if index % 2 == 0 else "C"),
+                    reason=(
+                        "same_source_hold_no_visible_switch"
+                        if index % 2 == 0
+                        else "same_source_internal_camera_cut"
+                    ),
+                )
+                for index in range(len(split_segments) - 1)
+            )
+            baseline = RenderPlan(
+                sources=(source,),
+                segments=(RenderSegment(0, 0.1, 1.4, 0.0),),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=baseline_output,
+                width=160,
+                height=90,
+                fps=30.0,
+            )
+            split = RenderPlan(
+                sources=(source,),
+                segments=tuple(split_segments),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=split_output,
+                width=160,
+                height=90,
+                fps=30.0,
+                transitions=transitions,
+            )
+
+            render(baseline, video_codec="libx264")
+            render(split, video_codec="libx264")
+
+            def decode(path: Path) -> np.ndarray:
+                raw = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(path),
+                        "-pix_fmt",
+                        "rgb24",
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                return np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (-1, 90, 160, 3)
+                )
+
+            baseline_frames = decode(baseline_output)
+            split_frames = decode(split_output)
+
+        self.assertTrue(np.array_equal(split_frames, baseline_frames))
+        self.assertEqual(len(split_frames), 42)
+        boundary_frames = np.cumsum(
+            [round(duration * 30.0) for duration in durations]
+        )[:-1]
+        for boundary_frame in boundary_frames:
+            self.assertFalse(
+                np.array_equal(
+                    split_frames[boundary_frame - 1],
+                    split_frames[boundary_frame],
+                ),
+                f"duplicated frame at split boundary {boundary_frame}",
+            )
 
     def test_mixed_face_dissolve_chain_keeps_exact_frames_and_reference_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -479,6 +657,191 @@ class RenderIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(int(completed.stdout.strip()), 120)
+
+    def test_group_transform_preserves_timewarp_frames_and_hides_roll_corners(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            self._source(source, "white", duration=2.02)
+            output = root / "group-transform.mp4"
+            safe_zoom = minimum_roll_safe_zoom(1.0)
+            track = EditorialTransformTrack(
+                (
+                    EditorialTransformKeyframe(0.0, safe_zoom, 0.50, 0.50, -1.0),
+                    EditorialTransformKeyframe(1.0, 1.10, 0.50, 0.50, 0.0),
+                    EditorialTransformKeyframe(2.0, 1.16, 0.50, 0.50, 1.0),
+                ),
+                reason="integration_motion_proof",
+            )
+            plan = RenderPlan(
+                sources=(source,),
+                segments=(
+                    RenderSegment(
+                        0,
+                        0.0,
+                        2.0,
+                        0.0,
+                        editorial_transform=track,
+                        source_duration=2.02,
+                    ),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=output,
+                width=160,
+                height=90,
+                fps=30.0,
+            )
+
+            render(plan, video_codec="libx264")
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=nb_read_frames,duration",
+                    "-of",
+                    "json",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stream = json.loads(probe.stdout)["streams"][0]
+            decoded = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(output),
+                    "-pix_fmt",
+                    "rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            frames = np.frombuffer(decoded, dtype=np.uint8).reshape((-1, 90, 160, 3))
+            border = np.concatenate(
+                (
+                    frames[:, :2].reshape(-1, 3),
+                    frames[:, -2:].reshape(-1, 3),
+                    frames[:, :, :2].reshape(-1, 3),
+                    frames[:, :, -2:].reshape(-1, 3),
+                ),
+                axis=0,
+            )
+
+        self.assertEqual(int(stream["nb_read_frames"]), 60)
+        self.assertAlmostEqual(float(stream["duration"]), 2.0, places=5)
+        self.assertEqual(float(np.mean(np.max(border, axis=1) < 8)), 0.0)
+
+    def test_member_pan_crop_composes_with_portrait_editorial_camera(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "member.mp4"
+            # Consume 2.02 source seconds into 2.00 output seconds so this one
+            # integration covers the real local-timewarp + moving tracker path.
+            self._member_marker_source(source, duration=2.02)
+            output = root / "member-editorial.mp4"
+            crop_width = (9.0 / 16.0) / (16.0 / 9.0)
+            pan = PanCropTrack(
+                (
+                    PanCropKeyframe(
+                        0.0,
+                        NormalizedCrop(0.04, 0.0, crop_width, 1.0),
+                    ),
+                    PanCropKeyframe(
+                        2.0,
+                        NormalizedCrop(0.66, 0.0, crop_width, 1.0),
+                    ),
+                )
+            )
+            editorial = EditorialTransformTrack(
+                (
+                    EditorialTransformKeyframe(0.0, 1.18, 0.52, 0.5, -1.6),
+                    EditorialTransformKeyframe(0.75, 1.0, 0.5, 0.5, 0.0),
+                    EditorialTransformKeyframe(2.0, 1.08, 0.5, 0.5, 0.0),
+                ),
+                reason="confirmed_member_track_plus_editorial_motion",
+            )
+            plan = RenderPlan(
+                sources=(source,),
+                segments=(
+                    RenderSegment(
+                        0,
+                        0.0,
+                        2.0,
+                        0.0,
+                        pan_crop=pan,
+                        editorial_transform=editorial,
+                        source_duration=2.02,
+                    ),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.PORTRAIT,
+                output=output,
+                width=90,
+                height=160,
+                fps=30.0,
+            )
+
+            render(plan, video_codec="libx264")
+            decoded = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(output),
+                    "-pix_fmt",
+                    "rgb24",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+            frames = np.frombuffer(decoded, dtype=np.uint8).reshape((-1, 160, 90, 3))
+            bright_masks = np.min(frames, axis=3) > 220
+            bright_counts = np.sum(bright_masks, axis=(1, 2))
+            bright_margins: list[tuple[int, int, int, int]] = []
+            for mask in bright_masks:
+                rows, columns = np.where(mask)
+                self.assertGreater(len(rows), 0)
+                bright_margins.append(
+                    (
+                        int(columns.min()),
+                        89 - int(columns.max()),
+                        int(rows.min()),
+                        159 - int(rows.max()),
+                    )
+                )
+            border = np.concatenate(
+                (
+                    frames[:, :2].reshape(-1, 3),
+                    frames[:, -2:].reshape(-1, 3),
+                    frames[:, :, :2].reshape(-1, 3),
+                    frames[:, :, -2:].reshape(-1, 3),
+                ),
+                axis=0,
+            )
+
+        self.assertEqual(len(frames), 60)
+        self.assertGreater(int(np.min(bright_counts)), 1500)
+        self.assertGreaterEqual(min(min(item) for item in bright_margins), 2)
+        self.assertEqual(float(np.mean(np.max(border, axis=1) < 8)), 0.0)
 
 
 if __name__ == "__main__":

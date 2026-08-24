@@ -15,6 +15,7 @@ from crosscut.audio import (
     align_signal_set,
     extract_mono_pcm,
     normalized_cross_correlation_offset,
+    spectral_flux_alignment_offset,
 )
 from crosscut.media import probe_media
 
@@ -31,6 +32,33 @@ def _distinct_signal(length: int, sample_rate: int) -> np.ndarray:
 
 
 class NormalizedCorrelationTests(unittest.TestCase):
+    def test_spectral_flux_alignment_survives_polarity_and_mix_change(self) -> None:
+        sample_rate = 4_000
+        rng = np.random.default_rng(20260823)
+        reference = np.zeros(sample_rate * 12, dtype=np.float32)
+        for index, position in enumerate((700, 2100, 3900, 6400, 9100, 12700, 17100, 22300, 29100, 35600)):
+            width = 35 + index * 3
+            reference[position : position + width] = np.hanning(width) * (0.5 + index / 20)
+        reference += rng.normal(0, 0.003, reference.size).astype(np.float32)
+        delay = int(1.35 * sample_rate)
+        source = np.concatenate(
+            (
+                np.zeros(delay, dtype=np.float32),
+                -0.55 * reference,
+            )
+        )
+        source = np.tanh(source * 2.4).astype(np.float32)
+        estimate = spectral_flux_alignment_offset(
+            reference,
+            source,
+            sample_rate=sample_rate,
+            max_offset_seconds=3.0,
+            min_overlap_seconds=5.0,
+        )
+        self.assertAlmostEqual(estimate.offset_seconds, 1.35, delta=0.04)
+        self.assertGreater(estimate.score, 0.65)
+        self.assertEqual(estimate.backend, "spectral_flux_ncc")
+
     sample_rate = 200
 
     def test_finds_positive_delay_despite_gain_and_dc_offset(self) -> None:

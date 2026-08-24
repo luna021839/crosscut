@@ -12,6 +12,11 @@ dependencies = [
   "opencv-contrib-python>=4.10",
 ]
 
+[project.optional-dependencies]
+stage-edit-mlx = [
+  "mlx==0.32.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
 [tool.setuptools]
 packages = ["crosscut"]
 

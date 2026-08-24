@@ -1,0 +1,4653 @@
+"""Independent post-render QA for one completed automatic GROUP artifact set.
+
+The pipeline deliberately does not import this module.  It consumes only the
+finished timestamp-bound analysis, render-plan, candidate-selection, and MP4
+artifacts, then performs read-only probing/decoding and JSON-only professional
+edit diagnostics.  The resulting report can be written atomically by callers.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+from typing import Any, Callable, Mapping, Sequence
+
+
+SCHEMA_VERSION = 1
+ANALYSIS_BASIS = "timestamp_bound_full_decode_professional_post_render_qa_v1"
+
+_ANALYSIS_SUFFIX = "-analysis.json"
+_PLAN_SUFFIX = "-render-plan.json"
+_SELECTION_SUFFIX = "-rendered-candidate-selection.json"
+_VIDEO_SUFFIX = "-group-crosscut.mp4"
+_REPORT_SUFFIX = "-post-render-qa.json"
+_BASE_PATTERN = re.compile(r"^(?P<base>IVE-.+-(?P<timestamp>\d{8}-\d{6}))$")
+
+# Post-render QA intentionally does not import the proxy-review implementation:
+# it audits serialized artifacts as an independent consumer.  Keep the exact
+# review contracts here instead of accepting an open-ended string prefix.  The
+# latter allowed a newly introduced, domain-aware v3 review to be rejected while
+# an arbitrary unsupported future suffix could have been accepted.
+_LEGACY_PROXY_REVIEW_BASIS = (
+    "decoded_output_proxy_all_transition_quality_review_v2"
+)
+_DOMAIN_AWARE_PROXY_REVIEW_BASIS = (
+    "decoded_output_proxy_domain_aware_quality_review_v3"
+)
+_INTRODUCED_CROSS_SOURCE_DOMAIN = "introduced_cross_source"
+_TIER_D_CONTINUITY_DOMAIN = "tier_d_continuity"
+_NATIVE_SOURCE_CUT_DOMAIN = "native_source_cut"
+_BOUNDARY_REVIEW_DOMAINS = (
+    _INTRODUCED_CROSS_SOURCE_DOMAIN,
+    _TIER_D_CONTINUITY_DOMAIN,
+    _NATIVE_SOURCE_CUT_DOMAIN,
+)
+
+
+class PostRenderQAVerdict(str, Enum):
+    PASS = "PASS"
+    CONDITIONAL = "CONDITIONAL"
+    FAIL = "FAIL"
+
+
+class QAIssueSeverity(str, Enum):
+    CONDITIONAL = "conditional"
+    FAIL = "fail"
+
+
+@dataclass(frozen=True, slots=True)
+class PostRenderQAConfig:
+    required_complete_candidate_count: int = 8
+    minimum_source_switches_per_minute_hard: float = 12.5
+    preferred_minimum_source_switches_per_minute: float = 13.5
+    preferred_maximum_source_switches_per_minute: float = 17.5
+    preferred_minimum_source_switch_ratio: float = 0.34
+    preferred_maximum_source_switch_ratio: float = 0.64
+    maximum_visual_shot_median_seconds: float = 2.2
+    preferred_minimum_source_run_seconds: float = 2.5
+    preferred_maximum_source_run_seconds: float = 5.5
+    maximum_source_run_seconds: float = 7.2
+    preferred_maximum_dominant_source_share: float = 0.28
+    hard_maximum_dominant_source_share: float = 0.45
+    minimum_distinct_sources_when_required: int = 8
+    minimum_overall_quality_p10: float = 0.36
+    maximum_source_quality_median_span: float = 0.22
+    minimum_boundary_score_p10: float = 58.0
+    minimum_proxy_weighted_score: float = 60.0
+    professional_maximum_boundary_issue_count: int = 0
+    professional_maximum_geometry_provider_failure_count: int = 0
+    standard_boundary_repair_maximum_frames: int = 3
+    partial_reedit_maximum_frames: int = 8
+    exact_beat_window_frames: float = 1.0
+    standard_beat_window_frames: float = 3.0
+    partial_beat_window_frames: float = 8.0
+    maximum_source_local_reuse_seconds: float = 0.0001
+    ffprobe_fps_tolerance: float = 0.05
+    final_duration_tolerance_frames: float = 1.0
+    maximum_sync_residual_p95_frames: float = 0.5
+    minimum_local_timewarp_anchor_count: int = 3
+    maximum_editorial_zoom: float = 1.18
+    maximum_editorial_center_shift: float = 0.025
+    maximum_editorial_roll_degrees: float = 1.6
+    minimum_editorial_event_spacing_seconds: float = 3.5
+    tool_timeout_seconds: float = 900.0
+    ffprobe: str = "ffprobe"
+    ffmpeg: str = "ffmpeg"
+
+    def __post_init__(self) -> None:
+        if self.required_complete_candidate_count < 1:
+            raise ValueError("required candidate count must be positive")
+        if self.minimum_local_timewarp_anchor_count < 2:
+            raise ValueError("local time-warp anchor count must be at least two")
+        if not (
+            0.0
+            < self.minimum_source_switches_per_minute_hard
+            <= self.preferred_minimum_source_switches_per_minute
+            <= self.preferred_maximum_source_switches_per_minute
+        ):
+            raise ValueError("source-switch density thresholds are invalid")
+        if not (
+            0.0
+            <= self.preferred_minimum_source_switch_ratio
+            <= self.preferred_maximum_source_switch_ratio
+            <= 1.0
+        ):
+            raise ValueError("source-switch ratio thresholds are invalid")
+        if not (
+            0
+            <= self.standard_boundary_repair_maximum_frames
+            <= self.partial_reedit_maximum_frames
+        ):
+            raise ValueError("boundary-repair frame limits are invalid")
+        if not (
+            0.0
+            <= self.exact_beat_window_frames
+            <= self.standard_beat_window_frames
+            <= self.partial_beat_window_frames
+        ):
+            raise ValueError("beat windows are invalid")
+        finite_values = (
+            value
+            for name in self.__dataclass_fields__
+            for value in (getattr(self, name),)
+            if isinstance(value, float)
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in finite_values):
+            raise ValueError("numeric QA configuration must be finite and non-negative")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PostRenderArtifactSet:
+    base_name: str
+    timestamp: str
+    analysis_path: Path
+    render_plan_path: Path
+    selection_path: Path
+    video_path: Path
+
+    def __post_init__(self) -> None:
+        match = _BASE_PATTERN.fullmatch(self.base_name)
+        if match is None or match.group("timestamp") != self.timestamp:
+            raise ValueError("artifact base name does not end in its timestamp")
+        expected = {
+            "analysis_path": f"{self.base_name}{_ANALYSIS_SUFFIX}",
+            "render_plan_path": f"{self.base_name}{_PLAN_SUFFIX}",
+            "selection_path": f"{self.base_name}{_SELECTION_SUFFIX}",
+            "video_path": f"{self.base_name}{_VIDEO_SUFFIX}",
+        }
+        parents: set[Path] = set()
+        for name, filename in expected.items():
+            path = Path(getattr(self, name))
+            object.__setattr__(self, name, path)
+            if path.name != filename:
+                raise ValueError(f"{name} is not bound to the artifact base name")
+            parents.add(path.parent.resolve())
+        if len(parents) != 1:
+            raise ValueError("artifact files must share one output directory")
+
+    @classmethod
+    def from_analysis_path(cls, analysis_path: Path) -> "PostRenderArtifactSet":
+        analysis = Path(analysis_path)
+        if not analysis.name.endswith(_ANALYSIS_SUFFIX):
+            raise ValueError("analysis filename does not use the expected suffix")
+        base = analysis.name[: -len(_ANALYSIS_SUFFIX)]
+        match = _BASE_PATTERN.fullmatch(base)
+        if match is None:
+            raise ValueError("analysis filename does not contain a terminal timestamp")
+        root = analysis.parent
+        return cls(
+            base_name=base,
+            timestamp=match.group("timestamp"),
+            analysis_path=analysis,
+            render_plan_path=root / f"{base}{_PLAN_SUFFIX}",
+            selection_path=root / f"{base}{_SELECTION_SUFFIX}",
+            video_path=root / f"{base}{_VIDEO_SUFFIX}",
+        )
+
+    @property
+    def output_directory(self) -> Path:
+        return self.analysis_path.parent
+
+    @property
+    def default_report_path(self) -> Path:
+        return self.output_directory / f"{self.base_name}{_REPORT_SUFFIX}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "base_name": self.base_name,
+            "timestamp": self.timestamp,
+            "analysis_path": str(self.analysis_path.resolve()),
+            "render_plan_path": str(self.render_plan_path.resolve()),
+            "selection_path": str(self.selection_path.resolve()),
+            "video_path": str(self.video_path.resolve()),
+        }
+
+
+def discover_completed_artifact_sets(
+    output_directory: Path,
+) -> tuple[PostRenderArtifactSet, ...]:
+    """Return only exact, non-empty four-file GROUP sets in timestamp order."""
+
+    root = Path(output_directory)
+    if not root.is_dir():
+        return ()
+    discovered: list[PostRenderArtifactSet] = []
+    for analysis_path in sorted(root.glob(f"IVE-*{_ANALYSIS_SUFFIX}")):
+        try:
+            artifact_set = PostRenderArtifactSet.from_analysis_path(analysis_path)
+        except ValueError:
+            continue
+        paths = (
+            artifact_set.analysis_path,
+            artifact_set.render_plan_path,
+            artifact_set.selection_path,
+            artifact_set.video_path,
+        )
+        try:
+            complete = all(
+                path.is_file() and path.stat().st_size > 0 for path in paths
+            )
+        except OSError:
+            complete = False
+        if complete:
+            discovered.append(artifact_set)
+    return tuple(sorted(discovered, key=lambda item: (item.timestamp, item.base_name)))
+
+
+@dataclass(frozen=True, slots=True)
+class QAIssue:
+    code: str
+    severity: QAIssueSeverity
+    message: str
+    path: str | None = None
+    value: Any = None
+    threshold: Any = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "severity": self.severity.value,
+            "message": self.message,
+            "path": self.path,
+            "value": self.value,
+            "threshold": self.threshold,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PostRenderQAReport:
+    artifact_set: PostRenderArtifactSet
+    verdict: PostRenderQAVerdict
+    metrics: Mapping[str, Any]
+    issues: tuple[QAIssue, ...]
+    policy: PostRenderQAConfig
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    analysis_basis: str = ANALYSIS_BASIS
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict is PostRenderQAVerdict.PASS
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "analysis": self.analysis_basis,
+            "created_at": self.created_at.astimezone(UTC).isoformat(),
+            "artifact_set": self.artifact_set.to_dict(),
+            "policy": self.policy.to_dict(),
+            "verdict": self.verdict.value,
+            "passed": self.passed,
+            "issue_count": len(self.issues),
+            "fail_issue_count": sum(
+                issue.severity is QAIssueSeverity.FAIL for issue in self.issues
+            ),
+            "conditional_issue_count": sum(
+                issue.severity is QAIssueSeverity.CONDITIONAL
+                for issue in self.issues
+            ),
+            "issues": [issue.to_dict() for issue in self.issues],
+            "metrics": dict(self.metrics),
+        }
+
+    def write_atomic(self, output_path: Path | None = None) -> Path:
+        destination = Path(output_path or self.artifact_set.default_report_path)
+        protected = {
+            self.artifact_set.analysis_path.resolve(),
+            self.artifact_set.render_plan_path.resolve(),
+            self.artifact_set.selection_path.resolve(),
+            self.artifact_set.video_path.resolve(),
+        }
+        if destination.resolve() in protected:
+            raise ValueError("post-render QA report cannot overwrite an input artifact")
+        payload = self.to_dict()
+        # Serialize before creating a temporary file so NaN/type failures leave
+        # an existing report untouched.
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(destination)
+        except OSError:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+        return destination.resolve()
+
+
+RunCommand = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
+
+
+def _run_command(command: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(command),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+class _IssueCollector:
+    def __init__(self) -> None:
+        self.issues: list[QAIssue] = []
+        self._keys: set[tuple[str, str | None]] = set()
+
+    def add(
+        self,
+        code: str,
+        severity: QAIssueSeverity,
+        message: str,
+        *,
+        path: str | None = None,
+        value: Any = None,
+        threshold: Any = None,
+    ) -> None:
+        key = (code, path)
+        if key in self._keys:
+            return
+        self._keys.add(key)
+        self.issues.append(
+            QAIssue(code, severity, message, path, value, threshold)
+        )
+
+    def verdict(self) -> PostRenderQAVerdict:
+        if any(issue.severity is QAIssueSeverity.FAIL for issue in self.issues):
+            return PostRenderQAVerdict.FAIL
+        if self.issues:
+            return PostRenderQAVerdict.CONDITIONAL
+        return PostRenderQAVerdict.PASS
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ValueError(f"required artifact is missing or empty: {path.name}")
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=lambda token: _reject_nonfinite_json(token),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not read JSON artifact {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON artifact is not an object: {path.name}")
+    return value
+
+
+def _reject_nonfinite_json(token: str) -> Any:
+    raise ValueError(f"non-finite JSON number is not allowed: {token}")
+
+
+def _mapping(value: Any) -> dict[str, Any] | None:
+    return dict(value) if isinstance(value, Mapping) else None
+
+
+def _sequence(value: Any) -> list[Any] | None:
+    return list(value) if isinstance(value, list) else None
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _integer(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _probe_number(value: Any) -> float | None:
+    result = _number(value)
+    if result is not None:
+        return result
+    if not isinstance(value, str) or value.strip() in {"", "N/A"}:
+        return None
+    try:
+        result = float(value)
+    except ValueError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _probe_integer(value: Any) -> int | None:
+    result = _integer(value)
+    if result is not None:
+        return result
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    return int(value)
+
+
+def _fraction(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def _quantile(values: Sequence[float], fraction: float) -> float | None:
+    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    position = fraction * (len(clean) - 1)
+    low = math.floor(position)
+    high = math.ceil(position)
+    alpha = position - low
+    return clean[low] * (1.0 - alpha) + clean[high] * alpha
+
+
+def _distribution(values: Sequence[float]) -> dict[str, Any]:
+    clean = tuple(float(value) for value in values if math.isfinite(float(value)))
+    return {
+        "count": len(clean),
+        "minimum": min(clean) if clean else None,
+        "p50": _quantile(clean, 0.50),
+        "p90": _quantile(clean, 0.90),
+        "maximum": max(clean) if clean else None,
+    }
+
+
+def _declared_path_matches(value: Any, actual: Path) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    declared = Path(value).expanduser()
+    if declared.name != actual.name:
+        return False
+    if declared.is_absolute():
+        return declared.resolve() == actual.resolve()
+    return (actual.parent / declared).resolve() == actual.resolve()
+
+
+def _parse_rate(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _number(value)
+    if not isinstance(value, str) or not value or value in {"N/A", "0/0"}:
+        return None
+    try:
+        numerator, denominator = value.split("/", 1)
+        denominator_value = float(denominator)
+        if denominator_value == 0.0:
+            return None
+        result = float(numerator) / denominator_value
+    except (ValueError, ZeroDivisionError):
+        return None
+    return result if math.isfinite(result) and result > 0.0 else None
+
+
+def _codec_family(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"h264", "avc1", "libx264", "h264_videotoolbox"}:
+        return "h264"
+    if normalized in {"h265", "hevc", "hvc1", "libx265", "hevc_videotoolbox"}:
+        return "hevc"
+    return normalized or None
+
+
+def _probe_and_decode(
+    video_path: Path,
+    *,
+    config: PostRenderQAConfig,
+    runner: RunCommand,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    ffprobe_command = (
+        config.ffprobe,
+        "-v",
+        "error",
+        "-count_frames",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        str(video_path),
+    )
+    ffmpeg_command = (
+        config.ffmpeg,
+        "-nostdin",
+        "-v",
+        "error",
+        "-xerror",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-f",
+        "null",
+        "-",
+    )
+    payload: dict[str, Any] | None = None
+    probe_result: subprocess.CompletedProcess[str] | None = None
+    try:
+        probe_result = runner(ffprobe_command, config.tool_timeout_seconds)
+        if probe_result.returncode != 0:
+            collector.add(
+                "ffprobe_failed",
+                QAIssueSeverity.FAIL,
+                "ffprobe could not inspect the final MP4.",
+                path="tool_checks.ffprobe",
+                value=(probe_result.stderr or "").strip()[-1000:],
+                threshold=0,
+            )
+        else:
+            decoded = json.loads(
+                probe_result.stdout or "",
+                parse_constant=lambda token: _reject_nonfinite_json(token),
+            )
+            if not isinstance(decoded, dict):
+                raise ValueError("ffprobe result is not an object")
+            payload = decoded
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError) as exc:
+        collector.add(
+            "ffprobe_unavailable_or_invalid",
+            QAIssueSeverity.FAIL,
+            "ffprobe did not return valid JSON metadata.",
+            path="tool_checks.ffprobe",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+
+    decode_result: subprocess.CompletedProcess[str] | None = None
+    try:
+        decode_result = runner(ffmpeg_command, config.tool_timeout_seconds)
+        if decode_result.returncode != 0:
+            collector.add(
+                "full_decode_failed",
+                QAIssueSeverity.FAIL,
+                "The final MP4 did not fully decode without errors.",
+                path="tool_checks.full_decode",
+                value=(decode_result.stderr or "").strip()[-1000:],
+                threshold=0,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        collector.add(
+            "full_decode_unavailable",
+            QAIssueSeverity.FAIL,
+            "The full-decode command could not be completed.",
+            path="tool_checks.full_decode",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+
+    return {
+        "ffprobe": {
+            "command": list(ffprobe_command),
+            "returncode": probe_result.returncode if probe_result is not None else None,
+            "payload": payload,
+        },
+        "full_decode": {
+            "command": list(ffmpeg_command),
+            "returncode": decode_result.returncode if decode_result is not None else None,
+            "stderr": (
+                (decode_result.stderr or "").strip()[-1000:]
+                if decode_result is not None
+                else None
+            ),
+            "passed": decode_result is not None and decode_result.returncode == 0,
+        },
+    }
+
+
+def _validate_artifact_binding(
+    artifacts: PostRenderArtifactSet,
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    checks: dict[str, bool] = {}
+
+    created_at = analysis.get("created_at")
+    timestamp_matches = False
+    if isinstance(created_at, str):
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            timestamp_matches = (
+                created.astimezone(UTC).strftime("%Y%m%d-%H%M%S")
+                == artifacts.timestamp
+            )
+        except ValueError:
+            timestamp_matches = False
+    checks["analysis_created_at_matches_filename_timestamp"] = timestamp_matches
+
+    render_payload = _mapping(analysis.get("render")) or {}
+    checks["analysis_video_path_matches"] = _declared_path_matches(
+        render_payload.get("video_path"), artifacts.video_path
+    )
+    checks["analysis_plan_path_matches"] = _declared_path_matches(
+        render_payload.get("plan_path"), artifacts.render_plan_path
+    )
+    checks["render_plan_output_matches"] = _declared_path_matches(
+        plan.get("output"), artifacts.video_path
+    )
+    checks["standalone_selection_matches_analysis"] = (
+        analysis.get("rendered_candidate_selection") == selection
+    )
+    embedded_render_selection = render_payload.get("rendered_candidate_selection")
+    checks["render_selection_matches_standalone"] = (
+        embedded_render_selection is None or embedded_render_selection == selection
+    )
+    try:
+        checks["video_nonempty"] = (
+            artifacts.video_path.is_file()
+            and artifacts.video_path.stat().st_size > 0
+        )
+    except OSError:
+        checks["video_nonempty"] = False
+
+    for name, passed in checks.items():
+        if not passed:
+            collector.add(
+                f"artifact_binding_{name}",
+                QAIssueSeverity.FAIL,
+                "The timestamp-bound artifact set is incomplete or internally inconsistent.",
+                path=f"artifact_binding.{name}",
+                value=passed,
+                threshold=True,
+            )
+
+    residue_patterns = (
+        ".ive-crosscut-candidate-proxy-*",
+        ".ive-crosscut-proxy-*",
+        ".partial-candidate-*.mp4",
+    )
+    try:
+        residues = sorted(
+            {
+                str(path.resolve())
+                for pattern in residue_patterns
+                for path in artifacts.output_directory.glob(pattern)
+            }
+        )
+    except OSError as exc:
+        residues = []
+        collector.add(
+            "temporary_proxy_residue_scan_failed",
+            QAIssueSeverity.FAIL,
+            "The output directory could not be checked for temporary proxy residue.",
+            path="artifact_binding.temporary_proxy_residue",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+    if residues:
+        collector.add(
+            "temporary_proxy_residue",
+            QAIssueSeverity.FAIL,
+            "Temporary candidate proxy residue remains beside the completed artifacts.",
+            path="artifact_binding.temporary_proxy_residue",
+            value=residues,
+            threshold=[],
+        )
+    return {"checks": checks, "temporary_proxy_residue": residues}
+
+
+def _expected_review_boundaries(
+    segment_payloads: Sequence[Any],
+    transition_payloads: Sequence[Any],
+) -> list[tuple[int, int, str, str | None, str | None, bool | None]]:
+    segments = [_mapping(raw) or {} for raw in segment_payloads]
+    transitions = [_mapping(raw) or {} for raw in transition_payloads]
+    if len(segments) != len(transitions) + 1:
+        return []
+    expected: list[
+        tuple[int, int, str, str | None, str | None, bool | None]
+    ] = []
+    for index, transition in enumerate(transitions):
+        outgoing = _integer(segments[index].get("source_index"))
+        incoming = _integer(segments[index + 1].get("source_index"))
+        tier = transition.get("tier")
+        reason = transition.get("reason")
+        if outgoing is None or incoming is None:
+            return []
+        left_source_end = _number(segments[index].get("source_local_end"))
+        if left_source_end is None:
+            left_source_end = _number(segments[index].get("source_end"))
+        right_source_start = _number(
+            segments[index + 1].get("source_local_start")
+        )
+        if right_source_start is None:
+            right_source_start = _number(segments[index + 1].get("source_start"))
+        source_clock_contiguous = (
+            False
+            if outgoing != incoming
+            else (
+                abs(left_source_end - right_source_start) <= 1e-4
+                if left_source_end is not None and right_source_start is not None
+                else None
+            )
+        )
+        if outgoing != incoming:
+            domain = _INTRODUCED_CROSS_SOURCE_DOMAIN
+        elif tier == "D":
+            domain = _TIER_D_CONTINUITY_DOMAIN
+        else:
+            domain = _NATIVE_SOURCE_CUT_DOMAIN
+        expected.append(
+            (
+                outgoing,
+                incoming,
+                domain,
+                tier if isinstance(tier, str) else None,
+                reason if isinstance(reason, str) else None,
+                source_clock_contiguous,
+            )
+        )
+    return expected
+
+
+def _domain_aware_boundary_contract_valid(
+    review: Mapping[str, Any],
+    *,
+    expected_boundaries: Sequence[
+        tuple[int, int, str, str | None, str | None, bool | None]
+    ],
+) -> bool:
+    """Validate v3 boundary domains against the authored render plan.
+
+    Same-source coalescing is a renderer implementation detail.  The review
+    still owns one record per authored boundary and must distinguish an
+    invisible Tier-D continuation from a broadcaster/native camera cut.  This
+    check therefore binds every serialized domain, source pair, tier and reason
+    back to the uncoalesced plan rather than merely trusting aggregate counts.
+    """
+
+    boundaries = [
+        _mapping(raw) or {}
+        for raw in (_sequence(review.get("boundaries")) or [])
+    ]
+    if len(boundaries) != len(expected_boundaries):
+        return False
+    if any(
+        boundary.get("boundary_index") != index
+        or boundary.get("outgoing_source_index") != expected[0]
+        or boundary.get("incoming_source_index") != expected[1]
+        or boundary.get("review_domain") != expected[2]
+        or boundary.get("transition_tier") != expected[3]
+        or boundary.get("transition_reason") != expected[4]
+        or expected[5] is None
+        or boundary.get("source_clock_contiguous") is not expected[5]
+        for index, (boundary, expected) in enumerate(
+            zip(boundaries, expected_boundaries, strict=True)
+        )
+    ):
+        return False
+
+    expected_counts = Counter(item[2] for item in expected_boundaries)
+    serialized_count_fields = {
+        _INTRODUCED_CROSS_SOURCE_DOMAIN: "introduced_cross_source_count",
+        _TIER_D_CONTINUITY_DOMAIN: "tier_d_continuity_count",
+        _NATIVE_SOURCE_CUT_DOMAIN: "native_source_cut_count",
+    }
+    if any(
+        _integer(review.get(field_name)) != expected_counts[domain]
+        for domain, field_name in serialized_count_fields.items()
+    ):
+        return False
+
+    domains = _mapping(review.get("boundary_domains")) or {}
+    if set(domains) != set(_BOUNDARY_REVIEW_DOMAINS):
+        return False
+    for domain in _BOUNDARY_REVIEW_DOMAINS:
+        payload = _mapping(domains.get(domain)) or {}
+        count = expected_counts[domain]
+        issue_indices = _sequence(payload.get("issue_indices"))
+        issue_count = _integer(payload.get("issue_count"))
+        issue_fraction = _number(payload.get("issue_fraction"))
+        score = _mapping(payload.get("score")) or {}
+        distribution = _mapping(score.get("distribution")) or {}
+        if not (
+            payload.get("domain") == domain
+            and payload.get("count_basis") == domain
+            and _integer(payload.get("boundary_count")) == count
+            and issue_indices is not None
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value < len(boundaries)
+                and expected_boundaries[value][2] == domain
+                for value in issue_indices
+            )
+            and len(set(issue_indices)) == len(issue_indices)
+            and issue_count == len(issue_indices)
+            and issue_fraction is not None
+            and math.isclose(
+                issue_fraction,
+                len(issue_indices) / count if count else 0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and _integer(distribution.get("count")) == count
+            and (
+                (_number(score.get("p10")) is not None)
+                if count
+                else score.get("p10") is None
+            )
+            and isinstance(payload.get("passed"), bool)
+        ):
+            return False
+    return True
+
+
+def _decoded_candidate_review_contract_valid(
+    review: Mapping[str, Any],
+    *,
+    expected_decoded_frames: int | None,
+    expected_proxy_duration: float | None,
+    expected_proxy_fps: float | None,
+    expected_transition_count: int | None,
+    expected_source_indices: Sequence[int],
+    expected_boundaries: Sequence[
+        tuple[int, int, str, str | None, str | None, bool | None]
+    ],
+) -> bool:
+    proxy = _mapping(review.get("proxy")) or {}
+    decoded_frames = _integer(proxy.get("decoded_frame_count"))
+    proxy_duration = _number(proxy.get("duration_seconds"))
+    proxy_fps = _number(proxy.get("fps"))
+    transition_count = _integer(review.get("transition_count"))
+    reviewed_count = _integer(review.get("reviewed_boundary_count"))
+    hard_count = _integer(review.get("hard_cut_count"))
+    dissolve_count = _integer(review.get("dissolve_count"))
+    boundaries = _sequence(review.get("boundaries")) or []
+    overall = _mapping(review.get("overall_quality")) or {}
+    source_quality = _mapping(review.get("source_quality")) or {}
+    source_quality_items = [
+        item
+        for raw in (_sequence(source_quality.get("per_source")) or [])
+        if (item := _mapping(raw)) is not None
+    ]
+    source_quality_indices = [
+        _integer(item.get("source_index")) for item in source_quality_items
+    ]
+    source_quality_medians = [
+        _number((_mapping(item.get("quality")) or {}).get("median"))
+        for item in source_quality_items
+    ]
+    source_quality_p10s = [
+        _number((_mapping(item.get("quality")) or {}).get("p10"))
+        for item in source_quality_items
+    ]
+    serialized_median_span = _number(source_quality.get("median_span"))
+    serialized_p10_span = _number(source_quality.get("p10_span"))
+    derived_median_span = (
+        max(value for value in source_quality_medians if value is not None)
+        - min(value for value in source_quality_medians if value is not None)
+        if source_quality_medians
+        and all(value is not None for value in source_quality_medians)
+        else None
+    )
+    derived_p10_span = (
+        max(value for value in source_quality_p10s if value is not None)
+        - min(value for value in source_quality_p10s if value is not None)
+        if source_quality_p10s
+        and all(value is not None for value in source_quality_p10s)
+        else None
+    )
+    boundary_score = _mapping(review.get("boundary_score")) or {}
+    analysis_basis = review.get("analysis")
+    schema_version = _integer(review.get("schema_version"))
+    review_contract_valid = (
+        schema_version == 2
+        and analysis_basis == _LEGACY_PROXY_REVIEW_BASIS
+    ) or (
+        schema_version == 3
+        and analysis_basis == _DOMAIN_AWARE_PROXY_REVIEW_BASIS
+        and _domain_aware_boundary_contract_valid(
+            review,
+            expected_boundaries=expected_boundaries,
+        )
+    )
+    return bool(
+        review_contract_valid
+        and isinstance(review.get("passed"), bool)
+        and proxy.get("path") is None
+        and proxy.get("temporary_proxy_removed_after_review") is True
+        and expected_decoded_frames is not None
+        and decoded_frames == expected_decoded_frames
+        and expected_proxy_duration is not None
+        and proxy_duration is not None
+        and math.isclose(
+            proxy_duration,
+            expected_proxy_duration,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        and expected_proxy_fps is not None
+        and proxy_fps is not None
+        and math.isclose(
+            proxy_fps,
+            expected_proxy_fps,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        and expected_transition_count is not None
+        and transition_count == expected_transition_count
+        and reviewed_count == expected_transition_count
+        and hard_count is not None
+        and dissolve_count is not None
+        and hard_count + dissolve_count == expected_transition_count
+        and len(boundaries) == expected_transition_count
+        and all(
+            (_mapping(item) or {}).get("boundary_index") == index
+            and isinstance((_mapping(item) or {}).get("passed"), bool)
+            and _number((_mapping(item) or {}).get("weighted_score")) is not None
+            for index, item in enumerate(boundaries)
+        )
+        and _integer(overall.get("count")) == expected_decoded_frames
+        and _number(overall.get("p10")) is not None
+        and all(index is not None for index in source_quality_indices)
+        and len(source_quality_indices) == len(expected_source_indices)
+        and len(set(source_quality_indices)) == len(source_quality_indices)
+        and set(source_quality_indices) == set(expected_source_indices)
+        and all(value is not None for value in source_quality_medians)
+        and all(value is not None for value in source_quality_p10s)
+        and serialized_median_span is not None
+        and derived_median_span is not None
+        and math.isclose(
+            serialized_median_span,
+            derived_median_span,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        and serialized_p10_span is not None
+        and derived_p10_span is not None
+        and math.isclose(
+            serialized_p10_span,
+            derived_p10_span,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        and _number(boundary_score.get("p10")) is not None
+        and _integer(boundary_score.get("issue_count")) is not None
+        and _number(review.get("weighted_score")) is not None
+        and _integer(review.get("geometry_provider_failure_count")) is not None
+    )
+
+
+def _validate_selection(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    required = config.required_complete_candidate_count
+    final_review = _mapping(selection.get("final_selected_review")) or {}
+    expected_decoded_frames = _integer(plan.get("output_frame_count"))
+    expected_proxy_duration = _number(plan.get("render_duration"))
+    expected_proxy_fps = _number(plan.get("fps"))
+    expected_source_indices = sorted(
+        {
+            index
+            for raw in (_sequence(plan.get("segments")) or [])
+            if (item := _mapping(raw)) is not None
+            and (index := _integer(item.get("source_index"))) is not None
+        }
+    )
+    plan_segments = [
+        _mapping(raw) or {}
+        for raw in (_sequence(plan.get("segments")) or [])
+    ]
+    plan_transitions = [
+        _mapping(raw) or {} for raw in (_sequence(plan.get("transitions")) or [])
+    ]
+    expected_transition_count = len(plan_transitions)
+    expected_boundaries = _expected_review_boundaries(
+        plan_segments,
+        plan_transitions,
+    )
+    checks = {
+        "selection_passed": selection.get("passed") is True,
+        "requested_review_count": selection.get("requested_review_count") == required,
+        "reviewed_candidate_count_field": (
+            selection.get("reviewed_candidate_count") == required
+        ),
+        "minimum_required_candidate_count": (
+            selection.get("minimum_required_candidate_count") == required
+        ),
+        "minimum_candidate_count_satisfied": (
+            selection.get("minimum_candidate_count_satisfied") is True
+        ),
+        "complete_candidate_count": selection.get("complete_candidate_count") == required,
+        "successful_review_count": selection.get("successful_review_count") == required,
+        "exact_complete_candidate_count_satisfied": (
+            selection.get("exact_complete_candidate_count_satisfied") is True
+        ),
+        "exact_successful_decoded_review_count_satisfied": (
+            selection.get("exact_successful_decoded_review_count_satisfied") is True
+        ),
+    }
+    candidates = _sequence(selection.get("candidates")) or []
+    complete_candidates = _sequence(selection.get("complete_candidates")) or []
+    complete_candidates_by_index = {
+        index: item
+        for raw in complete_candidates
+        if (item := _mapping(raw)) is not None
+        and (index := _integer(item.get("candidate_index"))) is not None
+    }
+    candidate_objects = [_mapping(item) or {} for item in candidates]
+    candidate_indices = [
+        _integer(item.get("candidate_index")) for item in candidate_objects
+    ]
+    successful_candidate_flags: list[bool] = []
+    review_pass_flags_match = True
+    sanitized_proxy_flags = True
+    for item in candidate_objects:
+        review = _mapping(item.get("review"))
+        candidate_source_indices = expected_source_indices
+        candidate_transition_count = expected_transition_count
+        candidate_boundaries = expected_boundaries
+        if (
+            review is not None
+            and review.get("analysis") == _DOMAIN_AWARE_PROXY_REVIEW_BASIS
+        ):
+            complete_candidate = complete_candidates_by_index.get(
+                _integer(item.get("candidate_index"))
+            )
+            candidate_choices = _sequence(
+                (
+                    _mapping(
+                        (complete_candidate or {}).get("visual_timeline")
+                    )
+                    or {}
+                ).get("choices")
+            ) or []
+            candidate_transitions = _sequence(
+                (
+                    _mapping(
+                        (complete_candidate or {}).get("group_transitions")
+                    )
+                    or {}
+                ).get("transitions")
+            ) or []
+            candidate_boundaries = _expected_review_boundaries(
+                candidate_choices,
+                candidate_transitions,
+            )
+            candidate_transition_count = len(candidate_transitions)
+            candidate_source_indices = sorted(
+                {
+                    index
+                    for raw in candidate_choices
+                    if (choice := _mapping(raw)) is not None
+                    and (index := _integer(choice.get("source_index"))) is not None
+                }
+            )
+        successful = (
+            review is not None
+            and item.get("error") is None
+            and _decoded_candidate_review_contract_valid(
+                review,
+                expected_decoded_frames=expected_decoded_frames,
+                expected_proxy_duration=expected_proxy_duration,
+                expected_proxy_fps=expected_proxy_fps,
+                expected_transition_count=candidate_transition_count,
+                expected_source_indices=candidate_source_indices,
+                expected_boundaries=candidate_boundaries,
+            )
+        )
+        successful_candidate_flags.append(successful)
+        if successful:
+            review_pass_flags_match = (
+                review_pass_flags_match
+                and item.get("passed") is review.get("passed")
+            )
+            proxy = _mapping(review.get("proxy")) or {}
+            sanitized_proxy_flags = (
+                sanitized_proxy_flags
+                and proxy.get("path") is None
+                and proxy.get("temporary_proxy_removed_after_review") is True
+            )
+    actual_successful_count = sum(successful_candidate_flags)
+    actual_passing_count = sum(
+        item.get("passed") is True for item in candidate_objects
+    )
+    selected_index = _integer(selection.get("selected_candidate_index"))
+    selected_entries = [
+        item
+        for item in candidate_objects
+        if item.get("selected") is True
+    ]
+    checks["reviewed_candidate_count"] = len(candidates) == required
+    checks["complete_candidates_payload_count"] = (
+        len(complete_candidates) == required
+    )
+    complete_candidate_indices = [
+        _integer((_mapping(item) or {}).get("candidate_index"))
+        for item in complete_candidates
+    ]
+    checks["complete_candidate_indices_match_reviewed"] = (
+        all(index is not None for index in complete_candidate_indices)
+        and len(set(complete_candidate_indices)) == required
+        and set(complete_candidate_indices) == set(candidate_indices)
+    )
+    checks["candidate_indices_valid_and_unique"] = (
+        all(index is not None for index in candidate_indices)
+        and len(set(candidate_indices)) == required
+    )
+    checks["actual_successful_review_count_matches"] = (
+        actual_successful_count == required
+        and selection.get("successful_review_count") == actual_successful_count
+    )
+    checks["actual_passing_candidate_count_matches"] = (
+        selection.get("passing_candidate_count") == actual_passing_count
+    )
+    checks["candidate_pass_flags_match_reviews"] = review_pass_flags_match
+    checks["candidate_proxy_payloads_sanitized"] = sanitized_proxy_flags
+    checks["selected_candidate_marker_matches"] = (
+        selected_index is not None
+        and len(selected_entries) == 1
+        and selected_entries[0].get("candidate_index") == selected_index
+    )
+    storage_policy = _mapping(selection.get("storage_policy")) or {}
+    checks["one_proxy_at_a_time_storage_policy"] = (
+        storage_policy.get("one_proxy_at_a_time") is True
+        and storage_policy.get("temporary_proxy_removed_after_each_review") is True
+        and storage_policy.get("decoded_frames_persisted") is False
+    )
+    checks["final_selected_review_passed"] = final_review.get("passed") is True
+    checks["final_selected_decoded_review_contract_valid"] = (
+        _decoded_candidate_review_contract_valid(
+            final_review,
+            expected_decoded_frames=expected_decoded_frames,
+            expected_proxy_duration=expected_proxy_duration,
+            expected_proxy_fps=expected_proxy_fps,
+            expected_transition_count=expected_transition_count,
+            expected_source_indices=expected_source_indices,
+            expected_boundaries=expected_boundaries,
+        )
+    )
+    checks["analysis_final_review_matches"] = (
+        analysis.get("rendered_proxy_review") == final_review
+    )
+    for name, passed in checks.items():
+        if not passed:
+            collector.add(
+                f"selection_{name}",
+                QAIssueSeverity.FAIL,
+                "The exact-eight decoded candidate selection contract did not pass.",
+                path=f"selection.{name}",
+                value=passed,
+                threshold=True,
+            )
+
+    version = selection.get("final_selected_version")
+    partial = _mapping(selection.get("proxy_triggered_partial_reedit")) or {}
+    checks["nested_selected_version_matches"] = (
+        partial.get("selected_version") == version
+    )
+    if version == "original" and selected_entries:
+        checks["original_final_review_matches_selected_candidate"] = (
+            selected_entries[0].get("passed") is True
+            and selected_entries[0].get("review") == final_review
+        )
+    else:
+        checks["original_final_review_matches_selected_candidate"] = True
+    for name in (
+        "nested_selected_version_matches",
+        "original_final_review_matches_selected_candidate",
+    ):
+        if not checks[name]:
+            collector.add(
+                f"selection_{name}",
+                QAIssueSeverity.FAIL,
+                "The final selection version or review is internally inconsistent.",
+                path=f"selection.{name}",
+                value=checks[name],
+                threshold=True,
+            )
+    partial_checks: dict[str, Any] = {
+        "selected_version": version,
+        "selected_partial_reedit": version == "partial_reedit",
+    }
+    if version not in {"original", "partial_reedit"}:
+        collector.add(
+            "selection_unknown_final_version",
+            QAIssueSeverity.FAIL,
+            "The final selected candidate version is unknown.",
+            path="selection.final_selected_version",
+            value=version,
+        )
+    if version == "partial_reedit":
+        invariant_checks = _mapping(partial.get("invariant_checks")) or {}
+        required_invariant_names = {
+            "segment_count_preserved",
+            "source_sequence_preserved",
+            "render_source_sequence_preserved",
+            "canonical_first_last_range_preserved",
+            "outside_issue_boundary_timestamps_preserved",
+            "actual_changed_boundaries_subset_of_requested",
+            "output_frame_count_preserved",
+            "render_duration_preserved",
+        }
+        valid_invariants = (
+            required_invariant_names.issubset(invariant_checks)
+            and all(value is True for value in invariant_checks.values())
+        )
+        changed_indices = _sequence(partial.get("changed_boundary_indices")) or []
+        transition_count = len(
+            _sequence(
+                (_mapping(analysis.get("group_transitions")) or {}).get(
+                    "transitions"
+                )
+            )
+            or []
+        )
+        repair_items = [
+            item
+            for raw in (
+                _sequence((_mapping(partial.get("repair")) or {}).get("repairs"))
+                or []
+            )
+            if (item := _mapping(raw)) is not None
+        ]
+        changed_repair_indices = [
+            index
+            for item in repair_items
+            if (index := _integer(item.get("boundary_index"))) is not None
+            and (
+                (_mapping(item.get("result")) or {}).get("changed") is True
+                or (
+                    _integer(
+                        (_mapping(item.get("result")) or {}).get(
+                            "selected_frame_offset"
+                        )
+                    )
+                    or 0
+                )
+                != 0
+            )
+        ]
+        valid_changed_indices = (
+            bool(changed_indices)
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                and value < transition_count
+                for value in changed_indices
+            )
+            and len(set(changed_indices)) == len(changed_indices)
+            and set(changed_indices) == set(changed_repair_indices)
+            and len(changed_repair_indices) == len(set(changed_repair_indices))
+        )
+        selected_original_review = (
+            _mapping(selected_entries[0].get("review"))
+            if len(selected_entries) == 1
+            else None
+        )
+        improvement_proof_valid = (
+            selected_original_review is not None
+            and selected_original_review.get("passed") is not True
+            and partial.get("before_review") == selected_original_review
+            and partial.get("after_review") == final_review
+            and final_review.get("passed") is True
+        )
+        partial_checks.update(
+            {
+                "attempted": partial.get("attempted") is True,
+                "improved": partial.get("improved") is True,
+                "outside_issue_boundaries_preserved": (
+                    partial.get("outside_issue_boundaries_preserved") is True
+                ),
+                "all_invariants_passed": valid_invariants,
+                "changed_boundary_indices_valid": valid_changed_indices,
+                "decoded_improvement_proof_valid": improvement_proof_valid,
+            }
+        )
+        for name in (
+            "attempted",
+            "improved",
+            "outside_issue_boundaries_preserved",
+            "all_invariants_passed",
+            "changed_boundary_indices_valid",
+            "decoded_improvement_proof_valid",
+        ):
+            if not partial_checks[name]:
+                collector.add(
+                    f"partial_reedit_{name}",
+                    QAIssueSeverity.FAIL,
+                    "The selected partial re-edit lacks a required invariant or improvement proof.",
+                    path=f"selection.proxy_triggered_partial_reedit.{name}",
+                    value=partial_checks[name],
+                    threshold=True,
+                )
+    return (
+        {
+            "required_candidate_count": required,
+            "checks": checks,
+            "final_selected_candidate_index": selection.get(
+                "selected_candidate_index"
+            ),
+            "actual_successful_review_count": actual_successful_count,
+            "actual_passing_candidate_count": actual_passing_count,
+            "final_selected_version": version,
+            "passing_candidate_count": selection.get("passing_candidate_count"),
+            "partial_reedit": partial_checks,
+        },
+        final_review,
+    )
+
+
+def _validate_plan_invariants(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    final_review: Mapping[str, Any],
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    segments = _sequence(plan.get("segments")) or []
+    transitions = _sequence(plan.get("transitions")) or []
+    timeline = _mapping(analysis.get("timeline_review")) or {}
+    group = _mapping(analysis.get("group_transitions")) or {}
+    fps = _number(plan.get("fps"))
+    duration = _number(plan.get("duration"))
+    render_duration = _number(plan.get("render_duration"))
+    output_frames = _integer(plan.get("output_frame_count"))
+    common_range = _mapping(analysis.get("common_master_range")) or {}
+    common_start = _number(common_range.get("start_seconds"))
+    common_end = _number(common_range.get("end_seconds"))
+    common_duration = _number(common_range.get("duration_seconds"))
+
+    expected_frames = (
+        int(round(duration * fps))
+        if duration is not None and fps is not None and fps > 0.0
+        else None
+    )
+    expected_render_duration = (
+        output_frames / fps
+        if output_frames is not None and fps is not None and fps > 0.0
+        else None
+    )
+    n = len(transitions)
+    hard_count = _integer(final_review.get("hard_cut_count"))
+    dissolve_count = _integer(final_review.get("dissolve_count"))
+    group_hard = _integer(group.get("hard_cut_boundary_count"))
+    group_dissolve = _integer(group.get("dissolve_count"))
+    introduced_hard = _integer(group.get("introduced_hard_cut_count"))
+    same_source_hold = _integer(group.get("same_source_hold_count"))
+    timeline_switches = _integer(timeline.get("source_switch_count"))
+    plan_hard_count = sum(
+        (_mapping(item) or {}).get("kind") == "hard_cut" for item in transitions
+    )
+    plan_dissolve_count = sum(
+        (_mapping(item) or {}).get("kind") == "face_dissolve"
+        for item in transitions
+    )
+    plan_cross_source_switch_count = 0
+    plan_introduced_hard_count = 0
+    plan_tier_d_hold_count = 0
+    plan_native_source_cut_count = 0
+    for index, raw_transition in enumerate(transitions):
+        transition = _mapping(raw_transition) or {}
+        left = _mapping(segments[index]) or {} if index < len(segments) else {}
+        right = (
+            _mapping(segments[index + 1]) or {}
+            if index + 1 < len(segments)
+            else {}
+        )
+        same_source = left.get("source_index") == right.get("source_index")
+        if not same_source:
+            plan_cross_source_switch_count += 1
+        if transition.get("kind") == "hard_cut" and transition.get("tier") != "D":
+            plan_introduced_hard_count += 1
+        if transition.get("kind") == "hard_cut" and transition.get("tier") == "D":
+            plan_tier_d_hold_count += 1
+        if (
+            transition.get("kind") == "hard_cut"
+            and transition.get("tier") != "D"
+            and same_source
+        ):
+            plan_native_source_cut_count += 1
+    timeline_boundaries = _sequence(timeline.get("boundaries")) or []
+    checks: dict[str, bool] = {
+        "one_transition_per_boundary": len(segments) > 0 and n == len(segments) - 1,
+        "timeline_boundary_count_matches": timeline.get("boundary_count") == n,
+        "timeline_boundary_payload_count_matches": len(timeline_boundaries) == n,
+        "proxy_transition_count_matches": final_review.get("transition_count") == n,
+        "proxy_reviewed_boundary_count_matches": (
+            final_review.get("reviewed_boundary_count") == n
+        ),
+        "proxy_transition_kinds_sum": (
+            hard_count is not None
+            and dissolve_count is not None
+            and hard_count + dissolve_count == n
+        ),
+        "proxy_transition_kind_counts_match_plan": (
+            hard_count == plan_hard_count
+            and dissolve_count == plan_dissolve_count
+        ),
+        "group_transition_kinds_sum": (
+            group_hard is not None
+            and group_dissolve is not None
+            and group_hard + group_dissolve == n
+        ),
+        "group_transition_kind_counts_match_plan": (
+            group_hard == plan_hard_count
+            and group_dissolve == plan_dissolve_count
+        ),
+        "visible_source_switch_count_matches": (
+            timeline_switches == plan_cross_source_switch_count
+        ),
+        "group_introduced_hard_count_matches_plan": (
+            introduced_hard == plan_introduced_hard_count
+        ),
+        "group_same_source_hold_count_matches_plan": (
+            same_source_hold == plan_tier_d_hold_count
+        ),
+        "hard_cut_count_decomposition": (
+            introduced_hard is not None
+            and same_source_hold is not None
+            and hard_count is not None
+            and introduced_hard + same_source_hold == hard_count
+        ),
+        "output_frame_count_formula": (
+            expected_frames is not None and output_frames == expected_frames
+        ),
+        "render_duration_formula": (
+            expected_render_duration is not None
+            and render_duration is not None
+            and math.isclose(
+                render_duration,
+                expected_render_duration,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ),
+        "proxy_decoded_frame_count_matches": (
+            final_review.get("proxy", {}).get("decoded_frame_count") == output_frames
+            if isinstance(final_review.get("proxy"), Mapping)
+            else False
+        ),
+    }
+
+    previous_end = 0.0
+    segment_duration_sum = 0.0
+    contiguous = True
+    positive = True
+    segment_source_indices: list[int] = []
+    for index, raw in enumerate(segments):
+        item = _mapping(raw)
+        if item is None:
+            contiguous = positive = False
+            break
+        master_start = _number(item.get("master_start"))
+        item_duration = _number(item.get("duration"))
+        source_index = _integer(item.get("source_index"))
+        if source_index is not None:
+            segment_source_indices.append(source_index)
+        if master_start is None or item_duration is None or item_duration <= 0.0:
+            positive = False
+            continue
+        if not math.isclose(master_start, previous_end, rel_tol=0.0, abs_tol=1e-6):
+            contiguous = False
+        previous_end = master_start + item_duration
+        segment_duration_sum += item_duration
+    checks["segments_positive"] = positive
+    checks["segments_contiguous"] = contiguous
+    checks["segment_duration_sum_matches_plan"] = (
+        duration is not None
+        and math.isclose(
+            segment_duration_sum,
+            duration,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    )
+
+    sources = _sequence(plan.get("sources")) or []
+    checks["segment_source_indices_in_range"] = (
+        len(segment_source_indices) == len(segments)
+        and all(0 <= index < len(sources) for index in segment_source_indices)
+    )
+    actual_used_source_indices = sorted(set(segment_source_indices))
+    source_usage = _mapping(plan.get("source_usage")) or {}
+    serialized_used_source_indices = _sequence(
+        source_usage.get("used_source_indices")
+    )
+    checks["source_usage_matches_segments"] = (
+        source_usage.get("distinct_source_count") == len(actual_used_source_indices)
+        and serialized_used_source_indices == actual_used_source_indices
+        and source_usage.get("total_segment_count") == len(segments)
+        and (
+            (usage_duration := _number(source_usage.get("total_duration_seconds")))
+            is not None
+        )
+        and duration is not None
+        and math.isclose(usage_duration, duration, rel_tol=0.0, abs_tol=1e-6)
+    )
+    checks["timeline_unique_sources_matches_plan"] = (
+        timeline.get("unique_source_count") == len(actual_used_source_indices)
+    )
+    visual_choices = _sequence(
+        (_mapping(analysis.get("visual_timeline")) or {}).get("choices")
+    ) or []
+    checks["visual_choices_match_plan_segments"] = (
+        len(visual_choices) == len(segments)
+        and all(
+            (_mapping(choice) or {}).get("segment_index") == index
+            and (_mapping(choice) or {}).get("source_index")
+            == (_mapping(segments[index]) or {}).get("source_index")
+            for index, choice in enumerate(visual_choices)
+        )
+    )
+    timeline_duration = _number(timeline.get("total_duration_seconds"))
+    checks["analysis_duration_contract_matches_plan"] = (
+        duration is not None
+        and timeline_duration is not None
+        and common_start is not None
+        and common_end is not None
+        and common_duration is not None
+        and math.isclose(timeline_duration, duration, rel_tol=0.0, abs_tol=1e-6)
+        and math.isclose(common_duration, duration, rel_tol=0.0, abs_tol=1e-6)
+        and math.isclose(
+            common_end,
+            common_start + common_duration,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    )
+
+    transition_payloads_valid = True
+    for index, transition_raw in enumerate(transitions):
+        transition = _mapping(transition_raw) or {}
+        left = _mapping(segments[index]) or {} if index < len(segments) else {}
+        right = (
+            _mapping(segments[index + 1]) or {}
+            if index + 1 < len(segments)
+            else {}
+        )
+        if transition.get("tier") == "D" and left.get("source_index") != right.get(
+            "source_index"
+        ):
+            checks["tier_d_same_source"] = False
+        if transition.get("kind") == "face_dissolve":
+            if transition.get("tier") != "A" or left.get("source_index") == right.get(
+                "source_index"
+            ):
+                checks["dissolve_tier_a_real_switch"] = False
+        kind = transition.get("kind")
+        frame_count = _integer(transition.get("frame_count"))
+        transition_duration = _number(transition.get("duration_seconds"))
+        if not (
+            kind in {"hard_cut", "face_dissolve"}
+            and frame_count is not None
+            and frame_count >= 0
+            and transition_duration is not None
+            and fps is not None
+            and fps > 0.0
+            and math.isclose(
+                transition_duration,
+                frame_count / fps,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and (kind != "hard_cut" or frame_count == 0)
+            and (kind != "face_dissolve" or frame_count > 0)
+        ):
+            transition_payloads_valid = False
+    checks.setdefault("tier_d_same_source", True)
+    checks.setdefault("dissolve_tier_a_real_switch", True)
+    checks["transition_payloads_valid"] = transition_payloads_valid
+
+    group_transitions = _sequence(group.get("transitions"))
+    checks["group_transitions_match_render_plan"] = group_transitions == transitions
+
+    render_payload = _mapping(analysis.get("render")) or {}
+    final_segments = _sequence(render_payload.get("final_render_segments")) or []
+    checks["final_render_segment_count_matches"] = len(final_segments) == len(segments)
+    final_segments_match = len(final_segments) == len(segments)
+    for index, (raw_plan_segment, raw_final_segment) in enumerate(
+        zip(segments, final_segments, strict=False)
+    ):
+        plan_segment = _mapping(raw_plan_segment) or {}
+        final_segment = _mapping(raw_final_segment) or {}
+        plan_start = _number(plan_segment.get("master_start"))
+        plan_duration = _number(plan_segment.get("duration"))
+        final_start = _number(final_segment.get("output_start_seconds"))
+        final_end = _number(final_segment.get("output_end_seconds"))
+        final_canonical_start = _number(
+            final_segment.get("canonical_master_start")
+        )
+        final_canonical_end = _number(final_segment.get("canonical_master_end"))
+        plan_source_start = _number(plan_segment.get("source_local_start"))
+        plan_source_end = _number(plan_segment.get("source_local_end"))
+        if plan_source_start is None:
+            plan_source_start = _number(plan_segment.get("source_start"))
+        if plan_source_end is None:
+            plan_source_end = _number(plan_segment.get("source_end"))
+        final_source_start = _number(final_segment.get("source_local_start"))
+        final_source_end = _number(final_segment.get("source_local_end"))
+        if not (
+            final_segment.get("segment_index") == index
+            and final_segment.get("request_source_index")
+            == plan_segment.get("source_index")
+            and plan_start is not None
+            and plan_duration is not None
+            and final_start is not None
+            and final_end is not None
+            and final_canonical_start is not None
+            and final_canonical_end is not None
+            and common_start is not None
+            and math.isclose(
+                final_canonical_start,
+                common_start + plan_start,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            and math.isclose(
+                final_canonical_end,
+                common_start + plan_start + plan_duration,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            and math.isclose(final_start, plan_start, rel_tol=0.0, abs_tol=1e-6)
+            and math.isclose(
+                final_end,
+                plan_start + plan_duration,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            and plan_source_start is not None
+            and plan_source_end is not None
+            and final_source_start is not None
+            and final_source_end is not None
+            and math.isclose(
+                final_source_start,
+                plan_source_start,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            and math.isclose(
+                final_source_end,
+                plan_source_end,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            final_segments_match = False
+    checks["final_render_segments_match_plan"] = final_segments_match
+
+    proxy_boundaries = _sequence(final_review.get("boundaries")) or []
+    proxy_boundaries_match = len(proxy_boundaries) == n
+    timeline_boundaries_match = len(timeline_boundaries) == n
+    derived_timeline_switch_count = 0
+    cumulative_seconds = 0.0
+    for index, transition_raw in enumerate(transitions):
+        segment = _mapping(segments[index]) or {} if index < len(segments) else {}
+        item_duration = _number(segment.get("duration"))
+        if item_duration is None or fps is None:
+            proxy_boundaries_match = False
+            continue
+        cumulative_seconds += item_duration
+        expected_cut_frame = int(round(cumulative_seconds * fps))
+        review_boundary = (
+            _mapping(proxy_boundaries[index]) or {}
+            if index < len(proxy_boundaries)
+            else {}
+        )
+        timeline_boundary = (
+            _mapping(timeline_boundaries[index]) or {}
+            if index < len(timeline_boundaries)
+            else {}
+        )
+        transition = _mapping(transition_raw) or {}
+        left_source_index = (_mapping(segments[index]) or {}).get("source_index")
+        right_source_index = (
+            (_mapping(segments[index + 1]) or {}).get("source_index")
+            if index + 1 < len(segments)
+            else None
+        )
+        if not (
+            review_boundary.get("boundary_index") == index
+            and review_boundary.get("cut_frame_index") == expected_cut_frame
+            and review_boundary.get("outgoing_source_index") == left_source_index
+            and review_boundary.get("incoming_source_index") == right_source_index
+            and review_boundary.get("transition_kind") == transition.get("kind")
+            and review_boundary.get("transition_frame_count")
+            == transition.get("frame_count")
+        ):
+            proxy_boundaries_match = False
+        timeline_at = _number(timeline_boundary.get("at_seconds"))
+        expected_source_switch = left_source_index != right_source_index
+        derived_timeline_switch_count += expected_source_switch
+        if not (
+            timeline_boundary.get("boundary_index") == index
+            and timeline_boundary.get("outgoing_segment_index") == index
+            and timeline_boundary.get("incoming_segment_index") == index + 1
+            and timeline_boundary.get("outgoing_source_id")
+            == str(left_source_index)
+            and timeline_boundary.get("incoming_source_id")
+            == str(right_source_index)
+            and timeline_boundary.get("source_switch") is expected_source_switch
+            and timeline_at is not None
+            and common_start is not None
+            and math.isclose(
+                timeline_at,
+                common_start + cumulative_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            timeline_boundaries_match = False
+    checks["proxy_boundary_schedule_matches_plan"] = proxy_boundaries_match
+    checks["timeline_boundary_schedule_matches_plan"] = timeline_boundaries_match
+    checks["timeline_source_switch_flags_match_plan"] = (
+        timeline_switches == derived_timeline_switch_count
+    )
+
+    for name, passed in checks.items():
+        if not passed:
+            collector.add(
+                f"plan_invariant_{name}",
+                QAIssueSeverity.FAIL,
+                "A render-plan, transition, timeline, or decoded-review invariant failed.",
+                path=f"plan_invariants.{name}",
+                value=passed,
+                threshold=True,
+            )
+    return {
+        "transition_count": n,
+        "segment_count": len(segments),
+        "checks": checks,
+        "visible_source_switch_count": timeline_switches,
+        "introduced_hard_cut_count": introduced_hard,
+        "dissolve_count": group_dissolve,
+        "derived_cross_source_switch_count": plan_cross_source_switch_count,
+        "derived_native_source_cut_count": plan_native_source_cut_count,
+        "plan_hard_cut_count": plan_hard_count,
+        "plan_dissolve_count": plan_dissolve_count,
+        "same_source_hold_count": same_source_hold,
+        "used_source_indices": actual_used_source_indices,
+    }
+
+
+def _validate_ffprobe_against_plan(
+    tool_checks: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    ffprobe = _mapping(tool_checks.get("ffprobe")) or {}
+    payload = _mapping(ffprobe.get("payload"))
+    if payload is None:
+        return {"available": False}
+    streams = _sequence(payload.get("streams")) or []
+    video_streams = [
+        item for raw in streams if (item := _mapping(raw)) is not None and item.get("codec_type") == "video"
+    ]
+    audio_streams = [
+        item for raw in streams if (item := _mapping(raw)) is not None and item.get("codec_type") == "audio"
+    ]
+    checks: dict[str, bool] = {
+        "exactly_one_video_stream": len(video_streams) == 1,
+        "exactly_one_audio_stream": len(audio_streams) == 1,
+    }
+    if not checks["exactly_one_video_stream"]:
+        video: dict[str, Any] = {}
+    else:
+        video = video_streams[0]
+    fps = _parse_rate(video.get("avg_frame_rate")) or _parse_rate(
+        video.get("r_frame_rate")
+    )
+    plan_fps = _number(plan.get("fps"))
+    width = _probe_integer(video.get("width"))
+    height = _probe_integer(video.get("height"))
+    read_frames = _probe_integer(video.get("nb_read_frames")) or _probe_integer(
+        video.get("nb_frames")
+    )
+    expected_frames = _integer(plan.get("output_frame_count"))
+    stream_duration = _probe_number(video.get("duration"))
+    format_payload = _mapping(payload.get("format")) or {}
+    duration = stream_duration or _probe_number(format_payload.get("duration"))
+    expected_duration = _number(plan.get("render_duration"))
+    tolerance_seconds = (
+        config.final_duration_tolerance_frames / plan_fps
+        if plan_fps is not None and plan_fps > 0.0
+        else 0.0
+    )
+    checks.update(
+        {
+            "width_matches": width == _integer(plan.get("width")),
+            "height_matches": height == _integer(plan.get("height")),
+            "fps_matches": (
+                fps is not None
+                and plan_fps is not None
+                and abs(fps - plan_fps) <= config.ffprobe_fps_tolerance
+            ),
+            "decoded_frame_count_matches": read_frames == expected_frames,
+            "duration_matches": (
+                duration is not None
+                and expected_duration is not None
+                and abs(duration - expected_duration) <= tolerance_seconds + 1e-9
+            ),
+            "codec_matches": _codec_family(video.get("codec_name"))
+            == _codec_family((_mapping(analysis.get("render")) or {}).get("video_codec")),
+        }
+    )
+    if audio_streams and duration is not None:
+        audio_duration = _probe_number(audio_streams[0].get("duration"))
+        checks["audio_duration_matches_video"] = (
+            audio_duration is not None
+            and abs(audio_duration - duration) <= tolerance_seconds + 1e-9
+        )
+    else:
+        checks["audio_duration_matches_video"] = False
+        audio_duration = None
+
+    for name, passed in checks.items():
+        if not passed:
+            collector.add(
+                f"final_media_{name}",
+                QAIssueSeverity.FAIL,
+                "The decoded final MP4 does not match the render contract.",
+                path=f"final_media.{name}",
+                value=passed,
+                threshold=True,
+            )
+    return {
+        "available": True,
+        "checks": checks,
+        "video": {
+            "codec_name": video.get("codec_name"),
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "decoded_frame_count": read_frames,
+            "duration_seconds": duration,
+        },
+        "audio": {
+            "stream_count": len(audio_streams),
+            "duration_seconds": audio_duration,
+        },
+        "duration_tolerance_seconds": tolerance_seconds,
+    }
+
+
+def _cadence_and_repetition_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    review = _mapping(analysis.get("timeline_review")) or {}
+    if review.get("passed") is not True:
+        collector.add(
+            "timeline_review_failed",
+            QAIssueSeverity.FAIL,
+            "The final structural timeline review did not pass.",
+            path="timeline_review.passed",
+            value=review.get("passed"),
+            threshold=True,
+        )
+    hard_failures = _sequence(review.get("hard_failures")) or []
+    if hard_failures:
+        collector.add(
+            "timeline_hard_failures_present",
+            QAIssueSeverity.FAIL,
+            "The final timeline contains structural hard failures.",
+            path="timeline_review.hard_failures",
+            value=hard_failures,
+            threshold=[],
+        )
+    warnings = _sequence(review.get("warnings")) or []
+    if warnings:
+        collector.add(
+            "timeline_warnings_present",
+            QAIssueSeverity.CONDITIONAL,
+            "The final timeline retains structural warnings.",
+            path="timeline_review.warnings",
+            value=warnings,
+            threshold=[],
+        )
+
+    plan_segments = [
+        item
+        for raw in (_sequence(plan.get("segments")) or [])
+        if (item := _mapping(raw)) is not None
+    ]
+    total_duration = _number(plan.get("duration"))
+    plan_source_sequence = [
+        _integer(item.get("source_index")) for item in plan_segments
+    ]
+    segment_output_durations = [
+        _number(item.get("duration")) for item in plan_segments
+    ]
+    plan_structure_available = (
+        bool(plan_segments)
+        and all(index is not None for index in plan_source_sequence)
+        and all(
+            duration is not None and duration > 0.0
+            for duration in segment_output_durations
+        )
+    )
+    switch_count = (
+        sum(
+            left != right
+            for left, right in zip(
+                plan_source_sequence, plan_source_sequence[1:]
+            )
+        )
+        if plan_structure_available
+        else None
+    )
+    serialized_switch_count = _integer(review.get("source_switch_count"))
+    if switch_count is None or serialized_switch_count != switch_count:
+        collector.add(
+            "source_switch_count_plan_mismatch",
+            QAIssueSeverity.FAIL,
+            "Timeline source-switch count does not match the render plan.",
+            path="timeline_review.source_switch_count",
+            value={"serialized": serialized_switch_count, "derived": switch_count},
+        )
+    serialized_switches_per_minute = _number(
+        review.get("source_switches_per_minute")
+    )
+    switches_per_minute = (
+        switch_count * 60.0 / total_duration
+        if switch_count is not None
+        and total_duration is not None
+        and total_duration > 0.0
+        else None
+    )
+    if not (
+        switches_per_minute is not None
+        and serialized_switches_per_minute is not None
+        and math.isclose(
+            switches_per_minute,
+            serialized_switches_per_minute,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    ):
+        collector.add(
+            "source_switch_density_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized source-switch density does not match count and duration.",
+            path="timeline_review.source_switches_per_minute",
+            value={
+                "serialized": serialized_switches_per_minute,
+                "derived": switches_per_minute,
+            },
+        )
+    if switches_per_minute is None or (
+        switches_per_minute < config.minimum_source_switches_per_minute_hard
+    ):
+        collector.add(
+            "source_switch_density_below_hard_minimum",
+            QAIssueSeverity.FAIL,
+            "Source-switch density is below the production hard minimum.",
+            path="timeline_review.source_switches_per_minute",
+            value=switches_per_minute,
+            threshold=config.minimum_source_switches_per_minute_hard,
+        )
+    elif not (
+        config.preferred_minimum_source_switches_per_minute
+        <= switches_per_minute
+        <= config.preferred_maximum_source_switches_per_minute
+    ):
+        collector.add(
+            "source_switch_density_outside_professional_band",
+            QAIssueSeverity.CONDITIONAL,
+            "Source-switch density is outside the reference-calibrated preferred band.",
+            path="timeline_review.source_switches_per_minute",
+            value=switches_per_minute,
+            threshold=[
+                config.preferred_minimum_source_switches_per_minute,
+                config.preferred_maximum_source_switches_per_minute,
+            ],
+        )
+
+    comparable_boundary_count = _integer(
+        review.get("comparable_visual_boundary_count")
+    )
+    serialized_switch_ratio = _number(review.get("source_switch_rate"))
+    switch_ratio = (
+        switch_count / comparable_boundary_count
+        if switch_count is not None
+        and comparable_boundary_count is not None
+        and comparable_boundary_count > 0
+        else None
+    )
+    if not (
+        switch_ratio is not None
+        and serialized_switch_ratio is not None
+        and math.isclose(
+            switch_ratio,
+            serialized_switch_ratio,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        collector.add(
+            "source_switch_ratio_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized source-switch ratio does not match structural counts.",
+            path="timeline_review.source_switch_rate",
+            value={"serialized": serialized_switch_ratio, "derived": switch_ratio},
+        )
+    if switch_ratio is None or not (
+        config.preferred_minimum_source_switch_ratio
+        <= switch_ratio
+        <= config.preferred_maximum_source_switch_ratio
+    ):
+        collector.add(
+            "source_switch_ratio_outside_professional_band",
+            QAIssueSeverity.CONDITIONAL,
+            "Source-switch ratio is outside the reference-calibrated preferred band.",
+            path="timeline_review.source_switch_rate",
+            value=switch_ratio,
+            threshold=[
+                config.preferred_minimum_source_switch_ratio,
+                config.preferred_maximum_source_switch_ratio,
+            ],
+        )
+
+    shot_durations = [
+        value
+        for raw in (_sequence(review.get("visual_shot_durations_seconds")) or [])
+        if (value := _number(raw)) is not None and value > 0.0
+    ]
+    serialized_shot_median = _number(review.get("visual_shot_median_seconds"))
+    shot_median = _quantile(shot_durations, 0.5)
+    if not (
+        shot_median is not None
+        and serialized_shot_median is not None
+        and len(shot_durations) == review.get("visual_shot_count")
+        and math.isclose(
+            shot_median,
+            serialized_shot_median,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        collector.add(
+            "visual_shot_median_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized visual-shot cadence does not match its duration payload.",
+            path="timeline_review.visual_shot_median_seconds",
+            value={"serialized": serialized_shot_median, "derived": shot_median},
+        )
+    if shot_median is None or shot_median > config.maximum_visual_shot_median_seconds:
+        collector.add(
+            "visual_shot_median_too_slow",
+            QAIssueSeverity.CONDITIONAL,
+            "Visual-shot cadence is slower than the professional warning ceiling.",
+            path="timeline_review.visual_shot_median_seconds",
+            value=shot_median,
+            threshold=config.maximum_visual_shot_median_seconds,
+        )
+
+    source_runs = [
+        item
+        for raw in (_sequence(review.get("source_runs")) or [])
+        if (item := _mapping(raw)) is not None
+    ]
+    serialized_run_durations = [
+        value
+        for item in source_runs
+        if (value := _number(item.get("duration_seconds"))) is not None
+        and value > 0.0
+    ]
+    run_durations: list[float] = []
+    if plan_structure_available:
+        for source_index, duration in zip(
+            plan_source_sequence,
+            segment_output_durations,
+            strict=True,
+        ):
+            assert source_index is not None and duration is not None
+            if run_durations and source_index == previous_run_source:
+                run_durations[-1] += duration
+            else:
+                run_durations.append(duration)
+                previous_run_source = source_index
+    serialized_run_median = _number(review.get("source_run_median_seconds"))
+    run_median = _quantile(run_durations, 0.5)
+    if not (
+        run_median is not None
+        and serialized_run_median is not None
+        and len(serialized_run_durations) == len(source_runs)
+        and len(run_durations) == len(serialized_run_durations)
+        and all(
+            math.isclose(left, right, rel_tol=0.0, abs_tol=1e-6)
+            for left, right in zip(
+                run_durations,
+                serialized_run_durations,
+                strict=True,
+            )
+        )
+        and math.isclose(
+            run_median,
+            serialized_run_median,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        collector.add(
+            "source_run_median_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized source-run median does not match its run payload.",
+            path="timeline_review.source_run_median_seconds",
+            value={"serialized": serialized_run_median, "derived": run_median},
+        )
+    if run_median is None or not (
+        config.preferred_minimum_source_run_seconds
+        <= run_median
+        <= config.preferred_maximum_source_run_seconds
+    ):
+        collector.add(
+            "source_run_median_outside_professional_band",
+            QAIssueSeverity.CONDITIONAL,
+            "Median continuous source run is outside the preferred band.",
+            path="timeline_review.source_run_median_seconds",
+            value=run_median,
+            threshold=[
+                config.preferred_minimum_source_run_seconds,
+                config.preferred_maximum_source_run_seconds,
+            ],
+        )
+    serialized_longest = _number(review.get("longest_source_run_seconds"))
+    longest = max(run_durations, default=None)
+    if not (
+        longest is not None
+        and serialized_longest is not None
+        and math.isclose(
+            longest,
+            serialized_longest,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        collector.add(
+            "source_run_longest_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized longest source run does not match its run payload.",
+            path="timeline_review.longest_source_run_seconds",
+            value={"serialized": serialized_longest, "derived": longest},
+        )
+    if longest is None or longest > config.maximum_source_run_seconds:
+        collector.add(
+            "source_run_exceeds_hard_maximum",
+            QAIssueSeverity.FAIL,
+            "A continuous source run exceeds the reference-p90 ceiling.",
+            path="timeline_review.longest_source_run_seconds",
+            value=longest,
+            threshold=config.maximum_source_run_seconds,
+        )
+
+    derived_unique_sources = (
+        len(set(plan_source_sequence)) if plan_structure_available else None
+    )
+    unique_sources = _integer(review.get("unique_source_count"))
+    if derived_unique_sources is None or unique_sources != derived_unique_sources:
+        collector.add(
+            "unique_source_count_plan_mismatch",
+            QAIssueSeverity.FAIL,
+            "Timeline unique-source count does not match the render plan.",
+            path="timeline_review.unique_source_count",
+            value={"serialized": unique_sources, "derived": derived_unique_sources},
+        )
+    required_sources = _integer(review.get("required_unique_source_count"))
+    available_sources = _integer(review.get("available_source_count"))
+    minimum_sources = required_sources
+    if (
+        available_sources is not None
+        and available_sources >= config.minimum_distinct_sources_when_required
+    ):
+        minimum_sources = max(
+            minimum_sources or 0,
+            config.minimum_distinct_sources_when_required,
+        )
+    if minimum_sources is None or (
+        unique_sources is None or unique_sources < minimum_sources
+    ):
+        collector.add(
+            "insufficient_source_diversity",
+            QAIssueSeverity.FAIL,
+            "The final edit uses fewer distinct sources than required.",
+            path="timeline_review.unique_source_count",
+            value=unique_sources,
+            threshold=minimum_sources,
+        )
+    shares = _mapping(review.get("per_source_share")) or {}
+    serialized_share_values: dict[int, float] = {}
+    share_keys_valid = True
+    for raw_key, raw_value in shares.items():
+        value = _number(raw_value)
+        if not (
+            isinstance(raw_key, str)
+            and raw_key.isdigit()
+            and str(source_index := int(raw_key)) == raw_key
+            and value is not None
+            and source_index not in serialized_share_values
+        ):
+            share_keys_valid = False
+            continue
+        serialized_share_values[source_index] = value
+    source_durations = _mapping(review.get("source_duration_seconds")) or {}
+    numeric_source_durations: dict[int, float] = {}
+    duration_keys_valid = True
+    for raw_key, raw_value in source_durations.items():
+        value = _number(raw_value)
+        if not (
+            isinstance(raw_key, str)
+            and raw_key.isdigit()
+            and str(source_index := int(raw_key)) == raw_key
+            and value is not None
+            and value > 0.0
+            and source_index not in numeric_source_durations
+        ):
+            duration_keys_valid = False
+            continue
+        numeric_source_durations[source_index] = value
+    plan_source_durations: dict[int, float] = {}
+    if plan_structure_available:
+        for source_index, duration in zip(
+            plan_source_sequence,
+            segment_output_durations,
+            strict=True,
+        ):
+            assert source_index is not None and duration is not None
+            plan_source_durations[source_index] = (
+                plan_source_durations.get(source_index, 0.0) + duration
+            )
+    derived_shares = (
+        {
+            key: value / total_duration
+            for key, value in numeric_source_durations.items()
+        }
+        if total_duration is not None and total_duration > 0.0
+        else {}
+    )
+    source_share_payload_matches = (
+        unique_sources is not None
+        and share_keys_valid
+        and duration_keys_valid
+        and len(numeric_source_durations) == unique_sources
+        and len(serialized_share_values) == unique_sources
+        and len(plan_source_durations) == unique_sources
+        and set(serialized_share_values) == set(derived_shares)
+        and total_duration is not None
+        and math.isclose(
+            sum(numeric_source_durations.values()),
+            total_duration,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        and set(numeric_source_durations) == set(plan_source_durations)
+        and all(
+            math.isclose(
+                numeric_source_durations[index],
+                plan_source_durations[index],
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            for index in plan_source_durations
+        )
+        and all(
+            math.isclose(
+                serialized_share_values[key],
+                derived_shares[key],
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            for key in derived_shares
+        )
+    )
+    if not source_share_payload_matches:
+        collector.add(
+            "source_share_payload_mismatch",
+            QAIssueSeverity.FAIL,
+            "Source durations and shares do not match the final duration.",
+            path="timeline_review.per_source_share",
+            value={
+                "serialized": serialized_share_values,
+                "derived": derived_shares,
+            },
+        )
+    share_values = list(derived_shares.values())
+    dominant = max(share_values, default=None)
+    if not (
+        unique_sources is not None
+        and len(share_values) == unique_sources
+        and all(0.0 < value <= 1.0 for value in share_values)
+        and math.isclose(sum(share_values), 1.0, rel_tol=0.0, abs_tol=1e-6)
+    ):
+        collector.add(
+            "source_share_distribution_invalid",
+            QAIssueSeverity.FAIL,
+            "Per-source shares must cover used sources and sum to one.",
+            path="timeline_review.per_source_share",
+            value={"count": len(share_values), "sum": sum(share_values)},
+            threshold={"count": unique_sources, "sum": 1.0},
+        )
+    if dominant is None or dominant > config.hard_maximum_dominant_source_share:
+        collector.add(
+            "dominant_source_share_hard",
+            QAIssueSeverity.FAIL,
+            "One source dominates too much of the final edit.",
+            path="timeline_review.per_source_share",
+            value=dominant,
+            threshold=config.hard_maximum_dominant_source_share,
+        )
+    elif dominant > config.preferred_maximum_dominant_source_share:
+        collector.add(
+            "dominant_source_share_above_preferred",
+            QAIssueSeverity.CONDITIONAL,
+            "One source exceeds the preferred share.",
+            path="timeline_review.per_source_share",
+            value=dominant,
+            threshold=config.preferred_maximum_dominant_source_share,
+        )
+    short_flashes = _integer(review.get("short_flash_count"))
+    if short_flashes is None or short_flashes > 0:
+        collector.add(
+            "short_source_flash_present",
+            QAIssueSeverity.FAIL,
+            "The final edit contains an unreadably short internal source flash.",
+            path="timeline_review.short_flash_count",
+            value=short_flashes,
+            threshold=0,
+        )
+    ping_pongs = _sequence(review.get("ping_pongs")) or []
+    risky_ping_pongs = sum(
+        (_mapping(item) or {}).get("within_review_window") is True
+        for item in ping_pongs
+    )
+    if risky_ping_pongs:
+        collector.add(
+            "risky_source_ping_pong_present",
+            QAIssueSeverity.CONDITIONAL,
+            "The final edit contains a fast A-B-A source reversal.",
+            path="timeline_review.ping_pongs",
+            value=risky_ping_pongs,
+            threshold=0,
+        )
+    for field_name in (
+        "scene_cut_risk_count",
+        "boundary_side_instability_count",
+    ):
+        value = _integer(review.get(field_name))
+        if value is None or value > 0:
+            collector.add(
+                f"timeline_{field_name}",
+                QAIssueSeverity.FAIL,
+                "A source switch retains unsafe native-cut or boundary-side instability.",
+                path=f"timeline_review.{field_name}",
+                value=value,
+                threshold=0,
+            )
+    return {
+        "source_switches_per_minute": switches_per_minute,
+        "source_switch_rate": switch_ratio,
+        "visual_shot_median_seconds": shot_median,
+        "source_run_median_seconds": run_median,
+        "longest_source_run_seconds": longest,
+        "unique_source_count": unique_sources,
+        "required_unique_source_count": required_sources,
+        "available_source_count": available_sources,
+        "effective_minimum_unique_source_count": minimum_sources,
+        "dominant_source_share": dominant,
+        "source_share_sum": sum(share_values),
+        "short_flash_count": short_flashes,
+        "risky_ping_pong_count": risky_ping_pongs,
+        "hard_failures": hard_failures,
+        "warnings": warnings,
+    }
+
+
+def _proxy_quality_and_geometry_metrics(
+    analysis: Mapping[str, Any],
+    final_review: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    if final_review.get("passed") is not True:
+        collector.add(
+            "decoded_proxy_review_failed",
+            QAIssueSeverity.FAIL,
+            "The final selected decoded proxy did not pass.",
+            path="rendered_proxy_review.passed",
+            value=final_review.get("passed"),
+            threshold=True,
+        )
+    overall = _mapping(final_review.get("overall_quality")) or {}
+    source_quality = _mapping(final_review.get("source_quality")) or {}
+    boundary_score = _mapping(final_review.get("boundary_score")) or {}
+    quality_p10 = _number(overall.get("p10"))
+    source_median_span = _number(source_quality.get("median_span"))
+    boundary_p10 = _number(boundary_score.get("p10"))
+    weighted = _number(final_review.get("weighted_score"))
+    proxy_payload = _mapping(final_review.get("proxy")) or {}
+    decoded_frame_count = _integer(proxy_payload.get("decoded_frame_count"))
+    overall_quality_count = _integer(overall.get("count"))
+    if (
+        decoded_frame_count is None
+        or overall_quality_count != decoded_frame_count
+    ):
+        collector.add(
+            "proxy_overall_quality_count_mismatch",
+            QAIssueSeverity.FAIL,
+            "Overall proxy quality must cover every decoded frame.",
+            path="rendered_proxy_review.overall_quality.count",
+            value={
+                "quality_count": overall_quality_count,
+                "decoded_frame_count": decoded_frame_count,
+            },
+        )
+    gates = (
+        (
+            "overall_quality_p10",
+            quality_p10,
+            config.minimum_overall_quality_p10,
+            lambda value, threshold: value >= threshold,
+        ),
+        (
+            "source_quality_median_span",
+            source_median_span,
+            config.maximum_source_quality_median_span,
+            lambda value, threshold: value <= threshold,
+        ),
+        (
+            "boundary_score_p10",
+            boundary_p10,
+            config.minimum_boundary_score_p10,
+            lambda value, threshold: value >= threshold,
+        ),
+        (
+            "proxy_weighted_score",
+            weighted,
+            config.minimum_proxy_weighted_score,
+            lambda value, threshold: value >= threshold,
+        ),
+    )
+    for name, value, threshold, predicate in gates:
+        if value is None or not predicate(value, threshold):
+            collector.add(
+                f"proxy_quality_{name}",
+                QAIssueSeverity.FAIL,
+                "Decoded proxy quality is outside the production gate.",
+                path=f"rendered_proxy_review.{name}",
+                value=value,
+                threshold=threshold,
+            )
+    issue_count = _integer(boundary_score.get("issue_count"))
+    if issue_count is None or issue_count > config.professional_maximum_boundary_issue_count:
+        collector.add(
+            "proxy_boundary_issues_require_manual_review",
+            QAIssueSeverity.CONDITIONAL,
+            "The proxy passed globally but retains at least one known boundary issue.",
+            path="rendered_proxy_review.boundary_score.issue_count",
+            value=issue_count,
+            threshold=config.professional_maximum_boundary_issue_count,
+        )
+    geometry_failures = _integer(final_review.get("geometry_provider_failure_count"))
+    if geometry_failures is None or (
+        geometry_failures
+        > config.professional_maximum_geometry_provider_failure_count
+    ):
+        collector.add(
+            "proxy_geometry_provider_failures",
+            QAIssueSeverity.CONDITIONAL,
+            "Some decoded proxy boundary geometry could not be measured.",
+            path="rendered_proxy_review.geometry_provider_failure_count",
+            value=geometry_failures,
+            threshold=config.professional_maximum_geometry_provider_failure_count,
+        )
+
+    boundaries = _sequence(final_review.get("boundaries")) or []
+    boundary_indices = [
+        _integer((_mapping(item) or {}).get("boundary_index"))
+        for item in boundaries
+    ]
+    if boundary_indices != list(range(len(boundaries))):
+        collector.add(
+            "proxy_boundary_indices_invalid",
+            QAIssueSeverity.FAIL,
+            "Decoded proxy boundary indices are not unique and sequential.",
+            path="rendered_proxy_review.boundaries[].boundary_index",
+            value=boundary_indices,
+            threshold=list(range(len(boundaries))),
+        )
+    actual_issue_count = sum(
+        (_mapping(item) or {}).get("passed") is not True for item in boundaries
+    )
+    actual_issue_indices = [
+        index
+        for index, item in enumerate(boundaries)
+        if (_mapping(item) or {}).get("passed") is not True
+    ]
+    serialized_issue_indices = _sequence(
+        final_review.get("boundary_issue_indices")
+    )
+    if serialized_issue_indices != actual_issue_indices:
+        collector.add(
+            "proxy_boundary_issue_indices_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized boundary issue indices do not match boundary pass flags.",
+            path="rendered_proxy_review.boundary_issue_indices",
+            value={
+                "serialized": serialized_issue_indices,
+                "actual": actual_issue_indices,
+            },
+        )
+    if issue_count != actual_issue_count:
+        collector.add(
+            "proxy_boundary_issue_count_mismatch",
+            QAIssueSeverity.FAIL,
+            "Serialized boundary issue count does not match boundary pass flags.",
+            path="rendered_proxy_review.boundary_score.issue_count",
+            value={"serialized": issue_count, "actual": actual_issue_count},
+        )
+    boundary_scores = [
+        value
+        for raw in boundaries
+        if (value := _number((_mapping(raw) or {}).get("weighted_score")))
+        is not None
+    ]
+    boundary_distribution = _mapping(boundary_score.get("distribution")) or {}
+    derived_boundary_p10 = _quantile(boundary_scores, 0.10)
+    if not (
+        len(boundary_scores) == len(boundaries)
+        and boundary_distribution.get("count") == len(boundaries)
+        and derived_boundary_p10 is not None
+        and boundary_p10 is not None
+        and math.isclose(
+            derived_boundary_p10,
+            boundary_p10,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    ):
+        collector.add(
+            "proxy_boundary_score_distribution_mismatch",
+            QAIssueSeverity.FAIL,
+            "Boundary-score summary does not match serialized boundary reviews.",
+            path="rendered_proxy_review.boundary_score",
+            value={
+                "serialized_p10": boundary_p10,
+                "derived_p10": derived_boundary_p10,
+                "score_count": len(boundary_scores),
+            },
+        )
+    insufficient = 0
+    covered = 0
+    closeup_relevant = 0
+    closeup_covered = 0
+    discontinuity_fields = (
+        "face_scale_discontinuity",
+        "face_position_discontinuity",
+        "silhouette_scale_discontinuity",
+        "silhouette_position_discontinuity",
+    )
+    discontinuities: dict[str, list[float]] = {
+        field_name: [] for field_name in discontinuity_fields
+    }
+    discontinuities_by_kind: dict[str, dict[str, list[float]]] = {}
+    boundary_sample_contract_valid = True
+    choices = _sequence((_mapping(analysis.get("visual_timeline")) or {}).get("choices")) or []
+    for index, raw in enumerate(boundaries):
+        boundary = _mapping(raw) or {}
+        transition_kind = str(boundary.get("transition_kind") or "unknown")
+        cut_frame = _integer(boundary.get("cut_frame_index"))
+        transition_frames = _integer(boundary.get("transition_frame_count"))
+        expected_offsets = (
+            [-2, -1, 0, 1]
+            if transition_kind == "hard_cut"
+            else [-2, -1, transition_frames, transition_frames + 1]
+            if transition_kind == "face_dissolve"
+            and transition_frames is not None
+            and transition_frames > 0
+            else None
+        )
+        sample_offsets = _sequence(boundary.get("sample_offsets"))
+        frame_indices = _sequence(boundary.get("frame_indices"))
+        by_kind = discontinuities_by_kind.setdefault(
+            transition_kind,
+            {field_name: [] for field_name in discontinuity_fields},
+        )
+        serialized_discontinuities = _mapping(boundary.get("discontinuities")) or {}
+        for field_name in discontinuity_fields:
+            value = _number(serialized_discontinuities.get(field_name))
+            if value is not None:
+                discontinuities[field_name].append(value)
+                by_kind[field_name].append(value)
+        reasons = _sequence(boundary.get("issue_reasons")) or []
+        insufficient += "insufficient_post_transition_review_handle" in reasons
+        metrics = _sequence(boundary.get("frame_metrics")) or []
+        if not (
+            expected_offsets is not None
+            and cut_frame is not None
+            and sample_offsets == expected_offsets
+            and frame_indices
+            == [cut_frame + offset for offset in expected_offsets]
+            and len(metrics) == len(expected_offsets)
+            and all(
+                (_mapping(item) or {}).get("offset") == offset
+                and (_mapping(item) or {}).get("frame_index")
+                == cut_frame + offset
+                for item, offset in zip(metrics, expected_offsets, strict=True)
+            )
+        ):
+            boundary_sample_contract_valid = False
+        geometries = [
+            _mapping((_mapping(item) or {}).get("subject_geometry")) or {}
+            for item in metrics
+        ]
+        pair = (geometries[1], geometries[2]) if len(geometries) >= 3 else ({}, {})
+        face_pair = all(item.get("face_bbox_xywh") is not None for item in pair)
+        silhouette_pair = all(
+            item.get("silhouette_bbox_xywh") is not None for item in pair
+        )
+        covered += face_pair or silhouette_pair
+        left_choice = _mapping(choices[index]) or {} if index < len(choices) else {}
+        right_choice = (
+            _mapping(choices[index + 1]) or {}
+            if index + 1 < len(choices)
+            else {}
+        )
+        left_type = left_choice.get("exit_shot_type") or left_choice.get("shot_type")
+        right_type = right_choice.get("entry_shot_type") or right_choice.get("shot_type")
+        relevant = "close_up" in {left_type, right_type}
+        closeup_relevant += relevant
+        closeup_covered += relevant and face_pair
+    if not boundary_sample_contract_valid:
+        collector.add(
+            "proxy_boundary_sample_contract_invalid",
+            QAIssueSeverity.FAIL,
+            "Boundary samples do not match duration-aware hard-cut/dissolve endpoints.",
+            path="rendered_proxy_review.boundaries",
+            value=False,
+            threshold=True,
+        )
+    if insufficient:
+        collector.add(
+            "insufficient_post_transition_review_handle",
+            QAIssueSeverity.FAIL,
+            "A dissolve lacks enough completed-transition review handle.",
+            path="rendered_proxy_review.boundaries",
+            value=insufficient,
+            threshold=0,
+        )
+    geometry_coverage = _fraction(covered, len(boundaries))
+    closeup_coverage = _fraction(closeup_covered, closeup_relevant)
+    if geometry_coverage is None or geometry_coverage < 1.0:
+        collector.add(
+            "proxy_subject_geometry_coverage_incomplete",
+            QAIssueSeverity.CONDITIONAL,
+            "Not every transition has paired face or silhouette endpoint geometry.",
+            path="rendered_proxy_review.boundaries[].frame_metrics",
+            value=geometry_coverage,
+            threshold=1.0,
+        )
+    if closeup_relevant and (closeup_coverage is None or closeup_coverage < 1.0):
+        collector.add(
+            "proxy_closeup_face_coverage_incomplete",
+            QAIssueSeverity.CONDITIONAL,
+            "A close-up transition lacks paired decoded face geometry.",
+            path="rendered_proxy_review.boundaries[].frame_metrics",
+            value=closeup_coverage,
+            threshold=1.0,
+        )
+
+    choices_used = {
+        _integer((_mapping(choice) or {}).get("source_index"))
+        for choice in choices
+    }
+    choices_used.discard(None)
+    quality_items = [
+        item
+        for raw in (_sequence(source_quality.get("per_source")) or [])
+        if (item := _mapping(raw)) is not None
+    ]
+    quality_indices = [
+        _integer(item.get("source_index")) for item in quality_items
+    ]
+    missing_quality_indices = sorted(
+        index for index in choices_used if index not in quality_indices
+    )
+    duplicate_quality_indices = sorted(
+        index
+        for index, count in Counter(quality_indices).items()
+        if index is not None and count > 1
+    )
+    if missing_quality_indices or duplicate_quality_indices:
+        collector.add(
+            "used_source_quality_coverage_invalid",
+            QAIssueSeverity.FAIL,
+            "Decoded quality evidence must cover every used source exactly once.",
+            path="rendered_proxy_review.source_quality.per_source",
+            value={
+                "missing": missing_quality_indices,
+                "duplicates": duplicate_quality_indices,
+            },
+        )
+
+    look = _mapping(analysis.get("source_look_match"))
+    look_metrics: dict[str, Any] = {"available": look is not None}
+    if look is None:
+        collector.add(
+            "source_look_match_unavailable",
+            QAIssueSeverity.CONDITIONAL,
+            "Source look-match evidence is unavailable.",
+            path="source_look_match",
+        )
+    else:
+        evidence = _sequence(look.get("evidence")) or []
+        evidence_items = [
+            item for raw in evidence if (item := _mapping(raw)) is not None
+        ]
+        evidence_indices = [
+            _integer(item.get("source_index")) for item in evidence_items
+        ]
+        missing_look_indices = sorted(
+            index for index in choices_used if index not in evidence_indices
+        )
+        duplicate_look_indices = sorted(
+            index
+            for index, count in Counter(evidence_indices).items()
+            if index is not None and count > 1
+        )
+        if missing_look_indices or duplicate_look_indices:
+            collector.add(
+                "used_source_look_evidence_coverage_invalid",
+                QAIssueSeverity.CONDITIONAL,
+                "Look-match evidence does not cover every used source exactly once.",
+                path="source_look_match.evidence",
+                value={
+                    "missing": missing_look_indices,
+                    "duplicates": duplicate_look_indices,
+                },
+            )
+        unstable_used: list[int] = []
+        insufficient_used: list[int] = []
+        for item in evidence_items:
+            source_index = _integer(item.get("source_index"))
+            if source_index not in choices_used:
+                continue
+            if item.get("stable") is not True:
+                unstable_used.append(source_index)  # type: ignore[arg-type]
+            decoded_samples = _integer(item.get("decoded_sample_count"))
+            if decoded_samples is None or decoded_samples < 6:
+                insufficient_used.append(source_index)  # type: ignore[arg-type]
+        if look.get("target_mode") == "unavailable_identity" or unstable_used:
+            collector.add(
+                "used_source_look_evidence_unstable",
+                QAIssueSeverity.CONDITIONAL,
+                "At least one used source lacks stable synchronized look evidence.",
+                path="source_look_match.evidence",
+                value=sorted(unstable_used),
+                threshold=[],
+            )
+        if insufficient_used:
+            collector.add(
+                "used_source_look_samples_insufficient",
+                QAIssueSeverity.CONDITIONAL,
+                "At least one used source has fewer than six look samples.",
+                path="source_look_match.evidence[].decoded_sample_count",
+                value=sorted(insufficient_used),
+                threshold=6,
+            )
+        look_metrics.update(
+            {
+                "target_mode": look.get("target_mode"),
+                "used_source_indices": sorted(choices_used),
+                "unstable_used_source_indices": sorted(unstable_used),
+                "insufficient_used_source_indices": sorted(insufficient_used),
+                "missing_used_source_indices": missing_look_indices,
+                "duplicate_source_indices": duplicate_look_indices,
+            }
+        )
+    return {
+        "overall_quality_p10": quality_p10,
+        "source_quality_median_span": source_median_span,
+        "used_source_indices": sorted(choices_used),
+        "missing_used_source_quality_indices": missing_quality_indices,
+        "duplicate_source_quality_indices": duplicate_quality_indices,
+        "boundary_score_p10": boundary_p10,
+        "weighted_score": weighted,
+        "boundary_issue_count": issue_count,
+        "actual_boundary_issue_count": actual_issue_count,
+        "actual_boundary_issue_indices": actual_issue_indices,
+        "boundary_sample_contract_valid": boundary_sample_contract_valid,
+        "derived_boundary_score_p10": derived_boundary_p10,
+        "geometry_provider_failure_count": geometry_failures,
+        "insufficient_transition_handle_count": insufficient,
+        "subject_geometry_coverage": geometry_coverage,
+        "closeup_relevant_boundary_count": closeup_relevant,
+        "closeup_face_coverage": closeup_coverage,
+        "subject_discontinuities": {
+            field_name: _distribution(values)
+            for field_name, values in discontinuities.items()
+        },
+        "subject_discontinuities_by_transition_kind": {
+            kind: {
+                field_name: _distribution(values)
+                for field_name, values in fields.items()
+            }
+            for kind, fields in sorted(discontinuities_by_kind.items())
+        },
+        "source_look_match": look_metrics,
+    }
+
+
+def _source_local_reuse_metrics(
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    segments = _sequence(plan.get("segments")) or []
+    by_source: dict[int, list[tuple[float, float, int]]] = {}
+    total = 0.0
+    for index, raw in enumerate(segments):
+        item = _mapping(raw) or {}
+        source_index = _integer(item.get("source_index"))
+        start = _number(item.get("source_local_start"))
+        end = _number(item.get("source_local_end"))
+        if start is None:
+            start = _number(item.get("source_start"))
+        if end is None:
+            end = _number(item.get("source_end"))
+        if source_index is None or start is None or end is None or end <= start:
+            collector.add(
+                "source_local_interval_invalid",
+                QAIssueSeverity.FAIL,
+                "A render segment lacks a valid source-local interval.",
+                path=f"render_plan.segments[{index}]",
+                value={"source_index": source_index, "start": start, "end": end},
+            )
+            continue
+        by_source.setdefault(source_index, []).append((start, end, index))
+        total += end - start
+
+    union_total = 0.0
+    overlaps: list[dict[str, Any]] = []
+    per_source: list[dict[str, Any]] = []
+    for source_index, intervals in sorted(by_source.items()):
+        ordered = sorted(intervals)
+        cursor_start, cursor_end, cursor_index = ordered[0]
+        source_union = 0.0
+        source_overlap = 0.0
+        for start, end, segment_index in ordered[1:]:
+            if start < cursor_end - config.maximum_source_local_reuse_seconds:
+                overlap = min(cursor_end, end) - start
+                if overlap > config.maximum_source_local_reuse_seconds:
+                    source_overlap += overlap
+                    overlaps.append(
+                        {
+                            "source_index": source_index,
+                            "left_segment_index": cursor_index,
+                            "right_segment_index": segment_index,
+                            "overlap_seconds": overlap,
+                        }
+                    )
+            if start > cursor_end:
+                source_union += cursor_end - cursor_start
+                cursor_start, cursor_end, cursor_index = start, end, segment_index
+            elif end > cursor_end:
+                cursor_end = end
+                cursor_index = segment_index
+        source_union += cursor_end - cursor_start
+        union_total += source_union
+        per_source.append(
+            {
+                "source_index": source_index,
+                "segment_interval_count": len(intervals),
+                "union_duration_seconds": source_union,
+                "overlap_seconds": source_overlap,
+            }
+        )
+    reused = max(0.0, total - union_total)
+    ratio = reused / total if total > 0.0 else None
+    if overlaps or reused > config.maximum_source_local_reuse_seconds:
+        collector.add(
+            "source_local_content_reused",
+            QAIssueSeverity.FAIL,
+            "The final plan reuses an already-consumed source-local interval.",
+            path="render_plan.segments",
+            value={"reused_seconds": reused, "overlaps": overlaps},
+            threshold=config.maximum_source_local_reuse_seconds,
+        )
+    return {
+        "total_source_local_duration_seconds": total,
+        "union_source_local_duration_seconds": union_total,
+        "reused_source_local_duration_seconds": reused,
+        "reused_content_ratio": ratio,
+        "overlaps": overlaps,
+        "per_source": per_source,
+    }
+
+
+def _normalized_entropy(values: Sequence[str]) -> float | None:
+    if not values:
+        return None
+    counts = Counter(values)
+    if len(counts) == 1:
+        return 0.0
+    total = len(values)
+    entropy = -sum(
+        (count / total) * math.log(count / total) for count in counts.values()
+    )
+    return entropy / math.log(len(counts))
+
+
+def _transform_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    motion = _mapping(analysis.get("editorial_motion"))
+    if motion is None:
+        collector.add(
+            "editorial_motion_unavailable",
+            QAIssueSeverity.CONDITIONAL,
+            "Editorial transform planning is unavailable.",
+            path="editorial_motion",
+        )
+        return {"available": False}
+    segments = _sequence(motion.get("segments")) or []
+    motion_segments = [_mapping(raw) or {} for raw in segments]
+    plan_segments = _sequence(plan.get("segments")) or []
+    motion_indices = [
+        _integer(item.get("segment_index")) for item in motion_segments
+    ]
+    plan_transitions = _sequence(plan.get("transitions")) or []
+    dissolve_endpoint_indices = {
+        segment_index
+        for transition_index, raw in enumerate(plan_transitions)
+        if (_mapping(raw) or {}).get("kind") == "face_dissolve"
+        for segment_index in (transition_index, transition_index + 1)
+    }
+    motion_contract_checks = {
+        "one_motion_segment_per_plan_segment": (
+            motion_indices == list(range(len(plan_segments)))
+        ),
+        "motion_source_indices_match_plan": (
+            len(motion_segments) == len(plan_segments)
+            and all(
+                item.get("source_index")
+                == (_mapping(plan_segments[index]) or {}).get("source_index")
+                for index, item in enumerate(motion_segments)
+            )
+        ),
+        "serialized_applied_segment_count_matches": (
+            motion.get("applied_segment_count")
+            == sum(item.get("applied") is True for item in motion_segments)
+        ),
+        "applied_flags_boolean": all(
+            isinstance(item.get("applied"), bool) for item in motion_segments
+        ),
+        "event_counts_nonnegative_integers": all(
+            (value := _integer(motion.get(field_name))) is not None and value >= 0
+            for field_name in (
+                "boundary_match_count",
+                "affine_boundary_match_count",
+                "zoom_event_count",
+                "pan_event_count",
+                "roll_event_count",
+                "interior_zoom_pulse_count",
+            )
+        ),
+        "dissolve_endpoint_transforms_disabled": all(
+            item.get("applied") is not True
+            for item in motion_segments
+            if _integer(item.get("segment_index")) in dissolve_endpoint_indices
+        ),
+    }
+    for name, passed in motion_contract_checks.items():
+        if not passed:
+            collector.add(
+                f"editorial_motion_{name}",
+                QAIssueSeverity.FAIL,
+                "Editorial motion segments do not match the final render plan.",
+                path=f"editorial_motion.{name}",
+                value=passed,
+                threshold=True,
+            )
+    applied = [item for item in motion_segments if item.get("applied") is True]
+    signatures: list[str] = []
+    reason_categories: list[str] = []
+    unsafe_keyframes: list[dict[str, Any]] = []
+    invalid_tracks: list[dict[str, Any]] = []
+    final_segments = {
+        _integer(item.get("segment_index")): item
+        for raw in (
+            _sequence(
+                (_mapping(analysis.get("render")) or {}).get(
+                    "final_render_segments"
+                )
+            )
+            or []
+        )
+        if (item := _mapping(raw)) is not None
+        and _integer(item.get("segment_index")) is not None
+    }
+    global_state_points: list[
+        tuple[float, float, float, float, float]
+    ] = []
+    for item in applied:
+        serialized_reasons = tuple(
+            sorted(
+                str(value)
+                for value in (_sequence(item.get("reasons")) or [])
+                if isinstance(value, str) and value.strip()
+            )
+        )
+        keyframes = [
+            child
+            for raw in (_sequence(item.get("keyframes")) or [])
+            if (child := _mapping(raw)) is not None
+        ]
+        zooms = [value for frame in keyframes if (value := _number(frame.get("zoom"))) is not None]
+        centers = [
+            (x, y)
+            for frame in keyframes
+            if (x := _number(frame.get("center_x"))) is not None
+            and (y := _number(frame.get("center_y"))) is not None
+        ]
+        rolls = [value for frame in keyframes if (value := _number(frame.get("roll_degrees"))) is not None]
+        times = [value for frame in keyframes if (value := _number(frame.get("time_seconds"))) is not None]
+        segment_index = _integer(item.get("segment_index"))
+        plan_segment = (
+            _mapping(plan_segments[segment_index]) or {}
+            if segment_index is not None and 0 <= segment_index < len(plan_segments)
+            else {}
+        )
+        plan_transform = _mapping(plan_segment.get("editorial_transform")) or {}
+        plan_transform_reason = plan_transform.get("reason")
+        plan_transform_keyframes = _sequence(plan_transform.get("keyframes"))
+        fallback_reason_bound_to_render_plan = bool(
+            not serialized_reasons
+            and isinstance(plan_transform_reason, str)
+            and plan_transform_reason.strip()
+            and plan_transform_keyframes == keyframes
+        )
+        reasons = (
+            serialized_reasons
+            if serialized_reasons
+            else (
+                (plan_transform_reason,)
+                if fallback_reason_bound_to_render_plan
+                else ()
+            )
+        )
+        segment_duration = _number(plan_segment.get("duration"))
+        full_numeric_keyframe_count = sum(
+            all(
+                _number(frame.get(field_name)) is not None
+                for field_name in (
+                    "time_seconds",
+                    "zoom",
+                    "center_x",
+                    "center_y",
+                    "roll_degrees",
+                )
+            )
+            for frame in keyframes
+        )
+        valid_track = (
+            bool(reasons)
+            and (bool(serialized_reasons) or fallback_reason_bound_to_render_plan)
+            and bool(keyframes)
+            and full_numeric_keyframe_count == len(keyframes)
+            and len(times) == len(keyframes)
+            and math.isclose(times[0], 0.0, rel_tol=0.0, abs_tol=1e-9)
+            and all(left < right for left, right in zip(times, times[1:]))
+            and segment_duration is not None
+            and times[-1] <= segment_duration + 1e-6
+        )
+        if not valid_track:
+            invalid_tracks.append(
+                {
+                    "segment_index": segment_index,
+                    "keyframe_count": len(keyframes),
+                    "numeric_keyframe_count": full_numeric_keyframe_count,
+                    "times_seconds": times,
+                    "segment_duration_seconds": segment_duration,
+                    "serialized_reasons": list(serialized_reasons),
+                    "effective_reasons": list(reasons),
+                    "plan_transform_reason": plan_transform_reason,
+                    "fallback_reason_bound_to_render_plan": (
+                        fallback_reason_bound_to_render_plan
+                    ),
+                }
+            )
+        max_zoom = max(zooms, default=1.0)
+        min_zoom = min(zooms, default=1.0)
+        max_shift = max(
+            (max(abs(x - 0.5), abs(y - 0.5)) for x, y in centers),
+            default=0.0,
+        )
+        max_roll = max((abs(value) for value in rolls), default=0.0)
+        if (
+            min_zoom < 1.0 - 1e-9
+            or
+            max_zoom > config.maximum_editorial_zoom + 1e-9
+            or max_shift > config.maximum_editorial_center_shift + 1e-9
+            or max_roll > config.maximum_editorial_roll_degrees + 1e-9
+        ):
+            unsafe_keyframes.append(
+                {
+                    "segment_index": item.get("segment_index"),
+                    "minimum_zoom": min_zoom,
+                    "maximum_zoom": max_zoom,
+                    "maximum_center_shift": max_shift,
+                    "maximum_roll_degrees": max_roll,
+                }
+            )
+        for reason in reasons:
+            reason_categories.append(reason.split(":", 1)[0])
+        signature_reasons = tuple(
+            sorted({reason.split(":", 1)[0] for reason in reasons})
+        )
+        zoom_bin = round((max_zoom - 1.0) / 0.01) if max_zoom > 1.0 else 0
+        pan_angle_bin = 0
+        if centers and max_shift > 1e-9:
+            furthest = max(
+                centers,
+                key=lambda point: math.hypot(
+                    point[0] - 0.5, point[1] - 0.5
+                ),
+            )
+            pan_angle_bin = int(
+                round(math.atan2(furthest[1] - 0.5, furthest[0] - 0.5) / (math.pi / 4.0))
+            )
+        pan_magnitude_bin = round(max_shift / 0.005)
+        signed_peak_roll = max(rolls, key=abs, default=0.0)
+        roll_bin = round(signed_peak_roll / 0.25)
+        duration_bin = (
+            round((max(times) - min(times)) / 0.1) if len(times) >= 2 else 0
+        )
+        signatures.append(
+            json.dumps(
+                {
+                    "reason_categories": signature_reasons,
+                    "zoom_bin_1pct": zoom_bin,
+                    "pan_octant": pan_angle_bin,
+                    "pan_magnitude_bin_half_percent": pan_magnitude_bin,
+                    "roll_bin_quarter_degree": roll_bin,
+                    "track_duration_bin_100ms": duration_bin,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        final_segment = final_segments.get(segment_index, {})
+        output_start = _number(final_segment.get("output_start_seconds"))
+        if keyframes and output_start is not None:
+            def state_components(
+                frame: Mapping[str, Any],
+            ) -> tuple[float, float, float, float]:
+                zoom = _number(frame.get("zoom"))
+                center_x = _number(frame.get("center_x"))
+                center_y = _number(frame.get("center_y"))
+                roll = _number(frame.get("roll_degrees"))
+                zoom_delta = abs((zoom if zoom is not None else 1.0) - 1.0)
+                pan_delta = math.hypot(
+                    (center_x if center_x is not None else 0.5) - 0.5,
+                    (center_y if center_y is not None else 0.5) - 0.5,
+                )
+                roll_delta = abs(roll if roll is not None else 0.0)
+                magnitude = zoom_delta + pan_delta + roll_delta / 10.0
+                return (magnitude, zoom_delta, pan_delta, roll_delta)
+
+            for keyframe in keyframes:
+                local_time = _number(keyframe.get("time_seconds"))
+                if local_time is not None:
+                    magnitude, zoom_delta, pan_delta, roll_delta = (
+                        state_components(keyframe)
+                    )
+                    global_state_points.append(
+                        (
+                            output_start + local_time,
+                            magnitude,
+                            zoom_delta,
+                            pan_delta,
+                            roll_delta,
+                        )
+                    )
+    non_applied_with_keyframes = [
+        item.get("segment_index")
+        for item in motion_segments
+        if item.get("applied") is not True
+        and bool(_sequence(item.get("keyframes")) or [])
+    ]
+    if invalid_tracks or non_applied_with_keyframes:
+        collector.add(
+            "editorial_motion_track_payload_invalid",
+            QAIssueSeverity.FAIL,
+            "Applied transform tracks must be numeric, ordered, bounded by their segment, and consistently marked.",
+            path="editorial_motion.segments",
+            value={
+                "invalid_applied_tracks": invalid_tracks,
+                "non_applied_segments_with_keyframes": non_applied_with_keyframes,
+            },
+        )
+    for item in motion_segments:
+        if item.get("applied") is True:
+            continue
+        segment_index = _integer(item.get("segment_index"))
+        final_segment = final_segments.get(segment_index, {})
+        output_start = _number(final_segment.get("output_start_seconds"))
+        output_end = _number(final_segment.get("output_end_seconds"))
+        if output_start is not None:
+            global_state_points.append((output_start, 0.0, 0.0, 0.0, 0.0))
+        if output_end is not None:
+            global_state_points.append((output_end, 0.0, 0.0, 0.0, 0.0))
+    if unsafe_keyframes:
+        collector.add(
+            "editorial_transform_safety_bound_exceeded",
+            QAIssueSeverity.FAIL,
+            "Serialized editorial keyframes exceed conservative transform bounds.",
+            path="editorial_motion.segments[].keyframes",
+            value=unsafe_keyframes,
+        )
+
+    section_plan = _mapping(analysis.get("section_plan")) or {}
+    sections = _sequence(section_plan.get("sections")) or []
+    target_zoom = 0
+    if sections:
+        target_zoom = int(
+            round(
+                sum(
+                    (_number((_mapping(raw) or {}).get("duration_seconds")) or 0.0)
+                    * (
+                        4.0
+                        + 8.0
+                        * (
+                            _number((_mapping(raw) or {}).get("camera_motion_budget"))
+                            or 0.0
+                        )
+                    )
+                    / 60.0
+                    for raw in sections
+                )
+            )
+        )
+    actual_zoom = _integer(motion.get("zoom_event_count"))
+
+    consecutive_duplicate_count = sum(
+        left == right for left, right in zip(signatures, signatures[1:])
+    )
+    fps = _number(plan.get("fps")) or 0.0
+    states_by_time: dict[float, tuple[float, float, float, float]] = {}
+    for event_time, magnitude, zoom_delta, pan_delta, roll_delta in global_state_points:
+        prior = states_by_time.get(event_time, (0.0, 0.0, 0.0, 0.0))
+        states_by_time[event_time] = (
+            max(magnitude, prior[0]),
+            max(zoom_delta, prior[1]),
+            max(pan_delta, prior[2]),
+            max(roll_delta, prior[3]),
+        )
+    ordered_state_points = sorted(states_by_time.items())
+    deduplicated_event_times: list[float] = []
+    derived_zoom_event_count = 0
+    derived_pan_event_count = 0
+    derived_roll_event_count = 0
+    active_excursion: list[tuple[float, float, float, float, float]] = []
+
+    def finish_excursion() -> None:
+        nonlocal derived_zoom_event_count
+        nonlocal derived_pan_event_count
+        nonlocal derived_roll_event_count
+        if not active_excursion:
+            return
+        deduplicated_event_times.append(
+            max(active_excursion, key=lambda item: item[1])[0]
+        )
+        derived_zoom_event_count += any(item[2] > 1e-9 for item in active_excursion)
+        derived_pan_event_count += any(item[3] > 1e-9 for item in active_excursion)
+        derived_roll_event_count += any(item[4] > 1e-9 for item in active_excursion)
+
+    for event_time, state in ordered_state_points:
+        magnitude, zoom_delta, pan_delta, roll_delta = state
+        if magnitude > 1e-9:
+            active_excursion.append(
+                (event_time, magnitude, zoom_delta, pan_delta, roll_delta)
+            )
+            continue
+        if active_excursion:
+            finish_excursion()
+            active_excursion = []
+    if active_excursion:
+        finish_excursion()
+    reason_sets = [
+        {
+            str(reason).split(":", 1)[0]
+            for reason in (_sequence(item.get("reasons")) or [])
+        }
+        for item in motion_segments
+    ]
+    derived_boundary_match_count = 0
+    derived_affine_boundary_match_count = 0
+    for boundary_index, raw_transition in enumerate(plan_transitions):
+        transition = _mapping(raw_transition) or {}
+        if (
+            transition.get("kind") != "hard_cut"
+            or boundary_index + 1 >= len(reason_sets)
+        ):
+            continue
+        common_reasons = reason_sets[boundary_index] & reason_sets[boundary_index + 1]
+        matched_reasons = {
+            reason
+            for reason in common_reasons
+            if reason.endswith("_matched_hard_cut")
+        }
+        if matched_reasons:
+            derived_boundary_match_count += 1
+        if any(reason.startswith("orb_affine_") for reason in matched_reasons):
+            derived_affine_boundary_match_count += 1
+
+    def contiguous_reason_event_count(reasons: set[str]) -> int:
+        count = 0
+        active = False
+        for segment_reasons in reason_sets:
+            present = bool(segment_reasons & reasons)
+            if present and not active:
+                count += 1
+            active = present
+        return count
+
+    derived_interior_zoom_count = contiguous_reason_event_count(
+        {"reference_calibrated_same_source_interior_zoom_pulse"}
+    )
+    derived_decorative_zoom_count = sum(
+        contiguous_reason_event_count({reason})
+        for reason in (
+            "reference_calibrated_push_in",
+            "reference_calibrated_pull_out",
+        )
+    )
+    derived_reason_zoom_event_count = (
+        derived_boundary_match_count
+        + derived_interior_zoom_count
+        + derived_decorative_zoom_count
+    )
+    derived_transform_event_count = len(deduplicated_event_times)
+    attainment = (
+        derived_reason_zoom_event_count / target_zoom if target_zoom > 0 else None
+    )
+    if target_zoom > 0 and derived_reason_zoom_event_count > target_zoom:
+        collector.add(
+            "editorial_zoom_target_exceeded",
+            QAIssueSeverity.FAIL,
+            "Derived non-neutral transform events exceed the section-directed cap.",
+            path="editorial_motion.segments",
+            value=derived_reason_zoom_event_count,
+            threshold=target_zoom,
+        )
+    elif target_zoom > 0 and derived_reason_zoom_event_count < target_zoom:
+        collector.add(
+            "editorial_zoom_target_underfilled",
+            QAIssueSeverity.CONDITIONAL,
+            "Safe serialized tracks did not fill the section-directed transform target.",
+            path="editorial_motion.segments",
+            value=derived_reason_zoom_event_count,
+            threshold=target_zoom,
+        )
+
+    serialized_pan_count = _integer(motion.get("pan_event_count"))
+    serialized_roll_count = _integer(motion.get("roll_event_count"))
+    serialized_boundary_count = _integer(motion.get("boundary_match_count"))
+    serialized_affine_count = _integer(motion.get("affine_boundary_match_count"))
+    serialized_interior_count = _integer(motion.get("interior_zoom_pulse_count"))
+    count_reconciliation_checks = {
+        "zoom_track_evidence": (
+            actual_zoom is not None
+            and serialized_roll_count is not None
+            and (
+                (actual_zoom + serialized_roll_count > 0)
+                == (derived_zoom_event_count > 0)
+            )
+        ),
+        "pan_track_evidence": (
+            serialized_pan_count is not None
+            and serialized_pan_count == derived_pan_event_count
+        ),
+        "roll_track_evidence": (
+            serialized_roll_count is not None
+            and serialized_roll_count == derived_roll_event_count
+        ),
+        "aggregate_structural_bounds": (
+            actual_zoom is not None
+            and serialized_pan_count is not None
+            and serialized_roll_count is not None
+            and serialized_boundary_count is not None
+            and serialized_affine_count is not None
+            and serialized_interior_count is not None
+            and serialized_affine_count <= serialized_boundary_count <= actual_zoom
+            and serialized_boundary_count + serialized_interior_count <= actual_zoom
+            and serialized_pan_count <= serialized_boundary_count
+        ),
+        "boundary_event_count_matches_reasons": (
+            serialized_boundary_count == derived_boundary_match_count
+        ),
+        "affine_event_count_matches_reasons": (
+            serialized_affine_count == derived_affine_boundary_match_count
+        ),
+        "interior_zoom_count_matches_reasons": (
+            serialized_interior_count == derived_interior_zoom_count
+        ),
+        "zoom_event_count_matches_reason_events": (
+            actual_zoom == derived_reason_zoom_event_count
+        ),
+    }
+    for name, passed in count_reconciliation_checks.items():
+        if not passed:
+            collector.add(
+                f"editorial_motion_{name}",
+                QAIssueSeverity.FAIL,
+                "Serialized transform event counts are inconsistent with applied tracks.",
+                path=f"editorial_motion.{name}",
+                value=passed,
+                threshold=True,
+            )
+    event_spacings = [
+        right - left
+        for left, right in zip(
+            deduplicated_event_times, deduplicated_event_times[1:]
+        )
+    ]
+    minimum_spacing = min(event_spacings, default=None)
+    if (
+        minimum_spacing is not None
+        and minimum_spacing
+        < config.minimum_editorial_event_spacing_seconds - 1e-9
+    ):
+        collector.add(
+            "editorial_event_spacing_below_minimum",
+            QAIssueSeverity.FAIL,
+            "Serialized editorial transform events violate the minimum spacing.",
+            path="editorial_motion.segments[].keyframes",
+            value=minimum_spacing,
+            threshold=config.minimum_editorial_event_spacing_seconds,
+        )
+    return {
+        "available": True,
+        "applied_segment_count": len(applied),
+        "segment_count": len(motion_segments),
+        "plan_segment_count": len(plan_segments),
+        "motion_contract_checks": motion_contract_checks,
+        "dissolve_endpoint_segment_indices": sorted(dissolve_endpoint_indices),
+        "applied_segment_coverage": _fraction(len(applied), len(plan_segments)),
+        "zoom_event_count": actual_zoom,
+        "pan_event_count": serialized_pan_count,
+        "roll_event_count": serialized_roll_count,
+        "boundary_match_count": serialized_boundary_count,
+        "affine_boundary_match_count": serialized_affine_count,
+        "interior_zoom_pulse_count": serialized_interior_count,
+        "count_reconciliation_checks": count_reconciliation_checks,
+        "serialized_event_subtype_count_status": (
+            "exact_from_segment_reason_identity_and_track_excursions"
+        ),
+        "target_zoom_event_count": target_zoom,
+        "target_attainment": attainment,
+        "target_attainment_basis": "derived_reason_identified_zoom_events",
+        "unique_transform_signature_count": len(set(signatures)),
+        "transform_signature_count": len(signatures),
+        "signature_reuse_ratio": (
+            1.0 - len(set(signatures)) / len(signatures) if signatures else None
+        ),
+        "consecutive_duplicate_signature_count": consecutive_duplicate_count,
+        "consecutive_duplicate_signature_fraction": _fraction(
+            consecutive_duplicate_count, max(0, len(signatures) - 1)
+        ),
+        "signature_basis": (
+            "reason_category_plus_zoom_pan_roll_amplitude_direction_and_duration_bins"
+        ),
+        "derived_event_times_seconds": deduplicated_event_times,
+        "derived_transform_event_count": derived_transform_event_count,
+        "derived_zoom_event_count": derived_zoom_event_count,
+        "derived_pan_event_count": derived_pan_event_count,
+        "derived_roll_event_count": derived_roll_event_count,
+        "derived_reason_zoom_event_count": derived_reason_zoom_event_count,
+        "derived_boundary_match_count": derived_boundary_match_count,
+        "derived_affine_boundary_match_count": (
+            derived_affine_boundary_match_count
+        ),
+        "derived_interior_zoom_pulse_count": derived_interior_zoom_count,
+        "derived_decorative_zoom_event_count": derived_decorative_zoom_count,
+        "derived_event_spacing_seconds": _distribution(event_spacings),
+        "minimum_derived_event_spacing_seconds": minimum_spacing,
+        "reason_category_entropy_normalized": _normalized_entropy(reason_categories),
+        "diversity_threshold_status": "reference_calibration_required",
+        "unsafe_keyframes": unsafe_keyframes,
+        "invalid_tracks": invalid_tracks,
+        "skipped_boundary_reasons": motion.get("skipped_boundary_reasons"),
+    }
+
+
+def _selected_boundary_repair_contracts(
+    analysis: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> tuple[
+    tuple[Mapping[str, Any], ...],
+    tuple[Mapping[str, Any], ...],
+]:
+    """Resolve the same final standard/partial repair records used on screen."""
+
+    standard = _mapping(analysis.get("visual_boundary_repairs")) or {}
+    selected_index = selection.get("selected_candidate_index")
+    for raw in _sequence(selection.get("complete_candidates")) or []:
+        candidate = _mapping(raw) or {}
+        candidate_repairs = _mapping(candidate.get("boundary_repairs"))
+        if (
+            candidate.get("candidate_index") == selected_index
+            and candidate_repairs is not None
+        ):
+            standard = candidate_repairs
+            break
+
+    plans: list[Mapping[str, Any]] = [standard]
+    by_index: dict[int, Mapping[str, Any]] = {}
+    for raw in _sequence(standard.get("repairs")) or []:
+        repair = _mapping(raw)
+        index = _integer((repair or {}).get("boundary_index"))
+        if repair is not None and index is not None:
+            by_index[index] = repair
+
+    partial = _mapping(selection.get("proxy_triggered_partial_reedit")) or {}
+    if selection.get("final_selected_version") == "partial_reedit":
+        partial_plan = _mapping(partial.get("repair")) or {}
+        plans.append(partial_plan)
+        changed = {
+            value
+            for value in (
+                _sequence(partial.get("changed_boundary_indices")) or []
+            )
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        for raw in _sequence(partial_plan.get("repairs")) or []:
+            repair = _mapping(raw)
+            index = _integer((repair or {}).get("boundary_index"))
+            if repair is not None and index is not None and index in changed:
+                by_index[index] = repair
+    return (tuple(plans), tuple(by_index[index] for index in sorted(by_index)))
+
+
+def _boundary_pose_evidence_metrics(
+    analysis: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    """Audit exact versus temporal real-pose coverage without a pose quota."""
+
+    plans, repairs = _selected_boundary_repair_contracts(analysis, selection)
+    contract_plans = tuple(
+        plan
+        for plan in plans
+        if "actual_pose_boundary_repair_v3"
+        in str(plan.get("analysis_basis") or "")
+    )
+    if not contract_plans:
+        return {
+            "available": False,
+            "contract": "formation_layout_and_actual_pose_boundary_repair_v3",
+            "legacy_or_unavailable": True,
+        }
+
+    geometry_attempts = sum(
+        _integer(plan.get("geometry_provider_attempt_count")) or 0
+        for plan in contract_plans
+    )
+    geometry_failures_values = [
+        _integer(plan.get("geometry_provider_failure_count"))
+        for plan in contract_plans
+    ]
+    missing_plan_contract = any(
+        _integer(plan.get("geometry_provider_attempt_count")) is None
+        or failure is None
+        for plan, failure in zip(
+            contract_plans, geometry_failures_values, strict=True
+        )
+    )
+    geometry_failures = sum(value or 0 for value in geometry_failures_values)
+    retained_failure_indices = sorted(
+        {
+            index
+            for repair_plan in contract_plans
+            for raw in (_sequence(repair_plan.get("failures")) or [])
+            if (failure := _mapping(raw)) is not None
+            and (index := _integer(failure.get("boundary_index"))) is not None
+        }
+    )
+    if geometry_failures:
+        collector.add(
+            "boundary_repair_geometry_provider_failures",
+            QAIssueSeverity.FAIL,
+            "Cut-local geometry decoding failed for at least one requested sample.",
+            path="visual_boundary_repairs.geometry_provider_failure_count",
+            value=geometry_failures,
+            threshold=0,
+        )
+
+    accepted_pose_bases = {
+        "exact_frame_opencv_zoo_mediapipe_pose",
+        "nearest_interior_temporal_opencv_zoo_mediapipe_pose",
+        "actual_pose_pair_unavailable",
+    }
+    professional_bases = {
+        "exact_actual_pose_plus_screen_geometry",
+        "nearest_interior_temporal_actual_pose_plus_screen_geometry",
+        "formation_assignment_plus_screen_geometry",
+        "subject_layout_plus_silhouette",
+    }
+    invalid_records: list[dict[str, Any]] = []
+    professional_gate_failures: list[int] = []
+    hog_pose_indices: list[int] = []
+    basis_counts: Counter[str] = Counter()
+    missing_mask_counts: Counter[str] = Counter()
+    exact_pose_side_count = 0
+    exact_pose_pair_count = 0
+    temporal_pose_side_count = 0
+    temporal_pose_pair_count = 0
+    nearest_pose_pair_count = 0
+    formation_side_count = 0
+    formation_pair_count = 0
+    formation_upper_body_side_count = 0
+    formation_upper_body_pair_count = 0
+    layout_side_count = 0
+    layout_pair_count = 0
+    silhouette_side_count = 0
+    silhouette_pair_count = 0
+
+    def bool_pair(
+        coverage: Mapping[str, Any], name: str
+    ) -> tuple[bool, bool] | None:
+        values = _sequence(coverage.get(name))
+        if (
+            values is None
+            or len(values) != 2
+            or any(type(value) is not bool for value in values)
+        ):
+            return None
+        return (bool(values[0]), bool(values[1]))
+
+    def count_pair(
+        coverage: Mapping[str, Any], name: str
+    ) -> tuple[int, int] | None:
+        values = _sequence(coverage.get(name))
+        if values is None or len(values) != 2:
+            return None
+        converted = tuple(_integer(value) for value in values)
+        if any(value is None or value < 0 for value in converted):
+            return None
+        return (int(converted[0]), int(converted[1]))  # type: ignore[arg-type]
+
+    for position, repair in enumerate(repairs):
+        index = _integer(repair.get("boundary_index"))
+        evidence = _mapping(repair.get("selected_visual_evidence")) or {}
+        coverage = _mapping(evidence.get("evidence_coverage"))
+        reasons: list[str] = []
+        if coverage is None:
+            invalid_records.append(
+                {
+                    "boundary_index": index,
+                    "reasons": ["evidence_coverage_missing"],
+                }
+            )
+            continue
+        exact = bool_pair(coverage, "exact_pose_available")
+        temporal = bool_pair(coverage, "temporal_pose_available")
+        formation = count_pair(coverage, "formation_person_counts")
+        formation_upper = count_pair(
+            coverage, "formation_upper_body_counts"
+        )
+        layout = bool_pair(coverage, "person_layout_available")
+        silhouette = bool_pair(coverage, "silhouette_available")
+        offsets_raw = _sequence(
+            coverage.get("temporal_pose_offsets_frames")
+        )
+        offsets = (
+            tuple(
+                None if value is None else _integer(value)
+                for value in offsets_raw
+            )
+            if offsets_raw is not None and len(offsets_raw) == 2
+            else None
+        )
+        for name, value in (
+            ("exact_pose_available", exact),
+            ("temporal_pose_available", temporal),
+            ("formation_person_counts", formation),
+            ("formation_upper_body_counts", formation_upper),
+            ("person_layout_available", layout),
+            ("silhouette_available", silhouette),
+            ("temporal_pose_offsets_frames", offsets),
+        ):
+            if value is None:
+                reasons.append(f"{name}_invalid")
+
+        pose_basis = evidence.get("pose_basis")
+        if pose_basis == "structure_hog_fallback":
+            if index is not None:
+                hog_pose_indices.append(index)
+        if pose_basis not in accepted_pose_bases:
+            reasons.append("pose_basis_invalid")
+        exact_mismatch = _number(evidence.get("exact_pose_mismatch"))
+        temporal_mismatch = _number(
+            evidence.get("nearest_temporal_pose_mismatch")
+        )
+        selected_pose_mismatch = _number(evidence.get("pose_mismatch"))
+        if pose_basis == "exact_frame_opencv_zoo_mediapipe_pose" and not (
+            exact == (True, True)
+            and exact_mismatch is not None
+            and selected_pose_mismatch is not None
+        ):
+            reasons.append("exact_pose_basis_not_supported_by_exact_pair")
+        if pose_basis == "nearest_interior_temporal_opencv_zoo_mediapipe_pose":
+            directional_offsets_valid = bool(
+                offsets is not None
+                and offsets[0] is not None
+                and offsets[1] is not None
+                and -3 <= offsets[0] <= 0
+                and 0 <= offsets[1] <= 3
+                and any(value != 0 for value in offsets)
+            )
+            if not (
+                temporal == (True, True)
+                and temporal_mismatch is not None
+                and selected_pose_mismatch is not None
+                and directional_offsets_valid
+            ):
+                reasons.append(
+                    "temporal_pose_basis_not_supported_by_interior_pair"
+                )
+        if pose_basis == "actual_pose_pair_unavailable" and (
+            selected_pose_mismatch is not None
+            or exact_mismatch is not None
+            or temporal_mismatch is not None
+        ):
+            reasons.append("unavailable_pose_basis_contains_pose_mismatch")
+
+        professional_basis = coverage.get("professional_evidence_basis")
+        professional_passed = coverage.get("professional_gate_passed")
+        if professional_basis not in professional_bases:
+            reasons.append("professional_evidence_basis_invalid")
+        if professional_passed is not True:
+            if index is not None:
+                professional_gate_failures.append(index)
+            reasons.append("professional_combined_evidence_gate_failed")
+
+        missing_mask_raw = _sequence(coverage.get("missing_mask"))
+        if missing_mask_raw is None or any(
+            not isinstance(value, str) or not value
+            for value in missing_mask_raw
+        ):
+            reasons.append("missing_mask_invalid")
+        else:
+            missing_mask_counts.update(str(value) for value in missing_mask_raw)
+
+        if reasons:
+            invalid_records.append(
+                {
+                    "boundary_index": index if index is not None else position,
+                    "reasons": sorted(set(reasons)),
+                }
+            )
+        if exact is not None:
+            exact_pose_side_count += sum(exact)
+            exact_pose_pair_count += int(all(exact))
+        if temporal is not None:
+            temporal_pose_side_count += sum(temporal)
+            temporal_pose_pair_count += int(all(temporal))
+            nearest_pose_pair_count += int(
+                all(temporal)
+                and offsets is not None
+                and any(value not in (None, 0) for value in offsets)
+            )
+        if formation is not None:
+            formation_side_count += sum(value > 0 for value in formation)
+            formation_pair_count += int(all(value > 0 for value in formation))
+        if formation_upper is not None:
+            formation_upper_body_side_count += sum(
+                value > 0 for value in formation_upper
+            )
+            formation_upper_body_pair_count += int(
+                all(value > 0 for value in formation_upper)
+            )
+        if layout is not None:
+            layout_side_count += sum(layout)
+            layout_pair_count += int(all(layout))
+        if silhouette is not None:
+            silhouette_side_count += sum(silhouette)
+            silhouette_pair_count += int(all(silhouette))
+        basis_counts[str(professional_basis)] += 1
+
+    if hog_pose_indices:
+        collector.add(
+            "boundary_hog_mislabeled_as_pose",
+            QAIssueSeverity.FAIL,
+            "HOG structure evidence was serialized as if it were actual pose.",
+            path="visual_boundary_repairs.repairs[].selected_visual_evidence.pose_basis",
+            value=sorted(hog_pose_indices),
+            threshold=[],
+        )
+    if professional_gate_failures:
+        collector.add(
+            "boundary_professional_combined_evidence_gate_failed",
+            QAIssueSeverity.FAIL,
+            "A selected cut lacks the required combined formation/layout/pose evidence.",
+            path="visual_boundary_repairs.repairs[].selected_visual_evidence.evidence_coverage",
+            value=sorted(professional_gate_failures),
+            threshold=[],
+        )
+    if missing_plan_contract or invalid_records:
+        collector.add(
+            "boundary_pose_evidence_contract_invalid",
+            QAIssueSeverity.FAIL,
+            "Cut-local pose evidence is missing or internally inconsistent.",
+            path="visual_boundary_repairs",
+            value={
+                "plan_contract_missing": missing_plan_contract,
+                "invalid_records": invalid_records,
+            },
+            threshold={
+                "plan_contract_missing": False,
+                "invalid_records": [],
+            },
+        )
+
+    boundary_count = len(repairs)
+    side_count = 2 * boundary_count
+    return {
+        "available": True,
+        "contract": "formation_layout_and_actual_pose_boundary_repair_v3",
+        "boundary_count": boundary_count,
+        "retained_without_selected_repair_boundary_indices": (
+            retained_failure_indices
+        ),
+        "side_count": side_count,
+        "geometry_provider_attempt_count": geometry_attempts,
+        "geometry_provider_failure_count": geometry_failures,
+        "exact_actual_pose_side_count": exact_pose_side_count,
+        "exact_actual_pose_side_coverage": _fraction(
+            exact_pose_side_count, side_count
+        ),
+        "exact_actual_pose_pair_count": exact_pose_pair_count,
+        "exact_actual_pose_pair_coverage": _fraction(
+            exact_pose_pair_count, boundary_count
+        ),
+        "temporal_actual_pose_side_count": temporal_pose_side_count,
+        "temporal_actual_pose_pair_count": temporal_pose_pair_count,
+        "nearest_temporal_actual_pose_pair_count": nearest_pose_pair_count,
+        "formation_side_count": formation_side_count,
+        "formation_pair_count": formation_pair_count,
+        "formation_upper_body_side_count": formation_upper_body_side_count,
+        "formation_upper_body_pair_count": formation_upper_body_pair_count,
+        "person_layout_side_count": layout_side_count,
+        "person_layout_pair_count": layout_pair_count,
+        "silhouette_side_count": silhouette_side_count,
+        "silhouette_pair_count": silhouette_pair_count,
+        "professional_evidence_basis_counts": dict(sorted(basis_counts.items())),
+        "professional_gate_failure_boundary_indices": sorted(
+            professional_gate_failures
+        ),
+        "hog_used_as_pose_boundary_indices": sorted(hog_pose_indices),
+        "missing_mask_counts": dict(sorted(missing_mask_counts.items())),
+        "invalid_records": invalid_records,
+        "passed": (
+            geometry_failures == 0
+            and not missing_plan_contract
+            and not professional_gate_failures
+            and not hog_pose_indices
+            and not invalid_records
+        ),
+    }
+
+
+def _beat_phrase_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    rhythm = _mapping(analysis.get("rhythm_analysis")) or {}
+    timeline = _mapping(analysis.get("timeline_review")) or {}
+    boundaries = [
+        item
+        for raw in (_sequence(timeline.get("boundaries")) or [])
+        if (item := _mapping(raw)) is not None and item.get("source_switch") is True
+    ]
+    beats = [
+        item
+        for raw in (_sequence(rhythm.get("beat_grid")) or [])
+        if (item := _mapping(raw)) is not None
+        and _number(item.get("time_seconds")) is not None
+    ]
+    beat_times = [float(item["time_seconds"]) for item in beats]
+    phrase_items = [
+        item
+        for raw in (_sequence(rhythm.get("phrase_candidates")) or [])
+        if (item := _mapping(raw)) is not None
+    ]
+    phrase_times = sorted(
+        {
+            value
+            for item in phrase_items
+            for key in ("start_seconds", "end_seconds")
+            if (value := _number(item.get(key))) is not None
+        }
+    )
+    fps = _number(plan.get("fps")) or 0.0
+    if not beat_times or fps <= 0.0:
+        collector.add(
+            "beat_grid_unavailable",
+            QAIssueSeverity.FAIL,
+            "The final edit cannot be checked against a valid beat grid.",
+            path="rhythm_analysis.beat_grid",
+        )
+    if not phrase_times:
+        collector.add(
+            "phrase_candidates_unavailable",
+            QAIssueSeverity.CONDITIONAL,
+            "Phrase-boundary alignment cannot be measured.",
+            path="rhythm_analysis.phrase_candidates",
+        )
+
+    beat_distances: list[float] = []
+    phrase_distances: list[float] = []
+    nearest_strengths: list[float] = []
+    per_boundary: list[dict[str, Any]] = []
+    for boundary in boundaries:
+        time_value = _number(boundary.get("at_seconds"))
+        if time_value is None:
+            continue
+        if beat_times and fps > 0.0:
+            nearest_index = min(
+                range(len(beat_times)),
+                key=lambda index: abs(beat_times[index] - time_value),
+            )
+            beat_distance = abs(beat_times[nearest_index] - time_value) * fps
+            strength = _number(beats[nearest_index].get("strength"))
+            beat_distances.append(beat_distance)
+            if strength is not None:
+                nearest_strengths.append(strength)
+        else:
+            beat_distance = None
+            strength = None
+        phrase_distance = (
+            min(abs(value - time_value) for value in phrase_times) * fps
+            if phrase_times and fps > 0.0
+            else None
+        )
+        if phrase_distance is not None:
+            phrase_distances.append(phrase_distance)
+        per_boundary.append(
+            {
+                "boundary_index": boundary.get("boundary_index"),
+                "canonical_master_seconds": time_value,
+                "nearest_beat_distance_frames": beat_distance,
+                "nearest_beat_strength": strength,
+                "nearest_phrase_boundary_distance_frames": phrase_distance,
+            }
+        )
+
+    standard_repairs = _sequence(
+        (_mapping(analysis.get("visual_boundary_repairs")) or {}).get("repairs")
+    ) or []
+    selected_index = selection.get("selected_candidate_index")
+    complete_candidates = _sequence(selection.get("complete_candidates")) or []
+    for raw in complete_candidates:
+        candidate = _mapping(raw) or {}
+        if candidate.get("candidate_index") == selected_index:
+            standard_repairs = _sequence(
+                (_mapping(candidate.get("boundary_repairs")) or {}).get("repairs")
+            ) or standard_repairs
+            break
+    offsets: dict[int, int] = {}
+    selected_boundary_seconds: dict[int, float] = {}
+    nominal_boundary_seconds: dict[int, float] = {}
+    repair_payload_consistency: dict[int, bool] = {}
+    for raw in standard_repairs:
+        repair = _mapping(raw) or {}
+        index = _integer(repair.get("boundary_index"))
+        result = _mapping(repair.get("result")) or {}
+        offset = _integer(result.get("selected_frame_offset"))
+        if index is not None and offset is not None:
+            offsets[index] = offset
+            selected_seconds = _number(result.get("selected_boundary_seconds"))
+            if selected_seconds is not None:
+                selected_boundary_seconds[index] = selected_seconds
+            nominal_seconds = _number(result.get("nominal_boundary_seconds"))
+            if nominal_seconds is not None:
+                nominal_boundary_seconds[index] = nominal_seconds
+            nested_selected = _mapping(result.get("selected")) or {}
+            nested_selected_seconds = _number(
+                nested_selected.get("boundary_seconds")
+            )
+            repair_payload_consistency[index] = (
+                nested_selected.get("frame_offset") == offset
+                and nested_selected_seconds is not None
+                and selected_seconds is not None
+                and math.isclose(
+                    nested_selected_seconds,
+                    selected_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+
+    partial = _mapping(selection.get("proxy_triggered_partial_reedit")) or {}
+    selected_partial_reedit = (
+        selection.get("final_selected_version") == "partial_reedit"
+    )
+    partial_changed = (
+        {
+            value
+            for value in (
+                _sequence(partial.get("changed_boundary_indices")) or []
+            )
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        if selected_partial_reedit
+        else set()
+    )
+    partial_repair = _mapping(partial.get("repair")) or {}
+    for raw in (
+        _sequence(partial_repair.get("repairs")) or []
+        if selected_partial_reedit
+        else []
+    ):
+        repair = _mapping(raw) or {}
+        index = _integer(repair.get("boundary_index"))
+        result = _mapping(repair.get("result")) or {}
+        offset = _integer(result.get("selected_frame_offset"))
+        if index is not None and offset is not None and index in partial_changed:
+            offsets[index] = offset
+            selected_seconds = _number(result.get("selected_boundary_seconds"))
+            if selected_seconds is not None:
+                selected_boundary_seconds[index] = selected_seconds
+            nominal_seconds = _number(result.get("nominal_boundary_seconds"))
+            if nominal_seconds is not None:
+                nominal_boundary_seconds[index] = nominal_seconds
+            nested_selected = _mapping(result.get("selected")) or {}
+            nested_selected_seconds = _number(
+                nested_selected.get("boundary_seconds")
+            )
+            repair_payload_consistency[index] = (
+                nested_selected.get("frame_offset") == offset
+                and nested_selected_seconds is not None
+                and selected_seconds is not None
+                and math.isclose(
+                    nested_selected_seconds,
+                    selected_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+
+    repair_records: list[dict[str, Any]] = []
+    visible_indices = {
+        _integer(item.get("boundary_index")) for item in boundaries
+    }
+    visible_indices.discard(None)
+    missing_repair_records = sorted(index for index in visible_indices if index not in offsets)
+    if missing_repair_records:
+        collector.add(
+            "visible_boundary_repair_evidence_missing",
+            QAIssueSeverity.CONDITIONAL,
+            "At least one visible source switch lacks serialized local-repair evidence.",
+            path="visual_boundary_repairs.repairs",
+            value=missing_repair_records,
+            threshold=[],
+        )
+    boundary_times = {
+        index: time_value
+        for item in boundaries
+        if (index := _integer(item.get("boundary_index"))) is not None
+        and (time_value := _number(item.get("at_seconds"))) is not None
+    }
+    for index in sorted(visible_indices):
+        if index not in offsets:
+            continue
+        offset = offsets[index]
+        maximum = (
+            config.partial_reedit_maximum_frames
+            if index in partial_changed
+            else config.standard_boundary_repair_maximum_frames
+        )
+        passed = abs(offset) <= maximum
+        selected_seconds = selected_boundary_seconds.get(index)
+        nominal_seconds = nominal_boundary_seconds.get(index)
+        timeline_seconds = boundary_times.get(index)
+        selected_time_matches_timeline = (
+            selected_seconds is not None
+            and timeline_seconds is not None
+            and math.isclose(
+                selected_seconds,
+                timeline_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        )
+        offset_time_matches = (
+            nominal_seconds is not None
+            and selected_seconds is not None
+            and fps > 0.0
+            and math.isclose(
+                selected_seconds,
+                nominal_seconds + offset / fps,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        )
+        payload_consistent = repair_payload_consistency.get(index) is True
+        repair_records.append(
+            {
+                "boundary_index": index,
+                "selected_frame_offset": offset,
+                "selected_boundary_seconds": selected_seconds,
+                "nominal_boundary_seconds": nominal_seconds,
+                "timeline_boundary_seconds": timeline_seconds,
+                "selected_time_matches_timeline": selected_time_matches_timeline,
+                "offset_time_matches": offset_time_matches,
+                "payload_consistent": payload_consistent,
+                "maximum_allowed_frames": maximum,
+                "partial_reedit_boundary": index in partial_changed,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            collector.add(
+                "boundary_repair_exceeds_allowed_radius",
+                QAIssueSeverity.FAIL,
+                "A visible boundary moved beyond its permitted local repair radius.",
+                path=f"boundary_repairs[{index}]",
+                value=offset,
+                threshold=maximum,
+            )
+        if not selected_time_matches_timeline:
+            collector.add(
+                "boundary_repair_time_mismatch",
+                QAIssueSeverity.FAIL,
+                "The selected repair timestamp does not match the final visible boundary.",
+                path=f"boundary_repairs[{index}].selected_boundary_seconds",
+                value={
+                    "selected_boundary_seconds": selected_seconds,
+                    "timeline_boundary_seconds": timeline_seconds,
+                },
+                threshold="absolute difference <= 1e-6 seconds",
+            )
+        if not offset_time_matches or not payload_consistent:
+            collector.add(
+                "boundary_repair_payload_inconsistent",
+                QAIssueSeverity.FAIL,
+                "Boundary repair offset and nested timestamps are internally inconsistent.",
+                path=f"boundary_repairs[{index}]",
+                value={
+                    "nominal_boundary_seconds": nominal_seconds,
+                    "selected_boundary_seconds": selected_seconds,
+                    "selected_frame_offset": offset,
+                    "nested_payload_consistent": payload_consistent,
+                },
+                threshold="selected = nominal + frame_offset / fps",
+            )
+
+    beat_distribution = _distribution(beat_distances)
+    phrase_distribution = _distribution(phrase_distances)
+    if beat_distances and max(beat_distances) > config.partial_beat_window_frames:
+        collector.add(
+            "visible_cut_far_from_beat_grid",
+            QAIssueSeverity.CONDITIONAL,
+            "At least one visible source switch is more than eight frames from the nearest beat.",
+            path="beat_phrase.per_boundary",
+            value=max(beat_distances),
+            threshold=config.partial_beat_window_frames,
+        )
+
+    section_metrics: list[dict[str, Any]] = []
+    beat_period = _number(rhythm.get("beat_period_seconds")) or 0.0
+    for raw in _sequence((_mapping(analysis.get("section_plan")) or {}).get("sections")) or []:
+        section = _mapping(raw) or {}
+        start = _number(section.get("start_seconds"))
+        end = _number(section.get("end_seconds"))
+        target_spm = _number(section.get("target_source_switches_per_minute"))
+        if start is None or end is None or end <= start or target_spm is None:
+            continue
+        in_section = [
+            item
+            for item in per_boundary
+            if start <= float(item["canonical_master_seconds"]) < end
+        ]
+        duration = end - start
+        achieved_spm = len(in_section) * 60.0 / duration
+        expected_count = int(round(target_spm * duration / 60.0))
+        last_beat_cut_count = (
+            sum(
+                end - beat_period
+                <= float(item["canonical_master_seconds"])
+                < end - 1e-9
+                for item in in_section
+            )
+            if beat_period > 0.0
+            and section.get("protect_last_beat_from_extra_cut") is True
+            else 0
+        )
+        if last_beat_cut_count:
+            collector.add(
+                "protected_section_last_beat_cut",
+                QAIssueSeverity.CONDITIONAL,
+                "A protected final section beat contains an extra source switch.",
+                path=f"section_plan.sections[{section.get('section_index')}]",
+                value=last_beat_cut_count,
+                threshold=0,
+            )
+        section_metrics.append(
+            {
+                "section_index": section.get("section_index"),
+                "role": section.get("role"),
+                "duration_seconds": duration,
+                "source_switch_count": len(in_section),
+                "achieved_source_switches_per_minute": achieved_spm,
+                "target_source_switches_per_minute": target_spm,
+                "expected_source_switch_count": expected_count,
+                "count_delta_from_target": len(in_section) - expected_count,
+                "protected_last_beat_cut_count": last_beat_cut_count,
+            }
+        )
+    return {
+        "visible_source_switch_count": len(per_boundary),
+        "beat_distance_frames": {
+            **beat_distribution,
+            "within_1_frame_count": sum(
+                value <= config.exact_beat_window_frames for value in beat_distances
+            ),
+            "within_1_frame_fraction": _fraction(
+                sum(value <= config.exact_beat_window_frames for value in beat_distances),
+                len(beat_distances),
+            ),
+            "within_3_frames_count": sum(
+                value <= config.standard_beat_window_frames for value in beat_distances
+            ),
+            "within_3_frames_fraction": _fraction(
+                sum(value <= config.standard_beat_window_frames for value in beat_distances),
+                len(beat_distances),
+            ),
+            "within_8_frames_count": sum(
+                value <= config.partial_beat_window_frames for value in beat_distances
+            ),
+            "within_8_frames_fraction": _fraction(
+                sum(value <= config.partial_beat_window_frames for value in beat_distances),
+                len(beat_distances),
+            ),
+        },
+        "phrase_distance_frames": phrase_distribution,
+        "phrase_hit_within_3_frames_fraction": _fraction(
+            sum(value <= config.standard_beat_window_frames for value in phrase_distances),
+            len(phrase_distances),
+        ),
+        "nearest_beat_strength": _distribution(nearest_strengths),
+        "per_boundary": per_boundary,
+        "repair_radius_checks": repair_records,
+        "missing_repair_boundary_indices": missing_repair_records,
+        "sections": section_metrics,
+        "phrase_professional_threshold_status": "reference_calibration_required",
+    }
+
+
+def _sync_quality_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    config: PostRenderQAConfig,
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    """Fail closed on the production PTS clock used by every rendered source.
+
+    ``local_timewarps`` is serialized in request-source index space while the
+    render plan uses its compact sources-array index.  The explicit mapping is
+    therefore part of the evidence; treating the two domains as interchangeable
+    could silently audit a different camera after an ineligible source is
+    removed.  The residual is converted to output frames so the professional
+    half-frame release target is independent of 29.97/30/59.94 fps delivery.
+    """
+
+    fps = _number(plan.get("fps"))
+    usage = _mapping(plan.get("source_usage")) or {}
+    raw_used_indices = _sequence(usage.get("used_source_indices"))
+    used_render_indices = (
+        tuple(_integer(value) for value in raw_used_indices)
+        if raw_used_indices is not None
+        else ()
+    )
+    mapping = _mapping(analysis.get("source_index_mapping")) or {}
+    eligible_to_request = _sequence(mapping.get("eligible_to_request"))
+    local_timewarps = _sequence(analysis.get("local_timewarps"))
+
+    domain_valid = (
+        fps is not None
+        and fps > 0.0
+        and bool(used_render_indices)
+        and all(index is not None and index >= 0 for index in used_render_indices)
+        and eligible_to_request is not None
+        and all(
+            index is not None and index < len(eligible_to_request)
+            for index in used_render_indices
+        )
+        and local_timewarps is not None
+    )
+    if not domain_valid:
+        collector.add(
+            "production_sync_evidence_missing_or_unmapped",
+            QAIssueSeverity.FAIL,
+            "Used render sources cannot be bound to their PTS time-warp evidence.",
+            path="local_timewarps",
+        )
+        return {
+            "basis": "used_source_piecewise_pts_residual_p95_frames_v1",
+            "domain_mapping_valid": False,
+            "used_render_source_indices": [
+                value for value in used_render_indices if value is not None
+            ],
+            "per_source": [],
+            "maximum_residual_p95_frames": None,
+            "passed": False,
+        }
+
+    assert fps is not None
+    assert eligible_to_request is not None
+    assert local_timewarps is not None
+    timewarp_by_request: dict[int, dict[str, Any]] = {}
+    duplicate_request_indices: set[int] = set()
+    for raw_item in local_timewarps:
+        item = _mapping(raw_item)
+        if item is None:
+            continue
+        request_index = _integer(item.get("source_index"))
+        if request_index is None or request_index < 0:
+            continue
+        if request_index in timewarp_by_request:
+            duplicate_request_indices.add(request_index)
+        else:
+            timewarp_by_request[request_index] = item
+
+    if duplicate_request_indices:
+        collector.add(
+            "production_sync_duplicate_source_evidence",
+            QAIssueSeverity.FAIL,
+            "A request source has more than one serialized time-warp record.",
+            path="local_timewarps",
+            value=sorted(duplicate_request_indices),
+        )
+
+    per_source: list[dict[str, Any]] = []
+    residual_frames_values: list[float] = []
+    for render_index_value in used_render_indices:
+        assert render_index_value is not None
+        request_index = _integer(eligible_to_request[render_index_value])
+        item = (
+            timewarp_by_request.get(request_index)
+            if request_index is not None
+            else None
+        )
+        path = f"local_timewarps[request_source_index={request_index}]"
+        if request_index is None or item is None:
+            collector.add(
+                "production_sync_used_source_evidence_missing",
+                QAIssueSeverity.FAIL,
+                "A rendered source has no bound local time-warp record.",
+                path=path,
+                value={
+                    "render_plan_source_index": render_index_value,
+                    "request_source_index": request_index,
+                },
+            )
+            per_source.append(
+                {
+                    "render_plan_source_index": render_index_value,
+                    "request_source_index": request_index,
+                    "passed": False,
+                    "reason": "timewarp_missing",
+                }
+            )
+            continue
+
+        residuals = _mapping(item.get("residuals")) or {}
+        residual_seconds = _number(residuals.get("p95_seconds"))
+        sample_count = _integer(residuals.get("sample_count"))
+        anchor_count = _integer(item.get("accepted_anchor_count"))
+        residual_definition = residuals.get("definition")
+        scalar_fallback = item.get("scalar_fallback")
+        status = item.get("status")
+        residual_frames = (
+            residual_seconds * fps
+            if residual_seconds is not None and residual_seconds >= 0.0
+            else None
+        )
+        piecewise_valid = (
+            scalar_fallback is False
+            and status == "local_monotonic_timewarp"
+            and residual_definition
+            == "absolute_anchor_residual_to_robust_affine_trend"
+            and anchor_count is not None
+            and anchor_count >= config.minimum_local_timewarp_anchor_count
+            and sample_count is not None
+            and sample_count >= config.minimum_local_timewarp_anchor_count
+            and residual_frames is not None
+        )
+        within_threshold = (
+            residual_frames is not None
+            and residual_frames <= config.maximum_sync_residual_p95_frames + 1e-12
+        )
+        passed = piecewise_valid and within_threshold
+        if not piecewise_valid:
+            collector.add(
+                "production_sync_used_source_not_piecewise_verified",
+                QAIssueSeverity.FAIL,
+                "A rendered source lacks a verified monotonic local PTS clock.",
+                path=path,
+                value={
+                    "status": status,
+                    "scalar_fallback": scalar_fallback,
+                    "accepted_anchor_count": anchor_count,
+                    "residual_sample_count": sample_count,
+                    "residual_definition": residual_definition,
+                },
+                threshold={
+                    "minimum_anchor_count": config.minimum_local_timewarp_anchor_count,
+                    "scalar_fallback": False,
+                },
+            )
+        elif not within_threshold:
+            collector.add(
+                "production_sync_residual_exceeds_half_frame",
+                QAIssueSeverity.FAIL,
+                "A rendered source exceeds the professional PTS residual target.",
+                path=path,
+                value=residual_frames,
+                threshold=config.maximum_sync_residual_p95_frames,
+            )
+        if residual_frames is not None:
+            residual_frames_values.append(residual_frames)
+        per_source.append(
+            {
+                "render_plan_source_index": render_index_value,
+                "request_source_index": request_index,
+                "status": status,
+                "scalar_fallback": scalar_fallback,
+                "accepted_anchor_count": anchor_count,
+                "residual_sample_count": sample_count,
+                "residual_definition": residual_definition,
+                "residual_p95_seconds": residual_seconds,
+                "residual_p95_frames": residual_frames,
+                "passed": passed,
+            }
+        )
+
+    return {
+        "basis": "used_source_piecewise_pts_residual_p95_frames_v1",
+        "domain_mapping_valid": True,
+        "fps": fps,
+        "used_render_source_indices": [
+            int(value) for value in used_render_indices if value is not None
+        ],
+        "maximum_allowed_residual_p95_frames": (
+            config.maximum_sync_residual_p95_frames
+        ),
+        "minimum_local_timewarp_anchor_count": (
+            config.minimum_local_timewarp_anchor_count
+        ),
+        "maximum_residual_p95_frames": (
+            max(residual_frames_values) if residual_frames_values else None
+        ),
+        "per_source": per_source,
+        "passed": (
+            len(per_source) == len(used_render_indices)
+            and all(item.get("passed") is True for item in per_source)
+            and not duplicate_request_indices
+        ),
+    }
+
+
+def evaluate_post_render_qa(
+    artifact_set: PostRenderArtifactSet,
+    *,
+    config: PostRenderQAConfig | None = None,
+    runner: RunCommand = _run_command,
+    created_at: datetime | None = None,
+) -> PostRenderQAReport:
+    """Evaluate one explicit completed set without modifying any input artifact."""
+
+    settings = config or PostRenderQAConfig()
+    collector = _IssueCollector()
+    metrics: dict[str, Any] = {}
+    try:
+        analysis = _load_json_object(artifact_set.analysis_path)
+        plan = _load_json_object(artifact_set.render_plan_path)
+        selection = _load_json_object(artifact_set.selection_path)
+    except ValueError as exc:
+        collector.add(
+            "artifact_json_unavailable_or_invalid",
+            QAIssueSeverity.FAIL,
+            "The timestamp-bound JSON artifact set could not be loaded.",
+            path="artifact_set",
+            value=str(exc),
+        )
+        return PostRenderQAReport(
+            artifact_set=artifact_set,
+            verdict=collector.verdict(),
+            metrics=metrics,
+            issues=tuple(collector.issues),
+            policy=settings,
+            created_at=created_at or datetime.now(UTC),
+        )
+
+    metrics["artifact_binding"] = _validate_artifact_binding(
+        artifact_set, analysis, plan, selection, collector
+    )
+    selection_metrics, final_review = _validate_selection(
+        analysis, plan, selection, settings, collector
+    )
+    metrics["selection"] = selection_metrics
+    metrics["plan_invariants"] = _validate_plan_invariants(
+        analysis, plan, final_review, collector
+    )
+    tool_checks = _probe_and_decode(
+        artifact_set.video_path,
+        config=settings,
+        runner=runner,
+        collector=collector,
+    )
+    metrics["tool_checks"] = tool_checks
+    metrics["final_media"] = _validate_ffprobe_against_plan(
+        tool_checks, analysis, plan, settings, collector
+    )
+    metrics["production_sync"] = _sync_quality_metrics(
+        analysis, plan, settings, collector
+    )
+    metrics["cadence_and_repetition"] = _cadence_and_repetition_metrics(
+        analysis, plan, settings, collector
+    )
+    metrics["proxy_quality_and_geometry"] = _proxy_quality_and_geometry_metrics(
+        analysis, final_review, settings, collector
+    )
+    metrics["source_local_reuse"] = _source_local_reuse_metrics(
+        plan, settings, collector
+    )
+    metrics["transforms"] = _transform_metrics(
+        analysis, plan, settings, collector
+    )
+    metrics["boundary_pose_evidence"] = _boundary_pose_evidence_metrics(
+        analysis, selection, collector
+    )
+    metrics["beat_and_phrase"] = _beat_phrase_metrics(
+        analysis, plan, selection, settings, collector
+    )
+    return PostRenderQAReport(
+        artifact_set=artifact_set,
+        verdict=collector.verdict(),
+        metrics=metrics,
+        issues=tuple(collector.issues),
+        policy=settings,
+        created_at=created_at or datetime.now(UTC),
+    )
+
+
+def evaluate_and_write_post_render_qa(
+    artifact_set: PostRenderArtifactSet,
+    *,
+    output_path: Path | None = None,
+    config: PostRenderQAConfig | None = None,
+    runner: RunCommand = _run_command,
+    created_at: datetime | None = None,
+) -> tuple[PostRenderQAReport, Path]:
+    report = evaluate_post_render_qa(
+        artifact_set,
+        config=config,
+        runner=runner,
+        created_at=created_at,
+    )
+    return (report, report.write_atomic(output_path))
+
+
+__all__ = [
+    "ANALYSIS_BASIS",
+    "PostRenderArtifactSet",
+    "PostRenderQAConfig",
+    "PostRenderQAReport",
+    "PostRenderQAVerdict",
+    "QAIssue",
+    "QAIssueSeverity",
+    "SCHEMA_VERSION",
+    "discover_completed_artifact_sets",
+    "evaluate_and_write_post_render_qa",
+    "evaluate_post_render_qa",
+]
