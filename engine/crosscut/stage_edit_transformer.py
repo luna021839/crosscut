@@ -34,6 +34,12 @@ from .reference_dataset import (
     NATIVE_SOURCE_CAMERA_CUT_EVENT,
     REFERENCE_START_EVENT,
 )
+from .stage_edit_transition_authority import (
+    LEARNED_TRANSITION_AUTHORITY,
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+    transition_authority_contract,
+)
 
 try:  # Optional so dataset/schema tooling remains portable.
     import mlx.core as mx
@@ -52,7 +58,7 @@ MASKED_SOURCE_LOGIT = -1.0e9
 PRODUCTION_TRAINING_REPORT_FILENAME = "training-report.json"
 PRODUCTION_TRAINING_RUN_KIND = "stage_edit_production_training"
 PRODUCTION_CHECKPOINT_SCOPE = "production_learned_editor"
-PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION = 6
+PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION = 7
 PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT = (
     "shared_media_feature_snapshot_with_postload_history_scrub_v2"
 )
@@ -444,6 +450,7 @@ class StageEditTransformerConfig:
     transition_count: int
     source_relation_mode: str = STAGE_EDIT_SOURCE_RELATION_MODE
     cut_logit_mode: str = STAGE_EDIT_CUT_LOGIT_MODE
+    transition_authority: str = LEARNED_TRANSITION_AUTHORITY
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
@@ -468,6 +475,7 @@ class StageEditTransformerConfig:
             raise ValueError("unsupported source relational encoder contract")
         if self.cut_logit_mode != STAGE_EDIT_CUT_LOGIT_MODE:
             raise ValueError("unsupported cut scoring contract")
+        StageEditTransitionAuthority(mode=self.transition_authority)
         if self.model_dimension % self.num_heads:
             raise ValueError("model dimension must be divisible by attention heads")
         if not 0.0 <= float(self.dropout) < 1.0:
@@ -487,6 +495,7 @@ class StageEditTransformerConfig:
         max_sequence_length: int,
         max_sources: int,
         dropout: float = 0.0,
+        transition_authority: str = LEARNED_TRANSITION_AUTHORITY,
     ) -> "StageEditTransformerConfig":
         return cls(
             config_version=3,
@@ -501,6 +510,7 @@ class StageEditTransformerConfig:
             max_sources=max_sources,
             duration_bucket_count=schema.duration_bucket_count,
             transition_count=len(schema.transition_labels),
+            transition_authority=transition_authority,
             dropout=dropout,
         )
 
@@ -1425,6 +1435,7 @@ class StageEditLossContract:
     duration_weight: float = 0.5
     transition_weight: float = 0.5
     crop_weight: float = 0.25
+    transition_authority: str = LEARNED_TRANSITION_AUTHORITY
 
     def __post_init__(self) -> None:
         if self.source_objective not in {
@@ -1455,6 +1466,11 @@ class StageEditLossContract:
             or self.cut_positive_weight < 1.0
         ):
             raise ValueError("cut positive weight must be finite and >= 1")
+        authority = StageEditTransitionAuthority(mode=self.transition_authority)
+        if authority.renderer_owned and self.transition_weight != 0.0:
+            raise ValueError(
+                "renderer-owned transition authority requires transition_weight=0"
+            )
 
 
 def _masked_mean(values: Any, mask: Any) -> Any:
@@ -1850,6 +1866,67 @@ def _production_training_report_errors(
             "production cut scorer is missing the schema-v3 raw linear plus "
             "zero-init Transformer residual contract"
         )
+    expected_transition_authority = (
+        transition_authority_contract(metadata_config.transition_authority)
+        if isinstance(metadata_config, StageEditTransformerConfig)
+        else None
+    )
+    expected_transition_authority_sha256 = (
+        StageEditTransitionAuthority(
+            mode=metadata_config.transition_authority
+        ).fingerprint
+        if isinstance(metadata_config, StageEditTransformerConfig)
+        else None
+    )
+    if (
+        expected_transition_authority is None
+        or payload.get("transition_authority_contract")
+        != expected_transition_authority
+        or payload.get("transition_authority_contract_sha256")
+        != expected_transition_authority_sha256
+    ):
+        errors.append(
+            "production transition authority is missing or differs from model metadata"
+        )
+    optimization = payload.get("optimization")
+    effective_loss = (
+        optimization.get("effective_loss_contract")
+        if isinstance(optimization, Mapping)
+        else None
+    )
+    if not isinstance(effective_loss, Mapping) or effective_loss.get(
+        "transition_authority"
+    ) != getattr(metadata_config, "transition_authority", None):
+        errors.append("production model and loss transition authority differ")
+    elif (
+        getattr(metadata_config, "transition_authority", None)
+        == RENDERER_OWNED_TRANSITION_AUTHORITY
+        and effective_loss.get("transition_weight") != 0.0
+    ):
+        errors.append("renderer-owned production transition loss must be zero")
+    effective_dynamic_loss = (
+        optimization.get("effective_dynamic_crop_loss_contract")
+        if isinstance(optimization, Mapping)
+        else None
+    )
+    dynamic_base_loss = (
+        effective_dynamic_loss.get("base")
+        if isinstance(effective_dynamic_loss, Mapping)
+        else None
+    )
+    if hasattr(metadata, "dynamic_crop_config") and (
+        not isinstance(dynamic_base_loss, Mapping)
+        or dynamic_base_loss.get("transition_authority")
+        != getattr(metadata_config, "transition_authority", None)
+        or (
+            getattr(metadata_config, "transition_authority", None)
+            == RENDERER_OWNED_TRANSITION_AUTHORITY
+            and dynamic_base_loss.get("transition_weight") != 0.0
+        )
+    ):
+        errors.append(
+            "production Dynamic Crop base transition authority differs from model"
+        )
 
     imbalance = payload.get("cut_imbalance_contract")
     if not isinstance(imbalance, Mapping):
@@ -1877,7 +1954,7 @@ def _production_training_report_errors(
         errors.append("production structured-head coverage gate is missing")
     else:
         if head_coverage.get("contract") != (
-            "duration_transition_training_and_heldout_entropy_gate_v1"
+            "duration_learned_transition_or_renderer_metadata_coverage_gate_v2"
         ):
             errors.append("production structured-head coverage contract differs")
         if head_coverage.get("passed") is not True:
@@ -2341,6 +2418,8 @@ __all__ = [
     "STAGE_EDIT_SOURCE_RELATION_MODE",
     "STAGE_EDIT_SOURCE_SCORING_CONTRACT",
     "STAGE_EDIT_VALIDATION_SELECTION_CONTRACT",
+    "LEARNED_TRANSITION_AUTHORITY",
+    "RENDERER_OWNED_TRANSITION_AUTHORITY",
     "TOKEN_SCHEMA_VERSION",
     "SourceCandidateToken",
     "StageEditCheckpointMetadata",

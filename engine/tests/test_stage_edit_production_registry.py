@@ -27,6 +27,9 @@ from crosscut.stage_edit_transformer import (
     StageEditReadinessReport,
     smoke_stage_edit_config,
 )
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+)
 from tests.test_professional_montage_policy import _profile, _write
 
 
@@ -66,7 +69,10 @@ def _checkpoint(root: Path, name: str = "checkpoint") -> Path:
     metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v2(
         "ive-production-v2",
         DEFAULT_STAGE_EDIT_SCHEMA,
-        smoke_stage_edit_config(),
+        replace(
+            smoke_stage_edit_config(),
+            transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+        ),
         training_steps=7,
         weights_trained=True,
         training_data_id="three-song-heldout",
@@ -90,6 +96,35 @@ def _montage_profile(root: Path, name: str = "montage-profile.json") -> Path:
 
 
 class StageEditProductionRegistryTests(unittest.TestCase):
+    def test_registry_rejects_transition_authority_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = _checkpoint(root)
+            montage_profile = _montage_profile(root)
+            registry = root / "active-production-bundle.json"
+            with patch(
+                "crosscut.stage_edit_production_registry.stage_edit_readiness_report",
+                return_value=_ready(checkpoint),
+            ):
+                register_stage_edit_production_bundle(
+                    checkpoint,
+                    professional_montage_grammar_profile_path=montage_profile,
+                    registry_path=registry,
+                )
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            payload["transition_authority"]["mode"] = (
+                "learned_multiclass_transition_head_v1"
+            )
+            unsigned = dict(payload)
+            unsigned.pop("registry_sha256")
+            payload["registry_sha256"] = _canonical_sha256(unsigned)
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                StageEditProductionRegistryError,
+                "transition authority is unsupported",
+            ):
+                load_registered_stage_edit_production_bundle(registry)
+
     def test_registration_is_immutable_idempotent_and_revalidated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -130,7 +165,7 @@ class StageEditProductionRegistryTests(unittest.TestCase):
                 ],
             )
             registry_payload = json.loads(registry.read_text(encoding="utf-8"))
-            self.assertEqual(2, registry_payload["schema_version"])
+            self.assertEqual(3, registry_payload["schema_version"])
             self.assertEqual(
                 {
                     "path",

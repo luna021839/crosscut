@@ -35,6 +35,9 @@ from crosscut.stage_edit_transformer import (
     STAGE_EDIT_DECISION_HISTORY_OWNER,
     StageEditReadinessReport,
 )
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+)
 
 
 def _ready_report() -> StageEditReadinessReport:
@@ -508,6 +511,64 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             edit = timeline.edit
             self.assertAlmostEqual(6.0, edit.duration_seconds)
             self.assertEqual(len(edit.shots) - 1, len(edit.boundaries))
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_renderer_owned_logits_cannot_change_path_or_fabricate_effects(
+        self, _mocked
+    ) -> None:
+        config = StageEditSemiMarkovConfig(
+            beam_width=16,
+            timeline_count=8,
+            minimum_unique_sources=3,
+            enforce_montage_grammar=False,
+            transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+            transition_score_weight=0.0,
+        )
+        original = _frames(6, 4)
+        adversarial = tuple(
+            replace(
+                frame,
+                transition_logits=(-1000.0, 1000.0, 900.0, 800.0),
+            )
+            for frame in original
+        )
+        first = _decode(frames=original, config=config)
+        second = _decode(frames=adversarial, config=config)
+        self.assertEqual(
+            tuple(tuple(item.signature() for item in timeline.decisions) for timeline in first.timelines),
+            tuple(tuple(item.signature() for item in timeline.decisions) for timeline in second.timelines),
+        )
+        self.assertEqual(
+            tuple(timeline.score for timeline in first.timelines),
+            tuple(timeline.score for timeline in second.timelines),
+        )
+        self.assertTrue(
+            all(
+                decision.transition_label in {"initial", "hard_cut"}
+                for timeline in first.timelines
+                for decision in timeline.decisions
+            )
+        )
+        self.assertEqual(
+            RENDERER_OWNED_TRANSITION_AUTHORITY,
+            first.audit.input_summary["transition_authority"]["mode"],
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError, "only hard_cut metadata"
+        ):
+            _decode(
+                frames=original,
+                config=config,
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        allowed_transition_labels=("zoom_match",),
+                    ),
+                ),
+            )
             self.assertTrue(
                 str(edit.output).endswith(f"stageedit-{timeline.rank:02d}.mp4")
             )
@@ -611,6 +672,8 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 minimum_unique_sources=3,
                 enforce_montage_grammar=True,
                 maximum_global_switches_per_minute=60.0,
+                transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+                transition_score_weight=0.0,
             ),
             constraints=(
                 StageEditSectionConstraint(
@@ -641,6 +704,20 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             0.37333333333333335,
         )
         self.assertIn("montage_grammar", result.timelines[0].score_components)
+        first_two = result.timelines[0].decisions[:2]
+        self.assertEqual("wide", first_two[0].shot_size)
+        self.assertGreater(first_two[0].formation_pose_coverage, 0.0)
+        self.assertNotEqual(
+            first_two[0].derivative_family_id,
+            first_two[1].derivative_family_id,
+        )
+        self.assertIn(first_two[1].shot_size, {"medium", "closeup"})
+        self.assertEqual(
+            "source_switch_entry_then_nonwide_close_or_medium_burst_not_hold",
+            result.timelines[0].edit.candidate_history[0][
+                "transition_authority"
+            ]["wide_anchor_editorial_role"],
+        )
         self.assertEqual(
             0.8,
             grammar["policy"]["chorus_wide_involved_family_switch_prior"][
@@ -1104,13 +1181,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         result = _decode(frames=frames)
 
-        self.assertEqual(7, result.audit.schema_version)
+        self.assertEqual(8, result.audit.schema_version)
         self.assertEqual(
             "verified_derivative_family_not_file_source",
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            4,
+            7,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(

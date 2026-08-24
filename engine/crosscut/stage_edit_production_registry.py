@@ -44,9 +44,13 @@ from .stage_edit_transformer import (
     StageEditReadinessReport,
     stage_edit_readiness_report,
 )
+from .stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 
 
-STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION = 2
+STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION = 3
 STAGE_EDIT_PRODUCTION_REGISTRY_KIND = (
     "ive_stage_edit_dynamic_crop_v2_active_production_bundle"
 )
@@ -122,6 +126,7 @@ class RegisteredStageEditProductionBundle:
     token_schema_fingerprint: str
     maximum_sequence_length: int
     maximum_sources: int
+    transition_authority: Mapping[str, Any]
     professional_montage_grammar_profile_path: Path
     professional_montage_grammar_profile_file_sha256: str
     professional_montage_grammar_profile_content_sha256: str
@@ -158,6 +163,10 @@ class RegisteredStageEditProductionBundle:
                 raise ValueError("registered StageEdit identity must be SHA-256")
         if self.maximum_sequence_length < 1 or self.maximum_sources < 2:
             raise ValueError("registered StageEdit model limits are invalid")
+        if dict(self.transition_authority) != StageEditTransitionAuthority(
+            mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+        ).to_dict():
+            raise ValueError("registered transition authority is not renderer-owned")
         if not self.professional_montage_grammar_profile_analysis_basis.strip():
             raise ValueError(
                 "registered professional montage profile analysis basis is invalid"
@@ -215,6 +224,7 @@ class RegisteredStageEditProductionBundle:
             "token_schema_fingerprint": self.token_schema_fingerprint,
             "maximum_sequence_length": self.maximum_sequence_length,
             "maximum_sources": self.maximum_sources,
+            "transition_authority": dict(self.transition_authority),
             "professional_montage_grammar_profile": (
                 self.professional_montage_grammar_profile_identity
             ),
@@ -252,6 +262,7 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         "token_schema_fingerprint",
         "maximum_sequence_length",
         "maximum_sources",
+        "transition_authority",
         "metadata",
         "weights",
         "training_report",
@@ -280,6 +291,12 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
     ):
         raise StageEditProductionRegistryError(
             "production registry activation contract is unsupported"
+        )
+    if payload.get("transition_authority") != StageEditTransitionAuthority(
+        mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+    ).to_dict():
+        raise StageEditProductionRegistryError(
+            "production registry transition authority is unsupported"
         )
     expected_storage_policy = {
         "external_ssd_preferred": True,
@@ -472,6 +489,12 @@ def load_registered_stage_edit_production_bundle(
         or token_schema != metadata.token_schema.fingerprint
         or maximum_sequence_length != metadata.base_model_config.max_sequence_length
         or maximum_sources != metadata.base_model_config.max_sources
+        or metadata.base_model_config.transition_authority
+        != RENDERER_OWNED_TRANSITION_AUTHORITY
+        or payload.get("transition_authority")
+        != StageEditTransitionAuthority(
+            mode=metadata.base_model_config.transition_authority
+        ).to_dict()
         or evidence["weights"][1] != metadata.weight_sha256
     ):
         raise StageEditProductionRegistryNotReadyError(
@@ -499,6 +522,7 @@ def load_registered_stage_edit_production_bundle(
         token_schema_fingerprint=token_schema,
         maximum_sequence_length=int(maximum_sequence_length),
         maximum_sources=int(maximum_sources),
+        transition_authority=dict(payload["transition_authority"]),
         professional_montage_grammar_profile_path=Path(
             montage_profile["path"]
         ),
@@ -607,6 +631,13 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             f"Dynamic Crop v2 metadata is invalid: {exc}"
         ) from exc
+    if (
+        metadata.base_model_config.transition_authority
+        != RENDERER_OWNED_TRANSITION_AUTHORITY
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "IVE production registry requires renderer-owned transition authority"
+        )
     readiness = stage_edit_readiness_report(checkpoint)
     if not (
         readiness.architecture_available
@@ -663,6 +694,9 @@ def register_stage_edit_production_bundle(
         "token_schema_fingerprint": metadata.token_schema.fingerprint,
         "maximum_sequence_length": metadata.base_model_config.max_sequence_length,
         "maximum_sources": metadata.base_model_config.max_sources,
+        "transition_authority": StageEditTransitionAuthority(
+            mode=metadata.base_model_config.transition_authority
+        ).to_dict(),
         "metadata": {
             "filename": metadata_path.name,
             "sha256": metadata_sha,

@@ -49,7 +49,8 @@ def _write_passing_development_checkpoint(
     checkpoint: Path, development_plan: Path
 ) -> None:
     checkpoint.mkdir(parents=True)
-    config = launcher.production_stage_edit_config().to_dict()
+    model_training = launcher._default_model_training_contract()
+    config = model_training["model_config"]
     fingerprint = launcher._canonical_sha256(config)
     training_songs = sorted(launcher.DEVELOPMENT_TRAINING_SONG_IDS)
     weight_path = checkpoint / "stage-edit-dynamic-crop-v2.safetensors"
@@ -73,7 +74,6 @@ def _write_passing_development_checkpoint(
     selection_path.write_text(json.dumps(selection), encoding="utf-8")
     selection_sha = hashlib.sha256(selection_path.read_bytes()).hexdigest()
     training = dict(launcher.DEFAULT_RELEASE_TRAINING_CONFIG)
-    model_training = launcher._default_model_training_contract()
     effective_loss = dict(model_training["base_loss_contract"])
     effective_loss["cut_positive_weight"] = 2.0
     effective_dynamic_loss = json.loads(
@@ -101,6 +101,12 @@ def _write_passing_development_checkpoint(
             "cut_threshold_frozen_before_heldout_forward": True,
         },
         "structured_head_coverage_gate": {"passed": True},
+        "transition_authority_contract": model_training[
+            "transition_authority_contract"
+        ],
+        "transition_authority_contract_sha256": model_training[
+            "transition_authority_contract_sha256"
+        ],
         "split": {
             "training_song_ids": training_songs,
             "held_out_song_ids": [launcher.XOXZ],
@@ -181,6 +187,29 @@ def _bindings(root: Path, songs: tuple[str, ...]):
 
 
 class StageEditReleaseFoldLauncherTests(unittest.TestCase):
+    def test_pre_renderer_authority_development_plan_schema_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                current = _create_development_plan(root, root / "checkpoint")
+                payload = json.loads(current.read_text(encoding="utf-8"))
+                payload.pop("plan_sha256")
+                payload["schema_version"] = 2
+                payload["analysis_basis"] = (
+                    "ive_stageedit_release_development_plan_v2"
+                )
+                stale = launcher._write_content_addressed(
+                    payload,
+                    output_directory=root / "stale",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "schema mismatch",
+                ):
+                    launcher._strict_development_plan(stale)
+
     def test_development_expands_four_songs_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
@@ -259,7 +288,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             )
             self.assertEqual(launcher.XOXZ, result.held_out_song_id)
 
-    def test_single_class_transition_labels_fail_before_training(self) -> None:
+    def test_exact_hard_cut_metadata_passes_renderer_owned_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             paths_by_song = {}
@@ -272,7 +301,37 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                             {
                                 "reference_id": (
                                     f"ref-{song_index}-{reference_index}"
-                                )
+                                ),
+                                "shot_labels": [
+                                    {
+                                        "edit_labels": {
+                                            "source_transition": {
+                                                "supervision_eligible": True,
+                                                "transition": "hard_cut",
+                                            }
+                                        }
+                                    }
+                                ],
+                                "listwise_records": [
+                                    {
+                                        "edit_labels": {
+                                            "source_transition": {
+                                                "supervision_eligible": True,
+                                                "transition": "hard_cut",
+                                            }
+                                        }
+                                    }
+                                ],
+                                "pairwise_records": [
+                                    {
+                                        "edit_labels": {
+                                            "source_transition": {
+                                                "supervision_eligible": True,
+                                                "transition": "hard_cut",
+                                            }
+                                        }
+                                    }
+                                ],
                             }
                         ),
                         encoding="utf-8",
@@ -280,16 +339,13 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     paths.append(path)
                 paths_by_song[song_id] = tuple(paths)
 
-            def example() -> SimpleNamespace:
+            def example(song_id: str, duration_bucket: int) -> SimpleNamespace:
                 return SimpleNamespace(
+                    song_id=song_id,
                     targets=SimpleNamespace(
                         targets=(
                             SimpleNamespace(
-                                duration_bucket=0,
-                                transition_label="hard_cut",
-                            ),
-                            SimpleNamespace(
-                                duration_bucket=1,
+                                duration_bucket=duration_bucket,
                                 transition_label="hard_cut",
                             ),
                         )
@@ -297,24 +353,77 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 )
 
             split = SimpleNamespace(
-                train=(example(), example()),
-                held_out=(example(), example()),
+                train=tuple(
+                    example(song, reference_index)
+                    for song in launcher.DEVELOPMENT_TRAINING_SONG_IDS
+                    for reference_index in range(2)
+                ),
+                held_out=(
+                    example(launcher.XOXZ, 0),
+                    example(launcher.XOXZ, 1),
+                ),
             )
+            corpus = SimpleNamespace(examples=split.train + split.held_out)
             with (
                 patch.object(
                     launcher,
                     "load_reference_training_corpus",
-                    return_value=SimpleNamespace(examples=()),
+                    return_value=corpus,
                 ),
                 patch.object(
                     launcher, "production_song_split", return_value=split
                 ),
             ):
+                evidence = launcher._preflight_structured_head_label_coverage(
+                    paths_by_song,
+                    contract=launcher._structured_head_preflight_contract(),
+                )
+            self.assertTrue(evidence["passed"])
+            self.assertEqual(
+                "skipped_non_authoritative",
+                evidence["training"]["transition"]["status"],
+            )
+            self.assertTrue(
+                all(
+                    audit["label_count"] == 2
+                    for audit in evidence["raw_transition_label_audit"].values()
+                )
+            )
+
+    def test_fabricated_nonhard_transition_label_fails_preflight(self) -> None:
+        for fabricated in ("zoom_match", "whip_pan", "cross_dissolve"):
+            with self.subTest(fabricated=fabricated), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve()
+                paths_by_song = {}
+                for song_index, song_id in enumerate(launcher.DEVELOPMENT_SONG_IDS):
+                    path = root / f"{song_index}.json"
+                    label = (
+                        fabricated
+                        if song_id == launcher.REBEL_HEART
+                        else "hard_cut"
+                    )
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "reference_id": f"ref-{song_index}",
+                                "shot_labels": [
+                                    {
+                                        "edit_labels": {
+                                            "source_transition": {
+                                                "supervision_eligible": True,
+                                                "transition": label,
+                                            }
+                                        }
+                                    }
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    paths_by_song[song_id] = (path,)
                 with self.assertRaisesRegex(
                     launcher.ReleaseFoldPreflightError,
-                    "training_transition_class_coverage_insufficient.*"
-                    "renderer-owned single-class transition mode remains "
-                    "explicitly disabled",
+                    "unrecognized or non-hard transition label",
                 ):
                     launcher._preflight_structured_head_label_coverage(
                         paths_by_song,
@@ -360,6 +469,26 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     "source objective binding mismatch",
                 ):
                     launcher._strict_development_plan(objective_plan)
+
+                changed_authority = json.loads(json.dumps(payload))
+                model_contract = changed_authority["model_training_contract"]
+                model_contract["model_config"]["transition_authority"] = (
+                    "learned_multiclass_transition_head_v1"
+                )
+                model_contract["model_config_sha256"] = launcher._canonical_sha256(
+                    model_contract["model_config"]
+                )
+                authority_plan = launcher._write_content_addressed(
+                    changed_authority,
+                    output_directory=root / "authority-tamper",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "renderer-owned transition authority differs",
+                ):
+                    launcher._strict_development_plan(authority_plan)
 
     def test_probe_selected_model_and_loss_contract_can_be_bound_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

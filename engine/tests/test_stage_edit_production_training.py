@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from crosscut.ive import AspectRatio
 from crosscut.render import EditorialTransformKeyframe
@@ -30,6 +31,7 @@ from crosscut.stage_edit_head_materializer import (
 from crosscut.stage_edit_production_training import (
     ProductionQualityThresholds,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
+    _structured_head_coverage_gate,
     evaluate_stage_edit_production_quality,
     prepare_stage_edit_production_input_sequences,
     production_song_split,
@@ -55,6 +57,10 @@ from crosscut.stage_edit_transformer import (
     mlx_runtime_version,
     stage_edit_recent_history_mask_contract,
     stage_edit_readiness_report,
+)
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
 )
 
 try:
@@ -137,6 +143,52 @@ def _passing_dynamic_metrics() -> dict:
 
 
 class StageEditProductionQualityTests(unittest.TestCase):
+    def test_renderer_owned_structured_coverage_keeps_duration_and_skips_logits(
+        self,
+    ) -> None:
+        examples = (
+            SimpleNamespace(
+                targets=SimpleNamespace(
+                    targets=(
+                        SimpleNamespace(
+                            duration_bucket=0, transition_label="hard_cut"
+                        ),
+                        SimpleNamespace(
+                            duration_bucket=1, transition_label="hard_cut"
+                        ),
+                    )
+                )
+            ),
+        )
+        heldout = {
+            "duration": {
+                "label_count": 6,
+                "observed_class_count": 2,
+                "label_entropy_bits": 1.0,
+                "label_histogram": {"0": 3, "1": 3},
+            },
+            "transition": {
+                "label_count": 6,
+                "observed_class_count": 1,
+                "label_entropy_bits": 0.0,
+                "label_histogram": {"0": 6},
+                "accuracy": 0.0,
+            },
+        }
+        gate = _structured_head_coverage_gate(
+            examples,
+            heldout,
+            thresholds=ProductionQualityThresholds(),
+            transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+        )
+        self.assertTrue(gate["passed"])
+        self.assertEqual(
+            "skipped_non_authoritative", gate["heldout"]["transition"]["status"]
+        )
+        self.assertEqual(
+            {"hard_cut": 6}, gate["heldout"]["transition"]["label_histogram"]
+        )
+
     def test_production_preprocessing_scrubs_human_history_snapshot_slice(self) -> None:
         schema = DEFAULT_STAGE_EDIT_SCHEMA
         example = _training_example("BANG", "BANG-human-history")
@@ -228,6 +280,22 @@ class StageEditProductionQualityTests(unittest.TestCase):
             "heldout_transition_label_entropy_below_threshold",
             degenerate_rejected.reasons,
         )
+
+        renderer_owned = evaluate_stage_edit_production_quality(
+            degenerate,
+            dynamic_crop_v2_metrics=_passing_dynamic_metrics(),
+            transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+        )
+        self.assertTrue(renderer_owned.passed)
+        transition_audit = renderer_owned.metrics["transition"]
+        self.assertEqual("skipped_non_authoritative", transition_audit["status"])
+        self.assertEqual(
+            RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+            transition_audit["reason"],
+        )
+        self.assertEqual(20, transition_audit["label_count"])
+        self.assertIsNone(transition_audit["learned_accuracy"])
+        self.assertFalse(transition_audit["learned_logits_consumed_for_quality"])
 
     def test_complete_song_split_never_leaks_heldout_references(self) -> None:
         examples = tuple(

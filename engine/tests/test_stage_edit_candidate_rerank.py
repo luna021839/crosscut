@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -20,6 +21,7 @@ from crosscut.stage_edit_transformer import (
     PRODUCTION_TRAINING_RUN_KIND,
     STAGE_EDIT_CUT_THRESHOLD_SELECTION_CONTRACT,
     STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
+    StageEditLossContract,
     StageEditTransformer,
     StageEditTransformerConfig,
     mlx_runtime_version,
@@ -29,6 +31,9 @@ from crosscut.stage_edit_transformer import (
     stage_edit_cut_scoring_contract,
     stage_edit_recent_history_mask_contract,
     stage_edit_source_scoring_contract,
+)
+from crosscut.stage_edit_transition_authority import (
+    StageEditTransitionAuthority,
 )
 from crosscut.timeline import (
     TimelineCandidate,
@@ -177,6 +182,14 @@ class StageEditCandidateRerankTests(unittest.TestCase):
             "cut_scoring_contract": stage_edit_cut_scoring_contract(
                 saved.model_config
             ),
+            "transition_authority_contract": StageEditTransitionAuthority(
+                mode=saved.model_config.transition_authority
+            ).to_dict(),
+            "transition_authority_contract_sha256": (
+                StageEditTransitionAuthority(
+                    mode=saved.model_config.transition_authority
+                ).fingerprint
+            ),
             "cut_imbalance_contract": stage_edit_cut_imbalance_contract(
                 positive_count=20,
                 negative_count=80,
@@ -185,7 +198,7 @@ class StageEditCandidateRerankTests(unittest.TestCase):
             "cut_threshold_freeze": threshold_freeze,
             "structured_head_coverage_gate": {
                 "contract": (
-                    "duration_transition_training_and_heldout_entropy_gate_v1"
+                    "duration_learned_transition_or_renderer_metadata_coverage_gate_v2"
                 ),
                 "passed": True,
                 "heldout_used_for_model_selection": False,
@@ -243,6 +256,7 @@ class StageEditCandidateRerankTests(unittest.TestCase):
                 "held_out_used_for_model_selection": False,
             },
             "optimization": {
+                "effective_loss_contract": asdict(StageEditLossContract()),
                 "model_selection": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
                 "best_validation_selection_evidence": {
                     "contract": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,

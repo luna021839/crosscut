@@ -40,9 +40,15 @@ from .stage_edit_transformer import (
     StageEditTokenSchema,
     stage_edit_readiness_report,
 )
+from .stage_edit_transition_authority import (
+    LEARNED_TRANSITION_AUTHORITY,
+    RENDERER_OWNED_ALLOWED_MODEL_LABELS,
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 
 
-DECODER_SCHEMA_VERSION = 7
+DECODER_SCHEMA_VERSION = 8
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -439,6 +445,7 @@ class StageEditSemiMarkovConfig:
     source_score_weight: float = 1.0
     duration_score_weight: float = 0.65
     transition_score_weight: float = 0.30
+    transition_authority: str = LEARNED_TRANSITION_AUTHORITY
     crop_correction_weight: float = 0.20
     source_quality_weight: float = 0.20
     boundary_continuity_weight: float = 0.35
@@ -518,6 +525,11 @@ class StageEditSemiMarkovConfig:
             if number <= 0.0:
                 raise StageEditDecodeInputError(f"{name} must be positive")
             object.__setattr__(self, name, number)
+        authority = StageEditTransitionAuthority(mode=self.transition_authority)
+        if authority.renderer_owned and self.transition_score_weight != 0.0:
+            raise StageEditDecodeInputError(
+                "renderer-owned transition authority requires transition_score_weight=0"
+            )
         if self.maximum_shot_seconds < self.minimum_shot_seconds:
             raise StageEditDecodeInputError("global shot duration bounds are inverted")
         if self.maximum_source_occupancy_fraction > 1.0:
@@ -1061,6 +1073,11 @@ def _resolved_constraints(
     schema: StageEditTokenSchema,
     config: StageEditSemiMarkovConfig,
 ) -> tuple[_ResolvedSectionConstraint, ...]:
+    authority = StageEditTransitionAuthority(mode=config.transition_authority)
+    if authority.renderer_owned and "hard_cut" not in schema.transition_labels:
+        raise StageEditDecodeInputError(
+            "renderer-owned transition authority requires hard_cut metadata"
+        )
     by_index: dict[int, StageEditSectionConstraint] = {}
     for item in overrides:
         if item.section_index >= len(section_plan.sections):
@@ -1071,6 +1088,13 @@ def _resolved_constraints(
         if unknown:
             raise StageEditDecodeInputError(
                 f"section constraint has unknown transitions: {sorted(unknown)}"
+            )
+        if authority.renderer_owned and item.allowed_transition_labels not in {
+            (),
+            RENDERER_OWNED_ALLOWED_MODEL_LABELS,
+        }:
+            raise StageEditDecodeInputError(
+                "renderer-owned section constraints allow only hard_cut metadata"
             )
         by_index[item.section_index] = item
 
@@ -1102,7 +1126,9 @@ def _resolved_constraints(
             )
         )
         labels = (
-            override.allowed_transition_labels
+            RENDERER_OWNED_ALLOWED_MODEL_LABELS
+            if authority.renderer_owned
+            else override.allowed_transition_labels
             if override is not None and override.allowed_transition_labels
             else schema.transition_labels
         )
@@ -2114,7 +2140,11 @@ def _build_stage_edit(
     output: Path,
     checkpoint_path: str,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None,
+    config: StageEditSemiMarkovConfig,
 ) -> StageEdit:
+    transition_authority = StageEditTransitionAuthority(
+        mode=config.transition_authority
+    )
     shots: list[StageShot] = []
     for decision in state.decisions:
         metadata = source_metadata[decision.source_index]
@@ -2186,10 +2216,14 @@ def _build_stage_edit(
                     }
                 ),
                 "transition_translation": (
-                    "model transition labels retained in audit; renderer IR uses "
-                    "duration-neutral hard cuts until evidence-gated transition "
-                    "rendering is connected"
+                    "model metadata is duration-neutral hard_cut; renderer-owned "
+                    "group_transition alone selects hard_cut or evidence-gated "
+                    "face_dissolve"
+                    if transition_authority.renderer_owned
+                    else "model transition labels retained in audit; renderer IR "
+                    "uses duration-neutral hard cuts"
                 ),
+                "transition_authority": transition_authority.to_dict(),
             },
         ),
     )
@@ -2426,21 +2460,33 @@ def decode_stage_edit_semimarkov_beam(
     duration_log_probabilities = tuple(
         _log_softmax(frame.duration_logits) for frame in frames
     )
-    transition_log_probabilities = tuple(
-        _masked_log_softmax(
-            frame.transition_logits,
-            tuple(
-                label
-                in resolved[
-                    _section_index_at_start(
-                        section_plan, frame.master_time_seconds
-                    )
-                ].allowed_transition_labels
-                for label in schema.transition_labels
-            ),
-        )
-        for frame in frames
+    transition_authority = StageEditTransitionAuthority(
+        mode=config.transition_authority
     )
+    if transition_authority.renderer_owned:
+        transition_log_probabilities = tuple(
+            tuple(
+                0.0 if label == "hard_cut" else -math.inf
+                for label in schema.transition_labels
+            )
+            for _ in frames
+        )
+    else:
+        transition_log_probabilities = tuple(
+            _masked_log_softmax(
+                frame.transition_logits,
+                tuple(
+                    label
+                    in resolved[
+                        _section_index_at_start(
+                            section_plan, frame.master_time_seconds
+                        )
+                    ].allowed_transition_labels
+                    for label in schema.transition_labels
+                ),
+            )
+            for frame in frames
+        )
     # Legacy four-value crops remain available for old checkpoints.  Dynamic
     # Crop v2 predictions are intentionally *not* projected here: the model's
     # normalized K=8 times can only be interpreted after a concrete duration
@@ -2698,7 +2744,11 @@ def decode_stage_edit_semimarkov_beam(
                     transition_indices = (
                         (None,)
                         if not state.decisions
-                        else tuple(range(len(schema.transition_labels)))
+                        else (
+                            (schema.transition_labels.index("hard_cut"),)
+                            if transition_authority.renderer_owned
+                            else tuple(range(len(schema.transition_labels)))
+                        )
                     )
                     for transition_index in transition_indices:
                         transition_hypothesis_count += 1
@@ -3064,6 +3114,7 @@ def decode_stage_edit_semimarkov_beam(
             output=Path(output),
             checkpoint_path=checkpoint_path,
             source_derivative_metadata=source_derivative_metadata,
+            config=config,
         )
         recent_density = (
             len(state.recent_cut_times)
@@ -3122,13 +3173,14 @@ def decode_stage_edit_semimarkov_beam(
         config=asdict(config),
         input_summary={
             "source_count": source_count,
+            "transition_authority": transition_authority.to_dict(),
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 4,
+                "supersedes": 7,
                 "reason": (
-                    "source diversity/occupancy remain derivative-family "
-                    "semantics and complete timelines now carry an enforced "
-                    "highlight/formation montage grammar audit"
+                    "renderer-owned IVE transition mode restricts learned "
+                    "metadata to duration-neutral hard_cut with zero transition "
+                    "score; renderer group_transition retains effect authority"
                 ),
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,

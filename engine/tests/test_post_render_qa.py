@@ -45,6 +45,10 @@ from crosscut.rendered_montage_grammar_review import (
     RenderedMontageGrammarConfig,
     review_rendered_montage_grammar,
 )
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 
 
 _TIMESTAMP = "20260823-123456"
@@ -2066,6 +2070,43 @@ class PostRenderQATests(unittest.TestCase):
         )
         self.assertTrue(
             metrics["checks"]["timeline_boundary_schedule_matches_plan"]
+        )
+
+    def test_v4_group_transition_authority_tamper_fails_plan_qa(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _artifacts, analysis, plan, selection = _fixture_payloads(
+                Path(directory)
+            )
+        group = analysis["group_transitions"]
+        group["analysis_basis"] = (
+            "tiered_future_face_head_sface_appearance_body_continuity_v4"
+        )
+        group["transition_authority"] = StageEditTransitionAuthority(
+            mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+        ).to_dict()
+        clean = _IssueCollector()
+        metrics = _validate_plan_invariants(
+            analysis, plan, selection["final_selected_review"], clean
+        )
+        self.assertTrue(
+            metrics["checks"]["renderer_owned_transition_authority_exact"]
+        )
+        group["transition_authority"][
+            "zoom_match_whip_pan_render_effects_authorized"
+        ] = True
+        tampered = _IssueCollector()
+        metrics = _validate_plan_invariants(
+            analysis, plan, selection["final_selected_review"], tampered
+        )
+        self.assertFalse(
+            metrics["checks"]["renderer_owned_transition_authority_exact"]
+        )
+        self.assertTrue(
+            any(
+                issue.code
+                == "plan_invariant_renderer_owned_transition_authority_exact"
+                for issue in tampered.issues
+            )
         )
 
     def test_generic_motion_reason_is_accepted_only_when_bound_to_render_plan(self) -> None:

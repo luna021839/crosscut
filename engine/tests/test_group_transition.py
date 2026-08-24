@@ -13,6 +13,10 @@ from crosscut.render import (
     TransitionKind,
 )
 from crosscut.timeline import ShotType
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
@@ -141,6 +145,22 @@ class GroupTransitionTests(unittest.TestCase):
             1.0,
         )
         self.assertAlmostEqual(transition.future_pose_max_mismatch or 0.0, 0.0)
+        payload = result.to_dict(30.0)
+        self.assertEqual(
+            StageEditTransitionAuthority(
+                mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+            ).to_dict(),
+            payload["transition_authority"],
+        )
+        self.assertEqual(
+            ["hard_cut", "face_dissolve"],
+            payload["transition_authority"]["renderer_allowed_kinds"],
+        )
+        self.assertFalse(
+            payload["transition_authority"][
+                "zoom_match_whip_pan_render_effects_authorized"
+            ]
+        )
 
     def test_missing_future_evidence_stays_tier_b_aligned_hard_cut(self) -> None:
         choices = (_choice(0, 0), replace(_choice(1, 1), dissolve_entry_face_geometry_window=()))

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -49,16 +49,21 @@ from .stage_edit_transformer import (
     StageEditTransformerConfig,
     production_stage_edit_config,
 )
+from .stage_edit_transition_authority import (
+    RENDERER_OWNED_ALLOWED_MODEL_LABELS,
+    RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 
 
-RELEASE_PLAN_SCHEMA_VERSION = 2
-FINAL_RELEASE_PLAN_SCHEMA_VERSION = 3
-DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v2"
-DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v2"
-FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v3"
-MODEL_TRAINING_CONTRACT_VERSION = 1
-STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 1
-RENDERER_OWNED_TRANSITION_CONTRACT_VERSION = 1
+RELEASE_PLAN_SCHEMA_VERSION = 3
+FINAL_RELEASE_PLAN_SCHEMA_VERSION = 4
+DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v3"
+DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v3"
+FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v4"
+MODEL_TRAINING_CONTRACT_VERSION = 2
+STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 2
 
 BANG_BANG = "IVE-BANG-BANG"
 BLACKHOLE = "IVE-BLACKHOLE"
@@ -313,6 +318,8 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
         "dynamic_crop_loss_contract",
         "dynamic_crop_loss_contract_sha256",
         "source_objective",
+        "transition_authority_contract",
+        "transition_authority_contract_sha256",
     }
     if set(contract) != expected_keys:
         raise ReleaseFoldPreflightError(
@@ -383,13 +390,39 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
         raise ReleaseFoldPreflightError(
             "release dynamic crop and base source objectives differ"
         )
+    authority = StageEditTransitionAuthority(
+        mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+    )
+    if (
+        model.transition_authority != authority.mode
+        or base_loss.transition_authority != authority.mode
+        or base_loss.transition_weight != 0.0
+        or contract.get("transition_authority_contract") != authority.to_dict()
+        or contract.get("transition_authority_contract_sha256")
+        != authority.fingerprint
+    ):
+        raise ReleaseFoldPreflightError(
+            "release model/loss renderer-owned transition authority differs"
+        )
     return contract
 
 
 def _default_model_training_contract() -> dict[str, Any]:
-    model = production_stage_edit_config().to_dict()
-    base_loss = asdict(StageEditLossContract())
-    dynamic_loss = asdict(DynamicCropV2LossContract())
+    authority = StageEditTransitionAuthority(
+        mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+    )
+    model = asdict(
+        replace(
+            production_stage_edit_config(),
+            transition_authority=authority.mode,
+        )
+    )
+    base = StageEditLossContract(
+        transition_weight=0.0,
+        transition_authority=authority.mode,
+    )
+    base_loss = asdict(base)
+    dynamic_loss = asdict(DynamicCropV2LossContract(base=base))
     return _validate_model_training_contract(
         {
             "contract_version": MODEL_TRAINING_CONTRACT_VERSION,
@@ -400,6 +433,8 @@ def _default_model_training_contract() -> dict[str, Any]:
             "dynamic_crop_loss_contract": dynamic_loss,
             "dynamic_crop_loss_contract_sha256": _canonical_sha256(dynamic_loss),
             "source_objective": base_loss["source_objective"],
+            "transition_authority_contract": authority.to_dict(),
+            "transition_authority_contract_sha256": authority.fingerprint,
         }
     )
 
@@ -414,14 +449,17 @@ def _structured_head_preflight_contract() -> dict[str, Any]:
             "minimum_label_entropy_bits": thresholds.minimum_duration_label_entropy_bits,
         },
         "transition": {
-            "mode": "learned_multiclass",
-            "minimum_observed_classes": thresholds.minimum_transition_observed_classes,
-            "minimum_label_entropy_bits": thresholds.minimum_transition_label_entropy_bits,
-        },
-        "renderer_owned_single_class_transition": {
-            "contract_version": RENDERER_OWNED_TRANSITION_CONTRACT_VERSION,
-            "enabled": False,
-            "activation_requires_separate_evidence_audit": True,
+            "mode": "renderer_owned_metadata_only",
+            "allowed_model_labels": list(RENDERER_OWNED_ALLOWED_MODEL_LABELS),
+            "required_label_set": list(RENDERER_OWNED_ALLOWED_MODEL_LABELS),
+            "minimum_label_count_per_partition": 1,
+            "learned_evaluation_status": "skipped_non_authoritative",
+            "learned_evaluation_reason": (
+                RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON
+            ),
+            "authority": StageEditTransitionAuthority(
+                mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+            ).to_dict(),
         },
     }
 
@@ -715,6 +753,60 @@ def _preflight_structured_head_label_coverage(
         )
     paths: list[Path] = []
     song_by_reference: dict[str, str] = {}
+    raw_transition_labels_by_song: dict[str, list[str]] = {
+        song: [] for song in DEVELOPMENT_SONG_IDS
+    }
+
+    def reject_unsupported_direct_fields(value: object) -> None:
+        if isinstance(value, Mapping):
+            direct = value.get("transition_label")
+            if direct is not None and str(direct).strip() not in (
+                "",
+                *RENDERER_OWNED_ALLOWED_MODEL_LABELS,
+            ):
+                raise ValueError(
+                    "renderer-owned supervision contains a fabricated direct "
+                    f"transition label: {direct!r}"
+                )
+            for child in value.values():
+                reject_unsupported_direct_fields(child)
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            for child in value:
+                reject_unsupported_direct_fields(child)
+
+    def collect_authoritative_shot_labels(
+        payload: Mapping[str, Any], song_id: str
+    ) -> None:
+        shot_labels = payload.get("shot_labels")
+        if not isinstance(shot_labels, list):
+            raise ValueError("supervision shot_labels must be an array")
+        for raw_shot in shot_labels:
+            if not isinstance(raw_shot, Mapping):
+                raise ValueError("supervision shot label must be an object")
+            edit_labels = raw_shot.get("edit_labels")
+            transition = (
+                edit_labels.get("source_transition")
+                if isinstance(edit_labels, Mapping)
+                else None
+            )
+            if not isinstance(transition, Mapping):
+                continue
+            eligible = transition.get("supervision_eligible")
+            if eligible is not True and eligible is not False and eligible is not None:
+                raise ValueError(
+                    "transition supervision_eligible must be boolean"
+                )
+            if eligible is not True:
+                continue
+            label = str(transition.get("transition") or "").strip()
+            if label not in RENDERER_OWNED_ALLOWED_MODEL_LABELS:
+                raise ValueError(
+                    "renderer-owned supervision contains an unrecognized or "
+                    f"non-hard transition label: {label!r}"
+                )
+            raw_transition_labels_by_song[song_id].append(label)
     for song_id in DEVELOPMENT_SONG_IDS:
         for raw_path in supervision_paths_by_song[song_id]:
             path = Path(raw_path).expanduser().resolve()
@@ -732,6 +824,12 @@ def _preflight_structured_head_label_coverage(
                         f"supervision reference id is missing or duplicated: {path}"
                     )
                 song_by_reference[reference_id] = song_id
+                reject_unsupported_direct_fields(payload)
+                collect_authoritative_shot_labels(payload, song_id)
+        if any(not raw_transition_labels_by_song[song] for song in DEVELOPMENT_SONG_IDS):
+            raise ValueError(
+                "every development song needs nonzero authoritative hard_cut labels"
+            )
         # The adapter derives duration/transition targets solely from the
         # immutable supervision JSON. Feature snapshots affect input features,
         # not these categorical labels, so preflight need not load video/crops.
@@ -751,6 +849,24 @@ def _preflight_structured_head_label_coverage(
             held_out_song_ids=(XOXZ,),
             required_training_song_ids=DEVELOPMENT_TRAINING_SONG_IDS,
         )
+        adapted_counts_by_song = {
+            song: sum(
+                target.transition_label is not None
+                for example in corpus.examples
+                if example.song_id == song
+                for target in example.targets.targets
+            )
+            for song in DEVELOPMENT_SONG_IDS
+        }
+        raw_counts_by_song = {
+            song: len(raw_transition_labels_by_song[song])
+            for song in DEVELOPMENT_SONG_IDS
+        }
+        if adapted_counts_by_song != raw_counts_by_song:
+            raise ValueError(
+                "adapted transition metadata counts differ from authoritative "
+                f"shot labels: raw={raw_counts_by_song}, adapted={adapted_counts_by_song}"
+            )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise ReleaseFoldPreflightError(
             f"structured head label preflight could not inspect bound labels: {exc}"
@@ -772,27 +888,58 @@ def _preflight_structured_head_label_coverage(
                 ("transition", "transition_label"),
             )
         },
+        "raw_transition_label_audit": {
+            song: {
+                "label_count": len(raw_transition_labels_by_song[song]),
+                "label_histogram": {
+                    "hard_cut": raw_transition_labels_by_song[song].count(
+                        "hard_cut"
+                    )
+                },
+                "all_recognized_labels_are_hard_cut": True,
+            }
+            for song in DEVELOPMENT_SONG_IDS
+        },
     }
     reasons: list[str] = []
     for side in ("training", "heldout"):
-        for name in ("duration", "transition"):
-            observed = evidence[side][name]
-            required = validated[name]
-            if observed["observed_class_count"] < required[
-                "minimum_observed_classes"
-            ]:
-                reasons.append(f"{side}_{name}_class_coverage_insufficient")
-            entropy = observed["label_entropy_bits"]
-            if entropy is None or entropy < required["minimum_label_entropy_bits"]:
-                reasons.append(f"{side}_{name}_label_entropy_insufficient")
+        duration = evidence[side]["duration"]
+        required_duration = validated["duration"]
+        if duration["observed_class_count"] < required_duration[
+            "minimum_observed_classes"
+        ]:
+            reasons.append(f"{side}_duration_class_coverage_insufficient")
+        entropy = duration["label_entropy_bits"]
+        if (
+            entropy is None
+            or entropy < required_duration["minimum_label_entropy_bits"]
+        ):
+            reasons.append(f"{side}_duration_label_entropy_insufficient")
+        transition = evidence[side]["transition"]
+        count = transition.get("label_count")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < validated["transition"]["minimum_label_count_per_partition"]
+            or transition.get("label_histogram") != {"hard_cut": count}
+        ):
+            reasons.append(
+                f"{side}_renderer_owned_transition_metadata_not_exact_hard_cut"
+            )
+        evidence[side]["transition"] = {
+            "status": "skipped_non_authoritative",
+            "reason": RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+            "label_count": count,
+            "label_histogram": transition.get("label_histogram"),
+            "learned_accuracy_consumed": False,
+            "learned_entropy_consumed": False,
+        }
     evidence["passed"] = not reasons
     evidence["reasons"] = reasons
     if reasons:
         raise ReleaseFoldPreflightError(
             "structured head label preflight failed before training: "
             + ", ".join(reasons)
-            + "; renderer-owned single-class transition mode remains explicitly "
-            "disabled pending a separate evidence audit"
         )
     return evidence
 
@@ -911,6 +1058,15 @@ def _assert_development_report(
     planned_model_training = _validate_model_training_contract(
         plan.get("model_training_contract")
     )
+    if (
+        report.get("transition_authority_contract")
+        != planned_model_training["transition_authority_contract"]
+        or report.get("transition_authority_contract_sha256")
+        != planned_model_training["transition_authority_contract_sha256"]
+    ):
+        raise ReleaseFoldPreflightError(
+            "development transition authority differs from frozen plan"
+        )
     if (
         config != planned_model_training["model_config"]
         or selection.get("model_config") != config

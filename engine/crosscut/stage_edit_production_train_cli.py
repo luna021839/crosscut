@@ -373,6 +373,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "dynamic crop and base loss/source objective contracts differ"
             )
+        if model_config.transition_authority != base_loss_contract.transition_authority:
+            raise ValueError(
+                "model and loss transition authority contracts differ"
+            )
     else:
         model_config = production_stage_edit_config()
         base_loss_contract = StageEditLossContract()

@@ -38,6 +38,10 @@ from .rendered_montage_grammar_review import (
     RenderedMontageGrammarConfig,
     review_rendered_montage_grammar,
 )
+from .stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 
 
 SCHEMA_VERSION = 1
@@ -1486,6 +1490,14 @@ def _validate_plan_invariants(
             plan_native_source_cut_count += 1
     timeline_boundaries = _sequence(timeline.get("boundaries")) or []
     checks: dict[str, bool] = {
+        "renderer_owned_transition_authority_exact": (
+            group.get("analysis_basis")
+            != "tiered_future_face_head_sface_appearance_body_continuity_v4"
+            or group.get("transition_authority")
+            == StageEditTransitionAuthority(
+                mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+            ).to_dict()
+        ),
         "one_transition_per_boundary": len(segments) > 0 and n == len(segments) - 1,
         "timeline_boundary_count_matches": timeline.get("boundary_count") == n,
         "timeline_boundary_payload_count_matches": len(timeline_boundaries) == n,

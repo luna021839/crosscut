@@ -141,6 +141,9 @@ from .stage_edit_pipeline_bridge import (
     run_stage_edit_pipeline_bridge,
 )
 from .stage_edit_semimarkov_beam import StageEditSemiMarkovConfig
+from .stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+)
 from .stage_edit_production_registry import (
     RegisteredStageEditProductionBundle,
     discover_registered_stage_edit_production_bundle,
@@ -5362,6 +5365,8 @@ def _stage_edit_semimarkov_config_from_montage_policy(
 ) -> StageEditSemiMarkovConfig:
     product = policy.product_editorial_requirements
     return StageEditSemiMarkovConfig(
+        transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+        transition_score_weight=0.0,
         highlight_minimum_closeup_fraction=(
             policy.minimum_close_duration_fraction.value
         ),

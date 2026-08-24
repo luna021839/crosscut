@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -45,6 +45,10 @@ from crosscut.stage_edit_transformer import (
     targets_from_reference_supervision,
     tensorize_stage_edit_batch,
     tensorize_stage_edit_supervision,
+)
+from crosscut.stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
 )
 
 try:
@@ -170,6 +174,17 @@ def _metal_available() -> bool:
 
 
 class StageEditSchemaTests(unittest.TestCase):
+    def test_renderer_owned_loss_requires_zero_transition_weight(self) -> None:
+        with self.assertRaisesRegex(ValueError, "transition_weight=0"):
+            StageEditLossContract(
+                transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+            )
+        contract = StageEditLossContract(
+            transition_authority=RENDERER_OWNED_TRANSITION_AUTHORITY,
+            transition_weight=0.0,
+        )
+        self.assertEqual(0.0, contract.transition_weight)
+
     def test_production_history_preprocessing_removes_human_slice_and_masks_it(self) -> None:
         original = _sequence()
         masked = mask_stage_edit_recent_history_for_semimarkov(original, SCHEMA)
@@ -885,6 +900,16 @@ class StageEditMLXTests(unittest.TestCase):
                     "cut_scoring_contract": (
                         stage_edit_cut_scoring_contract(self.config)
                     ),
+                    "transition_authority_contract": (
+                        StageEditTransitionAuthority(
+                            mode=self.config.transition_authority
+                        ).to_dict()
+                    ),
+                    "transition_authority_contract_sha256": (
+                        StageEditTransitionAuthority(
+                            mode=self.config.transition_authority
+                        ).fingerprint
+                    ),
                     "cut_imbalance_contract": (
                         stage_edit_cut_imbalance_contract(
                             positive_count=20,
@@ -894,7 +919,7 @@ class StageEditMLXTests(unittest.TestCase):
                     ),
                     "structured_head_coverage_gate": {
                         "contract": (
-                            "duration_transition_training_and_heldout_entropy_gate_v1"
+                            "duration_learned_transition_or_renderer_metadata_coverage_gate_v2"
                         ),
                         "passed": True,
                         "heldout_used_for_model_selection": False,
@@ -963,6 +988,9 @@ class StageEditMLXTests(unittest.TestCase):
                         "held_out_used_for_model_selection": False,
                     },
                     "optimization": {
+                        "effective_loss_contract": asdict(
+                            StageEditLossContract()
+                        ),
                         "model_selection": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
                         "best_validation_selection_evidence": {
                             "contract": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,

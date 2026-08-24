@@ -87,6 +87,14 @@ from .stage_edit_transformer import (
     tensorize_stage_edit_batch,
     tensorize_stage_edit_supervision,
 )
+from .stage_edit_transition_authority import (
+    LEARNED_TRANSITION_AUTHORITY,
+    RENDERER_OWNED_ALLOWED_MODEL_LABELS,
+    RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+    transition_authority_contract,
+)
 
 try:  # Optional outside Apple-silicon production hosts.
     import mlx.core as mx
@@ -102,7 +110,7 @@ else:
 
 
 STRUCTURED_HEAD_COVERAGE_CONTRACT = (
-    "duration_transition_training_and_heldout_entropy_gate_v1"
+    "duration_learned_transition_or_renderer_metadata_coverage_gate_v2"
 )
 STAGE_EDIT_TRAINING_SONG_EXPANSION_CONTRACT = (
     "complete_song_addition_with_one_reference_validation_and_snapshot_gate_v1"
@@ -316,6 +324,7 @@ def evaluate_stage_edit_production_quality(
     *,
     dynamic_crop_v2_metrics: Mapping[str, Any] | None = None,
     thresholds: ProductionQualityThresholds = ProductionQualityThresholds(),
+    transition_authority: str = LEARNED_TRANSITION_AUTHORITY,
 ) -> ProductionQualityGate:
     """Fail closed unless every renderer-active head generalizes unseen.
 
@@ -328,7 +337,9 @@ def evaluate_stage_edit_production_quality(
     presence, motion, and real renderer-decode gates remain mandatory for v2.
     """
 
+    authority = StageEditTransitionAuthority(mode=transition_authority)
     reasons: list[str] = []
+    reported_metrics = dict(metrics)
 
     def minimum_count(value: Any, minimum: int, reason: str) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -423,7 +434,46 @@ def evaluate_stage_edit_production_quality(
             thresholds.minimum_duration_label_entropy_bits,
             "heldout_duration_label_entropy_below_threshold",
         )
-    if not isinstance(transition, Mapping):
+    if authority.renderer_owned:
+        if not isinstance(transition, Mapping):
+            reasons.append("renderer_owned_transition_metadata_missing")
+            transition_count = 0
+            histogram: dict[str, Any] = {}
+        else:
+            raw_count = transition.get("label_count")
+            transition_count = (
+                raw_count
+                if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+                else 0
+            )
+            histogram = (
+                dict(transition.get("label_histogram"))
+                if isinstance(transition.get("label_histogram"), Mapping)
+                else {}
+            )
+            minimum_count(
+                transition_count,
+                thresholds.minimum_transition_labels,
+                "insufficient_heldout_renderer_owned_transition_metadata_labels",
+            )
+            if set(histogram) - {"0"} or sum(
+                value
+                for value in histogram.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            ) != transition_count:
+                reasons.append("heldout_renderer_owned_transition_metadata_not_hard_cut")
+        reported_metrics["transition"] = {
+            "status": "skipped_non_authoritative",
+            "reason": RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+            "label_count": transition_count,
+            "allowed_model_metadata_labels": list(
+                RENDERER_OWNED_ALLOWED_MODEL_LABELS
+            ),
+            "observed_model_label_histogram": histogram,
+            "learned_accuracy": None,
+            "learned_logits_consumed_for_quality": False,
+        }
+    elif not isinstance(transition, Mapping):
         reasons.append("transition_metrics_missing")
     else:
         minimum_count(
@@ -571,7 +621,7 @@ def evaluate_stage_edit_production_quality(
         passed=not reasons,
         reasons=tuple(reasons),
         thresholds=thresholds,
-        metrics=dict(metrics),
+        metrics=reported_metrics,
     )
 
 
@@ -824,8 +874,11 @@ def _structured_head_coverage_gate(
     held_out_metrics: Mapping[str, Any],
     *,
     thresholds: ProductionQualityThresholds,
+    transition_authority: str = LEARNED_TRANSITION_AUTHORITY,
 ) -> dict[str, Any]:
     """Reject trivial duration/transition accuracies on either data side."""
+
+    authority = StageEditTransitionAuthority(mode=transition_authority)
 
     training = {
         "duration": _categorical_target_coverage(
@@ -870,13 +923,46 @@ def _structured_head_coverage_gate(
             minimum_classes=thresholds.minimum_duration_observed_classes,
             minimum_entropy=thresholds.minimum_duration_label_entropy_bits,
         )
-        require_side(
-            side_name,
-            "transition",
-            side["transition"],
-            minimum_classes=thresholds.minimum_transition_observed_classes,
-            minimum_entropy=thresholds.minimum_transition_label_entropy_bits,
-        )
+        if authority.renderer_owned:
+            transition = side["transition"]
+            histogram = transition.get("label_histogram")
+            label_count = transition.get("label_count")
+            expected_histogram = {
+                "hard_cut" if side_name == "training" else "0": label_count
+            }
+            if (
+                not isinstance(label_count, int)
+                or isinstance(label_count, bool)
+                or label_count < 1
+                or histogram != expected_histogram
+            ):
+                reasons.append(
+                    f"{side_name}_renderer_owned_transition_metadata_not_exact_hard_cut"
+                )
+            side["transition"] = {
+                "status": "skipped_non_authoritative",
+                "reason": RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
+                "label_count": label_count,
+                "allowed_model_metadata_labels": list(
+                    RENDERER_OWNED_ALLOWED_MODEL_LABELS
+                ),
+                "label_histogram": (
+                    {"hard_cut": label_count}
+                    if isinstance(label_count, int)
+                    and not isinstance(label_count, bool)
+                    else histogram
+                ),
+                "learned_accuracy_consumed": False,
+                "learned_entropy_consumed": False,
+            }
+        else:
+            require_side(
+                side_name,
+                "transition",
+                side["transition"],
+                minimum_classes=thresholds.minimum_transition_observed_classes,
+                minimum_entropy=thresholds.minimum_transition_label_entropy_bits,
+            )
     return {
         "contract": STRUCTURED_HEAD_COVERAGE_CONTRACT,
         "passed": not reasons,
@@ -895,6 +981,9 @@ def _structured_head_coverage_gate(
                 thresholds.minimum_transition_label_entropy_bits
             ),
         },
+        "transition_authority": transition_authority_contract(
+            transition_authority
+        ),
         "training_partition": training,
         "heldout": held_out,
         "reference_validation_labels_consumed": False,
@@ -1185,6 +1274,18 @@ def train_production_stage_edit(
     config = model_config or production_stage_edit_config(schema)
     if config.token_schema_fingerprint != schema.fingerprint:
         raise ValueError("production model configuration and token schema differ")
+    if (
+        config.transition_authority
+        != effective_loss_contract.transition_authority
+        or config.transition_authority
+        != effective_dynamic_crop_loss_contract.base.transition_authority
+    ):
+        raise ValueError(
+            "model, base loss, and Dynamic Crop base transition authority differ"
+        )
+    transition_authority = StageEditTransitionAuthority(
+        mode=config.transition_authority
+    )
     maximum_length = max(len(example.sequence.tokens) for example in corpus.examples)
     maximum_sources = max(
         len(token.source_candidates)
@@ -1746,12 +1847,19 @@ def train_production_stage_edit(
         held_out_metrics,
         dynamic_crop_v2_metrics=held_out_dynamic_metrics,
         thresholds=quality_thresholds,
+        transition_authority=config.transition_authority,
     )
     structured_head_coverage_gate = _structured_head_coverage_gate(
         split.train,
         held_out_metrics,
         thresholds=quality_thresholds,
+        transition_authority=config.transition_authority,
     )
+    reported_held_out_metrics = dict(held_out_metrics)
+    if transition_authority.renderer_owned:
+        reported_held_out_metrics["transition"] = dict(
+            quality_gate.metrics["transition"]
+        )
     production_ready = bool(
         authorize_production_activation
         and quality_gate.passed
@@ -1800,6 +1908,8 @@ def train_production_stage_edit(
         "source_scoring_contract": stage_edit_source_scoring_contract(config),
         "source_evaluation_contract": stage_edit_source_evaluation_contract(),
         "cut_scoring_contract": stage_edit_cut_scoring_contract(config),
+        "transition_authority_contract": transition_authority.to_dict(),
+        "transition_authority_contract_sha256": transition_authority.fingerprint,
         "cut_imbalance_contract": cut_imbalance_contract,
         "cut_threshold_freeze": frozen_cut_threshold,
         "selection_freeze_evidence": selection_freeze_evidence,
@@ -1930,7 +2040,7 @@ def train_production_stage_edit(
             "cut_threshold_freeze_sha256": frozen_cut_threshold[
                 "freeze_sha256"
             ],
-            "metrics": held_out_metrics,
+            "metrics": reported_held_out_metrics,
             "dynamic_crop_v2_metrics": held_out_dynamic_metrics,
             "quality_gate": quality_gate.to_dict(),
         },

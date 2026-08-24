@@ -30,6 +30,10 @@ from typing import Any, Sequence
 from .face_identity import SFACE_EMBEDDING_SIZE, cosine_similarity
 from .face_match import FaceMatchPlan, FaceMatchSegment
 from .render import PanCropTrack, RenderTransition, TransitionKind
+from .stage_edit_transition_authority import (
+    RENDERER_OWNED_TRANSITION_AUTHORITY,
+    StageEditTransitionAuthority,
+)
 from .timeline import face_geometry_minimax_mismatch
 from .visual_score import VisualTimelineChoice, VisualTimelinePlan
 
@@ -86,7 +90,7 @@ class GroupTransitionConfig:
 class GroupTransitionPlan:
     transitions: tuple[RenderTransition, ...]
     analysis_basis: str = (
-        "tiered_future_face_head_sface_appearance_body_continuity_v3"
+        "tiered_future_face_head_sface_appearance_body_continuity_v4"
     )
 
     @property
@@ -121,6 +125,9 @@ class GroupTransitionPlan:
     def to_dict(self, fps: float) -> dict[str, Any]:
         return {
             "analysis_basis": self.analysis_basis,
+            "transition_authority": StageEditTransitionAuthority(
+                mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+            ).to_dict(),
             "count_basis": "transition_boundaries",
             "policy": {
                 "A": "safe_future_face_head_sface_appearance_body_micro_dissolve",
