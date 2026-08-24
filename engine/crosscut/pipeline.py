@@ -66,6 +66,10 @@ from .member_draft import (
 )
 from .member_editorial_motion import build_member_editorial_motion_plan
 from .performance_range import estimate_shared_performance_range
+from .post_render_qa import (
+    PostRenderArtifactSet,
+    evaluate_and_write_post_render_qa,
+)
 from .professional_reference_gate import ProfessionalReferenceProfile
 from .professional_reference_cadence import (
     ProfessionalReferenceCadenceProfile,
@@ -183,6 +187,9 @@ ELIGIBLE_SOURCE_INDEX_DOMAIN = "eligible_source_index"
 OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY = (
     "official_target_fancam_direct_full_frame"
 )
+AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT = (
+    "automatic_registered_stage_edit_mandatory_post_render_qa_v1"
+)
 _DIRECT_MEMBER_TARGET_RUN_SECONDS = 3.9
 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE = 13.5
 _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE = 17.5
@@ -198,6 +205,75 @@ class AnalysisArtifact:
     manifest_path: Path
     manifest: dict[str, Any]
     output_paths: tuple[Path, ...]
+
+
+def _enforce_automatic_stage_edit_post_render_qa(
+    *,
+    registered_stage_edit_bundle: RegisteredStageEditProductionBundle | None,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    reporter: EventReporter,
+) -> Path | None:
+    """Require PASS from the final-media QA only for registered automatic StageEdit.
+
+    The evaluator consumes the already persisted timestamp-bound analysis,
+    render-plan, candidate-selection, and final MP4.  Its report and the final
+    MP4 remain in place even when the verdict blocks the CLI success event.
+    """
+
+    if registered_stage_edit_bundle is None:
+        return None
+
+    artifact_set = PostRenderArtifactSet.from_analysis_path(manifest_path)
+    reporter.status(
+        "등록된 StageEdit 최종 MP4를 전체 디코딩하고 "
+        "전문 후처리 QA를 실행하는 중…"
+    )
+    report, report_path = evaluate_and_write_post_render_qa(artifact_set)
+    report_payload = report.to_dict()
+    provenance = {
+        "contract": AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
+        "required": True,
+        "activation": "automatic_registered_production_bundle",
+        "success_requires_pass": True,
+        "report_path": str(report_path.resolve()),
+        "verdict": report.verdict.value,
+        "passed": report.passed,
+        "analysis_basis": report.analysis_basis,
+        "issue_count": report_payload.get("issue_count"),
+        "fail_issue_count": report_payload.get("fail_issue_count"),
+        "conditional_issue_count": report_payload.get(
+            "conditional_issue_count"
+        ),
+        "failure_artifact_policy": {
+            "final_mp4_preserved": True,
+            "qa_report_preserved": True,
+            "analysis_manifest_preserved": True,
+        },
+    }
+    manifest["post_render_qa"] = dict(provenance)
+    render_payload = manifest.get("render")
+    if isinstance(render_payload, dict):
+        render_payload["post_render_qa"] = dict(provenance)
+    generation_payload = manifest.get("stage_edit_generation")
+    if isinstance(generation_payload, dict):
+        generation_payload["post_render_qa"] = dict(provenance)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    reporter.log(
+        "StageEdit 최종 후처리 QA "
+        f"{report.verdict.value} · 보고서 {report_path}"
+    )
+    if not report.passed:
+        raise RuntimeError(
+            "automatic registered StageEdit final render blocked by mandatory "
+            f"post-render QA verdict {report.verdict.value}; final MP4 preserved "
+            f"at {artifact_set.video_path.resolve()}; QA report preserved at "
+            f"{report_path.resolve()}"
+        )
+    return report_path.resolve()
 
 
 def _materialize_ranked_visual_proxy_candidates(
@@ -7080,6 +7156,14 @@ def analyze(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    mandatory_post_render_qa_path = (
+        _enforce_automatic_stage_edit_post_render_qa(
+            registered_stage_edit_bundle=registered_stage_edit_bundle,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            reporter=reporter,
+        )
+    )
     reporter.progress(1.0, "분석 결과를 저장했습니다.")
     output_paths = [manifest_path]
     if render_plan_path is not None:
@@ -7099,6 +7183,8 @@ def analyze(
         output_paths.append(stage_edit_generation_audit_path)
     if source_derivative_audit_path is not None:
         output_paths.append(source_derivative_audit_path)
+    if mandatory_post_render_qa_path is not None:
+        output_paths.append(mandatory_post_render_qa_path)
     if rendered_video_path is not None:
         output_paths.append(rendered_video_path)
     output_paths.extend(timeline_interchange_paths)

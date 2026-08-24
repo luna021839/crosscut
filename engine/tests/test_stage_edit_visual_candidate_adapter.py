@@ -12,8 +12,10 @@ from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.ive import AspectRatio
 from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
+    AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
     _GroupRenderCandidateBundle,
     _attempt_proxy_triggered_partial_reedit,
+    _enforce_automatic_stage_edit_post_render_qa,
     analyze,
 )
 from crosscut.render import (
@@ -250,6 +252,143 @@ def _visual_fixture(*, passed: bool = True):
 
 
 class StageEditVisualCandidateAdapterTests(unittest.TestCase):
+    @staticmethod
+    def _post_render_report(verdict: str) -> SimpleNamespace:
+        passed = verdict == "PASS"
+        return SimpleNamespace(
+            verdict=SimpleNamespace(value=verdict),
+            passed=passed,
+            analysis_basis="mandatory_stage_edit_post_render_test_v1",
+            to_dict=lambda: {
+                "issue_count": 0 if passed else 1,
+                "fail_issue_count": 0,
+                "conditional_issue_count": 0 if passed else 1,
+            },
+        )
+
+    @staticmethod
+    def _post_render_artifact_shell(
+        root: Path,
+    ) -> tuple[Path, Path, dict[str, object]]:
+        base = "IVE-BANG-BANG-20260824-120000"
+        analysis = root / f"{base}-analysis.json"
+        video = root / f"{base}-group-crosscut.mp4"
+        (root / f"{base}-render-plan.json").write_text("{}", encoding="utf-8")
+        (root / f"{base}-rendered-candidate-selection.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        video.write_bytes(b"preserved final mp4")
+        manifest: dict[str, object] = {
+            "render": {"video_path": str(video)},
+            "stage_edit_generation": {
+                "activation": {
+                    "activation": "automatic_registered_production_bundle"
+                }
+            },
+        }
+        analysis.write_text(json.dumps(manifest), encoding="utf-8")
+        return analysis, video, manifest
+
+    def test_registered_automatic_post_render_pass_is_persisted_as_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            analysis, video, manifest = self._post_render_artifact_shell(root)
+            report = self._post_render_report("PASS")
+
+            def evaluate(artifact_set):
+                self.assertTrue(artifact_set.analysis_path.is_file())
+                self.assertTrue(artifact_set.render_plan_path.is_file())
+                self.assertTrue(artifact_set.selection_path.is_file())
+                self.assertTrue(artifact_set.video_path.is_file())
+                report_path = artifact_set.default_report_path
+                report_path.write_text('{"verdict":"PASS"}', encoding="utf-8")
+                return report, report_path
+
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa",
+                side_effect=evaluate,
+            ) as evaluator:
+                report_path = _enforce_automatic_stage_edit_post_render_qa(
+                    registered_stage_edit_bundle=SimpleNamespace(),
+                    manifest=manifest,
+                    manifest_path=analysis,
+                    reporter=_MemoryReporter(),
+                )
+
+            evaluator.assert_called_once()
+            self.assertIsNotNone(report_path)
+            assert report_path is not None
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(video.is_file())
+            persisted = json.loads(analysis.read_text(encoding="utf-8"))
+            provenance = persisted["post_render_qa"]
+            self.assertEqual("PASS", provenance["verdict"])
+            self.assertTrue(provenance["passed"])
+            self.assertEqual(
+                AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
+                provenance["contract"],
+            )
+            self.assertEqual(provenance, persisted["render"]["post_render_qa"])
+            self.assertEqual(
+                provenance,
+                persisted["stage_edit_generation"]["post_render_qa"],
+            )
+
+    def test_registered_automatic_post_render_conditional_preserves_and_blocks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            analysis, video, manifest = self._post_render_artifact_shell(root)
+            report = self._post_render_report("CONDITIONAL")
+
+            def evaluate(artifact_set):
+                report_path = artifact_set.default_report_path
+                report_path.write_text(
+                    '{"verdict":"CONDITIONAL"}', encoding="utf-8"
+                )
+                return report, report_path
+
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa",
+                side_effect=evaluate,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "verdict CONDITIONAL.*final MP4 preserved.*QA report preserved",
+                ):
+                    _enforce_automatic_stage_edit_post_render_qa(
+                        registered_stage_edit_bundle=SimpleNamespace(),
+                        manifest=manifest,
+                        manifest_path=analysis,
+                        reporter=_MemoryReporter(),
+                    )
+
+            report_path = root / (
+                "IVE-BANG-BANG-20260824-120000-post-render-qa.json"
+            )
+            self.assertTrue(video.is_file())
+            self.assertTrue(report_path.is_file())
+            persisted = json.loads(analysis.read_text(encoding="utf-8"))
+            self.assertEqual("CONDITIONAL", persisted["post_render_qa"]["verdict"])
+            self.assertFalse(persisted["post_render_qa"]["passed"])
+
+    def test_non_registered_path_never_invokes_mandatory_post_render_qa(self) -> None:
+        with patch(
+            "crosscut.pipeline.evaluate_and_write_post_render_qa"
+        ) as evaluator:
+            result = _enforce_automatic_stage_edit_post_render_qa(
+                registered_stage_edit_bundle=None,
+                manifest={},
+                manifest_path=Path("/does/not/exist-analysis.json"),
+                reporter=_MemoryReporter(),
+            )
+
+        self.assertIsNone(result)
+        evaluator.assert_not_called()
+
     def test_prescribed_builder_runs_real_visual_dp_and_never_changes_source_path(
         self,
     ) -> None:
