@@ -480,6 +480,11 @@ class StageEditSemiMarkovConfig:
     # formation-evidenced wide from a generic/unknown wide without claiming
     # that it proves the complete group is visible.
     minimum_formation_anchor_person_count_normalized: float = 1.0 / 6.0
+    # IVE-only soft product preference. Four or more independent person-box
+    # observations make a wide readable as a group formation even when the
+    # tiny bodies are too small for per-person upper-body pose. This remains
+    # identity-free evidence and is not proof that all six members are shown.
+    strong_formation_anchor_person_count_normalized: float = 4.0 / 6.0
     highlight_minimum_post_burst_formation_resets: int = 1
 
     def __post_init__(self) -> None:
@@ -574,11 +579,19 @@ class StageEditSemiMarkovConfig:
             "highlight_minimum_early_wide_anchor_fraction",
             "highlight_minimum_phrase_entry_wide_anchor_fraction",
             "minimum_formation_anchor_person_count_normalized",
+            "strong_formation_anchor_person_count_normalized",
         ):
             number = _finite(getattr(self, name), name)
             if not 0.0 <= number <= 1.0:
                 raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
             object.__setattr__(self, name, number)
+        if (
+            self.strong_formation_anchor_person_count_normalized
+            < self.minimum_formation_anchor_person_count_normalized
+        ):
+            raise StageEditDecodeInputError(
+                "strong formation threshold cannot be below the weak threshold"
+            )
         if (
             self.highlight_minimum_closeup_fraction
             > self.highlight_minimum_nonwide_fraction
@@ -1182,17 +1195,39 @@ def _formation_wide_evidence(
     """Return only weak, identity-free evidence for a formation-aware wide.
 
     This must never be described as proof that all six IVE members are visible.
-    The immutable human-reference profile only supports distinguishing missing
-    or zero evidence from a detector/pose-backed wide observation.
+    A weak count still needs pose coverage; the IVE-only strong path accepts at
+    least four independent person boxes because tiny full-stage bodies often
+    fall below the upper-body pose model's usable scale.
     """
 
+    if (
+        shot_size not in _WIDE_SHOT_SIZES
+        or formation_person_count_normalized is None
+        or formation_person_count_normalized
+        < config.minimum_formation_anchor_person_count_normalized
+    ):
+        return False
+    strong_multi_person_evidence = (
+        formation_person_count_normalized
+        >= config.strong_formation_anchor_person_count_normalized
+    )
+    pose_backed_evidence = bool(
+        formation_pose_coverage is not None and formation_pose_coverage > 0.0
+    )
+    return strong_multi_person_evidence or pose_backed_evidence
+
+
+def _strong_formation_wide_evidence(
+    *,
+    shot_size: str,
+    formation_person_count_normalized: float | None,
+    config: StageEditSemiMarkovConfig,
+) -> bool:
     return bool(
         shot_size in _WIDE_SHOT_SIZES
         and formation_person_count_normalized is not None
         and formation_person_count_normalized
-        >= config.minimum_formation_anchor_person_count_normalized
-        and formation_pose_coverage is not None
-        and formation_pose_coverage > 0.0
+        >= config.strong_formation_anchor_person_count_normalized
     )
 
 
@@ -1298,6 +1333,14 @@ def _montage_grammar_score_raw(
                 config=config,
             ):
                 raw += 0.48
+                if _strong_formation_wide_evidence(
+                    shot_size=shot_size,
+                    formation_person_count_normalized=(
+                        formation_person_count_normalized
+                    ),
+                    config=config,
+                ):
+                    raw += 0.10
             else:
                 raw += 0.04
         elif shot_size in _CLOSEUP_SHOT_SIZES:
@@ -1342,6 +1385,14 @@ def _montage_grammar_score_raw(
                 config=config,
             ):
                 raw += 0.06
+                if _strong_formation_wide_evidence(
+                    shot_size=shot_size,
+                    formation_person_count_normalized=(
+                        formation_person_count_normalized
+                    ),
+                    config=config,
+                ):
+                    raw += 0.04
         if not anchor_zone:
             if shot_size in _CLOSEUP_SHOT_SIZES:
                 raw += 0.48
@@ -1373,18 +1424,25 @@ def _montage_grammar_score_raw(
             ):
                 # A wide reset after a face-scale burst exposes the formation
                 # without allowing the entire highlight to collapse to wides.
-                raw += (
-                    0.18
-                    if _formation_wide_evidence(
+                if _formation_wide_evidence(
+                    shot_size=shot_size,
+                    formation_person_count_normalized=(
+                        formation_person_count_normalized
+                    ),
+                    formation_pose_coverage=formation_pose_coverage,
+                    config=config,
+                ):
+                    raw += 0.18
+                    if _strong_formation_wide_evidence(
                         shot_size=shot_size,
                         formation_person_count_normalized=(
                             formation_person_count_normalized
                         ),
-                        formation_pose_coverage=formation_pose_coverage,
                         config=config,
-                    )
-                    else 0.02
-                )
+                    ):
+                        raw += 0.08
+                else:
+                    raw += 0.02
     elif directive.role is SectionRole.BUILD:
         if shot_size in _CLOSEUP_SHOT_SIZES:
             raw += 0.10 + 0.24 * progress
@@ -1938,9 +1996,20 @@ def _evaluate_montage_grammar(
                 "ive_product_nonwide_burst_requirement"
             ),
             "formation_evidence_semantics": (
-                "identity_free_nonzero_observed_person_and_pose_evidence_"
-                "not_proof_of_complete_group_formation"
+                "identity_free_weak_person_plus_pose_or_strong_multi_person_"
+                "box_evidence_not_proof_of_complete_group_formation"
             ),
+            "strong_formation_wide_product_preference": {
+                "minimum_normalized_person_box_count": (
+                    config.strong_formation_anchor_person_count_normalized
+                ),
+                "minimum_ive_roster_equivalent_count": 4,
+                "requires_identity_labels": False,
+                "proves_all_six_members_visible": False,
+                "maximum_anchor_raw_bonus": 0.10,
+                "maximum_switch_raw_bonus": 0.04,
+                "maximum_post_burst_reset_raw_bonus": 0.08,
+            },
             "insufficient_closeup_or_nonwide_candidates": (
                 "fail_before_render_instead_of_fabricating_a_flat_highlight"
             ),
@@ -1960,6 +2029,7 @@ def _evaluate_montage_grammar(
                 ),
                 "maximum_target_alignment_raw_bonus": 0.10,
                 "formation_evidenced_wide_additional_raw_bonus": 0.06,
+                "strong_multi_person_wide_additional_raw_bonus": 0.04,
                 "same_source_or_derivative_family_bonus": 0.0,
                 "repeated_wide_only_switch_bonus_after_no_target_improvement": (
                     0.0
@@ -2006,6 +2076,9 @@ def _evaluate_montage_grammar(
             ),
             "minimum_formation_anchor_person_count_normalized": (
                 config.minimum_formation_anchor_person_count_normalized
+            ),
+            "strong_formation_anchor_person_count_normalized": (
+                config.strong_formation_anchor_person_count_normalized
             ),
             "highlight_minimum_post_burst_formation_resets": (
                 config.highlight_minimum_post_burst_formation_resets

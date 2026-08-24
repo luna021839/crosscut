@@ -27,6 +27,7 @@ _MODEL_DIRECTORY = Path(__file__).resolve().parent / "models"
 PERSON_DETECTOR_MODEL = "person_detection_mediapipe_2023mar.onnx"
 POSE_ESTIMATOR_MODEL = "pose_estimation_mediapipe_2023mar.onnx"
 HUMAN_SEGMENTER_MODEL = "human_segmentation_pphumanseg_2023mar.onnx"
+FORMATION_PERSON_DETECTOR_MODEL = "object_detection_nanodet_2022nov.onnx"
 
 _EXPECTED_SHA256 = {
     PERSON_DETECTOR_MODEL: (
@@ -38,10 +39,14 @@ _EXPECTED_SHA256 = {
     HUMAN_SEGMENTER_MODEL: (
         "552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24"
     ),
+    FORMATION_PERSON_DETECTOR_MODEL: (
+        "4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186"
+    ),
 }
 
 POSE_BACKEND = "opencv_zoo_mediapipe_pose_2023mar"
 SILHOUETTE_BACKEND = "opencv_zoo_pphumanseg_2023mar"
+FORMATION_DETECTOR_BACKEND = "opencv_zoo_nanodet_2022nov"
 
 
 def _unit(value: float) -> float:
@@ -307,6 +312,181 @@ class _MediaPipePersonDetector:
             landmarks.reshape(-1, 8),
             scores[indices],
         ]
+
+
+class _NanoDetFormationDetector:
+    """Detect small on-stage people at a formation-readable 416px scale.
+
+    MediaPipe's 224px single-person proposal model remains the source of the
+    pose landmarks below.  It is intentionally complemented here by the
+    Apache-2.0 OpenCV Zoo NanoDet model: full-stage broadcast shots routinely
+    shrink each IVE member below the reliable scale of the pose proposal
+    model.  Only COCO ``person`` boxes and confidences are retained.
+    """
+
+    # The bundled NanoDet-m-plus-1.5x graph exposes three score/distance
+    # feature-map pairs.  OpenCV Zoo's generic wrapper lists stride 64 too but
+    # intentionally truncates it through ``zip`` because this exact graph has
+    # no fourth output pair; bind the real exported contract explicitly.
+    _STRIDES = (8, 16, 32)
+    _INPUT_SIZE = 416
+    _REG_MAX = 7
+
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        score_threshold: float = 0.35,
+        nms_threshold: float = 0.55,
+    ) -> None:
+        self._net = cv2.dnn.readNet(str(model_path))
+        self._score_threshold = float(score_threshold)
+        self._nms_threshold = float(nms_threshold)
+        self._project = np.arange(self._REG_MAX + 1, dtype=np.float64)
+        self._mean = np.asarray(
+            (103.53, 116.28, 123.675), dtype=np.float32
+        ).reshape(1, 1, 3)
+        self._std = np.asarray(
+            (57.375, 57.12, 58.395), dtype=np.float32
+        ).reshape(1, 1, 3)
+        self._anchors: tuple[np.ndarray, ...] = tuple(
+            self._anchors_for_stride(stride) for stride in self._STRIDES
+        )
+
+    @classmethod
+    def _anchors_for_stride(cls, stride: int) -> np.ndarray:
+        feature_size = cls._INPUT_SIZE // stride
+        shifts = np.arange(feature_size, dtype=np.float64) * stride
+        x_values, y_values = np.meshgrid(shifts, shifts)
+        offset = 0.5 * (stride - 1)
+        return np.column_stack(
+            (x_values.reshape(-1) + offset, y_values.reshape(-1) + offset)
+        )
+
+    @classmethod
+    def _letterbox(
+        cls, image: np.ndarray
+    ) -> tuple[np.ndarray, int, int, float]:
+        height, width = image.shape[:2]
+        scale = min(cls._INPUT_SIZE / height, cls._INPUT_SIZE / width)
+        resized_width = max(1, int(width * scale))
+        resized_height = max(1, int(height * scale))
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(
+            rgb,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        left = (cls._INPUT_SIZE - resized_width) // 2
+        top = (cls._INPUT_SIZE - resized_height) // 2
+        padded = cv2.copyMakeBorder(
+            rgb,
+            top,
+            cls._INPUT_SIZE - resized_height - top,
+            left,
+            cls._INPUT_SIZE - resized_width - left,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+        return padded, top, left, scale
+
+    def infer(self, image: np.ndarray) -> np.ndarray:
+        height, width = image.shape[:2]
+        padded, top, left, scale = self._letterbox(image)
+        normalized = (padded.astype(np.float32) - self._mean) / self._std
+        self._net.setInput(cv2.dnn.blobFromImage(normalized))
+        outputs = self._net.forward(self._net.getUnconnectedOutLayersNames())
+        class_outputs = outputs[::2]
+        box_outputs = outputs[1::2]
+        if (
+            len(class_outputs) != len(self._STRIDES)
+            or len(box_outputs) != len(self._STRIDES)
+        ):
+            raise ValueError("NanoDet output contract differs")
+
+        boxes: list[np.ndarray] = []
+        scores: list[np.ndarray] = []
+        for stride, class_output, box_output, anchors in zip(
+            self._STRIDES,
+            class_outputs,
+            box_outputs,
+            self._anchors,
+            strict=True,
+        ):
+            class_scores = np.asarray(class_output, dtype=np.float64).reshape(
+                -1, class_output.shape[-1]
+            )
+            distributions = np.asarray(box_output, dtype=np.float64).reshape(
+                -1, self._REG_MAX + 1
+            )
+            distributions -= np.max(distributions, axis=1, keepdims=True)
+            probabilities = np.exp(distributions)
+            probabilities /= np.sum(probabilities, axis=1, keepdims=True)
+            # Elementwise reduction avoids platform BLAS dispatch for this
+            # tiny fixed-width softmax.  Some Accelerate builds emitted
+            # spurious divide/overflow warnings and non-repeatable boxes for
+            # the equivalent matrix multiplication.
+            distances = np.sum(
+                probabilities * self._project[np.newaxis, :],
+                axis=1,
+            ).reshape(-1, 4) * stride
+            if len(anchors) != len(class_scores) or len(anchors) != len(distances):
+                raise ValueError("NanoDet feature-map shape differs")
+            person_scores = class_scores[:, 0]
+            selected = person_scores >= self._score_threshold
+            if not np.any(selected):
+                continue
+            points = anchors[selected]
+            selected_distances = distances[selected]
+            selected_boxes = np.column_stack(
+                (
+                    points[:, 0] - selected_distances[:, 0],
+                    points[:, 1] - selected_distances[:, 1],
+                    points[:, 0] + selected_distances[:, 2],
+                    points[:, 1] + selected_distances[:, 3],
+                )
+            )
+            boxes.append(
+                np.clip(selected_boxes, 0.0, float(self._INPUT_SIZE))
+            )
+            scores.append(person_scores[selected])
+
+        if not boxes:
+            return np.empty((0, 5), dtype=np.float64)
+        all_boxes = np.concatenate(boxes, axis=0)
+        all_scores = np.concatenate(scores, axis=0)
+        xywh = np.column_stack(
+            (
+                all_boxes[:, 0],
+                all_boxes[:, 1],
+                np.maximum(0.0, all_boxes[:, 2] - all_boxes[:, 0]),
+                np.maximum(0.0, all_boxes[:, 3] - all_boxes[:, 1]),
+            )
+        )
+        kept = cv2.dnn.NMSBoxes(
+            xywh.tolist(),
+            all_scores.tolist(),
+            self._score_threshold,
+            self._nms_threshold,
+        )
+        if len(kept) == 0:
+            return np.empty((0, 5), dtype=np.float64)
+        indices = np.asarray(kept, dtype=np.int64).reshape(-1)
+        restored = all_boxes[indices].copy()
+        restored[:, (0, 2)] = (restored[:, (0, 2)] - left) / scale
+        restored[:, (1, 3)] = (restored[:, (1, 3)] - top) / scale
+        restored[:, (0, 2)] = np.clip(restored[:, (0, 2)], 0.0, float(width))
+        restored[:, (1, 3)] = np.clip(restored[:, (1, 3)], 0.0, float(height))
+        result = np.column_stack((restored, all_scores[indices]))
+        valid = (
+            (result[:, 2] - result[:, 0] >= width * 0.015)
+            & (result[:, 3] - result[:, 1] >= height * 0.045)
+        )
+        result = result[valid]
+        if len(result) == 0:
+            return np.empty((0, 5), dtype=np.float64)
+        order = np.argsort(result[:, -1])[::-1]
+        return result[order]
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +772,9 @@ def _person_layout_embedding(
     *,
     frame_width: int,
     frame_height: int,
+    minimum_width: float = 0.03,
+    minimum_height: float = 0.08,
+    minimum_confidence: float = 0.44,
 ) -> tuple[float, ...]:
     """Encode the left-to-right on-screen formation of all detected dancers."""
 
@@ -602,7 +785,11 @@ def _person_layout_embedding(
         right = _unit(float(person[2]) / frame_width)
         bottom = _unit(float(person[3]) / frame_height)
         confidence = _unit(float(person[-1]))
-        if right - left < 0.03 or bottom - top < 0.08 or confidence < 0.44:
+        if (
+            right - left < minimum_width
+            or bottom - top < minimum_height
+            or confidence < minimum_confidence
+        ):
             continue
         boxes.append((left, top, right, bottom, confidence))
     if not boxes:
@@ -647,6 +834,9 @@ def _formation_people_descriptor(
     frame_height: int,
     pose_estimator: _MediaPipePoseEstimator | None = None,
     image: np.ndarray | None = None,
+    minimum_width: float = 0.03,
+    minimum_height: float = 0.08,
+    minimum_confidence: float = 0.44,
 ) -> tuple[
     tuple[FormationPersonDescriptor, ...],
     dict[int, _PoseObservation],
@@ -671,7 +861,11 @@ def _formation_people_descriptor(
         confidence = _unit(float(person[-1]))
         width = right - left
         height = bottom - top
-        if width < 0.03 or height < 0.08 or confidence < 0.44:
+        if (
+            width < minimum_width
+            or height < minimum_height
+            or confidence < minimum_confidence
+        ):
             continue
         bbox = (left, top, width, height)
         centroid = (left + width / 2.0, top + height / 2.0)
@@ -713,6 +907,62 @@ def _formation_people_descriptor(
     return tuple(descriptors), observations
 
 
+def _formation_bbox_iou(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    left_x, left_y, left_width, left_height = left
+    right_x, right_y, right_width, right_height = right
+    intersection_left = max(left_x, right_x)
+    intersection_top = max(left_y, right_y)
+    intersection_right = min(left_x + left_width, right_x + right_width)
+    intersection_bottom = min(left_y + left_height, right_y + right_height)
+    intersection = max(0.0, intersection_right - intersection_left) * max(
+        0.0, intersection_bottom - intersection_top
+    )
+    union = left_width * left_height + right_width * right_height - intersection
+    return intersection / union if union > 1.0e-12 else 0.0
+
+
+def _merge_formation_pose(
+    formation_people: Sequence[FormationPersonDescriptor],
+    pose_people: Sequence[FormationPersonDescriptor],
+) -> tuple[FormationPersonDescriptor, ...]:
+    """Transfer upper-body geometry onto stronger formation detections.
+
+    NanoDet is used for small-person recall while MediaPipe remains the pose
+    estimator.  A one-to-one IoU match prevents one pose from being copied to
+    multiple nearby performers.  Unmatched people retain only their
+    non-identifying screen-space box.
+    """
+
+    unused = set(range(len(pose_people)))
+    merged: list[FormationPersonDescriptor] = []
+    for person in formation_people:
+        matches = sorted(
+            (
+                (_formation_bbox_iou(person.bbox_xywh, pose_people[index].bbox_xywh), index)
+                for index in unused
+                if pose_people[index].upper_body_keypoints_xyc
+            ),
+            reverse=True,
+        )
+        upper_body: tuple[tuple[float, float, float], ...] = ()
+        if matches and matches[0][0] >= 0.15:
+            _overlap, index = matches[0]
+            unused.remove(index)
+            upper_body = pose_people[index].upper_body_keypoints_xyc
+        merged.append(
+            FormationPersonDescriptor(
+                bbox_xywh=person.bbox_xywh,
+                centroid_xy=person.centroid_xy,
+                detection_confidence=person.detection_confidence,
+                upper_body_keypoints_xyc=upper_body,
+            )
+        )
+    return tuple(merged)
+
+
 def _dominant_person(persons: np.ndarray) -> np.ndarray | None:
     if len(persons) == 0:
         return None
@@ -745,8 +995,10 @@ class SubjectGeometryAnalyzer:
         self._directory = model_directory or _MODEL_DIRECTORY
         self._pose_detector: _MediaPipePersonDetector | None = None
         self._pose_estimator: _MediaPipePoseEstimator | None = None
+        self._formation_detector: _NanoDetFormationDetector | None = None
         self._segmenter: _PPHumanSegmenter | None = None
         self._pose_load_attempted = False
+        self._formation_load_attempted = False
         self._segmenter_load_attempted = False
         self._lock = Lock()
 
@@ -773,6 +1025,19 @@ class SubjectGeometryAnalyzer:
             self._pose_detector = None
             self._pose_estimator = None
 
+    def _load_formation_detector(self) -> None:
+        if self._formation_load_attempted:
+            return
+        self._formation_load_attempted = True
+        if not self._valid_model(FORMATION_PERSON_DETECTOR_MODEL):
+            return
+        try:
+            self._formation_detector = _NanoDetFormationDetector(
+                self._directory / FORMATION_PERSON_DETECTOR_MODEL
+            )
+        except cv2.error:
+            self._formation_detector = None
+
     def _load_segmenter(self) -> None:
         if self._segmenter_load_attempted:
             return
@@ -796,6 +1061,7 @@ class SubjectGeometryAnalyzer:
             raise ValueError("subject geometry expects a non-empty BGR image")
         with self._lock:
             self._load_pose()
+            self._load_formation_detector()
             self._load_segmenter()
             silhouette_embedding: tuple[float, ...] = ()
             silhouette_bbox = None
@@ -824,18 +1090,58 @@ class SubjectGeometryAnalyzer:
             person_layout_embedding: tuple[float, ...] = ()
             formation_people: tuple[FormationPersonDescriptor, ...] = ()
             pose_backend = "none"
+            pose_persons = np.empty((0, 13), dtype=np.float64)
             if self._pose_detector is not None and self._pose_estimator is not None:
                 try:
-                    persons = self._pose_detector.infer(image)
-                    person_count = len(persons)
-                    person_layout_embedding = _person_layout_embedding(
-                        persons,
+                    pose_persons = self._pose_detector.infer(image)
+                except (cv2.error, ValueError, FloatingPointError):
+                    pose_persons = np.empty((0, 13), dtype=np.float64)
+
+            formation_persons = np.empty((0, 5), dtype=np.float64)
+            if self._formation_detector is not None:
+                try:
+                    formation_persons = self._formation_detector.infer(image)
+                except (cv2.error, ValueError, FloatingPointError):
+                    formation_persons = np.empty((0, 5), dtype=np.float64)
+            geometry_persons = (
+                formation_persons if len(formation_persons) else pose_persons
+            )
+            using_formation_detector = bool(len(formation_persons))
+            if len(geometry_persons):
+                person_count = len(geometry_persons)
+                person_layout_embedding = _person_layout_embedding(
+                    geometry_persons,
+                    frame_width=image.shape[1],
+                    frame_height=image.shape[0],
+                    minimum_width=(0.015 if using_formation_detector else 0.03),
+                    minimum_height=(0.045 if using_formation_detector else 0.08),
+                    minimum_confidence=(
+                        0.35 if using_formation_detector else 0.44
+                    ),
+                )
+                formation_people, _unused_observations = (
+                    _formation_people_descriptor(
+                        geometry_persons,
                         frame_width=image.shape[1],
                         frame_height=image.shape[0],
+                        minimum_width=(
+                            0.015 if using_formation_detector else 0.03
+                        ),
+                        minimum_height=(
+                            0.045 if using_formation_detector else 0.08
+                        ),
+                        minimum_confidence=(
+                            0.35 if using_formation_detector else 0.44
+                        ),
                     )
-                    formation_people, formation_observations = (
+                )
+
+            formation_observations: dict[int, _PoseObservation] = {}
+            if len(pose_persons) and self._pose_estimator is not None:
+                try:
+                    pose_formation_people, formation_observations = (
                         _formation_people_descriptor(
-                            persons,
+                            pose_persons,
                             frame_width=image.shape[1],
                             frame_height=image.shape[0],
                             pose_estimator=(
@@ -846,12 +1152,26 @@ class SubjectGeometryAnalyzer:
                             image=image if include_formation_pose else None,
                         )
                     )
-                    dominant = _dominant_person(persons)
+                    if formation_people and pose_formation_people:
+                        formation_people = _merge_formation_pose(
+                            formation_people,
+                            pose_formation_people,
+                        )
+                    elif not formation_people:
+                        formation_people = pose_formation_people
+                        person_count = len(pose_persons)
+                        person_layout_embedding = _person_layout_embedding(
+                            pose_persons,
+                            frame_width=image.shape[1],
+                            frame_height=image.shape[0],
+                        )
+
+                    dominant = _dominant_person(pose_persons)
                     if dominant is not None:
                         dominant_index = next(
                             (
                                 index
-                                for index, person in enumerate(persons)
+                                for index, person in enumerate(pose_persons)
                                 if np.array_equal(person, dominant)
                             ),
                             -1,
@@ -959,6 +1279,8 @@ def detect_people(image: np.ndarray) -> tuple[PersonDetection, ...]:
 
 
 __all__ = [
+    "FORMATION_DETECTOR_BACKEND",
+    "FORMATION_PERSON_DETECTOR_MODEL",
     "FormationPersonDescriptor",
     "HUMAN_SEGMENTER_MODEL",
     "ModelAssetStatus",

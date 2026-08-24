@@ -26,6 +26,7 @@ from crosscut.stage_edit_semimarkov_beam import (
     StageEditSemiMarkovConfig,
     StageEditSourceContinuity,
     StageEditSourceMetadata,
+    _formation_wide_evidence,
     _montage_grammar_score_raw,
     _wide_switch_preferred_target_score_raw,
     decode_stage_edit_semimarkov_beam,
@@ -296,6 +297,43 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             config.montage_grammar_score_weight * formation_wide_switch,
             config.source_score_weight,
         )
+
+    def test_strong_multi_person_wide_survives_tiny_pose_failure(self) -> None:
+        config = StageEditSemiMarkovConfig()
+        self.assertTrue(
+            _formation_wide_evidence(
+                shot_size="wide",
+                formation_person_count_normalized=4.0 / 6.0,
+                formation_pose_coverage=0.0,
+                config=config,
+            )
+        )
+        self.assertFalse(
+            _formation_wide_evidence(
+                shot_size="wide",
+                formation_person_count_normalized=3.0 / 6.0,
+                formation_pose_coverage=0.0,
+                config=config,
+            )
+        )
+        self.assertTrue(
+            _formation_wide_evidence(
+                shot_size="wide",
+                formation_person_count_normalized=1.0 / 6.0,
+                formation_pose_coverage=1.0 / 6.0,
+                config=config,
+            )
+        )
+
+    def test_strong_formation_threshold_cannot_weaken_reference_floor(self) -> None:
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "strong formation threshold",
+        ):
+            StageEditSemiMarkovConfig(
+                minimum_formation_anchor_person_count_normalized=0.5,
+                strong_formation_anchor_person_count_normalized=0.4,
+            )
 
     def test_nonwide_burst_prior_breaks_wide_only_run_during_soft_target_dip(
         self,

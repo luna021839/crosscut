@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from crosscut.pose import (
+    FORMATION_PERSON_DETECTOR_MODEL,
     FormationPersonDescriptor,
     HUMAN_SEGMENTER_MODEL,
     SILHOUETTE_BACKEND,
@@ -183,12 +184,67 @@ class PoseModelTests(unittest.TestCase):
         self.assertEqual(descriptor.silhouette_embedding, ())
         self.assertEqual(descriptor.silhouette_backend, "none")
 
+    def test_formation_detector_drives_six_person_layout_without_identity(self) -> None:
+        class _FormationDetector:
+            @staticmethod
+            def infer(_image: np.ndarray) -> np.ndarray:
+                return np.asarray(
+                    [
+                        (20 + index * 28, 18, 44 + index * 28, 190, 0.91)
+                        for index in range(6)
+                    ],
+                    dtype=np.float64,
+                )
+
+        class _PoseDetector:
+            @staticmethod
+            def infer(_image: np.ndarray) -> np.ndarray:
+                return np.empty((0, 13), dtype=np.float64)
+
+        class _PoseEstimator:
+            @staticmethod
+            def infer(_image: np.ndarray, _person: np.ndarray) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            analyzer = SubjectGeometryAnalyzer(Path(directory))
+            analyzer._pose_load_attempted = True
+            analyzer._formation_load_attempted = True
+            analyzer._segmenter_load_attempted = True
+            analyzer._pose_detector = _PoseDetector()
+            analyzer._pose_estimator = _PoseEstimator()
+            analyzer._formation_detector = _FormationDetector()
+            descriptor = analyzer.describe(
+                np.zeros((200, 220, 3), dtype=np.uint8)
+            )
+
+        self.assertEqual(descriptor.detected_person_count, 6)
+        self.assertEqual(len(descriptor.formation_people), 6)
+        self.assertEqual(len(descriptor.person_layout_embedding), 134)
+        np.testing.assert_allclose(
+            descriptor.person_layout_embedding[-8:],
+            (1.0,) * 8,
+        )
+        self.assertTrue(
+            all(
+                left.centroid_xy[0] < right.centroid_xy[0]
+                for left, right in zip(
+                    descriptor.formation_people,
+                    descriptor.formation_people[1:],
+                )
+            )
+        )
+
     def test_bundled_assets_have_exact_digest_and_load_in_opencv(self) -> None:
         statuses = model_asset_status(verify_load=True)
-        self.assertEqual(len(statuses), 3)
+        self.assertEqual(len(statuses), 4)
         self.assertTrue(all(status.present for status in statuses))
         self.assertTrue(all(status.digest_valid for status in statuses))
         self.assertTrue(all(status.loadable for status in statuses))
+        self.assertIn(
+            FORMATION_PERSON_DETECTOR_MODEL,
+            {status.name for status in statuses},
+        )
 
     def test_bundled_segmenter_executes_without_optional_python_packages(self) -> None:
         descriptor = SubjectGeometryAnalyzer().describe(

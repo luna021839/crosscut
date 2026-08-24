@@ -458,6 +458,31 @@ class RenderedMontageGrammarReviewTests(unittest.TestCase):
             result["failure_codes"],
         )
 
+    def test_strong_multi_person_wide_survives_tiny_pose_failure(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        for choice in fixture["visual_timeline"]["choices"]:
+            if choice["shot_type"] in {"group_wide", "full_shot"}:
+                choice["detected_person_counts"] = [4, 4, 4]
+                choice["formation_person_counts"] = [4, 4, 4]
+                choice["formation_upper_body_counts"] = [0, 0, 0]
+
+        result = _review(fixture)
+
+        self.assertTrue(result["passed"], result["failure_codes"])
+        self.assertTrue(
+            result["sections"][0]["formation_wide_anchor_present"]
+        )
+
     def test_declared_section_must_be_fully_covered(self) -> None:
         fixture = _analysis(
             ("group_wide", "medium", "close_up", "full_shot", "medium", "close_up"),

@@ -2174,7 +2174,7 @@ def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
     _VISUAL_ANALYZER_FINGERPRINT = build_analyzer_fingerprint(
         descriptor_schema=(
             "frame_visual_descriptor_v1_numeric_geometry_pose_silhouette_"
-            "formation_motion_no_sface_no_raw_frame"
+            "nanodet_formation_motion_no_sface_no_raw_frame"
         ),
         code_paths=(Path(__file__), Path(__file__).with_name("pose.py")),
         model_assets=model_assets,

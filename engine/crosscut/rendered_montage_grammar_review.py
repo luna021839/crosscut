@@ -95,6 +95,7 @@ class RenderedMontageGrammarConfig:
     minimum_nonwide_burst_boundaries: int = 1
     formation_anchor_run_window: int = 3
     minimum_formation_anchor_person_count: int = 1
+    strong_formation_anchor_person_count: int = 4
     minimum_post_burst_formation_reset_count: int = 1
     minimum_motion_accent_count: int = 1
     minimum_closeup_proxy_face_coverage: float = 0.80
@@ -125,6 +126,7 @@ class RenderedMontageGrammarConfig:
             "minimum_nonwide_burst_boundaries",
             "formation_anchor_run_window",
             "minimum_formation_anchor_person_count",
+            "strong_formation_anchor_person_count",
             "minimum_post_burst_formation_reset_count",
             "minimum_motion_accent_count",
             "wide_involved_source_switch_reference_count",
@@ -137,6 +139,13 @@ class RenderedMontageGrammarConfig:
         if self.minimum_formation_anchor_person_count < 1:
             raise ValueError(
                 "minimum_formation_anchor_person_count must be at least one"
+            )
+        if (
+            self.strong_formation_anchor_person_count
+            < self.minimum_formation_anchor_person_count
+        ):
+            raise ValueError(
+                "strong formation count cannot be below the weak count"
             )
         if self.wide_involved_source_switch_reference_count < 1:
             raise ValueError(
@@ -999,14 +1008,18 @@ def _proven_formation_wide(
 ) -> bool:
     formation_people = item.get("formation_person_count_max")
     upper_body_people = item.get("formation_upper_body_count_max")
-    return bool(
-        item.get("shot_class") in _WIDE
-        and formation_people is not None
-        and int(formation_people)
-        >= config.minimum_formation_anchor_person_count
-        and upper_body_people is not None
-        and int(upper_body_people) >= 1
+    if item.get("shot_class") not in _WIDE or formation_people is None:
+        return False
+    count = int(formation_people)
+    if count < config.minimum_formation_anchor_person_count:
+        return False
+    strong_multi_person_evidence = (
+        count >= config.strong_formation_anchor_person_count
     )
+    pose_backed_evidence = bool(
+        upper_body_people is not None and int(upper_body_people) >= 1
+    )
+    return strong_multi_person_evidence or pose_backed_evidence
 
 
 def _exact_stage_edit_anchor_metrics(
@@ -1493,8 +1506,9 @@ def review_rendered_montage_grammar(
         "rendered_closeup_proxy": closeup_proxy,
         "policy": {
             "formation_wide": (
-                "identity_free_nonzero_formation_person_and_upper_body_"
-                "evidence_for_anchor_and_reset_never_full_group_proof"
+                "identity_free_weak_person_plus_upper_body_or_strong_four_"
+                "person_box_evidence_for_anchor_and_reset_never_full_group_"
+                "proof"
             ),
             "highlight": (
                 "reference_close_wide_transition_exact_section_and_phrase_"
