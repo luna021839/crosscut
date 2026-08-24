@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -124,6 +124,22 @@ def _manifest_maps(
         feature[song] = Path(record["feature_manifest"]["path"])
         dynamic[song] = Path(record["dynamic_crop_manifest"]["path"])
     return materialization, feature, dynamic
+
+
+def _fake_provenance_verification(
+    *,
+    manifest_count: int = 3,
+    artifact_count: int = 599,
+    verified_path_count: int = 71,
+    verified_byte_count: int = 5_840_598_622,
+) -> launcher.DynamicCropV3ProvenanceVerificationEvidence:
+    return launcher.DynamicCropV3ProvenanceVerificationEvidence(
+        manifest_count=manifest_count,
+        artifact_count=artifact_count,
+        verified_path_count=verified_path_count,
+        verified_byte_count=verified_byte_count,
+        verified_path_records_sha256="f" * 64,
+    )
 
 
 def _smoke_path(root: Path, suffix: str = "e") -> Path:
@@ -420,6 +436,7 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
             candidate = launcher.default_dynamic_crop_v3_capacity_candidates()[0]
             payload = _smoke_payload(candidate)
             plan, _smoke = _create_plan(root, bundle, smoke_payload=payload)
+            provenance_verification = _fake_provenance_verification()
             with (
                 patch.object(
                     launcher,
@@ -428,6 +445,11 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
                 ),
                 patch.object(launcher, "_capture_source_provenance", return_value=_fake_source()),
                 patch.object(launcher, "_validate_manifest_set", return_value=bundle),
+                patch.object(
+                    launcher,
+                    "_verify_dynamic_crop_provenance_inputs",
+                    return_value=provenance_verification,
+                ),
                 patch.object(
                     launcher.v2_launcher.legacy,
                     "_validate_storage",
@@ -444,6 +466,185 @@ class DynamicCropV3CapacityFoldLauncherTests(unittest.TestCase):
             ]))
             self.assertFalse(preflight.to_dict()["capacity_selection_authorized"])
             self.assertEqual(2, len(preflight.training_song_ids))
+            self.assertEqual(
+                provenance_verification.to_dict(),
+                preflight.to_dict()["dynamic_crop_provenance_verification"],
+            )
+            self.assertFalse(
+                replace(
+                    preflight, dynamic_crop_provenance_verification=None
+                ).to_dict()["training_authorized"]
+            )
+
+    def test_provenance_audit_hashes_shared_inputs_once_and_reports_counts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            bundle = _fake_manifest_set(root)
+            input_specs = {
+                "attribution": ("file_sha256", b"attribution"),
+                "evidence": ("file_sha256", b"evidence"),
+                "reference_media": ("media_sha256", b"reference media"),
+                "source_media": ("media_sha256", b"source media"),
+            }
+            provenance: dict[str, object] = {}
+            input_paths: dict[str, Path] = {}
+            expected_bytes = 0
+            for name, (digest_name, content) in input_specs.items():
+                path = root / f"{name}.bin"
+                path.write_bytes(content)
+                input_paths[name] = path.resolve()
+                expected_bytes += len(content)
+                provenance[name] = {
+                    "path": str(path.resolve()),
+                    digest_name: hashlib.sha256(content).hexdigest(),
+                }
+
+            dynamic_paths: dict[str, Path] = {}
+            payloads_by_artifact: dict[Path, SimpleNamespace] = {}
+            for song_index, song_id in enumerate(launcher.SELECTION_SONG_IDS):
+                records: list[dict[str, object]] = []
+                for artifact_index in range(2):
+                    artifact_path = root / (
+                        f"dynamic-{song_index}-{artifact_index}.json"
+                    )
+                    artifact_path.write_text(
+                        json.dumps({"fixture": [song_index, artifact_index]}),
+                        encoding="utf-8",
+                    )
+                    content_sha256 = hashlib.sha256(
+                        f"content-{song_index}-{artifact_index}".encode()
+                    ).hexdigest()
+                    payloads_by_artifact[artifact_path.resolve()] = SimpleNamespace(
+                        payload={
+                            "provenance": {
+                                **provenance,
+                                "artifact_content_sha256": content_sha256,
+                            }
+                        }
+                    )
+                    records.append(
+                        {
+                            "reference_id": f"reference-{song_index}",
+                            "shot_index": artifact_index,
+                            "artifact": {
+                                "path": str(artifact_path.resolve()),
+                                "file_sha256": hashlib.sha256(
+                                    artifact_path.read_bytes()
+                                ).hexdigest(),
+                                "content_sha256": content_sha256,
+                            },
+                        }
+                    )
+                dynamic_paths[song_id] = _write_json(
+                    root / f"audit-dynamic-{song_index}.json",
+                    {"artifacts": records},
+                )
+            bundle = replace(
+                bundle,
+                dynamic_manifest_paths_by_song=MappingProxyType(dynamic_paths),
+            )
+
+            def load_fixture(path: Path, *, verify_input_files: bool) -> object:
+                self.assertFalse(verify_input_files)
+                return payloads_by_artifact[Path(path).resolve()]
+
+            def hash_fixture(path: Path) -> str:
+                return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+            with (
+                patch.object(
+                    launcher,
+                    "load_reference_dynamic_crop_supervision",
+                    side_effect=load_fixture,
+                ),
+                patch(
+                    "crosscut.dynamic_crop_input_verification._stable_file_sha256",
+                    wraps=hash_fixture,
+                ) as hash_input,
+            ):
+                evidence = launcher._verify_dynamic_crop_provenance_inputs(bundle)
+
+            self.assertEqual(4, hash_input.call_count)
+            self.assertEqual(3, evidence.manifest_count)
+            self.assertEqual(6, evidence.artifact_count)
+            self.assertEqual(4, evidence.verified_path_count)
+            self.assertEqual(expected_bytes, evidence.verified_byte_count)
+            self.assertEqual(
+                launcher.V3_CAPACITY_PREFLIGHT_INPUT_VERIFICATION_CONTRACT,
+                evidence.to_dict()["contract"],
+            )
+            self.assertTrue(
+                evidence.to_dict()["all_artifact_provenance_inputs_verified"]
+            )
+
+            drifted_source = input_paths["source_media"]
+            drifted_source.write_bytes(b"drifted source media")
+            observed_drift_sha256 = hashlib.sha256(
+                drifted_source.read_bytes()
+            ).hexdigest()
+            with (
+                patch.object(
+                    launcher,
+                    "load_reference_dynamic_crop_supervision",
+                    side_effect=load_fixture,
+                ),
+                self.assertRaises(
+                    launcher.DynamicCropV3CapacityFoldLauncherError
+                ) as raised,
+            ):
+                launcher._verify_dynamic_crop_provenance_inputs(bundle)
+            message = str(raised.exception)
+            self.assertIn("name=source_media", message)
+            self.assertIn(f"path={drifted_source}", message)
+            self.assertIn(
+                f"expected_sha256={provenance['source_media']['media_sha256']}",
+                message,
+            )
+            self.assertIn(
+                f"observed_sha256={observed_drift_sha256}", message
+            )
+
+    def test_preflight_rejects_provenance_drift_before_storage_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            bundle = _fake_manifest_set(root)
+            candidate = launcher.default_dynamic_crop_v3_capacity_candidates()[0]
+            payload = _smoke_payload(candidate)
+            plan, _smoke = _create_plan(root, bundle, smoke_payload=payload)
+            with (
+                patch.object(
+                    launcher,
+                    "load_dynamic_crop_v3_capacity_smoke",
+                    return_value=payload,
+                ),
+                patch.object(
+                    launcher, "_capture_source_provenance", return_value=_fake_source()
+                ),
+                patch.object(launcher, "_validate_manifest_set", return_value=bundle),
+                patch.object(
+                    launcher,
+                    "_verify_dynamic_crop_provenance_inputs",
+                    side_effect=launcher.DynamicCropV3CapacityFoldLauncherError(
+                        "source_media drift"
+                    ),
+                ),
+                patch.object(
+                    launcher.v2_launcher.legacy,
+                    "_validate_storage",
+                ) as validate_storage,
+            ):
+                with self.assertRaisesRegex(
+                    launcher.DynamicCropV3CapacityFoldLauncherError,
+                    "source_media drift",
+                ):
+                    launcher.preflight_dynamic_crop_v3_capacity_fold(
+                        plan,
+                        candidate_selector=candidate.candidate_name,
+                        held_out_song_id=launcher.SELECTION_SONG_IDS[-1],
+                    )
+            validate_storage.assert_not_called()
 
     def test_rehashed_plan_cannot_add_activation_authority(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

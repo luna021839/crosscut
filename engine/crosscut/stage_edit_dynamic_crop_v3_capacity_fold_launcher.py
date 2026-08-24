@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import stage_edit_dynamic_crop_capacity_fold_launcher as v2_launcher
+from .dynamic_crop_input_verification import verify_dynamic_crop_input_files
+from .reference_dynamic_crop_supervision import (
+    load_reference_dynamic_crop_supervision,
+)
 from .stage_edit_dynamic_crop_capacity_probe import (
     SELECTION_SONG_IDS,
     _atomic_exclusive_write,
@@ -86,6 +90,9 @@ V3_CAPACITY_FOLD_EVIDENCE_CONTRACT = (
 V3_CAPACITY_SMOKE_ADMISSION_CONTRACT = (
     "clean_release_trusted_content_addressed_runtime_and_capacity_pass_v1"
 )
+V3_CAPACITY_PREFLIGHT_INPUT_VERIFICATION_CONTRACT = (
+    "all_artifact_provenance_inputs_shared_sha256_cache_v1"
+)
 TRAIN_MODULE = "crosscut.stage_edit_production_train_cli"
 PRODUCTION_VOLUME_ROOT = Path("/Volumes/CrossCutMedia")
 
@@ -115,6 +122,7 @@ V3_SOURCE_RELATIVE_PATHS = (
     "engine/crosscut/stage_edit_feature_materializer.py",
     "engine/crosscut/reference_dynamic_crop_job.py",
     "engine/crosscut/reference_dynamic_crop_supervision.py",
+    "engine/crosscut/dynamic_crop_input_verification.py",
 )
 
 
@@ -156,6 +164,37 @@ class _AdmittedCapacitySmoke:
 
 
 @dataclass(frozen=True, slots=True)
+class DynamicCropV3ProvenanceVerificationEvidence:
+    manifest_count: int
+    artifact_count: int
+    verified_path_count: int
+    verified_byte_count: int
+    verified_path_records_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.manifest_count != len(SELECTION_SONG_IDS):
+            raise ValueError("provenance evidence must cover all three manifests")
+        if self.artifact_count < 1 or self.verified_path_count < 1:
+            raise ValueError("provenance evidence counts must be positive")
+        if self.verified_byte_count < 1:
+            raise ValueError("provenance evidence byte count must be positive")
+        if not _is_sha256(self.verified_path_records_sha256):
+            raise ValueError("provenance evidence path-record hash is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": V3_CAPACITY_PREFLIGHT_INPUT_VERIFICATION_CONTRACT,
+            "hash_algorithm": "sha256",
+            "manifest_count": self.manifest_count,
+            "artifact_count": self.artifact_count,
+            "verified_path_count": self.verified_path_count,
+            "verified_byte_count": self.verified_byte_count,
+            "verified_path_records_sha256": self.verified_path_records_sha256,
+            "all_artifact_provenance_inputs_verified": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class DynamicCropV3CapacityFoldPreflight:
     plan_path: Path
     plan_content_sha256: str
@@ -171,6 +210,9 @@ class DynamicCropV3CapacityFoldPreflight:
     train_cli_args: tuple[str, ...]
     command_argv: tuple[str, ...]
     free_bytes: int
+    dynamic_crop_provenance_verification: (
+        DynamicCropV3ProvenanceVerificationEvidence | None
+    ) = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,8 +237,15 @@ class DynamicCropV3CapacityFoldPreflight:
             "train_cli_args": list(self.train_cli_args),
             "command_argv": list(self.command_argv),
             "free_bytes": self.free_bytes,
+            "dynamic_crop_provenance_verification": (
+                self.dynamic_crop_provenance_verification.to_dict()
+                if self.dynamic_crop_provenance_verification is not None
+                else None
+            ),
             "dynamic_crop_version": 3,
-            "training_authorized": True,
+            "training_authorized": (
+                self.dynamic_crop_provenance_verification is not None
+            ),
             "fold_selection_authorized": False,
             "capacity_selection_authorized": False,
             "production_activation_authorized": False,
@@ -253,6 +302,158 @@ def _validate_manifest_set(**kwargs: Any) -> _ValidatedManifestSet:
         return v2_launcher._validate_manifest_set(**kwargs)
     except (OSError, ValueError) as exc:
         raise DynamicCropV3CapacityFoldLauncherError(str(exc)) from exc
+
+
+def _verify_dynamic_crop_provenance_inputs(
+    manifests: _ValidatedManifestSet,
+) -> DynamicCropV3ProvenanceVerificationEvidence:
+    """Hash every immutable crop input once before training is authorized."""
+
+    dynamic_manifests = dict(manifests.dynamic_manifest_paths_by_song)
+    if set(dynamic_manifests) != set(SELECTION_SONG_IDS):
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 provenance verification requires all three dynamic manifests"
+        )
+
+    verified_sha256_cache: dict[str, str] = {}
+    verified_identity_cache: dict[str, tuple[int, int, int, int, int]] = {}
+    seen_artifact_paths: set[Path] = set()
+    artifact_count = 0
+    for song_id in SELECTION_SONG_IDS:
+        manifest_path = dynamic_manifests[song_id]
+        try:
+            manifest = _mapping(
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+                f"{song_id} dynamic crop manifest",
+            )
+            records = _array(
+                manifest.get("artifacts"), f"{song_id} dynamic crop artifacts"
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise DynamicCropV3CapacityFoldLauncherError(
+                f"{song_id} dynamic crop provenance manifest is invalid: {exc}"
+            ) from exc
+
+        for index, raw_record in enumerate(records):
+            reference_id = "unknown-reference"
+            artifact_path: Path | None = None
+            try:
+                record = _mapping(
+                    raw_record, f"{song_id} dynamic crop artifact {index}"
+                )
+                reference_id = str(record.get("reference_id") or "").strip()
+                if not reference_id:
+                    raise ValueError("dynamic crop artifact reference id is blank")
+                artifact = _mapping(
+                    record.get("artifact"),
+                    f"{song_id}:{reference_id} dynamic crop artifact pointer",
+                )
+                artifact_path = v2_launcher._regular_safe_path(
+                    str(artifact.get("path") or ""),
+                    f"{song_id}:{reference_id} dynamic crop artifact",
+                )
+                if artifact_path in seen_artifact_paths:
+                    raise ValueError(
+                        f"duplicate dynamic crop artifact input: {artifact_path}"
+                    )
+                expected_file_sha256 = artifact.get("file_sha256")
+                expected_content_sha256 = artifact.get("content_sha256")
+                if not _is_sha256(expected_file_sha256) or not _is_sha256(
+                    expected_content_sha256
+                ):
+                    raise ValueError("dynamic crop artifact hashes are invalid")
+                observed_file_sha256 = v2_launcher._stable_file_sha256(
+                    artifact_path,
+                    f"{song_id}:{reference_id} dynamic crop artifact",
+                )
+                if observed_file_sha256 != expected_file_sha256:
+                    raise ValueError(
+                        "dynamic crop artifact file hash mismatch "
+                        f"path={artifact_path} "
+                        f"expected_sha256={expected_file_sha256} "
+                        f"observed_sha256={observed_file_sha256}"
+                    )
+                restored = load_reference_dynamic_crop_supervision(
+                    artifact_path,
+                    verify_input_files=False,
+                )
+                observed_content_sha256 = restored.payload["provenance"].get(
+                    "artifact_content_sha256"
+                )
+                if observed_content_sha256 != expected_content_sha256:
+                    raise ValueError(
+                        "dynamic crop artifact content hash mismatch "
+                        f"path={artifact_path} "
+                        f"expected_sha256={expected_content_sha256} "
+                        f"observed_sha256={observed_content_sha256}"
+                    )
+                verify_dynamic_crop_input_files(
+                    restored.payload,
+                    verified_sha256_cache=verified_sha256_cache,
+                    verified_identity_cache=verified_identity_cache,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                path_label = str(artifact_path) if artifact_path else "unresolved"
+                raise DynamicCropV3CapacityFoldLauncherError(
+                    "v3 dynamic crop provenance verification failed "
+                    f"song={song_id} reference={reference_id} "
+                    f"artifact_index={index} artifact_path={path_label}: {exc}"
+                ) from exc
+            assert artifact_path is not None
+            seen_artifact_paths.add(artifact_path)
+            artifact_count += 1
+
+    if artifact_count < 1 or not verified_sha256_cache:
+        raise DynamicCropV3CapacityFoldLauncherError(
+            "v3 dynamic crop provenance verification found no artifact inputs"
+        )
+
+    path_records: list[dict[str, Any]] = []
+    verified_byte_count = 0
+    for raw_path, observed_sha256 in sorted(verified_sha256_cache.items()):
+        path = Path(raw_path)
+        identity = verified_identity_cache.get(raw_path)
+        if identity is None:
+            raise DynamicCropV3CapacityFoldLauncherError(
+                f"verified v3 dynamic crop input identity is missing: {path}"
+            )
+        try:
+            observed = path.stat()
+        except OSError as exc:
+            raise DynamicCropV3CapacityFoldLauncherError(
+                f"verified v3 dynamic crop input became unavailable: {path}: {exc}"
+            ) from exc
+        current_identity = (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+        if current_identity != identity:
+            raise DynamicCropV3CapacityFoldLauncherError(
+                f"verified v3 dynamic crop input changed before audit completed: {path}"
+            )
+        device, inode, byte_count, mtime_ns, ctime_ns = identity
+        verified_byte_count += byte_count
+        path_records.append(
+            {
+                "path": raw_path,
+                "device": device,
+                "inode": inode,
+                "byte_count": byte_count,
+                "mtime_ns": mtime_ns,
+                "ctime_ns": ctime_ns,
+                "sha256": observed_sha256,
+            }
+        )
+    return DynamicCropV3ProvenanceVerificationEvidence(
+        manifest_count=len(dynamic_manifests),
+        artifact_count=artifact_count,
+        verified_path_count=len(path_records),
+        verified_byte_count=verified_byte_count,
+        verified_path_records_sha256=_canonical_sha256(path_records),
+    )
 
 
 def _capture_source_provenance(
@@ -1053,6 +1254,7 @@ def preflight_dynamic_crop_v3_capacity_fold(
             f"refusing to overwrite v3 checkpoint directory: {checkpoint}"
         )
     _require_same_source_provenance(source)
+    provenance_verification = _verify_dynamic_crop_provenance_inputs(manifests)
     try:
         free_bytes = v2_launcher.legacy._validate_storage(checkpoint)
     except (OSError, ValueError) as exc:
@@ -1080,6 +1282,7 @@ def preflight_dynamic_crop_v3_capacity_fold(
         train_cli_args=replayed_args[(candidate.candidate_id, held_out_song_id)],
         command_argv=tuple(run["command_argv"]),
         free_bytes=free_bytes,
+        dynamic_crop_provenance_verification=provenance_verification,
     )
 
 
@@ -2406,11 +2609,13 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "DynamicCropV3CapacityFoldLauncherError",
     "DynamicCropV3CapacityFoldPreflight",
+    "DynamicCropV3ProvenanceVerificationEvidence",
     "V3_CAPACITY_FOLD_CONTRACT",
     "V3_CAPACITY_FOLD_EVIDENCE_ANALYSIS_BASIS",
     "V3_CAPACITY_FOLD_EVIDENCE_PREFIX",
     "V3_CAPACITY_FOLD_PLAN_ANALYSIS_BASIS",
     "V3_CAPACITY_FOLD_PLAN_PREFIX",
+    "V3_CAPACITY_PREFLIGHT_INPUT_VERIFICATION_CONTRACT",
     "V3_SOURCE_RELATIVE_PATHS",
     "create_dynamic_crop_v3_capacity_fold_plan",
     "launch_dynamic_crop_v3_capacity_fold",

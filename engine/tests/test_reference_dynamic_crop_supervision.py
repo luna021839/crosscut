@@ -616,6 +616,7 @@ class ReferenceDynamicCropSupervisionTests(unittest.TestCase):
             )
             artifact.write(destination)
             digest_cache: dict[str, str] = {}
+            identity_cache: dict[str, tuple[int, int, int, int, int]] = {}
 
             loaded = load_reference_dynamic_crop_supervision(
                 destination,
@@ -628,14 +629,61 @@ class ReferenceDynamicCropSupervisionTests(unittest.TestCase):
                 verify_dynamic_crop_input_files(
                     loaded.payload,
                     verified_sha256_cache=digest_cache,
+                    verified_identity_cache=identity_cache,
                 )
                 verify_dynamic_crop_input_files(
                     loaded.payload,
                     verified_sha256_cache=digest_cache,
+                    verified_identity_cache=identity_cache,
                 )
 
             self.assertEqual(4, hash_file.call_count)
             self.assertEqual(4, len(digest_cache))
+            self.assertEqual(4, len(identity_cache))
+
+            source.write_bytes(b"x" * source.stat().st_size)
+            with self.assertRaisesRegex(ValueError, "identity changed after hashing"):
+                verify_dynamic_crop_input_files(
+                    loaded.payload,
+                    verified_sha256_cache=digest_cache,
+                    verified_identity_cache=identity_cache,
+                )
+
+    def test_input_drift_error_identifies_path_and_both_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "changed-source.mp4"
+            path.write_bytes(b"current source bytes")
+            observed = _sha256(path)
+            expected = hashlib.sha256(b"original source bytes").hexdigest()
+            payload = {
+                "provenance": {
+                    "attribution": {
+                        "path": str(path.resolve()),
+                        "file_sha256": observed,
+                    },
+                    "evidence": {
+                        "path": str(path.resolve()),
+                        "file_sha256": observed,
+                    },
+                    "reference_media": {
+                        "path": str(path.resolve()),
+                        "media_sha256": observed,
+                    },
+                    "source_media": {
+                        "path": str(path.resolve()),
+                        "media_sha256": expected,
+                    },
+                }
+            }
+
+            with self.assertRaises(ValueError) as raised:
+                verify_dynamic_crop_input_files(payload)
+
+            message = str(raised.exception)
+            self.assertIn("name=source_media", message)
+            self.assertIn(f"path={path.resolve()}", message)
+            self.assertIn(f"expected_sha256={expected}", message)
+            self.assertIn(f"observed_sha256={observed}", message)
 
     def test_interpolation_safety_rejects_individually_safe_endpoints(self) -> None:
         left = {
