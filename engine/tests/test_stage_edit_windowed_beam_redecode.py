@@ -356,6 +356,9 @@ def _typed_bridge_result(
                     if preflight.source_pair_scorer_fingerprint is not None
                     else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
                 ),
+                "temporal_pose_sidecar": (
+                    preflight.snapshot.temporal_pose_sidecar_audit()
+                ),
             },
         )
 

@@ -15,7 +15,7 @@ DEFAULT_AUTOMATIC_SOURCE_COUNT = 10
 MINIMUM_AUTOMATIC_SOURCE_COUNT = 8
 MAXIMUM_AUTOMATIC_SOURCE_COUNT = 24
 AUTOMATIC_MEMBER_SOURCE_COUNT = 10
-MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT = 8
+MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT = 4
 MAXIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT = AUTOMATIC_MEMBER_SOURCE_COUNT
 
 
@@ -117,7 +117,8 @@ class AnalysisRequest:
         The default group request is a ten-source target with an eight-source
         quality floor. Explicit group counts, including eight and every count
         above ten, remain exact user requirements. Automatic member mode keeps
-        its separate eight-to-ten contract.
+        a ten-source acquisition target while permitting a four-source
+        materialized floor for short promotion runs.
         """
 
         if self.edit_mode is EditMode.MEMBER:
@@ -336,16 +337,11 @@ class AnalysisRequest:
         if (
             self.source_mode is SourceMode.AUTOMATIC
             and self.edit_mode is EditMode.MEMBER
-            and not (
-                MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
-                <= self.desired_source_count
-                <= MAXIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
-            )
+            and self.desired_source_count != AUTOMATIC_MEMBER_SOURCE_COUNT
         ):
             raise ValueError(
-                "automatic member cross-edit mode requires between "
-                f"{MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT} and "
-                f"{MAXIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT} sources"
+                "automatic member cross-edit mode keeps an exact target of "
+                f"{AUTOMATIC_MEMBER_SOURCE_COUNT} sources"
             )
         if (
             self.source_mode is SourceMode.AUTOMATIC
@@ -408,17 +404,20 @@ class AnalysisRequest:
             raise ValueError("desired_source_count must be an integer")
         desired_source_count = raw_desired_count
         if source_mode is SourceMode.AUTOMATIC:
-            minimum_count = (
-                MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
-                if mode is EditMode.MEMBER
-                else MINIMUM_AUTOMATIC_SOURCE_COUNT
-            )
-            maximum_count = (
-                MAXIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
-                if mode is EditMode.MEMBER
-                else MAXIMUM_AUTOMATIC_SOURCE_COUNT
-            )
-            if not minimum_count <= desired_source_count <= maximum_count:
+            minimum_count = MINIMUM_AUTOMATIC_SOURCE_COUNT
+            maximum_count = MAXIMUM_AUTOMATIC_SOURCE_COUNT
+            if (
+                mode is EditMode.MEMBER
+                and desired_source_count != AUTOMATIC_MEMBER_SOURCE_COUNT
+            ):
+                raise ValueError(
+                    "automatic member desired_source_count must remain "
+                    f"{AUTOMATIC_MEMBER_SOURCE_COUNT}"
+                )
+            if (
+                mode is EditMode.GROUP
+                and not minimum_count <= desired_source_count <= maximum_count
+            ):
                 raise ValueError(
                     "automatic desired_source_count must be between "
                     f"{minimum_count} and {maximum_count}"

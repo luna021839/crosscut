@@ -1,23 +1,28 @@
 """Independent post-render QA for one completed automatic GROUP artifact set.
 
-The pipeline deliberately does not import this module.  It consumes only the
-finished timestamp-bound analysis, render-plan, candidate-selection, and MP4
-artifacts, then performs read-only probing/decoding and JSON-only professional
-edit diagnostics.  The resulting report can be written atomically by callers.
+The evaluator consumes only the finished timestamp-bound analysis,
+render-plan, candidate-selection, and MP4 artifacts.  It performs read-only
+probing/decoding and JSON-only professional edit diagnostics; the pipeline can
+invoke it as the final delivery gate and atomically persist its report.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
@@ -28,6 +33,10 @@ from .cut_local_sync import (
 from .post_render_perceptual_quality import (
     PerceptualQualityConfig,
     evaluate_post_render_perceptual_quality,
+)
+from .ive_product_quality_floor import (
+    automatic_ive_group_product_floor_required,
+    evaluate_ive_product_quality_floor,
 )
 from .professional_montage_grammar import (
     PROFILE_ANALYSIS_BASIS as MONTAGE_PROFILE_ANALYSIS_BASIS,
@@ -42,10 +51,18 @@ from .stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
     StageEditTransitionAuthority,
 )
+from .stage_edit_windowed_beam_redecode import (
+    STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+)
 
 
-SCHEMA_VERSION = 1
-ANALYSIS_BASIS = "timestamp_bound_full_decode_professional_post_render_qa_v1"
+SCHEMA_VERSION = 2
+ANALYSIS_BASIS = (
+    "content_bound_full_decode_professional_post_render_qa_v2"
+)
+INPUT_ARTIFACT_FINGERPRINT_CONTRACT = (
+    "post_render_qa_input_artifact_content_sha256_v1"
+)
 
 _ANALYSIS_SUFFIX = "-analysis.json"
 _PLAN_SUFFIX = "-render-plan.json"
@@ -84,6 +101,13 @@ _MONTAGE_PROFILE_IDENTITY_KEYS = frozenset(
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and _SHA256_PATTERN.fullmatch(value) is not None
+    )
+
+
 class PostRenderQAVerdict(str, Enum):
     PASS = "PASS"
     CONDITIONAL = "CONDITIONAL"
@@ -101,6 +125,7 @@ class PostRenderQAConfig:
     minimum_source_switches_per_minute_hard: float = 12.5
     preferred_minimum_source_switches_per_minute: float = 13.5
     preferred_maximum_source_switches_per_minute: float = 17.5
+    automatic_ive_preferred_maximum_source_switches_per_minute: float = 30.0
     preferred_minimum_source_switch_ratio: float = 0.34
     preferred_maximum_source_switch_ratio: float = 0.64
     maximum_visual_shot_median_seconds: float = 2.2
@@ -161,6 +186,13 @@ class PostRenderQAConfig:
             <= self.preferred_maximum_source_switches_per_minute
         ):
             raise ValueError("source-switch density thresholds are invalid")
+        if (
+            self.automatic_ive_preferred_maximum_source_switches_per_minute
+            < self.preferred_minimum_source_switches_per_minute
+        ):
+            raise ValueError(
+                "automatic IVE source-switch maximum cannot be below preferred minimum"
+            )
         if not (
             0.0
             <= self.preferred_minimum_source_switch_ratio
@@ -273,6 +305,53 @@ class PostRenderArtifactSet:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class PostRenderQAEvaluationSnapshot:
+    """Private, same-filesystem read authority for one QA evaluation.
+
+    The snapshot uses independent inodes. On APFS the video is normally a
+    clonefile copy-on-write clone; filesystems without clone support fall back
+    to a byte copy. Canonical output paths may therefore undergo A->B->A
+    replacement without changing what the evaluator reads or what a passing
+    delivery later materializes.
+    """
+
+    declared_artifact_set: PostRenderArtifactSet
+    artifact_set: PostRenderArtifactSet
+    directory: Path
+    creation_methods: Mapping[str, str]
+    declared_input_fingerprints: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "post_render_qa_private_read_authority_snapshot_v1",
+            "directory": str(self.directory.resolve()),
+            "retention": "ephemeral_removed_before_delivery_manifest_commit",
+            "creation_methods": dict(self.creation_methods),
+            "declared_input_fingerprints": dict(
+                self.declared_input_fingerprints
+            ),
+            "threat_model": {
+                "blocks": [
+                    "declared_path_aba_between_initial_hash_and_evaluator_open",
+                    "declared_path_replacement_between_qa_and_delivery_manifest",
+                    "preexisting_writer_fd_to_declared_input_inode",
+                ],
+                "snapshot_inode_independent_from_declared_input": True,
+                "large_video_copy_policy": (
+                    "macos_clonefile_first_then_byte_copy_fallback"
+                ),
+                "same_uid_malicious_snapshot_discovery_fully_prevented": False,
+                "same_uid_limitation": (
+                    "a malicious same-UID process that discovers the private "
+                    "snapshot can chmod or replace it; path-bound hashes and "
+                    "atomic inode promotion detect ordinary mutation but do "
+                    "not claim a kernel security boundary"
+                ),
+            },
+        }
+
+
 def discover_completed_artifact_sets(
     output_directory: Path,
 ) -> tuple[PostRenderArtifactSet, ...]:
@@ -331,6 +410,7 @@ class PostRenderQAReport:
     metrics: Mapping[str, Any]
     issues: tuple[QAIssue, ...]
     policy: PostRenderQAConfig
+    input_artifact_fingerprints: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     analysis_basis: str = ANALYSIS_BASIS
 
@@ -344,6 +424,9 @@ class PostRenderQAReport:
             "analysis": self.analysis_basis,
             "created_at": self.created_at.astimezone(UTC).isoformat(),
             "artifact_set": self.artifact_set.to_dict(),
+            "input_artifact_fingerprints": dict(
+                self.input_artifact_fingerprints
+            ),
             "policy": self.policy.to_dict(),
             "verdict": self.verdict.value,
             "passed": self.passed,
@@ -458,6 +541,272 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"JSON artifact is not an object: {path.name}")
     return value
+
+
+def _file_content_fingerprint(path: Path) -> dict[str, Any]:
+    """Hash one stable regular file and reject links or path replacement.
+
+    Product promotion must bind the bytes opened by the evaluator to the
+    artifact path itself.  Following a final-component symlink, or merely
+    comparing the descriptor before/after reading, leaves the recorded path
+    replaceable independently of the bytes that were hashed.
+    """
+
+    source = Path(path)
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        path_before = source.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            raise ValueError(
+                f"required artifact is not a regular non-symlink file: "
+                f"{source.name}"
+            )
+        resolved_before = source.resolve(strict=True)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (path_before.st_dev, path_before.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError(
+                    f"artifact path changed before fingerprinting: "
+                    f"{source.name}"
+                )
+            if before.st_size <= 0:
+                raise ValueError(
+                    f"required artifact is missing or empty: {source.name}"
+                )
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                byte_count += len(chunk)
+            after = os.fstat(stream.fileno())
+            path_after = source.lstat()
+            resolved_after = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"could not fingerprint artifact {source.name}: {exc}"
+        ) from exc
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    path_before_identity = (
+        path_before.st_dev,
+        path_before.st_ino,
+        path_before.st_size,
+        path_before.st_mtime_ns,
+        path_before.st_ctime_ns,
+    )
+    path_after_identity = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or before_identity != after_identity
+        or path_before_identity != before_identity
+        or path_after_identity != after_identity
+        or resolved_before != resolved_after
+        or byte_count != after.st_size
+    ):
+        raise ValueError(
+            f"artifact changed while being fingerprinted: {source.name}"
+        )
+    return {
+        "path": str(resolved_after),
+        "size_bytes": byte_count,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def fingerprint_post_render_artifacts(
+    artifact_set: PostRenderArtifactSet,
+) -> dict[str, Any]:
+    """Return exact content identities for the four mandatory QA inputs."""
+
+    return {
+        "contract": INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
+        "analysis": _file_content_fingerprint(artifact_set.analysis_path),
+        "render_plan": _file_content_fingerprint(
+            artifact_set.render_plan_path
+        ),
+        "selection": _file_content_fingerprint(artifact_set.selection_path),
+        "video": _file_content_fingerprint(artifact_set.video_path),
+    }
+
+
+def normalize_post_render_artifact_fingerprints(
+    fingerprints: Mapping[str, Any],
+    declared_artifact_set: PostRenderArtifactSet,
+) -> dict[str, Any]:
+    """Bind snapshot content hashes to the externally declared artifact paths."""
+
+    declared_paths = {
+        "analysis": declared_artifact_set.analysis_path,
+        "render_plan": declared_artifact_set.render_plan_path,
+        "selection": declared_artifact_set.selection_path,
+        "video": declared_artifact_set.video_path,
+    }
+    if fingerprints.get("contract") != INPUT_ARTIFACT_FINGERPRINT_CONTRACT:
+        raise ValueError("post-render artifact fingerprints use the wrong contract")
+    normalized: dict[str, Any] = {
+        "contract": INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
+    }
+    for key, declared_path in declared_paths.items():
+        payload = fingerprints.get(key)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"post-render artifact fingerprint missing {key}")
+        size_bytes = payload.get("size_bytes")
+        sha256 = payload.get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes <= 0
+            or not _valid_sha256(sha256)
+        ):
+            raise ValueError(
+                f"post-render artifact fingerprint malformed for {key}"
+            )
+        normalized[key] = {
+            "path": str(declared_path.resolve()),
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+        }
+    return normalized
+
+
+def _clone_or_copy_snapshot_file(source: Path, destination: Path) -> str:
+    """Create an independent snapshot inode, preferring APFS clonefile."""
+
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"QA snapshot destination already exists: {destination}")
+    clone_succeeded = False
+    if sys.platform == "darwin" and Path("/bin/cp").is_file():
+        completed = subprocess.run(
+            ["/bin/cp", "-c", str(source.resolve()), str(destination)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        clone_succeeded = completed.returncode == 0
+        if not clone_succeeded:
+            destination.unlink(missing_ok=True)
+    if clone_succeeded:
+        method = "macos_clonefile_copy_on_write"
+    else:
+        try:
+            with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, length=8 * 1024 * 1024)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        method = "byte_copy_fallback"
+    destination.chmod(stat.S_IRUSR)
+    return method
+
+
+def materialize_post_render_qa_snapshot(
+    artifact_set: PostRenderArtifactSet,
+) -> PostRenderQAEvaluationSnapshot:
+    """Freeze four QA inputs in a private same-filesystem artifact set.
+
+    Content equality is checked after all independent snapshot inodes exist.
+    The evaluator must receive only the returned ``artifact_set``; the original
+    paths are declaration and eventual delivery destinations, not read
+    authority during QA.
+    """
+
+    declared_fingerprints = fingerprint_post_render_artifacts(artifact_set)
+    directory = Path(
+        tempfile.mkdtemp(
+            prefix=f".{artifact_set.base_name}-qa-snapshot-",
+            dir=artifact_set.output_directory,
+        )
+    )
+    frozen = PostRenderArtifactSet(
+        base_name=artifact_set.base_name,
+        timestamp=artifact_set.timestamp,
+        analysis_path=directory / artifact_set.analysis_path.name,
+        render_plan_path=directory / artifact_set.render_plan_path.name,
+        selection_path=directory / artifact_set.selection_path.name,
+        video_path=directory / artifact_set.video_path.name,
+    )
+    source_and_destination = (
+        ("analysis", artifact_set.analysis_path, frozen.analysis_path),
+        ("render_plan", artifact_set.render_plan_path, frozen.render_plan_path),
+        ("selection", artifact_set.selection_path, frozen.selection_path),
+        ("video", artifact_set.video_path, frozen.video_path),
+    )
+    methods: dict[str, str] = {}
+    try:
+        for key, source, destination in source_and_destination:
+            methods[key] = _clone_or_copy_snapshot_file(source, destination)
+        frozen_fingerprints = fingerprint_post_render_artifacts(frozen)
+        normalized_frozen = normalize_post_render_artifact_fingerprints(
+            frozen_fingerprints,
+            artifact_set,
+        )
+        if normalized_frozen != declared_fingerprints:
+            raise ValueError(
+                "QA read-authority snapshot does not match declared inputs"
+            )
+    except Exception:
+        for _key, _source, destination in source_and_destination:
+            destination.unlink(missing_ok=True)
+        directory.rmdir()
+        raise
+    return PostRenderQAEvaluationSnapshot(
+        declared_artifact_set=artifact_set,
+        artifact_set=frozen,
+        directory=directory,
+        creation_methods=methods,
+        declared_input_fingerprints=declared_fingerprints,
+    )
+
+
+def cleanup_post_render_qa_snapshot(
+    snapshot: PostRenderQAEvaluationSnapshot,
+) -> None:
+    """Remove only files created inside one private QA snapshot directory."""
+
+    directory = Path(snapshot.directory)
+    try:
+        directory_state = directory.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(directory_state.st_mode):
+        raise RuntimeError("QA snapshot cleanup target lost directory identity")
+    for child in tuple(directory.iterdir()):
+        state = child.lstat()
+        if stat.S_ISDIR(state.st_mode) and not stat.S_ISLNK(state.st_mode):
+            raise RuntimeError(
+                f"unexpected directory inside QA snapshot: {child.name}"
+            )
+        child.unlink()
+    directory.rmdir()
 
 
 def _reject_nonfinite_json(token: str) -> Any:
@@ -1290,7 +1639,11 @@ def _validate_selection(
         "selected_version": version,
         "selected_partial_reedit": version == "partial_reedit",
     }
-    if version not in {"original", "partial_reedit"}:
+    if version not in {
+        "original",
+        "partial_reedit",
+        "windowed_semimarkov_redecode",
+    }:
         collector.add(
             "selection_unknown_final_version",
             QAIssueSeverity.FAIL,
@@ -1402,6 +1755,224 @@ def _validate_selection(
                     value=partial_checks[name],
                     threshold=True,
                 )
+    windowed_checks: dict[str, Any] = {
+        "selected_windowed_semimarkov_redecode": (
+            version == "windowed_semimarkov_redecode"
+        ),
+    }
+    if version == "windowed_semimarkov_redecode":
+        repair_loop = _mapping(partial.get("repair_loop")) or {}
+        beam_audit = _mapping(partial.get("windowed_beam_redecode")) or {}
+        beam_calls = [
+            item
+            for raw in (_sequence(beam_audit.get("calls")) or [])
+            if (item := _mapping(raw)) is not None
+        ]
+        evidence = _mapping(partial.get("selected_redecode_evidence")) or {}
+        lineage = [
+            item
+            for raw in (_sequence(partial.get("candidate_lineage_after")) or [])
+            if (item := _mapping(raw)) is not None
+        ]
+        final_lineage_events = [
+            item
+            for item in lineage
+            if item.get("stage")
+            == "reviewer_issue_window_actual_semimarkov_redecode"
+        ]
+        final_lineage = (
+            final_lineage_events[0]
+            if len(final_lineage_events) == 1
+            else {}
+        )
+        proposal_markers = [
+            (index, item)
+            for index, item in enumerate(lineage)
+            if item.get("stage") == "windowed_semimarkov_proposal_lineage"
+        ]
+        iterations = [
+            item
+            for raw in (_sequence(repair_loop.get("iterations")) or [])
+            if (item := _mapping(raw)) is not None
+        ]
+        committed_iterations = [
+            item
+            for item in iterations
+            if isinstance(item.get("committed_proposal_id"), str)
+            and bool(item.get("committed_proposal_id"))
+            and _valid_sha256(item.get("committed_edit_sha256"))
+        ]
+        committed_count = _integer(repair_loop.get("committed_iteration_count"))
+        initial_sha = repair_loop.get("initial_edit_sha256")
+        final_sha = repair_loop.get("final_edit_sha256")
+        selected_original_review = (
+            _mapping(selected_entries[0].get("review"))
+            if len(selected_entries) == 1
+            else None
+        )
+        perceptual_required = (
+            evidence.get("perceptual_targeted_source_substitution_required")
+            is True
+        )
+        required_evidence_keys = {
+            "actual_semimarkov_redecode",
+            "new_proxy_review_available",
+            "new_proxy_passed",
+            "new_proxy_perceptual_source_admission_passed",
+            "source_sequence_changed_by_redecode",
+            "perceptual_targeted_source_substitution_required",
+            "perceptual_targeted_source_substitution_satisfied",
+            "proposal_materialization_lineage_preserved",
+            "final_authoritative_exact_shot_clock_count",
+        }
+        evidence_contract_valid = (
+            required_evidence_keys.issubset(evidence)
+            and evidence.get("actual_semimarkov_redecode") is True
+            and evidence.get("new_proxy_review_available") is True
+            and evidence.get("new_proxy_passed") is True
+            and type(evidence.get("source_sequence_changed_by_redecode")) is bool
+            and type(
+                evidence.get(
+                    "perceptual_targeted_source_substitution_required"
+                )
+            )
+            is bool
+            and type(
+                evidence.get(
+                    "perceptual_targeted_source_substitution_satisfied"
+                )
+            )
+            is bool
+            and evidence.get("proposal_materialization_lineage_preserved") is True
+            and evidence.get("final_authoritative_exact_shot_clock_count") == 1
+            and (
+                not perceptual_required
+                or (
+                    evidence.get("new_proxy_perceptual_source_admission_passed")
+                    is True
+                    and evidence.get(
+                        "perceptual_targeted_source_substitution_satisfied"
+                    )
+                    is True
+                )
+            )
+        )
+        proposal_lineage_contract_valid = False
+        if len(proposal_markers) == 1 and len(final_lineage_events) == 1:
+            marker_index, marker = proposal_markers[0]
+            proposal_count = _integer(marker.get("event_count"))
+            final_index = lineage.index(final_lineage_events[0])
+            proposal_lineage_contract_valid = (
+                proposal_count is not None
+                and proposal_count >= 0
+                and marker_index + proposal_count + 1 == final_index
+                and final_lineage.get(
+                    "proposal_materialization_lineage_event_count"
+                )
+                == proposal_count
+            )
+        lineage_contract_valid = (
+            len(final_lineage_events) == 1
+            and proposal_lineage_contract_valid
+            and final_lineage.get("contract") == STAGE_EDIT_WINDOWED_BEAM_CONTRACT
+            and final_lineage.get("repair_loop_input_sha256")
+            == repair_loop.get("input_sha256")
+            and final_lineage.get("initial_edit_sha256") == initial_sha
+            and final_lineage.get("final_edit_sha256") == final_sha
+            and final_lineage.get("committed_iteration_count") == committed_count
+            and final_lineage.get("actual_public_decoder_invoked") is True
+            and final_lineage.get("decoded_proxy_revalidated_after_splice") is True
+            and final_lineage.get(
+                "heuristic_timing_repair_used_as_reviewer_repair"
+            )
+            is False
+            and all(final_lineage.get(key) == value for key, value in evidence.items())
+        )
+        promotion = _mapping(selection.get("stage_edit_render_promotion"))
+        promotion_lineage_valid = (
+            promotion is not None
+            and promotion.get("selected_version") == version
+            and promotion.get("selected_candidate_index") == selected_index
+            and promotion.get("selected_candidate_lineage") == lineage
+        )
+        windowed_checks.update(
+            {
+                "analysis_basis": (
+                    partial.get("analysis_basis")
+                    == STAGE_EDIT_WINDOWED_BEAM_CONTRACT
+                ),
+                "attempted": partial.get("attempted") is True,
+                "actual_local_semimarkov_redecode": (
+                    partial.get("actual_local_semimarkov_redecode") is True
+                ),
+                "heuristic_repair_not_used": (
+                    partial.get("heuristic_timing_repair_used") is False
+                ),
+                "repair_changed": (
+                    partial.get("repair_loop_changed") is True
+                    and partial.get("changed") is True
+                    and _valid_sha256(initial_sha)
+                    and _valid_sha256(final_sha)
+                    and initial_sha != final_sha
+                ),
+                "repair_loop_contract": (
+                    repair_loop.get("orchestrator") == "stage_edit_repair_loop_v1"
+                    and _valid_sha256(repair_loop.get("input_sha256"))
+                    # The repair loop receives exactly `(base_edit,)`; this is
+                    # its local tuple domain, not the rendered-candidate index.
+                    and repair_loop.get("selected_candidate_index") == 0
+                    and committed_count is not None
+                    and committed_count > 0
+                    and committed_count == len(committed_iterations)
+                    and committed_iterations[-1].get("committed_edit_sha256")
+                    == final_sha
+                    and bool(_mapping(repair_loop.get("initial_review")))
+                    and bool(_mapping(repair_loop.get("final_review")))
+                ),
+                "beam_decoder_contract": (
+                    beam_audit.get("contract")
+                    == STAGE_EDIT_WINDOWED_BEAM_CONTRACT
+                    and beam_audit.get("actual_public_decoder")
+                    == (
+                        "crosscut.stage_edit_semimarkov_beam."
+                        "decode_stage_edit_semimarkov_beam"
+                    )
+                    and (_integer(beam_audit.get("call_count")) or 0) > 0
+                    and len(beam_calls)
+                    == _integer(beam_audit.get("call_count"))
+                    and all(
+                        call.get("contract")
+                        == STAGE_EDIT_WINDOWED_BEAM_CONTRACT
+                        and (_integer(call.get("iteration")) or 0) > 0
+                        for call in beam_calls
+                    )
+                ),
+                "decoded_final_review_contract": (
+                    selected_original_review is not None
+                    and partial.get("before_review") == selected_original_review
+                    and partial.get("after_review") == final_review
+                    and final_review.get("passed") is True
+                    and partial.get("reason")
+                    == "strict_objectives_improved_and_proxy_revalidated"
+                ),
+                "selected_redecode_evidence_contract": evidence_contract_valid,
+                "candidate_lineage_contract": lineage_contract_valid,
+                "promotion_lineage_contract": promotion_lineage_valid,
+            }
+        )
+        for name, passed in windowed_checks.items():
+            if name == "selected_windowed_semimarkov_redecode":
+                continue
+            if not passed:
+                collector.add(
+                    f"windowed_semimarkov_redecode_{name}",
+                    QAIssueSeverity.FAIL,
+                    "The selected windowed Semi-Markov re-decode lacks required "
+                    "changed-edit, revalidation, or lineage evidence.",
+                    path=f"selection.proxy_triggered_partial_reedit.{name}",
+                    value=passed,
+                    threshold=True,
+                )
     return (
         {
             "required_candidate_count": required,
@@ -1414,6 +1985,7 @@ def _validate_selection(
             "final_selected_version": version,
             "passing_candidate_count": selection.get("passing_candidate_count"),
             "partial_reedit": partial_checks,
+            "windowed_semimarkov_redecode": windowed_checks,
         },
         final_review,
     )
@@ -2048,6 +2620,12 @@ def _cadence_and_repetition_metrics(
         and total_duration > 0.0
         else None
     )
+    automatic_ive_product_scope = _automatic_ive_group_product_scope(analysis)
+    applied_preferred_maximum_switches_per_minute = (
+        config.automatic_ive_preferred_maximum_source_switches_per_minute
+        if automatic_ive_product_scope
+        else config.preferred_maximum_source_switches_per_minute
+    )
     if not (
         switches_per_minute is not None
         and serialized_switches_per_minute is not None
@@ -2082,7 +2660,7 @@ def _cadence_and_repetition_metrics(
     elif not (
         config.preferred_minimum_source_switches_per_minute
         <= switches_per_minute
-        <= config.preferred_maximum_source_switches_per_minute
+        <= applied_preferred_maximum_switches_per_minute
     ):
         collector.add(
             "source_switch_density_outside_professional_band",
@@ -2092,7 +2670,7 @@ def _cadence_and_repetition_metrics(
             value=switches_per_minute,
             threshold=[
                 config.preferred_minimum_source_switches_per_minute,
-                config.preferred_maximum_source_switches_per_minute,
+                applied_preferred_maximum_switches_per_minute,
             ],
         )
 
@@ -2478,6 +3056,13 @@ def _cadence_and_repetition_metrics(
             )
     return {
         "source_switches_per_minute": switches_per_minute,
+        "preferred_source_switches_per_minute_band": [
+            config.preferred_minimum_source_switches_per_minute,
+            applied_preferred_maximum_switches_per_minute,
+        ],
+        "automatic_ive_product_cadence_band_applied": (
+            automatic_ive_product_scope
+        ),
         "source_switch_rate": switch_ratio,
         "visual_shot_median_seconds": shot_median,
         "source_run_median_seconds": run_median,
@@ -3627,16 +4212,22 @@ def _selected_boundary_repair_contracts(
     """Resolve the same final standard/partial repair records used on screen."""
 
     standard = _mapping(analysis.get("visual_boundary_repairs")) or {}
-    selected_index = selection.get("selected_candidate_index")
-    for raw in _sequence(selection.get("complete_candidates")) or []:
-        candidate = _mapping(raw) or {}
-        candidate_repairs = _mapping(candidate.get("boundary_repairs"))
-        if (
-            candidate.get("candidate_index") == selected_index
-            and candidate_repairs is not None
-        ):
-            standard = candidate_repairs
-            break
+    selected_version = selection.get("final_selected_version")
+    # The complete-candidate payload is serialized before an accepted windowed
+    # re-decode.  Its repair offsets, pose evidence, and beat/phrase clock are
+    # therefore superseded.  The analysis payload is the final-bundle
+    # authority after that promotion.
+    if selected_version != "windowed_semimarkov_redecode":
+        selected_index = selection.get("selected_candidate_index")
+        for raw in _sequence(selection.get("complete_candidates")) or []:
+            candidate = _mapping(raw) or {}
+            candidate_repairs = _mapping(candidate.get("boundary_repairs"))
+            if (
+                candidate.get("candidate_index") == selected_index
+                and candidate_repairs is not None
+            ):
+                standard = candidate_repairs
+                break
 
     plans: list[Mapping[str, Any]] = [standard]
     by_index: dict[int, Mapping[str, Any]] = {}
@@ -3647,7 +4238,7 @@ def _selected_boundary_repair_contracts(
             by_index[index] = repair
 
     partial = _mapping(selection.get("proxy_triggered_partial_reedit")) or {}
-    if selection.get("final_selected_version") == "partial_reedit":
+    if selected_version == "partial_reedit":
         partial_plan = _mapping(partial.get("repair")) or {}
         plans.append(partial_plan)
         changed = {
@@ -3663,6 +4254,349 @@ def _selected_boundary_repair_contracts(
             if repair is not None and index is not None and index in changed:
                 by_index[index] = repair
     return (tuple(plans), tuple(by_index[index] for index in sorted(by_index)))
+
+
+_TEMPORAL_POSE_MOTION_MARKER = "temporal_pose_motion_audit_v1"
+_TEMPORAL_POSE_MOTION_THRESHOLD_KEYS = frozenset(
+    {
+        "minimum_boundary_motion_magnitude",
+        "minimum_endpoint_pose_cosine",
+        "minimum_velocity_direction_cosine",
+        "minimum_phase_compatibility",
+        "pose_norm_epsilon",
+    }
+)
+_TEMPORAL_POSE_MOTION_EVIDENCE_KEYS = frozenset(
+    {
+        "contract",
+        "calibration_status",
+        "analysis_executed",
+        "input_valid",
+        "qualifies",
+        "classification",
+        "failure_reasons",
+        "feature_dimension",
+        "outgoing_sample_count",
+        "incoming_sample_count",
+        "outgoing_boundary_motion_magnitude",
+        "incoming_boundary_motion_magnitude",
+        "endpoint_pose_cosine",
+        "velocity_direction_cosine",
+        "phase_compatibility",
+        "confidence",
+        "static_pose_match",
+        "dynamic_pose_phase_match",
+        "direction_evidence_available",
+        "dynamic_direction_match_proven",
+        "soft_preference_applied",
+        "threshold_values",
+        "threshold_identity_sha256",
+        "preference_weight",
+        "configuration_fingerprint_sha256",
+    }
+)
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_temporal_pose_motion_configuration(
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    raw = _mapping(plan.get("temporal_pose_motion_configuration"))
+    if raw is None:
+        return (None, ("temporal_pose_motion_configuration_missing",))
+    expected_keys = {
+        "contract",
+        "calibration_status",
+        "threshold_values",
+        "threshold_identity_sha256",
+        "preference_weight",
+        "configuration_fingerprint_sha256",
+    }
+    reasons: list[str] = []
+    if set(raw) != expected_keys:
+        reasons.append("configuration_keys_invalid")
+    if raw.get("contract") != "visual_boundary_temporal_pose_motion_preference_v1":
+        reasons.append("configuration_contract_invalid")
+    status = raw.get("calibration_status")
+    if status not in {"calibration_unbound", "calibration_bound"}:
+        reasons.append("calibration_status_invalid")
+    preference_weight = _number(raw.get("preference_weight"))
+    if preference_weight is None or preference_weight < 0.0:
+        reasons.append("preference_weight_invalid")
+    threshold_values = _mapping(raw.get("threshold_values"))
+    threshold_identity = raw.get("threshold_identity_sha256")
+    if status == "calibration_unbound":
+        if raw.get("threshold_values") is not None:
+            reasons.append("unbound_threshold_values_present")
+        if threshold_identity is not None:
+            reasons.append("unbound_threshold_identity_present")
+    elif status == "calibration_bound":
+        if (
+            threshold_values is None
+            or set(threshold_values) != _TEMPORAL_POSE_MOTION_THRESHOLD_KEYS
+        ):
+            reasons.append("bound_threshold_values_invalid")
+        else:
+            values = {
+                key: _number(threshold_values.get(key))
+                for key in _TEMPORAL_POSE_MOTION_THRESHOLD_KEYS
+            }
+            if any(value is None for value in values.values()):
+                reasons.append("bound_threshold_value_nonfinite")
+            else:
+                motion = values["minimum_boundary_motion_magnitude"]
+                endpoint = values["minimum_endpoint_pose_cosine"]
+                direction = values["minimum_velocity_direction_cosine"]
+                phase = values["minimum_phase_compatibility"]
+                epsilon = values["pose_norm_epsilon"]
+                if not (
+                    motion is not None
+                    and motion > 0.0
+                    and endpoint is not None
+                    and -1.0 <= endpoint <= 1.0
+                    and direction is not None
+                    and -1.0 <= direction <= 1.0
+                    and phase is not None
+                    and 0.0 <= phase <= 1.0
+                    and epsilon is not None
+                    and epsilon > 0.0
+                ):
+                    reasons.append("bound_threshold_value_range_invalid")
+        if (
+            not isinstance(threshold_identity, str)
+            or _SHA256_PATTERN.fullmatch(threshold_identity) is None
+        ):
+            reasons.append("bound_threshold_identity_invalid")
+        elif threshold_values is not None:
+            expected_identity = _canonical_sha256(
+                {
+                    "contract": "temporal_pose_motion_thresholds_v1",
+                    "values": threshold_values,
+                }
+            )
+            if threshold_identity != expected_identity:
+                reasons.append("bound_threshold_identity_mismatch")
+
+    fingerprint = raw.get("configuration_fingerprint_sha256")
+    if (
+        not isinstance(fingerprint, str)
+        or _SHA256_PATTERN.fullmatch(fingerprint) is None
+    ):
+        reasons.append("configuration_fingerprint_invalid")
+    elif preference_weight is not None:
+        expected_fingerprint = _canonical_sha256(
+            {
+                "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+                "threshold_identity_sha256": threshold_identity,
+                "preference_weight": preference_weight,
+            }
+        )
+        if fingerprint != expected_fingerprint:
+            reasons.append("configuration_fingerprint_mismatch")
+    return (raw, tuple(sorted(set(reasons))))
+
+
+def _validate_temporal_pose_motion_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    configurations_by_fingerprint: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    raw = _mapping(evidence.get("temporal_pose_motion"))
+    if raw is None:
+        return (None, ("temporal_pose_motion_evidence_missing",))
+    reasons: list[str] = []
+    if set(raw) != _TEMPORAL_POSE_MOTION_EVIDENCE_KEYS:
+        reasons.append("evidence_keys_invalid_or_nonscalar_payload_present")
+    if raw.get("contract") != "scalar_temporal_pose_motion_boundary_evidence_v1":
+        reasons.append("evidence_contract_invalid")
+
+    bool_fields = (
+        "analysis_executed",
+        "input_valid",
+        "qualifies",
+        "static_pose_match",
+        "dynamic_pose_phase_match",
+        "direction_evidence_available",
+        "dynamic_direction_match_proven",
+    )
+    if any(type(raw.get(name)) is not bool for name in bool_fields):
+        reasons.append("boolean_scalar_fields_invalid")
+    failure_reasons = _sequence(raw.get("failure_reasons"))
+    if failure_reasons is None or any(
+        not isinstance(value, str) or not value for value in failure_reasons
+    ):
+        reasons.append("failure_reasons_invalid")
+    for name in (
+        "feature_dimension",
+        "outgoing_sample_count",
+        "incoming_sample_count",
+    ):
+        value = raw.get(name)
+        if value is not None and (_integer(value) is None or int(value) < 0):
+            reasons.append(f"{name}_invalid")
+    confidence = _number(raw.get("confidence"))
+    if confidence is None or not 0.0 <= confidence <= 1.0:
+        reasons.append("confidence_invalid")
+    for name in (
+        "outgoing_boundary_motion_magnitude",
+        "incoming_boundary_motion_magnitude",
+        "endpoint_pose_cosine",
+        "velocity_direction_cosine",
+        "phase_compatibility",
+    ):
+        value = raw.get(name)
+        number = _number(value)
+        if value is not None and number is None:
+            reasons.append(f"{name}_nonscalar_or_nonfinite")
+        elif number is not None:
+            if "motion_magnitude" in name and number < 0.0:
+                reasons.append(f"{name}_negative")
+            if "cosine" in name and not -1.0 <= number <= 1.0:
+                reasons.append(f"{name}_unnormalized")
+            if name == "phase_compatibility" and not 0.0 <= number <= 1.0:
+                reasons.append("phase_compatibility_unnormalized")
+
+    fingerprint = raw.get("configuration_fingerprint_sha256")
+    configuration = (
+        configurations_by_fingerprint.get(fingerprint)
+        if isinstance(fingerprint, str)
+        else None
+    )
+    if configuration is None:
+        reasons.append("evidence_configuration_not_bound_to_plan")
+    else:
+        for evidence_key, configuration_key in (
+            ("calibration_status", "calibration_status"),
+            ("threshold_values", "threshold_values"),
+            ("threshold_identity_sha256", "threshold_identity_sha256"),
+            ("preference_weight", "preference_weight"),
+        ):
+            if raw.get(evidence_key) != configuration.get(configuration_key):
+                reasons.append(f"{evidence_key}_differs_from_plan")
+
+    status = raw.get("calibration_status")
+    classification = raw.get("classification")
+    soft_preference = _number(raw.get("soft_preference_applied"))
+    preference_weight = _number(raw.get("preference_weight"))
+    if soft_preference is None or soft_preference < 0.0:
+        reasons.append("soft_preference_invalid")
+    if status == "calibration_unbound":
+        if not (
+            raw.get("analysis_executed") is False
+            and raw.get("input_valid") is False
+            and raw.get("qualifies") is False
+            and classification == "calibration_unbound"
+            and raw.get("direction_evidence_available") is False
+            and raw.get("dynamic_direction_match_proven") is False
+            and raw.get("dynamic_pose_phase_match") is False
+            and raw.get("static_pose_match") is False
+            and raw.get("feature_dimension") is None
+            and raw.get("outgoing_sample_count") == 0
+            and raw.get("incoming_sample_count") == 0
+            and confidence == 0.0
+            and soft_preference == 0.0
+            and failure_reasons
+            == ["temporal_pose_motion_thresholds_unbound"]
+        ):
+            reasons.append("unbound_evidence_masquerades_as_direction_proof")
+        for name in (
+            "outgoing_boundary_motion_magnitude",
+            "incoming_boundary_motion_magnitude",
+            "endpoint_pose_cosine",
+            "velocity_direction_cosine",
+            "phase_compatibility",
+        ):
+            if raw.get(name) is not None:
+                reasons.append("unbound_evidence_contains_motion_scalar")
+                break
+    elif status == "calibration_bound":
+        if raw.get("analysis_executed") is not True:
+            reasons.append("bound_analysis_not_executed")
+        if classification not in {
+            "invalid",
+            "static_pose_match",
+            "dynamic_pose_phase_match",
+            "dynamic_pose_phase_mismatch",
+        }:
+            reasons.append("bound_classification_invalid")
+        qualifies = raw.get("qualifies") is True
+        if not (
+            (raw.get("dynamic_pose_phase_match") is True) == qualifies
+            and (raw.get("dynamic_direction_match_proven") is True) == qualifies
+            and (classification == "dynamic_pose_phase_match") == qualifies
+        ):
+            reasons.append("dynamic_match_flags_inconsistent")
+        if (classification == "static_pose_match") != (
+            raw.get("static_pose_match") is True
+        ):
+            reasons.append("static_match_flag_inconsistent")
+        if raw.get("input_valid") is True:
+            if not (
+                raw.get("feature_dimension") == 60
+                and raw.get("outgoing_sample_count") == 2
+                and raw.get("incoming_sample_count") == 2
+                and _number(
+                    raw.get("outgoing_boundary_motion_magnitude")
+                )
+                is not None
+                and _number(
+                    raw.get("incoming_boundary_motion_magnitude")
+                )
+                is not None
+                and _number(raw.get("endpoint_pose_cosine")) is not None
+            ):
+                reasons.append("valid_analysis_missing_four_pose_samples")
+        elif not (
+            classification == "invalid"
+            and raw.get("qualifies") is False
+            and raw.get("dynamic_pose_phase_match") is False
+            and raw.get("dynamic_direction_match_proven") is False
+        ):
+            reasons.append("invalid_analysis_masquerades_as_match")
+        if qualifies != (failure_reasons == []):
+            reasons.append("qualification_failure_reasons_inconsistent")
+        direction_available = (
+            raw.get("input_valid") is True
+            and _number(raw.get("velocity_direction_cosine")) is not None
+        )
+        if (raw.get("direction_evidence_available") is True) != direction_available:
+            reasons.append("direction_evidence_availability_inconsistent")
+        if (
+            (not qualifies or preference_weight == 0.0)
+            and soft_preference != 0.0
+        ):
+            reasons.append("nonqualifying_motion_received_preference")
+    else:
+        reasons.append("evidence_calibration_status_invalid")
+
+    base_total_cost = _number(evidence.get("base_total_cost"))
+    total_cost = _number(evidence.get("total_cost"))
+    if base_total_cost is None or total_cost is None:
+        reasons.append("boundary_cost_scalars_missing")
+    elif (
+        total_cost < -1e-12
+        or total_cost > base_total_cost + 1e-12
+        or soft_preference is None
+        or not math.isclose(
+            base_total_cost - total_cost,
+            soft_preference,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        reasons.append("soft_preference_cost_reconciliation_failed")
+    return (raw, tuple(sorted(set(reasons))))
 
 
 def _boundary_pose_evidence_metrics(
@@ -3685,6 +4619,31 @@ def _boundary_pose_evidence_metrics(
             "contract": "formation_layout_and_actual_pose_boundary_repair_v3",
             "legacy_or_unavailable": True,
         }
+    temporal_contract_plans = tuple(
+        plan
+        for plan in contract_plans
+        if _TEMPORAL_POSE_MOTION_MARKER
+        in str(plan.get("analysis_basis") or "")
+    )
+    temporal_plan_contract_failures: list[dict[str, Any]] = []
+    temporal_configurations_by_fingerprint: dict[
+        str, Mapping[str, Any]
+    ] = {}
+    for position, plan in enumerate(temporal_contract_plans):
+        configuration, reasons = _validate_temporal_pose_motion_configuration(
+            plan
+        )
+        if reasons:
+            temporal_plan_contract_failures.append(
+                {"plan_index": position, "reasons": list(reasons)}
+            )
+            continue
+        assert configuration is not None
+        fingerprint = configuration.get(
+            "configuration_fingerprint_sha256"
+        )
+        assert isinstance(fingerprint, str)
+        temporal_configurations_by_fingerprint[fingerprint] = configuration
 
     geometry_attempts = sum(
         _integer(plan.get("geometry_provider_attempt_count")) or 0
@@ -3750,6 +4709,13 @@ def _boundary_pose_evidence_metrics(
     layout_pair_count = 0
     silhouette_side_count = 0
     silhouette_pair_count = 0
+    temporal_invalid_records: list[dict[str, Any]] = []
+    temporal_classification_counts: Counter[str] = Counter()
+    temporal_calibration_status_counts: Counter[str] = Counter()
+    temporal_direction_evidence_count = 0
+    temporal_dynamic_direction_match_count = 0
+    temporal_soft_preference_count = 0
+    temporal_soft_preference_total = 0.0
 
     def bool_pair(
         coverage: Mapping[str, Any], name: str
@@ -3777,6 +4743,45 @@ def _boundary_pose_evidence_metrics(
     for position, repair in enumerate(repairs):
         index = _integer(repair.get("boundary_index"))
         evidence = _mapping(repair.get("selected_visual_evidence")) or {}
+        if temporal_contract_plans:
+            temporal_evidence, temporal_reasons = (
+                _validate_temporal_pose_motion_evidence(
+                    evidence,
+                    configurations_by_fingerprint=(
+                        temporal_configurations_by_fingerprint
+                    ),
+                )
+            )
+            if temporal_reasons:
+                temporal_invalid_records.append(
+                    {
+                        "boundary_index": (
+                            index if index is not None else position
+                        ),
+                        "reasons": list(temporal_reasons),
+                    }
+                )
+            if temporal_evidence is not None:
+                temporal_classification_counts.update(
+                    [str(temporal_evidence.get("classification"))]
+                )
+                temporal_calibration_status_counts.update(
+                    [str(temporal_evidence.get("calibration_status"))]
+                )
+                temporal_direction_evidence_count += int(
+                    temporal_evidence.get("direction_evidence_available")
+                    is True
+                )
+                temporal_dynamic_direction_match_count += int(
+                    temporal_evidence.get("dynamic_direction_match_proven")
+                    is True
+                )
+                preference = _number(
+                    temporal_evidence.get("soft_preference_applied")
+                )
+                if preference is not None and preference > 0.0:
+                    temporal_soft_preference_count += 1
+                    temporal_soft_preference_total += preference
         coverage = _mapping(evidence.get("evidence_coverage"))
         reasons: list[str] = []
         if coverage is None:
@@ -3947,6 +4952,24 @@ def _boundary_pose_evidence_metrics(
                 "invalid_records": [],
             },
         )
+    if temporal_plan_contract_failures or temporal_invalid_records:
+        collector.add(
+            "boundary_temporal_pose_motion_contract_invalid",
+            QAIssueSeverity.FAIL,
+            "Temporal pose-motion evidence is non-scalar, misbound, or internally inconsistent.",
+            path=(
+                "visual_boundary_repairs.repairs[].selected_visual_evidence."
+                "temporal_pose_motion"
+            ),
+            value={
+                "plan_contract_failures": temporal_plan_contract_failures,
+                "invalid_records": temporal_invalid_records,
+            },
+            threshold={
+                "plan_contract_failures": [],
+                "invalid_records": [],
+            },
+        )
 
     boundary_count = len(repairs)
     side_count = 2 * boundary_count
@@ -3986,12 +5009,42 @@ def _boundary_pose_evidence_metrics(
         "hog_used_as_pose_boundary_indices": sorted(hog_pose_indices),
         "missing_mask_counts": dict(sorted(missing_mask_counts.items())),
         "invalid_records": invalid_records,
+        "temporal_pose_motion": {
+            "available": bool(temporal_contract_plans),
+            "contract": (
+                "scalar_temporal_pose_motion_boundary_evidence_v1"
+                if temporal_contract_plans
+                else None
+            ),
+            "plan_contract_failures": temporal_plan_contract_failures,
+            "invalid_records": temporal_invalid_records,
+            "calibration_status_counts": dict(
+                sorted(temporal_calibration_status_counts.items())
+            ),
+            "classification_counts": dict(
+                sorted(temporal_classification_counts.items())
+            ),
+            "direction_evidence_available_count": (
+                temporal_direction_evidence_count
+            ),
+            "dynamic_direction_match_proven_count": (
+                temporal_dynamic_direction_match_count
+            ),
+            "soft_preference_applied_count": temporal_soft_preference_count,
+            "soft_preference_applied_total": temporal_soft_preference_total,
+            "passed": (
+                not temporal_plan_contract_failures
+                and not temporal_invalid_records
+            ),
+        },
         "passed": (
             geometry_failures == 0
             and not missing_plan_contract
             and not professional_gate_failures
             and not hog_pose_indices
             and not invalid_records
+            and not temporal_plan_contract_failures
+            and not temporal_invalid_records
         ),
     }
 
@@ -4084,23 +5137,15 @@ def _beat_phrase_metrics(
             }
         )
 
-    standard_repairs = _sequence(
-        (_mapping(analysis.get("visual_boundary_repairs")) or {}).get("repairs")
-    ) or []
-    selected_index = selection.get("selected_candidate_index")
-    complete_candidates = _sequence(selection.get("complete_candidates")) or []
-    for raw in complete_candidates:
-        candidate = _mapping(raw) or {}
-        if candidate.get("candidate_index") == selected_index:
-            standard_repairs = _sequence(
-                (_mapping(candidate.get("boundary_repairs")) or {}).get("repairs")
-            ) or standard_repairs
-            break
+    _repair_plans, final_repairs = _selected_boundary_repair_contracts(
+        analysis,
+        selection,
+    )
     offsets: dict[int, int] = {}
     selected_boundary_seconds: dict[int, float] = {}
     nominal_boundary_seconds: dict[int, float] = {}
     repair_payload_consistency: dict[int, bool] = {}
-    for raw in standard_repairs:
+    for raw in final_repairs:
         repair = _mapping(raw) or {}
         index = _integer(repair.get("boundary_index"))
         result = _mapping(repair.get("result")) or {}
@@ -4144,40 +5189,6 @@ def _beat_phrase_metrics(
         if selected_partial_reedit
         else set()
     )
-    partial_repair = _mapping(partial.get("repair")) or {}
-    for raw in (
-        _sequence(partial_repair.get("repairs")) or []
-        if selected_partial_reedit
-        else []
-    ):
-        repair = _mapping(raw) or {}
-        index = _integer(repair.get("boundary_index"))
-        result = _mapping(repair.get("result")) or {}
-        offset = _integer(result.get("selected_frame_offset"))
-        if index is not None and offset is not None and index in partial_changed:
-            offsets[index] = offset
-            selected_seconds = _number(result.get("selected_boundary_seconds"))
-            if selected_seconds is not None:
-                selected_boundary_seconds[index] = selected_seconds
-            nominal_seconds = _number(result.get("nominal_boundary_seconds"))
-            if nominal_seconds is not None:
-                nominal_boundary_seconds[index] = nominal_seconds
-            nested_selected = _mapping(result.get("selected")) or {}
-            nested_selected_seconds = _number(
-                nested_selected.get("boundary_seconds")
-            )
-            repair_payload_consistency[index] = (
-                nested_selected.get("frame_offset") == offset
-                and nested_selected_seconds is not None
-                and selected_seconds is not None
-                and math.isclose(
-                    nested_selected_seconds,
-                    selected_seconds,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-            )
-
     repair_records: list[dict[str, Any]] = []
     visible_indices = {
         _integer(item.get("boundary_index")) for item in boundaries
@@ -4791,9 +5802,12 @@ def _perceptual_quality_metrics(
     verdict = payload.get("verdict")
     passed = payload.get("passed")
     contract_valid = (
-        payload.get("schema_version") == 1
+        payload.get("schema_version") == 2
         and payload.get("analysis")
-        == "full_final_decode_temporal_pumping_and_exact_source_retention_v1"
+        == (
+            "full_final_decode_temporal_pumping_exact_source_retention_and_"
+            "structure_binding_v2"
+        )
         and verdict in {"PASS", "CONDITIONAL", "FAIL"}
         and passed is (verdict == "PASS")
         and serialized_issues is not None
@@ -4891,6 +5905,10 @@ def _montage_profile_identity(
     return profile, identity
 
 
+def _automatic_ive_group_product_scope(analysis: Mapping[str, Any]) -> bool:
+    return automatic_ive_group_product_floor_required(analysis)
+
+
 def _rendered_montage_grammar_metrics(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -4900,17 +5918,20 @@ def _rendered_montage_grammar_metrics(
     *,
     trusted_registered_stage_edit: bool | None = None,
 ) -> dict[str, Any]:
-    """Recompute and hard-gate the final registered StageEdit montage grammar."""
+    """Recompute the final montage grammar for every IVE product delivery."""
 
     activation = resolve_cut_local_sync_activation(
         analysis,
         selection,
         trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
-    if not bool(activation["required"]):
+    ive_product_required = _automatic_ive_group_product_scope(analysis)
+    montage_required = bool(activation["required"] or ive_product_required)
+    if not montage_required:
         return {
             "required": False,
             "activation_contract": activation,
+            "ive_product_scope_required": False,
             "available": False,
             "passed": None,
         }
@@ -5071,6 +6092,7 @@ def _rendered_montage_grammar_metrics(
     return {
         "required": True,
         "activation_contract": activation,
+        "ive_product_scope_required": ive_product_required,
         "available": persisted is not None,
         "evidence_contract_valid": evidence_valid,
         "configuration_matches": configuration_matches,
@@ -5082,6 +6104,47 @@ def _rendered_montage_grammar_metrics(
         "recomputed_review": recomputed_with_profile,
         "passed": passed,
     }
+
+
+def _ive_product_quality_floor_metrics(
+    analysis: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    collector: _IssueCollector,
+) -> dict[str, Any]:
+    """Apply the IVE floor regardless of registered versus explicit activation."""
+
+    try:
+        result = evaluate_ive_product_quality_floor(
+            analysis,
+            selection=selection,
+        )
+        payload = result.to_dict()
+    except Exception as exc:
+        collector.add(
+            "ive_product_quality_floor_evidence_invalid",
+            QAIssueSeverity.FAIL,
+            "The IVE delivery floor could not validate its immutable evidence.",
+            path="ive_product_quality_floor",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+        return {
+            "required": _automatic_ive_group_product_scope(analysis),
+            "passed": False,
+            "evaluation_error": f"{type(exc).__name__}: {exc}",
+        }
+    if result.required and result.passed is not True:
+        collector.add(
+            "ive_product_quality_floor_failed",
+            QAIssueSeverity.FAIL,
+            "The automatic IVE GROUP render regressed below its delivery floor.",
+            path="ive_product_quality_floor",
+            value={
+                "evaluation_mode": result.evaluation_mode,
+                "failure_codes": list(result.failure_codes),
+            },
+            threshold={"passed": True},
+        )
+    return payload
 
 
 def evaluate_post_render_qa(
@@ -5098,6 +6161,19 @@ def evaluate_post_render_qa(
     settings = config or PostRenderQAConfig()
     collector = _IssueCollector()
     metrics: dict[str, Any] = {}
+    input_artifact_fingerprints: dict[str, Any] = {}
+    try:
+        input_artifact_fingerprints = fingerprint_post_render_artifacts(
+            artifact_set
+        )
+    except ValueError as exc:
+        collector.add(
+            "artifact_content_fingerprint_unavailable",
+            QAIssueSeverity.FAIL,
+            "The completed artifact set could not be content-fingerprinted.",
+            path="artifact_set",
+            value=str(exc),
+        )
     try:
         analysis = _load_json_object(artifact_set.analysis_path)
         plan = _load_json_object(artifact_set.render_plan_path)
@@ -5116,6 +6192,7 @@ def evaluate_post_render_qa(
             metrics=metrics,
             issues=tuple(collector.issues),
             policy=settings,
+            input_artifact_fingerprints=input_artifact_fingerprints,
             created_at=created_at or datetime.now(UTC),
         )
 
@@ -5162,6 +6239,11 @@ def evaluate_post_render_qa(
         collector,
         trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
+    metrics["ive_product_quality_floor"] = _ive_product_quality_floor_metrics(
+        analysis,
+        selection,
+        collector,
+    )
     metrics["cadence_and_repetition"] = _cadence_and_repetition_metrics(
         analysis, plan, settings, collector
     )
@@ -5180,12 +6262,47 @@ def evaluate_post_render_qa(
     metrics["beat_and_phrase"] = _beat_phrase_metrics(
         analysis, plan, selection, settings, collector
     )
+    final_artifact_fingerprints: dict[str, Any] = {}
+    try:
+        final_artifact_fingerprints = fingerprint_post_render_artifacts(
+            artifact_set
+        )
+    except ValueError as exc:
+        collector.add(
+            "artifact_content_stability_unavailable",
+            QAIssueSeverity.FAIL,
+            "The QA inputs could not be re-fingerprinted after evaluation.",
+            path="artifact_set",
+            value=str(exc),
+        )
+    stable = bool(
+        input_artifact_fingerprints
+        and final_artifact_fingerprints
+        and input_artifact_fingerprints == final_artifact_fingerprints
+    )
+    metrics["artifact_content_stability"] = {
+        "contract": INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
+        "stable_across_evaluation": stable,
+        "final_fingerprints": final_artifact_fingerprints,
+    }
+    if not stable:
+        collector.add(
+            "artifact_content_changed_during_qa",
+            QAIssueSeverity.FAIL,
+            "At least one QA input changed while the report was being evaluated.",
+            path="artifact_set",
+            value={
+                "initial": input_artifact_fingerprints,
+                "final": final_artifact_fingerprints,
+            },
+        )
     return PostRenderQAReport(
         artifact_set=artifact_set,
         verdict=collector.verdict(),
         metrics=metrics,
         issues=tuple(collector.issues),
         policy=settings,
+        input_artifact_fingerprints=input_artifact_fingerprints,
         created_at=created_at or datetime.now(UTC),
     )
 
@@ -5194,6 +6311,7 @@ def evaluate_and_write_post_render_qa(
     artifact_set: PostRenderArtifactSet,
     *,
     output_path: Path | None = None,
+    declared_artifact_set: PostRenderArtifactSet | None = None,
     config: PostRenderQAConfig | None = None,
     runner: RunCommand = _run_command,
     created_at: datetime | None = None,
@@ -5206,12 +6324,36 @@ def evaluate_and_write_post_render_qa(
         created_at=created_at,
         trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
+    if declared_artifact_set is not None:
+        normalized_fingerprints = normalize_post_render_artifact_fingerprints(
+            report.input_artifact_fingerprints,
+            declared_artifact_set,
+        )
+        normalized_metrics = deepcopy(dict(report.metrics))
+        stability = normalized_metrics.get("artifact_content_stability")
+        if isinstance(stability, dict):
+            final_fingerprints = stability.get("final_fingerprints")
+            if isinstance(final_fingerprints, Mapping):
+                stability["final_fingerprints"] = (
+                    normalize_post_render_artifact_fingerprints(
+                        final_fingerprints,
+                        declared_artifact_set,
+                    )
+                )
+        report = replace(
+            report,
+            artifact_set=declared_artifact_set,
+            metrics=normalized_metrics,
+            input_artifact_fingerprints=normalized_fingerprints,
+        )
     return (report, report.write_atomic(output_path))
 
 
 __all__ = [
     "ANALYSIS_BASIS",
+    "INPUT_ARTIFACT_FINGERPRINT_CONTRACT",
     "PostRenderArtifactSet",
+    "PostRenderQAEvaluationSnapshot",
     "PostRenderQAConfig",
     "PostRenderQAReport",
     "PostRenderQAVerdict",
@@ -5221,4 +6363,8 @@ __all__ = [
     "discover_completed_artifact_sets",
     "evaluate_and_write_post_render_qa",
     "evaluate_post_render_qa",
+    "cleanup_post_render_qa_snapshot",
+    "fingerprint_post_render_artifacts",
+    "materialize_post_render_qa_snapshot",
+    "normalize_post_render_artifact_fingerprints",
 ]

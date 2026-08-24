@@ -28,8 +28,12 @@ from .stage_edit_transformer import (
     STAGE_EDIT_FORMATION_LAYOUT_FEATURE_NAMES,
     STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES,
     STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
+    STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND,
+    STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
     SourceCandidateToken,
     StageEditSequence,
+    StageEditTemporalPoseSidecar,
     StageEditToken,
     StageEditTokenSchema,
 )
@@ -40,11 +44,15 @@ if TYPE_CHECKING:  # Avoid importing OpenCV-backed visual analysis at runtime.
     from .visual_score import FrameVisualDescriptor
 
 
-FEATURE_MATERIALIZER_SCHEMA_VERSION = 2
+FEATURE_MATERIALIZER_SCHEMA_VERSION = 3
 FEATURE_MATERIALIZER_CONTRACT = (
+    "stage_edit_inference_available_feature_materializer_v3"
+)
+FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2 = (
     "stage_edit_inference_available_feature_materializer_v2"
 )
 FEATURE_SNAPSHOT_KIND = "stage_edit_inference_safe_feature_snapshot"
+FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION = 2
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _UPSTREAM_COMPONENTS = frozenset(
@@ -108,6 +116,7 @@ class StageEditFeatureProvenance:
     upstream_sha256: tuple[tuple[str, str], ...] = ()
     analyzer_fingerprint_sha256: str | None = None
     contracts: tuple[str, ...] = ()
+    producer: str = FEATURE_MATERIALIZER_CONTRACT
 
     def __post_init__(self) -> None:
         normalized: list[tuple[str, str]] = []
@@ -137,10 +146,17 @@ class StageEditFeatureProvenance:
         if any(not value or len(value) > 160 for value in contracts):
             raise ValueError("feature provenance contracts must be bounded strings")
         object.__setattr__(self, "contracts", contracts)
+        producer = str(self.producer).strip()
+        if producer not in {
+            FEATURE_MATERIALIZER_CONTRACT,
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+        }:
+            raise ValueError("StageEdit feature producer is unsupported")
+        object.__setattr__(self, "producer", producer)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "producer": FEATURE_MATERIALIZER_CONTRACT,
+            "producer": self.producer,
             "input_availability": "available_before_editorial_source_choice",
             "reference_attribution_inputs_present": False,
             "upstream_sha256": dict(self.upstream_sha256),
@@ -160,7 +176,10 @@ class StageEditFeatureProvenance:
         }
         if set(payload) != expected:
             raise ValueError("StageEdit feature provenance schema does not match")
-        if payload.get("producer") != FEATURE_MATERIALIZER_CONTRACT:
+        if payload.get("producer") not in {
+            FEATURE_MATERIALIZER_CONTRACT,
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+        }:
             raise ValueError("StageEdit feature producer is unsupported")
         if payload.get("input_availability") != (
             "available_before_editorial_source_choice"
@@ -182,6 +201,7 @@ class StageEditFeatureProvenance:
                 else None
             ),
             contracts=tuple(str(value) for value in contracts),
+            producer=str(payload["producer"]),
         )
 
 
@@ -221,6 +241,7 @@ class SourceFeatureObservation:
     pose_model_embedding: tuple[float, ...] = ()
     formation_layout_embedding: tuple[float, ...] = ()
     formation_pose_embedding: tuple[float | None, ...] = ()
+    temporal_pose_sidecar: StageEditTemporalPoseSidecar | None = None
     available: bool = True
     hard_gate_passed: bool = True
 
@@ -316,6 +337,12 @@ class SourceFeatureObservation:
             "formation_pose_embedding",
             tuple(normalized_formation_pose),
         )
+        if self.temporal_pose_sidecar is not None and not isinstance(
+            self.temporal_pose_sidecar, StageEditTemporalPoseSidecar
+        ):
+            raise TypeError(
+                "temporal_pose_sidecar must use StageEditTemporalPoseSidecar"
+            )
         for name in signed_fields:
             value = getattr(self, name)
             normalized = _signed_unit_or_none(value)
@@ -527,6 +554,60 @@ def _fixed_embedding(
     return tuple(output)
 
 
+def _temporal_pose_sidecar(
+    earlier: Any,
+    later: Any,
+    *,
+    interval_seconds: Any,
+    sampling_contract: str,
+    earlier_backend: Any = None,
+    later_backend: Any = None,
+) -> StageEditTemporalPoseSidecar | None:
+    """Return a sidecar only for two source-real exact 60-D observations."""
+
+    # Keep the lightweight Transformer schema independent of OpenCV imports,
+    # while proving that its serialized producer constant still names the
+    # exact backend exported by the real pose analyzer.
+    from .pose import POSE_BACKEND
+
+    if POSE_BACKEND != STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND:
+        raise RuntimeError("StageEdit trusted pose backend identity changed")
+    backends = tuple(
+        str(value or "").strip() for value in (earlier_backend, later_backend)
+    )
+    if any(backend != POSE_BACKEND for backend in backends):
+        return None
+    if not (
+        isinstance(earlier, (list, tuple))
+        and isinstance(later, (list, tuple))
+        and len(earlier) == len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES)
+        and len(later) == len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES)
+    ):
+        return None
+    interval = _finite_or_none(interval_seconds)
+    if interval is None or interval <= 0.0:
+        return None
+    return StageEditTemporalPoseSidecar(
+        embeddings=(
+            _fixed_embedding(
+                earlier,
+                expected_length=len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+                name="earlier temporal model pose embedding",
+                signed=True,
+            ),
+            _fixed_embedding(
+                later,
+                expected_length=len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+                name="later temporal model pose embedding",
+                signed=True,
+            ),
+        ),
+        interval_seconds=interval,
+        sampling_contract=sampling_contract,
+        producer_backend=POSE_BACKEND,
+    )
+
+
 def _formation_person_value(person: Any, name: str) -> Any:
     if isinstance(person, Mapping):
         return person.get(name)
@@ -705,6 +786,23 @@ def source_observation_from_timeline_candidate(
     entry_pose = getattr(candidate, "entry_pose_embedding", ())
     exit_pose = getattr(candidate, "exit_pose_embedding", ())
     pose_motion = _cosine_motion(entry_pose, exit_pose)
+    pose_backends = getattr(candidate, "pose_backends", ())
+    if isinstance(pose_backends, (list, tuple)) and len(pose_backends) == 3:
+        entry_pose_backend = pose_backends[0]
+        exit_pose_backend = pose_backends[2]
+    else:
+        entry_pose_backend = None
+        exit_pose_backend = None
+    temporal_pose_sidecar = _temporal_pose_sidecar(
+        entry_pose,
+        exit_pose,
+        interval_seconds=getattr(candidate, "duration_seconds", None),
+        sampling_contract=(
+            STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT
+        ),
+        earlier_backend=entry_pose_backend,
+        later_backend=exit_pose_backend,
+    )
     motion = getattr(candidate, "entry_motion", None) or getattr(
         candidate, "motion", None
     )
@@ -796,6 +894,7 @@ def source_observation_from_timeline_candidate(
         color_temperature_normalized=color_temperature,
         occlusion_probability=occlusion,
         automatic_visual_confidence=visual_confidence,
+        temporal_pose_sidecar=temporal_pose_sidecar,
         **action_formation,
         available=available,
         hard_gate_passed=hard_gate_passed,
@@ -877,6 +976,16 @@ def source_observation_from_visual_cache_payload(
         person_layout_embedding=numeric_features.get("person_layout_embedding"),
         formation_people=numeric_features.get("formation_people"),
     )
+    temporal_pose_sidecar = _temporal_pose_sidecar(
+        numeric_features.get("pose_embedding"),
+        following.get("pose_embedding"),
+        interval_seconds=interval_seconds,
+        sampling_contract=(
+            STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+        ),
+        earlier_backend=numeric_features.get("pose_backend"),
+        later_backend=following.get("pose_backend"),
+    )
     return SourceFeatureObservation(
         source_id=source_id,
         sync_confidence=sync_confidence,
@@ -899,6 +1008,7 @@ def source_observation_from_visual_cache_payload(
             "foreground_obstruction_score"
         ),
         automatic_visual_confidence=visual_confidence,
+        temporal_pose_sidecar=temporal_pose_sidecar,
         **action_formation,
         available=available,
         hard_gate_passed=hard_gate_passed,
@@ -920,6 +1030,7 @@ def materialize_stage_edit_source_candidate(
         missing_mask=missing,
         available=observation.available,
         hard_gate_passed=observation.hard_gate_passed,
+        temporal_pose_sidecar=observation.temporal_pose_sidecar,
     )
 
 
@@ -1179,23 +1290,44 @@ def materialize_stage_edit_token(
     )
 
 
-def _candidate_to_dict(candidate: SourceCandidateToken) -> dict[str, Any]:
-    return {
+def _candidate_to_dict(
+    candidate: SourceCandidateToken,
+    *,
+    snapshot_schema_version: int,
+) -> dict[str, Any]:
+    payload = {
         "source_id": candidate.source_id,
         "features": list(candidate.features),
         "missing_mask": list(candidate.missing_mask),
         "available": candidate.available,
         "hard_gate_passed": candidate.hard_gate_passed,
     }
+    if snapshot_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+        payload["temporal_pose_sidecar"] = (
+            candidate.temporal_pose_sidecar.to_dict()
+            if candidate.temporal_pose_sidecar is not None
+            else None
+        )
+    elif snapshot_schema_version != FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION:
+        raise ValueError("unsupported StageEdit feature snapshot version")
+    return payload
 
 
-def _token_to_dict(token: StageEditToken) -> dict[str, Any]:
+def _token_to_dict(
+    token: StageEditToken,
+    *,
+    snapshot_schema_version: int,
+) -> dict[str, Any]:
     return {
         "master_time_seconds": token.master_time_seconds,
         "music_features": list(token.music_features),
         "section_features": list(token.section_features),
         "source_candidates": [
-            _candidate_to_dict(candidate) for candidate in token.source_candidates
+            _candidate_to_dict(
+                candidate,
+                snapshot_schema_version=snapshot_schema_version,
+            )
+            for candidate in token.source_candidates
         ],
         "recent_edit_features": list(token.recent_edit_features),
         "style_features": list(token.style_features),
@@ -1208,21 +1340,43 @@ def _snapshot_unsigned_payload(
     sequence: StageEditSequence,
     token_schema_fingerprint: str,
     provenance: StageEditFeatureProvenance,
+    snapshot_schema_version: int = FEATURE_MATERIALIZER_SCHEMA_VERSION,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": FEATURE_MATERIALIZER_SCHEMA_VERSION,
-        "snapshot_kind": FEATURE_SNAPSHOT_KIND,
-        "token_schema_fingerprint": token_schema_fingerprint,
-        "sequence_id": sequence.sequence_id,
-        "provenance": provenance.to_dict(),
-        "tokens": [_token_to_dict(token) for token in sequence.tokens],
-        "input_policy": {
+    if snapshot_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+        input_policy = {
             "training_inference_materializer_shared": True,
             "reference_attribution_match_inputs_present": False,
             "selected_labels_present": False,
             "missing_values_are_explicitly_masked": True,
             "source_availability_and_hard_gate_are_distinct": True,
-        },
+            "temporal_pose_sidecar_hash_bound": True,
+            "temporal_pose_sidecar_enters_transformer_tensors": False,
+            "legacy_snapshots_cannot_claim_pose_direction": True,
+        }
+    elif snapshot_schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION:
+        input_policy = {
+            "training_inference_materializer_shared": True,
+            "reference_attribution_match_inputs_present": False,
+            "selected_labels_present": False,
+            "missing_values_are_explicitly_masked": True,
+            "source_availability_and_hard_gate_are_distinct": True,
+        }
+    else:
+        raise ValueError("unsupported StageEdit feature snapshot version")
+    return {
+        "schema_version": snapshot_schema_version,
+        "snapshot_kind": FEATURE_SNAPSHOT_KIND,
+        "token_schema_fingerprint": token_schema_fingerprint,
+        "sequence_id": sequence.sequence_id,
+        "provenance": provenance.to_dict(),
+        "tokens": [
+            _token_to_dict(
+                token,
+                snapshot_schema_version=snapshot_schema_version,
+            )
+            for token in sequence.tokens
+        ],
+        "input_policy": input_policy,
     }
 
 
@@ -1309,12 +1463,21 @@ def _validate_token(token: StageEditToken, schema: StageEditTokenSchema) -> None
         raise ValueError("StageEdit snapshot source order must be canonical")
 
 
+def _temporal_pose_sidecar_count(sequence: StageEditSequence) -> int:
+    return sum(
+        candidate.temporal_pose_sidecar is not None
+        for token in sequence.tokens
+        for candidate in token.source_candidates
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StageEditFeatureSnapshot:
     sequence: StageEditSequence
     token_schema_fingerprint: str
     provenance: StageEditFeatureProvenance
     snapshot_sha256: str
+    schema_version: int = FEATURE_MATERIALIZER_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not self.sequence.sequence_id.strip() or not self.sequence.tokens:
@@ -1323,6 +1486,28 @@ class StageEditFeatureSnapshot:
             raise ValueError("StageEdit token schema fingerprint must be SHA-256")
         if _SHA256.fullmatch(self.snapshot_sha256) is None:
             raise ValueError("StageEdit feature snapshot hash must be SHA-256")
+        if self.schema_version not in {
+            FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+            FEATURE_MATERIALIZER_SCHEMA_VERSION,
+        }:
+            raise ValueError("unsupported StageEdit feature snapshot version")
+        expected_producer = (
+            FEATURE_MATERIALIZER_CONTRACT
+            if self.schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION
+            else FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2
+        )
+        if self.provenance.producer != expected_producer:
+            raise ValueError(
+                "StageEdit feature snapshot producer does not match its version"
+            )
+        if (
+            self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            and _temporal_pose_sidecar_count(self.sequence) != 0
+        ):
+            raise ValueError(
+                "legacy StageEdit feature snapshot v2 cannot carry a temporal "
+                "pose sidecar"
+            )
         previous = -math.inf
         for token in self.sequence.tokens:
             timestamp = _finite_or_none(token.master_time_seconds)
@@ -1333,6 +1518,7 @@ class StageEditFeatureSnapshot:
             sequence=self.sequence,
             token_schema_fingerprint=self.token_schema_fingerprint,
             provenance=self.provenance,
+            snapshot_schema_version=self.schema_version,
         )
         if _payload_sha256(unsigned) != self.snapshot_sha256:
             raise ValueError("StageEdit feature snapshot SHA-256 mismatch")
@@ -1357,11 +1543,20 @@ class StageEditFeatureSnapshot:
             token_schema_fingerprint=schema.fingerprint,
             provenance=provenance,
             snapshot_sha256=_payload_sha256(unsigned),
+            schema_version=FEATURE_MATERIALIZER_SCHEMA_VERSION,
         )
 
     def require_schema(self, schema: StageEditTokenSchema) -> None:
         if self.token_schema_fingerprint != schema.fingerprint:
             raise ValueError("StageEdit feature snapshot token schema mismatch")
+        if (
+            self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            and _temporal_pose_sidecar_count(self.sequence) != 0
+        ):
+            raise ValueError(
+                "legacy StageEdit feature snapshot v2 cannot carry a temporal "
+                "pose sidecar"
+            )
         for token in self.sequence.tokens:
             _validate_token(token, schema)
 
@@ -1385,11 +1580,38 @@ class StageEditFeatureSnapshot:
             )
         return matches[0]
 
+    def temporal_pose_sidecar_audit(self) -> dict[str, Any]:
+        candidate_count = sum(
+            len(token.source_candidates) for token in self.sequence.tokens
+        )
+        observed_count = _temporal_pose_sidecar_count(self.sequence)
+        legacy = self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        if legacy and observed_count != 0:
+            raise ValueError(
+                "legacy StageEdit feature snapshot v2 temporal sidecar audit "
+                "must observe zero sidecars"
+            )
+        return {
+            "snapshot_schema_version": self.schema_version,
+            "status": (
+                "legacy_v2_explicit_temporal_sidecar_missing"
+                if legacy
+                else "v3_hash_bound_temporal_sidecar"
+            ),
+            "candidate_count": candidate_count,
+            "observed_sidecar_count": observed_count,
+            "missing_sidecar_count": candidate_count - observed_count,
+            "sidecar_hash_bound": not legacy,
+            "enters_transformer_tensors": False,
+            "pose_direction_or_velocity_proven_by_snapshot_alone": False,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         payload = _snapshot_unsigned_payload(
             sequence=self.sequence,
             token_schema_fingerprint=self.token_schema_fingerprint,
             provenance=self.provenance,
+            snapshot_schema_version=self.schema_version,
         )
         if _payload_sha256(payload) != self.snapshot_sha256:
             raise ValueError("StageEdit feature snapshot mutated after hashing")
@@ -1424,7 +1646,11 @@ class StageEditFeatureSnapshot:
         }
         if set(payload) != expected:
             raise ValueError("StageEdit feature snapshot schema does not match")
-        if payload.get("schema_version") != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+        raw_schema_version = payload.get("schema_version")
+        if raw_schema_version not in {
+            FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+            FEATURE_MATERIALIZER_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported StageEdit feature snapshot version")
         if payload.get("snapshot_kind") != FEATURE_SNAPSHOT_KIND:
             raise ValueError("unsupported StageEdit feature snapshot kind")
@@ -1433,6 +1659,7 @@ class StageEditFeatureSnapshot:
             sequence=StageEditSequence("policy", ()),
             token_schema_fingerprint=schema.fingerprint,
             provenance=StageEditFeatureProvenance(),
+            snapshot_schema_version=raw_schema_version,
         )["input_policy"]
         if policy != expected_policy:
             raise ValueError("StageEdit feature snapshot input policy is unsafe")
@@ -1457,13 +1684,19 @@ class StageEditFeatureSnapshot:
                 raise ValueError("StageEdit snapshot candidates must be an array")
             candidates: list[SourceCandidateToken] = []
             for raw_candidate in raw_candidates:
-                if not isinstance(raw_candidate, Mapping) or set(raw_candidate) != {
+                expected_candidate_keys = {
                     "source_id",
                     "features",
                     "missing_mask",
                     "available",
                     "hard_gate_passed",
-                }:
+                }
+                if raw_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+                    expected_candidate_keys.add("temporal_pose_sidecar")
+                if (
+                    not isinstance(raw_candidate, Mapping)
+                    or set(raw_candidate) != expected_candidate_keys
+                ):
                     raise ValueError("StageEdit snapshot candidate schema does not match")
                 if not isinstance(raw_candidate["available"], bool) or not isinstance(
                     raw_candidate["hard_gate_passed"], bool
@@ -1485,6 +1718,15 @@ class StageEditFeatureSnapshot:
                         ),
                         available=raw_candidate["available"],
                         hard_gate_passed=raw_candidate["hard_gate_passed"],
+                        temporal_pose_sidecar=(
+                            StageEditTemporalPoseSidecar.from_dict(
+                                raw_candidate["temporal_pose_sidecar"]
+                            )
+                            if raw_schema_version
+                            == FEATURE_MATERIALIZER_SCHEMA_VERSION
+                            and raw_candidate["temporal_pose_sidecar"] is not None
+                            else None
+                        ),
                     )
                 )
             serialized_time = _finite_or_none(raw_token["master_time_seconds"])
@@ -1527,6 +1769,7 @@ class StageEditFeatureSnapshot:
             token_schema_fingerprint=raw_fingerprint,
             provenance=provenance,
             snapshot_sha256=raw_snapshot_sha256,
+            schema_version=raw_schema_version,
         )
         snapshot.require_schema(schema)
         unsigned = dict(payload)
@@ -1617,7 +1860,9 @@ def subset_stage_edit_token_sources(
 __all__ = [
     "CausalEditDecision",
     "FEATURE_MATERIALIZER_CONTRACT",
+    "FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2",
     "FEATURE_MATERIALIZER_SCHEMA_VERSION",
+    "FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION",
     "FEATURE_SNAPSHOT_KIND",
     "SourceFeatureObservation",
     "StageEditFeatureFrame",

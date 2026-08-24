@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -29,12 +32,14 @@ from crosscut.rendered_proxy_review import (
     PROXY_LANDSCAPE_SIZE,
     PROXY_PORTRAIT_SIZE,
     ProxyReviewConfig,
+    SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
     TIER_D_CONTINUITY_DOMAIN,
     _box_discontinuity,
     _motion_discontinuity,
     derive_proxy_render_plan,
     render_and_review_proxy,
     review_rendered_proxy,
+    verified_file_content_sha256,
 )
 
 
@@ -78,6 +83,12 @@ class _FakeProxyCapture:
 
 
 class RenderedProxyReviewTests(unittest.TestCase):
+    @staticmethod
+    def _fixture_content_sha256(path: Path) -> str:
+        return hashlib.sha256(
+            f"synthetic-file:{Path(path)}".encode("utf-8")
+        ).hexdigest()
+
     def _plan(self, aspect_ratio: AspectRatio) -> RenderPlan:
         width, height = (
             (1080, 1920)
@@ -211,9 +222,15 @@ class RenderedProxyReviewTests(unittest.TestCase):
         provider = geometry_provider or (
             lambda _frame: OutputSubjectGeometry()
         )
-        with patch(
-            "crosscut.rendered_proxy_review.cv2.VideoCapture",
-            return_value=capture,
+        with (
+            patch(
+                "crosscut.rendered_proxy_review.cv2.VideoCapture",
+                return_value=capture,
+            ),
+            patch(
+                "crosscut.rendered_proxy_review.verified_file_content_sha256",
+                side_effect=self._fixture_content_sha256,
+            ),
         ):
             review = review_rendered_proxy(
                 plan,
@@ -267,6 +284,131 @@ class RenderedProxyReviewTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "bounds"):
             OutputSubjectGeometry(face_bbox_xywh=(0.8, 0.2, 0.4, 0.3))
+
+    def test_segment_interior_geometry_is_exactly_scheduled_and_hash_bound(
+        self,
+    ) -> None:
+        plan = self._two_segment_plan(
+            same_source=False,
+            tier="C",
+            reason="synthetic_cross_source",
+        )
+        geometry = OutputSubjectGeometry(
+            face_count=1,
+            face_bbox_xywh=(0.30, 0.20, 0.20, 0.28),
+            face_backend="synthetic",
+        )
+        review = self._review_frames(
+            plan,
+            self._textured_frames(12),
+            geometry_provider=lambda _frame: geometry,
+        )
+
+        evidence = review.payload["segment_interior_geometry"]
+        self.assertEqual(evidence["contract"], SEGMENT_INTERIOR_GEOMETRY_CONTRACT)
+        self.assertEqual(evidence["segment_count"], 2)
+        self.assertEqual(evidence["sample_count"], 6)
+        self.assertTrue(evidence["complete"])
+        self.assertNotIn("path", evidence["proxy_identity"])
+        self.assertEqual(
+            evidence["proxy_identity"]["content_sha256"],
+            self._fixture_content_sha256(plan.output),
+        )
+        self.assertNotIn("source_path_sha256", evidence["segments"][0])
+        self.assertEqual(
+            evidence["segments"][0]["source_content_sha256"],
+            self._fixture_content_sha256(plan.sources[0]),
+        )
+        self.assertEqual(
+            [
+                sample["frame_index"]
+                for segment in evidence["segments"]
+                for sample in segment["samples"]
+            ],
+            [1, 3, 4, 7, 9, 10],
+        )
+        for segment in evidence["segments"]:
+            self.assertEqual(
+                sum(
+                    sample["represented_frame_count"]
+                    for sample in segment["samples"]
+                ),
+                segment["segment_frame_count"],
+            )
+        serialized = dict(evidence)
+        digest = serialized.pop("evidence_sha256")
+        expected = hashlib.sha256(
+            json.dumps(
+                serialized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(digest, expected)
+        self.assertFalse(
+            evidence["storage_policy"][
+                "appearance_or_identity_embeddings_serialized"
+            ]
+        )
+
+    def test_file_content_identity_rejects_same_metadata_different_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first-proxy.mp4"
+            second = Path(directory) / "second-proxy.mp4"
+            first.write_bytes(b"A" * 4096)
+            second.write_bytes(b"B" * 4096)
+            common_mtime_ns = first.stat().st_mtime_ns
+            os.utime(first, ns=(common_mtime_ns, common_mtime_ns))
+            os.utime(second, ns=(common_mtime_ns, common_mtime_ns))
+
+            first_stat = first.stat()
+            second_stat = second.stat()
+            self.assertEqual(first_stat.st_size, second_stat.st_size)
+            self.assertEqual(first_stat.st_mtime_ns, second_stat.st_mtime_ns)
+            self.assertNotEqual(
+                verified_file_content_sha256(first),
+                verified_file_content_sha256(second),
+            )
+
+    def test_file_content_cache_invalidates_same_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "source.mp4"
+            target.write_bytes(b"old-source-content")
+            original_mtime_ns = target.stat().st_mtime_ns
+            real_os_open = os.open
+            with patch(
+                "crosscut.rendered_proxy_review.os.open",
+                wraps=real_os_open,
+            ) as tracked_open:
+                first_digest = verified_file_content_sha256(target)
+                self.assertEqual(
+                    first_digest,
+                    verified_file_content_sha256(target),
+                )
+                self.assertEqual(tracked_open.call_count, 1)
+
+                replacement = Path(directory) / "replacement.mp4"
+                replacement.write_bytes(b"new-source-content")
+                os.utime(
+                    replacement,
+                    ns=(original_mtime_ns, original_mtime_ns),
+                )
+                replacement.replace(target)
+                self.assertEqual(target.stat().st_mtime_ns, original_mtime_ns)
+                self.assertEqual(
+                    target.stat().st_size,
+                    len(b"old-source-content"),
+                )
+
+                self.assertNotEqual(
+                    first_digest,
+                    verified_file_content_sha256(target),
+                )
+                self.assertEqual(tracked_open.call_count, 2)
 
     def test_perceptual_source_admission_passes_consistent_well_covered_runs(
         self,
@@ -956,9 +1098,15 @@ class RenderedProxyReviewTests(unittest.TestCase):
                 silhouette_backend="synthetic",
             )
 
-        with patch(
-            "crosscut.rendered_proxy_review.cv2.VideoCapture",
-            return_value=capture,
+        with (
+            patch(
+                "crosscut.rendered_proxy_review.cv2.VideoCapture",
+                return_value=capture,
+            ),
+            patch(
+                "crosscut.rendered_proxy_review.verified_file_content_sha256",
+                side_effect=self._fixture_content_sha256,
+            ),
         ):
             review = review_rendered_proxy(
                 plan,
@@ -966,7 +1114,7 @@ class RenderedProxyReviewTests(unittest.TestCase):
             )
 
         self.assertTrue(capture.released)
-        self.assertEqual(geometry_calls, 4)
+        self.assertEqual(geometry_calls, 10)
         self.assertEqual(review.payload["schema_version"], 3)
         self.assertEqual(review.payload["transition_count"], 1)
         self.assertEqual(review.payload["reviewed_boundary_count"], 1)
@@ -1019,16 +1167,22 @@ class RenderedProxyReviewTests(unittest.TestCase):
             fps=30.0,
         )
 
-        def unexpected_geometry(_frame: np.ndarray) -> OutputSubjectGeometry:
-            self.fail("an unreviewable dissolve must not sample another shot")
+        def interior_only_geometry(_frame: np.ndarray) -> OutputSubjectGeometry:
+            return OutputSubjectGeometry()
 
-        with patch(
-            "crosscut.rendered_proxy_review.cv2.VideoCapture",
-            return_value=capture,
+        with (
+            patch(
+                "crosscut.rendered_proxy_review.cv2.VideoCapture",
+                return_value=capture,
+            ),
+            patch(
+                "crosscut.rendered_proxy_review.verified_file_content_sha256",
+                side_effect=self._fixture_content_sha256,
+            ),
         ):
             review = review_rendered_proxy(
                 plan,
-                geometry_provider=unexpected_geometry,
+                geometry_provider=interior_only_geometry,
             )
 
         self.assertTrue(capture.released)
@@ -1043,6 +1197,10 @@ class RenderedProxyReviewTests(unittest.TestCase):
         )
         self.assertEqual(review.payload["boundary_issue_indices"], [0])
         self.assertEqual(review.payload["boundary_score"]["p10"], 0.0)
+        self.assertEqual(
+            review.payload["segment_interior_geometry"]["sample_count"],
+            5,
+        )
         self.assertFalse(review.passed)
 
 
@@ -1129,11 +1287,30 @@ class RenderedProxyReviewIntegrationTests(unittest.TestCase):
                 PROXY_LANDSCAPE_SIZE,
             )
             self.assertEqual(review.payload["proxy"]["decoded_frame_count"], 18)
+            self.assertEqual(
+                review.payload["proxy"]["content_sha256"],
+                hashlib.sha256(proxy_plan.output.read_bytes()).hexdigest(),
+            )
+            interior = review.payload["segment_interior_geometry"]
+            self.assertEqual(
+                interior["proxy_identity"]["content_sha256"],
+                review.payload["proxy"]["content_sha256"],
+            )
+            self.assertEqual(
+                [
+                    segment["source_content_sha256"]
+                    for segment in interior["segments"]
+                ],
+                [
+                    hashlib.sha256(first.read_bytes()).hexdigest(),
+                    hashlib.sha256(second.read_bytes()).hexdigest(),
+                ],
+            )
             self.assertEqual(review.payload["transition_count"], 1)
             self.assertEqual(review.payload["reviewed_boundary_count"], 1)
             self.assertEqual(review.payload["hard_cut_count"], 1)
             self.assertEqual(review.payload["dissolve_count"], 0)
-            self.assertEqual(calls, 4)
+            self.assertEqual(calls, 10)
             boundary = review.payload["boundaries"][0]
             self.assertEqual(boundary["transition_kind"], "hard_cut")
             self.assertEqual(boundary["transition_frame_count"], 0)

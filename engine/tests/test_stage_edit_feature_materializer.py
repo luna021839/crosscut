@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import fields
+import hashlib
 import json
+from types import SimpleNamespace
 import unittest
 
 from crosscut.stage_edit_feature_materializer import (
     CausalEditDecision,
+    FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+    FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
     SourceFeatureObservation,
     StageEditFeatureFrame,
     StageEditFeatureProvenance,
@@ -22,6 +26,9 @@ from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES,
     STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
+    STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND,
+    STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
 )
 from crosscut.rhythm import (
     Beat,
@@ -31,7 +38,7 @@ from crosscut.rhythm import (
     TempoEstimate,
 )
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
-from crosscut.pose import FormationPersonDescriptor
+from crosscut.pose import FormationPersonDescriptor, POSE_BACKEND
 from crosscut.timeline import TimelineCandidate
 from tests.test_stage_edit_reference_adapter import (
     PROHIBITED_REFERENCE_MATCH_INPUT_FIELDS,
@@ -41,6 +48,18 @@ from tests.test_stage_edit_reference_adapter import (
 
 
 SCHEMA = DEFAULT_STAGE_EDIT_SCHEMA
+
+
+def _snapshot_payload_sha256(payload: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _sources() -> tuple[SourceFeatureObservation, ...]:
@@ -259,6 +278,121 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
             observation.automatic_visual_confidence or 0.0, 0.81
         )
 
+    def test_real_pose_adapters_preserve_source_exact_two_sample_sidecars(self) -> None:
+        current = tuple(0.10 + index * 0.001 for index in range(60))
+        following = tuple(0.12 + index * 0.001 for index in range(60))
+        visual = source_observation_from_visual_cache_payload(
+            "source-temporal",
+            {
+                "pose_backend": POSE_BACKEND,
+                "pose_embedding": current,
+            },
+            following_numeric_features={
+                "pose_backend": POSE_BACKEND,
+                "pose_embedding": following,
+            },
+            interval_seconds=1.0 / 30.0,
+        )
+        assert visual.temporal_pose_sidecar is not None
+        self.assertEqual(
+            visual.temporal_pose_sidecar.sampling_contract,
+            STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
+        )
+        self.assertEqual(visual.temporal_pose_sidecar.embeddings, (current, following))
+        self.assertEqual(
+            visual.temporal_pose_sidecar.producer_backend,
+            POSE_BACKEND,
+        )
+        self.assertEqual(
+            STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND,
+            POSE_BACKEND,
+        )
+        self.assertIs(
+            materialize_stage_edit_source_candidate(visual).temporal_pose_sidecar,
+            visual.temporal_pose_sidecar,
+        )
+
+        timeline = source_observation_from_timeline_candidate(
+            TimelineCandidate(
+                segment_index=0,
+                source_id="source-temporal",
+                start_seconds=1.0,
+                end_seconds=2.0,
+                entry_pose_embedding=current,
+                exit_pose_embedding=following,
+            )
+        )
+        self.assertIsNone(timeline.temporal_pose_sidecar)
+
+        trusted_timeline = source_observation_from_timeline_candidate(
+            SimpleNamespace(
+                source_id="source-temporal",
+                duration_seconds=1.0,
+                entry_pose_embedding=current,
+                exit_pose_embedding=following,
+                pose_backends=(POSE_BACKEND, POSE_BACKEND, POSE_BACKEND),
+            )
+        )
+        assert trusted_timeline.temporal_pose_sidecar is not None
+        self.assertEqual(
+            trusted_timeline.temporal_pose_sidecar.sampling_contract,
+            STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT,
+        )
+        self.assertEqual(
+            trusted_timeline.temporal_pose_sidecar.interval_seconds,
+            1.0,
+        )
+
+        forged_timeline = source_observation_from_timeline_candidate(
+            SimpleNamespace(
+                source_id="source-temporal",
+                duration_seconds=1.0,
+                entry_pose_embedding=current,
+                exit_pose_embedding=following,
+                pose_backends=(
+                    f"{POSE_BACKEND}_forged",
+                    POSE_BACKEND,
+                    POSE_BACKEND,
+                ),
+            )
+        )
+        self.assertIsNone(forged_timeline.temporal_pose_sidecar)
+
+        for forged_backend in (
+            "forged_backend",
+            "none",
+            "opencv_zoo_mediapipe_pose",
+            f"{POSE_BACKEND}_forged",
+        ):
+            with self.subTest(forged_backend=forged_backend):
+                forged = source_observation_from_visual_cache_payload(
+                    "source-temporal",
+                    {
+                        "pose_backend": forged_backend,
+                        "pose_embedding": current,
+                    },
+                    following_numeric_features={
+                        "pose_backend": forged_backend,
+                        "pose_embedding": following,
+                    },
+                    interval_seconds=1.0 / 30.0,
+                )
+                self.assertIsNone(forged.temporal_pose_sidecar)
+
+        fallback = source_observation_from_visual_cache_payload(
+            "source-temporal",
+            {
+                "pose_backend": POSE_BACKEND,
+                "pose_embedding": current,
+            },
+            following_numeric_features={
+                "pose_backend": "structure_hog_fallback",
+                "pose_embedding": following,
+            },
+            interval_seconds=1.0 / 30.0,
+        )
+        self.assertIsNone(fallback.temporal_pose_sidecar)
+
     def test_real_pose_and_formation_features_have_fixed_masks_without_padding(self) -> None:
         pose = [(-0.5 if index % 2 == 0 else 0.5) for index in range(60)]
         layout = [0.25 for _ in range(134)]
@@ -434,6 +568,103 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
         legacy["schema_version"] = 1
         with self.assertRaisesRegex(ValueError, "unsupported.*version"):
             StageEditFeatureSnapshot.from_dict(legacy)
+
+    def test_v3_sidecar_is_hash_bound_and_v2_loads_as_explicit_missing(self) -> None:
+        first = tuple(0.10 + index * 0.001 for index in range(60))
+        second = tuple(0.12 + index * 0.001 for index in range(60))
+        observation = source_observation_from_visual_cache_payload(
+            "A",
+            {
+                "pose_backend": POSE_BACKEND,
+                "pose_embedding": first,
+            },
+            following_numeric_features={
+                "pose_backend": POSE_BACKEND,
+                "pose_embedding": second,
+            },
+            interval_seconds=0.04,
+        )
+        snapshot = materialize_stage_edit_feature_snapshot(
+            "ive:temporal-snapshot",
+            (StageEditFeatureFrame(0.5, (observation,)),),
+            performance_end_seconds=1.0,
+        )
+        payload = snapshot.to_dict()
+        audit = snapshot.temporal_pose_sidecar_audit()
+        self.assertEqual(audit["status"], "v3_hash_bound_temporal_sidecar")
+        self.assertEqual(audit["observed_sidecar_count"], 1)
+        self.assertTrue(audit["sidecar_hash_bound"])
+        self.assertFalse(audit["enters_transformer_tensors"])
+        self.assertEqual(
+            payload["tokens"][0]["source_candidates"][0][
+                "temporal_pose_sidecar"
+            ]["producer_backend"],
+            POSE_BACKEND,
+        )
+
+        tampered = deepcopy(payload)
+        tampered["tokens"][0]["source_candidates"][0][
+            "temporal_pose_sidecar"
+        ]["embeddings"][1][0] += 0.01
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            StageEditFeatureSnapshot.from_dict(tampered)
+
+        forged_producer = deepcopy(payload)
+        forged_producer["tokens"][0]["source_candidates"][0][
+            "temporal_pose_sidecar"
+        ]["producer_backend"] = f"{POSE_BACKEND}_forged"
+        unsigned_forged = deepcopy(forged_producer)
+        unsigned_forged.pop("snapshot_sha256")
+        forged_producer["snapshot_sha256"] = _snapshot_payload_sha256(
+            unsigned_forged
+        )
+        with self.assertRaisesRegex(ValueError, "producer backend is not trusted"):
+            StageEditFeatureSnapshot.from_dict(forged_producer)
+
+        legacy = deepcopy(payload)
+        legacy["schema_version"] = FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        legacy["provenance"]["producer"] = (
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2
+        )
+        for token in legacy["tokens"]:
+            for candidate in token["source_candidates"]:
+                candidate.pop("temporal_pose_sidecar")
+        legacy["input_policy"] = {
+            "training_inference_materializer_shared": True,
+            "reference_attribution_match_inputs_present": False,
+            "selected_labels_present": False,
+            "missing_values_are_explicitly_masked": True,
+            "source_availability_and_hard_gate_are_distinct": True,
+        }
+        unsigned = deepcopy(legacy)
+        unsigned.pop("snapshot_sha256")
+        legacy["snapshot_sha256"] = _snapshot_payload_sha256(unsigned)
+        restored = StageEditFeatureSnapshot.from_dict(legacy)
+        legacy_audit = restored.temporal_pose_sidecar_audit()
+        self.assertEqual(
+            restored.schema_version,
+            FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            legacy_audit["status"],
+            "legacy_v2_explicit_temporal_sidecar_missing",
+        )
+        self.assertEqual(legacy_audit["observed_sidecar_count"], 0)
+        self.assertFalse(legacy_audit["sidecar_hash_bound"])
+        self.assertFalse(
+            legacy_audit["pose_direction_or_velocity_proven_by_snapshot_alone"]
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "snapshot v2 cannot carry a temporal pose sidecar",
+        ):
+            StageEditFeatureSnapshot(
+                sequence=snapshot.sequence,
+                token_schema_fingerprint=restored.token_schema_fingerprint,
+                provenance=restored.provenance,
+                snapshot_sha256=restored.snapshot_sha256,
+                schema_version=FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+            )
 
     def test_reference_training_and_inference_consume_identical_snapshot(self) -> None:
         times = (0.0, 0.5, 1.0, 1.75, 2.5, 3.25)

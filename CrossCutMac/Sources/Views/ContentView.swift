@@ -361,7 +361,9 @@ struct ContentView: View {
                     HStack {
                         Label("자동 수집 목표", systemImage: "lock.fill")
                         Spacer()
-                        Text("최대 \(EditRequest.automaticMemberSourceCount)개")
+                        Text(
+                            "\(EditRequest.automaticMemberSourceCount)개 목표 · 최소 \(EditRequest.minimumAutomaticMemberSourceCount)개"
+                        )
                             .font(.body.monospacedDigit().weight(.semibold))
                             .foregroundStyle(.purple)
                     }
@@ -384,7 +386,7 @@ struct ContentView: View {
 
                 Text(
                     editMode == .member
-                        ? "공식 세로 직캠 10개를 우선 찾고, 부족하면 최소 8개를 전부 균등하게 돌려 씁니다."
+                        ? "공식 세로 직캠 10개를 목표로 찾고, 최소 4개만 통과해도 컷 밀도를 줄이지 않습니다. 같은 소스의 다른 시간대를 비인접 구간에 균형 재사용합니다."
                         : desiredSourceCount == 10
                             ? "공식 음방 10개를 먼저 찾고, 검증을 통과한 영상이 8개뿐이면 8개로 진행합니다."
                             : "직접 선택한 \(desiredSourceCount)개는 모두 확보해야 진행합니다."
@@ -886,7 +888,7 @@ struct ContentView: View {
                 ? "음방 10개 목표 · 최소 8개로 교차편집"
                 : "음방 \(automaticSourceCount)개를 찾아 교차편집"
         case .member:
-            return "\(targetMember.rawValue) 직캠 \(automaticSourceCount)개를 찾아 교차편집"
+            return "\(targetMember.rawValue) 직캠 10개 목표 · 최소 4개로 교차편집"
         }
     }
 
@@ -895,13 +897,13 @@ struct ContentView: View {
         case .group:
             return "IVE·곡명 제목으로 공식 음방 채널을 우선하고, 같은 곡 영상만 수집한 다음 음원으로 맞추고 편집합니다."
         case .member:
-            return "IVE·곡명 제목으로 \(targetMember.rawValue) 공식 세로 직캠만 수집합니다. 원본 화면을 유지한 채 같은 안무 시각과 컷 전후 위치·동작이 자연스러운 소스를 골라 편집합니다."
+            return "IVE·곡명 제목으로 \(targetMember.rawValue) 공식 세로 직캠만 수집합니다. 원본 화면을 유지하고, 컷 바로 양쪽의 포즈·실루엣·피사체 움직임으로 동작 중 연결을 우선합니다."
         }
     }
 
     private var editModeDetail: String {
         if sourceMode == .automatic, editMode == .member {
-            return "공식 대상 멤버 세로 직캠을 최대 10개, 최소 8개 확보해 같은 곡 시각으로 맞춘 뒤, 모든 소스를 균등하게 돌려 쓰며 위치·동작이 자연스러운 하드 컷으로 연결합니다."
+            return "공식 대상 멤버 세로 직캠 10개를 목표로 하되 소스 하한만 4개입니다. 전환 밀도는 그대로 유지하고, 같은 직캠의 다른 시간대를 인접 반복 없이 균형 재사용하며 컷 양쪽 동작 연결을 우선합니다."
         }
         return editMode.detail
     }
@@ -913,7 +915,7 @@ struct ContentView: View {
                 ? "곡명 입력 → 공식 음악방송 메타데이터 수집 → 10개 목표·최소 8개 자동 다운로드 → 자동 교차편집"
                 : "곡명 입력 → 공식 음악방송 메타데이터 수집 → 음방 \(automaticSourceCount)개 자동 다운로드 → 자동 교차편집"
         case .member:
-            return "곡명 입력 → 대상 멤버 공식 직캠 메타데이터 수집 → 직캠 \(automaticSourceCount)개 자동 다운로드 → 자동 교차직캠"
+            return "곡명 입력 → 공식 직캠 10개 목표·최소 4개 수집 → 밀도 유지 시간차 재사용 → 자동 교차직캠"
         }
     }
 

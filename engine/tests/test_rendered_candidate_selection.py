@@ -408,7 +408,9 @@ class RenderedCandidateSelectionTests(unittest.TestCase):
                 minimum_required_candidate_count=3,
                 render_review=fake,
                 professional_reference_profile=quality_profile,
-                professional_reference_cadence_profile=cadence_profile,  # type: ignore[arg-type]
+                professional_reference_cadence_profile=(
+                    cadence_profile  # type: ignore[arg-type]
+                ),
             )
 
         self.assertEqual(result.selected_candidate_index, 1)
@@ -818,6 +820,121 @@ class RenderedCandidateSelectionTests(unittest.TestCase):
 
         self.assertEqual(result.selected_candidate_index, 1)
 
+    def test_professional_dynamics_tie_uses_editorial_ranking_score(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = tuple(
+                RenderedCandidate(
+                    index,
+                    _plan(index),
+                    90.0,
+                    rank_metadata=RenderedCandidateRankMetadata(17.0),
+                )
+                for index in range(2)
+            )
+            reviews = {
+                0: {
+                    **_professional_payload(
+                        score=80.0,
+                        introduced=1,
+                        native=41,
+                    ),
+                    "ranking_weighted_score": 79.0,
+                },
+                1: {
+                    **_professional_payload(
+                        score=79.9,
+                        introduced=1,
+                        native=41,
+                    ),
+                    "ranking_weighted_score": 80.2,
+                },
+            }
+
+            def fake(plan: RenderPlan, _output: Path):
+                index = int(plan.output.stem.split("-")[-1])
+                return (plan, RenderedProxyReview(reviews[index]))
+
+            result = review_rendered_candidates(
+                candidates,
+                scratch_directory=root,
+                maximum_review_count=2,
+                minimum_required_candidate_count=2,
+                render_review=fake,
+                professional_reference_profile=_professional_profile(root),
+            )
+
+        self.assertEqual(result.selected_candidate_index, 1)
+        self.assertEqual(result.selected.weighted_score, 79.9)
+        self.assertEqual(result.selected.ranking_weighted_score, 80.2)
+
+    def test_professional_cadence_tie_uses_editorial_ranking_score(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cadence_profile = _SyntheticCadenceProfile()
+            candidates = tuple(
+                RenderedCandidate(
+                    index,
+                    _cadence_plan(index, 1.4),
+                    90.0,
+                    rank_metadata=RenderedCandidateRankMetadata(17.0),
+                )
+                for index in range(2)
+            )
+            reviews = {
+                0: {
+                    **_professional_payload(
+                        score=80.0,
+                        introduced=1,
+                        native=41,
+                    ),
+                    "ranking_weighted_score": 79.0,
+                },
+                1: {
+                    **_professional_payload(
+                        score=79.9,
+                        introduced=1,
+                        native=41,
+                    ),
+                    "ranking_weighted_score": 80.2,
+                },
+            }
+
+            def fake(plan: RenderPlan, _output: Path):
+                index = int(plan.output.stem.split("-")[-1])
+                payload = reviews[index]
+                payload["proxy"].update(
+                    {
+                        "fps": plan.fps,
+                        "decoded_frame_count": plan.output_frame_count,
+                        "duration_seconds": plan.render_duration,
+                    }
+                )
+                payload["boundaries"] = [
+                    {
+                        "cut_frame_index": int(round(1.4 * plan.fps)),
+                        "outgoing_source_index": 0,
+                        "incoming_source_index": 1,
+                    }
+                ]
+                return (plan, RenderedProxyReview(payload))
+
+            result = review_rendered_candidates(
+                candidates,
+                scratch_directory=root,
+                maximum_review_count=2,
+                minimum_required_candidate_count=2,
+                render_review=fake,
+                professional_reference_profile=_professional_profile(root),
+                professional_reference_cadence_profile=(
+                    cadence_profile  # type: ignore[arg-type]
+                ),
+            )
+
+        self.assertEqual(result.selected_candidate_index, 1)
+        self.assertEqual(result.selected.weighted_score, 79.9)
+        self.assertEqual(result.selected.ranking_weighted_score, 80.2)
+
     def test_no_profile_preserves_legacy_rank_and_schema(self) -> None:
         candidates = (
             RenderedCandidate(
@@ -856,6 +973,56 @@ class RenderedCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(serialized["analysis_basis"], ANALYSIS_BASIS)
         self.assertEqual(serialized["selection_basis"], SELECTION_BASIS)
         self.assertNotIn("professional_plateau_rerank", serialized)
+
+    def test_separate_editorial_ranking_score_does_not_mutate_technical_score(
+        self,
+    ) -> None:
+        candidates = (
+            RenderedCandidate(0, _plan(0), 90.0),
+            RenderedCandidate(1, _plan(1), 90.0),
+        )
+        reviews = {
+            0: {
+                **_payload(
+                    passed=True,
+                    score=80.0,
+                    issues=0.0,
+                    p10=80.0,
+                ),
+                "ranking_weighted_score": 79.0,
+            },
+            1: {
+                **_payload(
+                    passed=True,
+                    score=79.5,
+                    issues=0.0,
+                    p10=79.5,
+                ),
+                "ranking_weighted_score": 80.5,
+            },
+        }
+
+        def fake(plan: RenderPlan, _output: Path):
+            index = int(plan.output.stem.split("-")[-1])
+            return (plan, RenderedProxyReview(reviews[index]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = review_rendered_candidates(
+                candidates,
+                scratch_directory=Path(directory),
+                maximum_review_count=2,
+                minimum_required_candidate_count=2,
+                render_review=fake,
+            )
+
+        self.assertEqual(result.selected_candidate_index, 1)
+        self.assertEqual(result.selected.weighted_score, 79.5)
+        self.assertEqual(result.selected.ranking_weighted_score, 80.5)
+        selected = next(
+            item for item in result.to_dict()["candidates"] if item["selected"]
+        )
+        self.assertEqual(selected["weighted_score"], 79.5)
+        self.assertEqual(selected["ranking_weighted_score"], 80.5)
 
     def test_rank_metadata_is_strict(self) -> None:
         with self.assertRaisesRegex(ValueError, "finite and non-negative"):

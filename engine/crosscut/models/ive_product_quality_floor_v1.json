@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "analysis_basis": "ive_automatic_group_delivery_product_quality_floor_v1",
+  "scope": {
+    "artist": "IVE",
+    "edit_mode": "group",
+    "source_mode": "automatic"
+  },
+  "i_am_absolute_minimum_baseline": {
+    "song": "I AM",
+    "analysis_sha256": "43accf583a7749243ddaab2c9b8b6040e8eaab5d52016c24e31668d1efc2e16e",
+    "metrics": {
+      "close_duration_fraction": 0.32152109124843137,
+      "nonwide_duration_fraction": 0.5143116148397875,
+      "maximum_consecutive_wide_run_seconds": 7.331084476681127
+    },
+    "semantics": {
+      "fractions_denominator": "whole_song_known_shot_scale_duration",
+      "nonwide": "explicit_medium_plus_close",
+      "wide_run": "maximal_contiguous_wide_or_full_choices"
+    }
+  },
+  "legacy_fallback_policy": {
+    "eligible_only_when_stage_edit_generation_absent": true,
+    "eligible_only_when_role_conditioned_evidence_absent": true,
+    "close_duration_fraction_comparison": "greater_than_or_equal",
+    "nonwide_duration_fraction_comparison": "greater_than_or_equal",
+    "maximum_consecutive_wide_run_seconds_comparison": "less_than_or_equal",
+    "new_generation_missing_role_conditioned_evidence_fails_closed": true
+  },
+  "delivery_policy": {
+    "evaluation_order": [
+      "role_conditioned_professional_review",
+      "whole_song_i_am_absolute_minimum"
+    ],
+    "modern_role_conditioned_review_must_pass": true,
+    "modern_whole_song_i_am_absolute_floor_must_pass": true,
+    "selected_failed_pre_review_requires_successful_repair_lineage": true,
+    "other_artist_or_mode_behavior_unchanged": true
+  }
+}

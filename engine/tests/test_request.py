@@ -513,26 +513,35 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(request.target_member, IVEMember.GAEUL)
         self.assertEqual(request.member_anchors, ())
 
-    def test_automatic_member_accepts_eight_to_ten_requested_sources(self) -> None:
-        for requested_count in (8, 9, 10):
-            with self.subTest(requested_count=requested_count):
-                request = AnalysisRequest.from_dict(
-                    {
-                        "song": "I AM",
-                        "edit_mode": "member",
-                        "aspect_ratio": "9:16",
-                        "target_member": "가을",
-                        "source_mode": "automatic",
-                        "desired_source_count": requested_count,
-                        "sources": [],
-                    }
-                )
-                self.assertEqual(request.desired_source_count, requested_count)
+    def test_automatic_member_keeps_target_ten_with_four_source_floor(self) -> None:
+        request = AnalysisRequest.from_dict(
+            {
+                "song": "I AM",
+                "edit_mode": "member",
+                "aspect_ratio": "9:16",
+                "target_member": "가을",
+                "source_mode": "automatic",
+                "desired_source_count": 10,
+                "sources": [],
+            }
+        )
+        self.assertEqual(request.desired_source_count, 10)
+        self.assertEqual(request.automatic_source_count_floor, 4)
+        with tempfile.TemporaryDirectory() as temp:
+            sources = [Path(temp) / f"fancam-{index}.mp4" for index in range(4)]
+            for source in sources:
+                source.touch()
+            self.assertEqual(
+                len(request.with_materialized_sources(sources).sources),
+                4,
+            )
+            with self.assertRaisesRegex(ValueError, "between 4 and 10"):
+                request.with_materialized_sources(sources[:3])
 
-        for requested_count in (7, 11, 24):
+        for requested_count in (4, 8, 9, 11, 24):
             with self.subTest(requested_count=requested_count), self.assertRaisesRegex(
                 ValueError,
-                "between 8 and 10",
+                "must remain 10",
             ):
                 AnalysisRequest.from_dict(
                     {
@@ -579,7 +588,7 @@ class RequestTests(unittest.TestCase):
                 }
             )
 
-    def test_materialized_automatic_member_accepts_only_empty_anchors(self) -> None:
+    def test_materialized_automatic_member_accepts_four_to_ten_with_empty_anchors(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sources = [root / f"fancam-{index}.mp4" for index in range(11)]
@@ -599,8 +608,8 @@ class RequestTests(unittest.TestCase):
             deferred = request.with_materialized_sources(sources[:10], member_anchors=())
             self.assertEqual(deferred.member_anchors, ())
             self.assertEqual(
-                len(request.with_materialized_sources(sources[:8]).sources),
-                8,
+                len(request.with_materialized_sources(sources[:4]).sources),
+                4,
             )
             self.assertEqual(
                 len(request.with_materialized_sources(sources[:9]).sources),
@@ -631,9 +640,9 @@ class RequestTests(unittest.TestCase):
                     member_anchors=complete,
                 )
 
-            with self.assertRaisesRegex(ValueError, "between 8 and 10"):
-                request.with_materialized_sources(sources[:7], member_anchors=())
-            with self.assertRaisesRegex(ValueError, "between 8 and 10"):
+            with self.assertRaisesRegex(ValueError, "between 4 and 10"):
+                request.with_materialized_sources(sources[:3], member_anchors=())
+            with self.assertRaisesRegex(ValueError, "between 4 and 10"):
                 request.with_materialized_sources(sources, member_anchors=())
 
     def test_member_request(self) -> None:

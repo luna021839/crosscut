@@ -20,9 +20,17 @@ from crosscut.rhythm import (
     TempoEstimate,
 )
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
-from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
+from crosscut.stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_CONTRACT,
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
 from crosscut.stage_edit_feature_snapshot_job import (
     ACTION_FORMATION_EXTRACTION_CONTRACT,
+    FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    FEATURE_SNAPSHOT_JOB_INPUT_POLICY,
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+    FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
     _SAFE_ARTIFACT_ID,
     _reference_scaffold,
     _write_content_addressed_json,
@@ -374,6 +382,9 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                     motion=(0.01, -0.02),
                     primary_face_bbox=(0.3, 0.2, 0.2, 0.3),
                     color_embedding=(0.5, 0.4, 0.6, 0.1, 0.1, 0.1, 0.7, 0.2),
+                    pose_embedding=(0.1 + scalar * 0.01,) * 60,
+                    pose_confidence=0.8,
+                    pose_backend="opencv_zoo_mediapipe_pose_2023mar",
                 )
 
             with patch(
@@ -455,7 +466,26 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                 result.snapshots["ref-e2e"].read_text(encoding="utf-8")
             )
             manifest_payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest_payload["schema_version"], 2)
+            self.assertEqual(
+                manifest_payload["schema_version"],
+                FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                manifest_payload["analysis_basis"],
+                FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+            )
+            self.assertEqual(
+                manifest_payload["input_policy"],
+                dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY),
+            )
+            self.assertEqual(
+                manifest_payload["feature_provenance"]["producer"],
+                FEATURE_MATERIALIZER_CONTRACT,
+            )
+            self.assertEqual(
+                set(manifest_payload["feature_provenance"]["contracts"]),
+                set(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS),
+            )
             self.assertIn(
                 ACTION_FORMATION_EXTRACTION_CONTRACT,
                 manifest_payload["feature_provenance"]["contracts"],
@@ -464,7 +494,26 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                 "model_pose60_observed_time_count",
                 manifest_payload["statistics"]["per_source"]["A"],
             )
+            self.assertGreater(
+                manifest_payload["statistics"]["per_source"]["A"][
+                    "temporal_pose60_sidecar_observed_time_count"
+                ],
+                0,
+            )
+            self.assertTrue(
+                manifest_payload["input_policy"][
+                    "temporal_pose_sidecars_hash_bound_in_snapshot_v3"
+                ]
+            )
             snapshot = StageEditFeatureSnapshot.from_dict(snapshot_payload)
+            self.assertEqual(
+                snapshot.schema_version,
+                FEATURE_MATERIALIZER_SCHEMA_VERSION,
+            )
+            self.assertGreater(
+                snapshot.temporal_pose_sidecar_audit()["observed_sidecar_count"],
+                0,
+            )
             self.assertEqual(
                 poisoned_result.snapshot_sha256["ref-e2e"],
                 snapshot.snapshot_sha256,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -53,6 +54,7 @@ from crosscut.stage_edit_semimarkov_beam import (
     StageEditHeadFrame,
     StageEditSemiMarkovConfig,
     StageEditSemiMarkovResult,
+    StageEditSourceContinuity,
 )
 from crosscut.stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_CHECKPOINT_FILENAME,
@@ -67,8 +69,41 @@ from crosscut.stage_edit_transformer import (
     SourceCandidateToken,
     StageEditReadinessReport,
     StageEditSequence,
+    StageEditTemporalPoseSidecar,
     StageEditToken,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
 )
+
+
+def _assert_no_raw_pose_vectors(
+    test: unittest.TestCase,
+    value: object,
+) -> None:
+    forbidden_keys = {
+        "pose_model_embedding",
+        "normalized_velocity",
+        "pose_embedding",
+        "embeddings",
+    }
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = str(key)
+            test.assertFalse(
+                normalized_key in forbidden_keys
+                or normalized_key.endswith("_pose_embedding")
+                or normalized_key.endswith("_normalized_velocity")
+                or normalized_key.endswith("_embeddings"),
+                key,
+            )
+            _assert_no_raw_pose_vectors(test, nested)
+    elif isinstance(value, list):
+        if value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            for item in value
+        ):
+            test.assertNotIn(len(value), {60, 120})
+        for nested in value:
+            _assert_no_raw_pose_vectors(test, nested)
 
 
 def _candidate(source_id: str, value: float) -> SourceCandidateToken:
@@ -355,6 +390,11 @@ def _typed_timelines(
         master_start_seconds=0.0,
         duration_seconds=2.0,
         editorial_transform=None,
+        to_dict=lambda: {
+            "source_index": 0,
+            "master_start_seconds": 0.0,
+            "duration_seconds": 2.0,
+        },
     )
     return tuple(
         StageEditBeamTimeline(
@@ -495,11 +535,80 @@ def _typed_direct_bridge_result(
             "continuity_authority": preflight.continuity_authority,
             "continuity_scorer_contract": expected_contract,
             "continuity_scorer_fingerprint": expected_fingerprint,
+            "temporal_pose_sidecar": (
+                preflight.snapshot.temporal_pose_sidecar_audit()
+            ),
         },
     )
 
 
 class StageEditPipelineBridgeTests(unittest.TestCase):
+    def test_bridge_result_recursively_redacts_all_raw_pose_vectors(self) -> None:
+        checkpoint = Path("/tmp/stageedit-vector-redaction").resolve()
+        preflight = StageEditPipelineBridgePreflight(
+            snapshot_path=Path("/tmp/stageedit-feature.json").resolve(),
+            checkpoint_directory=checkpoint,
+            source_ids=("source-a", "source-b"),
+            snapshot=_snapshot(),
+            readiness=_ready(checkpoint),
+        )
+        result = _typed_direct_bridge_result(preflight)
+        sidecar = StageEditTemporalPoseSidecar(
+            embeddings=((0.1,) * 60, (0.2,) * 60),
+            interval_seconds=0.04,
+            sampling_contract=(
+                STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+            ),
+        )
+        continuity = StageEditSourceContinuity(
+            pose_motion=0.5,
+            pose_model_embedding=(0.25,) * 60,
+            temporal_pose_sidecar=sidecar,
+        )
+        frame = replace(
+            result.head_materialization.frames[0],
+            source_continuity=(continuity, StageEditSourceContinuity()),
+        )
+        result = replace(
+            result,
+            head_materialization=replace(
+                result.head_materialization,
+                frames=(frame,),
+            ),
+        )
+
+        self.assertEqual(60, len(continuity.pose_model_embedding or ()))
+        self.assertEqual((2, 60), (len(sidecar.embeddings), len(sidecar.embeddings[0])))
+        payload = json.loads(json.dumps(result.to_dict()))
+        _assert_no_raw_pose_vectors(self, payload)
+        _assert_no_raw_pose_vectors(self, result.semimarkov.audit.to_dict())
+        with tempfile.TemporaryDirectory() as raw:
+            destination = result.write_json(Path(raw) / "bridge-result.json")
+            persisted = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertEqual(payload, persisted)
+        _assert_no_raw_pose_vectors(self, persisted)
+
+        evidence = payload["head_materialization"]["frames"][0][
+            "source_continuity"
+        ][0]
+        self.assertEqual(
+            64,
+            len(evidence["same_time_pose_evidence"]["content_sha256"]),
+        )
+        self.assertEqual(
+            64,
+            len(evidence["temporal_pose_evidence"]["content_sha256"]),
+        )
+        poisoned = replace(
+            result,
+            selection_policy={
+                **result.selection_policy,
+                "embeddings": [[0.0] * 60, [0.0] * 60],
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "forbidden raw pose vector"):
+            poisoned.to_dict()
+
     def test_bridge_result_rejects_untyped_preflight_before_cross_object_use(
         self,
     ) -> None:
@@ -767,6 +876,10 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                     source_ids=("source-a", "source-b"),
                 )
                 self.assertEqual(snapshot.snapshot_sha256, preflight.snapshot.snapshot_sha256)
+                self.assertEqual(
+                    preflight.to_dict()["temporal_pose_sidecar"],
+                    snapshot.temporal_pose_sidecar_audit(),
+                )
 
                 with self.assertRaisesRegex(
                     StageEditPipelineBridgeInputError, "exactly match"
@@ -1061,13 +1174,17 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             direct_sections.call_args.kwargs["checkpoint_directory"],
             preflight.checkpoint_directory,
         )
-        self.assertEqual(STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION, 3)
-        self.assertTrue(STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT.endswith("_v3"))
-        self.assertEqual(result.schema_version, 3)
+        self.assertEqual(STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION, 4)
+        self.assertTrue(STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT.endswith("_v4"))
+        self.assertEqual(result.schema_version, 4)
         self.assertEqual(result.contract, STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT)
         self.assertEqual(8, len(result.retained_candidates))
         self.assertFalse(result.selection_policy["selected_for_render"])
         self.assertFalse(result.selection_policy["visual_baseline_replaced"])
+        self.assertEqual(
+            result.selection_policy["temporal_pose_sidecar"],
+            preflight.snapshot.temporal_pose_sidecar_audit(),
+        )
         self.assertEqual(
             "legacy_identity_default_not_automatic_group_safe",
             result.selection_policy["source_derivative_policy"],

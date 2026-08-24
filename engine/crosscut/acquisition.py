@@ -1185,8 +1185,8 @@ def _ordered_for_download(
 
     Some short IVE promotions do not expose eight distinct date/program slots.
     A fullcam or one-take from an already represented broadcast is still a
-    genuinely different camera source and may be needed to reach the automatic
-    eight-source floor.  It must never displace that slot's canonical programme
+    genuinely different camera source and may be needed to reach the
+    request-scoped automatic source floor. It must never displace that slot's canonical programme
     cut, so variants are retained only in a second, round-robin lane after all
     canonical slots.
     """
@@ -1263,7 +1263,7 @@ def _select_promotion_date_cluster(
     cluster. The cluster with the broadest distinct broadcast-slot coverage
     wins, then total camera-source count and recency break ties. At least four
     distinct slots are required; camera variants may fill the remaining
-    automatic eight-source floor. Undated and cross-promotion clips cannot
+    request-scoped automatic source floor. Undated and cross-promotion clips cannot
     silently fill that floor.
     """
 
@@ -1409,7 +1409,7 @@ def _source_count_policy(request: AnalysisRequest) -> dict[str, Any]:
 
     minimum_count = _minimum_acceptable_source_count(request)
     if request.edit_mode is EditMode.MEMBER:
-        policy = "automatic_member_requested_target_minimum_eight"
+        policy = "automatic_member_target_ten_minimum_four"
     elif minimum_count < request.desired_source_count:
         policy = "default_group_target_ten_minimum_eight"
     else:
@@ -2778,7 +2778,7 @@ def acquire_sources(
     # The primary/fallback and standard/close-up lanes are ranked separately.
     # Their internal ordering has already placed all canonical programme slots
     # before alternate cameras; retaining those alternates is necessary when a
-    # short promotion exposes fewer than eight distinct weekly-show slots.
+    # short promotion exposes fewer distinct weekly-show slots than the target.
 
     portrait_contract_required = _requires_automatic_member_portrait_contract(
         request
@@ -2930,7 +2930,7 @@ def acquire_sources(
                 "substring_inside_another_title": "rejected",
                 "other_registered_ive_activity_in_same_title": "rejected",
                 "promotion_cluster": (
-                    "minimum_four_distinct_slots_and_eight_sources_then_"
+                    "minimum_four_distinct_slots_and_request_scoped_source_floor_then_"
                     "largest_slot_count_source_count_latest_tie"
                 ),
             },

@@ -46,12 +46,30 @@ from .visual_score import (
 )
 
 
-FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION = 2
+FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION = 3
 FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS = (
-    "synchronized_source_causal_stage_edit_feature_snapshot_v2"
+    "synchronized_source_causal_stage_edit_feature_snapshot_v3"
 )
 ACTION_FORMATION_EXTRACTION_CONTRACT = (
-    "identity_free_pose60_layout134_formation6x8x3_with_missing_masks_v1"
+    "identity_free_pose60_layout134_formation6x8x3_with_hash_bound_"
+    "current_next_temporal_pose_sidecar_and_missing_masks_v2"
+)
+FEATURE_SNAPSHOT_JOB_INPUT_POLICY: Mapping[str, bool] = {
+    "features_available_before_current_editorial_choice": True,
+    "strictly_past_causal_edit_history_only": True,
+    "reference_match_scores_present": False,
+    "selected_or_rejected_source_targets_present": False,
+    "raw_frames_persisted": False,
+    "identity_embeddings_persisted": False,
+    "identity_free_temporal_pose_sidecars_persisted": True,
+    "temporal_pose_sidecars_hash_bound_in_snapshot_v3": True,
+    "temporal_pose_sidecars_enter_transformer_tensors": False,
+}
+FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS = (
+    FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    ACTION_FORMATION_EXTRACTION_CONTRACT,
+    "reference_match_scores_and_current_or_future_targets_excluded",
+    "visual_descriptors_decoded_once_per_source_in_forward_order",
 )
 DEFAULT_VISUAL_WORKING_WIDTH = 480
 DEFAULT_NEGATIVE_SAMPLES_PER_HOLD = 2
@@ -460,6 +478,7 @@ def _source_observations(
         formation_people_count = 0
         formation_upper_body_count = 0
         formation_upper_body_person_count = 0
+        temporal_pose_sidecar_count = 0
         for timestamp in master_times:
             index = index_by_time[timestamp]
             numeric = numeric_by_index.get(index, {}) if index is not None else {}
@@ -496,7 +515,7 @@ def _source_observations(
                     formation_upper_body_person_count += upper_body_people
                     if upper_body_people:
                         formation_upper_body_count += 1
-            observations[timestamp] = source_observation_from_visual_cache_payload(
+            observation = source_observation_from_visual_cache_payload(
                 source.source_id,
                 numeric,
                 following_numeric_features=following,
@@ -505,6 +524,10 @@ def _source_observations(
                 sync_residual_normalized=source.sync_residual_normalized,
                 available=available,
                 hard_gate_passed=available and gate,
+            )
+            observations[timestamp] = observation
+            temporal_pose_sidecar_count += int(
+                observation.temporal_pose_sidecar is not None
             )
             feature_hash.update(
                 _canonical_bytes(
@@ -529,6 +552,9 @@ def _source_observations(
             "formation_upper_body_observed_time_count": formation_upper_body_count,
             "formation_upper_body_observed_person_count": (
                 formation_upper_body_person_count
+            ),
+            "temporal_pose60_sidecar_observed_time_count": (
+                temporal_pose_sidecar_count
             ),
             "decoded_unique_frame_count": len(decoded.frames),
             "hard_sync_gate_passed": gate,
@@ -717,12 +743,7 @@ def build_stage_edit_feature_snapshots(
     provenance = StageEditFeatureProvenance(
         upstream_sha256=tuple(provenance_items),
         analyzer_fingerprint_sha256=visual_analyzer_fingerprint_sha256(),
-        contracts=(
-            FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
-            ACTION_FORMATION_EXTRACTION_CONTRACT,
-            "reference_match_scores_and_current_or_future_targets_excluded",
-            "visual_descriptors_decoded_once_per_source_in_forward_order",
-        ),
+        contracts=FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
     )
 
     snapshot_paths: dict[str, Path] = {}
@@ -787,14 +808,7 @@ def build_stage_edit_feature_snapshots(
         "schema_version": FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
         "analysis_basis": FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
         "song_id": normalized_song,
-        "input_policy": {
-            "features_available_before_current_editorial_choice": True,
-            "strictly_past_causal_edit_history_only": True,
-            "reference_match_scores_present": False,
-            "selected_or_rejected_source_targets_present": False,
-            "raw_frames_persisted": False,
-            "identity_embeddings_persisted": False,
-        },
+        "input_policy": dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY),
         "sampling": {
             "negative_samples_per_hold": negative_samples_per_hold,
             "boundary_guard_seconds": boundary_guard_seconds,
@@ -920,6 +934,8 @@ __all__ = [
     "DEFAULT_NEGATIVE_SAMPLES_PER_HOLD",
     "DEFAULT_VISUAL_WORKING_WIDTH",
     "FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS",
+    "FEATURE_SNAPSHOT_JOB_INPUT_POLICY",
+    "FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS",
     "FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION",
     "StageEditFeatureSnapshotJobResult",
     "build_stage_edit_feature_snapshots",

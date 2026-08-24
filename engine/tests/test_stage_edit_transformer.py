@@ -11,6 +11,7 @@ import unittest
 import numpy as np
 
 from crosscut.render import EditorialTransformKeyframe
+from crosscut.pose import POSE_BACKEND
 from crosscut.stage_edit_dynamic_crop_head_v2 import (
     DynamicCropTrajectoryTargetV2,
     StageEditDynamicCropTargetSequenceV2,
@@ -43,11 +44,14 @@ from crosscut.stage_edit_transformer import (
     PRODUCTION_TRAINING_REPORT_FILENAME,
     PRODUCTION_TRAINING_RUN_KIND,
     STAGE_EDIT_CUT_THRESHOLD_SELECTION_CONTRACT,
+    STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
     STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
     SourceCandidateToken,
     StageEditLossContract,
     StageEditModelOutput,
     StageEditSequence,
+    StageEditTemporalPoseSidecar,
     StageEditTarget,
     StageEditTargetSequence,
     StageEditToken,
@@ -413,6 +417,95 @@ class StageEditMLXTests(unittest.TestCase):
         self.assertEqual(gate_mask[0, 0].tolist()[:4], [True, False, True, False])
         self.assertEqual(candidate_mask[1, 0].tolist()[:3], [True, False, False])
         self.assertEqual(np.asarray(batch.sequence_mask)[1].tolist(), [True, False, False])
+
+    def test_temporal_pose_sidecar_cannot_change_schema_or_tensors(self) -> None:
+        original = _sequence("sidecar-free")
+        first_token = original.tokens[0]
+        first_candidate = first_token.source_candidates[0]
+        sidecar = StageEditTemporalPoseSidecar(
+            embeddings=(
+                (0.1,) * 60,
+                (0.2,) * 60,
+            ),
+            interval_seconds=1.0 / 30.0,
+            sampling_contract=(
+                STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+            ),
+        )
+        self.assertEqual(POSE_BACKEND, STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND)
+        self.assertEqual(POSE_BACKEND, sidecar.producer_backend)
+        serialized_sidecar = sidecar.to_dict()
+        self.assertEqual(POSE_BACKEND, serialized_sidecar["producer_backend"])
+        restored_sidecar = StageEditTemporalPoseSidecar.from_dict(
+            serialized_sidecar
+        )
+        self.assertEqual(sidecar, restored_sidecar)
+        for forged_backend in (
+            None,
+            "none",
+            "opencv_zoo_mediapipe_pose",
+            f"{POSE_BACKEND}_forged",
+        ):
+            with self.subTest(forged_backend=forged_backend):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "producer backend is not trusted",
+                ):
+                    StageEditTemporalPoseSidecar(
+                        embeddings=((0.1,) * 60, (0.2,) * 60),
+                        interval_seconds=1.0 / 30.0,
+                        sampling_contract=(
+                            STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+                        ),
+                        producer_backend=forged_backend,
+                    )
+                forged_sidecar = dict(serialized_sidecar)
+                forged_sidecar["producer_backend"] = forged_backend
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "producer backend is not trusted",
+                ):
+                    StageEditTemporalPoseSidecar.from_dict(forged_sidecar)
+        with_sidecar = replace(
+            original,
+            sequence_id="sidecar-bound",
+            tokens=(
+                replace(
+                    first_token,
+                    source_candidates=(
+                        replace(first_candidate, temporal_pose_sidecar=sidecar),
+                        *first_token.source_candidates[1:],
+                    ),
+                ),
+                *original.tokens[1:],
+            ),
+        )
+        self.assertEqual(
+            SCHEMA.fingerprint,
+            "41f6e234f4522c5e99edb0879d18479ba56cf1d59b50896e8b8c123b070f88af",
+        )
+        self.assertEqual(SCHEMA.raw_source_dimension, 360)
+        with mx.stream(mx.cpu):
+            original_batch = tensorize_stage_edit_batch(
+                (original,), SCHEMA, self.config, device=mx.cpu
+            )
+            sidecar_batch = tensorize_stage_edit_batch(
+                (with_sidecar,), SCHEMA, self.config, device=mx.cpu
+            )
+            mx.eval(
+                original_batch.source_features,
+                sidecar_batch.source_features,
+                original_batch.context_features,
+                sidecar_batch.context_features,
+            )
+        np.testing.assert_array_equal(
+            np.asarray(original_batch.source_features),
+            np.asarray(sidecar_batch.source_features),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(original_batch.context_features),
+            np.asarray(sidecar_batch.context_features),
+        )
 
     def test_reference_supervision_adapter_keeps_only_observed_labels(self) -> None:
         sequence = _sequence()

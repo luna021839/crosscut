@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 from statistics import median
 import tempfile
 from typing import Any, Iterator, Mapping, Sequence
@@ -68,16 +70,36 @@ from .member_draft import (
 from .member_editorial_motion import build_member_editorial_motion_plan
 from .performance_range import estimate_shared_performance_range
 from .post_render_qa import (
+    INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
     PostRenderArtifactSet,
+    PostRenderQAEvaluationSnapshot,
+    PostRenderQAConfig,
+    cleanup_post_render_qa_snapshot,
     evaluate_and_write_post_render_qa,
+    fingerprint_post_render_artifacts,
+    materialize_post_render_qa_snapshot,
+    normalize_post_render_artifact_fingerprints,
+)
+from .ive_product_quality_floor import (
+    APP_RESULT_EXPOSURE_CONTRACT,
+    PRE_REVIEW_REPAIR_LINEAGE_CONTRACT,
 )
 from .professional_reference_gate import ProfessionalReferenceProfile
 from .professional_reference_cadence import (
     ProfessionalReferenceCadenceProfile,
 )
 from .professional_montage_policy import (
+    CLOSE_BURST_DURATION_STATISTIC_PATH,
+    CLOSE_BURST_SHOT_COUNT_STATISTIC_PATH,
+    CLOSE_BURST_SOURCE_SWITCH_FRACTION_STATISTIC_PATH,
+    REFERENCE_FLOOR_QUANTILE,
     ProfessionalMontagePolicy,
+    close_burst_policy_binding_sha256,
     load_professional_montage_policy,
+)
+from .professional_motion_cut_profile import (
+    ProfessionalMotionCutProfile,
+    load_professional_motion_cut_profile,
 )
 from .render import (
     RENDER_PLAN_SOURCE_INDEX_DOMAIN,
@@ -218,11 +240,18 @@ OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY = (
     "official_target_fancam_direct_full_frame"
 )
 AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT = (
-    "automatic_registered_stage_edit_mandatory_post_render_qa_v1"
+    "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
 )
 DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH = Path(
     "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
-    "ive-professional-montage-grammar-v1.json"
+    "ive-professional-montage-grammar-v2.json"
+)
+DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH = Path(
+    "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
+    "ive-professional-motion-cut-profile-v1.json"
+)
+DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256 = (
+    "005a21f79ab1e0b5de76d3299ca2f61b54eb460b88cfb2f88dd392d93e9419b6"
 )
 _DIRECT_MEMBER_TARGET_RUN_SECONDS = 3.9
 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE = 13.5
@@ -241,41 +270,583 @@ class AnalysisArtifact:
     output_paths: tuple[Path, ...]
 
 
+def _write_analysis_manifest_atomically(
+    path: Path,
+    manifest: Mapping[str, Any],
+) -> Path:
+    """Replace one analysis manifest without exposing a partial JSON state."""
+
+    destination = Path(path)
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+    persisted, _fingerprint = _read_stable_regular_file(destination)
+    if persisted != encoded.encode("utf-8"):
+        raise OSError("analysis manifest changed during atomic replacement")
+    return destination
+
+
+def _read_stable_regular_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    """Read bytes from a path-bound regular descriptor without following links."""
+
+    source = Path(path)
+    try:
+        path_before = source.lstat()
+        if not stat.S_ISREG(path_before.st_mode):
+            raise ValueError(f"not a regular non-symlink file: {source.name}")
+        resolved_before = source.resolve(strict=True)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (path_before.st_dev, path_before.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise ValueError(f"path changed before reading: {source.name}")
+            content = stream.read()
+            after = os.fstat(stream.fileno())
+            path_after = source.lstat()
+            resolved_after = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"could not read stable file {source.name}: {exc}") from exc
+    descriptor_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    final_descriptor_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    final_path_identity = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or descriptor_identity != final_descriptor_identity
+        or final_path_identity != final_descriptor_identity
+        or resolved_before != resolved_after
+        or len(content) != after.st_size
+    ):
+        raise ValueError(f"file changed while being read: {source.name}")
+    return (
+        content,
+        {
+            "path": str(resolved_after),
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        },
+    )
+
+
+def _persist_qa_input_analysis_snapshot(
+    analysis_path: Path,
+    *,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Preserve the exact pre-promotion analysis bytes for later audit."""
+
+    source = Path(analysis_path)
+    content, source_fingerprint = _read_stable_regular_file(source)
+    digest = str(source_fingerprint["sha256"])
+    if digest != expected_sha256:
+        raise ValueError("analysis content changed before QA snapshot persistence")
+    suffix = "-analysis.json"
+    if not source.name.endswith(suffix):
+        raise ValueError("QA input analysis path has an unsupported name")
+    base_name = source.name[: -len(suffix)]
+    destination = source.with_name(
+        f"{base_name}-qa-input-analysis-{digest[:16]}.json"
+    )
+    if destination.exists():
+        existing, _existing_fingerprint = _read_stable_regular_file(
+            destination
+        )
+        if existing != content:
+            raise FileExistsError("QA input analysis snapshot collision")
+    else:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(destination)
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+    persisted, persisted_fingerprint = _read_stable_regular_file(destination)
+    if persisted != content or persisted_fingerprint["sha256"] != digest:
+        raise ValueError("QA input analysis snapshot changed before promotion")
+    return persisted_fingerprint
+
+
+def _atomically_materialize_verified_snapshot_file(
+    source: Path,
+    destination: Path,
+    *,
+    expected_fingerprint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Move one verified snapshot inode onto its canonical delivery path."""
+
+    source_path = Path(source)
+    destination_path = Path(destination)
+    before = source_path.lstat()
+    expected_size = expected_fingerprint.get("size_bytes")
+    expected_sha256 = expected_fingerprint.get("sha256")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or before.st_size != expected_size
+        or not isinstance(expected_sha256, str)
+    ):
+        raise RuntimeError(
+            f"verified QA snapshot is no longer promotable: {source_path.name}"
+        )
+    source_identity = (before.st_dev, before.st_ino, before.st_size)
+    os.replace(source_path, destination_path)
+    after = destination_path.lstat()
+    destination_identity = (after.st_dev, after.st_ino, after.st_size)
+    if not stat.S_ISREG(after.st_mode) or destination_identity != source_identity:
+        raise RuntimeError(
+            f"QA snapshot inode promotion lost authority: {destination_path.name}"
+        )
+    return {
+        "path": str(destination_path.resolve()),
+        "size_bytes": expected_size,
+        "sha256": expected_sha256,
+        "materialization": "same_filesystem_atomic_inode_replace",
+        "snapshot_device": before.st_dev,
+        "snapshot_inode": before.st_ino,
+        "canonical_device": after.st_dev,
+        "canonical_inode": after.st_ino,
+        "inode_identity_preserved": True,
+    }
+
+
 def _enforce_automatic_stage_edit_post_render_qa(
     *,
     registered_stage_edit_bundle: RegisteredStageEditProductionBundle | None,
     manifest: dict[str, Any],
     manifest_path: Path,
     reporter: EventReporter,
+    automatic_ive_group_delivery: bool | None = None,
+    rendered_montage_config: RenderedMontageGrammarConfig | None = None,
 ) -> Path | None:
-    """Require PASS from the final-media QA only for registered automatic StageEdit.
+    """Require PASS from final-media QA for every automatic IVE GROUP delivery.
 
     The evaluator consumes the already persisted timestamp-bound analysis,
-    render-plan, candidate-selection, and final MP4.  Its report and the final
-    MP4 remain in place even when the verdict blocks the CLI success event.
+    render-plan, candidate-selection, and final MP4.  Automatic product media
+    remains an unexposed ``pending_qa`` artifact until this function atomically
+    promotes a passing report to ``delivery``.  A failed report is persisted
+    as ``rejected`` and can never be restored by the app as a completed result.
+    ``None`` retains the old direct-call inference for compatibility; the
+    production caller always supplies the explicit request-scoped decision.
     """
 
-    if registered_stage_edit_bundle is None:
+    required = (
+        registered_stage_edit_bundle is not None
+        if automatic_ive_group_delivery is None
+        else automatic_ive_group_delivery
+    )
+    if not isinstance(required, bool):
+        raise TypeError("automatic_ive_group_delivery must resolve to boolean")
+    if not required:
         return None
+    if required:
+        request_payload = manifest.get("request")
+        if not (
+            isinstance(request_payload, Mapping)
+            and str(request_payload.get("group", "")).strip().upper()
+            == "IVE"
+            and str(request_payload.get("edit_mode", "")).strip().lower()
+            == "group"
+            and str(request_payload.get("source_mode", "")).strip().lower()
+            == "automatic"
+        ):
+            raise RuntimeError(
+                "mandatory automatic IVE GROUP post-render QA lost its exact "
+                "request scope"
+            )
+        exposure = manifest.get("app_result_exposure")
+        render_payload = manifest.get("render")
+        if not (
+            manifest.get("artifact_role") == "pending_qa"
+            and isinstance(exposure, Mapping)
+            and exposure.get("contract") == APP_RESULT_EXPOSURE_CONTRACT
+            and exposure.get("video_output_exposed") is False
+            and exposure.get("delivery_completion_message_allowed") is False
+            and isinstance(render_payload, Mapping)
+            and render_payload.get("artifact_role") == "pending_qa"
+        ):
+            raise RuntimeError(
+                "mandatory automatic IVE GROUP post-render QA requires an "
+                "unexposed pending_qa artifact"
+            )
+    if rendered_montage_config is not None and not isinstance(
+        rendered_montage_config, RenderedMontageGrammarConfig
+    ):
+        raise TypeError(
+            "rendered_montage_config must be RenderedMontageGrammarConfig"
+        )
 
-    artifact_set = PostRenderArtifactSet.from_analysis_path(manifest_path)
+    declared_artifact_set = PostRenderArtifactSet.from_analysis_path(
+        manifest_path
+    )
+    evaluation_snapshot = materialize_post_render_qa_snapshot(
+        declared_artifact_set
+    )
+    try:
+        return _complete_automatic_stage_edit_post_render_qa(
+            registered_stage_edit_bundle=registered_stage_edit_bundle,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            reporter=reporter,
+            rendered_montage_config=rendered_montage_config,
+            evaluation_snapshot=evaluation_snapshot,
+        )
+    finally:
+        cleanup_post_render_qa_snapshot(evaluation_snapshot)
+
+
+def _complete_automatic_stage_edit_post_render_qa(
+    *,
+    registered_stage_edit_bundle: RegisteredStageEditProductionBundle | None,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    reporter: EventReporter,
+    rendered_montage_config: RenderedMontageGrammarConfig | None,
+    evaluation_snapshot: PostRenderQAEvaluationSnapshot,
+) -> Path:
+    """Evaluate, bind, and materialize one already-frozen QA artifact set."""
+
+    declared_artifact_set = evaluation_snapshot.declared_artifact_set
+    artifact_set = evaluation_snapshot.artifact_set
     reporter.status(
-        "등록된 StageEdit 최종 MP4를 전체 디코딩하고 "
+        "IVE GROUP 최종 MP4를 전체 디코딩하고 "
         "전문 후처리 QA를 실행하는 중…"
     )
+    qa_arguments: dict[str, Any] = {
+        "trusted_registered_stage_edit": (
+            True if registered_stage_edit_bundle is not None else None
+        )
+    }
+    if rendered_montage_config is not None:
+        qa_arguments["config"] = PostRenderQAConfig(
+            rendered_montage_grammar=rendered_montage_config
+        )
     report, report_path = evaluate_and_write_post_render_qa(
         artifact_set,
-        trusted_registered_stage_edit=True,
+        output_path=artifact_set.default_report_path,
+        declared_artifact_set=declared_artifact_set,
+        **qa_arguments,
     )
     report_payload = report.to_dict()
+    reported_input_fingerprints = report_payload.get(
+        "input_artifact_fingerprints"
+    )
+    try:
+        expected_input_fingerprints = (
+            normalize_post_render_artifact_fingerprints(
+                reported_input_fingerprints,
+                declared_artifact_set,
+            )
+            if isinstance(reported_input_fingerprints, Mapping)
+            else {}
+        )
+    except ValueError:
+        expected_input_fingerprints = {}
+    try:
+        current_input_fingerprints = (
+            normalize_post_render_artifact_fingerprints(
+                fingerprint_post_render_artifacts(artifact_set),
+                declared_artifact_set,
+            )
+        )
+    except ValueError:
+        current_input_fingerprints = {}
+    input_content_matches = bool(
+        expected_input_fingerprints.get("contract")
+        == INPUT_ARTIFACT_FINGERPRINT_CONTRACT
+        and expected_input_fingerprints == current_input_fingerprints
+    )
+    persisted_analysis_payload: dict[str, Any] | None = None
+    try:
+        raw_persisted_analysis = json.loads(
+            artifact_set.analysis_path.read_text(encoding="utf-8")
+        )
+        if isinstance(raw_persisted_analysis, dict):
+            persisted_analysis_payload = raw_persisted_analysis
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        persisted_analysis_payload = None
+    in_memory_manifest_matches_evaluated_analysis = bool(
+        persisted_analysis_payload is not None
+        and persisted_analysis_payload == manifest
+    )
+    qa_input_analysis_snapshot: dict[str, Any] = {}
+    expected_analysis_fingerprint = (
+        expected_input_fingerprints.get("analysis")
+    )
+    expected_analysis_sha256 = (
+        expected_analysis_fingerprint.get("sha256")
+        if isinstance(expected_analysis_fingerprint, Mapping)
+        else None
+    )
+    if (
+        input_content_matches
+        and in_memory_manifest_matches_evaluated_analysis
+        and isinstance(expected_analysis_sha256, str)
+    ):
+        try:
+            qa_input_analysis_snapshot = _persist_qa_input_analysis_snapshot(
+                artifact_set.analysis_path,
+                expected_sha256=expected_analysis_sha256,
+            )
+        except (OSError, ValueError, FileExistsError):
+            qa_input_analysis_snapshot = {}
+    input_binding_matches = bool(
+        input_content_matches
+        and in_memory_manifest_matches_evaluated_analysis
+        and qa_input_analysis_snapshot.get("sha256")
+        == expected_analysis_sha256
+    )
+    expected_report_path = artifact_set.default_report_path
+    candidate_report_path = Path(report_path)
+    report_path_contract_matches = False
+    try:
+        report_path_contract_matches = bool(
+            candidate_report_path.name == expected_report_path.name
+            and candidate_report_path.parent.resolve(strict=True)
+            == expected_report_path.parent.resolve(strict=True)
+            and not candidate_report_path.is_symlink()
+        )
+    except OSError:
+        report_path_contract_matches = False
+    report_content_fingerprint: dict[str, Any] = {}
+    persisted_report_matches = False
+    try:
+        report_bytes, report_content_fingerprint = _read_stable_regular_file(
+            candidate_report_path
+        )
+        persisted_report = json.loads(report_bytes.decode("utf-8"))
+        persisted_report_matches = bool(
+            report_path_contract_matches
+            and isinstance(persisted_report, Mapping)
+            and dict(persisted_report) == report_payload
+        )
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+        persisted_report_matches = False
+    snapshot_stable_through_promotion = False
+    if qa_input_analysis_snapshot:
+        try:
+            _snapshot_bytes, final_snapshot_fingerprint = (
+                _read_stable_regular_file(
+                    Path(str(qa_input_analysis_snapshot["path"]))
+                )
+            )
+            snapshot_stable_through_promotion = bool(
+                final_snapshot_fingerprint == qa_input_analysis_snapshot
+            )
+        except (KeyError, TypeError, ValueError):
+            snapshot_stable_through_promotion = False
+    report_stable_through_promotion = False
+    if persisted_report_matches:
+        try:
+            final_report_bytes, final_report_fingerprint = (
+                _read_stable_regular_file(candidate_report_path)
+            )
+            final_report_payload = json.loads(
+                final_report_bytes.decode("utf-8")
+            )
+            report_stable_through_promotion = bool(
+                final_report_fingerprint == report_content_fingerprint
+                and isinstance(final_report_payload, Mapping)
+                and dict(final_report_payload) == report_payload
+            )
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+            report_stable_through_promotion = False
+    pre_promotion_input_fingerprints: dict[str, Any] = {}
+    try:
+        pre_promotion_input_fingerprints = (
+            normalize_post_render_artifact_fingerprints(
+                fingerprint_post_render_artifacts(artifact_set),
+                declared_artifact_set,
+            )
+        )
+    except ValueError:
+        pre_promotion_input_fingerprints = {}
+    inputs_stable_through_promotion = bool(
+        input_content_matches
+        and pre_promotion_input_fingerprints == current_input_fingerprints
+    )
+    promotion_binding_passed = bool(
+        input_binding_matches
+        and persisted_report_matches
+        and inputs_stable_through_promotion
+        and snapshot_stable_through_promotion
+        and report_stable_through_promotion
+    )
+    effective_passed = bool(report.passed and promotion_binding_passed)
+    delivery_gate_verdict = "PASS" if effective_passed else "FAIL"
+    delivery_materialization: dict[str, Any] = {
+        "contract": "post_render_qa_verified_snapshot_materialization_v1",
+        "performed": False,
+        "input_artifacts": {},
+        "report": {},
+        "analysis_snapshot": {},
+    }
+    if promotion_binding_passed:
+        promoted_inputs: dict[str, Any] = {}
+        for key, source, destination in (
+            (
+                "render_plan",
+                artifact_set.render_plan_path,
+                declared_artifact_set.render_plan_path,
+            ),
+            (
+                "selection",
+                artifact_set.selection_path,
+                declared_artifact_set.selection_path,
+            ),
+            (
+                "video",
+                artifact_set.video_path,
+                declared_artifact_set.video_path,
+            ),
+        ):
+            promoted_inputs[key] = (
+                _atomically_materialize_verified_snapshot_file(
+                    source,
+                    destination,
+                    expected_fingerprint=pre_promotion_input_fingerprints[key],
+                )
+            )
+        delivery_materialization["performed"] = True
+        delivery_materialization["input_artifacts"] = promoted_inputs
+    if report_stable_through_promotion:
+        delivery_materialization["report"] = (
+            _atomically_materialize_verified_snapshot_file(
+                candidate_report_path,
+                declared_artifact_set.default_report_path,
+                expected_fingerprint=report_content_fingerprint,
+            )
+        )
+    if snapshot_stable_through_promotion:
+        snapshot_source = Path(str(qa_input_analysis_snapshot["path"]))
+        snapshot_destination = declared_artifact_set.output_directory / (
+            snapshot_source.name
+        )
+        delivery_materialization["analysis_snapshot"] = (
+            _atomically_materialize_verified_snapshot_file(
+                snapshot_source,
+                snapshot_destination,
+                expected_fingerprint=qa_input_analysis_snapshot,
+            )
+        )
+        qa_input_analysis_snapshot = {
+            "path": delivery_materialization["analysis_snapshot"]["path"],
+            "size_bytes": delivery_materialization["analysis_snapshot"][
+                "size_bytes"
+            ],
+            "sha256": delivery_materialization["analysis_snapshot"]["sha256"],
+        }
+    promotion_binding = {
+        "contract": "post_render_qa_delivery_promotion_binding_v1",
+        "input_artifact_contract": INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
+        "evaluated_input_artifacts": (
+            dict(expected_input_fingerprints)
+            if isinstance(expected_input_fingerprints, Mapping)
+            else {}
+        ),
+        "current_inputs_match_evaluated_content": input_content_matches,
+        "inputs_stable_through_promotion": inputs_stable_through_promotion,
+        "pre_promotion_input_artifacts": pre_promotion_input_fingerprints,
+        "in_memory_manifest_matches_evaluated_analysis": (
+            in_memory_manifest_matches_evaluated_analysis
+        ),
+        "pre_promotion_analysis_snapshot": qa_input_analysis_snapshot,
+        "persisted_report_matches_evaluator_payload": (
+            persisted_report_matches
+        ),
+        "report_path_matches_bound_default": report_path_contract_matches,
+        "report_stable_through_promotion": report_stable_through_promotion,
+        "report_content_fingerprint": report_content_fingerprint,
+        "evaluation_snapshot": evaluation_snapshot.to_dict(),
+        "delivery_materialization": delivery_materialization,
+        "passed": promotion_binding_passed,
+    }
+    promoted_report = delivery_materialization.get("report")
+    report_audit_path = str(
+        promoted_report.get("path")
+        if isinstance(promoted_report, Mapping) and promoted_report.get("path")
+        else report_content_fingerprint.get(
+            "path",
+            candidate_report_path.absolute(),
+        )
+    )
     provenance = {
         "contract": AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
         "required": True,
-        "activation": "automatic_registered_production_bundle",
+        "activation": (
+            "automatic_registered_production_bundle"
+            if registered_stage_edit_bundle is not None
+            else "automatic_request_scoped_ive_group_delivery"
+        ),
+        "ive_product_floor_required_independent_of_activation": True,
         "success_requires_pass": True,
-        "report_path": str(report_path.resolve()),
+        "report_path": report_audit_path,
         "verdict": report.verdict.value,
-        "passed": report.passed,
+        "passed": effective_passed,
+        "delivery_gate_verdict": delivery_gate_verdict,
+        "report_verdict": report.verdict.value,
+        "report_passed": report.passed,
         "analysis_basis": report.analysis_basis,
         "issue_count": report_payload.get("issue_count"),
         "fail_issue_count": report_payload.get("fail_issue_count"),
@@ -286,31 +857,55 @@ def _enforce_automatic_stage_edit_post_render_qa(
             "final_mp4_preserved": True,
             "qa_report_preserved": True,
             "analysis_manifest_preserved": True,
+            "app_result_exposure_blocked": not effective_passed,
         },
+        "promotion_binding": promotion_binding,
     }
+    # No delivery manifest is published until every unpromoted private clone,
+    # including a fallback full video copy, has been removed. The outer
+    # ``finally`` repeats this idempotently for evaluator and promotion errors.
+    cleanup_post_render_qa_snapshot(evaluation_snapshot)
+    final_role = "delivery" if effective_passed else "rejected"
+    exposure = {
+        "contract": APP_RESULT_EXPOSURE_CONTRACT,
+        "video_output_exposed": effective_passed,
+        "delivery_completion_message_allowed": effective_passed,
+    }
+    if (
+        not in_memory_manifest_matches_evaluated_analysis
+        and persisted_analysis_payload is not None
+    ):
+        manifest.clear()
+        manifest.update(deepcopy(persisted_analysis_payload))
+    manifest["artifact_role"] = final_role
+    manifest["app_result_exposure"] = dict(exposure)
     manifest["post_render_qa"] = dict(provenance)
     render_payload = manifest.get("render")
     if isinstance(render_payload, dict):
+        render_payload["artifact_role"] = final_role
+        render_payload["app_result_exposure"] = dict(exposure)
         render_payload["post_render_qa"] = dict(provenance)
     generation_payload = manifest.get("stage_edit_generation")
     if isinstance(generation_payload, dict):
         generation_payload["post_render_qa"] = dict(provenance)
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_analysis_manifest_atomically(manifest_path, manifest)
     reporter.log(
-        "StageEdit 최종 후처리 QA "
-        f"{report.verdict.value} · 보고서 {report_path}"
+        "IVE GROUP 최종 후처리 QA "
+        f"{report.verdict.value} · 보고서 {report_audit_path}"
     )
-    if not report.passed:
-        raise RuntimeError(
-            "automatic registered StageEdit final render blocked by mandatory "
-            f"post-render QA verdict {report.verdict.value}; final MP4 preserved "
-            f"at {artifact_set.video_path.resolve()}; QA report preserved at "
-            f"{report_path.resolve()}"
+    if not effective_passed:
+        failure_reason = (
+            f"post-render QA verdict {report.verdict.value}"
+            if not report.passed
+            else "post-render QA artifact content binding failure"
         )
-    return report_path.resolve()
+        raise RuntimeError(
+            "automatic IVE GROUP final render blocked by mandatory "
+            f"{failure_reason}; rejected media "
+            "is retained only for diagnostics and is not exposed as a "
+            f"completed result; QA report preserved at {report_audit_path}"
+        )
+    return Path(report_audit_path)
 
 
 def _materialize_ranked_visual_proxy_candidates(
@@ -3319,6 +3914,186 @@ def _review_stage_edit_bundle_montage(
     return review, analysis
 
 
+def _apply_bounded_human_target_proxy_rank(
+    payload: dict[str, Any],
+    montage_review: Mapping[str, Any],
+    *,
+    technical_passed: bool,
+) -> None:
+    """Apply bounded human-target rank signals without changing technical score.
+
+    Hard gates are evaluated first and cannot be rescued.  The close/non-wide
+    P50 terms are symmetric, while the P75 wide-run term saturates at or below
+    its target, so ever-more close-ups or ever-shorter wide shots cannot accrue
+    unbounded rank.  The raw decoded score remains authoritative and unchanged
+    for perceptual admission, repair, and final-media QA; only a separate
+    candidate-ranking score receives the editorial adjustment.  A qualifying
+    close-only burst is a separate zero-or-additive soft signal weighted by its
+    observed event support (six events / twenty references), so absence does
+    not lower the established three-component alignment.
+    """
+
+    aggregate = montage_review.get("highlight_aggregate")
+    soft_targets = (
+        aggregate.get("soft_targets")
+        if isinstance(aggregate, Mapping)
+        else None
+    )
+    raw_alignment = (
+        soft_targets.get("aggregate_alignment_score")
+        if isinstance(soft_targets, Mapping)
+        else None
+    )
+    hard_passed = bool(
+        technical_passed and montage_review.get("passed") is True
+    )
+    if raw_alignment is None:
+        if hard_passed:
+            raise RuntimeError(
+                "hard-passing montage review lacks bounded human-target "
+                "alignment evidence"
+            )
+        return
+    if (
+        isinstance(raw_alignment, bool)
+        or not isinstance(raw_alignment, (int, float))
+        or not math.isfinite(float(raw_alignment))
+        or not 0.0 <= float(raw_alignment) <= 1.0
+    ):
+        raise RuntimeError(
+            "rendered montage human-target alignment score is malformed"
+        )
+    raw_score = payload.get("weighted_score")
+    if (
+        isinstance(raw_score, bool)
+        or not isinstance(raw_score, (int, float))
+        or not math.isfinite(float(raw_score))
+    ):
+        raise RuntimeError("decoded proxy weighted score is malformed")
+    alignment = float(raw_alignment)
+    close_burst_evidence = (
+        soft_targets.get("close_only_multi_source_burst_event_p10")
+        if isinstance(soft_targets, Mapping)
+        else None
+    )
+    close_burst_bonus = 0.0
+    if close_burst_evidence is not None:
+        if not isinstance(close_burst_evidence, Mapping):
+            raise RuntimeError("rendered close-burst soft evidence is malformed")
+        close_alignment = close_burst_evidence.get("alignment_score")
+        support_weight = close_burst_evidence.get(
+            "event_occurrence_support_weight"
+        )
+        observed_event_count = close_burst_evidence.get("observed_event_count")
+        human_reference_count = close_burst_evidence.get(
+            "human_reference_count"
+        )
+        binding_active = close_burst_evidence.get("policy_binding_active")
+        if binding_active is False:
+            if any(
+                value is not None
+                for value in (
+                    close_alignment,
+                    support_weight,
+                    close_burst_evidence.get(
+                        "evidence_weighted_alignment_score"
+                    ),
+                    close_burst_evidence.get("policy_binding"),
+                )
+            ):
+                raise RuntimeError(
+                    "inactive rendered close-burst evidence claims an active "
+                    "score or policy binding"
+                )
+        elif not (
+            binding_active is True
+            and isinstance(close_burst_evidence.get("policy_binding"), Mapping)
+            and isinstance(observed_event_count, int)
+            and not isinstance(observed_event_count, bool)
+            and observed_event_count > 0
+            and isinstance(human_reference_count, int)
+            and not isinstance(human_reference_count, bool)
+            and human_reference_count > 0
+            and isinstance(close_alignment, (int, float))
+            and not isinstance(close_alignment, bool)
+            and math.isfinite(float(close_alignment))
+            and 0.0 <= float(close_alignment) <= 1.0
+            and isinstance(support_weight, (int, float))
+            and not isinstance(support_weight, bool)
+            and math.isfinite(float(support_weight))
+            and math.isclose(
+                float(support_weight),
+                min(1.0, observed_event_count / human_reference_count),
+                abs_tol=1.0e-12,
+            )
+        ):
+            raise RuntimeError(
+                "rendered close-burst policy binding or support weight is "
+                "malformed"
+            )
+        evidence_weighted = close_burst_evidence.get(
+            "evidence_weighted_alignment_score"
+        )
+        if evidence_weighted is not None:
+            if (
+                isinstance(evidence_weighted, bool)
+                or not isinstance(evidence_weighted, (int, float))
+                or not math.isfinite(float(evidence_weighted))
+                or not 0.0 <= float(evidence_weighted) <= 1.0
+            ):
+                raise RuntimeError(
+                    "rendered close-burst evidence-weighted score is malformed"
+                )
+            if not math.isclose(
+                float(evidence_weighted),
+                float(close_alignment) * float(support_weight),
+                abs_tol=1.0e-12,
+            ):
+                raise RuntimeError(
+                    "rendered close-burst evidence-weighted score disagrees "
+                    "with its hash-bound support"
+                )
+            close_burst_bonus = (
+                float(evidence_weighted) if hard_passed else 0.0
+            )
+    maximum_absolute_adjustment = 1.0
+    adjustment = (
+        maximum_absolute_adjustment * (2.0 * alignment - 1.0)
+        if hard_passed
+        else 0.0
+    )
+    adjusted = min(
+        100.0,
+        max(0.0, float(raw_score) + adjustment + close_burst_bonus),
+    )
+    payload["technical_proxy_weighted_score_before_human_target"] = float(
+        raw_score
+    )
+    payload["human_target_bounded_ranking"] = {
+        "contract": (
+            "hard_pass_bounded_symmetric_human_target_plus_evidence_"
+            "weighted_close_burst_rerank_v2"
+        ),
+        "eligible_only_after_technical_and_montage_hard_pass": True,
+        "eligible": hard_passed,
+        "aggregate_alignment_score": alignment,
+        "maximum_absolute_adjustment_points": maximum_absolute_adjustment,
+        "applied_adjustment_points": adjustment,
+        "close_burst_zero_or_additive_bonus_points": close_burst_bonus,
+        "close_burst_bonus_weight_is_observed_event_support_fraction": True,
+        "close_burst_absence_lowers_existing_alignment": False,
+        "total_applied_adjustment_points": adjustment + close_burst_bonus,
+        "technical_weighted_score": float(raw_score),
+        "adjusted_weighted_score": adjusted,
+        "closeup_target_is_symmetric": True,
+        "nonwide_target_is_symmetric": True,
+        "wide_run_reward_saturates_at_or_below_p75": True,
+        "over_close_past_target_is_rewarded": False,
+        "soft_target_evidence": deepcopy(dict(soft_targets)),
+    }
+    payload["ranking_weighted_score"] = adjusted
+
+
 def _review_complete_group_candidates(
     candidates: Sequence[_GroupRenderCandidateBundle],
     *,
@@ -3428,6 +4203,11 @@ def _review_complete_group_candidates(
         payload["rendered_montage_grammar_review"] = montage_review
         payload["passed"] = bool(
             technical_passed and montage_review.get("passed") is True
+        )
+        _apply_bounded_human_target_proxy_rank(
+            payload,
+            montage_review,
+            technical_passed=technical_passed,
         )
         return proxy_plan, RenderedProxyReview(payload)
 
@@ -5780,6 +6560,137 @@ def _load_stage_edit_montage_policy(
     return policy
 
 
+def _stage_edit_motion_cut_profile_manifest_payload(
+    profile: ProfessionalMotionCutProfile,
+    montage_policy: ProfessionalMontagePolicy,
+) -> dict[str, Any]:
+    """Bind motion calibration to its exact file and current montage source."""
+
+    if not isinstance(profile, ProfessionalMotionCutProfile):
+        raise TypeError("profile must be ProfessionalMotionCutProfile")
+    if not isinstance(montage_policy, ProfessionalMontagePolicy):
+        raise TypeError("montage_policy must be ProfessionalMontagePolicy")
+    source_path = profile.source_path
+    file_sha256 = profile.file_sha256
+    if (
+        not isinstance(source_path, Path)
+        or source_path.resolve()
+        != DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH.resolve()
+        or file_sha256
+        != DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
+    ):
+        raise RuntimeError(
+            "StageEdit motion-cut calibration file identity changed"
+        )
+    profile_payload = profile.to_dict()
+    provenance = profile_payload.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise RuntimeError("StageEdit motion-cut calibration lacks provenance")
+    source_montage_identity = provenance.get("source_montage_profile")
+    current_montage_identity = montage_policy.profile_identity
+    if (
+        not isinstance(source_montage_identity, Mapping)
+        or not isinstance(current_montage_identity, Mapping)
+        or dict(source_montage_identity) != dict(current_montage_identity)
+    ):
+        raise RuntimeError(
+            "StageEdit motion-cut calibration source montage identity differs "
+            "from the active montage policy"
+        )
+    recommendation = profile.recommendation
+    recommendation_payload = recommendation.to_dict()
+    if (
+        recommendation.hard_gate is not False
+        or recommendation.minimum_required_switches_per_section is not None
+        or recommendation.pose_phase_hard_threshold is not None
+    ):
+        raise RuntimeError(
+            "StageEdit motion-cut calibration attempted to create a hard gate"
+        )
+    return {
+        "path": str(source_path.resolve()),
+        "file_sha256": file_sha256,
+        "content_sha256": profile.profile_content_sha256,
+        "source_montage_profile_identity": deepcopy(
+            dict(source_montage_identity)
+        ),
+        "active_montage_policy_identity": deepcopy(
+            dict(current_montage_identity)
+        ),
+        "source_identity_binding_passed": True,
+        "recommendation": recommendation_payload,
+        "runtime_binding": {
+            "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+            "both_motion_minimum_pose_motion_p10": (
+                recommendation.both_moving_minimum_pose_motion
+            ),
+            "continuity_minimum_score_p10": (
+                recommendation.continuity_compatible_minimum_score
+            ),
+            "same_time_pose_cosine_soft_bonus_qualifier_p50": (
+                recommendation.pose_phase_compatible_preferred_cosine
+            ),
+            "soft_bonus_only": True,
+            "hard_gate": False,
+            "minimum_required_switches_per_section": None,
+            "highlight_minimum_motion_closeup_switch_boundaries": 0,
+            "direction_or_velocity_proven": False,
+        },
+        "direction_or_velocity_proven": False,
+    }
+
+
+def _load_stage_edit_motion_cut_profile(
+    *,
+    registered_bundle: RegisteredStageEditProductionBundle | None,
+    explicit_preflight: StageEditPipelineBridgePreflight | None,
+    montage_policy: ProfessionalMontagePolicy | None,
+) -> ProfessionalMotionCutProfile | None:
+    """Strict-load the fixed IVE motion calibration for every StageEdit path."""
+
+    if registered_bundle is None and explicit_preflight is None:
+        return None
+    if montage_policy is None:
+        raise RuntimeError(
+            "StageEdit motion-cut calibration requires the active montage policy"
+        )
+    profile = load_professional_motion_cut_profile(
+        DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
+        expected_file_sha256=(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
+        ),
+        # The raw profile is fixed by SHA-256 and its source montage identity
+        # is compared to the independently strict-loaded current policy below.
+        verify_source_inputs=False,
+    )
+    _stage_edit_motion_cut_profile_manifest_payload(profile, montage_policy)
+    return profile
+
+
+def _report_stage_edit_motion_cut_profile(
+    reporter: EventReporter,
+    payload: Mapping[str, Any],
+) -> None:
+    runtime = payload.get("runtime_binding")
+    if not isinstance(runtime, Mapping):
+        raise RuntimeError("StageEdit motion-cut reporter payload is incomplete")
+    reporter.emit(
+        "log",
+        message=(
+            "IVE 하이라이트 동작중 포즈 연결 soft qualifier 엄격 검증 완료 · "
+            f"path {payload['path']} · file SHA-256 "
+            f"{payload['file_sha256']} · content SHA-256 "
+            f"{payload['content_sha256']} · P10 motion "
+            f"{runtime['both_motion_minimum_pose_motion_p10']} · "
+            f"P10 continuity {runtime['continuity_minimum_score_p10']} · "
+            "P50 same-time pose cosine "
+            f"{runtime['same_time_pose_cosine_soft_bonus_qualifier_p50']} · "
+            "hard gate/quota 없음 · direction/velocity 증명 아님"
+        ),
+        professional_motion_cut_profile=deepcopy(dict(payload)),
+    )
+
+
 def _registered_stage_edit_bridge_kwargs(
     bundle: RegisteredStageEditProductionBundle,
 ) -> dict[str, Any]:
@@ -5878,9 +6789,86 @@ def _stage_edit_continuity_config_identity(
     return authority, contract, fingerprint
 
 
+def _professional_montage_policy_fingerprint(
+    policy: ProfessionalMontagePolicy,
+) -> str:
+    """Hash the exact immutable policy payload used by both production gates."""
+
+    if not isinstance(policy, ProfessionalMontagePolicy):
+        raise TypeError("policy must be ProfessionalMontagePolicy")
+    encoded = json.dumps(
+        policy.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _close_burst_binding_from_policy(
+    policy: ProfessionalMontagePolicy,
+    *,
+    policy_fingerprint_sha256: str,
+) -> tuple[int, str]:
+    """Resolve the sparse event P10s without inventing an occurrence quota."""
+
+    expected = (
+        (
+            policy.minimum_close_burst_shot_count,
+            CLOSE_BURST_SHOT_COUNT_STATISTIC_PATH,
+        ),
+        (
+            policy.minimum_close_burst_duration_seconds,
+            CLOSE_BURST_DURATION_STATISTIC_PATH,
+        ),
+        (
+            policy.minimum_close_burst_source_switch_fraction,
+            CLOSE_BURST_SOURCE_SWITCH_FRACTION_STATISTIC_PATH,
+        ),
+    )
+    counts = {item.reference_count for item, _path in expected}
+    if len(counts) != 1 or None in counts:
+        raise RuntimeError(
+            "professional montage close-burst event counts are incomplete"
+        )
+    for threshold, statistic_path in expected:
+        provenance = threshold.provenance
+        if not (
+            provenance.profile_identity == policy.identity
+            and provenance.statistic_path == statistic_path
+            and provenance.statistic == "observed_burst_event_distribution_p10"
+            and math.isclose(
+                provenance.quantile,
+                REFERENCE_FLOOR_QUANTILE,
+                abs_tol=1.0e-12,
+            )
+            and provenance.reference_floor_basis is None
+        ):
+            raise RuntimeError(
+                "professional montage close-burst provenance is not exact"
+            )
+    reference_count = int(next(iter(counts)))
+    binding = close_burst_policy_binding_sha256(
+        profile_identity=policy.identity,
+        policy_fingerprint_sha256=policy_fingerprint_sha256,
+        minimum_shot_count=policy.minimum_close_burst_shot_count.value,
+        minimum_duration_seconds=(
+            policy.minimum_close_burst_duration_seconds.value
+        ),
+        minimum_source_switch_fraction=(
+            policy.minimum_close_burst_source_switch_fraction.value
+        ),
+        event_reference_count=reference_count,
+    )
+    return reference_count, binding
+
+
 def _stage_edit_semimarkov_config_from_montage_policy(
     policy: ProfessionalMontagePolicy,
     *,
+    motion_cut_profile: ProfessionalMotionCutProfile | None = None,
+    require_motion_cut_calibration: bool = False,
     minimum_unique_sources: int = 3,
     maximum_source_occupancy_fraction: float = 0.60,
     continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY,
@@ -5889,7 +6877,39 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
     ),
 ) -> StageEditSemiMarkovConfig:
+    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if require_motion_cut_calibration or motion_cut_profile is not None:
+            raise RuntimeError(
+                "StageEdit learned continuity authority lacks a separately "
+                "calibrated authority-matched motion-cut profile"
+            )
+    elif continuity_authority != HANDCRAFTED_CONTINUITY_AUTHORITY:
+        raise RuntimeError(
+            "StageEdit motion-cut calibration continuity authority is unsupported"
+        )
+    if require_motion_cut_calibration and motion_cut_profile is None:
+        raise RuntimeError(
+            "active StageEdit path is missing its professional motion-cut "
+            "calibration"
+        )
+    motion_calibration = None
+    motion_recommendation = None
+    if motion_cut_profile is not None:
+        _stage_edit_motion_cut_profile_manifest_payload(
+            motion_cut_profile,
+            policy,
+        )
+        motion_calibration = motion_cut_profile.to_stage_edit_calibration()
+        motion_recommendation = motion_cut_profile.recommendation
     product = policy.product_editorial_requirements
+    identity = policy.identity
+    policy_fingerprint = _professional_montage_policy_fingerprint(policy)
+    close_burst_reference_count, close_burst_binding = (
+        _close_burst_binding_from_policy(
+            policy,
+            policy_fingerprint_sha256=policy_fingerprint,
+        )
+    )
     return StageEditSemiMarkovConfig(
         minimum_unique_sources=minimum_unique_sources,
         maximum_source_occupancy_fraction=maximum_source_occupancy_fraction,
@@ -5898,10 +6918,64 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         highlight_minimum_closeup_fraction=(
             policy.minimum_close_duration_fraction.value
         ),
-        # No non-wide duration reference floor exists.  This is an explicit
-        # IVE product editorial target, while close/burst/wide-transition
-        # floors below retain their profile provenance.
-        highlight_minimum_nonwide_fraction=0.35,
+        highlight_minimum_nonwide_fraction=(
+            policy.minimum_nonwide_duration_fraction.value
+        ),
+        highlight_pooled_product_minimum_closeup_fraction=(
+            policy.highlight_pooled_product_minimum_close_duration_fraction.value
+        ),
+        highlight_pooled_product_minimum_nonwide_fraction=(
+            policy.highlight_pooled_product_minimum_nonwide_duration_fraction.value
+        ),
+        highlight_preferred_closeup_fraction=(
+            policy.preferred_close_duration_fraction.value
+        ),
+        highlight_preferred_nonwide_fraction=(
+            policy.preferred_nonwide_duration_fraction.value
+        ),
+        highlight_maximum_consecutive_wide_run_seconds=(
+            policy.maximum_consecutive_wide_run_seconds.value
+        ),
+        highlight_preferred_maximum_consecutive_wide_run_seconds=(
+            policy.preferred_maximum_consecutive_wide_run_seconds.value
+        ),
+        highlight_policy_profile_analysis_basis=identity.analysis_basis,
+        highlight_policy_profile_schema_version=identity.schema_version,
+        highlight_policy_profile_path=identity.path,
+        highlight_policy_profile_file_sha256=identity.file_sha256,
+        highlight_policy_profile_content_sha256=identity.content_sha256,
+        highlight_policy_fingerprint_sha256=policy_fingerprint,
+        highlight_minimum_close_burst_shot_count=(
+            policy.minimum_close_burst_shot_count.value
+        ),
+        highlight_minimum_close_burst_duration_seconds=(
+            policy.minimum_close_burst_duration_seconds.value
+        ),
+        highlight_minimum_close_burst_source_switch_fraction=(
+            policy.minimum_close_burst_source_switch_fraction.value
+        ),
+        highlight_close_burst_event_reference_count=(
+            close_burst_reference_count
+        ),
+        highlight_close_burst_policy_binding_sha256=close_burst_binding,
+        highlight_motion_calibration=motion_calibration,
+        highlight_motion_boundary_minimum_pose_motion=(
+            motion_recommendation.both_moving_minimum_pose_motion
+            if motion_recommendation is not None
+            else None
+        ),
+        highlight_motion_boundary_minimum_continuity_score=(
+            motion_recommendation.continuity_compatible_minimum_score
+            if motion_recommendation is not None
+            else None
+        ),
+        highlight_motion_boundary_minimum_pose_phase_cosine=(
+            motion_recommendation.pose_phase_compatible_preferred_cosine
+            if motion_recommendation is not None
+            else None
+        ),
+        highlight_motion_boundary_minimum_sharpness=None,
+        highlight_minimum_motion_closeup_switch_boundaries=0,
         highlight_minimum_wide_involved_source_switch_fraction=(
             policy.minimum_wide_involved_source_switch_fraction.value
         ),
@@ -5943,11 +7017,275 @@ def _stage_edit_semimarkov_config_from_montage_policy(
 
 def _rendered_montage_config_from_policy(
     policy: ProfessionalMontagePolicy,
+    *,
+    require_complete_role_duration_policy: bool = False,
 ) -> RenderedMontageGrammarConfig:
     product = policy.product_editorial_requirements
+    identity = policy.identity
+    policy_fingerprint = _professional_montage_policy_fingerprint(policy)
+    close_burst_reference_count, close_burst_binding = (
+        _close_burst_binding_from_policy(
+            policy,
+            policy_fingerprint_sha256=policy_fingerprint,
+        )
+    )
+    role_policies = {
+        item.role: item for item in policy.role_conditioned_duration_policies
+    }
+    if len(role_policies) != len(policy.role_conditioned_duration_policies):
+        raise RuntimeError(
+            "professional montage policy has duplicate role-duration evidence"
+        )
+    expected_roles = {"build", "chorus_like", "bridge_like"}
+    unexpected_roles = set(role_policies) - expected_roles
+    if unexpected_roles:
+        raise RuntimeError(
+            "professional montage policy has unsupported role-duration evidence: "
+            + ", ".join(sorted(unexpected_roles))
+        )
+    missing_roles = expected_roles - set(role_policies)
+    if require_complete_role_duration_policy and missing_roles:
+        raise RuntimeError(
+            "production rendered montage policy requires complete build, "
+            "chorus_like, and bridge_like duration evidence; missing: "
+            + ", ".join(sorted(missing_roles))
+        )
+
+    default_config: RenderedMontageGrammarConfig | None = None
+
+    def fallback_config_value(field: str) -> Any:
+        nonlocal default_config
+        if default_config is None:
+            default_config = RenderedMontageGrammarConfig()
+        return getattr(default_config, field)
+
+    def required_role_value(
+        role: str,
+        attribute: str,
+        fallback_config_field: str,
+    ) -> float:
+        role_policy = role_policies.get(role)
+        if role_policy is None:
+            # Partial profiles remain usable by policy-loader unit tests.  The
+            # sole production call below opts into complete-role fail-closed
+            # validation, so these constructor defaults cannot mask missing
+            # build or bridge evidence in an automatic StageEdit render.
+            return float(fallback_config_value(fallback_config_field))
+        threshold = getattr(role_policy, attribute)
+        if threshold is None:
+            raise RuntimeError(
+                f"professional montage role {role!r} lacks required "
+                f"{attribute} evidence"
+            )
+        return float(threshold.value)
+
+    def optional_role_value(
+        role: str,
+        attribute: str,
+        fallback_config_field: str,
+    ) -> float | None:
+        role_policy = role_policies.get(role)
+        if role_policy is None:
+            fallback = fallback_config_value(fallback_config_field)
+            return None if fallback is None else float(fallback)
+        threshold = getattr(role_policy, attribute)
+        # A hash-bound zero P10 is intentionally represented by None.  Do not
+        # promote it to an unsupported positive local minimum.
+        return None if threshold is None else float(threshold.value)
+
+    def role_reference_count(
+        role: str,
+        fallback_config_field: str,
+    ) -> int:
+        role_policy = role_policies.get(role)
+        if role_policy is None:
+            return int(fallback_config_value(fallback_config_field))
+        return int(role_policy.reference_count)
+
     return RenderedMontageGrammarConfig(
-        minimum_closeup_fraction=policy.minimum_close_duration_fraction.value,
-        minimum_nonwide_fraction=0.35,
+        minimum_closeup_fraction=required_role_value(
+            "chorus_like",
+            "local_minimum_close_duration_fraction",
+            "minimum_closeup_fraction",
+        ),
+        minimum_nonwide_fraction=(
+            required_role_value(
+                "chorus_like",
+                "local_minimum_nonwide_duration_fraction",
+                "minimum_nonwide_fraction",
+            )
+        ),
+        pooled_product_minimum_closeup_fraction=(
+            policy.highlight_pooled_product_minimum_close_duration_fraction.value
+        ),
+        pooled_product_minimum_nonwide_fraction=(
+            policy.highlight_pooled_product_minimum_nonwide_duration_fraction.value
+        ),
+        preferred_closeup_fraction=(
+            policy.preferred_close_duration_fraction.value
+        ),
+        preferred_nonwide_fraction=(
+            policy.preferred_nonwide_duration_fraction.value
+        ),
+        maximum_consecutive_wide_run_seconds=(
+            required_role_value(
+                "chorus_like",
+                "maximum_consecutive_wide_run_seconds",
+                "maximum_consecutive_wide_run_seconds",
+            )
+        ),
+        preferred_maximum_consecutive_wide_run_seconds=(
+            policy.preferred_maximum_consecutive_wide_run_seconds.value
+        ),
+        chorus_role_pooled_product_minimum_closeup_fraction=(
+            required_role_value(
+                "chorus_like",
+                "pooled_product_minimum_close_duration_fraction",
+                "chorus_role_pooled_product_minimum_closeup_fraction",
+            )
+        ),
+        chorus_role_pooled_product_minimum_nonwide_fraction=(
+            required_role_value(
+                "chorus_like",
+                "pooled_product_minimum_nonwide_duration_fraction",
+                "chorus_role_pooled_product_minimum_nonwide_fraction",
+            )
+        ),
+        chorus_role_preferred_closeup_fraction=required_role_value(
+            "chorus_like",
+            "preferred_close_duration_fraction",
+            "chorus_role_preferred_closeup_fraction",
+        ),
+        chorus_role_preferred_nonwide_fraction=required_role_value(
+            "chorus_like",
+            "preferred_nonwide_duration_fraction",
+            "chorus_role_preferred_nonwide_fraction",
+        ),
+        chorus_role_preferred_maximum_consecutive_wide_run_seconds=(
+            required_role_value(
+                "chorus_like",
+                "preferred_maximum_consecutive_wide_run_seconds",
+                "chorus_role_preferred_maximum_consecutive_wide_run_seconds",
+            )
+        ),
+        build_minimum_closeup_fraction=optional_role_value(
+            "build",
+            "local_minimum_close_duration_fraction",
+            "build_minimum_closeup_fraction",
+        ),
+        build_minimum_nonwide_fraction=optional_role_value(
+            "build",
+            "local_minimum_nonwide_duration_fraction",
+            "build_minimum_nonwide_fraction",
+        ),
+        build_pooled_product_minimum_closeup_fraction=required_role_value(
+            "build",
+            "pooled_product_minimum_close_duration_fraction",
+            "build_pooled_product_minimum_closeup_fraction",
+        ),
+        build_pooled_product_minimum_nonwide_fraction=required_role_value(
+            "build",
+            "pooled_product_minimum_nonwide_duration_fraction",
+            "build_pooled_product_minimum_nonwide_fraction",
+        ),
+        build_preferred_closeup_fraction=required_role_value(
+            "build",
+            "preferred_close_duration_fraction",
+            "build_preferred_closeup_fraction",
+        ),
+        build_preferred_nonwide_fraction=required_role_value(
+            "build",
+            "preferred_nonwide_duration_fraction",
+            "build_preferred_nonwide_fraction",
+        ),
+        build_maximum_consecutive_wide_run_seconds=required_role_value(
+            "build",
+            "maximum_consecutive_wide_run_seconds",
+            "build_maximum_consecutive_wide_run_seconds",
+        ),
+        build_preferred_maximum_consecutive_wide_run_seconds=(
+            required_role_value(
+                "build",
+                "preferred_maximum_consecutive_wide_run_seconds",
+                "build_preferred_maximum_consecutive_wide_run_seconds",
+            )
+        ),
+        build_duration_reference_count=role_reference_count(
+            "build",
+            "build_duration_reference_count",
+        ),
+        bridge_minimum_closeup_fraction=optional_role_value(
+            "bridge_like",
+            "local_minimum_close_duration_fraction",
+            "bridge_minimum_closeup_fraction",
+        ),
+        bridge_minimum_nonwide_fraction=optional_role_value(
+            "bridge_like",
+            "local_minimum_nonwide_duration_fraction",
+            "bridge_minimum_nonwide_fraction",
+        ),
+        bridge_pooled_product_minimum_closeup_fraction=required_role_value(
+            "bridge_like",
+            "pooled_product_minimum_close_duration_fraction",
+            "bridge_pooled_product_minimum_closeup_fraction",
+        ),
+        bridge_pooled_product_minimum_nonwide_fraction=required_role_value(
+            "bridge_like",
+            "pooled_product_minimum_nonwide_duration_fraction",
+            "bridge_pooled_product_minimum_nonwide_fraction",
+        ),
+        bridge_preferred_closeup_fraction=required_role_value(
+            "bridge_like",
+            "preferred_close_duration_fraction",
+            "bridge_preferred_closeup_fraction",
+        ),
+        bridge_preferred_nonwide_fraction=required_role_value(
+            "bridge_like",
+            "preferred_nonwide_duration_fraction",
+            "bridge_preferred_nonwide_fraction",
+        ),
+        bridge_maximum_consecutive_wide_run_seconds=required_role_value(
+            "bridge_like",
+            "maximum_consecutive_wide_run_seconds",
+            "bridge_maximum_consecutive_wide_run_seconds",
+        ),
+        bridge_preferred_maximum_consecutive_wide_run_seconds=(
+            required_role_value(
+                "bridge_like",
+                "preferred_maximum_consecutive_wide_run_seconds",
+                "bridge_preferred_maximum_consecutive_wide_run_seconds",
+            )
+        ),
+        bridge_duration_reference_count=role_reference_count(
+            "bridge_like",
+            "bridge_duration_reference_count",
+        ),
+        highlight_product_minimum_source_switches_per_minute=(
+            policy.highlight_product_minimum_source_switches_per_minute.value
+        ),
+        highlight_preferred_source_switches_per_minute=(
+            policy.highlight_preferred_source_switches_per_minute.value
+        ),
+        highlight_cadence_reference_count=(
+            policy.highlight_cadence_reference_count
+        ),
+        policy_profile_analysis_basis=identity.analysis_basis,
+        policy_profile_schema_version=identity.schema_version,
+        policy_profile_path=identity.path,
+        policy_profile_file_sha256=identity.file_sha256,
+        policy_profile_content_sha256=identity.content_sha256,
+        policy_fingerprint_sha256=policy_fingerprint,
+        minimum_close_burst_shot_count=(
+            policy.minimum_close_burst_shot_count.value
+        ),
+        minimum_close_burst_duration_seconds=(
+            policy.minimum_close_burst_duration_seconds.value
+        ),
+        minimum_close_burst_source_switch_fraction=(
+            policy.minimum_close_burst_source_switch_fraction.value
+        ),
+        close_burst_event_reference_count=close_burst_reference_count,
+        close_burst_policy_binding_sha256=close_burst_binding,
         minimum_wide_involved_source_switch_fraction=(
             policy.minimum_wide_involved_source_switch_fraction.value
         ),
@@ -6105,6 +7443,20 @@ def analyze(
         registered_bundle=registered_stage_edit_bundle,
         explicit_preflight=stage_edit_generation_preflight,
     )
+    stage_edit_motion_cut_profile = _load_stage_edit_motion_cut_profile(
+        registered_bundle=registered_stage_edit_bundle,
+        explicit_preflight=stage_edit_generation_preflight,
+        montage_policy=stage_edit_montage_policy,
+    )
+    stage_edit_motion_cut_profile_payload = (
+        _stage_edit_motion_cut_profile_manifest_payload(
+            stage_edit_motion_cut_profile,
+            stage_edit_montage_policy,
+        )
+        if stage_edit_motion_cut_profile is not None
+        and stage_edit_montage_policy is not None
+        else None
+    )
     (
         stage_edit_continuity_authority,
         stage_edit_continuity_scorer_contract,
@@ -6116,6 +7468,8 @@ def analyze(
     stage_edit_semimarkov_config = (
         _stage_edit_semimarkov_config_from_montage_policy(
             stage_edit_montage_policy,
+            motion_cut_profile=stage_edit_motion_cut_profile,
+            require_motion_cut_calibration=True,
             minimum_unique_sources=(
                 MINIMUM_AUTOMATIC_SOURCE_COUNT
                 if request.source_mode is SourceMode.AUTOMATIC
@@ -6140,7 +7494,10 @@ def analyze(
         else None
     )
     rendered_montage_config = (
-        _rendered_montage_config_from_policy(stage_edit_montage_policy)
+        _rendered_montage_config_from_policy(
+            stage_edit_montage_policy,
+            require_complete_role_duration_policy=True,
+        )
         if stage_edit_montage_policy is not None
         else None
     )
@@ -6190,6 +7547,11 @@ def analyze(
             f"4곡/20편 · file SHA-256 "
             f"{stage_edit_montage_policy.identity.file_sha256[:12]} · "
             "대형 앵커→근접 연쇄→대형 복귀 게이트 활성화"
+        )
+    if stage_edit_motion_cut_profile_payload is not None:
+        _report_stage_edit_motion_cut_profile(
+            reporter,
+            stage_edit_motion_cut_profile_payload,
         )
     if registered_stage_edit_bundle is not None:
         reporter.log(
@@ -7150,6 +8512,55 @@ def analyze(
                             )
                         )
                         return
+                    pre_review_failures = _pre_review_hard_failure_codes(
+                        materialized
+                    )
+                    if pre_review_failures:
+                        repair = bundle.boundary_repairs
+                        if repair is None or repair.changed_count < 1:
+                            candidate_post_repair_review_rejections.append(
+                                {
+                                    **_post_repair_review_rejection_payload(
+                                        materialized,
+                                        bundle,
+                                    ),
+                                    "delivery_lineage_failure": (
+                                        "failed_pre_review_without_changed_"
+                                        "boundary_repair"
+                                    ),
+                                }
+                            )
+                            return
+                        bundle = replace(
+                            bundle,
+                            candidate_lineage=bundle.candidate_lineage
+                            + (
+                                {
+                                    "stage": (
+                                        "pre_review_failure_repair_validation"
+                                    ),
+                                    "contract": (
+                                        PRE_REVIEW_REPAIR_LINEAGE_CONTRACT
+                                    ),
+                                    "candidate_index": (
+                                        materialized.candidate_index
+                                    ),
+                                    "pre_review_passed": False,
+                                    "pre_review_hard_failure_codes": list(
+                                        pre_review_failures
+                                    ),
+                                    "boundary_repair_analysis_basis": (
+                                        repair.analysis_basis
+                                    ),
+                                    "boundary_repair_changed_count": (
+                                        repair.changed_count
+                                    ),
+                                    "post_repair_timeline_review_passed": True,
+                                    "post_repair_hard_failure_codes": [],
+                                    "delivery_eligible": True,
+                                },
+                            ),
+                        )
                     derived.append(bundle)
 
                 for materialized in materialized_group_candidates:
@@ -7904,6 +9315,11 @@ def analyze(
                     technical_proxy_passed
                     and rendered_montage_grammar_review_payload.get("passed")
                     is True
+                )
+                _apply_bounded_human_target_proxy_rank(
+                    rendered_proxy_review_payload,
+                    rendered_montage_grammar_review_payload,
+                    technical_passed=technical_proxy_passed,
                 )
             final_proxy_passed = bool(
                 rendered_proxy_review_payload is not None
@@ -8834,6 +10250,24 @@ def analyze(
                 "안전하게 정렬된 소스 2개와 박자 분석이 필요해 멤버 영상을 만들지 않았습니다."
             )
 
+    automatic_ive_group_artifact = bool(
+        request.source_mode is SourceMode.AUTOMATIC
+        and request.edit_mode is EditMode.GROUP
+    )
+    artifact_role: str | None = None
+    if automatic_ive_group_artifact:
+        if rendered_video_path is None:
+            artifact_role = "diagnostic"
+        elif allow_failed_comparison_render:
+            artifact_role = "comparison"
+        else:
+            # A rendered file is not a product result yet.  Mandatory final
+            # media QA below is the sole authority that may promote this
+            # unexposed state to ``delivery``.
+            artifact_role = "pending_qa"
+    if render_payload is not None and artifact_role is not None:
+        render_payload["artifact_role"] = artifact_role
+
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "created_at": timestamp.isoformat(),
@@ -8928,6 +10362,11 @@ def analyze(
                 "professional_montage_policy": (
                     stage_edit_montage_policy.to_dict()
                     if stage_edit_montage_policy is not None
+                    else None
+                ),
+                "professional_motion_cut_profile": (
+                    deepcopy(stage_edit_motion_cut_profile_payload)
+                    if stage_edit_motion_cut_profile_payload is not None
                     else None
                 ),
             }
@@ -9034,24 +10473,48 @@ def analyze(
             used_direct_full_frame=(member_direct_full_frame_payload is not None),
         ),
     }
+    if automatic_ive_group_artifact:
+        manifest["artifact_role"] = artifact_role
+        manifest["app_result_exposure"] = {
+            "contract": APP_RESULT_EXPOSURE_CONTRACT,
+            "video_output_exposed": artifact_role == "delivery",
+            "delivery_completion_message_allowed": artifact_role == "delivery",
+        }
     if stage_edit_candidate_rerank_result is not None:
         manifest["stage_edit_candidate_rerank"] = (
             stage_edit_candidate_rerank_result.to_dict()
         )
     filename = f"{base_filename}-analysis.json"
     manifest_path = request.output_directory / filename
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _write_analysis_manifest_atomically(manifest_path, manifest)
     mandatory_post_render_qa_path = (
         _enforce_automatic_stage_edit_post_render_qa(
             registered_stage_edit_bundle=registered_stage_edit_bundle,
             manifest=manifest,
             manifest_path=manifest_path,
             reporter=reporter,
+            automatic_ive_group_delivery=bool(
+                request.source_mode is SourceMode.AUTOMATIC
+                and request.edit_mode is EditMode.GROUP
+                and not request.acquire_only
+                and rendered_video_path is not None
+                and artifact_role == "pending_qa"
+            ),
+            rendered_montage_config=rendered_montage_config,
         )
     )
+    if automatic_ive_group_artifact:
+        promoted_role = manifest.get("artifact_role")
+        if promoted_role not in {
+            "diagnostic",
+            "comparison",
+            "delivery",
+        }:
+            raise RuntimeError(
+                "automatic IVE GROUP artifact did not reach a terminal "
+                "exposure state"
+            )
+        artifact_role = str(promoted_role)
     reporter.progress(1.0, "분석 결과를 저장했습니다.")
     output_paths = [manifest_path]
     if render_plan_path is not None:
@@ -9073,7 +10536,9 @@ def analyze(
         output_paths.append(source_derivative_audit_path)
     if mandatory_post_render_qa_path is not None:
         output_paths.append(mandatory_post_render_qa_path)
-    if rendered_video_path is not None:
+    if rendered_video_path is not None and (
+        not automatic_ive_group_artifact or artifact_role == "delivery"
+    ):
         output_paths.append(rendered_video_path)
     output_paths.extend(timeline_interchange_paths)
     return AnalysisArtifact(

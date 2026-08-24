@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import json
 import math
@@ -24,10 +25,14 @@ from crosscut.member_draft import (
     SegmentSubjectSample,
 )
 from crosscut.pipeline import (
+    DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH,
+    DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256,
+    DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
     ELIGIBLE_SOURCE_INDEX_DOMAIN,
     OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,
     REQUEST_SOURCE_INDEX_DOMAIN,
     _GroupRenderCandidateBundle,
+    _apply_bounded_human_target_proxy_rank,
     _alignment_eligibility,
     _attempt_proxy_triggered_partial_reedit,
     _attach_direct_member_editorial_motion_tracks,
@@ -46,6 +51,7 @@ from crosscut.pipeline import (
     _member_render_selection_basis,
     _materialize_ranked_visual_proxy_candidates,
     _load_learned_reviewer_session,
+    _load_stage_edit_motion_cut_profile,
     _load_professional_reference_profile,
     _load_professional_reference_cadence_profile,
     _review_visual_timeline_for_render,
@@ -54,9 +60,29 @@ from crosscut.pipeline import (
     _safe_slug,
     _source_index_mapping,
     _stage_edit_montage_analysis_payload,
+    _stage_edit_motion_cut_profile_manifest_payload,
+    _stage_edit_semimarkov_config_from_montage_policy,
+    _report_stage_edit_motion_cut_profile,
+    _rendered_montage_config_from_policy,
     _strip_superseded_exact_stage_edit_shot_clocks,
     _with_index_domain,
     analyze,
+)
+from crosscut.post_render_qa import (
+    PostRenderArtifactSet,
+    fingerprint_post_render_artifacts,
+)
+from crosscut.professional_montage_policy import (
+    load_professional_montage_policy,
+)
+from crosscut.professional_motion_cut_profile import (
+    load_professional_motion_cut_profile,
+)
+from crosscut.stage_edit_continuity_authority import (
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
 )
 from crosscut.audio import AlignmentResult, SourceAlignment
 from crosscut.media import AudioStreamInfo, MediaInfo, VideoStreamInfo
@@ -293,6 +319,51 @@ class _MemoryReporter:
         self.emit("log", message=message)
 
 
+def _persist_mock_bound_qa_report(
+    artifact_set: object,
+    *,
+    verdict: str,
+    output_path: Path | None = None,
+) -> tuple[SimpleNamespace, Path]:
+    passed = verdict == "PASS"
+    fingerprints = fingerprint_post_render_artifacts(artifact_set)  # type: ignore[arg-type]
+    payload = {
+        "issue_count": 0 if passed else 1,
+        "fail_issue_count": 0,
+        "conditional_issue_count": 0 if passed else 1,
+        "input_artifact_fingerprints": fingerprints,
+    }
+    report = SimpleNamespace(
+        verdict=SimpleNamespace(value=verdict),
+        passed=passed,
+        analysis_basis="fixture_post_render_qa",
+        to_dict=lambda: dict(payload),
+    )
+    destination = Path(
+        output_path or artifact_set.default_report_path  # type: ignore[attr-defined]
+    )
+    destination.write_text(json.dumps(payload), encoding="utf-8")
+    return report, destination
+
+
+def _persist_post_render_artifact_shell(
+    manifest_path: Path,
+    manifest: dict[str, object],
+) -> None:
+    base = manifest_path.name[: -len("-analysis.json")]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (manifest_path.parent / f"{base}-render-plan.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (
+        manifest_path.parent
+        / f"{base}-rendered-candidate-selection.json"
+    ).write_text("{}", encoding="utf-8")
+    (manifest_path.parent / f"{base}-group-crosscut.mp4").write_bytes(
+        b"fixture final mp4"
+    )
+
+
 class _VisualSelectionStub:
     def __init__(self, source_indices: tuple[int, ...], source_count: int) -> None:
         self.source_indices = source_indices
@@ -378,6 +449,459 @@ def _visual_choice(
 
 
 class PipelineTests(unittest.TestCase):
+    def test_default_ive_montage_profile_is_release_v2(self) -> None:
+        self.assertEqual(
+            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH,
+            Path(
+                "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
+                "ive-professional-montage-grammar-v2.json"
+            ),
+        )
+
+    def test_rendered_montage_config_binds_hash_bound_role_policy_and_cadence(
+        self,
+    ) -> None:
+        policy = load_professional_montage_policy(
+            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        )
+        roles = {
+            item.role: item
+            for item in policy.role_conditioned_duration_policies
+        }
+        self.assertEqual(
+            {"build", "chorus_like", "bridge_like"},
+            set(roles),
+        )
+        config = _rendered_montage_config_from_policy(
+            policy,
+            require_complete_role_duration_policy=True,
+        )
+
+        field_bindings = {
+            "minimum_closeup_fraction": (
+                "chorus_like",
+                "local_minimum_close_duration_fraction",
+            ),
+            "minimum_nonwide_fraction": (
+                "chorus_like",
+                "local_minimum_nonwide_duration_fraction",
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                "chorus_like",
+                "maximum_consecutive_wide_run_seconds",
+            ),
+            "chorus_role_pooled_product_minimum_closeup_fraction": (
+                "chorus_like",
+                "pooled_product_minimum_close_duration_fraction",
+            ),
+            "chorus_role_pooled_product_minimum_nonwide_fraction": (
+                "chorus_like",
+                "pooled_product_minimum_nonwide_duration_fraction",
+            ),
+            "chorus_role_preferred_closeup_fraction": (
+                "chorus_like",
+                "preferred_close_duration_fraction",
+            ),
+            "chorus_role_preferred_nonwide_fraction": (
+                "chorus_like",
+                "preferred_nonwide_duration_fraction",
+            ),
+            "chorus_role_preferred_maximum_consecutive_wide_run_seconds": (
+                "chorus_like",
+                "preferred_maximum_consecutive_wide_run_seconds",
+            ),
+            "build_minimum_closeup_fraction": (
+                "build",
+                "local_minimum_close_duration_fraction",
+            ),
+            "build_minimum_nonwide_fraction": (
+                "build",
+                "local_minimum_nonwide_duration_fraction",
+            ),
+            "build_pooled_product_minimum_closeup_fraction": (
+                "build",
+                "pooled_product_minimum_close_duration_fraction",
+            ),
+            "build_pooled_product_minimum_nonwide_fraction": (
+                "build",
+                "pooled_product_minimum_nonwide_duration_fraction",
+            ),
+            "build_preferred_closeup_fraction": (
+                "build",
+                "preferred_close_duration_fraction",
+            ),
+            "build_preferred_nonwide_fraction": (
+                "build",
+                "preferred_nonwide_duration_fraction",
+            ),
+            "build_maximum_consecutive_wide_run_seconds": (
+                "build",
+                "maximum_consecutive_wide_run_seconds",
+            ),
+            "build_preferred_maximum_consecutive_wide_run_seconds": (
+                "build",
+                "preferred_maximum_consecutive_wide_run_seconds",
+            ),
+            "bridge_minimum_closeup_fraction": (
+                "bridge_like",
+                "local_minimum_close_duration_fraction",
+            ),
+            "bridge_minimum_nonwide_fraction": (
+                "bridge_like",
+                "local_minimum_nonwide_duration_fraction",
+            ),
+            "bridge_pooled_product_minimum_closeup_fraction": (
+                "bridge_like",
+                "pooled_product_minimum_close_duration_fraction",
+            ),
+            "bridge_pooled_product_minimum_nonwide_fraction": (
+                "bridge_like",
+                "pooled_product_minimum_nonwide_duration_fraction",
+            ),
+            "bridge_preferred_closeup_fraction": (
+                "bridge_like",
+                "preferred_close_duration_fraction",
+            ),
+            "bridge_preferred_nonwide_fraction": (
+                "bridge_like",
+                "preferred_nonwide_duration_fraction",
+            ),
+            "bridge_maximum_consecutive_wide_run_seconds": (
+                "bridge_like",
+                "maximum_consecutive_wide_run_seconds",
+            ),
+            "bridge_preferred_maximum_consecutive_wide_run_seconds": (
+                "bridge_like",
+                "preferred_maximum_consecutive_wide_run_seconds",
+            ),
+        }
+        for config_field, (role_name, policy_field) in field_bindings.items():
+            with self.subTest(config_field=config_field):
+                threshold = getattr(roles[role_name], policy_field)
+                expected = None if threshold is None else threshold.value
+                self.assertEqual(expected, getattr(config, config_field))
+
+        self.assertIsNone(config.build_minimum_closeup_fraction)
+        self.assertIsNone(config.build_minimum_nonwide_fraction)
+        self.assertIsNone(config.bridge_minimum_closeup_fraction)
+        self.assertGreater(
+            config.build_pooled_product_minimum_nonwide_fraction,
+            0.0,
+        )
+        self.assertGreater(
+            config.bridge_pooled_product_minimum_nonwide_fraction,
+            0.0,
+        )
+        self.assertEqual(
+            roles["build"].reference_count,
+            config.build_duration_reference_count,
+        )
+        self.assertEqual(
+            roles["bridge_like"].reference_count,
+            config.bridge_duration_reference_count,
+        )
+        self.assertEqual(
+            policy.highlight_product_minimum_source_switches_per_minute.value,
+            config.highlight_product_minimum_source_switches_per_minute,
+        )
+        self.assertEqual(
+            policy.highlight_preferred_source_switches_per_minute.value,
+            config.highlight_preferred_source_switches_per_minute,
+        )
+        self.assertEqual(
+            policy.highlight_cadence_reference_count,
+            config.highlight_cadence_reference_count,
+        )
+        self.assertAlmostEqual(
+            18.642084765823732,
+            config.highlight_product_minimum_source_switches_per_minute,
+        )
+        self.assertAlmostEqual(
+            23.505554096533405,
+            config.highlight_preferred_source_switches_per_minute,
+        )
+        self.assertEqual(
+            policy.minimum_close_burst_shot_count.value,
+            config.minimum_close_burst_shot_count,
+        )
+        self.assertEqual(
+            policy.minimum_close_burst_duration_seconds.value,
+            config.minimum_close_burst_duration_seconds,
+        )
+        self.assertEqual(
+            policy.minimum_close_burst_source_switch_fraction.value,
+            config.minimum_close_burst_source_switch_fraction,
+        )
+        self.assertEqual(6, config.close_burst_event_reference_count)
+        self.assertEqual(64, len(str(config.close_burst_policy_binding_sha256)))
+
+        build = roles["build"]
+        assert build.pooled_product_minimum_close_duration_fraction is not None
+        sentinel = (
+            build.pooled_product_minimum_close_duration_fraction.value + 0.01
+        )
+        changed_build = replace(
+            build,
+            pooled_product_minimum_close_duration_fraction=replace(
+                build.pooled_product_minimum_close_duration_fraction,
+                value=sentinel,
+            ),
+        )
+        changed_policy = replace(
+            policy,
+            role_conditioned_duration_policies=tuple(
+                changed_build if item.role == "build" else item
+                for item in policy.role_conditioned_duration_policies
+            ),
+        )
+        changed_config = _rendered_montage_config_from_policy(
+            changed_policy,
+            require_complete_role_duration_policy=True,
+        )
+        self.assertEqual(
+            sentinel,
+            changed_config.build_pooled_product_minimum_closeup_fraction,
+        )
+        constructor_default = RenderedMontageGrammarConfig()
+        self.assertNotEqual(
+            constructor_default.build_pooled_product_minimum_closeup_fraction,
+            changed_config.build_pooled_product_minimum_closeup_fraction,
+        )
+
+        missing_bridge_policy = replace(
+            policy,
+            role_conditioned_duration_policies=tuple(
+                item
+                for item in policy.role_conditioned_duration_policies
+                if item.role != "bridge_like"
+            ),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires complete build, chorus_like, and bridge_like",
+        ):
+            _rendered_montage_config_from_policy(
+                missing_bridge_policy,
+                require_complete_role_duration_policy=True,
+            )
+
+    def test_default_ive_motion_cut_profile_is_fixed_release_v1(self) -> None:
+        self.assertEqual(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
+            Path(
+                "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
+                "ive-professional-motion-cut-profile-v1.json"
+            ),
+        )
+        self.assertEqual(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256,
+            "005a21f79ab1e0b5de76d3299ca2f61b54eb460b88cfb2f88dd392d93e9419b6",
+        )
+
+    def test_stage_edit_motion_cut_profile_is_inactive_only_without_stageedit(
+        self,
+    ) -> None:
+        with patch(
+            "crosscut.pipeline.load_professional_motion_cut_profile"
+        ) as loader:
+            self.assertIsNone(
+                _load_stage_edit_motion_cut_profile(
+                    registered_bundle=None,
+                    explicit_preflight=None,
+                    montage_policy=None,
+                )
+            )
+        loader.assert_not_called()
+
+    def test_stage_edit_motion_cut_profile_binds_soft_runtime_and_manifest(
+        self,
+    ) -> None:
+        montage_policy = load_professional_montage_policy(
+            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        )
+        with patch(
+            "crosscut.pipeline.load_professional_motion_cut_profile",
+            wraps=load_professional_motion_cut_profile,
+        ) as loader:
+            profile = _load_stage_edit_motion_cut_profile(
+                registered_bundle=object(),  # type: ignore[arg-type]
+                explicit_preflight=None,
+                montage_policy=montage_policy,
+            )
+        loader.assert_called_once_with(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
+            expected_file_sha256=(
+                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
+            ),
+            verify_source_inputs=False,
+        )
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        payload = _stage_edit_motion_cut_profile_manifest_payload(
+            profile,
+            montage_policy,
+        )
+        self.assertEqual(
+            str(DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH),
+            payload["path"],
+        )
+        self.assertEqual(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256,
+            payload["file_sha256"],
+        )
+        self.assertEqual(
+            "9f70c549acbda2e80f3497b57c189ddbb5df4e4bbd4f5eda9095c5af699ae680",
+            payload["content_sha256"],
+        )
+        self.assertEqual(
+            montage_policy.profile_identity,
+            payload["source_montage_profile_identity"],
+        )
+        self.assertEqual(
+            montage_policy.profile_identity,
+            payload["active_montage_policy_identity"],
+        )
+        self.assertTrue(payload["source_identity_binding_passed"])
+        self.assertFalse(payload["direction_or_velocity_proven"])
+        runtime = payload["runtime_binding"]
+        self.assertAlmostEqual(
+            0.0002705025925969218,
+            runtime["both_motion_minimum_pose_motion_p10"],
+        )
+        self.assertAlmostEqual(
+            -0.49213925079872173,
+            runtime["continuity_minimum_score_p10"],
+        )
+        self.assertAlmostEqual(
+            0.8486102174679628,
+            runtime["same_time_pose_cosine_soft_bonus_qualifier_p50"],
+        )
+        self.assertTrue(runtime["soft_bonus_only"])
+        self.assertFalse(runtime["hard_gate"])
+        self.assertIsNone(runtime["minimum_required_switches_per_section"])
+        self.assertEqual(
+            0,
+            runtime["highlight_minimum_motion_closeup_switch_boundaries"],
+        )
+        self.assertFalse(runtime["direction_or_velocity_proven"])
+
+        config = _stage_edit_semimarkov_config_from_montage_policy(
+            montage_policy,
+            motion_cut_profile=profile,
+            require_motion_cut_calibration=True,
+        )
+        self.assertIsNotNone(config.highlight_motion_calibration)
+        self.assertAlmostEqual(
+            0.0002705025925969218,
+            config.highlight_motion_boundary_minimum_pose_motion,
+        )
+        self.assertAlmostEqual(
+            -0.49213925079872173,
+            config.highlight_motion_boundary_minimum_continuity_score,
+        )
+        self.assertAlmostEqual(
+            0.8486102174679628,
+            config.highlight_motion_boundary_minimum_pose_phase_cosine,
+        )
+        self.assertIsNone(
+            config.highlight_motion_boundary_minimum_sharpness
+        )
+        self.assertEqual(
+            0,
+            config.highlight_minimum_motion_closeup_switch_boundaries,
+        )
+
+        reporter = _MemoryReporter()
+        _report_stage_edit_motion_cut_profile(reporter, payload)
+        self.assertEqual(1, len(reporter.events))
+        event_type, event = reporter.events[0]
+        self.assertEqual("log", event_type)
+        self.assertEqual(
+            payload,
+            event["professional_motion_cut_profile"],
+        )
+        self.assertIn(str(payload["path"]), str(event["message"]))
+        self.assertIn(str(payload["file_sha256"]), str(event["message"]))
+        self.assertIn(str(payload["content_sha256"]), str(event["message"]))
+
+    def test_stage_edit_motion_cut_profile_fails_closed_on_file_or_source_change(
+        self,
+    ) -> None:
+        montage_policy = load_professional_montage_policy(
+            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        )
+        for error in (
+            FileNotFoundError("profile missing"),
+            ValueError("motion-cut profile file SHA-256 mismatch"),
+        ):
+            with self.subTest(error=type(error).__name__), patch(
+                "crosscut.pipeline.load_professional_motion_cut_profile",
+                side_effect=error,
+            ):
+                with self.assertRaises(type(error)):
+                    _load_stage_edit_motion_cut_profile(
+                        registered_bundle=object(),  # type: ignore[arg-type]
+                        explicit_preflight=None,
+                        montage_policy=montage_policy,
+                    )
+
+        profile = load_professional_motion_cut_profile(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
+            expected_file_sha256=(
+                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
+            ),
+            verify_source_inputs=False,
+        )
+        changed_policy = replace(
+            montage_policy,
+            identity=replace(
+                montage_policy.identity,
+                content_sha256="0" * 64,
+            ),
+        )
+        with patch(
+            "crosscut.pipeline.load_professional_motion_cut_profile",
+            return_value=profile,
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "source montage identity differs",
+        ):
+            _load_stage_edit_motion_cut_profile(
+                registered_bundle=object(),  # type: ignore[arg-type]
+                explicit_preflight=None,
+                montage_policy=changed_policy,
+            )
+
+    def test_active_learned_continuity_has_no_silent_motion_calibration_fallback(
+        self,
+    ) -> None:
+        montage_policy = load_professional_montage_policy(
+            DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH
+        )
+        profile = load_professional_motion_cut_profile(
+            DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_PATH,
+            expected_file_sha256=(
+                DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256
+            ),
+            verify_source_inputs=False,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "learned continuity authority lacks.*authority-matched",
+        ):
+            _stage_edit_semimarkov_config_from_montage_policy(
+                montage_policy,
+                motion_cut_profile=profile,
+                require_motion_cut_calibration=True,
+                continuity_authority=(
+                    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+                ),
+                continuity_scorer_contract=(
+                    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+                ),
+                continuity_scorer_fingerprint="a" * 64,
+            )
+
     def test_stage_edit_request_is_forwarded_to_top32_proxy_rerank_only_when_explicit(
         self,
     ) -> None:
@@ -755,6 +1279,11 @@ class PipelineTests(unittest.TestCase):
                     "passed": True,
                     "failure_codes": [],
                     "configuration": {},
+                    "highlight_aggregate": {
+                        "soft_targets": {
+                            "aggregate_alignment_score": 0.5,
+                        }
+                    },
                 },
             ) as montage_review:
                 result = _review_complete_group_candidates(
@@ -780,6 +1309,223 @@ class PipelineTests(unittest.TestCase):
                     for item in reviewed_payloads
                 )
             )
+
+    def test_hard_pass_proxy_rank_uses_bounded_symmetric_human_target(self) -> None:
+        payload = {
+            "passed": True,
+            "weighted_score": 80.0,
+            "weighted_score_before_perceptual_source_admission": 80.0,
+            "perceptual_source_admission_penalty_points": 0.0,
+        }
+        montage = {
+            "passed": True,
+            "highlight_aggregate": {
+                "soft_targets": {
+                    "aggregate_alignment_score": 1.0,
+                    "closeup_p50": {"alignment_score": 1.0},
+                    "nonwide_p50": {"alignment_score": 1.0},
+                    "maximum_wide_run_p75": {"alignment_score": 1.0},
+                }
+            },
+        }
+
+        _apply_bounded_human_target_proxy_rank(
+            payload,
+            montage,
+            technical_passed=True,
+        )
+
+        self.assertEqual(
+            payload["technical_proxy_weighted_score_before_human_target"],
+            80.0,
+        )
+        self.assertEqual(payload["weighted_score"], 80.0)
+        self.assertEqual(payload["ranking_weighted_score"], 81.0)
+        self.assertEqual(
+            payload["weighted_score"],
+            payload["weighted_score_before_perceptual_source_admission"]
+            - payload["perceptual_source_admission_penalty_points"],
+        )
+        evidence = payload["human_target_bounded_ranking"]
+        self.assertEqual(evidence["maximum_absolute_adjustment_points"], 1.0)
+        self.assertFalse(evidence["over_close_past_target_is_rewarded"])
+
+        over_close = {"passed": True, "weighted_score": 80.0}
+        montage["highlight_aggregate"]["soft_targets"][
+            "aggregate_alignment_score"
+        ] = 0.2
+        _apply_bounded_human_target_proxy_rank(
+            over_close,
+            montage,
+            technical_passed=True,
+        )
+        self.assertEqual(over_close["weighted_score"], 80.0)
+        self.assertAlmostEqual(over_close["ranking_weighted_score"], 79.4)
+        self.assertGreaterEqual(over_close["ranking_weighted_score"], 79.0)
+
+        failed = {"passed": False, "weighted_score": 80.0}
+        _apply_bounded_human_target_proxy_rank(
+            failed,
+            montage,
+            technical_passed=False,
+        )
+        self.assertEqual(failed["weighted_score"], 80.0)
+        self.assertEqual(failed["ranking_weighted_score"], 80.0)
+        self.assertFalse(failed["human_target_bounded_ranking"]["eligible"])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "lacks bounded human-target alignment evidence",
+        ):
+            _apply_bounded_human_target_proxy_rank(
+                {"passed": True, "weighted_score": 80.0},
+                {"passed": True},
+                technical_passed=True,
+            )
+
+    def test_qualified_close_burst_adds_only_evidence_weighted_soft_rank(self) -> None:
+        base_montage = {
+            "passed": True,
+            "highlight_aggregate": {
+                "soft_targets": {
+                    "aggregate_alignment_score": 0.5,
+                    "closeup_p50": {"alignment_score": 0.5},
+                    "nonwide_p50": {"alignment_score": 0.5},
+                    "maximum_wide_run_p75": {"alignment_score": 0.5},
+                }
+            },
+        }
+        absent = {"passed": True, "weighted_score": 80.0}
+        _apply_bounded_human_target_proxy_rank(
+            absent,
+            base_montage,
+            technical_passed=True,
+        )
+        self.assertEqual(80.0, absent["weighted_score"])
+        self.assertEqual(80.0, absent["ranking_weighted_score"])
+
+        qualified_montage = deepcopy(base_montage)
+        qualified_montage["highlight_aggregate"]["soft_targets"][
+            "close_only_multi_source_burst_event_p10"
+        ] = {
+            "policy_binding_active": True,
+            "policy_binding": {"binding_sha256": "a" * 64},
+            "alignment_score": 1.0,
+            "event_occurrence_support_weight": 6.0 / 20.0,
+            "evidence_weighted_alignment_score": 6.0 / 20.0,
+            "observed_event_count": 6,
+            "human_reference_count": 20,
+            "qualified_event_count": 1,
+            "absence_is_hard_failure": False,
+        }
+        qualified = {"passed": True, "weighted_score": 80.0}
+        _apply_bounded_human_target_proxy_rank(
+            qualified,
+            qualified_montage,
+            technical_passed=True,
+        )
+        self.assertEqual(80.0, qualified["weighted_score"])
+        self.assertAlmostEqual(80.3, qualified["ranking_weighted_score"])
+        ranking = qualified["human_target_bounded_ranking"]
+        self.assertAlmostEqual(
+            0.3,
+            ranking["close_burst_zero_or_additive_bonus_points"],
+        )
+        self.assertFalse(ranking["close_burst_absence_lowers_existing_alignment"])
+
+        tampered_montage = deepcopy(qualified_montage)
+        tampered_montage["highlight_aggregate"]["soft_targets"][
+            "close_only_multi_source_burst_event_p10"
+        ]["event_occurrence_support_weight"] = 0.9
+        with self.assertRaisesRegex(RuntimeError, "support weight is malformed"):
+            _apply_bounded_human_target_proxy_rank(
+                {"passed": True, "weighted_score": 80.0},
+                tampered_montage,
+                technical_passed=True,
+            )
+
+    def test_final_repaired_proxy_rank_replaces_stale_pre_repair_evidence(
+        self,
+    ) -> None:
+        repaired_payload = {
+            "passed": True,
+            "weighted_score": 80.0,
+            "technical_proxy_passed_before_montage_grammar": True,
+            "ranking_weighted_score": 81.0,
+            "human_target_bounded_ranking": {
+                "aggregate_alignment_score": 1.0,
+                "applied_adjustment_points": 1.0,
+                "stale_pre_repair_evidence": True,
+            },
+        }
+        final_montage = {
+            "passed": True,
+            "highlight_aggregate": {
+                "soft_targets": {
+                    "aggregate_alignment_score": 0.0,
+                    "final_repaired_timeline": True,
+                }
+            },
+        }
+
+        _apply_bounded_human_target_proxy_rank(
+            repaired_payload,
+            final_montage,
+            technical_passed=bool(
+                repaired_payload[
+                    "technical_proxy_passed_before_montage_grammar"
+                ]
+            ),
+        )
+
+        self.assertEqual(repaired_payload["weighted_score"], 80.0)
+        self.assertEqual(repaired_payload["ranking_weighted_score"], 79.0)
+        final_evidence = repaired_payload["human_target_bounded_ranking"]
+        self.assertNotIn("stale_pre_repair_evidence", final_evidence)
+        self.assertEqual(final_evidence["aggregate_alignment_score"], 0.0)
+        self.assertEqual(final_evidence["applied_adjustment_points"], -1.0)
+        self.assertTrue(
+            final_evidence["soft_target_evidence"][
+                "final_repaired_timeline"
+            ]
+        )
+
+        hard_failed_payload = {
+            "passed": False,
+            "weighted_score": 80.0,
+            "technical_proxy_passed_before_montage_grammar": False,
+            "ranking_weighted_score": 81.0,
+            "human_target_bounded_ranking": {
+                "aggregate_alignment_score": 1.0,
+                "applied_adjustment_points": 1.0,
+                "stale_pre_repair_evidence": True,
+            },
+        }
+        _apply_bounded_human_target_proxy_rank(
+            hard_failed_payload,
+            {
+                "passed": True,
+                "highlight_aggregate": {
+                    "soft_targets": {
+                        "aggregate_alignment_score": 1.0,
+                    }
+                },
+            },
+            technical_passed=False,
+        )
+
+        self.assertFalse(hard_failed_payload["passed"])
+        self.assertEqual(hard_failed_payload["weighted_score"], 80.0)
+        self.assertEqual(hard_failed_payload["ranking_weighted_score"], 80.0)
+        hard_fail_evidence = hard_failed_payload[
+            "human_target_bounded_ranking"
+        ]
+        self.assertFalse(hard_fail_evidence["eligible"])
+        self.assertEqual(hard_fail_evidence["applied_adjustment_points"], 0.0)
+        self.assertNotIn(
+            "stale_pre_repair_evidence",
+            hard_fail_evidence,
+        )
 
     def test_windowed_repair_keeps_only_final_exact_shot_clock_for_montage(
         self,
@@ -1736,6 +2482,7 @@ class PipelineTests(unittest.TestCase):
                 artifact = analyze(
                     request,
                     _MemoryReporter(),  # type: ignore[arg-type]
+                    allow_failed_comparison_render=True,
                     review_rendered_proxies=True,
                 )
 
@@ -1913,6 +2660,7 @@ class PipelineTests(unittest.TestCase):
                 recovered_artifact = analyze(
                     request,
                     _MemoryReporter(),  # type: ignore[arg-type]
+                    allow_failed_comparison_render=True,
                     review_rendered_proxies=True,
                 )
                 recovery_report = recovered_artifact.manifest[
@@ -2362,6 +3110,21 @@ class PipelineTests(unittest.TestCase):
                     "allow_failed_comparison_render"
                 ]
             )
+            self.assertEqual(
+                automatic_artifact.manifest["artifact_role"],
+                "comparison",
+            )
+            self.assertFalse(
+                automatic_artifact.manifest["app_result_exposure"][
+                    "video_output_exposed"
+                ]
+            )
+            self.assertFalse(
+                any(
+                    path.suffix.lower() == ".mp4"
+                    for path in automatic_artifact.output_paths
+                )
+            )
             performance_range_trim = automatic_artifact.manifest[
                 "performance_range_trim"
             ]
@@ -2568,6 +3331,15 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(
                 artifact.manifest["render"]["allow_failed_comparison_render"]
+            )
+            self.assertEqual(artifact.manifest["artifact_role"], "comparison")
+            self.assertFalse(
+                artifact.manifest["app_result_exposure"][
+                    "video_output_exposed"
+                ]
+            )
+            self.assertFalse(
+                any(path.suffix.lower() == ".mp4" for path in artifact.output_paths)
             )
             self.assertEqual(
                 artifact.manifest["common_master_range"]["end_seconds"],
@@ -3460,29 +4232,37 @@ class PipelineTests(unittest.TestCase):
     def test_registered_post_render_enforcement_passes_trusted_activation_authority(
         self,
     ) -> None:
-        report = SimpleNamespace(
-            verdict=SimpleNamespace(value="PASS"),
-            passed=True,
-            analysis_basis="fixture_post_render_qa",
-            to_dict=lambda: {
-                "issue_count": 0,
-                "fail_issue_count": 0,
-                "conditional_issue_count": 0,
-            },
-        )
         reporter = _MemoryReporter()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = root / "IVE-fixture-20260824-120000-analysis.json"
             manifest: dict[str, object] = {
-                "render": {},
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "pending_qa",
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": False,
+                    "delivery_completion_message_allowed": False,
+                },
+                "render": {"artifact_role": "pending_qa"},
                 "stage_edit_generation": {},
             }
-            manifest_path.write_text("{}", encoding="utf-8")
-            qa_path = root / "qa.json"
+            _persist_post_render_artifact_shell(manifest_path, manifest)
+            qa_path = PostRenderArtifactSet.from_analysis_path(
+                manifest_path
+            ).default_report_path
             with patch(
                 "crosscut.pipeline.evaluate_and_write_post_render_qa",
-                return_value=(report, qa_path),
+                side_effect=lambda artifact_set, **_kwargs: (
+                    _persist_mock_bound_qa_report(
+                        artifact_set,
+                        verdict="PASS",
+                    )
+                ),
             ) as evaluate:
                 returned = _enforce_automatic_stage_edit_post_render_qa(
                     registered_stage_edit_bundle=object(),  # type: ignore[arg-type]
@@ -3495,6 +4275,169 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(
             evaluate.call_args.kwargs["trusted_registered_stage_edit"]
         )
+        self.assertEqual(manifest["artifact_role"], "delivery")
+        self.assertTrue(
+            manifest["app_result_exposure"]["video_output_exposed"]
+        )
+        self.assertEqual(manifest["render"]["artifact_role"], "delivery")
+
+    def test_explicit_automatic_ive_group_also_runs_mandatory_post_render_qa(
+        self,
+    ) -> None:
+        reporter = _MemoryReporter()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "IVE-fixture-20260824-120000-analysis.json"
+            manifest: dict[str, object] = {
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "pending_qa",
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": False,
+                    "delivery_completion_message_allowed": False,
+                },
+                "render": {"artifact_role": "pending_qa"},
+                "stage_edit_generation": {},
+            }
+            _persist_post_render_artifact_shell(manifest_path, manifest)
+            qa_path = PostRenderArtifactSet.from_analysis_path(
+                manifest_path
+            ).default_report_path
+            montage_config = RenderedMontageGrammarConfig()
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa",
+                side_effect=lambda artifact_set, **_kwargs: (
+                    _persist_mock_bound_qa_report(
+                        artifact_set,
+                        verdict="PASS",
+                    )
+                ),
+            ) as evaluate:
+                returned = _enforce_automatic_stage_edit_post_render_qa(
+                    registered_stage_edit_bundle=None,
+                    manifest=manifest,  # type: ignore[arg-type]
+                    manifest_path=manifest_path,
+                    reporter=reporter,  # type: ignore[arg-type]
+                    automatic_ive_group_delivery=True,
+                    rendered_montage_config=montage_config,
+                )
+
+        self.assertEqual(returned, qa_path.resolve())
+        self.assertIsNone(
+            evaluate.call_args.kwargs["trusted_registered_stage_edit"]
+        )
+        self.assertIs(
+            evaluate.call_args.kwargs["config"].rendered_montage_grammar,
+            montage_config,
+        )
+        self.assertEqual(
+            manifest["post_render_qa"]["activation"],
+            "automatic_request_scoped_ive_group_delivery",
+        )
+        self.assertTrue(
+            manifest["post_render_qa"][
+                "ive_product_floor_required_independent_of_activation"
+            ]
+        )
+        self.assertEqual(manifest["artifact_role"], "delivery")
+        self.assertTrue(
+            manifest["app_result_exposure"][
+                "delivery_completion_message_allowed"
+            ]
+        )
+
+    def test_automatic_ive_delivery_blocks_conditional_post_render_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "IVE-fixture-20260824-120000-analysis.json"
+            manifest: dict[str, object] = {
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "pending_qa",
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": False,
+                    "delivery_completion_message_allowed": False,
+                },
+                "render": {"artifact_role": "pending_qa"},
+            }
+            _persist_post_render_artifact_shell(manifest_path, manifest)
+            qa_path = PostRenderArtifactSet.from_analysis_path(
+                manifest_path
+            ).default_report_path
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa",
+                side_effect=lambda artifact_set, **_kwargs: (
+                    _persist_mock_bound_qa_report(
+                        artifact_set,
+                        verdict="CONDITIONAL",
+                    )
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "blocked by mandatory post-render QA verdict CONDITIONAL",
+                ):
+                    _enforce_automatic_stage_edit_post_render_qa(
+                        registered_stage_edit_bundle=None,
+                        manifest=manifest,  # type: ignore[arg-type]
+                        manifest_path=manifest_path,
+                        reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                        automatic_ive_group_delivery=True,
+                    )
+
+        self.assertFalse(manifest["post_render_qa"]["passed"])
+        self.assertEqual(manifest["artifact_role"], "rejected")
+        self.assertFalse(
+            manifest["app_result_exposure"]["video_output_exposed"]
+        )
+        self.assertEqual(manifest["render"]["artifact_role"], "rejected")
+
+    def test_mandatory_qa_refuses_preexposed_or_nonpending_product_media(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "IVE-fixture-20260824-120000-analysis.json"
+            manifest: dict[str, object] = {
+                "request": {
+                    "group": "IVE",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                },
+                "artifact_role": "delivery",
+                "app_result_exposure": {
+                    "contract": "automatic_ive_group_app_result_exposure_v1",
+                    "video_output_exposed": True,
+                    "delivery_completion_message_allowed": True,
+                },
+                "render": {"artifact_role": "delivery"},
+            }
+            manifest_path.write_text("{}", encoding="utf-8")
+            with patch(
+                "crosscut.pipeline.evaluate_and_write_post_render_qa"
+            ) as evaluate:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires an unexposed pending_qa artifact",
+                ):
+                    _enforce_automatic_stage_edit_post_render_qa(
+                        registered_stage_edit_bundle=None,
+                        manifest=manifest,  # type: ignore[arg-type]
+                        manifest_path=manifest_path,
+                        reporter=_MemoryReporter(),  # type: ignore[arg-type]
+                        automatic_ive_group_delivery=True,
+                    )
+            evaluate.assert_not_called()
 
     def test_index_domain_helpers_reject_ambiguous_mappings(self) -> None:
         sources = (Path("/tmp/a.mp4"), Path("/tmp/b.mp4"))
@@ -3748,6 +4691,55 @@ class PipelineTests(unittest.TestCase):
         self.assertLessEqual(
             cadence["source_duration_balance"]["maximum_relative_deviation"],
             0.08,
+        )
+
+    def test_direct_full_frame_four_sources_preserve_fifty_span_cut_cadence(
+        self,
+    ) -> None:
+        duration = 200.0
+        timing = _rotating_timing_draft(
+            source_count=4,
+            duration_seconds=duration,
+            unit_seconds=1.0,
+        )
+        path = tuple(range(4)) * 12 + (0, 1)
+        selection = _VisualSelectionStub(path, 4)
+
+        with patch(
+            "crosscut.pipeline.select_balanced_direct_member_sources",
+            return_value=selection,
+        ):
+            segments, _transitions, _details, cadence, visual_selection = (
+                _official_target_fancam_direct_full_frame_segments(
+                    timing_draft=timing,
+                    eligible_indices=tuple(range(4)),
+                    eligible_sources=tuple(
+                        Path(f"official-gaeul-{index}.mp4")
+                        for index in range(4)
+                    ),
+                    common_master_start=0.0,
+                    source_timewarps=None,
+                    scene_cut_times=((),) * 4,
+                    descriptor_provider=lambda *_args: None,
+                )
+            )
+
+        self.assertEqual(len(segments), 50)
+        self.assertEqual(cadence["source_switch_count"], 49)
+        self.assertAlmostEqual(
+            cadence["source_switches_per_minute"],
+            49 * 60.0 / duration,
+        )
+        self.assertTrue(cadence["passed"])
+        self.assertEqual(
+            visual_selection.source_counts,
+            (13, 13, 12, 12),
+        )
+        self.assertTrue(
+            all(
+                left.source_index != right.source_index
+                for left, right in zip(segments, segments[1:])
+            )
         )
 
     def test_direct_partition_fallback_moves_proven_final_boundary_to_five_three(
@@ -4188,7 +5180,7 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-    def test_automatic_portrait_member_allows_eight_to_ten_aligned_sources(self) -> None:
+    def test_automatic_portrait_member_allows_four_to_ten_aligned_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sources = tuple(root / f"official-gaeul-{index}.mp4" for index in range(10))
@@ -4209,16 +5201,16 @@ class PipelineTests(unittest.TestCase):
             ratios = _automatic_member_direct_full_frame_ratios(
                 request,
                 tuple(_portrait_analysis_media(source) for source in sources),
-                tuple(range(8)),
+                tuple(range(4)),
             )
             self.assertIsNotNone(ratios)
-            self.assertEqual(len(ratios or ()), 8)
+            self.assertEqual(len(ratios or ()), 4)
 
-            with self.assertRaisesRegex(ValueError, "between 8 and 10"):
+            with self.assertRaisesRegex(ValueError, "between 4 and 10"):
                 _automatic_member_direct_full_frame_ratios(
                     request,
                     tuple(_portrait_analysis_media(source) for source in sources),
-                    tuple(range(7)),
+                    tuple(range(3)),
                 )
 
     def test_automatic_portrait_member_bad_aspect_fails_closed_before_fallback(self) -> None:

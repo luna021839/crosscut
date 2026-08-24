@@ -353,7 +353,7 @@ class DirectMemberVisualTests(unittest.TestCase):
                 boundary.minimum_pair_cost,
                 boundary.mismatch.cost,
             )
-        self.assertEqual(selection.sample_count, 138)
+        self.assertEqual(selection.sample_count, 168)
         self.assertEqual(selection.failed_sample_count, 0)
         payload = selection.to_dict()
         self.assertEqual(payload["distinct_source_count"], 3)
@@ -381,6 +381,62 @@ class DirectMemberVisualTests(unittest.TestCase):
             "adaptive_cost_beam",
         )
         self.assertFalse(payload["optimizer_search"]["search_capacity_exhausted"])
+
+    def test_cut_adjacent_both_moving_connection_beats_static_endpoint_tie(
+        self,
+    ) -> None:
+        def provider(
+            source_index: int,
+            _source: Path,
+            source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            sample = round(source_local_seconds, 1)
+            if source_index == 0 and sample == 0.8:
+                return _descriptor(0.20)
+            if source_index == 1 and sample == 1.2:
+                return _descriptor(0.20)
+            return _descriptor(0.40)
+
+        selection = select_balanced_direct_member_sources(
+            sources=(Path("moving-out.mp4"), Path("moving-in.mp4")),
+            canonical_spans=((0.0, 1.0), (1.0, 2.0)),
+            audio_offsets=(0.0, 0.0),
+            preferred_source_order=(1, 0),
+            config=DirectMemberVisualConfig(
+                sample_frame_step_seconds=0.1,
+                beam_width=200,
+            ),
+            descriptor_provider=provider,
+        )
+
+        # Static endpoint geometry is identical for both possible paths and
+        # preferred order would otherwise choose 1->0. The actual adjacent
+        # motion evidence must make the opposite, moving 0->1 connection win.
+        self.assertEqual(selection.source_indices, (0, 1))
+        evidence = selection.boundaries[0].mismatch.motion_connection
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.timestamp_bound_adjacent)
+        self.assertTrue(evidence.both_moving)
+        self.assertGreater(evidence.soft_preference_applied, 0.0)
+        self.assertIsNotNone(evidence.direction_cosine_audit_only)
+        self.assertLess(float(evidence.direction_cosine_audit_only), 0.0)
+        payload = selection.to_dict()
+        motion = payload["boundaries"][0]["mismatch"]["motion_connection"]
+        self.assertFalse(
+            motion["direction_cosine_influenced_gate_or_bonus"]
+        )
+        self.assertFalse(motion["sparse_or_nonadjacent_evidence_used"])
+        self.assertFalse(motion["raw_vectors_persisted"])
+        self.assertEqual(
+            motion["master_timestamps_seconds"],
+            {
+                "outgoing_previous": 0.8,
+                "outgoing_endpoint": 0.9,
+                "incoming_start": 1.1,
+                "incoming_next": 1.2,
+            },
+        )
 
     def test_span_content_sampling_includes_entry_early_and_quartiles(self) -> None:
         selection = select_balanced_direct_member_sources(

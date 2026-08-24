@@ -1,11 +1,46 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
+import numpy as np
+
+from crosscut.ive import AspectRatio
+from crosscut.professional_montage_policy import (
+    close_burst_policy_binding_sha256,
+)
+from crosscut.render import (
+    RenderPlan,
+    RenderSegment,
+    RenderTransition,
+    segment_frame_counts,
+)
 from crosscut.rendered_montage_grammar_review import (
     RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS,
+    RenderedMontageGrammarConfig,
+    _proxy_geometry_shot_class,
+    _symmetric_fraction_target_evidence,
+    _wide_run_soft_target_evidence,
     review_rendered_montage_grammar,
 )
+from crosscut.rendered_proxy_review import (
+    OutputSubjectGeometry,
+    _segment_interior_geometry_evidence,
+    _segment_interior_schedule,
+    verified_file_content_sha256,
+)
+
+
+def _fixture_file_content_sha256(path: Path) -> str:
+    return hashlib.sha256(
+        f"synthetic-file:{Path(path)}".encode("utf-8")
+    ).hexdigest()
 
 
 def _analysis(
@@ -192,6 +227,9 @@ def _analysis(
             "proxy": {
                 "fps": 30.0,
                 "decoded_frame_count": len(choices) * 30,
+                "content_sha256": _fixture_file_content_sha256(
+                    Path("synthetic-proxy.mp4")
+                ),
             },
             "transition_count": len(boundaries),
             "reviewed_boundary_count": len(boundaries),
@@ -202,12 +240,20 @@ def _analysis(
     }
 
 
-def _render_plan(fixture: dict[str, object]) -> dict[str, object]:
+def _render_plan(
+    fixture: dict[str, object],
+    *,
+    source_paths: tuple[Path, ...] | None = None,
+) -> dict[str, object]:
     choices = fixture["visual_timeline"]["choices"]
     source_count = fixture["source_derivative_diversity"]["source_count"]
     duration = float(len(choices))
     return {
-        "sources": [f"source-{index}.mp4" for index in range(source_count)],
+        "sources": (
+            [str(path) for path in source_paths]
+            if source_paths is not None
+            else [f"source-{index}.mp4" for index in range(source_count)]
+        ),
         "source_index_domains": {
             "sources[]": "render_plan_sources_array_index",
             "reference_source": "render_plan_sources_array_index",
@@ -224,6 +270,16 @@ def _render_plan(fixture: dict[str, object]) -> dict[str, object]:
                     choice["canonical_master_end"]
                     - choice["canonical_master_start"]
                 ),
+                "source_start": choice["source_local_start"],
+                "source_duration": None,
+                "effective_source_duration": (
+                    choice["source_local_end"] - choice["source_local_start"]
+                ),
+                "crop": None,
+                "pan_crop": None,
+                "editorial_transform": None,
+                "look_adjustment": None,
+                "boundary_look_track": None,
             }
             for choice in choices
         ],
@@ -236,15 +292,156 @@ def _render_plan(fixture: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _attach_segment_interior_geometry(
+    fixture: dict[str, object],
+    *,
+    sample_classes_by_segment: dict[int, tuple[str, ...]] | None = None,
+    automatic_ive: bool = True,
+    source_paths: tuple[Path, ...] | None = None,
+    use_real_content: bool = False,
+) -> None:
+    choices = fixture["visual_timeline"]["choices"]
+    source_count = fixture["source_derivative_diversity"]["source_count"]
+    proxy_plan = RenderPlan(
+        sources=(
+            source_paths
+            if source_paths is not None
+            else tuple(
+                Path(f"source-{index}.mp4") for index in range(source_count)
+            )
+        ),
+        segments=tuple(
+            RenderSegment(
+                choice["source_index"],
+                choice["source_local_start"],
+                choice["duration_seconds"],
+                choice["canonical_master_start"],
+            )
+            for choice in choices
+        ),
+        reference_source=0,
+        aspect_ratio=AspectRatio.LANDSCAPE,
+        output=Path("synthetic-proxy.mp4"),
+        width=854,
+        height=480,
+        fps=30.0,
+        transitions=tuple(
+            RenderTransition() for _ in range(max(0, len(choices) - 1))
+        ),
+    )
+    counts = segment_frame_counts(proxy_plan)
+    schedule = _segment_interior_schedule(proxy_plan, counts)
+    samples_by_segment: dict[int, list[object]] = {}
+    for sample in schedule:
+        samples_by_segment.setdefault(sample.segment_index, []).append(sample)
+
+    aliases = {
+        "group_wide": "wide",
+        "full_shot": "wide",
+        "close_up": "close",
+    }
+    frames: dict[int, np.ndarray] = {}
+    for segment_index, segment_samples in samples_by_segment.items():
+        default_class = aliases.get(
+            str(choices[segment_index]["shot_type"]),
+            str(choices[segment_index]["shot_type"]),
+        )
+        classes = (
+            sample_classes_by_segment.get(segment_index)
+            if sample_classes_by_segment is not None
+            and segment_index in sample_classes_by_segment
+            else (default_class,) * len(segment_samples)
+        )
+        if classes is None or len(classes) != len(segment_samples):
+            raise ValueError("interior fixture sample classes differ from schedule")
+        for sample, shot_class in zip(segment_samples, classes, strict=True):
+            frame = np.zeros((2, 2, 3), dtype=np.uint8)
+            frame[0, 0, 0] = {"wide": 1, "medium": 2, "close": 3}[
+                shot_class
+            ]
+            frames[sample.frame_index] = frame
+
+    def geometry_provider(frame: np.ndarray) -> OutputSubjectGeometry:
+        shot_class = {1: "wide", 2: "medium", 3: "close"}[
+            int(frame[0, 0, 0])
+        ]
+        if shot_class == "wide":
+            # Exercise the exact visual_score no-face => group-wide fallback.
+            return OutputSubjectGeometry(face_count=0)
+        height = 0.15 if shot_class == "medium" else 0.30
+        return OutputSubjectGeometry(
+            face_count=1,
+            face_bbox_xywh=(0.35, 0.20, 0.20, height),
+            face_backend="synthetic",
+        )
+
+    proxy = fixture["rendered_proxy_review"]
+    proxy["schema_version"] = 3
+    if use_real_content:
+        proxy["segment_interior_geometry"] = (
+            _segment_interior_geometry_evidence(
+                plan=proxy_plan,
+                counts=counts,
+                schedule=schedule,
+                frames=frames,
+                geometry_provider=geometry_provider,
+                proxy_identity=proxy["proxy"],
+            )
+        )
+    else:
+        with patch(
+            "crosscut.rendered_proxy_review.verified_file_content_sha256",
+            side_effect=_fixture_file_content_sha256,
+        ):
+            proxy["segment_interior_geometry"] = (
+                _segment_interior_geometry_evidence(
+                    plan=proxy_plan,
+                    counts=counts,
+                    schedule=schedule,
+                    frames=frames,
+                    geometry_provider=geometry_provider,
+                    proxy_identity=proxy["proxy"],
+                )
+            )
+    if automatic_ive:
+        fixture["request"] = {
+            "group": "IVE",
+            "edit_mode": "group",
+            "source_mode": "automatic",
+        }
+
+
 def _review(
     fixture: dict[str, object],
     *,
     render_plan: dict[str, object] | None = None,
+    config: RenderedMontageGrammarConfig | None = None,
 ) -> dict[str, object]:
-    return review_rendered_montage_grammar(
-        fixture,
-        render_plan=_render_plan(fixture) if render_plan is None else render_plan,
-    )
+    with patch(
+        "crosscut.rendered_montage_grammar_review.verified_file_content_sha256",
+        side_effect=_fixture_file_content_sha256,
+    ):
+        return review_rendered_montage_grammar(
+            fixture,
+            render_plan=(
+                _render_plan(fixture) if render_plan is None else render_plan
+            ),
+            config=config or RenderedMontageGrammarConfig(),
+        )
+
+
+def _split_into_two_highlights(fixture: dict[str, object]) -> None:
+    choices = fixture["visual_timeline"]["choices"]
+    if len(choices) != 12:
+        raise ValueError("two-highlight fixture needs twelve one-second choices")
+    first = fixture["section_plan"]["sections"][0]
+    fixture["section_plan"]["sections"] = [
+        {**first, "section_index": 0, "start_seconds": 0.0, "end_seconds": 6.0},
+        {**first, "section_index": 1, "start_seconds": 6.0, "end_seconds": 12.0},
+    ]
+    shots = fixture["stage_edit_exact_shot_clock"]["shots"]
+    for index, shot in enumerate(shots):
+        shot["section_progress"] = (index % 6) / 5.0
 
 
 def _configure_dissolve(
@@ -282,7 +479,446 @@ def _configure_dissolve(
     return boundary
 
 
+def _hash_bound_montage_config() -> RenderedMontageGrammarConfig:
+    identity = {
+        "analysis_basis": "ive_human_reference_visual_montage_grammar_v2",
+        "schema_version": 2,
+        "path": "/tmp/ive-professional-montage-v2.json",
+        "file_sha256": "a" * 64,
+        "content_sha256": "b" * 64,
+    }
+    binding = close_burst_policy_binding_sha256(
+        profile_identity=identity,
+        policy_fingerprint_sha256="c" * 64,
+        minimum_shot_count=2.0,
+        minimum_duration_seconds=2.1503940144767864,
+        minimum_source_switch_fraction=2.0 / 3.0,
+        event_reference_count=6,
+    )
+    return RenderedMontageGrammarConfig(
+        policy_profile_analysis_basis=identity["analysis_basis"],
+        policy_profile_schema_version=identity["schema_version"],
+        policy_profile_path=identity["path"],
+        policy_profile_file_sha256=identity["file_sha256"],
+        policy_profile_content_sha256=identity["content_sha256"],
+        policy_fingerprint_sha256="c" * 64,
+        minimum_close_burst_shot_count=2.0,
+        minimum_close_burst_duration_seconds=2.1503940144767864,
+        minimum_close_burst_source_switch_fraction=2.0 / 3.0,
+        close_burst_event_reference_count=6,
+        close_burst_policy_binding_sha256=binding,
+    )
+
+
 class RenderedMontageGrammarReviewTests(unittest.TestCase):
+    def test_successful_no_face_geometry_matches_visual_score_wide_fallback(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _proxy_geometry_shot_class(
+                {"face_count": 0, "face_bbox_xywh": None},
+                RenderedMontageGrammarConfig(),
+            ),
+            "wide",
+        )
+
+    def test_all_wide_bridge_cannot_bypass_role_conditioned_duration_gate(
+        self,
+    ) -> None:
+        result = _review(
+            _analysis(
+                ("group_wide",) * 12,
+                tuple(range(12)),
+                role="bridge_like",
+                establish=False,
+            )
+        )
+
+        section = result["sections"][0]
+        aggregate = result["role_conditioned_duration_aggregates"][
+            "bridge_like"
+        ]
+        self.assertTrue(section["strict_role_duration_gate_applied"])
+        self.assertFalse(section["strict_highlight_gate_applied"])
+        self.assertFalse(section["short_section_duration_exemption_applied"])
+        self.assertIn(
+            "bridge_nonwide_fraction_below_floor",
+            section["failure_codes"],
+        )
+        # The immutable bridge P10 for close duration is zero: it must not be
+        # promoted into a made-up positive local quota.  Pooled P25 still
+        # rejects an all-wide role.
+        self.assertIsNone(
+            aggregate["hard_targets"][
+                "local_minimum_closeup_duration_fraction"
+            ]
+        )
+        self.assertFalse(
+            aggregate["hard_targets"][
+                "zero_p10_promoted_to_positive_minimum"
+            ]
+        )
+        self.assertIn(
+            "bridge_pooled_closeup_fraction_below_product_minimum",
+            aggregate["failure_codes"],
+        )
+        self.assertIn(
+            "bridge_pooled_nonwide_fraction_below_product_minimum",
+            result["failure_codes"],
+        )
+        self.assertFalse(result["passed"])
+
+    def test_short_chorus_no_longer_uses_five_second_gate_bypass(self) -> None:
+        result = _review(
+            _analysis(
+                ("group_wide",) * 4,
+                (0, 1, 2, 3),
+                establish=False,
+            )
+        )
+
+        section = result["sections"][0]
+        self.assertLess(
+            section["duration_seconds"],
+            RenderedMontageGrammarConfig().highlight_minimum_duration_seconds,
+        )
+        self.assertTrue(section["strict_highlight_gate_applied"])
+        self.assertFalse(section["short_section_duration_exemption_applied"])
+        self.assertIn(
+            "highlight_closeup_fraction_below_floor",
+            section["failure_codes"],
+        )
+        self.assertFalse(result["passed"])
+
+    def test_slow_highlight_source_switch_cadence_fails_final_render_gate(
+        self,
+    ) -> None:
+        config = RenderedMontageGrammarConfig(
+            minimum_wide_involved_source_switch_fraction=0.0,
+            minimum_nonwide_burst_boundaries=0,
+            minimum_post_burst_formation_reset_count=0,
+            minimum_motion_accent_count=0,
+        )
+        result = _review(
+            _analysis(
+                (
+                    "group_wide",
+                    "close_up",
+                    "medium",
+                    "group_wide",
+                    "close_up",
+                    "medium",
+                    "group_wide",
+                    "close_up",
+                ),
+                (0, 0, 1, 1, 1, 1, 1, 1),
+                establish=False,
+            ),
+            config=config,
+        )
+
+        section = result["sections"][0]
+        self.assertAlmostEqual(7.5, section["source_switches_per_minute"])
+        self.assertAlmostEqual(
+            18.642084765823732,
+            section["source_switches_per_minute_hard_minimum"],
+        )
+        self.assertAlmostEqual(
+            23.505554096533405,
+            section["source_switches_per_minute_preferred_target"],
+        )
+        self.assertIn(
+            "highlight_source_switches_per_minute_below_product_minimum",
+            section["failure_codes"],
+        )
+        self.assertFalse(result["passed"])
+
+    def test_soft_targets_are_symmetric_and_do_not_reward_over_close(self) -> None:
+        target = 0.40
+        under = _symmetric_fraction_target_evidence(0.30, target)
+        over = _symmetric_fraction_target_evidence(0.50, target)
+        farther_over = _symmetric_fraction_target_evidence(0.70, target)
+        self.assertAlmostEqual(under["alignment_score"], over["alignment_score"])
+        self.assertLess(farther_over["alignment_score"], over["alignment_score"])
+
+        below_wide_target = _wide_run_soft_target_evidence(2.0, 5.0, 8.0)
+        at_wide_target = _wide_run_soft_target_evidence(5.0, 5.0, 8.0)
+        above_wide_target = _wide_run_soft_target_evidence(6.0, 5.0, 8.0)
+        self.assertEqual(1.0, below_wide_target["alignment_score"])
+        self.assertEqual(1.0, at_wide_target["alignment_score"])
+        self.assertLess(above_wide_target["alignment_score"], 1.0)
+
+    def test_highlight_aggregate_binds_exact_primitive_policy_identity(self) -> None:
+        config = _hash_bound_montage_config()
+        result = _review(
+            _analysis(
+                (
+                    "group_wide",
+                    "medium",
+                    "close_up",
+                    "full_shot",
+                    "medium",
+                    "close_up",
+                ),
+                (0, 1, 2, 3, 1, 2),
+                motion_indices=(1, 4),
+            ),
+            config=config,
+        )
+
+        provenance = result["highlight_aggregate"]["policy_provenance"]
+        self.assertTrue(provenance["profile_identity_bound"])
+        self.assertEqual("c" * 64, provenance["policy_fingerprint_sha256"])
+        self.assertEqual(
+            {
+                "analysis_basis": "ive_human_reference_visual_montage_grammar_v2",
+                "schema_version": 2,
+                "path": "/tmp/ive-professional-montage-v2.json",
+                "file_sha256": "a" * 64,
+                "content_sha256": "b" * 64,
+            },
+            provenance["profile_identity"],
+        )
+        self.assertEqual(
+            config.close_burst_policy_binding_sha256,
+            provenance["close_burst_soft_policy_binding"]["binding_sha256"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing its close-burst"):
+            replace(config, close_burst_policy_binding_sha256=None)
+        with self.assertRaisesRegex(ValueError, "binding SHA-256 mismatch"):
+            replace(config, minimum_close_burst_duration_seconds=2.2)
+
+    def test_close_only_burst_soft_preference_is_additive_and_saturated(self) -> None:
+        config = _hash_bound_montage_config()
+        absent = _review(
+            _analysis(
+                (
+                    "group_wide",
+                    "medium",
+                    "close_up",
+                    "full_shot",
+                    "medium",
+                    "close_up",
+                ),
+                (0, 1, 2, 3, 1, 2),
+                motion_indices=(1, 4),
+            ),
+            config=config,
+        )
+        absent_soft = absent["highlight_aggregate"]["soft_targets"][
+            "close_only_multi_source_burst_event_p10"
+        ]
+        self.assertTrue(absent["passed"])
+        self.assertEqual(0, absent_soft["candidate_event_count"])
+        self.assertEqual(0.0, absent_soft["evidence_weighted_alignment_score"])
+        self.assertFalse(absent_soft["absence_is_hard_failure"])
+
+        qualified = _review(
+            _analysis(
+                (
+                    "group_wide",
+                    "close_up",
+                    "close_up",
+                    "close_up",
+                    "full_shot",
+                    "medium",
+                    "close_up",
+                ),
+                (0, 1, 2, 3, 4, 1, 2),
+                motion_indices=(1, 2, 3, 5),
+            ),
+            config=config,
+        )
+        qualified_soft = qualified["highlight_aggregate"]["soft_targets"][
+            "close_only_multi_source_burst_event_p10"
+        ]
+        self.assertTrue(qualified["passed"])
+        self.assertEqual(1, qualified_soft["qualified_event_count"])
+        self.assertAlmostEqual(0.30, qualified_soft["event_occurrence_support_weight"])
+        self.assertAlmostEqual(
+            0.30,
+            qualified_soft["evidence_weighted_alignment_score"],
+        )
+        self.assertEqual(3, qualified_soft["events"][0]["shot_count"])
+        self.assertEqual(2, qualified_soft["events"][0]["source_switch_count"])
+
+    def test_i_am_shaped_highlights_clear_human_parity_duration_gates(self) -> None:
+        # 50% wide, 16.7% medium, 33.3% close: deliberately shaped like the
+        # accepted I AM floor, while retaining formation anchors and resets.
+        pattern = (
+            "group_wide",
+            "medium",
+            "close_up",
+            "full_shot",
+            "close_up",
+            "group_wide",
+        )
+        fixture = _analysis(
+            pattern + pattern,
+            tuple(range(12)),
+            motion_indices=(1, 2, 4, 7, 8, 10),
+        )
+        _split_into_two_highlights(fixture)
+
+        result = _review(fixture)
+
+        self.assertTrue(result["passed"], result["failure_codes"])
+        aggregate = result["highlight_aggregate"]
+        self.assertTrue(aggregate["passed"])
+        self.assertEqual(2, aggregate["strict_highlight_section_count"])
+        self.assertAlmostEqual(
+            1.0 / 3.0,
+            aggregate["observed"]["closeup_duration_fraction"],
+        )
+        self.assertAlmostEqual(
+            0.5,
+            aggregate["observed"]["nonwide_duration_fraction"],
+        )
+        self.assertEqual(
+            "professional_montage_policy_v2_strict_highlight_duration_gate_v1",
+            aggregate["contract"],
+        )
+        self.assertFalse(
+            aggregate["soft_targets"]["over_close_past_target_is_rewarded"]
+        )
+        self.assertEqual(
+            0.25,
+            aggregate["policy_provenance"]["metrics"][
+                "pooled_closeup_duration_product_minimum"
+            ]["quantile"],
+        )
+
+    def test_failed_bang_shaped_wide_occupancy_fails_duration_products(self) -> None:
+        # 75% wide, 10% medium, 15% close reproduces the failed BANG shape.
+        shot_types = (
+            "group_wide",
+            "full_shot",
+            "group_wide",
+            "medium",
+            "close_up",
+            "group_wide",
+            "full_shot",
+            "group_wide",
+            "group_wide",
+            "close_up",
+            "full_shot",
+            "group_wide",
+            "medium",
+            "group_wide",
+            "full_shot",
+            "close_up",
+            "group_wide",
+            "full_shot",
+            "group_wide",
+            "group_wide",
+        )
+        result = _review(
+            _analysis(
+                shot_types,
+                tuple(range(20)),
+                motion_indices=(4, 9, 15),
+            )
+        )
+
+        self.assertFalse(result["passed"])
+        aggregate = result["highlight_aggregate"]
+        self.assertAlmostEqual(
+            0.15,
+            aggregate["observed"]["closeup_duration_fraction"],
+        )
+        self.assertAlmostEqual(
+            0.25,
+            aggregate["observed"]["nonwide_duration_fraction"],
+        )
+        self.assertIn(
+            "highlight_pooled_closeup_fraction_below_product_minimum",
+            aggregate["failure_codes"],
+        )
+        self.assertIn(
+            "highlight_pooled_nonwide_fraction_below_product_minimum",
+            aggregate["failure_codes"],
+        )
+
+    def test_strong_highlight_cannot_rescue_another_sections_local_p10_failure(
+        self,
+    ) -> None:
+        weak = (
+            "group_wide",
+            "medium",
+            "close_up",
+            "full_shot",
+            "group_wide",
+            "group_wide",
+        )
+        strong = (
+            "group_wide",
+            "close_up",
+            "close_up",
+            "full_shot",
+            "close_up",
+            "close_up",
+        )
+        fixture = _analysis(
+            weak + strong,
+            tuple(range(12)),
+            motion_indices=(1, 2, 7, 8, 10, 11),
+        )
+        _split_into_two_highlights(fixture)
+
+        result = _review(fixture)
+
+        aggregate = result["highlight_aggregate"]
+        self.assertGreater(
+            aggregate["observed"]["closeup_duration_fraction"],
+            aggregate["hard_targets"][
+                "pooled_product_minimum_closeup_duration_fraction"
+            ],
+        )
+        self.assertIn(
+            "highlight_closeup_fraction_below_floor",
+            aggregate["local_section_failures"]["0"],
+        )
+        self.assertNotIn("1", aggregate["local_section_failures"])
+        self.assertFalse(result["passed"])
+
+    def test_consecutive_wide_run_above_human_maximum_is_rejected(self) -> None:
+        shot_types = (
+            ("group_wide", "full_shot", "group_wide") * 3
+            + (
+                "medium",
+                "close_up",
+                "medium",
+                "close_up",
+                "group_wide",
+                "medium",
+                "close_up",
+                "medium",
+                "close_up",
+                "medium",
+                "close_up",
+            )
+        )
+        result = _review(
+            _analysis(
+                shot_types,
+                tuple(range(20)),
+                motion_indices=(9, 10, 11, 14, 15, 16, 18, 19),
+            )
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(
+            9.0,
+            result["highlight_aggregate"]["observed"][
+                "maximum_consecutive_wide_run_seconds"
+            ],
+        )
+        self.assertIn(
+            "section_0:highlight_maximum_consecutive_wide_run_exceeded",
+            result["failure_codes"],
+        )
+
     def test_wide_anchor_then_two_short_closeup_bursts_passes(self) -> None:
         result = _review(
             _analysis(
@@ -775,6 +1411,231 @@ class RenderedMontageGrammarReviewTests(unittest.TestCase):
             0.0,
             result["rendered_closeup_proxy"]["face_coverage_fraction"],
         )
+
+    def test_automatic_ive_duration_and_wide_run_use_interior_geometry(
+        self,
+    ) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+            motion_indices=(1, 2, 4, 5),
+        )
+        _attach_segment_interior_geometry(fixture)
+
+        result = _review(fixture)
+
+        self.assertTrue(result["passed"], result["failure_codes"])
+        interior = result["rendered_segment_interior_geometry"]
+        self.assertTrue(interior["required"])
+        self.assertTrue(interior["passed"])
+        self.assertEqual(interior["unknown_sample_count"], 0)
+        self.assertAlmostEqual(
+            interior["whole_song_observed"]["close_duration_fraction"],
+            2.0 / 6.0,
+        )
+        self.assertAlmostEqual(
+            result["sections"][0]["closeup_duration_fraction"],
+            2.0 / 6.0,
+        )
+
+    def test_claimed_close_with_wide_interior_sample_cannot_pass(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+            motion_indices=(1, 2, 4, 5),
+        )
+        _attach_segment_interior_geometry(
+            fixture,
+            sample_classes_by_segment={2: ("close", "wide", "close")},
+        )
+
+        result = _review(fixture)
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "rendered_nonwide_claim_contradicted_by_wide_interior_geometry",
+            result["failure_codes"],
+        )
+        self.assertGreater(
+            result["rendered_segment_interior_geometry"][
+                "nonwide_claim_wide_contradiction_count"
+            ],
+            0,
+        )
+        self.assertLess(
+            result["sections"][0]["closeup_duration_fraction"],
+            2.0 / 6.0,
+        )
+
+    def test_automatic_ive_missing_interior_geometry_fails_closed(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        fixture["request"] = {
+            "group": "IVE",
+            "edit_mode": "group",
+            "source_mode": "automatic",
+        }
+
+        result = _review(fixture)
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "rendered_segment_interior_geometry_evidence_missing",
+            result["failure_codes"],
+        )
+
+    def test_interior_geometry_hash_and_exact_schedule_tampering_is_rejected(
+        self,
+    ) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        _attach_segment_interior_geometry(fixture)
+        evidence = fixture["rendered_proxy_review"][
+            "segment_interior_geometry"
+        ]
+        evidence["segments"][2]["samples"][1]["frame_index"] += 1
+
+        with self.assertRaisesRegex(ValueError, "evidence SHA-256 mismatch"):
+            _review(fixture)
+
+        core = dict(evidence)
+        core.pop("evidence_sha256")
+        evidence["evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "frame_index differs from schedule"):
+            _review(fixture)
+
+    def test_same_proxy_metadata_with_different_content_is_rejected(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first-proxy.mp4"
+            second = Path(directory) / "second-proxy.mp4"
+            first.write_bytes(b"first-proxy-content")
+            second.write_bytes(b"other-proxy-content")
+            common_mtime_ns = first.stat().st_mtime_ns
+            os.utime(first, ns=(common_mtime_ns, common_mtime_ns))
+            os.utime(second, ns=(common_mtime_ns, common_mtime_ns))
+            self.assertEqual(first.stat().st_size, second.stat().st_size)
+            self.assertEqual(first.stat().st_mtime_ns, second.stat().st_mtime_ns)
+
+            fixture["rendered_proxy_review"]["proxy"]["content_sha256"] = (
+                verified_file_content_sha256(first)
+            )
+            _attach_segment_interior_geometry(fixture)
+            fixture["rendered_proxy_review"]["proxy"]["content_sha256"] = (
+                verified_file_content_sha256(second)
+            )
+
+            with self.assertRaisesRegex(ValueError, "proxy identity differs"):
+                _review(fixture)
+
+    def test_same_source_path_replacement_breaks_content_binding(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+            motion_indices=(1, 2, 4, 5),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_paths = tuple(
+                root / f"source-{index}.mp4" for index in range(4)
+            )
+            for index, path in enumerate(source_paths):
+                path.write_bytes(bytes([65 + index]) * 4096)
+            for index, item in enumerate(
+                fixture["source_index_mapping"]["eligible_sources"]
+            ):
+                item["source"] = str(source_paths[index])
+            fixture["rendered_proxy_review"]["proxy"]["content_sha256"] = (
+                hashlib.sha256(b"synthetic decoded proxy").hexdigest()
+            )
+            _attach_segment_interior_geometry(
+                fixture,
+                source_paths=source_paths,
+                use_real_content=True,
+            )
+            plan = _render_plan(fixture, source_paths=source_paths)
+            before = review_rendered_montage_grammar(
+                fixture,
+                render_plan=plan,
+                config=RenderedMontageGrammarConfig(),
+            )
+            self.assertTrue(before["passed"], before["failure_codes"])
+
+            target = source_paths[2]
+            target_stat = target.stat()
+            replacement = root / "replacement.mp4"
+            replacement.write_bytes(b"Z" * target_stat.st_size)
+            os.utime(
+                replacement,
+                ns=(target_stat.st_atime_ns, target_stat.st_mtime_ns),
+            )
+            replacement.replace(target)
+            self.assertEqual(target.stat().st_size, target_stat.st_size)
+            self.assertEqual(target.stat().st_mtime_ns, target_stat.st_mtime_ns)
+
+            with self.assertRaisesRegex(ValueError, "RenderPlan binding hash mismatch"):
+                review_rendered_montage_grammar(
+                    fixture,
+                    render_plan=plan,
+                    config=RenderedMontageGrammarConfig(),
+                )
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ from .stage_edit_learned_reviewer_adapter import (
 
 ANALYSIS_BASIS = "sequential_decoded_proxy_candidate_rerank_v1"
 SELECTION_BASIS = (
-    "pass_then_decoded_weighted_score_then_issue_fraction_"
+    "pass_then_optional_bounded_editorial_ranking_score_then_issue_fraction_"
     "then_boundary_p10_then_pre_render_score"
 )
 PROFESSIONAL_PLATEAU_ANALYSIS_BASIS = (
@@ -126,6 +126,22 @@ class RenderedCandidateReview:
         return float(self.review_payload.get("weighted_score", -math.inf))
 
     @property
+    def ranking_weighted_score(self) -> float:
+        """Return an optional editorial rank without mutating technical QA."""
+
+        if self.review_payload is None:
+            return -math.inf
+        value = self.review_payload.get(
+            "ranking_weighted_score",
+            self.review_payload.get("weighted_score", -math.inf),
+        )
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return -math.inf
+        return number if math.isfinite(number) else -math.inf
+
+    @property
     def issue_fraction(self) -> float:
         if self.review_payload is None:
             return 1.0
@@ -155,6 +171,11 @@ class RenderedCandidateReview:
             "passed": self.passed,
             "weighted_score": (
                 self.weighted_score if math.isfinite(self.weighted_score) else None
+            ),
+            "ranking_weighted_score": (
+                self.ranking_weighted_score
+                if math.isfinite(self.ranking_weighted_score)
+                else None
             ),
             "issue_fraction": self.issue_fraction,
             "boundary_score_p10": (
@@ -295,7 +316,7 @@ def _rank(item: RenderedCandidateReview) -> tuple[Any, ...]:
     return (
         item.passed,
         item.review_payload is not None,
-        item.weighted_score,
+        item.ranking_weighted_score,
         -item.issue_fraction,
         item.boundary_p10,
         item.candidate.pre_render_score,
@@ -988,7 +1009,7 @@ def _professional_plateau_selection(
                     float(
                         review.candidate.rank_metadata.source_switches_per_minute
                     ),
-                    review.weighted_score,
+                    review.ranking_weighted_score,
                     review.candidate.pre_render_score,
                     -review.candidate.candidate_index,
                 ),
@@ -1005,7 +1026,7 @@ def _professional_plateau_selection(
                             review.candidate.candidate_index
                         ]["cadence_adjusted_dynamics_score"]
                     ),
-                    review.weighted_score,
+                    review.ranking_weighted_score,
                     review.candidate.pre_render_score,
                     -review.candidate.candidate_index,
                 ),
@@ -1056,7 +1077,7 @@ def _professional_plateau_selection(
             ),
             "stable_tie_break": [
                 "higher_source_switches_per_minute",
-                "higher_decoded_weighted_score",
+                "higher_editorial_ranking_weighted_score",
                 "higher_pre_render_score",
                 "lower_candidate_index",
             ],

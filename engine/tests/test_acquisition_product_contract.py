@@ -449,11 +449,11 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
                     )
                     self.assertEqual(client.download_attempts, [])
 
-    def test_member_target_ten_completes_with_eight_verified_portrait_sources(self) -> None:
+    def test_member_target_ten_completes_with_four_verified_portrait_sources(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             request = _automatic_request(root, member=True)
-            client = _FakeClient(_member_entries(8))
+            client = _FakeClient(_member_entries(4))
 
             artifact = acquire_sources(
                 request,
@@ -464,19 +464,49 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             )
 
             self.assertEqual(request.desired_source_count, 10)
-            self.assertEqual(len(artifact.source_paths), 8)
-            self.assertEqual(len(client.download_attempts), 8)
+            self.assertEqual(len(artifact.source_paths), 4)
+            self.assertEqual(len(client.download_attempts), 4)
             self.assertEqual(
                 artifact.manifest["minimum_acceptable_source_count"],
-                8,
+                4,
             )
             summary = artifact.manifest["summary"]
             self.assertEqual(summary["status"], "complete")
-            self.assertEqual(summary["downloaded_source_count"], 8)
+            self.assertEqual(summary["downloaded_source_count"], 4)
             self.assertTrue(summary["source_count_fallback_applied"])
 
             materialized = request.with_materialized_sources(artifact.source_paths)
-            self.assertEqual(len(materialized.sources), 8)
+            self.assertEqual(len(materialized.sources), 4)
+
+    def test_member_three_distinct_fancams_fail_the_four_source_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, member=True)
+            client = _FakeClient(_member_entries(3))
+
+            with self.assertRaisesRegex(AcquisitionError, "최소 4개"):
+                acquire_sources(
+                    request,
+                    _MemoryReporter(),
+                    client=client,  # type: ignore[arg-type]
+                    media_validator=lambda path: None,
+                    media_probe=_media_with_dimensions,
+                )
+
+            manifest = json.loads(
+                (root / "cache" / "acquisition-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["minimum_acceptable_source_count"], 4)
+            self.assertEqual(
+                manifest["source_count_policy"]["policy"],
+                "automatic_member_target_ten_minimum_four",
+            )
+            self.assertEqual(
+                manifest["summary"]["status"],
+                "insufficient_metadata_candidates",
+            )
 
     def test_selection_requires_ive_show_title_and_verified_official_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

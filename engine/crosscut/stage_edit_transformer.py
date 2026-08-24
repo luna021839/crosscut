@@ -156,6 +156,22 @@ STAGE_EDIT_ACTION_FORMATION_SOURCE_FEATURE_NAMES = (
     *STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES,
 )
 
+STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT = (
+    "source_exact_visual_cache_current_next_real_pose60_v1"
+)
+STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT = (
+    "source_exact_timeline_entry_exit_real_pose60_v1"
+)
+STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND = (
+    "opencv_zoo_mediapipe_pose_2023mar"
+)
+STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS = frozenset(
+    {
+        STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
+        STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT,
+    }
+)
+
 
 def _tuple_of_strings(value: Sequence[Any], field_name: str) -> tuple[str, ...]:
     output = tuple(str(item).strip() for item in value)
@@ -353,6 +369,110 @@ DEFAULT_STAGE_EDIT_SCHEMA = StageEditTokenSchema(
 
 
 @dataclass(frozen=True, slots=True)
+class StageEditTemporalPoseSidecar:
+    """Source-exact two-sample pose evidence excluded from model tensors.
+
+    The sidecar is serialized and content-hashed with feature snapshots, but
+    it is not named by :class:`StageEditTokenSchema` and is never consumed by
+    ``tensorize_stage_edit_batch``.  This preserves every existing checkpoint
+    dimension and schema fingerprint while allowing post-forward pair audits.
+    """
+
+    embeddings: tuple[tuple[float, ...], tuple[float, ...]]
+    interval_seconds: float
+    sampling_contract: str
+    producer_backend: str = STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND
+
+    def __post_init__(self) -> None:
+        samples = tuple(tuple(value for value in sample) for sample in self.embeddings)
+        if len(samples) != 2 or any(
+            len(sample) != len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES)
+            for sample in samples
+        ):
+            raise ValueError(
+                "temporal pose sidecar must contain exactly two 60-D samples"
+            )
+        normalized: list[tuple[float, ...]] = []
+        for sample in samples:
+            if any(isinstance(value, bool) for value in sample):
+                raise ValueError(
+                    "temporal pose sidecar values must be real coordinates"
+                )
+            try:
+                values = tuple(float(value) for value in sample)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "temporal pose sidecar values must be real coordinates"
+                ) from exc
+            if any(
+                not math.isfinite(value) or not -1.0 <= value <= 1.0
+                for value in values
+            ):
+                raise ValueError(
+                    "temporal pose sidecar values must be finite in [-1, 1]"
+                )
+            normalized.append(values)
+        if isinstance(self.interval_seconds, bool):
+            raise ValueError("temporal pose sidecar interval must be positive")
+        try:
+            interval = float(self.interval_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "temporal pose sidecar interval must be positive"
+            ) from exc
+        if not math.isfinite(interval) or interval <= 0.0:
+            raise ValueError("temporal pose sidecar interval must be positive")
+        contract = str(self.sampling_contract).strip()
+        if contract not in STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS:
+            raise ValueError("temporal pose sidecar sampling contract is unsupported")
+        producer_backend = str(self.producer_backend).strip()
+        if producer_backend != STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND:
+            raise ValueError(
+                "temporal pose sidecar producer backend is not trusted"
+            )
+        object.__setattr__(self, "embeddings", tuple(normalized))
+        object.__setattr__(self, "interval_seconds", interval)
+        object.__setattr__(self, "sampling_contract", contract)
+        object.__setattr__(self, "producer_backend", producer_backend)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "embeddings": [list(sample) for sample in self.embeddings],
+            "interval_seconds": self.interval_seconds,
+            "sampling_contract": self.sampling_contract,
+            "producer_backend": self.producer_backend,
+            "transformer_tensor_input": False,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any]
+    ) -> "StageEditTemporalPoseSidecar":
+        expected = {
+            "embeddings",
+            "interval_seconds",
+            "sampling_contract",
+            "producer_backend",
+            "transformer_tensor_input",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise ValueError("temporal pose sidecar schema does not match")
+        if payload.get("transformer_tensor_input") is not False:
+            raise ValueError("temporal pose sidecar cannot enter Transformer tensors")
+        raw_embeddings = payload.get("embeddings")
+        if not isinstance(raw_embeddings, list) or any(
+            not isinstance(sample, list) for sample in raw_embeddings
+        ):
+            raise ValueError("temporal pose sidecar embeddings must be arrays")
+        return cls(
+            embeddings=tuple(tuple(sample) for sample in raw_embeddings),
+            interval_seconds=payload.get("interval_seconds"),
+            sampling_contract=payload.get("sampling_contract"),
+            producer_backend=payload.get("producer_backend"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SourceCandidateToken:
     """Features for one synchronized source at one master-timeline token."""
 
@@ -361,6 +481,15 @@ class SourceCandidateToken:
     missing_mask: tuple[bool, ...] = ()
     available: bool = True
     hard_gate_passed: bool = True
+    temporal_pose_sidecar: StageEditTemporalPoseSidecar | None = None
+
+    def __post_init__(self) -> None:
+        if self.temporal_pose_sidecar is not None and not isinstance(
+            self.temporal_pose_sidecar, StageEditTemporalPoseSidecar
+        ):
+            raise TypeError(
+                "temporal_pose_sidecar must use StageEditTemporalPoseSidecar"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2943,6 +3072,10 @@ __all__ = [
     "STAGE_EDIT_FORMATION_LAYOUT_FEATURE_NAMES",
     "STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES",
     "STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES",
+    "STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND",
+    "STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS",
+    "STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT",
+    "STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT",
     "STAGE_EDIT_SOURCE_RELATION_MODE",
     "STAGE_EDIT_SOURCE_SCORING_CONTRACT",
     "STAGE_EDIT_VALIDATION_SELECTION_CONTRACT",
@@ -2950,6 +3083,7 @@ __all__ = [
     "RENDERER_OWNED_TRANSITION_AUTHORITY",
     "TOKEN_SCHEMA_VERSION",
     "SourceCandidateToken",
+    "StageEditTemporalPoseSidecar",
     "StageEditCheckpointMetadata",
     "StageEditLossContract",
     "StageEditModelOutput",

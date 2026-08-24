@@ -10,7 +10,7 @@ production readiness contract before any decoding work is attempted.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import math
@@ -18,6 +18,21 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .ive import AspectRatio
+from .professional_montage_policy import (
+    CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+    DURATION_PREFERRED_TARGET_QUANTILE,
+    DURATION_PRODUCT_MINIMUM_QUANTILE,
+    HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+    HIGHLIGHT_DURATION_EVIDENCE_CONTRACT,
+    HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+    HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT,
+    HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+    REFERENCE_FLOOR_QUANTILE,
+    WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+    WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+    close_burst_policy_binding_payload,
+    close_burst_policy_binding_sha256,
+)
 from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -49,9 +64,15 @@ from .stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
     StageEditSourcePairScorer,
 )
+from .stage_edit_temporal_pose_motion import (
+    TemporalPoseMotionThresholds,
+    require_scalar_stage_edit_pose_payload,
+)
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_DECISION_HISTORY_OWNER,
+    STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
+    StageEditTemporalPoseSidecar,
     StageEditTokenSchema,
     stage_edit_readiness_report,
 )
@@ -63,8 +84,8 @@ from .stage_edit_transition_authority import (
 )
 
 
-DECODER_SCHEMA_VERSION = 10
-DECODER_CONTRACT = "stage_edit_semimarkov_beam_v7"
+DECODER_SCHEMA_VERSION = 13
+DECODER_CONTRACT = "stage_edit_semimarkov_beam_v10"
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -75,7 +96,10 @@ _NONWIDE_SHOT_SIZES = frozenset({"medium", "closeup", "extreme_closeup"})
 MONTAGE_GRAMMAR_CONTRACT = (
     "ive_human_reference_wide_transition_floor_plus_"
     "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-    "highlight_burst_reset_and_reference_cadence_target_v6"
+    "highlight_burst_reset_reference_cadence_and_close_burst_soft_target_v7"
+)
+HIGHLIGHT_AGGREGATE_CONTRACT = (
+    "professional_montage_policy_v2_strict_highlight_duration_gate_v1"
 )
 HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
     "ive_20_human_reference_chorus_shot_boundary_rate_distribution_v1"
@@ -86,6 +110,96 @@ HANDCRAFTED_CONTINUITY_SCORER_CONTRACT = (
 HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT = hashlib.sha256(
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT.encode("utf-8")
 ).hexdigest()
+HIGHLIGHT_MOTION_CALIBRATION_CONTRACT = (
+    "ive_human_reference_highlight_close_switch_"
+    "motion_amount_plus_continuity_calibration_v3"
+)
+HIGHLIGHT_MOTION_CALIBRATION_QUANTILES = (0.10, 0.25, 0.50, 0.75)
+_HIGHLIGHT_MOTION_ACCENT_MAXIMUM_RAW_BONUS = 0.12
+TEMPORAL_POSE_MOTION_CALIBRATION_CONTRACT = (
+    "source_exact_temporal_pose_motion_threshold_calibration_v1"
+)
+TEMPORAL_POSE_MOTION_CALIBRATION_ACTIVATION_AVAILABLE = False
+SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT = (
+    "hash_bound_stage_edit_token_pose60_scalar_evidence_v1"
+)
+TEMPORAL_POSE_SIDECAR_SCALAR_EVIDENCE_CONTRACT = (
+    "hash_bound_source_exact_temporal_pose_sidecar_scalar_evidence_v1"
+)
+
+
+def _redacted_content_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _public_scalar_pose_payload(
+    payload: dict[str, Any],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    require_scalar_stage_edit_pose_payload(payload, context=context)
+    return payload
+
+
+def _same_time_pose_scalar_evidence(
+    embedding: Sequence[float] | None,
+) -> dict[str, Any]:
+    observed = embedding is not None
+    return {
+        "contract": SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT,
+        "observed": observed,
+        "feature_dimension": len(embedding) if embedding is not None else None,
+        "trusted_producer_contract": (
+            SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT if observed else None
+        ),
+        "content_sha256": (
+            _redacted_content_sha256(
+                {
+                    "contract": SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT,
+                    "feature_dimension": len(embedding),
+                    "coordinates": [float(value) for value in embedding],
+                }
+            )
+            if embedding is not None
+            else None
+        ),
+    }
+
+
+def _temporal_sidecar_scalar_evidence(
+    sidecar: StageEditTemporalPoseSidecar | None,
+) -> dict[str, Any]:
+    observed = sidecar is not None
+    return {
+        "contract": TEMPORAL_POSE_SIDECAR_SCALAR_EVIDENCE_CONTRACT,
+        "observed": observed,
+        "sample_count": len(sidecar.embeddings) if sidecar is not None else 0,
+        "feature_dimension": (
+            len(sidecar.embeddings[0]) if sidecar is not None else None
+        ),
+        "interval_seconds": (
+            sidecar.interval_seconds if sidecar is not None else None
+        ),
+        "sampling_contract": (
+            sidecar.sampling_contract if sidecar is not None else None
+        ),
+        "trusted_producer_contract": (
+            sidecar.producer_backend if sidecar is not None else None
+        ),
+        "content_sha256": (
+            _redacted_content_sha256(sidecar.to_dict())
+            if sidecar is not None
+            else None
+        ),
+        "enters_transformer_tensors": False,
+    }
 
 
 class StageEditSemiMarkovError(RuntimeError):
@@ -123,6 +237,382 @@ def _strict_bool_tuple(values: Sequence[bool], name: str) -> tuple[bool, ...]:
 
 def _float_tuple(values: Sequence[float], name: str) -> tuple[float, ...]:
     return tuple(_finite(value, f"{name}[{index}]") for index, value in enumerate(values))
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditHighlightMotionCalibration:
+    """Immutable profile-v3 input for motion-accent ranking.
+
+    The current v2 montage policy does not contain a choreography-motion
+    distribution.  This separate payload lets an audited source-pair corpus
+    bind those observations without silently turning them into a hard quota.
+    Runtime thresholds remain explicit on :class:`StageEditSemiMarkovConfig`.
+    """
+
+    analysis_basis: str
+    human_reference_count: int
+    source_pair_negative_samples: int
+    maximum_sources: int
+    confirmed_source_switch_count: int
+    highlight_role_close_involved_switch_count: int
+    build_close_involved_switch_count: int
+    chorus_close_involved_switch_count: int
+    bridge_close_involved_switch_count: int
+    pose_pair_observed_switch_count: int
+    continuity_observed_switch_count: int
+    pose_embedding_cosine_observed_switch_count: int
+    sharpness_pair_observed_switch_count: int
+    pose_motion_minimum_quantiles: tuple[float, float, float, float]
+    continuity_score_quantiles: tuple[float, float, float, float]
+    pose_embedding_cosine_quantiles: tuple[float, float, float, float]
+    sharpness_minimum_quantiles: tuple[float, float, float, float] | None = None
+    continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY
+    continuity_scorer_contract: str = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+
+    def __post_init__(self) -> None:
+        basis = str(self.analysis_basis).strip()
+        if not basis:
+            raise StageEditDecodeInputError(
+                "highlight motion calibration analysis_basis cannot be blank"
+            )
+        object.__setattr__(self, "analysis_basis", basis)
+        for name in (
+            "human_reference_count",
+            "maximum_sources",
+            "confirmed_source_switch_count",
+            "highlight_role_close_involved_switch_count",
+            "pose_pair_observed_switch_count",
+            "continuity_observed_switch_count",
+            "pose_embedding_cosine_observed_switch_count",
+            "sharpness_pair_observed_switch_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                if (
+                    name == "sharpness_pair_observed_switch_count"
+                    and not isinstance(value, bool)
+                    and value == 0
+                ):
+                    continue
+                raise StageEditDecodeInputError(
+                    f"highlight motion calibration {name} must be a positive integer"
+                )
+        for name in (
+            "build_close_involved_switch_count",
+            "chorus_close_involved_switch_count",
+            "bridge_close_involved_switch_count",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise StageEditDecodeInputError(
+                    f"highlight motion calibration {name} must be a non-negative "
+                    "integer"
+                )
+        negative_samples = self.source_pair_negative_samples
+        if (
+            isinstance(negative_samples, bool)
+            or not isinstance(negative_samples, int)
+            or negative_samples < 0
+        ):
+            raise StageEditDecodeInputError(
+                "highlight motion calibration source_pair_negative_samples must "
+                "be a non-negative integer"
+            )
+        if self.maximum_sources < 2:
+            raise StageEditDecodeInputError(
+                "highlight motion calibration maximum_sources must be at least two"
+            )
+        if not (
+            self.highlight_role_close_involved_switch_count
+            <= self.confirmed_source_switch_count
+            and self.pose_pair_observed_switch_count
+            <= self.highlight_role_close_involved_switch_count
+            and self.continuity_observed_switch_count
+            <= self.highlight_role_close_involved_switch_count
+            and self.sharpness_pair_observed_switch_count
+            <= self.highlight_role_close_involved_switch_count
+            and self.pose_embedding_cosine_observed_switch_count
+            <= self.highlight_role_close_involved_switch_count
+            and (
+                self.build_close_involved_switch_count
+                + self.chorus_close_involved_switch_count
+                + self.bridge_close_involved_switch_count
+            )
+            == self.highlight_role_close_involved_switch_count
+        ):
+            raise StageEditDecodeInputError(
+                "highlight motion calibration observed counts are inconsistent"
+            )
+
+        def normalize_quantiles(
+            values: Sequence[float],
+            *,
+            name: str,
+            minimum: float,
+            maximum: float,
+        ) -> tuple[float, float, float, float]:
+            normalized = _float_tuple(values, name)
+            if len(normalized) != len(HIGHLIGHT_MOTION_CALIBRATION_QUANTILES):
+                raise StageEditDecodeInputError(
+                    f"{name} must contain P10, P25, P50, and P75"
+                )
+            if any(not minimum <= value <= maximum for value in normalized):
+                raise StageEditDecodeInputError(
+                    f"{name} values must lie in [{minimum}, {maximum}]"
+                )
+            if any(
+                right + _TIME_EPSILON < left
+                for left, right in zip(normalized, normalized[1:])
+            ):
+                raise StageEditDecodeInputError(
+                    f"{name} values must be monotonic"
+                )
+            return normalized  # type: ignore[return-value]
+
+        object.__setattr__(
+            self,
+            "pose_motion_minimum_quantiles",
+            normalize_quantiles(
+                self.pose_motion_minimum_quantiles,
+                name="pose_motion_minimum_quantiles",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "continuity_score_quantiles",
+            normalize_quantiles(
+                self.continuity_score_quantiles,
+                name="continuity_score_quantiles",
+                minimum=-1.0,
+                maximum=0.0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "pose_embedding_cosine_quantiles",
+            normalize_quantiles(
+                self.pose_embedding_cosine_quantiles,
+                name="pose_embedding_cosine_quantiles",
+                minimum=-1.0,
+                maximum=1.0,
+            ),
+        )
+        sharpness = self.sharpness_minimum_quantiles
+        if self.sharpness_pair_observed_switch_count == 0:
+            if sharpness is not None:
+                raise StageEditDecodeInputError(
+                    "sharpness quantiles require observed sharpness pairs"
+                )
+        elif sharpness is None:
+            raise StageEditDecodeInputError(
+                "observed sharpness pairs require sharpness quantiles"
+            )
+        else:
+            object.__setattr__(
+                self,
+                "sharpness_minimum_quantiles",
+                normalize_quantiles(
+                    sharpness,
+                    name="sharpness_minimum_quantiles",
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+            )
+        authority = str(self.continuity_authority).strip()
+        scorer_contract = str(self.continuity_scorer_contract).strip()
+        if authority != HANDCRAFTED_CONTINUITY_AUTHORITY:
+            raise StageEditDecodeInputError(
+                "the current highlight motion calibration requires handcrafted "
+                "continuity authority"
+            )
+        if scorer_contract != HANDCRAFTED_CONTINUITY_SCORER_CONTRACT:
+            raise StageEditDecodeInputError(
+                "the current highlight motion calibration scorer contract must "
+                "match handcrafted continuity"
+            )
+        object.__setattr__(self, "continuity_authority", authority)
+        object.__setattr__(self, "continuity_scorer_contract", scorer_contract)
+
+    def to_dict(self) -> dict[str, Any]:
+        distributions: dict[str, Any] = {
+            "pose_motion_minimum": {
+                "observed_switch_count": self.pose_pair_observed_switch_count,
+                "values": dict(
+                    zip(
+                        ("p10", "p25", "p50", "p75"),
+                        self.pose_motion_minimum_quantiles,
+                        strict=True,
+                    )
+                ),
+            },
+            "handcrafted_continuity_score": {
+                "observed_switch_count": self.continuity_observed_switch_count,
+                "values": dict(
+                    zip(
+                        ("p10", "p25", "p50", "p75"),
+                        self.continuity_score_quantiles,
+                        strict=True,
+                    )
+                ),
+            },
+            "same_time_pose_embedding_cosine_proxy": {
+                "observed_switch_count": (
+                    self.pose_embedding_cosine_observed_switch_count
+                ),
+                "values": dict(
+                    zip(
+                        ("p10", "p25", "p50", "p75"),
+                        self.pose_embedding_cosine_quantiles,
+                        strict=True,
+                    )
+                ),
+                "runtime_pair_feature_available": True,
+                "eligible_as_soft_bonus_qualifier": True,
+                "used_for_threshold_activation": False,
+                "default_runtime_threshold_bound": False,
+                "hard_gate_derived_from_sparse_support": False,
+                "direction_or_velocity_proven": False,
+            },
+            "sharpness_minimum": {
+                "observed_switch_count": self.sharpness_pair_observed_switch_count,
+                "values": (
+                    dict(
+                        zip(
+                            ("p10", "p25", "p50", "p75"),
+                            self.sharpness_minimum_quantiles,
+                            strict=True,
+                        )
+                    )
+                    if self.sharpness_minimum_quantiles is not None
+                    else None
+                ),
+            },
+        }
+        payload: dict[str, Any] = {
+            "contract": HIGHLIGHT_MOTION_CALIBRATION_CONTRACT,
+            "schema_version": 3,
+            "analysis_basis": self.analysis_basis,
+            "quantile_method": "nearest_rank_empirical",
+            "quantiles": list(HIGHLIGHT_MOTION_CALIBRATION_QUANTILES),
+            "sampling": {
+                "human_reference_count": self.human_reference_count,
+                "source_pair_negative_samples": self.source_pair_negative_samples,
+                "maximum_sources": self.maximum_sources,
+            },
+            "counts": {
+                "confirmed_source_switch_count": (
+                    self.confirmed_source_switch_count
+                ),
+                "highlight_role_close_involved_switch_count": (
+                    self.highlight_role_close_involved_switch_count
+                ),
+                "highlight_role_close_involved_switch_count_by_role": {
+                    "build": self.build_close_involved_switch_count,
+                    "chorus_like": self.chorus_close_involved_switch_count,
+                    "bridge": self.bridge_close_involved_switch_count,
+                },
+            },
+            "continuity_authority": self.continuity_authority,
+            "continuity_scorer_contract": self.continuity_scorer_contract,
+            "distributions": distributions,
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload["calibration_fingerprint_sha256"] = hashlib.sha256(
+            canonical
+        ).hexdigest()
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditTemporalPoseMotionCalibration:
+    """Explicit evidence identity plus fully injected temporal thresholds."""
+
+    analysis_basis: str
+    source_evidence_sha256: str
+    observed_boundary_count: int
+    thresholds: TemporalPoseMotionThresholds
+
+    def __post_init__(self) -> None:
+        basis = str(self.analysis_basis).strip()
+        if not basis:
+            raise StageEditDecodeInputError(
+                "temporal pose-motion calibration analysis_basis cannot be blank"
+            )
+        digest = str(self.source_evidence_sha256).strip()
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise StageEditDecodeInputError(
+                "temporal pose-motion source evidence must be lowercase SHA-256"
+            )
+        count = self.observed_boundary_count
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise StageEditDecodeInputError(
+                "temporal pose-motion observed boundary count must be positive"
+            )
+        thresholds = self.thresholds
+        if isinstance(thresholds, Mapping):
+            try:
+                thresholds = TemporalPoseMotionThresholds(**dict(thresholds))
+            except (TypeError, ValueError) as exc:
+                raise StageEditDecodeInputError(
+                    "temporal pose-motion thresholds cannot be round-tripped"
+                ) from exc
+        if not isinstance(thresholds, TemporalPoseMotionThresholds):
+            raise StageEditDecodeInputError(
+                "temporal pose-motion thresholds have an invalid type"
+            )
+        object.__setattr__(self, "analysis_basis", basis)
+        object.__setattr__(self, "source_evidence_sha256", digest)
+        object.__setattr__(self, "thresholds", thresholds)
+
+    def to_dict(self) -> dict[str, Any]:
+        thresholds = {
+            "minimum_boundary_motion_magnitude": (
+                self.thresholds.minimum_boundary_motion_magnitude
+            ),
+            "minimum_endpoint_pose_cosine": (
+                self.thresholds.minimum_endpoint_pose_cosine
+            ),
+            "minimum_velocity_direction_cosine": (
+                self.thresholds.minimum_velocity_direction_cosine
+            ),
+            "minimum_phase_compatibility": (
+                self.thresholds.minimum_phase_compatibility
+            ),
+            "pose_norm_epsilon": self.thresholds.pose_norm_epsilon,
+        }
+        payload: dict[str, Any] = {
+            "contract": TEMPORAL_POSE_MOTION_CALIBRATION_CONTRACT,
+            "analysis_basis": self.analysis_basis,
+            "source_evidence_sha256": self.source_evidence_sha256,
+            "observed_boundary_count": self.observed_boundary_count,
+            "thresholds": thresholds,
+            "default_thresholds_present": False,
+            "hard_boundary_quota": 0,
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload["calibration_fingerprint_sha256"] = hashlib.sha256(
+            canonical
+        ).hexdigest()
+        return payload
 
 
 def _normalized_shot_size(value: str, name: str) -> str:
@@ -239,9 +729,20 @@ class StageEditSourceContinuity:
     detected_person_count_normalized: float | None = None
     formation_person_count_normalized: float | None = None
     formation_pose_coverage: float | None = None
+    # Exact same-master-time 60-D model-pose observation.  This is deliberately
+    # appended rather than inserted into the Transformer schema: the values
+    # already exist in every source token and are copied only for pairwise
+    # runtime auditing after the global forward pass.
+    pose_model_embedding: tuple[float, ...] | None = None
+    # Two source-local real-model observations remain a non-Transformer
+    # sidecar.  The previous head frame supplies the outgoing pre-boundary
+    # window and the current frame supplies the incoming post-boundary window.
+    temporal_pose_sidecar: StageEditTemporalPoseSidecar | None = None
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
+            if name in {"pose_model_embedding", "temporal_pose_sidecar"}:
+                continue
             value = getattr(self, name)
             if value is None:
                 continue
@@ -255,8 +756,56 @@ class StageEditSourceContinuity:
             if value is not None and not 0.0 <= value <= 1.0:
                 raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
 
-    def to_dict(self) -> dict[str, float | None]:
-        return asdict(self)
+        pose_embedding = self.pose_model_embedding
+        if pose_embedding is not None:
+            if isinstance(pose_embedding, (str, bytes)):
+                raise StageEditDecodeInputError(
+                    "pose_model_embedding must contain numeric coordinates"
+                )
+            try:
+                normalized_pose = _float_tuple(
+                    tuple(pose_embedding), "pose_model_embedding"
+                )
+            except TypeError as exc:
+                raise StageEditDecodeInputError(
+                    "pose_model_embedding must be a numeric sequence or None"
+                ) from exc
+            if len(normalized_pose) != len(
+                STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES
+            ):
+                raise StageEditDecodeInputError(
+                    "pose_model_embedding must contain exactly 60 values"
+                )
+            if any(not -1.0 <= value <= 1.0 for value in normalized_pose):
+                raise StageEditDecodeInputError(
+                    "pose_model_embedding values must lie in [-1, 1]"
+                )
+            object.__setattr__(
+                self, "pose_model_embedding", normalized_pose
+            )
+        if self.temporal_pose_sidecar is not None and not isinstance(
+            self.temporal_pose_sidecar, StageEditTemporalPoseSidecar
+        ):
+            raise StageEditDecodeInputError(
+                "temporal_pose_sidecar must use StageEditTemporalPoseSidecar"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name not in {"pose_model_embedding", "temporal_pose_sidecar"}
+        }
+        payload["same_time_pose_evidence"] = _same_time_pose_scalar_evidence(
+            self.pose_model_embedding
+        )
+        payload["temporal_pose_evidence"] = _temporal_sidecar_scalar_evidence(
+            self.temporal_pose_sidecar
+        )
+        return _public_scalar_pose_payload(
+            payload,
+            context="StageEdit source continuity",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,7 +966,7 @@ class StageEditHeadFrame:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _public_scalar_pose_payload({
             "master_time_seconds": self.master_time_seconds,
             "cut_logit": self.cut_logit,
             "source_logits": list(self.source_logits),
@@ -443,7 +992,7 @@ class StageEditHeadFrame:
             "section_progress": self.section_progress,
             "phrase_progress": self.phrase_progress,
             "section_role": self.section_role,
-        }
+        }, context="StageEdit head frame")
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,8 +1082,8 @@ class StageEditSemiMarkovConfig:
     # IVE professional-montage profile.  The non-wide/burst/reset requirements
     # below are deliberately labelled as product editorial requirements rather
     # than being misrepresented as lower-quantile reference floors.
-    highlight_minimum_closeup_fraction: float = 0.15096153846153848
-    highlight_minimum_nonwide_fraction: float = 0.35
+    highlight_minimum_closeup_fraction: float = 0.1696555074498807
+    highlight_minimum_nonwide_fraction: float = 0.33771372775759073
     highlight_minimum_wide_involved_source_switch_fraction: float = (
         0.37333333333333335
     )
@@ -582,6 +1131,63 @@ class StageEditSemiMarkovConfig:
     # The audit config always records the resolved non-optional values.
     continuity_scorer_contract: str | None = None
     continuity_scorer_fingerprint: str | None = None
+    # Appended for positional backwards compatibility.  The local values
+    # above are duration-weighted P10 floors applied to *every* strict
+    # highlight.  These P25 requirements are pooled across all strict
+    # highlights, so one unusually close section cannot rescue a flat one.
+    highlight_pooled_product_minimum_closeup_fraction: float = (
+        0.22343208166310066
+    )
+    highlight_pooled_product_minimum_nonwide_fraction: float = (
+        0.48417342818793935
+    )
+    # Descriptive human P50 targets.  They affect only bounded final-timeline
+    # ranking/evidence; neither is a hard gate and overshooting the target does
+    # not keep accumulating reward.
+    highlight_preferred_closeup_fraction: float = 0.3267829794497803
+    highlight_preferred_nonwide_fraction: float = 0.6607923807246032
+    # Human-reference P100 is a fail-closed upper limit.  P75 is a saturated
+    # soft upper target: shorter wide runs receive no additional reward.
+    highlight_maximum_consecutive_wide_run_seconds: float = 8.258529233180866
+    highlight_preferred_maximum_consecutive_wide_run_seconds: float = (
+        5.833280462440257
+    )
+    # Primitive-only optional identity avoids mutable config mappings and lets
+    # the pipeline bind the exact ProfessionalMontagePolicy payload later.
+    highlight_policy_profile_analysis_basis: str | None = None
+    highlight_policy_profile_schema_version: int | None = None
+    highlight_policy_profile_path: str | None = None
+    highlight_policy_profile_file_sha256: str | None = None
+    highlight_policy_profile_content_sha256: str | None = None
+    highlight_policy_fingerprint_sha256: str | None = None
+    highlight_motion_calibration: StageEditHighlightMotionCalibration | None = None
+    # Profile v2 has no choreography-motion boundary distribution.  These
+    # hooks therefore default inactive rather than inventing a quota.  When a
+    # future profile binds them, a boundary counts only when motion amount,
+    # continuity compatibility, and (when observed) sharpness all pass.
+    highlight_motion_boundary_minimum_pose_motion: float | None = None
+    highlight_motion_boundary_minimum_continuity_score: float | None = None
+    highlight_motion_boundary_minimum_sharpness: float | None = None
+    highlight_minimum_motion_closeup_switch_boundaries: int = 0
+    # Optional same-time pose-phase gate.  It is inactive by default and may
+    # only bind one of the immutable human-calibration quantiles.  Direction
+    # and velocity are intentionally outside this scalar-cosine contract.
+    highlight_motion_boundary_minimum_pose_phase_cosine: float | None = None
+    # Optional source-exact temporal calibration.  No thresholds are supplied
+    # by default; binding this typed evidence makes temporal phase/direction an
+    # additional requirement for the existing bounded motion soft bonus.
+    highlight_temporal_pose_motion_calibration: (
+        StageEditTemporalPoseMotionCalibration | None
+    ) = None
+    # Six observed human close-only multi-source burst events provide
+    # conditional event-shape P10s, while per-reference occurrence P10 and
+    # median are both zero.  Production binds these as a saturated soft
+    # preference only; absence can never eliminate a timeline.
+    highlight_minimum_close_burst_shot_count: float | None = None
+    highlight_minimum_close_burst_duration_seconds: float | None = None
+    highlight_minimum_close_burst_source_switch_fraction: float | None = None
+    highlight_close_burst_event_reference_count: int | None = None
+    highlight_close_burst_policy_binding_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enforce_montage_grammar, bool):
@@ -659,6 +1265,17 @@ class StageEditSemiMarkovConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise StageEditDecodeInputError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.highlight_minimum_motion_closeup_switch_boundaries, bool)
+            or not isinstance(
+                self.highlight_minimum_motion_closeup_switch_boundaries, int
+            )
+            or self.highlight_minimum_motion_closeup_switch_boundaries < 0
+        ):
+            raise StageEditDecodeInputError(
+                "highlight_minimum_motion_closeup_switch_boundaries must be a "
+                "non-negative integer"
+            )
         if self.enforce_aba_exclusion and self.recent_source_window < 2:
             raise StageEditDecodeInputError(
                 "recent_source_window must be at least two for A-B-A exclusion"
@@ -678,6 +1295,8 @@ class StageEditSemiMarkovConfig:
             "highlight_burst_maximum_shot_seconds",
             "highlight_product_minimum_source_switches_per_minute",
             "highlight_preferred_source_switches_per_minute",
+            "highlight_maximum_consecutive_wide_run_seconds",
+            "highlight_preferred_maximum_consecutive_wide_run_seconds",
         ):
             number = _finite(getattr(self, name), name)
             if number <= 0.0:
@@ -728,6 +1347,10 @@ class StageEditSemiMarkovConfig:
             "highlight_preferred_wide_involved_source_switch_fraction",
             "highlight_minimum_early_wide_anchor_fraction",
             "highlight_minimum_phrase_entry_wide_anchor_fraction",
+            "highlight_pooled_product_minimum_closeup_fraction",
+            "highlight_pooled_product_minimum_nonwide_fraction",
+            "highlight_preferred_closeup_fraction",
+            "highlight_preferred_nonwide_fraction",
             "minimum_formation_anchor_person_count_normalized",
             "strong_formation_anchor_person_count_normalized",
         ):
@@ -735,6 +1358,215 @@ class StageEditSemiMarkovConfig:
             if not 0.0 <= number <= 1.0:
                 raise StageEditDecodeInputError(f"{name} must lie in [0, 1]")
             object.__setattr__(self, name, number)
+        for name in (
+            "highlight_motion_boundary_minimum_pose_motion",
+            "highlight_motion_boundary_minimum_sharpness",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            number = _finite(value, name)
+            if number < 0.0:
+                raise StageEditDecodeInputError(f"{name} cannot be negative")
+            object.__setattr__(self, name, number)
+        continuity_minimum = self.highlight_motion_boundary_minimum_continuity_score
+        if continuity_minimum is not None:
+            number = _finite(
+                continuity_minimum,
+                "highlight_motion_boundary_minimum_continuity_score",
+            )
+            if not -1.0 <= number <= 0.0:
+                raise StageEditDecodeInputError(
+                    "highlight motion continuity minimum must lie in [-1, 0]"
+                )
+            object.__setattr__(
+                self,
+                "highlight_motion_boundary_minimum_continuity_score",
+                number,
+            )
+        pose_phase_minimum = (
+            self.highlight_motion_boundary_minimum_pose_phase_cosine
+        )
+        if pose_phase_minimum is not None:
+            number = _finite(
+                pose_phase_minimum,
+                "highlight_motion_boundary_minimum_pose_phase_cosine",
+            )
+            if not -1.0 <= number <= 1.0:
+                raise StageEditDecodeInputError(
+                    "highlight motion pose-phase cosine minimum must lie in "
+                    "[-1, 1]"
+                )
+            object.__setattr__(
+                self,
+                "highlight_motion_boundary_minimum_pose_phase_cosine",
+                number,
+            )
+        calibration = self.highlight_motion_calibration
+        if calibration is not None:
+            if isinstance(calibration, Mapping):
+                try:
+                    calibration = StageEditHighlightMotionCalibration(
+                        **dict(calibration)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StageEditDecodeInputError(
+                        "highlight_motion_calibration mapping cannot be "
+                        "round-tripped"
+                    ) from exc
+                object.__setattr__(
+                    self, "highlight_motion_calibration", calibration
+                )
+            if not isinstance(calibration, StageEditHighlightMotionCalibration):
+                raise StageEditDecodeInputError(
+                    "highlight_motion_calibration has an invalid type"
+                )
+            pose_threshold = self.highlight_motion_boundary_minimum_pose_motion
+            continuity_threshold = (
+                self.highlight_motion_boundary_minimum_continuity_score
+            )
+            if (pose_threshold is None) != (continuity_threshold is None):
+                raise StageEditDecodeInputError(
+                    "profile-calibrated motion ranking requires paired pose and "
+                    "continuity thresholds"
+                )
+            if pose_threshold is not None and continuity_threshold is not None:
+                if not any(
+                    math.isclose(
+                        pose_threshold,
+                        value,
+                        abs_tol=_TIME_EPSILON,
+                    )
+                    for value in calibration.pose_motion_minimum_quantiles
+                ):
+                    raise StageEditDecodeInputError(
+                        "motion pose threshold is not a calibrated quantile"
+                    )
+                if not any(
+                    math.isclose(
+                        continuity_threshold,
+                        value,
+                        abs_tol=_TIME_EPSILON,
+                    )
+                    for value in calibration.continuity_score_quantiles
+                ):
+                    raise StageEditDecodeInputError(
+                        "motion continuity threshold is not a calibrated quantile"
+                    )
+                if calibration.continuity_authority != self.continuity_authority:
+                    raise StageEditDecodeInputError(
+                        "motion calibration continuity authority does not match "
+                        "the runtime authority"
+                    )
+                resolved_scorer_contract = self.continuity_scorer_contract
+                if (
+                    resolved_scorer_contract is None
+                    and self.continuity_authority
+                    == HANDCRAFTED_CONTINUITY_AUTHORITY
+                ):
+                    resolved_scorer_contract = (
+                        HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+                    )
+                if (
+                    resolved_scorer_contract is not None
+                    and calibration.continuity_scorer_contract
+                    != resolved_scorer_contract
+                ):
+                    raise StageEditDecodeInputError(
+                        "motion calibration scorer contract does not match the "
+                        "runtime scorer"
+                    )
+            pose_phase_threshold = (
+                self.highlight_motion_boundary_minimum_pose_phase_cosine
+            )
+            if pose_phase_threshold is not None:
+                if pose_threshold is None or continuity_threshold is None:
+                    raise StageEditDecodeInputError(
+                        "pose-phase threshold requires paired pose-motion and "
+                        "continuity thresholds"
+                    )
+                if not any(
+                    math.isclose(
+                        pose_phase_threshold,
+                        value,
+                        abs_tol=_TIME_EPSILON,
+                    )
+                    for value in calibration.pose_embedding_cosine_quantiles
+                ):
+                    raise StageEditDecodeInputError(
+                        "motion pose-phase threshold is not a calibrated quantile"
+                    )
+            sharpness_threshold = (
+                self.highlight_motion_boundary_minimum_sharpness
+            )
+            if sharpness_threshold is not None:
+                if calibration.sharpness_minimum_quantiles is None:
+                    raise StageEditDecodeInputError(
+                        "motion sharpness threshold has no calibrated observations"
+                    )
+                if not any(
+                    math.isclose(
+                        sharpness_threshold,
+                        value,
+                        abs_tol=_TIME_EPSILON,
+                    )
+                    for value in calibration.sharpness_minimum_quantiles
+                ):
+                    raise StageEditDecodeInputError(
+                        "motion sharpness threshold is not a calibrated quantile"
+                    )
+        elif self.highlight_motion_boundary_minimum_pose_phase_cosine is not None:
+            raise StageEditDecodeInputError(
+                "pose-phase threshold requires an immutable motion calibration"
+            )
+        temporal_calibration = self.highlight_temporal_pose_motion_calibration
+        if temporal_calibration is not None:
+            if not TEMPORAL_POSE_MOTION_CALIBRATION_ACTIVATION_AVAILABLE:
+                raise StageEditDecodeInputError(
+                    "temporal pose-motion calibration activation is unavailable "
+                    "until an immutable evidence loader/registry verifies it"
+                )
+            if isinstance(temporal_calibration, Mapping):
+                try:
+                    temporal_calibration = StageEditTemporalPoseMotionCalibration(
+                        **dict(temporal_calibration)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StageEditDecodeInputError(
+                        "temporal pose-motion calibration mapping cannot be "
+                        "round-tripped"
+                    ) from exc
+                object.__setattr__(
+                    self,
+                    "highlight_temporal_pose_motion_calibration",
+                    temporal_calibration,
+                )
+            if not isinstance(
+                temporal_calibration, StageEditTemporalPoseMotionCalibration
+            ):
+                raise StageEditDecodeInputError(
+                    "highlight temporal pose-motion calibration has invalid type"
+                )
+            if (
+                calibration is None
+                or self.highlight_motion_boundary_minimum_pose_motion is None
+                or self.highlight_motion_boundary_minimum_continuity_score is None
+            ):
+                raise StageEditDecodeInputError(
+                    "temporal pose-motion qualification requires the existing "
+                    "calibrated motion and continuity soft preference"
+                )
+        if (
+            self.highlight_minimum_motion_closeup_switch_boundaries > 0
+            and (
+                self.highlight_motion_boundary_minimum_pose_motion is None
+                or self.highlight_motion_boundary_minimum_continuity_score is None
+            )
+        ):
+            raise StageEditDecodeInputError(
+                "motion close-up switch gate requires both pose-motion amount "
+                "and continuity-compatibility thresholds"
+            )
         if (
             self.strong_formation_anchor_person_count_normalized
             < self.minimum_formation_anchor_person_count_normalized
@@ -749,6 +1581,153 @@ class StageEditSemiMarkovConfig:
             raise StageEditDecodeInputError(
                 "highlight close-up floor cannot exceed the non-wide floor"
             )
+        if (
+            self.highlight_pooled_product_minimum_closeup_fraction
+            + _TIME_EPSILON
+            < self.highlight_minimum_closeup_fraction
+            or self.highlight_pooled_product_minimum_nonwide_fraction
+            + _TIME_EPSILON
+            < self.highlight_minimum_nonwide_fraction
+        ):
+            raise StageEditDecodeInputError(
+                "highlight pooled P25 product minimum cannot be below its "
+                "local P10 floor"
+            )
+        if (
+            self.highlight_preferred_closeup_fraction + _TIME_EPSILON
+            < self.highlight_pooled_product_minimum_closeup_fraction
+            or self.highlight_preferred_nonwide_fraction + _TIME_EPSILON
+            < self.highlight_pooled_product_minimum_nonwide_fraction
+        ):
+            raise StageEditDecodeInputError(
+                "highlight P50 preferred target cannot be below its P25 "
+                "product minimum"
+            )
+        if (
+            self.highlight_preferred_maximum_consecutive_wide_run_seconds
+            > self.highlight_maximum_consecutive_wide_run_seconds
+            + _TIME_EPSILON
+        ):
+            raise StageEditDecodeInputError(
+                "highlight P75 preferred wide-run maximum cannot exceed its "
+                "hard maximum"
+            )
+        provenance_values = (
+            self.highlight_policy_profile_analysis_basis,
+            self.highlight_policy_profile_schema_version,
+            self.highlight_policy_profile_path,
+            self.highlight_policy_profile_file_sha256,
+            self.highlight_policy_profile_content_sha256,
+            self.highlight_policy_fingerprint_sha256,
+        )
+        if any(value is not None for value in provenance_values):
+            if any(value is None for value in provenance_values):
+                raise StageEditDecodeInputError(
+                    "highlight policy provenance identity must be complete"
+                )
+            assert self.highlight_policy_profile_schema_version is not None
+            if (
+                isinstance(self.highlight_policy_profile_schema_version, bool)
+                or not isinstance(self.highlight_policy_profile_schema_version, int)
+                or self.highlight_policy_profile_schema_version < 1
+            ):
+                raise StageEditDecodeInputError(
+                    "highlight policy profile schema version must be positive"
+                )
+            for name in (
+                "highlight_policy_profile_analysis_basis",
+                "highlight_policy_profile_path",
+            ):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise StageEditDecodeInputError(f"{name} cannot be blank")
+            if not Path(str(self.highlight_policy_profile_path)).is_absolute():
+                raise StageEditDecodeInputError(
+                    "highlight policy profile path must be absolute"
+                )
+            for name in (
+                "highlight_policy_profile_file_sha256",
+                "highlight_policy_profile_content_sha256",
+                "highlight_policy_fingerprint_sha256",
+            ):
+                value = getattr(self, name)
+                if not (
+                    isinstance(value, str)
+                    and len(value) == 64
+                    and all(character in "0123456789abcdef" for character in value)
+                ):
+                    raise StageEditDecodeInputError(
+                        f"{name} must be lowercase SHA-256"
+                    )
+        identity_bound = all(value is not None for value in provenance_values)
+        close_burst_values = (
+            self.highlight_minimum_close_burst_shot_count,
+            self.highlight_minimum_close_burst_duration_seconds,
+            self.highlight_minimum_close_burst_source_switch_fraction,
+            self.highlight_close_burst_event_reference_count,
+            self.highlight_close_burst_policy_binding_sha256,
+        )
+        if identity_bound and any(value is None for value in close_burst_values):
+            raise StageEditDecodeInputError(
+                "hash-bound highlight policy is missing its close-burst soft "
+                "preference binding"
+            )
+        if not identity_bound and any(value is not None for value in close_burst_values):
+            raise StageEditDecodeInputError(
+                "close-burst soft preference requires complete hash-bound "
+                "highlight policy identity"
+            )
+        if identity_bound:
+            assert self.highlight_minimum_close_burst_shot_count is not None
+            assert self.highlight_minimum_close_burst_duration_seconds is not None
+            assert (
+                self.highlight_minimum_close_burst_source_switch_fraction
+                is not None
+            )
+            assert self.highlight_close_burst_event_reference_count is not None
+            assert self.highlight_close_burst_policy_binding_sha256 is not None
+            assert self.highlight_policy_fingerprint_sha256 is not None
+            try:
+                expected_binding = close_burst_policy_binding_sha256(
+                    profile_identity={
+                        "analysis_basis": (
+                            self.highlight_policy_profile_analysis_basis
+                        ),
+                        "schema_version": (
+                            self.highlight_policy_profile_schema_version
+                        ),
+                        "path": self.highlight_policy_profile_path,
+                        "file_sha256": (
+                            self.highlight_policy_profile_file_sha256
+                        ),
+                        "content_sha256": (
+                            self.highlight_policy_profile_content_sha256
+                        ),
+                    },
+                    policy_fingerprint_sha256=(
+                        self.highlight_policy_fingerprint_sha256
+                    ),
+                    minimum_shot_count=(
+                        self.highlight_minimum_close_burst_shot_count
+                    ),
+                    minimum_duration_seconds=(
+                        self.highlight_minimum_close_burst_duration_seconds
+                    ),
+                    minimum_source_switch_fraction=(
+                        self.highlight_minimum_close_burst_source_switch_fraction
+                    ),
+                    event_reference_count=(
+                        self.highlight_close_burst_event_reference_count
+                    ),
+                )
+            except ValueError as exc:
+                raise StageEditDecodeInputError(
+                    f"close-burst soft preference binding is malformed: {exc}"
+                ) from exc
+            if self.highlight_close_burst_policy_binding_sha256 != expected_binding:
+                raise StageEditDecodeInputError(
+                    "close-burst soft preference binding SHA-256 mismatch"
+                )
         if (
             self.highlight_preferred_wide_involved_source_switch_fraction
             + _TIME_EPSILON
@@ -831,6 +1810,48 @@ class StageEditBeamDecision:
     # Separate from the preserved v2 field so downstream users that type-check
     # ``dynamic_crop_decode`` continue to receive only the v2 decode contract.
     dynamic_crop_decode_v3: DynamicCropTrackDecodeV3 | None = None
+    boundary_pose_motion_minimum: float | None = None
+    boundary_pose_motion_delta: float | None = None
+    boundary_camera_motion_delta: float | None = None
+    boundary_minimum_sharpness: float | None = None
+    boundary_continuity_score: float | None = None
+    boundary_motion_amount_plus_continuity_evidence_complete: bool = False
+    boundary_motion_amount_plus_continuity_supported: bool = False
+    boundary_pose_phase_cosine: float | None = None
+    boundary_pose_phase_evidence_observed: bool = False
+    boundary_pose_phase_threshold_bound: bool = False
+    boundary_pose_phase_match_proven: bool = False
+    boundary_pose_phase_feature_dimension: int | None = None
+    boundary_pose_phase_outgoing_observed: bool = False
+    boundary_pose_phase_incoming_observed: bool = False
+    boundary_pose_phase_trusted_producer_contract: str | None = None
+    boundary_pose_phase_outgoing_content_sha256: str | None = None
+    boundary_pose_phase_incoming_content_sha256: str | None = None
+    boundary_pose_phase_pair_content_sha256: str | None = None
+    boundary_temporal_pose_motion_thresholds_bound: bool = False
+    boundary_temporal_pose_motion_input_valid: bool = False
+    boundary_temporal_outgoing_motion_magnitude: float | None = None
+    boundary_temporal_incoming_motion_magnitude: float | None = None
+    boundary_temporal_endpoint_pose_cosine: float | None = None
+    boundary_temporal_velocity_direction_cosine: float | None = None
+    boundary_temporal_phase_compatibility: float | None = None
+    boundary_temporal_confidence: float = 0.0
+    boundary_temporal_classification: str | None = None
+    boundary_temporal_static_pose_match: bool = False
+    boundary_temporal_dynamic_pose_phase_match: bool = False
+    boundary_temporal_failure_reasons: tuple[str, ...] = ()
+    boundary_temporal_sampling_contract_match: bool = False
+    boundary_temporal_outgoing_sampling_contract: str | None = None
+    boundary_temporal_incoming_sampling_contract: str | None = None
+    boundary_temporal_feature_dimension: int | None = None
+    boundary_temporal_outgoing_sidecar_observed: bool = False
+    boundary_temporal_incoming_sidecar_observed: bool = False
+    boundary_temporal_outgoing_trusted_producer_contract: str | None = None
+    boundary_temporal_incoming_trusted_producer_contract: str | None = None
+    boundary_temporal_outgoing_content_sha256: str | None = None
+    boundary_temporal_incoming_content_sha256: str | None = None
+    boundary_temporal_pair_content_sha256: str | None = None
+    boundary_pose_direction_or_velocity_proven: bool = False
 
     @property
     def duration_seconds(self) -> float:
@@ -868,7 +1889,7 @@ class StageEditBeamDecision:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _public_scalar_pose_payload({
             "shot_index": self.shot_index,
             "start_candidate_index": self.start_candidate_index,
             "end_candidate_index": self.end_candidate_index,
@@ -886,6 +1907,125 @@ class StageEditBeamDecision:
                 self.formation_person_count_normalized
             ),
             "formation_pose_coverage": self.formation_pose_coverage,
+            "boundary_motion_amount_plus_continuity": {
+                "pose_motion_minimum": self.boundary_pose_motion_minimum,
+                "pose_motion_delta": self.boundary_pose_motion_delta,
+                "camera_motion_delta": self.boundary_camera_motion_delta,
+                "minimum_sharpness": self.boundary_minimum_sharpness,
+                "continuity_score": self.boundary_continuity_score,
+                "pose_phase_cosine": self.boundary_pose_phase_cosine,
+                "pose_phase_evidence_observed": (
+                    self.boundary_pose_phase_evidence_observed
+                ),
+                "pose_phase_threshold_bound": (
+                    self.boundary_pose_phase_threshold_bound
+                ),
+                "evidence_complete": (
+                    self.boundary_motion_amount_plus_continuity_evidence_complete
+                ),
+                "accent_supported": (
+                    self.boundary_motion_amount_plus_continuity_supported
+                ),
+                "high_motion_alone_is_sufficient": False,
+                "high_pose_phase_alone_is_sufficient": False,
+                "pose_phase_match_proven": (
+                    self.boundary_pose_phase_match_proven
+                ),
+                "same_time_pose_evidence": {
+                    "contract": SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT,
+                    "feature_dimension": (
+                        self.boundary_pose_phase_feature_dimension
+                    ),
+                    "outgoing_observed": (
+                        self.boundary_pose_phase_outgoing_observed
+                    ),
+                    "incoming_observed": (
+                        self.boundary_pose_phase_incoming_observed
+                    ),
+                    "trusted_producer_contract": (
+                        self.boundary_pose_phase_trusted_producer_contract
+                    ),
+                    "outgoing_content_sha256": (
+                        self.boundary_pose_phase_outgoing_content_sha256
+                    ),
+                    "incoming_content_sha256": (
+                        self.boundary_pose_phase_incoming_content_sha256
+                    ),
+                    "pair_content_sha256": (
+                        self.boundary_pose_phase_pair_content_sha256
+                    ),
+                },
+                "temporal_pose_motion": {
+                    "thresholds_bound": (
+                        self.boundary_temporal_pose_motion_thresholds_bound
+                    ),
+                    "input_valid": (
+                        self.boundary_temporal_pose_motion_input_valid
+                    ),
+                    "outgoing_boundary_motion_magnitude": (
+                        self.boundary_temporal_outgoing_motion_magnitude
+                    ),
+                    "incoming_boundary_motion_magnitude": (
+                        self.boundary_temporal_incoming_motion_magnitude
+                    ),
+                    "endpoint_pose_cosine": (
+                        self.boundary_temporal_endpoint_pose_cosine
+                    ),
+                    "velocity_direction_cosine": (
+                        self.boundary_temporal_velocity_direction_cosine
+                    ),
+                    "phase_compatibility": (
+                        self.boundary_temporal_phase_compatibility
+                    ),
+                    "confidence": self.boundary_temporal_confidence,
+                    "classification": self.boundary_temporal_classification,
+                    "static_pose_match": (
+                        self.boundary_temporal_static_pose_match
+                    ),
+                    "dynamic_pose_phase_match": (
+                        self.boundary_temporal_dynamic_pose_phase_match
+                    ),
+                    "failure_reasons": list(
+                        self.boundary_temporal_failure_reasons
+                    ),
+                    "sampling_contract_match": (
+                        self.boundary_temporal_sampling_contract_match
+                    ),
+                    "outgoing_sampling_contract": (
+                        self.boundary_temporal_outgoing_sampling_contract
+                    ),
+                    "incoming_sampling_contract": (
+                        self.boundary_temporal_incoming_sampling_contract
+                    ),
+                    "feature_dimension": (
+                        self.boundary_temporal_feature_dimension
+                    ),
+                    "outgoing_sidecar_observed": (
+                        self.boundary_temporal_outgoing_sidecar_observed
+                    ),
+                    "incoming_sidecar_observed": (
+                        self.boundary_temporal_incoming_sidecar_observed
+                    ),
+                    "outgoing_trusted_producer_contract": (
+                        self.boundary_temporal_outgoing_trusted_producer_contract
+                    ),
+                    "incoming_trusted_producer_contract": (
+                        self.boundary_temporal_incoming_trusted_producer_contract
+                    ),
+                    "outgoing_content_sha256": (
+                        self.boundary_temporal_outgoing_content_sha256
+                    ),
+                    "incoming_content_sha256": (
+                        self.boundary_temporal_incoming_content_sha256
+                    ),
+                    "pair_content_sha256": (
+                        self.boundary_temporal_pair_content_sha256
+                    ),
+                },
+                "pose_direction_or_velocity_proven": (
+                    self.boundary_pose_direction_or_velocity_proven
+                ),
+            },
             "section_progress": self.section_progress,
             "phrase_progress": self.phrase_progress,
             "section_role": self.section_role,
@@ -977,7 +2117,7 @@ class StageEditBeamDecision:
                 ),
                 "section_switch_counts": list(self.section_switch_counts_after),
             },
-        }
+        }, context="StageEdit beam decision")
 
 
 @dataclass(frozen=True, slots=True)
@@ -996,7 +2136,7 @@ class StageEditBeamTimeline:
     )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _public_scalar_pose_payload({
             "rank": self.rank,
             "score": self.score,
             "score_components": dict(self.score_components),
@@ -1013,7 +2153,7 @@ class StageEditBeamTimeline:
             },
             "decisions": [item.to_dict() for item in self.decisions],
             "stage_edit": self.edit.to_dict(),
-        }
+        }, context="StageEdit beam timeline")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1037,7 +2177,7 @@ class StageEditDecodeAudit:
     score_provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _public_scalar_pose_payload({
             "schema_version": self.schema_version,
             "decoder": self.decoder,
             "input_sha256": self.input_sha256,
@@ -1055,7 +2195,7 @@ class StageEditDecodeAudit:
             "returned_timeline_count": self.returned_timeline_count,
             "request_fulfilled": self.request_fulfilled,
             "score_provenance": dict(self.score_provenance),
-        }
+        }, context="StageEdit decode audit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1068,10 +2208,10 @@ class StageEditSemiMarkovResult:
         return tuple(item.edit for item in self.timelines)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _public_scalar_pose_payload({
             "timelines": [item.to_dict() for item in self.timelines],
             "audit": self.audit.to_dict(),
-        }
+        }, context="StageEdit semi-Markov result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1493,6 +2633,176 @@ def _wide_switch_preferred_target_score_raw(
     return 0.10 * max(0.0, 1.0 - after_distance)
 
 
+def _duration_fraction_moves_toward_target(
+    *,
+    prior_target_duration: float,
+    prior_known_duration: float,
+    added_target_duration: float,
+    added_known_duration: float,
+    target_fraction: float,
+) -> bool:
+    before = (
+        prior_target_duration / prior_known_duration
+        if prior_known_duration > _TIME_EPSILON
+        else 0.0
+    )
+    after_known = prior_known_duration + added_known_duration
+    after = (
+        (prior_target_duration + added_target_duration) / after_known
+        if after_known > _TIME_EPSILON
+        else 0.0
+    )
+    return abs(after - target_fraction) + _TIME_EPSILON < abs(
+        before - target_fraction
+    )
+
+
+def _calibration_quantile_label(
+    value: float | None,
+    calibrated_values: Sequence[float],
+) -> str | None:
+    if value is None:
+        return None
+    for label, candidate in zip(
+        ("p10", "p25", "p50", "p75"),
+        calibrated_values,
+        strict=True,
+    ):
+        if math.isclose(value, candidate, abs_tol=_TIME_EPSILON):
+            return label
+    return None
+
+
+def _profile_calibrated_motion_bonus_active(
+    config: StageEditSemiMarkovConfig,
+) -> bool:
+    calibration = config.highlight_motion_calibration
+    if calibration is None:
+        return False
+    pose_threshold = config.highlight_motion_boundary_minimum_pose_motion
+    continuity_threshold = (
+        config.highlight_motion_boundary_minimum_continuity_score
+    )
+    pose_phase_threshold = (
+        config.highlight_motion_boundary_minimum_pose_phase_cosine
+    )
+    return bool(
+        pose_threshold is not None
+        and continuity_threshold is not None
+        and calibration.continuity_authority == config.continuity_authority
+        and _calibration_quantile_label(
+            pose_threshold,
+            calibration.pose_motion_minimum_quantiles,
+        )
+        is not None
+        and _calibration_quantile_label(
+            continuity_threshold,
+            calibration.continuity_score_quantiles,
+        )
+        is not None
+        and (
+            pose_phase_threshold is None
+            or _calibration_quantile_label(
+                pose_phase_threshold,
+                calibration.pose_embedding_cosine_quantiles,
+            )
+            is not None
+        )
+    )
+
+
+def _highlight_motion_calibration_audit(
+    config: StageEditSemiMarkovConfig,
+) -> dict[str, Any]:
+    calibration = config.highlight_motion_calibration
+    pose_threshold = config.highlight_motion_boundary_minimum_pose_motion
+    continuity_threshold = (
+        config.highlight_motion_boundary_minimum_continuity_score
+    )
+    sharpness_threshold = config.highlight_motion_boundary_minimum_sharpness
+    pose_phase_threshold = (
+        config.highlight_motion_boundary_minimum_pose_phase_cosine
+    )
+    return {
+        "evidence_semantics": (
+            "scalar_pose_motion_amount_plus_resolved_boundary_continuity_"
+            "plus_optional_same_time_pose_phase_cosine_and_sharpness"
+        ),
+        "profile_v2_contains_motion_distribution": False,
+        "profile_v3_calibration_input_bound": calibration is not None,
+        "calibration": calibration.to_dict() if calibration is not None else None,
+        "selected_thresholds": {
+            "pose_motion_minimum": pose_threshold,
+            "pose_motion_quantile": (
+                _calibration_quantile_label(
+                    pose_threshold,
+                    calibration.pose_motion_minimum_quantiles,
+                )
+                if calibration is not None
+                else None
+            ),
+            "continuity_score_minimum": continuity_threshold,
+            "continuity_score_quantile": (
+                _calibration_quantile_label(
+                    continuity_threshold,
+                    calibration.continuity_score_quantiles,
+                )
+                if calibration is not None
+                else None
+            ),
+            "sharpness_minimum": sharpness_threshold,
+            "sharpness_quantile": (
+                _calibration_quantile_label(
+                    sharpness_threshold,
+                    calibration.sharpness_minimum_quantiles or (),
+                )
+                if calibration is not None
+                else None
+            ),
+            "pose_phase_cosine_minimum": pose_phase_threshold,
+            "pose_phase_cosine_quantile": (
+                _calibration_quantile_label(
+                    pose_phase_threshold,
+                    calibration.pose_embedding_cosine_quantiles,
+                )
+                if calibration is not None
+                else None
+            ),
+        },
+        "soft_bonus_active": _profile_calibrated_motion_bonus_active(config),
+        "maximum_raw_bonus_per_eligible_boundary": (
+            _HIGHLIGHT_MOTION_ACCENT_MAXIMUM_RAW_BONUS
+        ),
+        "hard_minimum_supported_boundary_count": (
+            config.highlight_minimum_motion_closeup_switch_boundaries
+        ),
+        "hard_minimum_defaults_inactive": True,
+        "high_motion_alone_is_sufficient": False,
+        "high_pose_phase_alone_is_sufficient": False,
+        "pose_phase_threshold_bound": pose_phase_threshold is not None,
+        "soft_bonus_requires_pose_phase_when_threshold_bound": True,
+        "pose_embedding_cosine_runtime_feature_available": True,
+        "same_time_pose_embedding_cosine_is_temporal_direction_proof": False,
+        "temporal_pose_motion": {
+            "calibration_bound": False,
+            "calibration": None,
+            "activation_available": False,
+            "boundary_alignment_proven": False,
+            "default_thresholds_present": False,
+            "new_hard_boundary_quota": 0,
+            "requires_source_exact_two_sample_real_pose60_sidecars": True,
+            "uses_previous_sparse_token_as_cut_adjacent_sample": False,
+            "sparse_sidecars_are_scalar_hash_audit_only": True,
+            "enters_transformer_tensors": False,
+            "static_pose_match_can_receive_dynamic_bonus": False,
+            "opposite_direction_can_receive_dynamic_bonus": False,
+            "missing_sidecar_can_receive_dynamic_bonus": False,
+        },
+        "pose_phase_direction_or_velocity_proven": False,
+        "temporal_direction_proof_capability_bound": False,
+    }
+
+
 def _montage_grammar_score_raw(
     *,
     directive: Any,
@@ -1508,6 +2818,10 @@ def _montage_grammar_score_raw(
     config: StageEditSemiMarkovConfig,
     prior_source_switch_boundaries: int = 0,
     prior_wide_involved_source_switch_boundaries: int = 0,
+    prior_section_known_duration_seconds: float = 0.0,
+    prior_section_closeup_duration_seconds: float = 0.0,
+    prior_section_nonwide_duration_seconds: float = 0.0,
+    boundary_motion_accent_supported: bool = False,
 ) -> float:
     """Bounded structural prior; learned logits still own the edit decision.
 
@@ -1554,6 +2868,69 @@ def _montage_grammar_score_raw(
             raw -= 0.12
 
     if directive.role is SectionRole.CHORUS_LIKE:
+        if (
+            prior_section_known_duration_seconds <= _TIME_EPSILON
+            and previous_shot_size is not None
+            and previous_shot_size != "unknown"
+            and previous_duration_seconds is not None
+        ):
+            # Preserve the helper's useful standalone semantics in tests and
+            # diagnostics; the production beam supplies exact section totals.
+            prior_section_known_duration_seconds = previous_duration_seconds
+            prior_section_closeup_duration_seconds = (
+                previous_duration_seconds
+                if previous_shot_size in _CLOSEUP_SHOT_SIZES
+                else 0.0
+            )
+            prior_section_nonwide_duration_seconds = (
+                previous_duration_seconds
+                if previous_shot_size in _NONWIDE_SHOT_SIZES
+                else 0.0
+            )
+        added_known_duration = duration_seconds
+        closeup_target_improves = _duration_fraction_moves_toward_target(
+            prior_target_duration=prior_section_closeup_duration_seconds,
+            prior_known_duration=prior_section_known_duration_seconds,
+            added_target_duration=(
+                duration_seconds
+                if shot_size in _CLOSEUP_SHOT_SIZES
+                else 0.0
+            ),
+            added_known_duration=added_known_duration,
+            target_fraction=config.highlight_preferred_closeup_fraction,
+        )
+        nonwide_target_improves = _duration_fraction_moves_toward_target(
+            prior_target_duration=prior_section_nonwide_duration_seconds,
+            prior_known_duration=prior_section_known_duration_seconds,
+            added_target_duration=(
+                duration_seconds
+                if shot_size in _NONWIDE_SHOT_SIZES
+                else 0.0
+            ),
+            added_known_duration=added_known_duration,
+            target_fraction=config.highlight_preferred_nonwide_fraction,
+        )
+        closeup_involved_source_switch = bool(
+            derivative_family_source_switched
+            and previous_shot_size is not None
+            and (
+                previous_shot_size in _CLOSEUP_SHOT_SIZES
+                or shot_size in _CLOSEUP_SHOT_SIZES
+            )
+        )
+        if (
+            directive.duration_seconds
+            >= config.highlight_minimum_duration_seconds
+            and closeup_involved_source_switch
+            and boundary_motion_accent_supported
+            and closeup_target_improves
+            and _profile_calibrated_motion_bonus_active(config)
+        ):
+            # Profile authority, measured motion amount, resolved pair
+            # continuity, and optional sharpness must all agree before this
+            # bounded preference can influence ranking. It never rewards a
+            # close-up that moves occupancy farther past the P50 target.
+            raw += _HIGHLIGHT_MOTION_ACCENT_MAXIMUM_RAW_BONUS
         wide_involved_switch = bool(
             derivative_family_source_switched
             and previous_shot_size is not None
@@ -1576,10 +2953,7 @@ def _montage_grammar_score_raw(
             ),
         )
         raw += soft_target_raw
-        if (
-            wide_involved_switch
-            and soft_target_raw > 0.0
-        ):
+        if wide_involved_switch and soft_target_raw > 0.0:
             # Formation evidence is an additional confidence adjustment only
             # while this switch moves the running ratio toward the profile
             # median. It cannot keep rewarding a wide-only ratio of 1.0.
@@ -1602,9 +2976,9 @@ def _montage_grammar_score_raw(
                     raw += 0.04
         if not anchor_zone:
             if shot_size in _CLOSEUP_SHOT_SIZES:
-                raw += 0.48
+                raw += 0.48 * int(closeup_target_improves)
             elif shot_size == "medium":
-                raw += 0.24
+                raw += 0.24 * int(nonwide_target_improves)
             elif shot_size in _WIDE_SHOT_SIZES:
                 raw -= 0.12
         if previous_shot_size is not None:
@@ -1612,9 +2986,15 @@ def _montage_grammar_score_raw(
                 previous_shot_size in _NONWIDE_SHOT_SIZES
                 and shot_size in _NONWIDE_SHOT_SIZES
             ):
-                raw += 0.22
+                target_improves = bool(
+                    closeup_target_improves
+                    if shot_size in _CLOSEUP_SHOT_SIZES
+                    else nonwide_target_improves
+                )
+                raw += 0.22 * int(target_improves)
                 if (
-                    previous_duration_seconds is not None
+                    target_improves
+                    and previous_duration_seconds is not None
                     and previous_duration_seconds
                     <= config.highlight_burst_maximum_shot_seconds
                     and duration_seconds
@@ -1679,9 +3059,20 @@ def _section_candidate_shot_support(
     records: list[list[dict[str, Any]]] = [
         [] for _section in section_plan.sections
     ]
-    for frame in frames:
+    for frame_index, frame in enumerate(frames):
         section_index = _section_index_at_start(
             section_plan, frame.master_time_seconds
+        )
+        directive = section_plan.sections[section_index]
+        next_time = (
+            frames[frame_index + 1].master_time_seconds
+            if frame_index + 1 < len(frames)
+            else section_plan.end_seconds
+        )
+        support_duration = max(
+            0.0,
+            min(directive.end_seconds, next_time)
+            - max(directive.start_seconds, frame.master_time_seconds),
         )
         known_sizes: list[tuple[int, str, bool]] = []
         for source_index, metadata in enumerate(source_metadata):
@@ -1734,6 +3125,7 @@ def _section_candidate_shot_support(
                     for _family, size, _formation in known_sizes
                 ),
                 "multi_family_nonwide": len(nonwide_families) >= 2,
+                "support_duration_seconds": support_duration,
             }
         )
 
@@ -1749,11 +3141,29 @@ def _section_candidate_shot_support(
         multi_count = sum(
             bool(item["multi_family_nonwide"]) for item in section_records
         )
+        support_duration = sum(
+            float(item["support_duration_seconds"])
+            for item in section_records
+        )
+
+        def supported_duration(name: str) -> float:
+            return sum(
+                float(item["support_duration_seconds"])
+                for item in section_records
+                if bool(item[name])
+            )
+
+        known_duration = supported_duration("known")
+        wide_duration = supported_duration("wide")
+        nonwide_duration = supported_duration("nonwide")
+        closeup_duration = supported_duration("closeup")
+        multi_duration = supported_duration("multi_family_nonwide")
         early = section_records[: config.formation_anchor_decision_window]
         result.append(
             {
                 "section_index": directive.section_index,
                 "candidate_frame_count": count,
+                "candidate_support_duration_seconds": support_duration,
                 "known_shot_size_frame_count": known_count,
                 "known_shot_size_frame_fraction": (
                     known_count / count if count else 0.0
@@ -1762,15 +3172,32 @@ def _section_candidate_shot_support(
                 "wide_supported_frame_fraction": (
                     wide_count / count if count else 0.0
                 ),
+                "known_shot_size_supported_duration_seconds": known_duration,
+                "known_shot_size_supported_duration_fraction": (
+                    known_duration / support_duration if support_duration else 0.0
+                ),
+                "wide_supported_duration_seconds": wide_duration,
+                "wide_supported_duration_fraction": (
+                    wide_duration / support_duration if support_duration else 0.0
+                ),
                 "nonwide_supported_frame_count": nonwide_count,
                 "nonwide_supported_frame_fraction": (
                     nonwide_count / count if count else 0.0
+                ),
+                "nonwide_supported_duration_seconds": nonwide_duration,
+                "nonwide_supported_duration_fraction": (
+                    nonwide_duration / support_duration if support_duration else 0.0
                 ),
                 "closeup_supported_frame_count": closeup_count,
                 "closeup_supported_frame_fraction": (
                     closeup_count / count if count else 0.0
                 ),
+                "closeup_supported_duration_seconds": closeup_duration,
+                "closeup_supported_duration_fraction": (
+                    closeup_duration / support_duration if support_duration else 0.0
+                ),
                 "multi_family_nonwide_supported_frame_count": multi_count,
+                "multi_family_nonwide_supported_duration_seconds": multi_duration,
                 "early_wide_supported": any(
                     bool(item["wide"]) for item in early
                 ),
@@ -1887,6 +3314,378 @@ def _exact_chorus_anchor_metrics(
     }
 
 
+def _maximum_consecutive_wide_duration_seconds(
+    decisions: Sequence[StageEditBeamDecision],
+) -> float:
+    """Measure maximal contiguous known-wide occupancy in one section."""
+
+    maximum = 0.0
+    current = 0.0
+    for decision in decisions:
+        if decision.shot_size in _WIDE_SHOT_SIZES:
+            current += decision.duration_seconds
+            maximum = max(maximum, current)
+        else:
+            # Unknown evidence cannot be treated as wide and cannot bridge two
+            # otherwise separate known-wide runs.
+            current = 0.0
+    return maximum
+
+
+def _close_only_multi_source_burst_evidence(
+    decisions: Sequence[StageEditBeamDecision],
+    config: StageEditSemiMarkovConfig,
+) -> dict[str, Any]:
+    """Audit maximal close-only runs and their bounded conditional-event fit."""
+
+    active = config.highlight_close_burst_policy_binding_sha256 is not None
+    if not active:
+        return {
+            "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+            "policy_binding_active": False,
+            "policy_binding": None,
+            "candidate_event_count": 0,
+            "qualified_event_count": 0,
+            "events": [],
+            "saturated_soft_preference_score": None,
+            "absence_is_hard_failure": False,
+            "hard_gate": False,
+        }
+    assert config.highlight_minimum_close_burst_shot_count is not None
+    assert config.highlight_minimum_close_burst_duration_seconds is not None
+    assert (
+        config.highlight_minimum_close_burst_source_switch_fraction is not None
+    )
+    assert config.highlight_close_burst_event_reference_count is not None
+    assert config.highlight_policy_fingerprint_sha256 is not None
+    policy_binding = close_burst_policy_binding_payload(
+        profile_identity={
+            "analysis_basis": config.highlight_policy_profile_analysis_basis,
+            "schema_version": config.highlight_policy_profile_schema_version,
+            "path": config.highlight_policy_profile_path,
+            "file_sha256": config.highlight_policy_profile_file_sha256,
+            "content_sha256": config.highlight_policy_profile_content_sha256,
+        },
+        policy_fingerprint_sha256=config.highlight_policy_fingerprint_sha256,
+        minimum_shot_count=config.highlight_minimum_close_burst_shot_count,
+        minimum_duration_seconds=(
+            config.highlight_minimum_close_burst_duration_seconds
+        ),
+        minimum_source_switch_fraction=(
+            config.highlight_minimum_close_burst_source_switch_fraction
+        ),
+        event_reference_count=config.highlight_close_burst_event_reference_count,
+    )
+    policy_binding["binding_sha256"] = (
+        config.highlight_close_burst_policy_binding_sha256
+    )
+
+    maximal_close_runs: list[tuple[StageEditBeamDecision, ...]] = []
+    current: list[StageEditBeamDecision] = []
+    for decision in decisions:
+        if decision.shot_size in _CLOSEUP_SHOT_SIZES:
+            current.append(decision)
+            continue
+        if current:
+            maximal_close_runs.append(tuple(current))
+            current = []
+    if current:
+        maximal_close_runs.append(tuple(current))
+
+    events: list[dict[str, Any]] = []
+    for close_run in maximal_close_runs:
+        switch_positions = tuple(
+            position
+            for position, (left, right) in enumerate(
+                zip(close_run, close_run[1:]),
+                start=1,
+            )
+            if left.derivative_family_id != right.derivative_family_id
+        )
+        if not switch_positions:
+            continue
+        shot_count = len(close_run)
+        duration_seconds = sum(item.duration_seconds for item in close_run)
+        source_switch_count = len(switch_positions)
+        source_switch_fraction = source_switch_count / max(1, shot_count - 1)
+        qualified = bool(
+            shot_count + _TIME_EPSILON
+            >= config.highlight_minimum_close_burst_shot_count
+            and duration_seconds + _TIME_EPSILON
+            >= config.highlight_minimum_close_burst_duration_seconds
+            and source_switch_fraction + _TIME_EPSILON
+            >= config.highlight_minimum_close_burst_source_switch_fraction
+        )
+        switch_decisions = tuple(close_run[position] for position in switch_positions)
+        events.append(
+            {
+                "first_shot_index": close_run[0].shot_index,
+                "last_shot_index": close_run[-1].shot_index,
+                "start_seconds": close_run[0].master_start_seconds,
+                "end_seconds": close_run[-1].master_end_seconds,
+                "shot_count": shot_count,
+                "duration_seconds": duration_seconds,
+                "source_switch_count": source_switch_count,
+                "source_switch_fraction": source_switch_fraction,
+                "derivative_family_ids": [
+                    item.derivative_family_id for item in close_run
+                ],
+                "motion_amount_plus_continuity_supported_switch_count": sum(
+                    int(item.boundary_motion_amount_plus_continuity_supported)
+                    for item in switch_decisions
+                ),
+                "same_time_pose_phase_matched_switch_count": sum(
+                    int(item.boundary_pose_phase_match_proven)
+                    for item in switch_decisions
+                ),
+                "temporal_direction_proven_switch_count": sum(
+                    int(item.boundary_pose_direction_or_velocity_proven)
+                    for item in switch_decisions
+                ),
+                "qualified": qualified,
+            }
+        )
+    qualified_count = sum(int(item["qualified"]) for item in events)
+    return {
+        "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+        "policy_binding_active": True,
+        "policy_binding": policy_binding,
+        "candidate_event_count": len(events),
+        "qualified_event_count": qualified_count,
+        "events": events,
+        "saturated_soft_preference_score": 1.0 if qualified_count else 0.0,
+        "saturation": "one_or_more_qualified_events",
+        "absence_is_hard_failure": False,
+        "hard_gate": False,
+        "medium_to_close_counts_as_close_only": False,
+        "constituent_switch_motion_preference_remains_separate": True,
+        "temporal_direction_threshold_bound": (
+            config.highlight_temporal_pose_motion_calibration is not None
+        ),
+    }
+
+
+def _symmetric_fraction_target_evidence(
+    observed: float,
+    target: float,
+) -> dict[str, float | bool]:
+    deviation = abs(observed - target)
+    return {
+        "target": target,
+        "observed": observed,
+        "absolute_deviation": deviation,
+        "shortfall": max(0.0, target - observed),
+        "excess": max(0.0, observed - target),
+        # A bounded triangular score is genuinely symmetric around P50.
+        # Going beyond the target therefore loses, rather than earns, reward.
+        "alignment_score": max(0.0, 1.0 - deviation),
+        "hard_gate": False,
+    }
+
+
+def _wide_run_soft_target_evidence(
+    observed: float,
+    preferred_maximum: float,
+    hard_maximum: float,
+) -> dict[str, float | bool | str]:
+    excess = max(0.0, observed - preferred_maximum)
+    span = max(_TIME_EPSILON, hard_maximum - preferred_maximum)
+    return {
+        "target": preferred_maximum,
+        "observed": observed,
+        "upper_target_excess_seconds": excess,
+        "alignment_score": (
+            1.0 if excess <= _TIME_EPSILON else max(0.0, 1.0 - excess / span)
+        ),
+        "preference": "at_or_below",
+        "saturated_at_or_below_target": True,
+        "hard_gate": False,
+    }
+
+
+def _highlight_policy_provenance(
+    config: StageEditSemiMarkovConfig,
+) -> dict[str, Any]:
+    identity_bound = config.highlight_policy_fingerprint_sha256 is not None
+    profile_identity = (
+        {
+            "analysis_basis": config.highlight_policy_profile_analysis_basis,
+            "schema_version": config.highlight_policy_profile_schema_version,
+            "path": config.highlight_policy_profile_path,
+            "file_sha256": config.highlight_policy_profile_file_sha256,
+            "content_sha256": config.highlight_policy_profile_content_sha256,
+        }
+        if identity_bound
+        else None
+    )
+    close_burst_binding = None
+    if identity_bound:
+        assert profile_identity is not None
+        assert config.highlight_policy_fingerprint_sha256 is not None
+        assert config.highlight_minimum_close_burst_shot_count is not None
+        assert config.highlight_minimum_close_burst_duration_seconds is not None
+        assert (
+            config.highlight_minimum_close_burst_source_switch_fraction
+            is not None
+        )
+        assert config.highlight_close_burst_event_reference_count is not None
+        close_burst_binding = close_burst_policy_binding_payload(
+            profile_identity=profile_identity,
+            policy_fingerprint_sha256=(
+                config.highlight_policy_fingerprint_sha256
+            ),
+            minimum_shot_count=(
+                config.highlight_minimum_close_burst_shot_count
+            ),
+            minimum_duration_seconds=(
+                config.highlight_minimum_close_burst_duration_seconds
+            ),
+            minimum_source_switch_fraction=(
+                config.highlight_minimum_close_burst_source_switch_fraction
+            ),
+            event_reference_count=(
+                config.highlight_close_burst_event_reference_count
+            ),
+        )
+        close_burst_binding["binding_sha256"] = (
+            config.highlight_close_burst_policy_binding_sha256
+        )
+
+    def metric(
+        *,
+        config_field: str,
+        policy_member: str,
+        value: float,
+        statistic_path: str,
+        quantile: float,
+        hard_gate: bool,
+        scope: str,
+        comparison: str,
+    ) -> dict[str, Any]:
+        return {
+            "config_field": config_field,
+            "professional_montage_policy_member": policy_member,
+            "value": value,
+            "statistic_path": statistic_path,
+            "quantile": quantile,
+            "hard_gate": hard_gate,
+            "scope": scope,
+            "comparison": comparison,
+        }
+
+    return {
+        "contract": HIGHLIGHT_AGGREGATE_CONTRACT,
+        "profile_identity_bound": identity_bound,
+        "profile_identity": profile_identity,
+        "policy_fingerprint_sha256": (
+            config.highlight_policy_fingerprint_sha256
+        ),
+        "close_burst_soft_policy_binding": close_burst_binding,
+        "duration_evidence_contract": HIGHLIGHT_DURATION_EVIDENCE_CONTRACT,
+        "wide_run_evidence_contract": HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT,
+        "metrics": {
+            "local_closeup_duration_minimum": metric(
+                config_field="highlight_minimum_closeup_fraction",
+                policy_member="minimum_close_duration_fraction",
+                value=config.highlight_minimum_closeup_fraction,
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=REFERENCE_FLOOR_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="greater_than_or_equal",
+            ),
+            "local_nonwide_duration_minimum": metric(
+                config_field="highlight_minimum_nonwide_fraction",
+                policy_member="minimum_nonwide_duration_fraction",
+                value=config.highlight_minimum_nonwide_fraction,
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=REFERENCE_FLOOR_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_closeup_duration_product_minimum": metric(
+                config_field=(
+                    "highlight_pooled_product_minimum_closeup_fraction"
+                ),
+                policy_member=(
+                    "highlight_pooled_product_minimum_close_duration_fraction"
+                ),
+                value=(
+                    config.highlight_pooled_product_minimum_closeup_fraction
+                ),
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+                hard_gate=True,
+                scope="pooled_strict_highlights",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_nonwide_duration_product_minimum": metric(
+                config_field=(
+                    "highlight_pooled_product_minimum_nonwide_fraction"
+                ),
+                policy_member=(
+                    "highlight_pooled_product_minimum_nonwide_duration_fraction"
+                ),
+                value=(
+                    config.highlight_pooled_product_minimum_nonwide_fraction
+                ),
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+                hard_gate=True,
+                scope="pooled_strict_highlights",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_closeup_duration_preferred_target": metric(
+                config_field="highlight_preferred_closeup_fraction",
+                policy_member="preferred_close_duration_fraction",
+                value=config.highlight_preferred_closeup_fraction,
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+                hard_gate=False,
+                scope="pooled_strict_highlights",
+                comparison="symmetric_target_deviation",
+            ),
+            "pooled_nonwide_duration_preferred_target": metric(
+                config_field="highlight_preferred_nonwide_fraction",
+                policy_member="preferred_nonwide_duration_fraction",
+                value=config.highlight_preferred_nonwide_fraction,
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+                hard_gate=False,
+                scope="pooled_strict_highlights",
+                comparison="symmetric_target_deviation",
+            ),
+            "maximum_consecutive_wide_run": metric(
+                config_field="highlight_maximum_consecutive_wide_run_seconds",
+                policy_member="maximum_consecutive_wide_run_seconds",
+                value=config.highlight_maximum_consecutive_wide_run_seconds,
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                quantile=WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="less_than_or_equal",
+            ),
+            "preferred_maximum_consecutive_wide_run": metric(
+                config_field=(
+                    "highlight_preferred_maximum_consecutive_wide_run_seconds"
+                ),
+                policy_member=(
+                    "preferred_maximum_consecutive_wide_run_seconds"
+                ),
+                value=(
+                    config.highlight_preferred_maximum_consecutive_wide_run_seconds
+                ),
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                quantile=WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+                hard_gate=False,
+                scope="maximum_across_strict_highlights",
+                comparison="soft_upper_target",
+            ),
+        },
+    }
+
+
 def _evaluate_montage_grammar(
     *,
     decisions: Sequence[StageEditBeamDecision],
@@ -1909,6 +3708,7 @@ def _evaluate_montage_grammar(
 
     all_failures: list[str] = []
     section_metrics: list[dict[str, Any]] = []
+    strict_highlight_records: list[dict[str, Any]] = []
     for directive, selected, support in zip(
         section_plan.sections,
         by_section,
@@ -1934,15 +3734,92 @@ def _evaluate_montage_grammar(
         closeup_fraction = closeup_duration / known_duration if known_duration else 0.0
         nonwide_fraction = nonwide_duration / known_duration if known_duration else 0.0
         wide_fraction = wide_duration / known_duration if known_duration else 0.0
+        maximum_consecutive_wide_run_seconds = (
+            _maximum_consecutive_wide_duration_seconds(selected)
+        )
+        close_only_burst_evidence = _close_only_multi_source_burst_evidence(
+            selected,
+            config,
+        )
         burst_boundaries = 0
         burst_right_positions: list[int] = []
         closeup_chain_boundaries = 0
         source_switch_boundaries = 0
         wide_involved_source_switch_boundaries = 0
+        closeup_involved_source_switch_boundaries = 0
+        nonwide_involved_source_switch_boundaries = 0
+        motion_closeup_source_switch_boundaries = 0
+        motion_nonwide_source_switch_boundaries = 0
+        motion_evidence_complete_closeup_boundaries = 0
+        motion_evidence_complete_nonwide_boundaries = 0
+        pose_phase_observed_closeup_boundaries = 0
+        pose_phase_observed_nonwide_boundaries = 0
+        pose_phase_matched_closeup_boundaries = 0
+        pose_phase_matched_nonwide_boundaries = 0
+        temporal_input_valid_closeup_boundaries = 0
+        temporal_input_valid_nonwide_boundaries = 0
+        temporal_direction_proven_closeup_boundaries = 0
+        temporal_direction_proven_nonwide_boundaries = 0
+        temporal_static_match_closeup_boundaries = 0
+        temporal_static_match_nonwide_boundaries = 0
         for position, (left, right) in enumerate(zip(selected, selected[1:])):
             if left.derivative_family_id == right.derivative_family_id:
                 continue
             source_switch_boundaries += 1
+            closeup_involved = bool(
+                left.shot_size in _CLOSEUP_SHOT_SIZES
+                or right.shot_size in _CLOSEUP_SHOT_SIZES
+            )
+            nonwide_involved = bool(
+                left.shot_size in _NONWIDE_SHOT_SIZES
+                or right.shot_size in _NONWIDE_SHOT_SIZES
+            )
+            if closeup_involved:
+                closeup_involved_source_switch_boundaries += 1
+                motion_evidence_complete_closeup_boundaries += int(
+                    right.boundary_motion_amount_plus_continuity_evidence_complete
+                )
+                motion_closeup_source_switch_boundaries += int(
+                    right.boundary_motion_amount_plus_continuity_supported
+                )
+                pose_phase_observed_closeup_boundaries += int(
+                    right.boundary_pose_phase_evidence_observed
+                )
+                pose_phase_matched_closeup_boundaries += int(
+                    right.boundary_pose_phase_match_proven
+                )
+                temporal_input_valid_closeup_boundaries += int(
+                    right.boundary_temporal_pose_motion_input_valid
+                )
+                temporal_direction_proven_closeup_boundaries += int(
+                    right.boundary_pose_direction_or_velocity_proven
+                )
+                temporal_static_match_closeup_boundaries += int(
+                    right.boundary_temporal_static_pose_match
+                )
+            if nonwide_involved:
+                nonwide_involved_source_switch_boundaries += 1
+                motion_evidence_complete_nonwide_boundaries += int(
+                    right.boundary_motion_amount_plus_continuity_evidence_complete
+                )
+                motion_nonwide_source_switch_boundaries += int(
+                    right.boundary_motion_amount_plus_continuity_supported
+                )
+                pose_phase_observed_nonwide_boundaries += int(
+                    right.boundary_pose_phase_evidence_observed
+                )
+                pose_phase_matched_nonwide_boundaries += int(
+                    right.boundary_pose_phase_match_proven
+                )
+                temporal_input_valid_nonwide_boundaries += int(
+                    right.boundary_temporal_pose_motion_input_valid
+                )
+                temporal_direction_proven_nonwide_boundaries += int(
+                    right.boundary_pose_direction_or_velocity_proven
+                )
+                temporal_static_match_nonwide_boundaries += int(
+                    right.boundary_temporal_static_pose_match
+                )
             if (
                 left.shot_size in _WIDE_SHOT_SIZES
                 or right.shot_size in _WIDE_SHOT_SIZES
@@ -2042,7 +3919,7 @@ def _evaluate_montage_grammar(
             ):
                 failures.append("highlight_shot_size_evidence_incomplete")
             if (
-                float(support["closeup_supported_frame_fraction"])
+                float(support["closeup_supported_duration_fraction"])
                 + _TIME_EPSILON
                 < config.highlight_minimum_closeup_fraction
             ):
@@ -2053,7 +3930,7 @@ def _evaluate_montage_grammar(
             ):
                 failures.append("highlight_closeup_fraction_below_floor")
             if (
-                float(support["nonwide_supported_frame_fraction"])
+                float(support["nonwide_supported_duration_fraction"])
                 + _TIME_EPSILON
                 < config.highlight_minimum_nonwide_fraction
             ):
@@ -2062,6 +3939,21 @@ def _evaluate_montage_grammar(
                 config.highlight_minimum_nonwide_fraction
             ):
                 failures.append("highlight_nonwide_fraction_below_floor")
+            if (
+                maximum_consecutive_wide_run_seconds
+                > config.highlight_maximum_consecutive_wide_run_seconds
+                + _TIME_EPSILON
+            ):
+                failures.append(
+                    "highlight_maximum_consecutive_wide_run_exceeded"
+                )
+            if (
+                motion_closeup_source_switch_boundaries
+                < config.highlight_minimum_motion_closeup_switch_boundaries
+            ):
+                failures.append(
+                    "highlight_motion_closeup_switch_boundary_missing"
+                )
             if (
                 source_switch_boundaries > 0
                 and wide_involved_source_switch_fraction + _TIME_EPSILON
@@ -2110,6 +4002,81 @@ def _evaluate_montage_grammar(
                 )
             elif directive.establish_with_wide_shot and not formation_anchor_present:
                 failures.append("formation_wide_anchor_evidence_missing")
+            strict_highlight_records.append(
+                {
+                    "section_index": directive.section_index,
+                    "known_duration_seconds": known_duration,
+                    "closeup_duration_seconds": closeup_duration,
+                    "nonwide_duration_seconds": nonwide_duration,
+                    "maximum_consecutive_wide_run_seconds": (
+                        maximum_consecutive_wide_run_seconds
+                    ),
+                    "candidate_frame_count": int(
+                        support["candidate_frame_count"]
+                    ),
+                    "closeup_supported_frame_count": int(
+                        support["closeup_supported_frame_count"]
+                    ),
+                    "nonwide_supported_frame_count": int(
+                        support["nonwide_supported_frame_count"]
+                    ),
+                    "candidate_support_duration_seconds": float(
+                        support["candidate_support_duration_seconds"]
+                    ),
+                    "closeup_supported_duration_seconds": float(
+                        support["closeup_supported_duration_seconds"]
+                    ),
+                    "nonwide_supported_duration_seconds": float(
+                        support["nonwide_supported_duration_seconds"]
+                    ),
+                    "close_only_multi_source_burst": (
+                        close_only_burst_evidence
+                    ),
+                "closeup_involved_source_switch_boundary_count": (
+                    closeup_involved_source_switch_boundaries
+                ),
+                "motion_closeup_source_switch_boundary_count": (
+                    motion_closeup_source_switch_boundaries
+                ),
+                "pose_phase_observed_closeup_source_switch_boundary_count": (
+                    pose_phase_observed_closeup_boundaries
+                ),
+                "pose_phase_matched_closeup_source_switch_boundary_count": (
+                    pose_phase_matched_closeup_boundaries
+                ),
+                "temporal_input_valid_closeup_source_switch_boundary_count": (
+                    temporal_input_valid_closeup_boundaries
+                ),
+                "temporal_direction_proven_closeup_source_switch_boundary_count": (
+                    temporal_direction_proven_closeup_boundaries
+                ),
+                "temporal_static_match_closeup_source_switch_boundary_count": (
+                    temporal_static_match_closeup_boundaries
+                ),
+                "nonwide_involved_source_switch_boundary_count": (
+                    nonwide_involved_source_switch_boundaries
+                ),
+                "motion_nonwide_source_switch_boundary_count": (
+                    motion_nonwide_source_switch_boundaries
+                ),
+                "pose_phase_observed_nonwide_source_switch_boundary_count": (
+                    pose_phase_observed_nonwide_boundaries
+                ),
+                "pose_phase_matched_nonwide_source_switch_boundary_count": (
+                    pose_phase_matched_nonwide_boundaries
+                ),
+                "temporal_input_valid_nonwide_source_switch_boundary_count": (
+                    temporal_input_valid_nonwide_boundaries
+                ),
+                "temporal_direction_proven_nonwide_source_switch_boundary_count": (
+                    temporal_direction_proven_nonwide_boundaries
+                ),
+                "temporal_static_match_nonwide_source_switch_boundary_count": (
+                    temporal_static_match_nonwide_boundaries
+                ),
+                "local_failure_codes": tuple(failures),
+                }
+            )
         all_failures.extend(
             f"section_{directive.section_index}:{value}" for value in failures
         )
@@ -2122,14 +4089,133 @@ def _evaluate_montage_grammar(
                 "selected_shot_count": len(selected),
                 "known_shot_size_count": len(known),
                 "known_shot_size_fraction": known_fraction,
+                "known_duration_seconds": known_duration,
                 "wide_shot_count": len(wides),
                 "wide_shot_fraction": wide_fraction,
+                "wide_duration_seconds": wide_duration,
                 "nonwide_shot_count": len(nonwides),
                 "nonwide_shot_fraction": nonwide_fraction,
+                "nonwide_duration_seconds": nonwide_duration,
                 "closeup_shot_count": len(closeups),
                 "closeup_shot_fraction": closeup_fraction,
+                "closeup_duration_seconds": closeup_duration,
+                "maximum_consecutive_wide_run_seconds": (
+                    maximum_consecutive_wide_run_seconds
+                ),
+                "maximum_consecutive_wide_run_hard_limit_seconds": (
+                    config.highlight_maximum_consecutive_wide_run_seconds
+                ),
+                "preferred_maximum_consecutive_wide_run_seconds": (
+                    config.highlight_preferred_maximum_consecutive_wide_run_seconds
+                ),
+                "closeup_preferred_target": _symmetric_fraction_target_evidence(
+                    closeup_fraction,
+                    config.highlight_preferred_closeup_fraction,
+                ),
+                "nonwide_preferred_target": _symmetric_fraction_target_evidence(
+                    nonwide_fraction,
+                    config.highlight_preferred_nonwide_fraction,
+                ),
+                "wide_run_preferred_target": _wide_run_soft_target_evidence(
+                    maximum_consecutive_wide_run_seconds,
+                    config.highlight_preferred_maximum_consecutive_wide_run_seconds,
+                    config.highlight_maximum_consecutive_wide_run_seconds,
+                ),
                 "nonwide_burst_boundary_count": burst_boundaries,
                 "closeup_chain_boundary_count": closeup_chain_boundaries,
+                "close_only_multi_source_burst": close_only_burst_evidence,
+                "motion_amount_plus_continuity_boundaries": {
+                    "evidence_contract": (
+                        "exact_source_pair_pose_motion_plus_resolved_"
+                        "continuity_plus_optional_same_time_pose_phase_cosine_"
+                        "and_sharpness_v2"
+                    ),
+                    "profile_v2_human_distribution_available": False,
+                    "profile_v3_calibration_input_bound": (
+                        config.highlight_motion_calibration is not None
+                    ),
+                    "profile_v3_derivation_required": (
+                        config.highlight_motion_calibration is None
+                    ),
+                    "closeup_involved_source_switch_boundary_count": (
+                        closeup_involved_source_switch_boundaries
+                    ),
+                    "closeup_motion_evidence_complete_boundary_count": (
+                        motion_evidence_complete_closeup_boundaries
+                    ),
+                    "closeup_motion_accent_supported_boundary_count": (
+                        motion_closeup_source_switch_boundaries
+                    ),
+                    "closeup_pose_phase_observed_boundary_count": (
+                        pose_phase_observed_closeup_boundaries
+                    ),
+                    "closeup_pose_phase_matched_boundary_count": (
+                        pose_phase_matched_closeup_boundaries
+                    ),
+                    "closeup_temporal_input_valid_boundary_count": (
+                        temporal_input_valid_closeup_boundaries
+                    ),
+                    "closeup_temporal_direction_proven_boundary_count": (
+                        temporal_direction_proven_closeup_boundaries
+                    ),
+                    "closeup_temporal_static_pose_match_boundary_count": (
+                        temporal_static_match_closeup_boundaries
+                    ),
+                    "closeup_static_or_unsupported_boundary_count": (
+                        closeup_involved_source_switch_boundaries
+                        - motion_closeup_source_switch_boundaries
+                    ),
+                    "nonwide_involved_source_switch_boundary_count": (
+                        nonwide_involved_source_switch_boundaries
+                    ),
+                    "nonwide_motion_evidence_complete_boundary_count": (
+                        motion_evidence_complete_nonwide_boundaries
+                    ),
+                    "nonwide_motion_accent_supported_boundary_count": (
+                        motion_nonwide_source_switch_boundaries
+                    ),
+                    "nonwide_pose_phase_observed_boundary_count": (
+                        pose_phase_observed_nonwide_boundaries
+                    ),
+                    "nonwide_pose_phase_matched_boundary_count": (
+                        pose_phase_matched_nonwide_boundaries
+                    ),
+                    "nonwide_temporal_input_valid_boundary_count": (
+                        temporal_input_valid_nonwide_boundaries
+                    ),
+                    "nonwide_temporal_direction_proven_boundary_count": (
+                        temporal_direction_proven_nonwide_boundaries
+                    ),
+                    "nonwide_temporal_static_pose_match_boundary_count": (
+                        temporal_static_match_nonwide_boundaries
+                    ),
+                    "nonwide_static_or_unsupported_boundary_count": (
+                        nonwide_involved_source_switch_boundaries
+                        - motion_nonwide_source_switch_boundaries
+                    ),
+                    "minimum_closeup_motion_boundary_count": (
+                        config.highlight_minimum_motion_closeup_switch_boundaries
+                    ),
+                    "minimum_pose_motion": (
+                        config.highlight_motion_boundary_minimum_pose_motion
+                    ),
+                    "minimum_continuity_score": (
+                        config.highlight_motion_boundary_minimum_continuity_score
+                    ),
+                    "minimum_sharpness": (
+                        config.highlight_motion_boundary_minimum_sharpness
+                    ),
+                    "minimum_pose_phase_cosine": (
+                        config.highlight_motion_boundary_minimum_pose_phase_cosine
+                    ),
+                    "high_motion_alone_is_sufficient": False,
+                    "high_pose_phase_alone_is_sufficient": False,
+                    "pose_phase_proof_requires_observed_same_time_pair": True,
+                    "pose_direction_or_velocity_proven": bool(
+                        temporal_direction_proven_closeup_boundaries
+                        or temporal_direction_proven_nonwide_boundaries
+                    ),
+                },
                 "source_switch_boundary_count": source_switch_boundaries,
                 "source_switch_rate_per_minute": source_switch_rate_per_minute,
                 "source_switch_product_minimum_per_minute": (
@@ -2175,6 +4261,350 @@ def _evaluate_montage_grammar(
                 "passed": not failures,
             }
         )
+    aggregate_known_duration = sum(
+        float(item["known_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_duration = sum(
+        float(item["closeup_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_duration = sum(
+        float(item["nonwide_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_fraction = (
+        aggregate_closeup_duration / aggregate_known_duration
+        if aggregate_known_duration
+        else 0.0
+    )
+    aggregate_nonwide_fraction = (
+        aggregate_nonwide_duration / aggregate_known_duration
+        if aggregate_known_duration
+        else 0.0
+    )
+    aggregate_maximum_wide_run = max(
+        (
+            float(item["maximum_consecutive_wide_run_seconds"])
+            for item in strict_highlight_records
+        ),
+        default=0.0,
+    )
+    aggregate_candidate_frames = sum(
+        int(item["candidate_frame_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_supported_frames = sum(
+        int(item["closeup_supported_frame_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_supported_frames = sum(
+        int(item["nonwide_supported_frame_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_candidate_support_duration = sum(
+        float(item["candidate_support_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_supported_duration = sum(
+        float(item["closeup_supported_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_supported_duration = sum(
+        float(item["nonwide_supported_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_switch_boundaries = sum(
+        int(item["closeup_involved_source_switch_boundary_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_motion_closeup_switch_boundaries = sum(
+        int(item["motion_closeup_source_switch_boundary_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_switch_boundaries = sum(
+        int(item["nonwide_involved_source_switch_boundary_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_motion_nonwide_switch_boundaries = sum(
+        int(item["motion_nonwide_source_switch_boundary_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_close_burst_candidate_count = sum(
+        int(item["close_only_multi_source_burst"]["candidate_event_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_close_burst_qualified_count = sum(
+        int(item["close_only_multi_source_burst"]["qualified_event_count"])
+        for item in strict_highlight_records
+    )
+    close_burst_binding_active = bool(
+        strict_highlight_records
+        and strict_highlight_records[0]["close_only_multi_source_burst"][
+            "policy_binding_active"
+        ]
+    )
+    close_burst_soft_score = (
+        1.0 if aggregate_close_burst_qualified_count else 0.0
+    ) if close_burst_binding_active else None
+    close_burst_occurrence_support_weight = (
+        min(
+            1.0,
+            config.highlight_close_burst_event_reference_count
+            / config.highlight_cadence_reference_count,
+        )
+        if close_burst_binding_active
+        and config.highlight_close_burst_event_reference_count is not None
+        else None
+    )
+    aggregate_close_burst_events = [
+        {
+            "section_index": int(item["section_index"]),
+            **dict(event),
+        }
+        for item in strict_highlight_records
+        for event in item["close_only_multi_source_burst"]["events"]
+    ]
+    aggregate_closeup_support_frame_fraction = (
+        aggregate_closeup_supported_frames / aggregate_candidate_frames
+        if aggregate_candidate_frames
+        else 0.0
+    )
+    aggregate_nonwide_support_frame_fraction = (
+        aggregate_nonwide_supported_frames / aggregate_candidate_frames
+        if aggregate_candidate_frames
+        else 0.0
+    )
+    aggregate_closeup_support_fraction = (
+        aggregate_closeup_supported_duration
+        / aggregate_candidate_support_duration
+        if aggregate_candidate_support_duration
+        else 0.0
+    )
+    aggregate_nonwide_support_fraction = (
+        aggregate_nonwide_supported_duration
+        / aggregate_candidate_support_duration
+        if aggregate_candidate_support_duration
+        else 0.0
+    )
+    aggregate_failures: list[str] = [
+        f"section_{item['section_index']}:{failure}"
+        for item in strict_highlight_records
+        for failure in item["local_failure_codes"]
+    ]
+    if strict_highlight_records:
+        if (
+            aggregate_closeup_support_fraction + _TIME_EPSILON
+            < config.highlight_pooled_product_minimum_closeup_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_closeup_candidate_support_insufficient"
+            )
+        elif (
+            aggregate_closeup_fraction + _TIME_EPSILON
+            < config.highlight_pooled_product_minimum_closeup_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_closeup_fraction_below_product_minimum"
+            )
+        if (
+            aggregate_nonwide_support_fraction + _TIME_EPSILON
+            < config.highlight_pooled_product_minimum_nonwide_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_nonwide_candidate_support_insufficient"
+            )
+        elif (
+            aggregate_nonwide_fraction + _TIME_EPSILON
+            < config.highlight_pooled_product_minimum_nonwide_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_nonwide_fraction_below_product_minimum"
+            )
+    pooled_failures = [
+        item
+        for item in aggregate_failures
+        if not item.startswith("section_")
+    ]
+    all_failures.extend(pooled_failures)
+    closeup_target = _symmetric_fraction_target_evidence(
+        aggregate_closeup_fraction,
+        config.highlight_preferred_closeup_fraction,
+    )
+    nonwide_target = _symmetric_fraction_target_evidence(
+        aggregate_nonwide_fraction,
+        config.highlight_preferred_nonwide_fraction,
+    )
+    wide_run_target = _wide_run_soft_target_evidence(
+        aggregate_maximum_wide_run,
+        config.highlight_preferred_maximum_consecutive_wide_run_seconds,
+        config.highlight_maximum_consecutive_wide_run_seconds,
+    )
+    soft_target_score = (
+        (
+            float(closeup_target["alignment_score"])
+            + float(nonwide_target["alignment_score"])
+            + float(wide_run_target["alignment_score"])
+        )
+        / 3.0
+        if strict_highlight_records
+        else None
+    )
+    highlight_aggregate = {
+        "contract": HIGHLIGHT_AGGREGATE_CONTRACT,
+        "strict_highlight_section_indices": [
+            int(item["section_index"]) for item in strict_highlight_records
+        ],
+        "strict_highlight_section_count": len(strict_highlight_records),
+        "duration_weighting": (
+            "sum_observed_known_shot_duration_across_strict_highlights"
+        ),
+        "observed": {
+            "known_duration_seconds": aggregate_known_duration,
+            "closeup_duration_seconds": aggregate_closeup_duration,
+            "nonwide_duration_seconds": aggregate_nonwide_duration,
+            "closeup_duration_fraction": aggregate_closeup_fraction,
+            "nonwide_duration_fraction": aggregate_nonwide_fraction,
+            "maximum_consecutive_wide_run_seconds": (
+                aggregate_maximum_wide_run
+            ),
+            "closeup_involved_source_switch_boundary_count": (
+                aggregate_closeup_switch_boundaries
+            ),
+            "motion_closeup_source_switch_boundary_count": (
+                aggregate_motion_closeup_switch_boundaries
+            ),
+            "static_or_unsupported_closeup_source_switch_boundary_count": (
+                aggregate_closeup_switch_boundaries
+                - aggregate_motion_closeup_switch_boundaries
+            ),
+            "nonwide_involved_source_switch_boundary_count": (
+                aggregate_nonwide_switch_boundaries
+            ),
+            "motion_nonwide_source_switch_boundary_count": (
+                aggregate_motion_nonwide_switch_boundaries
+            ),
+            "static_or_unsupported_nonwide_source_switch_boundary_count": (
+                aggregate_nonwide_switch_boundaries
+                - aggregate_motion_nonwide_switch_boundaries
+            ),
+            "close_only_multi_source_burst_candidate_event_count": (
+                aggregate_close_burst_candidate_count
+            ),
+            "close_only_multi_source_burst_qualified_event_count": (
+                aggregate_close_burst_qualified_count
+            ),
+        },
+        "candidate_support": {
+            "candidate_frame_count": aggregate_candidate_frames,
+            "closeup_supported_frame_count": (
+                aggregate_closeup_supported_frames
+            ),
+            "nonwide_supported_frame_count": (
+                aggregate_nonwide_supported_frames
+            ),
+            "closeup_supported_frame_fraction": (
+                aggregate_closeup_support_frame_fraction
+            ),
+            "nonwide_supported_frame_fraction": (
+                aggregate_nonwide_support_frame_fraction
+            ),
+            "candidate_support_duration_seconds": (
+                aggregate_candidate_support_duration
+            ),
+            "closeup_supported_duration_seconds": (
+                aggregate_closeup_supported_duration
+            ),
+            "nonwide_supported_duration_seconds": (
+                aggregate_nonwide_supported_duration
+            ),
+            "closeup_supported_duration_fraction": (
+                aggregate_closeup_support_fraction
+            ),
+            "nonwide_supported_duration_fraction": (
+                aggregate_nonwide_support_fraction
+            ),
+            "product_minimum_closeup_fraction": (
+                config.highlight_pooled_product_minimum_closeup_fraction
+            ),
+            "product_minimum_nonwide_fraction": (
+                config.highlight_pooled_product_minimum_nonwide_fraction
+            ),
+            "insufficient_support_fails_before_render": True,
+            "hard_gate_uses_duration_weighted_support": True,
+        },
+        "hard_targets": {
+            "local_minimum_closeup_duration_fraction": (
+                config.highlight_minimum_closeup_fraction
+            ),
+            "local_minimum_nonwide_duration_fraction": (
+                config.highlight_minimum_nonwide_fraction
+            ),
+            "pooled_product_minimum_closeup_duration_fraction": (
+                config.highlight_pooled_product_minimum_closeup_fraction
+            ),
+            "pooled_product_minimum_nonwide_duration_fraction": (
+                config.highlight_pooled_product_minimum_nonwide_fraction
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                config.highlight_maximum_consecutive_wide_run_seconds
+            ),
+        },
+        "soft_targets": {
+            "closeup_p50": closeup_target,
+            "nonwide_p50": nonwide_target,
+            "maximum_wide_run_p75": wide_run_target,
+            "close_only_multi_source_burst_event_p10": {
+                "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+                "policy_binding_active": close_burst_binding_active,
+                "policy_binding": (
+                    strict_highlight_records[0][
+                        "close_only_multi_source_burst"
+                    ]["policy_binding"]
+                    if close_burst_binding_active
+                    else None
+                ),
+                "candidate_event_count": aggregate_close_burst_candidate_count,
+                "qualified_event_count": aggregate_close_burst_qualified_count,
+                "events": aggregate_close_burst_events,
+                "alignment_score": close_burst_soft_score,
+                "event_occurrence_support_weight": (
+                    close_burst_occurrence_support_weight
+                ),
+                "evidence_weighted_alignment_score": (
+                    close_burst_soft_score * close_burst_occurrence_support_weight
+                    if close_burst_soft_score is not None
+                    and close_burst_occurrence_support_weight is not None
+                    else None
+                ),
+                "observed_event_count": (
+                    config.highlight_close_burst_event_reference_count
+                ),
+                "human_reference_count": config.highlight_cadence_reference_count,
+                "saturated_at_one_or_more_qualified_events": True,
+                "absence_is_hard_failure": False,
+                "hard_gate": False,
+                "per_reference_occurrence_p10": 0.0,
+                "per_reference_occurrence_median": 0.0,
+                "medium_to_close_counts_as_close_only": False,
+            },
+            "aggregate_alignment_score": soft_target_score,
+            "score_is_hard_gate": False,
+            "over_close_past_target_is_rewarded": False,
+        },
+        "policy_provenance": _highlight_policy_provenance(config),
+        "motion_amount_plus_continuity_policy": (
+            _highlight_motion_calibration_audit(config)
+        ),
+        "local_section_failures": {
+            str(item["section_index"]): list(item["local_failure_codes"])
+            for item in strict_highlight_records
+            if item["local_failure_codes"]
+        },
+        "failure_codes": aggregate_failures,
+        "passed": not aggregate_failures,
+    }
+
     strict_chorus_present = any(
         directive.role is SectionRole.CHORUS_LIKE
         and directive.duration_seconds >= config.highlight_minimum_duration_seconds
@@ -2218,14 +4648,16 @@ def _evaluate_montage_grammar(
         "passed": not all_failures,
         "failure_codes": all_failures,
         "exact_anchor_metrics": exact_anchor_metrics,
+        "highlight_aggregate": highlight_aggregate,
         "policy": {
             "wide_shots": (
                 "formation_evidenced_anchor_and_post_burst_reset_not_full_"
                 "highlight_occupancy"
             ),
             "highlight_shots": (
-                "reference_closeup_and_wide_transition_floors_plus_explicit_"
-                "ive_product_nonwide_burst_requirement"
+                "per_section_duration_p10_plus_pooled_duration_p25_and_"
+                "maximum_wide_run_hard_gates_with_bounded_p50_p75_soft_"
+                "targets"
             ),
             "formation_evidence_semantics": (
                 "identity_free_weak_person_plus_pose_or_strong_multi_person_"
@@ -2289,6 +4721,34 @@ def _evaluate_montage_grammar(
                     config.montage_grammar_score_weight
                 ),
             },
+            "motion_amount_plus_continuity_closeup_switch_hook": {
+                **_highlight_motion_calibration_audit(config),
+                "eligible_boundary": (
+                    "strict_chorus_closeup_involved_actual_source_switch_"
+                    "that_moves_closeup_occupancy_toward_p50"
+                ),
+                "score_component": "montage_grammar",
+                "over_close_past_p50_is_rewarded": False,
+                "pose_phase_proof_is_per_actual_family_boundary": True,
+                "pose_direction_or_velocity_proven": any(
+                    decision.boundary_pose_direction_or_velocity_proven
+                    for decision in decisions
+                ),
+            },
+            "close_only_multi_source_burst_soft_preference": {
+                "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+                "conditional_event_thresholds_not_occurrence_quota": True,
+                "per_reference_occurrence_p10": 0.0,
+                "per_reference_occurrence_median": 0.0,
+                "hard_gate": False,
+                "saturated_at_one_or_more_qualified_events": True,
+                "score_component": (
+                    "highlight_close_burst_soft_preference"
+                ),
+                "applied_through_montage_grammar_weight": (
+                    config.montage_grammar_score_weight
+                ),
+            },
         },
         "thresholds": {
             "highlight_minimum_duration_seconds": (
@@ -2302,6 +4762,24 @@ def _evaluate_montage_grammar(
             ),
             "highlight_minimum_nonwide_fraction": (
                 config.highlight_minimum_nonwide_fraction
+            ),
+            "highlight_pooled_product_minimum_closeup_fraction": (
+                config.highlight_pooled_product_minimum_closeup_fraction
+            ),
+            "highlight_pooled_product_minimum_nonwide_fraction": (
+                config.highlight_pooled_product_minimum_nonwide_fraction
+            ),
+            "highlight_preferred_closeup_fraction": (
+                config.highlight_preferred_closeup_fraction
+            ),
+            "highlight_preferred_nonwide_fraction": (
+                config.highlight_preferred_nonwide_fraction
+            ),
+            "highlight_maximum_consecutive_wide_run_seconds": (
+                config.highlight_maximum_consecutive_wide_run_seconds
+            ),
+            "highlight_preferred_maximum_consecutive_wide_run_seconds": (
+                config.highlight_preferred_maximum_consecutive_wide_run_seconds
             ),
             "highlight_minimum_wide_involved_source_switch_fraction": (
                 config.highlight_minimum_wide_involved_source_switch_fraction
@@ -2330,6 +4808,21 @@ def _evaluate_montage_grammar(
             "highlight_minimum_nonwide_burst_boundaries": (
                 config.highlight_minimum_nonwide_burst_boundaries
             ),
+            "highlight_minimum_close_burst_shot_count": (
+                config.highlight_minimum_close_burst_shot_count
+            ),
+            "highlight_minimum_close_burst_duration_seconds": (
+                config.highlight_minimum_close_burst_duration_seconds
+            ),
+            "highlight_minimum_close_burst_source_switch_fraction": (
+                config.highlight_minimum_close_burst_source_switch_fraction
+            ),
+            "highlight_close_burst_event_reference_count": (
+                config.highlight_close_burst_event_reference_count
+            ),
+            "highlight_close_burst_policy_binding_sha256": (
+                config.highlight_close_burst_policy_binding_sha256
+            ),
             "formation_anchor_decision_window": (
                 config.formation_anchor_decision_window
             ),
@@ -2341,6 +4834,21 @@ def _evaluate_montage_grammar(
             ),
             "highlight_minimum_post_burst_formation_resets": (
                 config.highlight_minimum_post_burst_formation_resets
+            ),
+            "highlight_motion_boundary_minimum_pose_motion": (
+                config.highlight_motion_boundary_minimum_pose_motion
+            ),
+            "highlight_motion_boundary_minimum_continuity_score": (
+                config.highlight_motion_boundary_minimum_continuity_score
+            ),
+            "highlight_motion_boundary_minimum_sharpness": (
+                config.highlight_motion_boundary_minimum_sharpness
+            ),
+            "highlight_motion_boundary_minimum_pose_phase_cosine": (
+                config.highlight_motion_boundary_minimum_pose_phase_cosine
+            ),
+            "highlight_minimum_motion_closeup_switch_boundaries": (
+                config.highlight_minimum_motion_closeup_switch_boundaries
             ),
         },
         "sections": section_metrics,
@@ -2593,6 +5101,392 @@ def _boundary_continuity_raw(
             "boundary continuity scorer violated its bounded [-1, 0] contract"
         )
     return result
+
+
+def _temporal_pose_sidecar_pair_audit(
+    *,
+    frame: StageEditHeadFrame,
+    outgoing_source_index: int,
+    incoming_source_index: int,
+) -> dict[str, Any]:
+    """Describe sidecars without claiming they touch the current cut.
+
+    Snapshot tokens are sparse editorial candidates.  The previous token's
+    current/next source-frame pair is therefore not a cut-minus-one/cut pair.
+    Keep the content-bound scalar audit, but never construct a temporal window
+    or qualify direction/phase until timestamps are explicitly bound to the
+    proposed cut.
+    """
+
+    # Audit both source observations from the same sparse token.  In
+    # particular, do not substitute the previous sparse token for a cut-minus-
+    # one frame: its timestamp can be more than a video frame away.
+    outgoing_sidecar = (
+        frame.source_continuity[outgoing_source_index].temporal_pose_sidecar
+        if frame.source_continuity
+        and outgoing_source_index < len(frame.source_continuity)
+        else None
+    )
+    incoming_sidecar = (
+        frame.source_continuity[incoming_source_index].temporal_pose_sidecar
+        if frame.source_continuity
+        and incoming_source_index < len(frame.source_continuity)
+        else None
+    )
+    sampling_contract_match = bool(
+        outgoing_sidecar is not None
+        and incoming_sidecar is not None
+        and outgoing_sidecar.sampling_contract
+        == incoming_sidecar.sampling_contract
+    )
+    outgoing_evidence = _temporal_sidecar_scalar_evidence(outgoing_sidecar)
+    incoming_evidence = _temporal_sidecar_scalar_evidence(incoming_sidecar)
+    failure_reasons = ["boundary_alignment_unproven"]
+    if outgoing_sidecar is None:
+        failure_reasons.append("temporal_outgoing_sidecar_missing")
+    if incoming_sidecar is None:
+        failure_reasons.append("temporal_incoming_sidecar_missing")
+    if (
+        outgoing_sidecar is not None
+        and incoming_sidecar is not None
+        and not sampling_contract_match
+    ):
+        failure_reasons.append("temporal_sampling_contract_mismatch")
+    pair_content_sha256 = (
+        _redacted_content_sha256(
+            {
+                "contract": TEMPORAL_POSE_SIDECAR_SCALAR_EVIDENCE_CONTRACT,
+                "outgoing_content_sha256": outgoing_evidence[
+                    "content_sha256"
+                ],
+                "incoming_content_sha256": incoming_evidence[
+                    "content_sha256"
+                ],
+            }
+        )
+        if outgoing_sidecar is not None and incoming_sidecar is not None
+        else None
+    )
+    return {
+        "sampling_contract_match": sampling_contract_match,
+        "outgoing": outgoing_evidence,
+        "incoming": incoming_evidence,
+        "pair_content_sha256": pair_content_sha256,
+        "boundary_alignment_proven": False,
+        "failure_reasons": tuple(failure_reasons),
+    }
+
+
+def _boundary_motion_amount_plus_continuity_evidence(
+    *,
+    frame: StageEditHeadFrame,
+    outgoing_frame: StageEditHeadFrame | None = None,
+    outgoing_source_index: int | None,
+    incoming_source_index: int,
+    derivative_family_ids: Sequence[int],
+    continuity_score: float,
+    config: StageEditSemiMarkovConfig,
+) -> dict[str, Any]:
+    """Audit an actual-family switch using exact source observations.
+
+    The legacy pose-phase field remains a same-time 60-D cosine proxy only.
+    Sparse temporal sidecars are content-bound for audit, but cannot prove
+    direction or phase until their samples are timestamp-bound to this cut.
+    """
+
+    inactive = {
+        "pose_motion_minimum": None,
+        "pose_motion_delta": None,
+        "camera_motion_delta": None,
+        "minimum_sharpness": None,
+        "continuity_score": None,
+        "pose_phase_cosine": None,
+        "pose_phase_evidence_observed": False,
+        "pose_phase_threshold_bound": False,
+        "evidence_complete": False,
+        "accent_supported": False,
+        "pose_phase_match_proven": False,
+        "pose_phase_feature_dimension": None,
+        "pose_phase_outgoing_observed": False,
+        "pose_phase_incoming_observed": False,
+        "pose_phase_trusted_producer_contract": None,
+        "pose_phase_outgoing_content_sha256": None,
+        "pose_phase_incoming_content_sha256": None,
+        "pose_phase_pair_content_sha256": None,
+        "temporal_pose_motion_thresholds_bound": False,
+        "temporal_pose_motion_input_valid": False,
+        "temporal_outgoing_boundary_motion_magnitude": None,
+        "temporal_incoming_boundary_motion_magnitude": None,
+        "temporal_endpoint_pose_cosine": None,
+        "temporal_velocity_direction_cosine": None,
+        "temporal_phase_compatibility": None,
+        "temporal_confidence": 0.0,
+        "temporal_classification": None,
+        "temporal_static_pose_match": False,
+        "temporal_dynamic_pose_phase_match": False,
+        "temporal_failure_reasons": (),
+        "temporal_sampling_contract_match": False,
+        "temporal_outgoing_sampling_contract": None,
+        "temporal_incoming_sampling_contract": None,
+        "temporal_feature_dimension": None,
+        "temporal_outgoing_sidecar_observed": False,
+        "temporal_incoming_sidecar_observed": False,
+        "temporal_outgoing_trusted_producer_contract": None,
+        "temporal_incoming_trusted_producer_contract": None,
+        "temporal_outgoing_content_sha256": None,
+        "temporal_incoming_content_sha256": None,
+        "temporal_pair_content_sha256": None,
+        "pose_direction_or_velocity_proven": False,
+    }
+    if outgoing_source_index is None or not frame.source_continuity:
+        return inactive
+    if (
+        derivative_family_ids[outgoing_source_index]
+        == derivative_family_ids[incoming_source_index]
+    ):
+        return inactive
+    outgoing = frame.source_continuity[outgoing_source_index]
+    incoming = frame.source_continuity[incoming_source_index]
+    outgoing_pose = outgoing.pose_model_embedding
+    incoming_pose = incoming.pose_model_embedding
+    outgoing_pose_evidence = _same_time_pose_scalar_evidence(outgoing_pose)
+    incoming_pose_evidence = _same_time_pose_scalar_evidence(incoming_pose)
+    pose_pair_content_sha256 = (
+        _redacted_content_sha256(
+            {
+                "contract": SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT,
+                "outgoing_content_sha256": outgoing_pose_evidence[
+                    "content_sha256"
+                ],
+                "incoming_content_sha256": incoming_pose_evidence[
+                    "content_sha256"
+                ],
+            }
+        )
+        if outgoing_pose is not None and incoming_pose is not None
+        else None
+    )
+    pose_phase_cosine: float | None = None
+    if outgoing_pose is not None and incoming_pose is not None:
+        # Both tuples were already validated as exact 60-D bounded finite
+        # observations by StageEditSourceContinuity.  A zero norm is observed
+        # data but cannot define a cosine and therefore cannot prove phase.
+        outgoing_norm = math.sqrt(sum(value * value for value in outgoing_pose))
+        incoming_norm = math.sqrt(sum(value * value for value in incoming_pose))
+        if outgoing_norm > _TIME_EPSILON and incoming_norm > _TIME_EPSILON:
+            pose_phase_cosine = min(
+                1.0,
+                max(
+                    -1.0,
+                    sum(
+                        left * right
+                        for left, right in zip(
+                            outgoing_pose, incoming_pose, strict=True
+                        )
+                    )
+                    / (outgoing_norm * incoming_norm),
+                ),
+            )
+    pose_values = (outgoing.pose_motion, incoming.pose_motion)
+    pose_complete = all(value is not None for value in pose_values)
+    pose_minimum = (
+        min(float(value) for value in pose_values if value is not None)
+        if pose_complete
+        else None
+    )
+    pose_delta = (
+        abs(float(pose_values[1]) - float(pose_values[0]))
+        if pose_complete
+        else None
+    )
+    camera_values = (
+        outgoing.camera_motion_x,
+        outgoing.camera_motion_y,
+        incoming.camera_motion_x,
+        incoming.camera_motion_y,
+    )
+    camera_delta = (
+        math.hypot(
+            float(incoming.camera_motion_x) - float(outgoing.camera_motion_x),
+            float(incoming.camera_motion_y) - float(outgoing.camera_motion_y),
+        )
+        if all(value is not None for value in camera_values)
+        else None
+    )
+    sharpness_values = (outgoing.sharpness, incoming.sharpness)
+    sharpness_minimum = (
+        min(float(value) for value in sharpness_values if value is not None)
+        if all(value is not None for value in sharpness_values)
+        else None
+    )
+    amount_threshold = config.highlight_motion_boundary_minimum_pose_motion
+    continuity_threshold = (
+        config.highlight_motion_boundary_minimum_continuity_score
+    )
+    sharpness_threshold = config.highlight_motion_boundary_minimum_sharpness
+    pose_phase_threshold = (
+        config.highlight_motion_boundary_minimum_pose_phase_cosine
+    )
+    policy_active = amount_threshold is not None and continuity_threshold is not None
+    pose_phase_threshold_bound = pose_phase_threshold is not None
+    pose_phase_match_proven = bool(
+        pose_phase_threshold_bound
+        and pose_phase_cosine is not None
+        and pose_phase_cosine + _TIME_EPSILON
+        >= float(pose_phase_threshold)
+    )
+    temporal_calibration = config.highlight_temporal_pose_motion_calibration
+    # The previous StageEdit token is not proven adjacent to this cut. Preserve
+    # the hash-bound sidecar audit while keeping all direction/phase evidence
+    # neutral. A non-None calibration is rejected by config validation above.
+    temporal_evidence = _temporal_pose_sidecar_pair_audit(
+        frame=frame,
+        outgoing_source_index=outgoing_source_index,
+        incoming_source_index=incoming_source_index,
+    )
+    temporal_evidence_complete = False
+    temporal_dynamic_match = False
+    evidence_complete = bool(
+        policy_active
+        and pose_complete
+        and (
+            not pose_phase_threshold_bound
+            or pose_phase_cosine is not None
+        )
+        and (
+            sharpness_threshold is None or sharpness_minimum is not None
+        )
+        and (
+            temporal_calibration is None or temporal_evidence_complete
+        )
+    )
+    accent_supported = bool(
+        evidence_complete
+        and pose_minimum is not None
+        and pose_minimum + _TIME_EPSILON >= float(amount_threshold)
+        # The same resolved authority that scores the actual pair must also
+        # say the pair is compatible. High motion alone can never pass.
+        and continuity_score + _TIME_EPSILON >= float(continuity_threshold)
+        # Phase is optional only while its calibrated threshold is inactive.
+        # Once bound, neither motion nor continuity may bypass the pose match.
+        and (
+            not pose_phase_threshold_bound
+            or pose_phase_match_proven
+        )
+        and (
+            sharpness_threshold is None
+            or (
+                sharpness_minimum is not None
+                and sharpness_minimum + _TIME_EPSILON
+                >= sharpness_threshold
+            )
+        )
+        and (
+            temporal_calibration is None or temporal_dynamic_match
+        )
+    )
+    return {
+        "pose_motion_minimum": pose_minimum,
+        "pose_motion_delta": pose_delta,
+        "camera_motion_delta": camera_delta,
+        "minimum_sharpness": sharpness_minimum,
+        "continuity_score": continuity_score,
+        "pose_phase_cosine": pose_phase_cosine,
+        "pose_phase_evidence_observed": pose_phase_cosine is not None,
+        "pose_phase_threshold_bound": pose_phase_threshold_bound,
+        "evidence_complete": evidence_complete,
+        "accent_supported": accent_supported,
+        "pose_phase_match_proven": pose_phase_match_proven,
+        "pose_phase_feature_dimension": (
+            len(outgoing_pose)
+            if outgoing_pose is not None and incoming_pose is not None
+            else None
+        ),
+        "pose_phase_outgoing_observed": outgoing_pose is not None,
+        "pose_phase_incoming_observed": incoming_pose is not None,
+        "pose_phase_trusted_producer_contract": (
+            SAME_TIME_POSE_SCALAR_EVIDENCE_CONTRACT
+            if outgoing_pose is not None or incoming_pose is not None
+            else None
+        ),
+        "pose_phase_outgoing_content_sha256": outgoing_pose_evidence[
+            "content_sha256"
+        ],
+        "pose_phase_incoming_content_sha256": incoming_pose_evidence[
+            "content_sha256"
+        ],
+        "pose_phase_pair_content_sha256": pose_pair_content_sha256,
+        "temporal_pose_motion_thresholds_bound": False,
+        "temporal_pose_motion_input_valid": temporal_evidence_complete,
+        "temporal_outgoing_boundary_motion_magnitude": (
+            None
+        ),
+        "temporal_incoming_boundary_motion_magnitude": (
+            None
+        ),
+        "temporal_endpoint_pose_cosine": (
+            None
+        ),
+        "temporal_velocity_direction_cosine": (
+            None
+        ),
+        "temporal_phase_compatibility": (
+            None
+        ),
+        "temporal_confidence": (
+            0.0
+        ),
+        "temporal_classification": (
+            "boundary_alignment_unproven"
+            if temporal_evidence["outgoing"]["observed"]
+            and temporal_evidence["incoming"]["observed"]
+            else "temporal_pose_sidecar_missing"
+        ),
+        "temporal_static_pose_match": bool(
+            False
+        ),
+        "temporal_dynamic_pose_phase_match": temporal_dynamic_match,
+        "temporal_failure_reasons": (
+            temporal_evidence["failure_reasons"]
+        ),
+        "temporal_sampling_contract_match": (
+            temporal_evidence["sampling_contract_match"]
+        ),
+        "temporal_outgoing_sampling_contract": temporal_evidence[
+            "outgoing"
+        ]["sampling_contract"],
+        "temporal_incoming_sampling_contract": temporal_evidence[
+            "incoming"
+        ]["sampling_contract"],
+        "temporal_feature_dimension": (
+            temporal_evidence["outgoing"]["feature_dimension"]
+            if temporal_evidence["outgoing"]["observed"]
+            and temporal_evidence["incoming"]["observed"]
+            else None
+        ),
+        "temporal_outgoing_sidecar_observed": temporal_evidence[
+            "outgoing"
+        ]["observed"],
+        "temporal_incoming_sidecar_observed": temporal_evidence[
+            "incoming"
+        ]["observed"],
+        "temporal_outgoing_trusted_producer_contract": temporal_evidence[
+            "outgoing"
+        ]["trusted_producer_contract"],
+        "temporal_incoming_trusted_producer_contract": temporal_evidence[
+            "incoming"
+        ]["trusted_producer_contract"],
+        "temporal_outgoing_content_sha256": temporal_evidence[
+            "outgoing"
+        ]["content_sha256"],
+        "temporal_incoming_content_sha256": temporal_evidence[
+            "incoming"
+        ]["content_sha256"],
+        "temporal_pair_content_sha256": temporal_evidence[
+            "pair_content_sha256"
+        ],
+        "pose_direction_or_velocity_proven": False,
+    }
 
 
 def _source_span_rejection(
@@ -3171,6 +6065,30 @@ def decode_stage_edit_semimarkov_beam(
         minimum_duration = constraint.minimum_shot_seconds
 
         for state in states:
+            prior_section_decisions = tuple(
+                item
+                for item in state.decisions
+                if _section_index_at_start(
+                    section_plan,
+                    item.master_start_seconds,
+                )
+                == section_index
+            )
+            prior_section_known_duration = sum(
+                item.duration_seconds
+                for item in prior_section_decisions
+                if item.shot_size != "unknown"
+            )
+            prior_section_closeup_duration = sum(
+                item.duration_seconds
+                for item in prior_section_decisions
+                if item.shot_size in _CLOSEUP_SHOT_SIZES
+            )
+            prior_section_nonwide_duration = sum(
+                item.duration_seconds
+                for item in prior_section_decisions
+                if item.shot_size in _NONWIDE_SHOT_SIZES
+            )
             prior_source_switch_boundaries = (
                 state.section_local_source_switch_boundaries
                 if state.current_section_index == section_index
@@ -3493,6 +6411,22 @@ def decode_stage_edit_semimarkov_beam(
                             continuity_authority=config.continuity_authority,
                             source_pair_scorer=source_pair_scorer,
                         )
+                        boundary_motion_evidence = (
+                            _boundary_motion_amount_plus_continuity_evidence(
+                                frame=frame,
+                                outgoing_frame=(
+                                    frames[start_index - 1]
+                                    if state.current_source is not None
+                                    and start_index > 0
+                                    else None
+                                ),
+                                outgoing_source_index=state.current_source,
+                                incoming_source_index=source_index,
+                                derivative_family_ids=derivative_family_ids,
+                                continuity_score=boundary_continuity_raw,
+                                config=config,
+                            )
+                        )
                         quality_raw = metadata.quality_log_prior
                         novelty_raw = (
                             1.0
@@ -3583,6 +6517,18 @@ def decode_stage_edit_semimarkov_beam(
                             ),
                             prior_wide_involved_source_switch_boundaries=(
                                 prior_wide_involved_source_switch_boundaries
+                            ),
+                            prior_section_known_duration_seconds=(
+                                prior_section_known_duration
+                            ),
+                            prior_section_closeup_duration_seconds=(
+                                prior_section_closeup_duration
+                            ),
+                            prior_section_nonwide_duration_seconds=(
+                                prior_section_nonwide_duration
+                            ),
+                            boundary_motion_accent_supported=bool(
+                                boundary_motion_evidence["accent_supported"]
                             ),
                         )
                         components = (
@@ -3707,6 +6653,219 @@ def decode_stage_edit_semimarkov_beam(
                             section_progress=frame.section_progress,
                             phrase_progress=frame.phrase_progress,
                             section_role=frame.section_role,
+                            boundary_pose_motion_minimum=(
+                                boundary_motion_evidence["pose_motion_minimum"]
+                            ),
+                            boundary_pose_motion_delta=(
+                                boundary_motion_evidence["pose_motion_delta"]
+                            ),
+                            boundary_camera_motion_delta=(
+                                boundary_motion_evidence["camera_motion_delta"]
+                            ),
+                            boundary_minimum_sharpness=(
+                                boundary_motion_evidence["minimum_sharpness"]
+                            ),
+                            boundary_continuity_score=(
+                                boundary_motion_evidence["continuity_score"]
+                            ),
+                            boundary_motion_amount_plus_continuity_evidence_complete=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "evidence_complete"
+                                    ]
+                                )
+                            ),
+                            boundary_motion_amount_plus_continuity_supported=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "accent_supported"
+                                    ]
+                                )
+                            ),
+                            boundary_pose_phase_cosine=(
+                                boundary_motion_evidence[
+                                    "pose_phase_cosine"
+                                ]
+                            ),
+                            boundary_pose_phase_evidence_observed=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "pose_phase_evidence_observed"
+                                    ]
+                                )
+                            ),
+                            boundary_pose_phase_threshold_bound=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "pose_phase_threshold_bound"
+                                    ]
+                                )
+                            ),
+                            boundary_pose_phase_match_proven=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "pose_phase_match_proven"
+                                    ]
+                                )
+                            ),
+                            boundary_pose_phase_feature_dimension=(
+                                boundary_motion_evidence[
+                                    "pose_phase_feature_dimension"
+                                ]
+                            ),
+                            boundary_pose_phase_outgoing_observed=bool(
+                                boundary_motion_evidence[
+                                    "pose_phase_outgoing_observed"
+                                ]
+                            ),
+                            boundary_pose_phase_incoming_observed=bool(
+                                boundary_motion_evidence[
+                                    "pose_phase_incoming_observed"
+                                ]
+                            ),
+                            boundary_pose_phase_trusted_producer_contract=(
+                                boundary_motion_evidence[
+                                    "pose_phase_trusted_producer_contract"
+                                ]
+                            ),
+                            boundary_pose_phase_outgoing_content_sha256=(
+                                boundary_motion_evidence[
+                                    "pose_phase_outgoing_content_sha256"
+                                ]
+                            ),
+                            boundary_pose_phase_incoming_content_sha256=(
+                                boundary_motion_evidence[
+                                    "pose_phase_incoming_content_sha256"
+                                ]
+                            ),
+                            boundary_pose_phase_pair_content_sha256=(
+                                boundary_motion_evidence[
+                                    "pose_phase_pair_content_sha256"
+                                ]
+                            ),
+                            boundary_temporal_pose_motion_thresholds_bound=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "temporal_pose_motion_thresholds_bound"
+                                    ]
+                                )
+                            ),
+                            boundary_temporal_pose_motion_input_valid=(
+                                bool(
+                                    boundary_motion_evidence[
+                                        "temporal_pose_motion_input_valid"
+                                    ]
+                                )
+                            ),
+                            boundary_temporal_outgoing_motion_magnitude=(
+                                boundary_motion_evidence[
+                                    "temporal_outgoing_boundary_motion_magnitude"
+                                ]
+                            ),
+                            boundary_temporal_incoming_motion_magnitude=(
+                                boundary_motion_evidence[
+                                    "temporal_incoming_boundary_motion_magnitude"
+                                ]
+                            ),
+                            boundary_temporal_endpoint_pose_cosine=(
+                                boundary_motion_evidence[
+                                    "temporal_endpoint_pose_cosine"
+                                ]
+                            ),
+                            boundary_temporal_velocity_direction_cosine=(
+                                boundary_motion_evidence[
+                                    "temporal_velocity_direction_cosine"
+                                ]
+                            ),
+                            boundary_temporal_phase_compatibility=(
+                                boundary_motion_evidence[
+                                    "temporal_phase_compatibility"
+                                ]
+                            ),
+                            boundary_temporal_confidence=float(
+                                boundary_motion_evidence["temporal_confidence"]
+                            ),
+                            boundary_temporal_classification=(
+                                boundary_motion_evidence[
+                                    "temporal_classification"
+                                ]
+                            ),
+                            boundary_temporal_static_pose_match=bool(
+                                boundary_motion_evidence[
+                                    "temporal_static_pose_match"
+                                ]
+                            ),
+                            boundary_temporal_dynamic_pose_phase_match=bool(
+                                boundary_motion_evidence[
+                                    "temporal_dynamic_pose_phase_match"
+                                ]
+                            ),
+                            boundary_temporal_failure_reasons=tuple(
+                                str(value)
+                                for value in boundary_motion_evidence[
+                                    "temporal_failure_reasons"
+                                ]
+                            ),
+                            boundary_temporal_sampling_contract_match=bool(
+                                boundary_motion_evidence[
+                                    "temporal_sampling_contract_match"
+                                ]
+                            ),
+                            boundary_temporal_outgoing_sampling_contract=(
+                                boundary_motion_evidence[
+                                    "temporal_outgoing_sampling_contract"
+                                ]
+                            ),
+                            boundary_temporal_incoming_sampling_contract=(
+                                boundary_motion_evidence[
+                                    "temporal_incoming_sampling_contract"
+                                ]
+                            ),
+                            boundary_temporal_feature_dimension=(
+                                boundary_motion_evidence[
+                                    "temporal_feature_dimension"
+                                ]
+                            ),
+                            boundary_temporal_outgoing_sidecar_observed=bool(
+                                boundary_motion_evidence[
+                                    "temporal_outgoing_sidecar_observed"
+                                ]
+                            ),
+                            boundary_temporal_incoming_sidecar_observed=bool(
+                                boundary_motion_evidence[
+                                    "temporal_incoming_sidecar_observed"
+                                ]
+                            ),
+                            boundary_temporal_outgoing_trusted_producer_contract=(
+                                boundary_motion_evidence[
+                                    "temporal_outgoing_trusted_producer_contract"
+                                ]
+                            ),
+                            boundary_temporal_incoming_trusted_producer_contract=(
+                                boundary_motion_evidence[
+                                    "temporal_incoming_trusted_producer_contract"
+                                ]
+                            ),
+                            boundary_temporal_outgoing_content_sha256=(
+                                boundary_motion_evidence[
+                                    "temporal_outgoing_content_sha256"
+                                ]
+                            ),
+                            boundary_temporal_incoming_content_sha256=(
+                                boundary_motion_evidence[
+                                    "temporal_incoming_content_sha256"
+                                ]
+                            ),
+                            boundary_temporal_pair_content_sha256=(
+                                boundary_motion_evidence[
+                                    "temporal_pair_content_sha256"
+                                ]
+                            ),
+                            boundary_pose_direction_or_velocity_proven=bool(
+                                boundary_motion_evidence[
+                                    "pose_direction_or_velocity_proven"
+                                ]
+                            ),
                         )
                         new_state = _BeamState(
                             current_index=end_index,
@@ -3780,6 +6939,40 @@ def decode_stage_edit_semimarkov_beam(
                 reason = str(failure).partition(":")[2] or str(failure)
                 reject(reason)
             continue
+        soft_target_score = montage["highlight_aggregate"]["soft_targets"][
+            "aggregate_alignment_score"
+        ]
+        if soft_target_score is not None:
+            aggregate_component = _component(
+                "highlight_aggregate_soft_target",
+                float(soft_target_score),
+                config.montage_grammar_score_weight,
+            )
+            state = replace(
+                state,
+                score=state.score + aggregate_component.contribution,
+                component_totals=_add_component_totals(
+                    state.component_totals,
+                    (aggregate_component,),
+                ),
+            )
+        close_burst_score = montage["highlight_aggregate"]["soft_targets"][
+            "close_only_multi_source_burst_event_p10"
+        ]["evidence_weighted_alignment_score"]
+        if close_burst_score is not None and float(close_burst_score) > 0.0:
+            close_burst_component = _component(
+                "highlight_close_burst_soft_preference",
+                min(1.0, max(0.0, float(close_burst_score))),
+                config.montage_grammar_score_weight,
+            )
+            state = replace(
+                state,
+                score=state.score + close_burst_component.contribution,
+                component_totals=_add_component_totals(
+                    state.component_totals,
+                    (close_burst_component,),
+                ),
+            )
         complete.append(state)
     if not complete:
         summary = ", ".join(
@@ -3790,6 +6983,7 @@ def decode_stage_edit_semimarkov_beam(
             + (f": {summary}" if summary else "")
         )
 
+    complete.sort(key=_state_sort_key)
     selected_states: list[_BeamState] = []
     completion_signatures: set[tuple[Any, ...]] = set()
     duplicate_completions = 0
@@ -3907,14 +7101,26 @@ def decode_stage_edit_semimarkov_beam(
             ),
             "decoder_schema_migration": {
                 "current": DECODER_SCHEMA_VERSION,
-                "supersedes": 9,
+                "supersedes": 12,
                 "reason": (
-                    "explicit boundary-continuity authority binds either the "
-                    "backward-compatible handcrafted scorer or one production "
-                    "learned source-pair scorer fingerprint"
+                    "optional separately calibrated source-exact temporal "
+                    "pose sidecars can qualify dynamic highlight continuity, "
+                    "and hash-bound close-only multi-source burst evidence can "
+                    "supply a sparse evidence-weighted soft tie-break without "
+                    "changing Transformer tokens or checkpoints"
                 ),
                 "legacy_source_counter_aliases_retained": True,
                 "automatic_group_requires_verified_family_metadata": True,
+                "same_time_pose_cosine_relabelled_as_temporal": False,
+                "current_motion_profile_direction_calibration_claimed": False,
+                "temporal_calibration_bound": (
+                    config.highlight_temporal_pose_motion_calibration is not None
+                ),
+                "pose_direction_or_velocity_claimed": any(
+                    decision.boundary_pose_direction_or_velocity_proven
+                    for timeline in timelines
+                    for decision in timeline.decisions
+                ),
             },
             "source_derivative_diversity": (
                 source_derivative_metadata.to_dict()
@@ -4027,6 +7233,8 @@ __all__ = [
     "HANDCRAFTED_CONTINUITY_AUTHORITY",
     "HANDCRAFTED_CONTINUITY_SCORER_CONTRACT",
     "HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT",
+    "HIGHLIGHT_MOTION_CALIBRATION_CONTRACT",
+    "HIGHLIGHT_MOTION_CALIBRATION_QUANTILES",
     "MONTAGE_GRAMMAR_CONTRACT",
     "PRODUCTION_LEARNED_CONTINUITY_AUTHORITY",
     "StageEditBeamDecision",
@@ -4035,6 +7243,8 @@ __all__ = [
     "StageEditDecodeAudit",
     "StageEditDecodeInputError",
     "StageEditHeadFrame",
+    "StageEditHighlightMotionCalibration",
+    "StageEditTemporalPoseMotionCalibration",
     "StageEditNoValidTimelineError",
     "StageEditScoreComponent",
     "StageEditSectionConstraint",
@@ -4043,6 +7253,8 @@ __all__ = [
     "StageEditSemiMarkovResult",
     "StageEditSourceContinuity",
     "StageEditSourceMetadata",
+    "TEMPORAL_POSE_MOTION_CALIBRATION_ACTIVATION_AVAILABLE",
+    "TEMPORAL_POSE_MOTION_CALIBRATION_CONTRACT",
     "decode_stage_edit_semimarkov_beam",
     "stage_edit_boundary_continuity_score",
 ]

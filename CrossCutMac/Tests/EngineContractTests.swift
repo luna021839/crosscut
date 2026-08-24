@@ -741,6 +741,11 @@ final class EngineContractTests: XCTestCase {
     }
 
     func testAutomaticMemberSourceCountIsAlwaysExactlyTen() {
+        XCTAssertEqual(EditRequest.automaticMemberSourceCount, 10)
+        XCTAssertEqual(EditRequest.minimumAutomaticMemberSourceCount, 4)
+        XCTAssertTrue(EditMode.member.detail.contains("소스 하한만 4개"))
+        XCTAssertTrue(EditMode.member.detail.contains("전환 밀도를 유지"))
+        XCTAssertTrue(EditMode.member.detail.contains("다른 시간대"))
         for requestedCount in [2, 9, 10, 24, 99] {
             let request = EditRequest(
                 song: "I AM",
@@ -1504,6 +1509,19 @@ except KeyboardInterrupt:
                 "Missing bundled pose asset: \(relativePath)"
             )
         }
+        let professionalQualityAssetPaths = [
+            "crosscut/models/object_detection_nanodet_2022nov.onnx",
+            "crosscut/models/iam_closeup_gold_regression_v1.json",
+            "crosscut/models/ive_product_quality_floor_v1.json",
+        ]
+        for relativePath in professionalQualityAssetPaths {
+            XCTAssertTrue(
+                FileManager.default.isReadableFile(
+                    atPath: engineDirectory.appendingPathComponent(relativePath).path
+                ),
+                "Missing bundled professional quality asset: \(relativePath)"
+            )
+        }
         let requiredProfessionalStageEditModules = [
             "crosscut/stage_edit_production_registry.py",
             "crosscut/stage_edit_semimarkov_beam.py",
@@ -1552,6 +1570,7 @@ except KeyboardInterrupt:
                     || $0 == "crosscut/models/LICENSE.yunet"
                     || sfaceAssetPaths.contains($0)
                     || poseAssetPaths.contains($0)
+                    || professionalQualityAssetPaths.contains($0)
             }
         )
     }

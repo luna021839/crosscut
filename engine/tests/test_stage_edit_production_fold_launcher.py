@@ -8,6 +8,10 @@ import unittest
 from unittest.mock import patch
 
 from crosscut import stage_edit_production_fold_launcher as launcher
+from crosscut.stage_edit_feature_snapshot_job import (
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+    FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
+)
 
 
 def _production_contract() -> dict[str, object]:
@@ -71,6 +75,17 @@ def _write_plan(root: Path, checkpoint_root: Path) -> Path:
 
 
 class StageEditProductionFoldLauncherTests(unittest.TestCase):
+    def test_production_feature_contract_is_exact_current_v3(self) -> None:
+        self.assertEqual(FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION, 3)
+        self.assertEqual(
+            launcher.REQUIRED_FEATURE_PROVENANCE_CONTRACTS,
+            frozenset(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS),
+        )
+        self.assertNotIn(
+            "synchronized_source_causal_stage_edit_feature_snapshot_v2",
+            launcher.REQUIRED_FEATURE_PROVENANCE_CONTRACTS,
+        )
+
     def test_preflight_expands_fifteen_references_and_three_manifests(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()

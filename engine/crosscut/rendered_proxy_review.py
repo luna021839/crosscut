@@ -10,13 +10,17 @@ serialized or written as review artifacts.
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import stat
 from statistics import median
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 import cv2
@@ -41,6 +45,28 @@ PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS = (
 HUMAN_REFERENCE_BOUNDARY_ANALYSIS_BASIS = (
     "human_reference_hard_cut_boundary_scalar_evidence_v2"
 )
+SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS = (
+    "decoded_output_segment_interior_identity_free_geometry_sampling_v2"
+)
+SEGMENT_INTERIOR_GEOMETRY_CONTRACT = (
+    "render_plan_source_content_and_output_content_bound_segment_interior_"
+    "geometry_v2"
+)
+SEGMENT_INTERIOR_SAMPLE_FRACTIONS = (0.25, 0.50, 0.75)
+_STABLE_PROXY_IDENTITY_FIELDS = (
+    "width",
+    "height",
+    "fps",
+    "decoded_frame_count",
+    "duration_seconds",
+    "render_codec",
+    "content_sha256",
+)
+_FILE_CONTENT_SHA256_CACHE_MAXIMUM_ENTRIES = 256
+_FILE_CONTENT_SHA256_CACHE: OrderedDict[
+    str, tuple[tuple[int, int, int, int, int, int], str]
+] = OrderedDict()
+_FILE_CONTENT_SHA256_CACHE_LOCK = threading.RLock()
 PROXY_LANDSCAPE_SIZE = (854, 480)
 PROXY_PORTRAIT_SIZE = (270, 480)
 # Hard cuts compare the last two outgoing frames with the first two incoming
@@ -106,6 +132,122 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
         "p90": _quantile(clean, 0.90),
         "maximum": max(clean) if clean else None,
     }
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_stat_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _regular_file_lstat(path: Path) -> tuple[int, int, int, int, int, int]:
+    try:
+        details = path.stat(follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise ValueError(f"content-bound file is unavailable: {path}") from exc
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError(f"content-bound path is not a regular file: {path}")
+    return _file_stat_identity(details)
+
+
+def verified_file_content_sha256(path: Path) -> str:
+    """Return a cached SHA-256 only while the exact regular file is unchanged.
+
+    Cache reuse is keyed by path plus device, inode, mode, size, mtime, and
+    ctime.  A second ``lstat`` closes the cache-hit check; hashing additionally
+    compares the opened descriptor with the path before and after the read.
+    Any concurrent replacement or mutation therefore fails closed instead of
+    certifying bytes that no longer occupy the requested path.
+    """
+
+    absolute = Path(os.path.abspath(Path(path).expanduser()))
+    before_identity = _regular_file_lstat(absolute)
+    cache_key = str(absolute)
+    with _FILE_CONTENT_SHA256_CACHE_LOCK:
+        cached = _FILE_CONTENT_SHA256_CACHE.get(cache_key)
+        if cached is not None and cached[0] == before_identity:
+            after_lookup_identity = _regular_file_lstat(absolute)
+            if after_lookup_identity != before_identity:
+                raise ValueError(
+                    f"content-bound file changed during cache verification: {absolute}"
+                )
+            _FILE_CONTENT_SHA256_CACHE.move_to_end(cache_key)
+            return cached[1]
+        if cached is not None:
+            _FILE_CONTENT_SHA256_CACHE.pop(cache_key, None)
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(absolute, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"content-bound file could not be opened: {absolute}"
+        ) from exc
+    digest = hashlib.sha256()
+    try:
+        opened_identity = _file_stat_identity(os.fstat(descriptor))
+        if opened_identity != before_identity:
+            raise ValueError(
+                f"content-bound file changed before hashing: {absolute}"
+            )
+        observed_size = 0
+        while True:
+            block = os.read(descriptor, 4 * 1024 * 1024)
+            if not block:
+                break
+            observed_size += len(block)
+            digest.update(block)
+        descriptor_after_identity = _file_stat_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+    path_after_identity = _regular_file_lstat(absolute)
+    if not (
+        before_identity
+        == opened_identity
+        == descriptor_after_identity
+        == path_after_identity
+        and observed_size == before_identity[3]
+    ):
+        raise ValueError(
+            f"content-bound file changed while SHA-256 was computed: {absolute}"
+        )
+    result = digest.hexdigest()
+    with _FILE_CONTENT_SHA256_CACHE_LOCK:
+        current_identity = _regular_file_lstat(absolute)
+        if current_identity != before_identity:
+            raise ValueError(
+                f"content-bound file changed before SHA-256 cache commit: {absolute}"
+            )
+        _FILE_CONTENT_SHA256_CACHE[cache_key] = (before_identity, result)
+        _FILE_CONTENT_SHA256_CACHE.move_to_end(cache_key)
+        while (
+            len(_FILE_CONTENT_SHA256_CACHE)
+            > _FILE_CONTENT_SHA256_CACHE_MAXIMUM_ENTRIES
+        ):
+            _FILE_CONTENT_SHA256_CACHE.popitem(last=False)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +454,8 @@ GeometryProvider = Callable[[np.ndarray], OutputSubjectGeometry]
 
 def _default_geometry_provider(frame: np.ndarray) -> OutputSubjectGeometry:
     # Import lazily: the bundled YuNet/person/silhouette models are loaded only
-    # for selected boundary frames, never for every proxy frame.
+    # for deterministic boundary frames plus at most three interior samples
+    # per render segment, never for every proxy frame.
     from .visual_score import describe_frame
 
     descriptor = describe_frame(
@@ -379,6 +522,307 @@ class _BoundaryReviewWindow:
 
     def duration_seconds(self, fps: float) -> float:
         return self.transition_frame_count / fps
+
+
+@dataclass(frozen=True, slots=True)
+class _SegmentInteriorSample:
+    segment_index: int
+    source_index: int
+    segment_frame_start: int
+    segment_frame_end: int
+    segment_frame_count: int
+    segment_frame_offset: int
+    frame_index: int
+    represented_frame_start: int
+    represented_frame_end: int
+
+    @property
+    def represented_frame_count(self) -> int:
+        return self.represented_frame_end - self.represented_frame_start
+
+
+def _segment_interior_sample_offsets(frame_count: int) -> tuple[int, ...]:
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int):
+        raise TypeError("segment frame count must be an integer")
+    if frame_count < 1:
+        raise ValueError("segment frame count must be positive")
+    return tuple(
+        sorted(
+            {
+                min(
+                    frame_count - 1,
+                    max(
+                        0,
+                        int(
+                            math.floor(
+                                (frame_count - 1) * fraction + 0.5
+                            )
+                        ),
+                    ),
+                )
+                for fraction in SEGMENT_INTERIOR_SAMPLE_FRACTIONS
+            }
+        )
+    )
+
+
+def _segment_interior_schedule(
+    plan: RenderPlan,
+    counts: Sequence[int],
+) -> tuple[_SegmentInteriorSample, ...]:
+    if len(counts) != len(plan.segments):
+        raise ValueError("segment frame counts differ from RenderPlan")
+    result: list[_SegmentInteriorSample] = []
+    segment_frame_start = 0
+    for segment_index, (segment, frame_count) in enumerate(
+        zip(plan.segments, counts, strict=True)
+    ):
+        offsets = _segment_interior_sample_offsets(int(frame_count))
+        represented_starts = [0]
+        represented_starts.extend(
+            (left + right + 1) // 2
+            for left, right in zip(offsets, offsets[1:])
+        )
+        represented_ends = [*represented_starts[1:], int(frame_count)]
+        for offset, represented_start, represented_end in zip(
+            offsets,
+            represented_starts,
+            represented_ends,
+            strict=True,
+        ):
+            if not represented_start <= offset < represented_end:
+                raise ValueError("interior sample does not represent its own frame")
+            result.append(
+                _SegmentInteriorSample(
+                    segment_index=segment_index,
+                    source_index=segment.source_index,
+                    segment_frame_start=segment_frame_start,
+                    segment_frame_end=segment_frame_start + int(frame_count),
+                    segment_frame_count=int(frame_count),
+                    segment_frame_offset=offset,
+                    frame_index=segment_frame_start + offset,
+                    represented_frame_start=segment_frame_start + represented_start,
+                    represented_frame_end=segment_frame_start + represented_end,
+                )
+            )
+        segment_frame_start += int(frame_count)
+    if segment_frame_start != plan.output_frame_count:
+        raise ValueError("interior schedule does not cover RenderPlan output frames")
+    return tuple(result)
+
+
+def _render_timeline_binding_payload(
+    plan: RenderPlan,
+    counts: Sequence[int],
+    *,
+    source_content_sha256: Sequence[str],
+) -> dict[str, Any]:
+    serialized_segments = plan.to_json()["segments"]
+    content_digests = tuple(source_content_sha256)
+    if len(content_digests) != len(plan.sources) or any(
+        len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in content_digests
+    ):
+        raise ValueError("RenderPlan source content SHA-256 binding is invalid")
+    return {
+        "source_content_sha256": list(content_digests),
+        "master_audio_start": plan.master_audio_start,
+        "fps": plan.fps,
+        "output_frame_count": plan.output_frame_count,
+        "segments": [
+            {
+                "segment_index": index,
+                "source_index": segment.source_index,
+                "master_start": segment.master_start,
+                "duration": segment.duration,
+                "source_start": segment.source_start,
+                "source_duration": segment.source_duration,
+                "effective_source_duration": segment.effective_source_duration,
+                "crop": serialized_segments[index].get("crop"),
+                "pan_crop": serialized_segments[index].get("pan_crop"),
+                "editorial_transform": serialized_segments[index].get(
+                    "editorial_transform"
+                ),
+                "look_adjustment": serialized_segments[index].get(
+                    "look_adjustment"
+                ),
+                "boundary_look_track": serialized_segments[index].get(
+                    "boundary_look_track"
+                ),
+                "output_frame_count": int(frame_count),
+            }
+            for index, (segment, frame_count) in enumerate(
+                zip(plan.segments, counts, strict=True)
+            )
+        ],
+        "transitions": [
+            {
+                "boundary_index": index,
+                "kind": transition.kind.value,
+                "frame_count": transition.frame_count,
+            }
+            for index, transition in enumerate(plan.transitions)
+        ],
+    }
+
+
+def _segment_interior_geometry_evidence(
+    *,
+    plan: RenderPlan,
+    counts: Sequence[int],
+    schedule: Sequence[_SegmentInteriorSample],
+    frames: Mapping[int, np.ndarray],
+    geometry_provider: GeometryProvider,
+    proxy_identity: Mapping[str, Any],
+    source_content_sha256: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    content_digests = (
+        tuple(verified_file_content_sha256(path) for path in plan.sources)
+        if source_content_sha256 is None
+        else tuple(source_content_sha256)
+    )
+    if len(content_digests) != len(plan.sources) or any(
+        len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in content_digests
+    ):
+        raise ValueError("segment geometry source content SHA-256 is invalid")
+    proxy_content_sha256 = proxy_identity.get("content_sha256")
+    if not (
+        isinstance(proxy_content_sha256, str)
+        and len(proxy_content_sha256) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in proxy_content_sha256
+        )
+    ):
+        raise ValueError("segment geometry proxy content SHA-256 is invalid")
+    stable_proxy_identity = {
+        field: proxy_identity[field]
+        for field in _STABLE_PROXY_IDENTITY_FIELDS
+        if field in proxy_identity
+    }
+    by_segment: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+    provider_failure_count = 0
+    face_backends: set[str] = set()
+    silhouette_backends: set[str] = set()
+    for sample in schedule:
+        frame = frames.get(sample.frame_index)
+        if frame is None:
+            geometry = OutputSubjectGeometry()
+            failed = True
+        else:
+            geometry, failed = _safe_geometry(geometry_provider, frame)
+        provider_failure_count += int(failed)
+        face_backends.add(geometry.face_backend)
+        silhouette_backends.add(geometry.silhouette_backend)
+        by_segment[sample.segment_index].append(
+            {
+                "segment_frame_offset": sample.segment_frame_offset,
+                "frame_index": sample.frame_index,
+                "represented_frame_start": sample.represented_frame_start,
+                "represented_frame_end": sample.represented_frame_end,
+                "represented_frame_count": sample.represented_frame_count,
+                "geometry_provider_failed": failed,
+                "subject_geometry": geometry.to_dict(),
+            }
+        )
+
+    segments: list[dict[str, Any]] = []
+    segment_frame_start = 0
+    for segment_index, (segment, frame_count) in enumerate(
+        zip(plan.segments, counts, strict=True)
+    ):
+        samples = by_segment.get(segment_index, [])
+        if not samples:
+            raise ValueError("segment interior sampling produced an empty segment")
+        represented_count = sum(
+            int(item["represented_frame_count"]) for item in samples
+        )
+        if represented_count != int(frame_count):
+            raise ValueError("segment interior samples do not cover their segment")
+        segments.append(
+            {
+                "segment_index": segment_index,
+                "source_index": segment.source_index,
+                "source_content_sha256": content_digests[segment.source_index],
+                "segment_frame_start": segment_frame_start,
+                "segment_frame_end": segment_frame_start + int(frame_count),
+                "segment_frame_count": int(frame_count),
+                "samples": samples,
+            }
+        )
+        segment_frame_start += int(frame_count)
+
+    timeline_binding = _render_timeline_binding_payload(
+        plan,
+        counts,
+        source_content_sha256=content_digests,
+    )
+    sampling_schedule = [
+        {
+            "segment_index": sample.segment_index,
+            "source_index": sample.source_index,
+            "segment_frame_offset": sample.segment_frame_offset,
+            "frame_index": sample.frame_index,
+            "represented_frame_start": sample.represented_frame_start,
+            "represented_frame_end": sample.represented_frame_end,
+            "represented_frame_count": sample.represented_frame_count,
+        }
+        for sample in schedule
+    ]
+    core: dict[str, Any] = {
+        "schema_version": 1,
+        "analysis_basis": SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
+        "contract": SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+        "source_index_domain": "render_plan_sources_array_index",
+        "output_frame_index_domain": "decoded_proxy_output_frame_index",
+        "sampling_policy": {
+            "sample_fractions": list(SEGMENT_INTERIOR_SAMPLE_FRACTIONS),
+            "rounding": "nearest_output_frame_half_up_unique",
+            "represented_duration": (
+                "nearest_sample_integer_frame_cells_exactly_partition_each_"
+                "render_segment_proxy_estimate_not_all_frame_measurement"
+            ),
+            "short_segment_policy": (
+                "deduplicate_fraction_samples_and_use_available_exact_frames"
+            ),
+            "sample_count_per_segment_maximum": len(
+                SEGMENT_INTERIOR_SAMPLE_FRACTIONS
+            ),
+        },
+        # Temporary proxy paths are deliberately excluded: candidate cleanup
+        # replaces the top-level path with ``None`` after review.  Clock,
+        # dimensions, duration, and codec remain immutable and independently
+        # bind these samples to the decoded output.
+        "proxy_identity": stable_proxy_identity,
+        "proxy_identity_sha256": _canonical_sha256(stable_proxy_identity),
+        "render_timeline_binding_sha256": _canonical_sha256(timeline_binding),
+        "sampling_schedule_sha256": _canonical_sha256(sampling_schedule),
+        "segment_count": len(plan.segments),
+        "sample_count": len(schedule),
+        "geometry_provider_failure_count": provider_failure_count,
+        "complete": bool(
+            len(segments) == len(plan.segments)
+            and len(schedule) == sum(len(item["samples"]) for item in segments)
+            and provider_failure_count == 0
+        ),
+        "geometry_backend_provenance": {
+            "face_backends": sorted(face_backends),
+            "silhouette_backends": sorted(silhouette_backends),
+        },
+        "storage_policy": {
+            "frame_images_persisted": False,
+            "original_pixels_serialized": False,
+            "appearance_or_identity_embeddings_serialized": False,
+            "proxy_content_sha256_persisted": True,
+            "source_content_sha256_persisted": True,
+            "serialized_evidence": "normalized_subject_geometry_only",
+        },
+        "segments": segments,
+    }
+    return {**core, "evidence_sha256": _canonical_sha256(core)}
 
 
 def _boundary_review_domain(
@@ -1759,6 +2203,10 @@ def review_rendered_proxy(
     expected_width, expected_height = proxy_dimensions(plan.aspect_ratio)
     if (plan.width, plan.height) != (expected_width, expected_height):
         raise ValueError("proxy review requires the fixed 480p RenderPlan size")
+    source_content_sha256 = tuple(
+        verified_file_content_sha256(path) for path in plan.sources
+    )
+    proxy_content_sha256 = verified_file_content_sha256(plan.output)
     capture = cv2.VideoCapture(str(plan.output))
     if not capture.isOpened():
         raise ValueError(f"could not open rendered proxy: {plan.output}")
@@ -1774,6 +2222,11 @@ def review_rendered_proxy(
         raise ValueError("decoded proxy frame rate does not match its RenderPlan")
 
     counts = segment_frame_counts(plan)
+    interior_schedule = _segment_interior_schedule(plan, counts)
+    interior_frame_indices = frozenset(
+        sample.frame_index for sample in interior_schedule
+    )
+    interior_frames: dict[int, np.ndarray] = {}
     segment_run_indices: list[int] = []
     run_source_indices: list[int] = []
     run_durations_seconds: list[float] = []
@@ -1904,6 +2357,8 @@ def review_rendered_proxy(
             run_perceptual_metrics[
                 segment_run_indices[segment_index]
             ].append(perceptual_metrics)
+            if frame_index in interior_frame_indices:
+                interior_frames[frame_index] = frame.copy()
             if frame_index in uses:
                 cached_frames[frame_index] = frame.copy()
                 cached_scalars[frame_index] = metrics
@@ -1935,11 +2390,37 @@ def review_rendered_proxy(
     finally:
         capture.release()
 
+    if tuple(
+        verified_file_content_sha256(path) for path in plan.sources
+    ) != source_content_sha256:
+        raise ValueError("RenderPlan source content changed during proxy review")
+    if verified_file_content_sha256(plan.output) != proxy_content_sha256:
+        raise ValueError("rendered proxy content changed during proxy review")
     if frame_index != plan.output_frame_count:
         raise ValueError(
             "decoded proxy frame count does not match its RenderPlan: "
             f"expected {plan.output_frame_count}, decoded {frame_index}"
         )
+    proxy_identity = {
+        "path": str(plan.output.resolve()),
+        "width": plan.width,
+        "height": plan.height,
+        "fps": plan.fps,
+        "decoded_frame_count": frame_index,
+        "duration_seconds": plan.render_duration,
+        "render_codec": render_codec,
+        "content_sha256": proxy_content_sha256,
+    }
+    segment_interior_geometry = _segment_interior_geometry_evidence(
+        plan=plan,
+        counts=counts,
+        schedule=interior_schedule,
+        frames=interior_frames,
+        geometry_provider=provider,
+        proxy_identity=proxy_identity,
+        source_content_sha256=source_content_sha256,
+    )
+    interior_frames.clear()
     boundary_reviews.sort(key=lambda item: int(item["boundary_index"]))
     if len(boundary_reviews) != len(boundary_windows):
         raise ValueError("proxy ended before every transition window was reviewed")
@@ -2095,22 +2576,18 @@ def review_rendered_proxy(
     payload = {
         "schema_version": 3,
         "analysis": ANALYSIS_BASIS,
-        "proxy": {
-            "path": str(plan.output.resolve()),
-            "width": plan.width,
-            "height": plan.height,
-            "fps": plan.fps,
-            "decoded_frame_count": frame_index,
-            "duration_seconds": plan.render_duration,
-            "render_codec": render_codec,
-        },
+        "proxy": proxy_identity,
         "review_policy": settings.to_dict(),
         "storage_policy": {
             "frame_images_persisted": False,
             "original_pixels_serialized": False,
             "appearance_or_identity_embeddings_serialized": False,
-            "serialized_evidence": "derived_scalars_and_normalized_geometry_only",
+            "serialized_evidence": (
+                "derived_scalars_boundary_and_segment_interior_normalized_"
+                "geometry_only"
+            ),
         },
+        "segment_interior_geometry": segment_interior_geometry,
         "overall_quality": overall_quality,
         "source_quality": {
             "per_source": per_source,
@@ -2217,10 +2694,14 @@ __all__ = [
     "PROXY_PORTRAIT_SIZE",
     "ProxyReviewConfig",
     "RenderedProxyReview",
+    "SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS",
+    "SEGMENT_INTERIOR_GEOMETRY_CONTRACT",
+    "SEGMENT_INTERIOR_SAMPLE_FRACTIONS",
     "TIER_D_CONTINUITY_DOMAIN",
     "derive_proxy_render_plan",
     "proxy_dimensions",
     "render_and_review_proxy",
     "review_hard_cut_frame_window",
     "review_rendered_proxy",
+    "verified_file_content_sha256",
 ]

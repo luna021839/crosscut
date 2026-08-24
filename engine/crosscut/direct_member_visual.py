@@ -79,6 +79,9 @@ class DirectMemberVisualConfig:
     insufficient_evidence_penalty: float = 0.35
     missing_descriptor_cost: float = 2.75
     ping_pong_penalty: float = 0.14
+    minimum_adjacent_motion_magnitude: float = 0.020
+    minimum_temporal_motion_component_count: int = 2
+    motion_connection_preference_weight: float = 0.22
     duration_balance_weight: float = 4.0
     maximum_source_duration_relative_deviation: float = 0.08
     minimum_face_sample_count: int = 1
@@ -137,6 +140,8 @@ class DirectMemberVisualConfig:
             self.insufficient_evidence_penalty,
             self.missing_descriptor_cost,
             self.ping_pong_penalty,
+            self.minimum_adjacent_motion_magnitude,
+            self.motion_connection_preference_weight,
             self.duration_balance_weight,
             self.maximum_source_duration_relative_deviation,
             self.minimum_acceptable_quality_score,
@@ -196,6 +201,14 @@ class DirectMemberVisualConfig:
                 "minimum_evidence_component_count must be a positive integer"
             )
         if (
+            isinstance(self.minimum_temporal_motion_component_count, bool)
+            or not isinstance(self.minimum_temporal_motion_component_count, int)
+            or not 1 <= self.minimum_temporal_motion_component_count <= 3
+        ):
+            raise ValueError(
+                "minimum_temporal_motion_component_count must be between one and three"
+            )
+        if (
             isinstance(self.minimum_face_sample_count, bool)
             or not isinstance(self.minimum_face_sample_count, int)
             or not 0
@@ -250,6 +263,8 @@ class DirectMemberVisualConfig:
             self.maximum_source_duration_relative_deviation,
             self.minimum_acceptable_quality_score,
             self.foreground_obstruction_rejection_score,
+            self.minimum_adjacent_motion_magnitude,
+            self.motion_connection_preference_weight,
             self.terminal_composite_exit_quality_maximum,
             self.terminal_composite_pre_exit_quality_maximum,
             self.terminal_composite_first_quality_drop_minimum,
@@ -280,8 +295,8 @@ class DirectMemberVisualConfig:
             "sample_frame_step_seconds": self.sample_frame_step_seconds,
             "early_interior_sample_seconds": self.early_interior_sample_seconds,
             "sample_policy": (
-                "outgoing_boundary_minus_one_frame_and_"
-                "incoming_boundary_plus_one_frame"
+                "outgoing_minus_two_to_minus_one_frames_and_"
+                "incoming_plus_one_to_plus_two_frames"
             ),
             "span_content_sample_policy": (
                 "cut_plus_one_output_frame_cut_plus_0_20_seconds_quarter_midpoint_"
@@ -325,6 +340,27 @@ class DirectMemberVisualConfig:
             ),
             "missing_descriptor_cost": self.missing_descriptor_cost,
             "ping_pong_penalty": self.ping_pong_penalty,
+            "adjacent_motion_connection": {
+                "contract": (
+                    "cut_adjacent_timestamp_bound_pose_silhouette_subject_motion_v1"
+                ),
+                "sample_policy": (
+                    "outgoing_previous_to_endpoint_and_incoming_start_to_next_"
+                    "at_one_output_frame_spacing"
+                ),
+                "minimum_motion_magnitude": (
+                    self.minimum_adjacent_motion_magnitude
+                ),
+                "minimum_temporal_component_count": (
+                    self.minimum_temporal_motion_component_count
+                ),
+                "soft_preference_weight": (
+                    self.motion_connection_preference_weight
+                ),
+                "direction_cosine_policy": "audit_only_never_gate_or_bonus",
+                "sparse_or_nonadjacent_evidence_allowed": False,
+                "raw_vectors_persisted": False,
+            },
             "duration_balance": {
                 "target_policy": (
                     "total_duration_times_source_quota_divided_by_span_count"
@@ -494,6 +530,92 @@ class _BoundarySample:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectBoundaryMotionEvidence:
+    """Scalar-only motion evidence from the four cut-adjacent frames."""
+
+    timestamp_bound_adjacent: bool
+    outgoing_previous_master_seconds: float
+    outgoing_endpoint_master_seconds: float
+    incoming_start_master_seconds: float
+    incoming_next_master_seconds: float
+    outgoing_previous_source_local_seconds: float
+    outgoing_endpoint_source_local_seconds: float
+    incoming_start_source_local_seconds: float
+    incoming_next_source_local_seconds: float
+    outgoing_pose_motion_magnitude: float | None
+    incoming_pose_motion_magnitude: float | None
+    outgoing_silhouette_motion_magnitude: float | None
+    incoming_silhouette_motion_magnitude: float | None
+    outgoing_subject_motion_magnitude: float | None
+    incoming_subject_motion_magnitude: float | None
+    outgoing_motion_magnitude: float | None
+    incoming_motion_magnitude: float | None
+    outgoing_motion_component_count: int
+    incoming_motion_component_count: int
+    both_moving: bool
+    endpoint_pose_shape_mismatch: float | None
+    endpoint_pose_shape_compatibility: float | None
+    direction_cosine_audit_only: float | None
+    soft_preference_applied: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": (
+                "cut_adjacent_timestamp_bound_pose_silhouette_subject_motion_v1"
+            ),
+            "timestamp_bound_adjacent": self.timestamp_bound_adjacent,
+            "master_timestamps_seconds": {
+                "outgoing_previous": self.outgoing_previous_master_seconds,
+                "outgoing_endpoint": self.outgoing_endpoint_master_seconds,
+                "incoming_start": self.incoming_start_master_seconds,
+                "incoming_next": self.incoming_next_master_seconds,
+            },
+            "source_local_timestamps_seconds": {
+                "outgoing_previous": (
+                    self.outgoing_previous_source_local_seconds
+                ),
+                "outgoing_endpoint": (
+                    self.outgoing_endpoint_source_local_seconds
+                ),
+                "incoming_start": self.incoming_start_source_local_seconds,
+                "incoming_next": self.incoming_next_source_local_seconds,
+            },
+            "motion_magnitudes": {
+                "outgoing_pose": self.outgoing_pose_motion_magnitude,
+                "incoming_pose": self.incoming_pose_motion_magnitude,
+                "outgoing_silhouette": (
+                    self.outgoing_silhouette_motion_magnitude
+                ),
+                "incoming_silhouette": (
+                    self.incoming_silhouette_motion_magnitude
+                ),
+                "outgoing_subject": self.outgoing_subject_motion_magnitude,
+                "incoming_subject": self.incoming_subject_motion_magnitude,
+                "outgoing_aggregate": self.outgoing_motion_magnitude,
+                "incoming_aggregate": self.incoming_motion_magnitude,
+            },
+            "motion_component_counts": {
+                "outgoing": self.outgoing_motion_component_count,
+                "incoming": self.incoming_motion_component_count,
+            },
+            "both_moving": self.both_moving,
+            "endpoint_pose_shape_mismatch": (
+                self.endpoint_pose_shape_mismatch
+            ),
+            "endpoint_pose_shape_compatibility": (
+                self.endpoint_pose_shape_compatibility
+            ),
+            "direction_cosine_audit_only": (
+                self.direction_cosine_audit_only
+            ),
+            "direction_cosine_influenced_gate_or_bonus": False,
+            "soft_preference_applied": self.soft_preference_applied,
+            "sparse_or_nonadjacent_evidence_used": False,
+            "raw_vectors_persisted": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class DirectSpanSourceValidity:
     eligible_source_index: int
     valid: bool
@@ -596,6 +718,7 @@ class DirectBoundaryMismatch:
     evidence_component_count: int
     warning_flags: tuple[str, ...]
     severe_flags: tuple[str, ...]
+    motion_connection: DirectBoundaryMotionEvidence | None = None
 
     def components(self) -> dict[str, float | None]:
         return {
@@ -617,6 +740,11 @@ class DirectBoundaryMismatch:
             "evidence_component_count": self.evidence_component_count,
             "warning_flags": list(self.warning_flags),
             "severe_flags": list(self.severe_flags),
+            "motion_connection": (
+                self.motion_connection.to_dict()
+                if self.motion_connection is not None
+                else None
+            ),
         }
 
 
@@ -765,6 +893,11 @@ class DirectMemberVisualSelection:
         for boundary in self.boundaries:
             warning_counts.update(boundary.mismatch.warning_flags)
             severe_counts.update(boundary.mismatch.severe_flags)
+        motion_evidence = tuple(
+            evidence
+            for boundary in self.boundaries
+            if (evidence := boundary.mismatch.motion_connection) is not None
+        )
         validity_reasons: Counter[str] = Counter(
             reason
             for span in self.span_validity
@@ -831,6 +964,38 @@ class DirectMemberVisualSelection:
             ),
             "warning_flag_counts": dict(sorted(warning_counts.items())),
             "severe_flag_counts": dict(sorted(severe_counts.items())),
+            "adjacent_motion_connection": {
+                "evaluated_boundary_count": len(motion_evidence),
+                "timestamp_bound_adjacent_boundary_count": sum(
+                    evidence.timestamp_bound_adjacent
+                    for evidence in motion_evidence
+                ),
+                "both_moving_boundary_count": sum(
+                    evidence.both_moving for evidence in motion_evidence
+                ),
+                "soft_preference_applied_boundary_count": sum(
+                    evidence.soft_preference_applied > 0.0
+                    for evidence in motion_evidence
+                ),
+                "soft_preference": _distribution(
+                    [
+                        evidence.soft_preference_applied
+                        for evidence in motion_evidence
+                    ]
+                ),
+                "direction_cosine_audit_only": _distribution(
+                    [
+                        value
+                        for evidence in motion_evidence
+                        if (
+                            value := evidence.direction_cosine_audit_only
+                        )
+                        is not None
+                    ]
+                ),
+                "direction_influenced_selection": False,
+                "raw_vectors_persisted": False,
+            },
             "sample_count": self.sample_count,
             "failed_sample_count": self.failed_sample_count,
             "descriptor_success_fraction": (
@@ -902,11 +1067,12 @@ class DirectMemberVisualSelection:
         return {
             "analysis_basis": (
                 "timewarp_boundary_native_cut_non_identity_geometry_"
-                "adaptive_beam_exact_feasibility_lifeline_v4"
+                "cut_adjacent_motion_adaptive_beam_exact_feasibility_lifeline_v5"
             ),
             "selection_objective": (
                 "minimum_real_boundary_geometry_mismatch_subject_to_"
-                "all_source_count_duration_no_adjacent_repeat_constraints"
+                "all_source_count_duration_no_adjacent_repeat_constraints_"
+                "plus_direction_agnostic_both_moving_endpoint_shape_soft_preference"
             ),
             "selected_source_indices": list(self.source_indices),
             "distinct_source_count": len(set(self.source_indices)),
@@ -939,6 +1105,14 @@ class DirectMemberVisualSelection:
                     self.source_indices[1:],
                 )
             ),
+            "same_source_nonadjacent_reuse_count": sum(
+                max(0, count - 1) for count in self.source_counts
+            ),
+            "rapid_ping_pong_count": sum(
+                self.source_indices[index] == self.source_indices[index - 2]
+                for index in range(2, len(self.source_indices))
+            ),
+            "rapid_ping_pong_penalty": self.config.ping_pong_penalty,
             "optimizer_cost": self.optimizer_cost,
             "optimizer_search": dict(self.optimizer_search_diagnostics),
             "native_scene_cut_evidence": {
@@ -958,7 +1132,7 @@ class DirectMemberVisualSelection:
                 "persisted_evidence": (
                     "normalized_attention_geometry_backend_confidence_"
                     "foreground_obstruction_highlight_clipping_gray_summary_"
-                    "scalars_and_aggregate_mismatch_only"
+                    "cut_adjacent_motion_scalars_and_aggregate_mismatch_only"
                 ),
             },
         }
@@ -1365,11 +1539,332 @@ def _person_count_mismatch(left: int, right: int) -> float | None:
     )
 
 
+def _actual_pose_vector(
+    descriptor: FrameVisualDescriptor | None,
+    config: DirectMemberVisualConfig,
+) -> tuple[float, ...] | None:
+    if (
+        descriptor is None
+        or descriptor.pose_backend == "structure_hog_fallback"
+        or descriptor.pose_confidence < config.minimum_pose_confidence
+        or not descriptor.pose_embedding
+    ):
+        return None
+    return tuple(float(value) for value in descriptor.pose_embedding)
+
+
+def _vector_delta(
+    previous: Sequence[float] | None,
+    current: Sequence[float] | None,
+) -> tuple[float, ...] | None:
+    if (
+        previous is None
+        or current is None
+        or not previous
+        or len(previous) != len(current)
+    ):
+        return None
+    return tuple(
+        float(right) - float(left)
+        for left, right in zip(previous, current, strict=True)
+    )
+
+
+def _delta_magnitude(values: Sequence[float] | None) -> float | None:
+    if not values:
+        return None
+    return min(
+        1.0,
+        math.sqrt(sum(float(value) ** 2 for value in values) / len(values)),
+    )
+
+
+def _direction_cosine(
+    left: Sequence[float],
+    right: Sequence[float],
+) -> float | None:
+    if not left or len(left) != len(right):
+        return None
+    left_norm = math.sqrt(sum(float(value) ** 2 for value in left))
+    right_norm = math.sqrt(sum(float(value) ** 2 for value in right))
+    if left_norm <= 1e-12 or right_norm <= 1e-12:
+        return None
+    return max(
+        -1.0,
+        min(
+            1.0,
+            sum(
+                float(left_value) * float(right_value)
+                for left_value, right_value in zip(left, right, strict=True)
+            )
+            / (left_norm * right_norm),
+        ),
+    )
+
+
+def _subject_motion_vector(
+    previous: _AttentionGeometry | None,
+    current: _AttentionGeometry | None,
+) -> tuple[float, ...] | None:
+    if previous is None or current is None:
+        return None
+    previous_area = previous.bbox_xywh[2] * previous.bbox_xywh[3]
+    current_area = current.bbox_xywh[2] * current.bbox_xywh[3]
+    if previous_area <= 0.0 or current_area <= 0.0:
+        return None
+    return (
+        current.centroid_xy[0] - previous.centroid_xy[0],
+        current.centroid_xy[1] - previous.centroid_xy[1],
+        math.log(current_area / previous_area) / math.log(4.0),
+    )
+
+
+def _motion_components(
+    previous: _BoundarySample,
+    current: _BoundarySample,
+    config: DirectMemberVisualConfig,
+) -> dict[str, tuple[float, tuple[float, ...]]]:
+    previous_descriptor = previous.descriptor
+    current_descriptor = current.descriptor
+    if previous_descriptor is None or current_descriptor is None:
+        return {}
+    pose_delta = _vector_delta(
+        _actual_pose_vector(previous_descriptor, config),
+        _actual_pose_vector(current_descriptor, config),
+    )
+    silhouette_delta = _vector_delta(
+        (
+            tuple(previous_descriptor.silhouette_embedding)
+            if previous_descriptor.silhouette_confidence
+            >= config.minimum_silhouette_confidence
+            else None
+        ),
+        (
+            tuple(current_descriptor.silhouette_embedding)
+            if current_descriptor.silhouette_confidence
+            >= config.minimum_silhouette_confidence
+            else None
+        ),
+    )
+    subject_delta = _subject_motion_vector(previous.attention, current.attention)
+    raw = {
+        "pose": pose_delta,
+        "silhouette": silhouette_delta,
+        "subject": subject_delta,
+    }
+    result: dict[str, tuple[float, tuple[float, ...]]] = {}
+    for name, vector in raw.items():
+        magnitude = _delta_magnitude(vector)
+        if magnitude is not None and vector is not None:
+            result[name] = (magnitude, vector)
+    return result
+
+
+def _cut_adjacent_motion_evidence(
+    *,
+    outgoing_previous: _BoundarySample,
+    outgoing_endpoint: _BoundarySample,
+    incoming_start: _BoundarySample,
+    incoming_next: _BoundarySample,
+    config: DirectMemberVisualConfig,
+) -> DirectBoundaryMotionEvidence:
+    step = config.sample_frame_step_seconds
+    outgoing_master_delta = (
+        outgoing_endpoint.master_seconds - outgoing_previous.master_seconds
+    )
+    incoming_master_delta = (
+        incoming_next.master_seconds - incoming_start.master_seconds
+    )
+    outgoing_local_delta = (
+        outgoing_endpoint.source_local_seconds
+        - outgoing_previous.source_local_seconds
+    )
+    incoming_local_delta = (
+        incoming_next.source_local_seconds
+        - incoming_start.source_local_seconds
+    )
+    adjacent = bool(
+        all(
+            0.75 * step <= value <= 1.25 * step
+            for value in (outgoing_master_delta, incoming_master_delta)
+        )
+        and outgoing_local_delta > 0.0
+        and incoming_local_delta > 0.0
+        and all(
+            sample.descriptor is not None
+            for sample in (
+                outgoing_previous,
+                outgoing_endpoint,
+                incoming_start,
+                incoming_next,
+            )
+        )
+    )
+    outgoing_components = (
+        _motion_components(outgoing_previous, outgoing_endpoint, config)
+        if adjacent
+        else {}
+    )
+    incoming_components = (
+        _motion_components(incoming_start, incoming_next, config)
+        if adjacent
+        else {}
+    )
+    outgoing_motion = (
+        sum(value[0] for value in outgoing_components.values())
+        / len(outgoing_components)
+        if outgoing_components
+        else None
+    )
+    incoming_motion = (
+        sum(value[0] for value in incoming_components.values())
+        / len(incoming_components)
+        if incoming_components
+        else None
+    )
+    left = outgoing_endpoint.descriptor
+    right = incoming_start.descriptor
+    endpoint_components: list[float] = []
+    if left is not None and right is not None:
+        left_pose = _actual_pose_vector(left, config)
+        right_pose = _actual_pose_vector(right, config)
+        pose_mismatch = _embedding_distance(left_pose or (), right_pose or ())
+        if pose_mismatch is not None:
+            endpoint_components.append(pose_mismatch)
+        if (
+            left.silhouette_confidence >= config.minimum_silhouette_confidence
+            and right.silhouette_confidence
+            >= config.minimum_silhouette_confidence
+        ):
+            silhouette_mismatch = _embedding_distance(
+                left.silhouette_embedding,
+                right.silhouette_embedding,
+            )
+            if silhouette_mismatch is not None:
+                endpoint_components.append(silhouette_mismatch)
+        _position_mismatch, subject_scale_mismatch = _attention_mismatch(
+            outgoing_endpoint.attention,
+            incoming_start.attention,
+        )
+        if subject_scale_mismatch is not None:
+            endpoint_components.append(subject_scale_mismatch)
+    endpoint_mismatch = (
+        sum(endpoint_components) / len(endpoint_components)
+        if endpoint_components
+        else None
+    )
+    endpoint_compatibility = (
+        max(0.0, 1.0 - endpoint_mismatch)
+        if endpoint_mismatch is not None
+        else None
+    )
+    both_moving = bool(
+        adjacent
+        and outgoing_motion is not None
+        and incoming_motion is not None
+        and outgoing_motion >= config.minimum_adjacent_motion_magnitude
+        and incoming_motion >= config.minimum_adjacent_motion_magnitude
+        and len(outgoing_components)
+        >= config.minimum_temporal_motion_component_count
+        and len(incoming_components)
+        >= config.minimum_temporal_motion_component_count
+    )
+    common_directions = [
+        cosine
+        for name in ("pose", "silhouette", "subject")
+        if name in outgoing_components and name in incoming_components
+        and (
+            cosine := _direction_cosine(
+                outgoing_components[name][1],
+                incoming_components[name][1],
+            )
+        )
+        is not None
+    ]
+    direction_cosine = (
+        sum(common_directions) / len(common_directions)
+        if common_directions
+        else None
+    )
+    motion_strength = (
+        min(
+            1.0,
+            min(float(outgoing_motion), float(incoming_motion))
+            / (config.minimum_adjacent_motion_magnitude * 4.0),
+        )
+        if both_moving
+        else 0.0
+    )
+    soft_preference = (
+        config.motion_connection_preference_weight
+        * motion_strength
+        * float(endpoint_compatibility)
+        if both_moving and endpoint_compatibility is not None
+        else 0.0
+    )
+    return DirectBoundaryMotionEvidence(
+        timestamp_bound_adjacent=adjacent,
+        outgoing_previous_master_seconds=outgoing_previous.master_seconds,
+        outgoing_endpoint_master_seconds=outgoing_endpoint.master_seconds,
+        incoming_start_master_seconds=incoming_start.master_seconds,
+        incoming_next_master_seconds=incoming_next.master_seconds,
+        outgoing_previous_source_local_seconds=(
+            outgoing_previous.source_local_seconds
+        ),
+        outgoing_endpoint_source_local_seconds=(
+            outgoing_endpoint.source_local_seconds
+        ),
+        incoming_start_source_local_seconds=incoming_start.source_local_seconds,
+        incoming_next_source_local_seconds=incoming_next.source_local_seconds,
+        outgoing_pose_motion_magnitude=(
+            outgoing_components.get("pose", (None, ()))[0]
+        ),
+        incoming_pose_motion_magnitude=(
+            incoming_components.get("pose", (None, ()))[0]
+        ),
+        outgoing_silhouette_motion_magnitude=(
+            outgoing_components.get("silhouette", (None, ()))[0]
+        ),
+        incoming_silhouette_motion_magnitude=(
+            incoming_components.get("silhouette", (None, ()))[0]
+        ),
+        outgoing_subject_motion_magnitude=(
+            outgoing_components.get("subject", (None, ()))[0]
+        ),
+        incoming_subject_motion_magnitude=(
+            incoming_components.get("subject", (None, ()))[0]
+        ),
+        outgoing_motion_magnitude=outgoing_motion,
+        incoming_motion_magnitude=incoming_motion,
+        outgoing_motion_component_count=len(outgoing_components),
+        incoming_motion_component_count=len(incoming_components),
+        both_moving=both_moving,
+        endpoint_pose_shape_mismatch=endpoint_mismatch,
+        endpoint_pose_shape_compatibility=endpoint_compatibility,
+        direction_cosine_audit_only=direction_cosine,
+        soft_preference_applied=soft_preference,
+    )
+
+
 def _boundary_mismatch(
     outgoing: _BoundarySample,
     incoming: _BoundarySample,
     config: DirectMemberVisualConfig,
+    *,
+    outgoing_previous: _BoundarySample | None = None,
+    incoming_next: _BoundarySample | None = None,
 ) -> DirectBoundaryMismatch:
+    motion_connection = (
+        _cut_adjacent_motion_evidence(
+            outgoing_previous=outgoing_previous,
+            outgoing_endpoint=outgoing,
+            incoming_start=incoming,
+            incoming_next=incoming_next,
+            config=config,
+        )
+        if outgoing_previous is not None and incoming_next is not None
+        else None
+    )
     left = outgoing.descriptor
     right = incoming.descriptor
     if left is None or right is None:
@@ -1387,6 +1882,7 @@ def _boundary_mismatch(
             evidence_component_count=0,
             warning_flags=("missing_visual_descriptor",),
             severe_flags=("missing_visual_descriptor",),
+            motion_connection=motion_connection,
         )
 
     attention_position, attention_scale = _attention_mismatch(
@@ -1488,6 +1984,8 @@ def _boundary_mismatch(
     if len(available) < config.minimum_evidence_component_count:
         missing_count = config.minimum_evidence_component_count - len(available)
         cost += config.insufficient_evidence_penalty * missing_count
+    if motion_connection is not None:
+        cost -= motion_connection.soft_preference_applied
     return DirectBoundaryMismatch(
         cost=cost,
         base_mismatch=base,
@@ -1502,6 +2000,7 @@ def _boundary_mismatch(
         evidence_component_count=len(available),
         warning_flags=tuple(warning_flags),
         severe_flags=tuple(severe_flags),
+        motion_connection=motion_connection,
     )
 
 
@@ -2664,6 +3163,8 @@ def select_balanced_direct_member_sources(
         provider = owned_provider
     outgoing_samples: list[tuple[_BoundarySample, ...]] = []
     incoming_samples: list[tuple[_BoundarySample, ...]] = []
+    outgoing_previous_samples: list[tuple[_BoundarySample, ...]] = []
+    incoming_next_samples: list[tuple[_BoundarySample, ...]] = []
     matrices: list[tuple[tuple[DirectBoundaryMismatch, ...], ...]] = []
     span_diagnostics: list[DirectSpanVisualDiagnostic] = []
     sample_count = 0
@@ -2753,13 +3254,29 @@ def select_balanced_direct_member_sources(
                 spans[boundary_index][0],
                 boundary - resolved_config.sample_frame_step_seconds,
             )
+            outgoing_previous_master = max(
+                spans[boundary_index][0],
+                boundary - 2.0 * resolved_config.sample_frame_step_seconds,
+            )
             incoming_master = min(
                 spans[boundary_index + 1][1],
                 boundary + resolved_config.sample_frame_step_seconds,
             )
+            incoming_next_master = min(
+                spans[boundary_index + 1][1],
+                boundary + 2.0 * resolved_config.sample_frame_step_seconds,
+            )
+            outgoing_previous: list[_BoundarySample] = []
             outgoing: list[_BoundarySample] = []
             incoming: list[_BoundarySample] = []
+            incoming_next: list[_BoundarySample] = []
             for source_index, source in enumerate(resolved_sources):
+                outgoing_previous_local = _source_local_time(
+                    outgoing_previous_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
                 outgoing_local = _source_local_time(
                     outgoing_master,
                     source_index=source_index,
@@ -2772,6 +3289,17 @@ def select_balanced_direct_member_sources(
                     audio_offsets=offsets,
                     source_timewarps=clocks,
                 )
+                incoming_next_local = _source_local_time(
+                    incoming_next_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
+                outgoing_previous_descriptor = provider(
+                    source_index,
+                    source,
+                    outgoing_previous_local,
+                )
                 outgoing_descriptor = provider(
                     source_index,
                     source,
@@ -2782,9 +3310,28 @@ def select_balanced_direct_member_sources(
                     source,
                     incoming_local,
                 )
-                sample_count += 2
+                incoming_next_descriptor = provider(
+                    source_index,
+                    source,
+                    incoming_next_local,
+                )
+                sample_count += 4
+                failed_sample_count += int(
+                    outgoing_previous_descriptor is None
+                )
                 failed_sample_count += int(outgoing_descriptor is None)
                 failed_sample_count += int(incoming_descriptor is None)
+                failed_sample_count += int(incoming_next_descriptor is None)
+                outgoing_previous.append(
+                    _BoundarySample(
+                        master_seconds=outgoing_previous_master,
+                        source_local_seconds=outgoing_previous_local,
+                        descriptor=outgoing_previous_descriptor,
+                        attention=_attention_geometry(
+                            outgoing_previous_descriptor
+                        ),
+                    )
+                )
                 outgoing.append(
                     _BoundarySample(
                         master_seconds=outgoing_master,
@@ -2801,10 +3348,22 @@ def select_balanced_direct_member_sources(
                         attention=_attention_geometry(incoming_descriptor),
                     )
                 )
+                incoming_next.append(
+                    _BoundarySample(
+                        master_seconds=incoming_next_master,
+                        source_local_seconds=incoming_next_local,
+                        descriptor=incoming_next_descriptor,
+                        attention=_attention_geometry(incoming_next_descriptor),
+                    )
+                )
+            outgoing_previous_tuple = tuple(outgoing_previous)
             outgoing_tuple = tuple(outgoing)
             incoming_tuple = tuple(incoming)
+            incoming_next_tuple = tuple(incoming_next)
+            outgoing_previous_samples.append(outgoing_previous_tuple)
             outgoing_samples.append(outgoing_tuple)
             incoming_samples.append(incoming_tuple)
+            incoming_next_samples.append(incoming_next_tuple)
             matrices.append(
                 tuple(
                     tuple(
@@ -2812,6 +3371,10 @@ def select_balanced_direct_member_sources(
                             outgoing_tuple[left_index],
                             incoming_tuple[right_index],
                             resolved_config,
+                            outgoing_previous=(
+                                outgoing_previous_tuple[left_index]
+                            ),
+                            incoming_next=incoming_next_tuple[right_index],
                         )
                         for right_index in range(source_count)
                     )
@@ -3013,6 +3576,7 @@ def select_balanced_direct_member_sources(
 __all__ = [
     "DescriptorProvider",
     "DirectBoundaryMismatch",
+    "DirectBoundaryMotionEvidence",
     "DirectBoundaryVisualDiagnostic",
     "DirectMemberVisualConfig",
     "DirectMemberVisualSelection",

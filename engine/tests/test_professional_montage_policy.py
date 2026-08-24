@@ -3,17 +3,37 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
 
-from crosscut.professional_montage_grammar import ROLE_NAMES
+from crosscut.professional_montage_grammar import (
+    PROFILE_ANALYSIS_BASIS,
+    PROFILE_SCHEMA_VERSION,
+    ROLE_NAMES,
+)
 from crosscut.professional_montage_policy import (
+    DURATION_PREFERRED_TARGET_QUANTILE,
+    DURATION_PRODUCT_MINIMUM_QUANTILE,
     FORMATION_EVIDENCE_THRESHOLD_NORMALIZED,
     FORMATION_PERSON_COUNT_SEMANTICS,
     PRODUCT_EDITORIAL_REQUIREMENT_BASIS,
     ProfessionalMontagePolicyError,
+    WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+    WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
     load_professional_montage_policy,
+)
+from crosscut.stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_semimarkov_beam import (
+    HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+    HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+)
+from crosscut.stage_edit_source_pair_scorer import (
+    STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
 )
 
 
@@ -66,6 +86,46 @@ def _event_distribution(value: float, *, count: int) -> dict[str, object]:
     }
 
 
+def _linear_quantile(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    position = quantile * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _reference_distribution_from_values(
+    values: list[float],
+) -> dict[str, object]:
+    return {
+        "count": len(values),
+        "minimum": min(values),
+        "p10": _linear_quantile(values, 0.10),
+        "p25": _linear_quantile(values, 0.25),
+        "median": _linear_quantile(values, 0.50),
+        "p75": _linear_quantile(values, 0.75),
+        "p90": _linear_quantile(values, 0.90),
+        "maximum": max(values),
+        "reference_floor": {
+            "quantile": 0.1,
+            "value": _linear_quantile(values, 0.10),
+            "basis": "lower_quantile_of_contributing_human_reference_edits",
+        },
+    }
+
+
+def _event_distribution_from_values(values: list[float]) -> dict[str, object]:
+    result = _reference_distribution_from_values(values)
+    result.pop("reference_floor")
+    return result
+
+
+def _nearest_rank(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
 _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS = (
     (9, 25.809134238516712),
     (4, 11.916519656435916),
@@ -89,8 +149,46 @@ _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS = (
     (9, 33.29892498582262),
 )
 
+_CLOSE_DURATION_FRACTIONS = [0.20 + 0.01 * index for index in range(20)]
+_NONWIDE_DURATION_FRACTIONS = [0.50 + 0.01 * index for index in range(20)]
+_ROLE_DURATIONS = [
+    duration for _shot_count, duration in _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS
+]
+_WIDE_RUN_DURATIONS = [
+    duration * (1.0 - nonwide)
+    for duration, nonwide in zip(
+        _ROLE_DURATIONS,
+        _NONWIDE_DURATION_FRACTIONS,
+        strict=True,
+    )
+]
+
 
 def _profile() -> dict[str, object]:
+    close_duration_seconds = [
+        duration * fraction
+        for duration, fraction in zip(
+            _ROLE_DURATIONS,
+            _CLOSE_DURATION_FRACTIONS,
+            strict=True,
+        )
+    ]
+    nonwide_duration_seconds = [
+        duration * fraction
+        for duration, fraction in zip(
+            _ROLE_DURATIONS,
+            _NONWIDE_DURATION_FRACTIONS,
+            strict=True,
+        )
+    ]
+    medium_duration_seconds = [
+        nonwide - close
+        for nonwide, close in zip(
+            nonwide_duration_seconds,
+            close_duration_seconds,
+            strict=True,
+        )
+    ]
     chorus = {
         "contributing_reference_count": 20,
         "pooled_counts": {
@@ -100,13 +198,51 @@ def _profile() -> dict[str, object]:
             ),
             "nonwide_multi_source_burst_count": 16,
             "closeup_multi_source_burst_count": 6,
+            "consecutive_wide_run_count": 20,
+        },
+        "pooled_durations_seconds": {
+            "role": sum(_ROLE_DURATIONS),
+            "observed_shot_scale": sum(_ROLE_DURATIONS),
+            "unknown_shot_scale": 0.0,
+            "shot_size": {
+                "wide": sum(_WIDE_RUN_DURATIONS),
+                "medium": sum(medium_duration_seconds),
+                "close": sum(close_duration_seconds),
+            },
+            "nonwide": sum(nonwide_duration_seconds),
         },
         "reference_distributions": {
+            # Legacy, explicitly count-based audit evidence.  These values are
+            # deliberately different from the duration distributions below.
             "shot_size_fractions": {
                 "wide": _reference_distribution(0.2381818181818182),
                 "medium": _reference_distribution(0.0),
                 "close": _reference_distribution(0.15096153846153848),
             },
+            "shot_size_duration_fractions": {
+                "wide": _reference_distribution_from_values(
+                    [1.0 - value for value in _NONWIDE_DURATION_FRACTIONS]
+                ),
+                "medium": _reference_distribution_from_values(
+                    [
+                        nonwide - close
+                        for nonwide, close in zip(
+                            _NONWIDE_DURATION_FRACTIONS,
+                            _CLOSE_DURATION_FRACTIONS,
+                            strict=True,
+                        )
+                    ]
+                ),
+                "close": _reference_distribution_from_values(
+                    _CLOSE_DURATION_FRACTIONS
+                ),
+            },
+            "nonwide_duration_fraction": _reference_distribution_from_values(
+                _NONWIDE_DURATION_FRACTIONS
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                _reference_distribution_from_values(_WIDE_RUN_DURATIONS)
+            ),
             "entry_wide_anchor_fraction": _reference_distribution(0.0),
             "early_wide_anchor_fraction": _reference_distribution(1.0 / 3.0),
             "phrase_entry_wide_anchor_fraction": _reference_distribution(
@@ -145,6 +281,18 @@ def _profile() -> dict[str, object]:
                 count=6,
             ),
         },
+        "wide_run_event_distributions": {
+            "consecutive_wide_run_shot_count": _event_distribution_from_values(
+                [1.0] * 20
+            ),
+            "consecutive_wide_run_duration_seconds": (
+                _event_distribution_from_values(_WIDE_RUN_DURATIONS)
+            ),
+            "semantics": (
+                "maximal_contiguous_known_wide_shots_within_one_"
+                "acoustic_role_single_wide_shot_is_a_run"
+            ),
+        },
         "wide_shot_person_count_evidence": {
             "detected_person_count_normalized": _event_distribution(
                 1.0 / 6.0,
@@ -165,6 +313,13 @@ def _profile() -> dict[str, object]:
             chorus_shot_count, chorus_duration = (
                 _ACTUAL_PROFILE_CHORUS_CADENCE_INPUTS[cadence_index]
             )
+            close_fraction = _CLOSE_DURATION_FRACTIONS[cadence_index]
+            nonwide_fraction = _NONWIDE_DURATION_FRACTIONS[cadence_index]
+            wide_fraction = 1.0 - nonwide_fraction
+            medium_fraction = nonwide_fraction - close_fraction
+            wide_duration = chorus_duration * wide_fraction
+            medium_duration = chorus_duration * medium_fraction
+            close_duration = chorus_duration * close_fraction
             references.append(
                 {
                     "reference_id": f"REF-{song_index}-{reference_index}",
@@ -176,6 +331,40 @@ def _profile() -> dict[str, object]:
                             ),
                             "role_duration_seconds": (
                                 chorus_duration if role == "chorus_like" else 0.0
+                            ),
+                            **(
+                                {
+                                    "observed_shot_scale_duration_seconds": (
+                                        chorus_duration
+                                    ),
+                                    "unknown_shot_scale_duration_seconds": 0.0,
+                                    "shot_size_duration_seconds": {
+                                        "wide": wide_duration,
+                                        "medium": medium_duration,
+                                        "close": close_duration,
+                                    },
+                                    "shot_size_duration_fractions": {
+                                        "wide": wide_fraction,
+                                        "medium": medium_fraction,
+                                        "close": close_fraction,
+                                    },
+                                    "nonwide_duration_seconds": (
+                                        medium_duration + close_duration
+                                    ),
+                                    "nonwide_duration_fraction": (
+                                        nonwide_fraction
+                                    ),
+                                    "consecutive_wide_run_count": 1,
+                                    "consecutive_wide_run_shot_counts": [1],
+                                    "consecutive_wide_run_durations_seconds": [
+                                        wide_duration
+                                    ],
+                                    "maximum_consecutive_wide_run_seconds": (
+                                        wide_duration
+                                    ),
+                                }
+                                if role == "chorus_like"
+                                else {}
                             ),
                         }
                         for role in ROLE_NAMES
@@ -191,8 +380,8 @@ def _profile() -> dict[str, object]:
             }
         )
     profile: dict[str, object] = {
-        "schema_version": 1,
-        "analysis_basis": "ive_human_reference_visual_montage_grammar_v1",
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "analysis_basis": PROFILE_ANALYSIS_BASIS,
         "configuration": {
             "minimum_song_count": 4,
             "minimum_references_per_song": 5,
@@ -209,6 +398,12 @@ def _profile() -> dict[str, object]:
         "distributional_policy": {
             "hand_authored_visual_quality_thresholds_present": False,
             "reference_floors_are_lower_distribution_quantiles": True,
+            "shot_size_count_fractions_are_count_only_audit_metrics": True,
+            "shot_size_duration_fractions_use_observed_duration_only": True,
+            "nonwide_duration_is_explicit_medium_plus_close_never_one_minus_wide": True,
+            "consecutive_wide_runs_are_maximal_contiguous_known_wide_shots_within_role": True,
+            "single_wide_shot_is_a_consecutive_wide_run": True,
+            "reference_maximum_wide_run_is_zero_when_no_wide_is_observed": True,
         },
         "evidence_limitations": {
             "generic_wide_is_proven_group_formation": False,
@@ -222,7 +417,7 @@ def _profile() -> dict[str, object]:
             "profile_content_sha256": None,
             "generator": {
                 "module": "crosscut.professional_montage_grammar",
-                "module_version": "1",
+                "module_version": "2",
             },
             "songs": [
                 {"song_id": song["song_id"]} for song in songs
@@ -258,7 +453,150 @@ def _write(path: Path, profile: dict[str, object]) -> bytes:
     return raw
 
 
+def _install_positive_duration_role(
+    profile: dict[str, object],
+    *,
+    role_name: str,
+    close_values: list[float],
+    nonwide_values: list[float],
+) -> None:
+    if len(close_values) != 20 or len(nonwide_values) != 20:
+        raise ValueError("role fixture needs twenty references")
+    maximum_wide_runs: list[float] = []
+    for index, reference in enumerate(
+        ref
+        for song in profile["songs"]  # type: ignore[index]
+        for ref in song["references"]
+    ):
+        close = close_values[index]
+        nonwide = nonwide_values[index]
+        if not 0.0 <= close <= nonwide < 1.0:
+            raise ValueError("invalid synthetic role fractions")
+        duration = 10.0
+        medium = nonwide - close
+        wide = 1.0 - nonwide
+        wide_duration = duration * wide
+        maximum_wide_runs.append(wide_duration)
+        reference["by_acoustic_role"][role_name] = {
+            "role": role_name,
+            "shot_count": 3,
+            "role_duration_seconds": duration,
+            "observed_shot_scale_duration_seconds": duration,
+            "unknown_shot_scale_duration_seconds": 0.0,
+            "shot_size_duration_seconds": {
+                "wide": wide_duration,
+                "medium": duration * medium,
+                "close": duration * close,
+            },
+            "shot_size_duration_fractions": {
+                "wide": wide,
+                "medium": medium,
+                "close": close,
+            },
+            "nonwide_duration_seconds": duration * nonwide,
+            "nonwide_duration_fraction": nonwide,
+            "consecutive_wide_run_count": 1,
+            "consecutive_wide_run_shot_counts": [1],
+            "consecutive_wide_run_durations_seconds": [wide_duration],
+            "maximum_consecutive_wide_run_seconds": wide_duration,
+        }
+    chorus = profile["aggregate_by_acoustic_role"]["chorus_like"]  # type: ignore[index]
+    aggregate = deepcopy(chorus)
+    distributions = aggregate["reference_distributions"]
+    distributions["shot_size_duration_fractions"] = {
+        "wide": _reference_distribution_from_values(
+            [1.0 - value for value in nonwide_values]
+        ),
+        "medium": _reference_distribution_from_values(
+            [
+                nonwide - close
+                for nonwide, close in zip(
+                    nonwide_values, close_values, strict=True
+                )
+            ]
+        ),
+        "close": _reference_distribution_from_values(close_values),
+    }
+    distributions["nonwide_duration_fraction"] = (
+        _reference_distribution_from_values(nonwide_values)
+    )
+    distributions["maximum_consecutive_wide_run_seconds"] = (
+        _reference_distribution_from_values(maximum_wide_runs)
+    )
+    aggregate["contributing_reference_count"] = 20
+    profile["aggregate_by_acoustic_role"][role_name] = aggregate  # type: ignore[index]
+    _rehash(profile)
+
+
 class ProfessionalMontagePolicyTests(unittest.TestCase):
+    def test_role_conditioned_duration_policy_omits_zero_p10_without_bypass(
+        self,
+    ) -> None:
+        profile = _profile()
+        build_close = [0.0, 0.0, 0.0] + [0.24] * 17
+        build_nonwide = [0.0, 0.0, 0.0] + [0.54] * 17
+        bridge_close = [0.0, 0.0, 0.0] + [0.32] * 17
+        bridge_nonwide = [0.60] * 20
+        _install_positive_duration_role(
+            profile,
+            role_name="build",
+            close_values=build_close,
+            nonwide_values=build_nonwide,
+        )
+        _install_positive_duration_role(
+            profile,
+            role_name="bridge_like",
+            close_values=bridge_close,
+            nonwide_values=bridge_nonwide,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "role-conditioned-profile.json"
+            _write(path, profile)
+            policy = load_professional_montage_policy(path)
+
+        roles = {
+            item.role: item
+            for item in policy.role_conditioned_duration_policies
+        }
+        self.assertEqual(
+            {"build", "chorus_like", "bridge_like"}, set(roles)
+        )
+        self.assertIsNone(
+            roles["build"].local_minimum_close_duration_fraction
+        )
+        self.assertIsNone(
+            roles["build"].local_minimum_nonwide_duration_fraction
+        )
+        self.assertIsNone(
+            roles["bridge_like"].local_minimum_close_duration_fraction
+        )
+        self.assertAlmostEqual(
+            _linear_quantile(bridge_nonwide, 0.10),
+            roles["bridge_like"].local_minimum_nonwide_duration_fraction.value,
+        )
+        self.assertAlmostEqual(
+            _linear_quantile(build_close, 0.25),
+            roles[
+                "build"
+            ].pooled_product_minimum_close_duration_fraction.value,
+        )
+        self.assertAlmostEqual(
+            _linear_quantile(bridge_close, 0.50),
+            roles["bridge_like"].preferred_close_duration_fraction.value,
+        )
+        serialized = policy.to_dict()["role_conditioned_duration_policies"]
+        self.assertIsNone(
+            serialized["build"][
+                "local_minimum_close_duration_fraction"
+            ]
+        )
+        self.assertTrue(
+            serialized["build"][
+                "zero_local_p10_is_omitted_not_promoted"
+            ]
+        )
+
     def test_loads_hash_bound_reference_thresholds_and_separate_product_rules(
         self,
     ) -> None:
@@ -275,10 +613,8 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertEqual(
                 policy.profile_identity,
                 {
-                    "analysis_basis": (
-                        "ive_human_reference_visual_montage_grammar_v1"
-                    ),
-                    "schema_version": 1,
+                    "analysis_basis": PROFILE_ANALYSIS_BASIS,
+                    "schema_version": PROFILE_SCHEMA_VERSION,
                     "path": str(path),
                     "file_sha256": file_sha256,
                     "content_sha256": _profile()["provenance"][
@@ -287,7 +623,12 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 },
             )
             expected = {
-                "minimum_close_duration_fraction": 0.15096153846153848,
+                "minimum_close_duration_fraction": _linear_quantile(
+                    _CLOSE_DURATION_FRACTIONS, 0.10
+                ),
+                "minimum_nonwide_duration_fraction": _linear_quantile(
+                    _NONWIDE_DURATION_FRACTIONS, 0.10
+                ),
                 "minimum_early_wide_anchor_fraction": 1.0 / 3.0,
                 "minimum_phrase_entry_wide_anchor_fraction": (
                     0.2785714285714286
@@ -311,6 +652,74 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 )
                 self.assertIn("chorus_like", threshold.provenance.statistic_path)
                 self.assertEqual(threshold.provenance.quantile, 0.1)
+                if "close_burst" in name:
+                    self.assertEqual(6, threshold.reference_count)
+
+            duration_targets = {
+                "highlight_pooled_product_minimum_close_duration_fraction": (
+                    _nearest_rank(
+                        _CLOSE_DURATION_FRACTIONS,
+                        DURATION_PRODUCT_MINIMUM_QUANTILE,
+                    )
+                ),
+                "highlight_pooled_product_minimum_nonwide_duration_fraction": (
+                    _nearest_rank(
+                        _NONWIDE_DURATION_FRACTIONS,
+                        DURATION_PRODUCT_MINIMUM_QUANTILE,
+                    )
+                ),
+                "preferred_close_duration_fraction": _nearest_rank(
+                    _CLOSE_DURATION_FRACTIONS,
+                    DURATION_PREFERRED_TARGET_QUANTILE,
+                ),
+                "preferred_nonwide_duration_fraction": _nearest_rank(
+                    _NONWIDE_DURATION_FRACTIONS,
+                    DURATION_PREFERRED_TARGET_QUANTILE,
+                ),
+            }
+            for name, expected_value in duration_targets.items():
+                target = getattr(policy, name)
+                self.assertAlmostEqual(target.value, expected_value)
+                self.assertEqual(target.reference_count, 20)
+                self.assertIn("duration", target.provenance.statistic)
+                self.assertIsNone(target.provenance.reference_floor_basis)
+                expected_quantile = (
+                    DURATION_PRODUCT_MINIMUM_QUANTILE
+                    if "product_minimum" in name
+                    else DURATION_PREFERRED_TARGET_QUANTILE
+                )
+                self.assertEqual(target.provenance.quantile, expected_quantile)
+            self.assertIn(
+                "shot_size_duration_fractions.close",
+                policy.minimum_close_duration_fraction.provenance.statistic_path,
+            )
+            self.assertNotIn(
+                ".shot_size_fractions.close",
+                policy.minimum_close_duration_fraction.provenance.statistic_path,
+            )
+
+            hard_wide_maximum = policy.maximum_consecutive_wide_run_seconds
+            preferred_wide_maximum = (
+                policy.preferred_maximum_consecutive_wide_run_seconds
+            )
+            self.assertAlmostEqual(
+                hard_wide_maximum.value,
+                _nearest_rank(
+                    _WIDE_RUN_DURATIONS,
+                    WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+                ),
+            )
+            self.assertAlmostEqual(
+                preferred_wide_maximum.value,
+                _nearest_rank(
+                    _WIDE_RUN_DURATIONS,
+                    WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+                ),
+            )
+            self.assertEqual(hard_wide_maximum.reference_count, 20)
+            self.assertEqual(preferred_wide_maximum.reference_count, 20)
+            self.assertEqual(hard_wide_maximum.provenance.quantile, 1.0)
+            self.assertEqual(preferred_wide_maximum.provenance.quantile, 0.75)
 
             preferred = (
                 policy.preferred_wide_involved_source_switch_fraction
@@ -376,10 +785,9 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertFalse(serialized_cadence_preferred["hard_gate"])
             self.assertEqual(serialized["highlight_cadence_reference_count"], 20)
 
-            self.assertIsNone(policy.minimum_nonwide_duration_fraction)
             self.assertEqual(
                 policy.nonwide_duration_fraction_policy,
-                "unavailable_never_derived_from_one_minus_wide",
+                "explicit_observed_duration_p10_never_derived_from_one_minus_wide",
             )
             zero_paths = {
                 item.statistic_path
@@ -396,6 +804,23 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 zero_paths,
             )
             serialized = policy.to_dict()
+            self.assertTrue(
+                serialized["profile_informed_product_maximums"]
+                ["maximum_consecutive_wide_run_seconds"]["hard_gate"]
+            )
+            self.assertEqual(
+                serialized["profile_informed_product_maximums"]
+                ["maximum_consecutive_wide_run_seconds"]["comparison"],
+                "less_than_or_equal",
+            )
+            self.assertFalse(
+                serialized["profile_derived_preferred_maximums"]
+                ["preferred_maximum_consecutive_wide_run_seconds"]["hard_gate"]
+            )
+            self.assertTrue(
+                serialized["count_based_audit_minimums"]
+                ["never_used_as_duration_policy"]
+            )
             self.assertTrue(
                 all(
                     not item["usable_as_positive_production_minimum"]
@@ -437,6 +862,18 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 maximum_source_occupancy_fraction=0.45,
             )
             rendered_config = _rendered_montage_config_from_policy(policy)
+            learned_decode_config = (
+                _stage_edit_semimarkov_config_from_montage_policy(
+                    policy,
+                    continuity_authority=(
+                        PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+                    ),
+                    continuity_scorer_contract=(
+                        STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+                    ),
+                    continuity_scorer_fingerprint="a" * 64,
+                )
+            )
             self.assertEqual(
                 decode_config.highlight_preferred_wide_involved_source_switch_fraction,
                 0.8,
@@ -455,8 +892,65 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             )
             self.assertEqual(decode_config.highlight_cadence_reference_count, 20)
             self.assertEqual(
+                decode_config.continuity_authority,
+                HANDCRAFTED_CONTINUITY_AUTHORITY,
+            )
+            self.assertEqual(
+                decode_config.continuity_scorer_contract,
+                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            )
+            self.assertEqual(
+                decode_config.continuity_scorer_fingerprint,
+                HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+            )
+            self.assertEqual(
+                learned_decode_config.continuity_authority,
+                PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+            )
+            self.assertEqual(
+                learned_decode_config.continuity_scorer_contract,
+                STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
+            )
+            self.assertEqual(
+                learned_decode_config.continuity_scorer_fingerprint,
+                "a" * 64,
+            )
+            self.assertEqual(
                 decode_config.highlight_minimum_nonwide_burst_boundaries,
                 2,
+            )
+            self.assertEqual(
+                decode_config.highlight_minimum_close_burst_shot_count,
+                policy.minimum_close_burst_shot_count.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_minimum_close_burst_duration_seconds,
+                policy.minimum_close_burst_duration_seconds.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_minimum_close_burst_source_switch_fraction,
+                policy.minimum_close_burst_source_switch_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_close_burst_event_reference_count,
+                6,
+            )
+            self.assertEqual(
+                rendered_config.minimum_close_burst_shot_count,
+                policy.minimum_close_burst_shot_count.value,
+            )
+            self.assertEqual(
+                rendered_config.minimum_close_burst_duration_seconds,
+                policy.minimum_close_burst_duration_seconds.value,
+            )
+            self.assertEqual(
+                rendered_config.minimum_close_burst_source_switch_fraction,
+                policy.minimum_close_burst_source_switch_fraction.value,
+            )
+            self.assertEqual(rendered_config.close_burst_event_reference_count, 6)
+            self.assertEqual(
+                rendered_config.close_burst_policy_binding_sha256,
+                decode_config.highlight_close_burst_policy_binding_sha256,
             )
             self.assertEqual(decode_config.minimum_unique_sources, 8)
             self.assertEqual(
@@ -470,6 +964,98 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertEqual(
                 rendered_config.wide_involved_source_switch_reference_count,
                 17,
+            )
+            self.assertEqual(
+                decode_config.highlight_minimum_closeup_fraction,
+                policy.minimum_close_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_minimum_nonwide_fraction,
+                policy.minimum_nonwide_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_pooled_product_minimum_closeup_fraction,
+                policy.highlight_pooled_product_minimum_close_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_pooled_product_minimum_nonwide_fraction,
+                policy.highlight_pooled_product_minimum_nonwide_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_preferred_closeup_fraction,
+                policy.preferred_close_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_preferred_nonwide_fraction,
+                policy.preferred_nonwide_duration_fraction.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_maximum_consecutive_wide_run_seconds,
+                policy.maximum_consecutive_wide_run_seconds.value,
+            )
+            self.assertEqual(
+                decode_config.highlight_preferred_maximum_consecutive_wide_run_seconds,
+                policy.preferred_maximum_consecutive_wide_run_seconds.value,
+            )
+            self.assertEqual(
+                rendered_config.minimum_closeup_fraction,
+                decode_config.highlight_minimum_closeup_fraction,
+            )
+            self.assertEqual(
+                rendered_config.minimum_nonwide_fraction,
+                decode_config.highlight_minimum_nonwide_fraction,
+            )
+            self.assertEqual(
+                rendered_config.pooled_product_minimum_closeup_fraction,
+                decode_config.highlight_pooled_product_minimum_closeup_fraction,
+            )
+            self.assertEqual(
+                rendered_config.pooled_product_minimum_nonwide_fraction,
+                decode_config.highlight_pooled_product_minimum_nonwide_fraction,
+            )
+            self.assertEqual(
+                rendered_config.preferred_closeup_fraction,
+                decode_config.highlight_preferred_closeup_fraction,
+            )
+            self.assertEqual(
+                rendered_config.preferred_nonwide_fraction,
+                decode_config.highlight_preferred_nonwide_fraction,
+            )
+            self.assertEqual(
+                rendered_config.maximum_consecutive_wide_run_seconds,
+                decode_config.highlight_maximum_consecutive_wide_run_seconds,
+            )
+            self.assertEqual(
+                rendered_config.preferred_maximum_consecutive_wide_run_seconds,
+                decode_config.highlight_preferred_maximum_consecutive_wide_run_seconds,
+            )
+            self.assertEqual(
+                rendered_config.policy_fingerprint_sha256,
+                decode_config.highlight_policy_fingerprint_sha256,
+            )
+            self.assertRegex(
+                str(rendered_config.policy_fingerprint_sha256),
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                rendered_config.policy_profile_analysis_basis,
+                policy.identity.analysis_basis,
+            )
+            self.assertEqual(
+                rendered_config.policy_profile_schema_version,
+                policy.identity.schema_version,
+            )
+            self.assertEqual(
+                rendered_config.policy_profile_path,
+                policy.identity.path,
+            )
+            self.assertEqual(
+                rendered_config.policy_profile_file_sha256,
+                policy.identity.file_sha256,
+            )
+            self.assertEqual(
+                rendered_config.policy_profile_content_sha256,
+                policy.identity.content_sha256,
             )
 
     def test_expected_raw_file_hash_is_optional_but_strict_when_supplied(self) -> None:
@@ -511,12 +1097,12 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
 
     def test_semantic_tampering_fails_even_when_attacker_rehashes_profile(self) -> None:
         mutations = (
-            ("schema", lambda value: value.__setitem__("schema_version", 2)),
+            ("schema", lambda value: value.__setitem__("schema_version", 1)),
             ("basis", lambda value: value.__setitem__("analysis_basis", "other")),
             (
                 "generator",
                 lambda value: value["provenance"]["generator"].__setitem__(  # type: ignore[index,union-attr]
-                    "module_version", "2"
+                    "module_version", "1"
                 ),
             ),
             (
@@ -554,14 +1140,14 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             mismatched = _profile()
             close = mismatched["aggregate_by_acoustic_role"]["chorus_like"][  # type: ignore[index]
                 "reference_distributions"
-            ]["shot_size_fractions"]["close"]
+            ]["shot_size_duration_fractions"]["close"]
             close["reference_floor"]["value"] = 0.14
             _rehash(mismatched)
             mismatch_path = Path(temporary) / "mismatch.json"
             _write(mismatch_path, mismatched)
             with self.assertRaisesRegex(
                 ProfessionalMontagePolicyError,
-                "not a profile p10 reference floor",
+                "reference-floor provenance mismatch",
             ):
                 load_professional_montage_policy(mismatch_path)
 
@@ -594,6 +1180,84 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             ):
                 load_professional_montage_policy(inverted_path)
 
+    def test_v1_and_count_as_duration_profiles_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = _profile()
+            legacy["schema_version"] = 1
+            legacy["analysis_basis"] = (
+                "ive_human_reference_visual_montage_grammar_v1"
+            )
+            legacy["provenance"]["generator"]["module_version"] = "1"  # type: ignore[index]
+            _rehash(legacy)
+            legacy_path = root / "legacy-v1.json"
+            _write(legacy_path, legacy)
+            with self.assertRaisesRegex(
+                ProfessionalMontagePolicyError,
+                "unsupported profile schema version",
+            ):
+                load_professional_montage_policy(legacy_path)
+
+            count_as_duration = _profile()
+            chorus = count_as_duration["aggregate_by_acoustic_role"][  # type: ignore[index]
+                "chorus_like"
+            ]
+            distributions = chorus["reference_distributions"]
+            distributions["shot_size_duration_fractions"]["close"] = deepcopy(  # type: ignore[index]
+                distributions["shot_size_fractions"]["close"]  # type: ignore[index]
+            )
+            _rehash(count_as_duration)
+            misuse_path = root / "count-as-duration.json"
+            _write(misuse_path, count_as_duration)
+            with self.assertRaisesRegex(
+                ProfessionalMontagePolicyError,
+                "disagrees with duration evidence",
+            ):
+                load_professional_montage_policy(misuse_path)
+
+    def test_explicit_nonwide_and_wide_run_evidence_fail_closed(self) -> None:
+        mutations = (
+            (
+                "nonwide value",
+                "explicit nonwide duration mismatch",
+                lambda role: role.__setitem__(
+                    "nonwide_duration_fraction",
+                    1.0
+                    - role["shot_size_duration_fractions"]["wide"]
+                    + 0.01,
+                ),
+            ),
+            (
+                "wide maximum",
+                "maximum consecutive wide-run mismatch",
+                lambda role: role.__setitem__(
+                    "maximum_consecutive_wide_run_seconds", 999.0
+                ),
+            ),
+            (
+                "wide run duration",
+                "consecutive wide-run evidence mismatch",
+                lambda role: role[
+                    "consecutive_wide_run_durations_seconds"
+                ].__setitem__(0, 0.01),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (name, error, mutate) in enumerate(mutations):
+                with self.subTest(name=name):
+                    profile = _profile()
+                    role = profile["songs"][0]["references"][0][  # type: ignore[index]
+                        "by_acoustic_role"
+                    ]["chorus_like"]
+                    mutate(role)
+                    _rehash(profile)
+                    path = Path(temporary) / f"duration-{index}.json"
+                    _write(path, profile)
+                    with self.assertRaisesRegex(
+                        ProfessionalMontagePolicyError, error
+                    ):
+                        load_professional_montage_policy(path)
+
     def test_chorus_cadence_evidence_fails_closed_when_rehashed_but_invalid(
         self,
     ) -> None:
@@ -615,7 +1279,7 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
         mutations = (
             (
                 "zero duration",
-                "cannot supply chorus cadence evidence",
+                "invalid duration coverage",
                 lambda profile: first_chorus(profile).__setitem__(
                     "role_duration_seconds", 0.0
                 ),

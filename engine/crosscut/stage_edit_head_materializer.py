@@ -43,9 +43,13 @@ from .stage_edit_semimarkov_beam import (
     StageEditHeadFrame,
     StageEditSourceContinuity,
 )
+from .stage_edit_temporal_pose_motion import (
+    require_scalar_stage_edit_pose_payload,
+)
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     MASKED_SOURCE_LOGIT,
+    STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
     StageEditReadinessReport,
     StageEditSequence,
     StageEditTensorBatch,
@@ -57,11 +61,11 @@ from .stage_edit_transformer import (
 )
 
 
-STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 5
+STAGE_EDIT_HEAD_MATERIALIZER_SCHEMA_VERSION = 7
 STAGE_EDIT_HEAD_MATERIALIZER_CONTRACT = (
     "production_dynamic_crop_v2_v3_transformer_to_semimarkov_heads_with_"
-    "source_exact_crop_pair_continuity_exact_music_structure_and_versioned_"
-    "checkpoint_evidence_v5"
+    "source_exact_crop_pair_continuity_and_pose_phase_exact_music_structure_"
+    "temporal_pose_sidecar_and_versioned_checkpoint_evidence_v7"
 )
 
 
@@ -330,11 +334,52 @@ def _source_continuity_from_candidate(
     schema: StageEditTokenSchema,
 ) -> StageEditSourceContinuity:
     by_name = _source_feature_values(candidate, schema)
+    feature_names = tuple(schema.source_feature_names)
+    try:
+        pose_indices = tuple(
+            feature_names.index(name)
+            for name in STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES
+        )
+    except ValueError as exc:
+        raise StageEditHeadMaterializerInputError(
+            "checkpoint schema lacks the exact 60-D pose-model embedding"
+        ) from exc
+    missing = (
+        tuple(candidate.missing_mask)
+        if candidate.missing_mask
+        else (False,) * len(candidate.features)
+    )
+    if any(not isinstance(value, (bool, np.bool_)) for value in missing):
+        raise StageEditHeadMaterializerInputError(
+            "source candidate missing mask must contain booleans"
+        )
+    pose_missing = tuple(bool(missing[index]) for index in pose_indices)
+    if all(pose_missing):
+        pose_embedding: tuple[float, ...] | None = None
+    elif any(pose_missing):
+        raise StageEditHeadMaterializerInputError(
+            "pose-model embedding missingness must mark all 60 coordinates "
+            "observed or all 60 missing"
+        )
+    else:
+        pose_embedding = tuple(
+            float(candidate.features[index]) for index in pose_indices
+        )
+        if any(
+            not math.isfinite(value) or not -1.0 <= value <= 1.0
+            for value in pose_embedding
+        ):
+            raise StageEditHeadMaterializerInputError(
+                "observed pose-model embedding values must be finite and lie "
+                "in [-1, 1]"
+            )
     return StageEditSourceContinuity(
         **{
             destination: by_name.get(source)
             for source, destination in _CONTINUITY_FEATURE_FIELDS.items()
-        }
+        },
+        pose_model_embedding=pose_embedding,
+        temporal_pose_sidecar=candidate.temporal_pose_sidecar,
     )
 
 
@@ -423,7 +468,7 @@ class StageEditHeadMaterializationResult:
                 raise ValueError("StageEdit checkpoint contract evidence is invalid")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "contract": self.contract,
             "sequence_id": self.sequence_id,
@@ -455,6 +500,11 @@ class StageEditHeadMaterializationResult:
             "readiness": self.readiness.to_dict(),
             "frames": [item.to_dict() for item in self.frames],
         }
+        require_scalar_stage_edit_pose_payload(
+            payload,
+            context="StageEdit head materialization result",
+        )
+        return payload
 
 
 def _sequence_payload(sequence: StageEditSequence) -> dict[str, Any]:
@@ -478,6 +528,11 @@ def _sequence_payload(sequence: StageEditSequence) -> dict[str, Any]:
                         "missing_mask": list(candidate.missing_mask),
                         "available": candidate.available,
                         "hard_gate_passed": candidate.hard_gate_passed,
+                        "temporal_pose_sidecar": (
+                            candidate.temporal_pose_sidecar.to_dict()
+                            if candidate.temporal_pose_sidecar is not None
+                            else None
+                        ),
                     }
                     for candidate in token.source_candidates
                 ],

@@ -4,8 +4,10 @@ This module measures *what the reference editors did* without inventing a
 close-up quota.  Every labelled reference shot is joined to the exact
 ``cut_master_time`` token in an immutable StageEdit feature snapshot.  The
 selected source's inference-safe ``shot_scale`` column and its missing bit are
-then used to measure wide/medium/close framing, source-switch shot-size pairs,
-wide establishing anchors, and data-relative short non-wide bursts.
+then used to measure wide/medium/close framing by both honest shot counts and
+observed duration, explicit non-wide duration, consecutive wide holds,
+source-switch shot-size pairs, wide establishing anchors, and data-relative
+short non-wide bursts.
 
 The result is a multi-song profile whose lower floors are quantiles of the
 reference-edit distribution.  It contains no hand-authored quality pass
@@ -24,17 +26,25 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Mapping, Sequence
 
-from .stage_edit_feature_materializer import StageEditFeatureSnapshot
+from .stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_CONTRACT,
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
+from .stage_edit_feature_snapshot_job import (
+    FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    FEATURE_SNAPSHOT_JOB_INPUT_POLICY,
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+    FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
+)
 from .stage_edit_transformer import DEFAULT_STAGE_EDIT_SCHEMA
 
 
-PROFILE_SCHEMA_VERSION = 1
-PROFILE_ANALYSIS_BASIS = "ive_human_reference_visual_montage_grammar_v1"
-MODULE_VERSION = "1"
-FEATURE_JOB_SCHEMA_VERSION = 2
-FEATURE_JOB_ANALYSIS_BASIS = (
-    "synchronized_source_causal_stage_edit_feature_snapshot_v2"
-)
+PROFILE_SCHEMA_VERSION = 2
+PROFILE_ANALYSIS_BASIS = "ive_human_reference_visual_montage_grammar_v2"
+MODULE_VERSION = "2"
+FEATURE_JOB_SCHEMA_VERSION = FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION
+FEATURE_JOB_ANALYSIS_BASIS = FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS
 MATERIALIZATION_SCHEMA_VERSION = 1
 MATERIALIZATION_ANALYSIS_BASIS = "immutable_reference_training_materialization_v1"
 REFERENCE_SUPERVISION_SCHEMA_VERSION = 3
@@ -562,6 +572,47 @@ def _burst_events(
     return events
 
 
+def _consecutive_wide_runs(shots: Sequence[_Shot]) -> list[dict[str, Any]]:
+    """Return maximal, contiguous known-wide runs within one acoustic role.
+
+    A single long wide shot is deliberately a run: the production failure this
+    evidence is meant to expose is excessive *time* spent wide, not merely a
+    repeated count label.  Unknown shot scale, a clock gap, or a role change
+    terminates a run and is never silently treated as wide.
+    """
+
+    events: list[dict[str, Any]] = []
+    current: list[_Shot] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            events.append(
+                {
+                    "role": current[0].role,
+                    "shot_count": len(current),
+                    "duration_seconds": sum(shot.duration for shot in current),
+                }
+            )
+        current = []
+
+    for shot in shots:
+        if shot.size != "wide":
+            flush()
+            continue
+        if not current:
+            current = [shot]
+            continue
+        previous = current[-1]
+        if previous.end == shot.start and previous.role == shot.role:
+            current.append(shot)
+        else:
+            flush()
+            current = [shot]
+    flush()
+    return events
+
+
 def _empty_role_metric(role: str) -> dict[str, Any]:
     return {
         "role": role,
@@ -569,6 +620,8 @@ def _empty_role_metric(role: str) -> dict[str, Any]:
         "role_duration_seconds": 0.0,
         "observed_shot_scale_count": 0,
         "unknown_shot_scale_count": 0,
+        "observed_shot_scale_duration_seconds": 0.0,
+        "unknown_shot_scale_duration_seconds": 0.0,
         "unknown_shot_scale_reasons": {
             "missing_mask": 0,
             "source_unavailable": 0,
@@ -576,6 +629,18 @@ def _empty_role_metric(role: str) -> dict[str, Any]:
         },
         "shot_size_counts": {name: 0 for name in SHOT_SIZE_NAMES},
         "shot_size_fractions": {name: None for name in SHOT_SIZE_NAMES},
+        "shot_size_duration_seconds": {
+            name: 0.0 for name in SHOT_SIZE_NAMES
+        },
+        "shot_size_duration_fractions": {
+            name: None for name in SHOT_SIZE_NAMES
+        },
+        "nonwide_duration_seconds": 0.0,
+        "nonwide_duration_fraction": None,
+        "consecutive_wide_run_count": 0,
+        "consecutive_wide_run_shot_counts": [],
+        "consecutive_wide_run_durations_seconds": [],
+        "maximum_consecutive_wide_run_seconds": 0.0,
         "eligible_source_boundary_count": 0,
         "source_switch_count": 0,
         "source_switch_fraction": None,
@@ -762,6 +827,7 @@ def _measure_reference(
         maximum_shot_duration=None,
         close_only=True,
     )
+    consecutive_wide_runs = _consecutive_wide_runs(shots)
     role_metrics = {role: _empty_role_metric(role) for role in ROLE_NAMES}
     for shot in shots:
         metric = role_metrics[shot.role]
@@ -769,10 +835,15 @@ def _measure_reference(
         metric["role_duration_seconds"] += shot.duration
         if shot.size is None:
             metric["unknown_shot_scale_count"] += 1
+            metric["unknown_shot_scale_duration_seconds"] += shot.duration
             metric["unknown_shot_scale_reasons"][shot.scale_unknown_reason] += 1
         else:
             metric["observed_shot_scale_count"] += 1
+            metric["observed_shot_scale_duration_seconds"] += shot.duration
             metric["shot_size_counts"][shot.size] += 1
+            metric["shot_size_duration_seconds"][shot.size] += shot.duration
+            if shot.size in {"medium", "close"}:
+                metric["nonwide_duration_seconds"] += shot.duration
             if shot.size == "wide":
                 if shot.detected_person_count_normalized is not None:
                     metric[
@@ -788,6 +859,18 @@ def _measure_reference(
                     metric[
                         "wide_shot_formation_person_count_normalized_values"
                     ].append(shot.formation_person_count_normalized)
+
+    for event in consecutive_wide_runs:
+        metric = role_metrics[str(event["role"])]
+        metric["consecutive_wide_run_count"] += 1
+        metric["consecutive_wide_run_shot_counts"].append(event["shot_count"])
+        metric["consecutive_wide_run_durations_seconds"].append(
+            event["duration_seconds"]
+        )
+        metric["maximum_consecutive_wide_run_seconds"] = max(
+            metric["maximum_consecutive_wide_run_seconds"],
+            event["duration_seconds"],
+        )
 
     for earlier, later in zip(shots, shots[1:]):
         if earlier.end != later.start:
@@ -881,6 +964,19 @@ def _measure_reference(
                 name: metric["shot_size_counts"][name] / observed
                 for name in SHOT_SIZE_NAMES
             }
+        observed_duration = metric["observed_shot_scale_duration_seconds"]
+        if observed_duration > 0.0:
+            metric["shot_size_duration_fractions"] = {
+                name: metric["shot_size_duration_seconds"][name]
+                / observed_duration
+                for name in SHOT_SIZE_NAMES
+            }
+            # This is intentionally calculated from the two measured duration
+            # buckets.  It is never synthesized as ``1 - wide``.
+            metric["nonwide_duration_fraction"] = (
+                metric["shot_size_duration_seconds"]["medium"]
+                + metric["shot_size_duration_seconds"]["close"]
+            ) / observed_duration
         boundaries = metric["eligible_source_boundary_count"]
         if boundaries:
             metric["source_switch_fraction"] = (
@@ -1006,6 +1102,12 @@ def _aggregate_roles(
                 reference["by_acoustic_role"][role]["unknown_shot_scale_count"]
                 for reference in contributors
             ),
+            "consecutive_wide_run_count": sum(
+                reference["by_acoustic_role"][role][
+                    "consecutive_wide_run_count"
+                ]
+                for reference in contributors
+            ),
             "source_switch_count": sum(
                 reference["by_acoustic_role"][role]["source_switch_count"]
                 for reference in contributors
@@ -1047,7 +1149,41 @@ def _aggregate_roles(
                 for reference in contributors
             ),
         }
+        pooled_durations_seconds = {
+            "role": sum(
+                reference["by_acoustic_role"][role]["role_duration_seconds"]
+                for reference in contributors
+            ),
+            "observed_shot_scale": sum(
+                reference["by_acoustic_role"][role][
+                    "observed_shot_scale_duration_seconds"
+                ]
+                for reference in contributors
+            ),
+            "unknown_shot_scale": sum(
+                reference["by_acoustic_role"][role][
+                    "unknown_shot_scale_duration_seconds"
+                ]
+                for reference in contributors
+            ),
+            "shot_size": {
+                size: sum(
+                    reference["by_acoustic_role"][role][
+                        "shot_size_duration_seconds"
+                    ][size]
+                    for reference in contributors
+                )
+                for size in SHOT_SIZE_NAMES
+            },
+            "nonwide": sum(
+                reference["by_acoustic_role"][role]["nonwide_duration_seconds"]
+                for reference in contributors
+            ),
+        }
         distributions: dict[str, Any] = {
+            # Retained as a clearly count-derived audit distribution for
+            # compatibility.  Production duration policies must use the
+            # separate duration paths below.
             "shot_size_fractions": {
                 size: _reference_distribution(
                     _metric_values(
@@ -1061,6 +1197,37 @@ def _aggregate_roles(
                 )
                 for size in SHOT_SIZE_NAMES
             },
+            "shot_size_duration_fractions": {
+                size: _reference_distribution(
+                    _metric_values(
+                        contributors,
+                        role,
+                        lambda metric, size=size: metric[
+                            "shot_size_duration_fractions"
+                        ][size],
+                    ),
+                    floor_quantile=floor_quantile,
+                )
+                for size in SHOT_SIZE_NAMES
+            },
+            "nonwide_duration_fraction": _reference_distribution(
+                _metric_values(
+                    contributors,
+                    role,
+                    lambda metric: metric["nonwide_duration_fraction"],
+                ),
+                floor_quantile=floor_quantile,
+            ),
+            "maximum_consecutive_wide_run_seconds": _reference_distribution(
+                _metric_values(
+                    contributors,
+                    role,
+                    lambda metric: metric[
+                        "maximum_consecutive_wide_run_seconds"
+                    ],
+                ),
+                floor_quantile=floor_quantile,
+            ),
             "source_switch_fraction": _reference_distribution(
                 _metric_values(
                     contributors,
@@ -1277,9 +1444,24 @@ def _aggregate_roles(
                 "closeup_multi_source_burst_source_switch_fractions"
             ]
         ]
+        wide_run_shot_counts = [
+            float(value)
+            for reference in contributors
+            for value in reference["by_acoustic_role"][role][
+                "consecutive_wide_run_shot_counts"
+            ]
+        ]
+        wide_run_durations = [
+            float(value)
+            for reference in contributors
+            for value in reference["by_acoustic_role"][role][
+                "consecutive_wide_run_durations_seconds"
+            ]
+        ]
         result[role] = {
             "contributing_reference_count": len(contributors),
             "pooled_counts": pooled_counts,
+            "pooled_durations_seconds": pooled_durations_seconds,
             "reference_distributions": distributions,
             "burst_event_distributions": {
                 "short_nonwide_shot_count": _event_distribution(
@@ -1315,6 +1497,18 @@ def _aggregate_roles(
                 ),
                 "closeup_multi_source_switch_fraction": _event_distribution(
                     multi_close_switch_fractions
+                ),
+            },
+            "wide_run_event_distributions": {
+                "consecutive_wide_run_shot_count": _event_distribution(
+                    wide_run_shot_counts
+                ),
+                "consecutive_wide_run_duration_seconds": _event_distribution(
+                    wide_run_durations
+                ),
+                "semantics": (
+                    "maximal_contiguous_known_wide_shots_within_one_"
+                    "acoustic_role_single_wide_shot_is_a_run"
                 ),
             },
             "wide_shot_person_count_evidence": {
@@ -1432,16 +1626,15 @@ def _load_feature_manifest(
             "feature manifest filename is not content-addressed"
         )
     policy = _mapping(payload.get("input_policy"), "feature input policy")
-    required_policy = {
-        "features_available_before_current_editorial_choice": True,
-        "strictly_past_causal_edit_history_only": True,
-        "reference_match_scores_present": False,
-        "selected_or_rejected_source_targets_present": False,
-        "raw_frames_persisted": False,
-        "identity_embeddings_persisted": False,
-    }
-    if any(policy.get(key) is not value for key, value in required_policy.items()):
+    if dict(policy) != dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY):
         raise MontageGrammarEvidenceError("feature snapshot leakage policy mismatch")
+    provenance = _mapping(payload.get("feature_provenance"), "feature provenance")
+    if (
+        provenance.get("producer") != FEATURE_MATERIALIZER_CONTRACT
+        or set(_array(provenance.get("contracts"), "feature contracts"))
+        != set(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS)
+    ):
+        raise MontageGrammarEvidenceError("feature provenance contract mismatch")
     source_count = _integer(payload.get("source_count"), "source_count")
     if source_count < config.minimum_sources_per_song:
         raise MontageGrammarEvidenceError("feature manifest source count is too small")
@@ -1600,6 +1793,8 @@ def _build_song(
             ) from exc
         if snapshot.snapshot_sha256 != record.get("snapshot_sha256"):
             raise MontageGrammarEvidenceError("snapshot internal hash mismatch")
+        if snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+            raise MontageGrammarEvidenceError("snapshot schema is not v3")
         if len(snapshot.sequence.tokens) != record.get("token_count"):
             raise MontageGrammarEvidenceError("snapshot token count mismatch")
         expected_sequence = f"stageedit-features:{item.song_id}:{reference_id}"
@@ -1782,6 +1977,12 @@ def build_professional_montage_grammar_profile(
             "reference_floor_quantile": settings.reference_floor_quantile,
             "zero_event_reference_edits_are_retained_in_rate_distributions": True,
             "missing_shot_scale_is_counted_as_unknown": True,
+            "shot_size_count_fractions_are_count_only_audit_metrics": True,
+            "shot_size_duration_fractions_use_observed_duration_only": True,
+            "nonwide_duration_is_explicit_medium_plus_close_never_one_minus_wide": True,
+            "consecutive_wide_runs_are_maximal_contiguous_known_wide_shots_within_role": True,
+            "single_wide_shot_is_a_consecutive_wide_run": True,
+            "reference_maximum_wide_run_is_zero_when_no_wide_is_observed": True,
             "source_switch_pairs_require_contiguous_known_outgoing_and_incoming_shots": True,
             "section_entries_use_exact_token_role_and_section_progress_reset": True,
             "phrase_entries_use_exact_token_phrase_progress_reset": True,
@@ -1913,6 +2114,172 @@ def _validate_reference_metric(reference: Mapping[str, Any]) -> None:
                 abs_tol=1e-12,
             ):
                 raise MontageGrammarEvidenceError("shot-size fraction mismatch")
+
+        role_duration = _finite(
+            metric["role_duration_seconds"],
+            "role_duration_seconds",
+        )
+        observed_duration = _finite(
+            metric["observed_shot_scale_duration_seconds"],
+            "observed_shot_scale_duration_seconds",
+        )
+        unknown_duration = _finite(
+            metric["unknown_shot_scale_duration_seconds"],
+            "unknown_shot_scale_duration_seconds",
+        )
+        if min(role_duration, observed_duration, unknown_duration) < 0.0:
+            raise MontageGrammarEvidenceError(
+                "shot-scale duration evidence cannot be negative"
+            )
+        if (shot_count > 0) != (role_duration > 0.0) or not math.isclose(
+            observed_duration + unknown_duration,
+            role_duration,
+            abs_tol=1e-10,
+        ):
+            raise MontageGrammarEvidenceError(
+                "role duration/shot-scale duration mismatch"
+            )
+        size_durations = _mapping(
+            metric["shot_size_duration_seconds"],
+            "shot_size_duration_seconds",
+        )
+        if set(size_durations) != set(SHOT_SIZE_NAMES):
+            raise MontageGrammarEvidenceError(
+                "shot-size duration schema mismatch"
+            )
+        typed_size_durations = {
+            size: _finite(
+                size_durations[size], f"{size} duration seconds"
+            )
+            for size in SHOT_SIZE_NAMES
+        }
+        if any(value < 0.0 for value in typed_size_durations.values()) or not (
+            math.isclose(
+                sum(typed_size_durations.values()),
+                observed_duration,
+                abs_tol=1e-10,
+            )
+        ):
+            raise MontageGrammarEvidenceError(
+                "shot-size durations mismatch observed duration"
+            )
+        duration_fractions = _mapping(
+            metric["shot_size_duration_fractions"],
+            "shot_size_duration_fractions",
+        )
+        if set(duration_fractions) != set(SHOT_SIZE_NAMES):
+            raise MontageGrammarEvidenceError(
+                "shot-size duration fraction schema mismatch"
+            )
+        for size in SHOT_SIZE_NAMES:
+            expected = (
+                typed_size_durations[size] / observed_duration
+                if observed_duration > 0.0
+                else None
+            )
+            actual = duration_fractions[size]
+            if expected is None:
+                if actual is not None:
+                    raise MontageGrammarEvidenceError(
+                        "shot-size duration fraction exists without observed duration"
+                    )
+            elif actual is None or not math.isclose(
+                _finite(actual, "shot-size duration fraction"),
+                expected,
+                abs_tol=1e-12,
+            ):
+                raise MontageGrammarEvidenceError(
+                    "shot-size duration fraction mismatch"
+                )
+        explicit_nonwide_duration = _finite(
+            metric["nonwide_duration_seconds"],
+            "nonwide_duration_seconds",
+        )
+        expected_nonwide_duration = (
+            typed_size_durations["medium"] + typed_size_durations["close"]
+        )
+        if explicit_nonwide_duration < 0.0 or not math.isclose(
+            explicit_nonwide_duration,
+            expected_nonwide_duration,
+            abs_tol=1e-10,
+        ):
+            raise MontageGrammarEvidenceError(
+                "explicit nonwide duration is not medium plus close duration"
+            )
+        expected_nonwide_fraction = (
+            explicit_nonwide_duration / observed_duration
+            if observed_duration > 0.0
+            else None
+        )
+        actual_nonwide_fraction = metric["nonwide_duration_fraction"]
+        if expected_nonwide_fraction is None:
+            if actual_nonwide_fraction is not None:
+                raise MontageGrammarEvidenceError(
+                    "nonwide duration fraction exists without observed duration"
+                )
+        elif actual_nonwide_fraction is None or not math.isclose(
+            _finite(actual_nonwide_fraction, "nonwide_duration_fraction"),
+            expected_nonwide_fraction,
+            abs_tol=1e-12,
+        ):
+            raise MontageGrammarEvidenceError(
+                "explicit nonwide duration fraction mismatch"
+            )
+
+        wide_run_count = _integer(
+            metric["consecutive_wide_run_count"],
+            "consecutive_wide_run_count",
+        )
+        wide_run_shot_counts = _array(
+            metric["consecutive_wide_run_shot_counts"],
+            "consecutive_wide_run_shot_counts",
+        )
+        wide_run_durations = _array(
+            metric["consecutive_wide_run_durations_seconds"],
+            "consecutive_wide_run_durations_seconds",
+        )
+        if (
+            wide_run_count < 0
+            or wide_run_count != len(wide_run_shot_counts)
+            or wide_run_count != len(wide_run_durations)
+        ):
+            raise MontageGrammarEvidenceError("consecutive wide-run evidence mismatch")
+        typed_run_shot_counts = tuple(
+            _integer(value, "wide-run shot count")
+            for value in wide_run_shot_counts
+        )
+        typed_run_durations = tuple(
+            _finite(value, "wide-run duration") for value in wide_run_durations
+        )
+        if any(value < 1 for value in typed_run_shot_counts) or any(
+            value <= 0.0 for value in typed_run_durations
+        ):
+            raise MontageGrammarEvidenceError("consecutive wide-run values are invalid")
+        if sum(typed_run_shot_counts) != _integer(
+            size_counts["wide"], "wide shot count"
+        ) or not math.isclose(
+            sum(typed_run_durations),
+            typed_size_durations["wide"],
+            abs_tol=1e-10,
+        ):
+            raise MontageGrammarEvidenceError(
+                "consecutive wide runs do not partition observed wide shots"
+            )
+        maximum_wide_run = _finite(
+            metric["maximum_consecutive_wide_run_seconds"],
+            "maximum_consecutive_wide_run_seconds",
+        )
+        expected_maximum_wide_run = (
+            max(typed_run_durations) if typed_run_durations else 0.0
+        )
+        if maximum_wide_run < 0.0 or not math.isclose(
+            maximum_wide_run,
+            expected_maximum_wide_run,
+            abs_tol=1e-10,
+        ):
+            raise MontageGrammarEvidenceError(
+                "maximum consecutive wide-run duration mismatch"
+            )
         pair_counts = _mapping(
             metric["source_switch_pair_counts"],
             "source_switch_pair_counts",
@@ -2097,12 +2464,6 @@ def _validate_reference_metric(reference: Mapping[str, Any]) -> None:
                     f"{prefix} value lies outside [0, 1]"
                 )
 
-        role_duration = _finite(
-            metric["role_duration_seconds"],
-            "role_duration_seconds",
-        )
-        if role_duration < 0.0 or (shot_count > 0) != (role_duration > 0.0):
-            raise MontageGrammarEvidenceError("role duration/shot count mismatch")
         for burst_name in (
             "short_nonwide_burst",
             "short_closeup_burst",
@@ -2507,6 +2868,12 @@ class ProfessionalMontageGrammarProfile:
             "reference_floor_quantile": settings.reference_floor_quantile,
             "zero_event_reference_edits_are_retained_in_rate_distributions": True,
             "missing_shot_scale_is_counted_as_unknown": True,
+            "shot_size_count_fractions_are_count_only_audit_metrics": True,
+            "shot_size_duration_fractions_use_observed_duration_only": True,
+            "nonwide_duration_is_explicit_medium_plus_close_never_one_minus_wide": True,
+            "consecutive_wide_runs_are_maximal_contiguous_known_wide_shots_within_role": True,
+            "single_wide_shot_is_a_consecutive_wide_run": True,
+            "reference_maximum_wide_run_is_zero_when_no_wide_is_observed": True,
             "source_switch_pairs_require_contiguous_known_outgoing_and_incoming_shots": True,
             "section_entries_use_exact_token_role_and_section_progress_reset": True,
             "phrase_entries_use_exact_token_phrase_progress_reset": True,

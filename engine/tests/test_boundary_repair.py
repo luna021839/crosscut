@@ -9,6 +9,9 @@ from crosscut.boundary_repair import (
     BoundaryRepairRequest,
     repair_boundary,
 )
+from crosscut.stage_edit_temporal_pose_motion import (
+    TemporalPoseMotionThresholds,
+)
 
 
 def _request(**overrides: object) -> BoundaryRepairRequest:
@@ -23,6 +26,41 @@ def _request(**overrides: object) -> BoundaryRepairRequest:
 
 
 class BoundaryRepairTests(unittest.TestCase):
+    def test_temporal_pose_motion_policy_is_fully_injected_and_validated(
+        self,
+    ) -> None:
+        thresholds = TemporalPoseMotionThresholds(
+            minimum_boundary_motion_magnitude=0.5,
+            minimum_endpoint_pose_cosine=0.8,
+            minimum_velocity_direction_cosine=0.7,
+            minimum_phase_compatibility=0.75,
+            pose_norm_epsilon=1e-8,
+        )
+        settings = BoundaryRepairConfig(
+            temporal_pose_motion_thresholds=thresholds,
+            temporal_pose_motion_preference_weight=0.4,
+        )
+        self.assertIs(settings.temporal_pose_motion_thresholds, thresholds)
+        self.assertEqual(
+            settings.temporal_pose_motion_preference_weight,
+            0.4,
+        )
+        self.assertIsNone(
+            BoundaryRepairConfig().temporal_pose_motion_thresholds
+        )
+        self.assertEqual(
+            BoundaryRepairConfig().temporal_pose_motion_preference_weight,
+            0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            BoundaryRepairConfig(
+                temporal_pose_motion_preference_weight=-0.01,
+            )
+        with self.assertRaisesRegex(TypeError, "TemporalPoseMotionThresholds"):
+            BoundaryRepairConfig(
+                temporal_pose_motion_thresholds=object(),  # type: ignore[arg-type]
+            )
+
     def test_proxy_triggered_partial_reedit_can_search_eight_frames(self) -> None:
         costs = {offset: 0.8 for offset in range(-8, 9)}
         costs[8] = 0.0

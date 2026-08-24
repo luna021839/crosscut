@@ -24,6 +24,7 @@ from .professional_montage_grammar import (
     PROFILE_ANALYSIS_BASIS,
     PROFILE_SCHEMA_VERSION,
     ROLE_NAMES,
+    SHOT_SIZE_NAMES,
 )
 
 
@@ -45,6 +46,10 @@ REFERENCE_FLOOR_BASIS = (
 )
 REFERENCE_FLOOR_QUANTILE = 0.10
 REFERENCE_PREFERRED_TARGET_QUANTILE = 0.50
+DURATION_PRODUCT_MINIMUM_QUANTILE = 0.25
+DURATION_PREFERRED_TARGET_QUANTILE = 0.50
+WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE = 0.75
+WIDE_RUN_HARD_MAXIMUM_QUANTILE = 1.00
 HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE = 0.50
 HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE = 0.75
 HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
@@ -53,6 +58,50 @@ HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT = (
 HIGHLIGHT_CADENCE_STATISTIC_PATH = (
     "songs[].references[].by_acoustic_role.chorus_like."
     "derived_shot_boundary_rate_per_minute"
+)
+CLOSE_BURST_EVENT_EVIDENCE_CONTRACT = (
+    "ive_chorus_maximal_close_only_multi_source_burst_event_p10_v1"
+)
+CLOSE_BURST_SHOT_COUNT_STATISTIC_PATH = (
+    "aggregate_by_acoustic_role.chorus_like.burst_event_distributions."
+    "closeup_multi_source_shot_count"
+)
+CLOSE_BURST_DURATION_STATISTIC_PATH = (
+    "aggregate_by_acoustic_role.chorus_like.burst_event_distributions."
+    "closeup_multi_source_duration_seconds"
+)
+CLOSE_BURST_SOURCE_SWITCH_FRACTION_STATISTIC_PATH = (
+    "aggregate_by_acoustic_role.chorus_like.burst_event_distributions."
+    "closeup_multi_source_switch_fraction"
+)
+CLOSE_BURST_POLICY_BINDING_CONTRACT = (
+    "hash_bound_professional_montage_close_burst_soft_preference_v1"
+)
+HIGHLIGHT_DURATION_EVIDENCE_CONTRACT = (
+    "per_reference_chorus_observed_shot_scale_duration_fractions_v2"
+)
+HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH = (
+    "songs[].references[].by_acoustic_role.chorus_like."
+    "shot_size_duration_fractions.close"
+)
+HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH = (
+    "songs[].references[].by_acoustic_role.chorus_like."
+    "nonwide_duration_fraction"
+)
+HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT = (
+    "per_reference_chorus_maximal_contiguous_known_wide_run_v2"
+)
+HIGHLIGHT_WIDE_RUN_STATISTIC_PATH = (
+    "songs[].references[].by_acoustic_role.chorus_like."
+    "maximum_consecutive_wide_run_seconds"
+)
+ROLE_CONDITIONED_DURATION_EVIDENCE_CONTRACT = (
+    "per_reference_build_chorus_bridge_observed_duration_policy_v1"
+)
+ROLE_CONDITIONED_DURATION_ROLES = (
+    "build",
+    "chorus_like",
+    "bridge_like",
 )
 FORMATION_EVIDENCE_THRESHOLD_NORMALIZED = 1.0 / 6.0
 EXPECTED_SONG_COUNT = 4
@@ -73,8 +122,10 @@ _TOP_LEVEL_KEYS = {
 _CHORUS_KEYS = {
     "contributing_reference_count",
     "pooled_counts",
+    "pooled_durations_seconds",
     "reference_distributions",
     "burst_event_distributions",
+    "wide_run_event_distributions",
     "wide_shot_person_count_evidence",
 }
 
@@ -269,6 +320,131 @@ class ProfessionalMontageProfileIdentity:
         }
 
 
+def close_burst_policy_binding_payload(
+    *,
+    profile_identity: ProfessionalMontageProfileIdentity | Mapping[str, Any],
+    policy_fingerprint_sha256: str,
+    minimum_shot_count: float,
+    minimum_duration_seconds: float,
+    minimum_source_switch_fraction: float,
+    event_reference_count: int,
+) -> dict[str, Any]:
+    """Build the canonical, hashable close-burst soft-policy binding.
+
+    The three P10 values describe the six *observed events*, not an occurrence
+    quota across twenty references.  Keeping their exact paths, identity, and
+    sparse count in one digest lets both pre-render decoding and final rendered
+    review reject a missing or accidentally altered production binding.
+    """
+
+    identity = (
+        profile_identity.to_dict()
+        if isinstance(profile_identity, ProfessionalMontageProfileIdentity)
+        else dict(_mapping(profile_identity, "close burst profile identity"))
+    )
+    if set(identity) != {
+        "analysis_basis",
+        "schema_version",
+        "path",
+        "file_sha256",
+        "content_sha256",
+    }:
+        raise ProfessionalMontagePolicyError(
+            "close burst profile identity schema mismatch"
+        )
+    _sha256(policy_fingerprint_sha256, "close burst policy fingerprint")
+    for name in ("file_sha256", "content_sha256"):
+        _sha256(identity.get(name), f"close burst profile {name}")
+    if not isinstance(identity.get("analysis_basis"), str) or not str(
+        identity["analysis_basis"]
+    ).strip():
+        raise ProfessionalMontagePolicyError(
+            "close burst profile analysis_basis cannot be blank"
+        )
+    schema_version = _integer(
+        identity.get("schema_version"), "close burst profile schema_version"
+    )
+    if schema_version < 1:
+        raise ProfessionalMontagePolicyError(
+            "close burst profile schema_version must be positive"
+        )
+    path = identity.get("path")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ProfessionalMontagePolicyError(
+            "close burst profile path must be absolute"
+        )
+    shot_count = _finite(minimum_shot_count, "close burst minimum shot count")
+    duration = _finite(
+        minimum_duration_seconds, "close burst minimum duration seconds"
+    )
+    switch_fraction = _finite(
+        minimum_source_switch_fraction,
+        "close burst minimum source switch fraction",
+    )
+    if shot_count <= 0.0 or duration <= 0.0 or not 0.0 < switch_fraction <= 1.0:
+        raise ProfessionalMontagePolicyError(
+            "close burst event P10 thresholds are outside their valid domains"
+        )
+    if (
+        isinstance(event_reference_count, bool)
+        or not isinstance(event_reference_count, int)
+        or event_reference_count < 1
+    ):
+        raise ProfessionalMontagePolicyError(
+            "close burst event reference count must be positive"
+        )
+    return {
+        "contract": CLOSE_BURST_POLICY_BINDING_CONTRACT,
+        "profile_identity": identity,
+        "professional_montage_policy_fingerprint_sha256": (
+            policy_fingerprint_sha256
+        ),
+        "event_reference_count": event_reference_count,
+        "per_reference_occurrence_p10": 0.0,
+        "per_reference_occurrence_median": 0.0,
+        "absence_is_hard_failure": False,
+        "metrics": {
+            "minimum_shot_count": {
+                "professional_montage_policy_member": (
+                    "minimum_close_burst_shot_count"
+                ),
+                "value": shot_count,
+                "statistic_path": CLOSE_BURST_SHOT_COUNT_STATISTIC_PATH,
+                "statistic": "observed_burst_event_distribution_p10",
+                "quantile": REFERENCE_FLOOR_QUANTILE,
+            },
+            "minimum_duration_seconds": {
+                "professional_montage_policy_member": (
+                    "minimum_close_burst_duration_seconds"
+                ),
+                "value": duration,
+                "statistic_path": CLOSE_BURST_DURATION_STATISTIC_PATH,
+                "statistic": "observed_burst_event_distribution_p10",
+                "quantile": REFERENCE_FLOOR_QUANTILE,
+            },
+            "minimum_source_switch_fraction": {
+                "professional_montage_policy_member": (
+                    "minimum_close_burst_source_switch_fraction"
+                ),
+                "value": switch_fraction,
+                "statistic_path": (
+                    CLOSE_BURST_SOURCE_SWITCH_FRACTION_STATISTIC_PATH
+                ),
+                "statistic": "observed_burst_event_distribution_p10",
+                "quantile": REFERENCE_FLOOR_QUANTILE,
+            },
+        },
+    }
+
+
+def close_burst_policy_binding_sha256(**kwargs: Any) -> str:
+    """Hash :func:`close_burst_policy_binding_payload` canonically."""
+
+    return hashlib.sha256(
+        _canonical_bytes(close_burst_policy_binding_payload(**kwargs))
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileStatisticProvenance:
     profile_identity: ProfessionalMontageProfileIdentity
@@ -292,13 +468,20 @@ class ProfileDerivedMinimum:
     name: str
     value: float
     provenance: ProfileStatisticProvenance
+    # Event distributions have fewer observations than the twenty-reference
+    # song corpus.  Preserve that sparse count explicitly so downstream code
+    # cannot mistake an event P10 for a per-reference occurrence floor.
+    reference_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "name": self.name,
             "value": self.value,
             "provenance": self.provenance.to_dict(),
         }
+        if self.reference_count is not None:
+            payload["reference_count"] = self.reference_count
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +520,114 @@ class ProfileInformedProductMinimum:
             "hard_gate": True,
             "is_reference_floor": False,
             "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileInformedProductMaximum:
+    """A hard upper product bound backed by observed human evidence."""
+
+    name: str
+    value: float
+    reference_count: int
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "reference_count": self.reference_count,
+            "hard_gate": True,
+            "comparison": "less_than_or_equal",
+            "is_reference_floor": False,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileDerivedPreferredMaximum:
+    """A descriptive human upper target that is never itself a hard gate."""
+
+    name: str
+    value: float
+    reference_count: int
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "reference_count": self.reference_count,
+            "hard_gate": False,
+            "preference": "at_or_below",
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RoleConditionedDurationPolicy:
+    """Hash-bound duration policy for one positive-duration editing role.
+
+    A zero P10 is retained as explicit evidence, but represented by ``None``
+    for the local hard minimum so callers cannot silently turn absence of a
+    positive human floor into an invented quota.  The role-pooled P25 and P50
+    values are taken from the profile's validated empirical distributions.
+    """
+
+    role: str
+    reference_count: int
+    local_minimum_close_duration_fraction: ProfileDerivedMinimum | None
+    local_minimum_nonwide_duration_fraction: ProfileDerivedMinimum | None
+    pooled_product_minimum_close_duration_fraction: (
+        ProfileInformedProductMinimum | None
+    )
+    pooled_product_minimum_nonwide_duration_fraction: (
+        ProfileInformedProductMinimum | None
+    )
+    preferred_close_duration_fraction: ProfileDerivedPreferredTarget
+    preferred_nonwide_duration_fraction: ProfileDerivedPreferredTarget
+    maximum_consecutive_wide_run_seconds: ProfileInformedProductMaximum
+    preferred_maximum_consecutive_wide_run_seconds: (
+        ProfileDerivedPreferredMaximum
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "reference_count": self.reference_count,
+            "local_minimum_close_duration_fraction": (
+                self.local_minimum_close_duration_fraction.to_dict()
+                if self.local_minimum_close_duration_fraction is not None
+                else None
+            ),
+            "local_minimum_nonwide_duration_fraction": (
+                self.local_minimum_nonwide_duration_fraction.to_dict()
+                if self.local_minimum_nonwide_duration_fraction is not None
+                else None
+            ),
+            "pooled_product_minimum_close_duration_fraction": (
+                self.pooled_product_minimum_close_duration_fraction.to_dict()
+                if self.pooled_product_minimum_close_duration_fraction is not None
+                else None
+            ),
+            "pooled_product_minimum_nonwide_duration_fraction": (
+                self.pooled_product_minimum_nonwide_duration_fraction.to_dict()
+                if self.pooled_product_minimum_nonwide_duration_fraction is not None
+                else None
+            ),
+            "preferred_close_duration_fraction": (
+                self.preferred_close_duration_fraction.to_dict()
+            ),
+            "preferred_nonwide_duration_fraction": (
+                self.preferred_nonwide_duration_fraction.to_dict()
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                self.maximum_consecutive_wide_run_seconds.to_dict()
+            ),
+            "preferred_maximum_consecutive_wide_run_seconds": (
+                self.preferred_maximum_consecutive_wide_run_seconds.to_dict()
+            ),
+            "zero_local_p10_is_omitted_not_promoted": True,
         }
 
 
@@ -402,6 +693,22 @@ class ProductEditorialRequirements:
 class ProfessionalMontagePolicy:
     identity: ProfessionalMontageProfileIdentity
     minimum_close_duration_fraction: ProfileDerivedMinimum
+    minimum_nonwide_duration_fraction: ProfileDerivedMinimum
+    highlight_pooled_product_minimum_close_duration_fraction: (
+        ProfileInformedProductMinimum
+    )
+    highlight_pooled_product_minimum_nonwide_duration_fraction: (
+        ProfileInformedProductMinimum
+    )
+    preferred_close_duration_fraction: ProfileDerivedPreferredTarget
+    preferred_nonwide_duration_fraction: ProfileDerivedPreferredTarget
+    maximum_consecutive_wide_run_seconds: ProfileInformedProductMaximum
+    preferred_maximum_consecutive_wide_run_seconds: (
+        ProfileDerivedPreferredMaximum
+    )
+    role_conditioned_duration_policies: tuple[
+        RoleConditionedDurationPolicy, ...
+    ]
     minimum_early_wide_anchor_fraction: ProfileDerivedMinimum
     minimum_phrase_entry_wide_anchor_fraction: ProfileDerivedMinimum
     minimum_wide_involved_source_switch_fraction: ProfileDerivedMinimum
@@ -421,7 +728,6 @@ class ProfessionalMontagePolicy:
     minimum_close_burst_shot_count: ProfileDerivedMinimum
     minimum_close_burst_duration_seconds: ProfileDerivedMinimum
     minimum_close_burst_source_switch_fraction: ProfileDerivedMinimum
-    minimum_nonwide_duration_fraction: None
     nonwide_duration_fraction_policy: str
     unusable_zero_reference_floors: tuple[UnusableReferenceFloor, ...]
     product_editorial_requirements: ProductEditorialRequirements
@@ -433,6 +739,7 @@ class ProfessionalMontagePolicy:
     def to_dict(self) -> dict[str, Any]:
         threshold_names = (
             "minimum_close_duration_fraction",
+            "minimum_nonwide_duration_fraction",
             "minimum_early_wide_anchor_fraction",
             "minimum_phrase_entry_wide_anchor_fraction",
             "minimum_wide_involved_source_switch_fraction",
@@ -449,6 +756,12 @@ class ProfessionalMontagePolicy:
                 name: getattr(self, name).to_dict() for name in threshold_names
             },
             "profile_derived_preferred_targets": {
+                "preferred_close_duration_fraction": (
+                    self.preferred_close_duration_fraction.to_dict()
+                ),
+                "preferred_nonwide_duration_fraction": (
+                    self.preferred_nonwide_duration_fraction.to_dict()
+                ),
                 "preferred_wide_involved_source_switch_fraction": (
                     self.preferred_wide_involved_source_switch_fraction.to_dict()
                 ),
@@ -457,8 +770,24 @@ class ProfessionalMontagePolicy:
                 ),
             },
             "profile_informed_product_minimums": {
+                "highlight_pooled_product_minimum_close_duration_fraction": (
+                    self.highlight_pooled_product_minimum_close_duration_fraction.to_dict()
+                ),
+                "highlight_pooled_product_minimum_nonwide_duration_fraction": (
+                    self.highlight_pooled_product_minimum_nonwide_duration_fraction.to_dict()
+                ),
                 "highlight_product_minimum_source_switches_per_minute": (
                     self.highlight_product_minimum_source_switches_per_minute.to_dict()
+                ),
+            },
+            "profile_informed_product_maximums": {
+                "maximum_consecutive_wide_run_seconds": (
+                    self.maximum_consecutive_wide_run_seconds.to_dict()
+                ),
+            },
+            "profile_derived_preferred_maximums": {
+                "preferred_maximum_consecutive_wide_run_seconds": (
+                    self.preferred_maximum_consecutive_wide_run_seconds.to_dict()
                 ),
             },
             "highlight_cadence_reference_count": (
@@ -467,7 +796,28 @@ class ProfessionalMontagePolicy:
             "highlight_cadence_evidence_contract": (
                 HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT
             ),
-            "minimum_nonwide_duration_fraction": None,
+            "highlight_duration_evidence_contract": (
+                HIGHLIGHT_DURATION_EVIDENCE_CONTRACT
+            ),
+            "highlight_wide_run_evidence_contract": (
+                HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT
+            ),
+            "role_conditioned_duration_evidence_contract": (
+                ROLE_CONDITIONED_DURATION_EVIDENCE_CONTRACT
+            ),
+            "role_conditioned_duration_policies": {
+                item.role: item.to_dict()
+                for item in self.role_conditioned_duration_policies
+            },
+            "count_based_audit_minimums": {
+                "minimum_nonwide_burst_shot_count": (
+                    self.minimum_nonwide_burst_shot_count.to_dict()
+                ),
+                "minimum_close_burst_shot_count": (
+                    self.minimum_close_burst_shot_count.to_dict()
+                ),
+                "never_used_as_duration_policy": True,
+            },
             "nonwide_duration_fraction_policy": (
                 self.nonwide_duration_fraction_policy
             ),
@@ -522,6 +872,21 @@ def _validate_profile_contract(profile: Mapping[str, Any]) -> Mapping[str, Any]:
         )
     if distributional.get("reference_floors_are_lower_distribution_quantiles") is not True:
         raise ProfessionalMontagePolicyError("profile reference-floor semantics mismatch")
+    required_duration_semantics = {
+        "shot_size_count_fractions_are_count_only_audit_metrics": True,
+        "shot_size_duration_fractions_use_observed_duration_only": True,
+        "nonwide_duration_is_explicit_medium_plus_close_never_one_minus_wide": True,
+        "consecutive_wide_runs_are_maximal_contiguous_known_wide_shots_within_role": True,
+        "single_wide_shot_is_a_consecutive_wide_run": True,
+        "reference_maximum_wide_run_is_zero_when_no_wide_is_observed": True,
+    }
+    if any(
+        distributional.get(name) is not expected
+        for name, expected in required_duration_semantics.items()
+    ):
+        raise ProfessionalMontagePolicyError(
+            "profile duration and consecutive-wide-run semantics mismatch"
+        )
 
     scope = _mapping(profile.get("scope"), "profile scope")
     if scope.get("artist") != "IVE":
@@ -724,6 +1089,912 @@ def _nearest_rank_empirical_quantile(
     return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
 
 
+def _linear_quantile(values: list[float], quantile: float) -> float:
+    ordered = sorted(_finite(value, "reference distribution value") for value in values)
+    if not ordered:
+        raise ProfessionalMontagePolicyError(
+            "reference distribution requires at least one value"
+        )
+    if len(ordered) == 1:
+        return ordered[0]
+    position = quantile * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _validate_distribution_against_values(
+    distribution: Mapping[str, Any],
+    values: list[float],
+    *,
+    name: str,
+    reference_floor: bool,
+) -> None:
+    expected_keys = {
+        "count",
+        "minimum",
+        "p10",
+        "p25",
+        "median",
+        "p75",
+        "p90",
+        "maximum",
+    }
+    if reference_floor:
+        expected_keys.add("reference_floor")
+    if set(distribution) != expected_keys:
+        raise ProfessionalMontagePolicyError(f"{name} distribution schema mismatch")
+    if _integer(distribution.get("count"), f"{name}.count") != len(values):
+        raise ProfessionalMontagePolicyError(f"{name} distribution count mismatch")
+    expected = {
+        "minimum": min(values),
+        "p10": _linear_quantile(values, 0.10),
+        "p25": _linear_quantile(values, 0.25),
+        "median": _linear_quantile(values, 0.50),
+        "p75": _linear_quantile(values, 0.75),
+        "p90": _linear_quantile(values, 0.90),
+        "maximum": max(values),
+    }
+    for statistic, expected_value in expected.items():
+        actual = _finite(distribution.get(statistic), f"{name}.{statistic}")
+        if not math.isclose(actual, expected_value, abs_tol=1e-10):
+            raise ProfessionalMontagePolicyError(
+                f"{name} distribution {statistic} disagrees with duration evidence"
+            )
+    if reference_floor:
+        floor = _mapping(
+            distribution.get("reference_floor"), f"{name}.reference_floor"
+        )
+        if set(floor) != {"quantile", "value", "basis"}:
+            raise ProfessionalMontagePolicyError(
+                f"{name} reference-floor schema mismatch"
+            )
+        if (
+            not math.isclose(
+                _finite(floor.get("quantile"), f"{name}.reference_floor.quantile"),
+                REFERENCE_FLOOR_QUANTILE,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                _finite(floor.get("value"), f"{name}.reference_floor.value"),
+                expected["p10"],
+                abs_tol=1e-10,
+            )
+            or floor.get("basis") != REFERENCE_FLOOR_BASIS
+        ):
+            raise ProfessionalMontagePolicyError(
+                f"{name} reference-floor provenance mismatch"
+            )
+
+
+def _duration_fraction_and_wide_run_evidence(
+    profile: Mapping[str, Any],
+    chorus: Mapping[str, Any],
+) -> tuple[list[float], list[float], list[float]]:
+    """Recompute typed duration evidence from all twenty reference payloads."""
+
+    close_values: list[float] = []
+    nonwide_values: list[float] = []
+    maximum_wide_run_values: list[float] = []
+    wide_run_durations: list[float] = []
+    wide_run_shot_counts: list[float] = []
+    pooled_role_duration = 0.0
+    pooled_observed_duration = 0.0
+    pooled_unknown_duration = 0.0
+    pooled_size_durations = {name: 0.0 for name in SHOT_SIZE_NAMES}
+    pooled_nonwide_duration = 0.0
+
+    for song_index, raw_song in enumerate(_array(profile.get("songs"), "songs")):
+        song = _mapping(raw_song, f"song {song_index}")
+        for reference_index, raw_reference in enumerate(
+            _array(song.get("references"), f"song {song_index} references")
+        ):
+            label = f"song {song_index} reference {reference_index} chorus_like"
+            reference = _mapping(raw_reference, label)
+            roles = _mapping(reference.get("by_acoustic_role"), f"{label} roles")
+            role = _mapping(roles.get("chorus_like"), label)
+            role_duration = _finite(
+                role.get("role_duration_seconds"), f"{label} role duration"
+            )
+            observed_duration = _finite(
+                role.get("observed_shot_scale_duration_seconds"),
+                f"{label} observed shot-scale duration",
+            )
+            unknown_duration = _finite(
+                role.get("unknown_shot_scale_duration_seconds"),
+                f"{label} unknown shot-scale duration",
+            )
+            if (
+                role_duration <= 0.0
+                or observed_duration <= 0.0
+                or unknown_duration < 0.0
+                or not math.isclose(
+                    observed_duration + unknown_duration,
+                    role_duration,
+                    abs_tol=1e-10,
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} has invalid duration coverage"
+                )
+            raw_size_durations = _mapping(
+                role.get("shot_size_duration_seconds"),
+                f"{label} shot_size_duration_seconds",
+            )
+            raw_duration_fractions = _mapping(
+                role.get("shot_size_duration_fractions"),
+                f"{label} shot_size_duration_fractions",
+            )
+            if set(raw_size_durations) != set(SHOT_SIZE_NAMES) or set(
+                raw_duration_fractions
+            ) != set(SHOT_SIZE_NAMES):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} shot-size duration schema mismatch"
+                )
+            size_durations = {
+                size: _finite(
+                    raw_size_durations[size], f"{label} {size} duration"
+                )
+                for size in SHOT_SIZE_NAMES
+            }
+            if any(value < 0.0 for value in size_durations.values()) or not math.isclose(
+                sum(size_durations.values()), observed_duration, abs_tol=1e-10
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} shot-size durations mismatch observed duration"
+                )
+            duration_fractions: dict[str, float] = {}
+            for size in SHOT_SIZE_NAMES:
+                actual = _finite(
+                    raw_duration_fractions[size], f"{label} {size} duration fraction"
+                )
+                expected = size_durations[size] / observed_duration
+                if not 0.0 <= actual <= 1.0 or not math.isclose(
+                    actual, expected, abs_tol=1e-12
+                ):
+                    raise ProfessionalMontagePolicyError(
+                        f"{label} {size} duration fraction mismatch"
+                    )
+                duration_fractions[size] = actual
+            nonwide_duration = _finite(
+                role.get("nonwide_duration_seconds"),
+                f"{label} explicit nonwide duration",
+            )
+            explicit_expected_nonwide = (
+                size_durations["medium"] + size_durations["close"]
+            )
+            nonwide_fraction = _finite(
+                role.get("nonwide_duration_fraction"),
+                f"{label} explicit nonwide duration fraction",
+            )
+            if (
+                not math.isclose(
+                    nonwide_duration, explicit_expected_nonwide, abs_tol=1e-10
+                )
+                or not 0.0 <= nonwide_fraction <= 1.0
+                or not math.isclose(
+                    nonwide_fraction,
+                    nonwide_duration / observed_duration,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} explicit nonwide duration mismatch"
+                )
+
+            run_count = _integer(
+                role.get("consecutive_wide_run_count"),
+                f"{label} consecutive_wide_run_count",
+            )
+            run_durations = [
+                _finite(value, f"{label} wide-run duration")
+                for value in _array(
+                    role.get("consecutive_wide_run_durations_seconds"),
+                    f"{label} consecutive_wide_run_durations_seconds",
+                )
+            ]
+            run_shot_counts = [
+                _integer(value, f"{label} wide-run shot count")
+                for value in _array(
+                    role.get("consecutive_wide_run_shot_counts"),
+                    f"{label} consecutive_wide_run_shot_counts",
+                )
+            ]
+            if (
+                run_count < 0
+                or run_count != len(run_durations)
+                or run_count != len(run_shot_counts)
+                or any(value <= 0.0 for value in run_durations)
+                or any(value < 1 for value in run_shot_counts)
+                or not math.isclose(
+                    sum(run_durations), size_durations["wide"], abs_tol=1e-10
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} consecutive wide-run evidence mismatch"
+                )
+            maximum_wide_run = _finite(
+                role.get("maximum_consecutive_wide_run_seconds"),
+                f"{label} maximum consecutive wide run",
+            )
+            expected_maximum = max(run_durations) if run_durations else 0.0
+            if maximum_wide_run < 0.0 or not math.isclose(
+                maximum_wide_run, expected_maximum, abs_tol=1e-10
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} maximum consecutive wide-run mismatch"
+                )
+
+            close_values.append(duration_fractions["close"])
+            nonwide_values.append(nonwide_fraction)
+            maximum_wide_run_values.append(maximum_wide_run)
+            wide_run_durations.extend(run_durations)
+            wide_run_shot_counts.extend(float(value) for value in run_shot_counts)
+            pooled_role_duration += role_duration
+            pooled_observed_duration += observed_duration
+            pooled_unknown_duration += unknown_duration
+            pooled_nonwide_duration += nonwide_duration
+            for size in SHOT_SIZE_NAMES:
+                pooled_size_durations[size] += size_durations[size]
+
+    if not (
+        len(close_values)
+        == len(nonwide_values)
+        == len(maximum_wide_run_values)
+        == EXPECTED_REFERENCE_COUNT
+    ):
+        raise ProfessionalMontagePolicyError(
+            "duration policy requires exactly twenty chorus references"
+        )
+
+    reference_root = _mapping(
+        chorus.get("reference_distributions"),
+        "chorus reference_distributions",
+    )
+    duration_distributions = _mapping(
+        reference_root.get("shot_size_duration_fractions"),
+        "chorus shot_size_duration_fractions",
+    )
+    if set(duration_distributions) != set(SHOT_SIZE_NAMES):
+        raise ProfessionalMontagePolicyError(
+            "chorus duration distribution schema mismatch"
+        )
+    _validate_distribution_against_values(
+        _mapping(duration_distributions.get("close"), "close duration distribution"),
+        close_values,
+        name="chorus close duration fraction",
+        reference_floor=True,
+    )
+    _validate_distribution_against_values(
+        _mapping(
+            reference_root.get("nonwide_duration_fraction"),
+            "nonwide duration distribution",
+        ),
+        nonwide_values,
+        name="chorus nonwide duration fraction",
+        reference_floor=True,
+    )
+    _validate_distribution_against_values(
+        _mapping(
+            reference_root.get("maximum_consecutive_wide_run_seconds"),
+            "maximum wide-run distribution",
+        ),
+        maximum_wide_run_values,
+        name="chorus maximum consecutive wide-run seconds",
+        reference_floor=True,
+    )
+
+    pooled = _mapping(
+        chorus.get("pooled_durations_seconds"), "chorus pooled durations"
+    )
+    if set(pooled) != {
+        "role",
+        "observed_shot_scale",
+        "unknown_shot_scale",
+        "shot_size",
+        "nonwide",
+    }:
+        raise ProfessionalMontagePolicyError(
+            "chorus pooled duration schema mismatch"
+        )
+    expected_pooled_scalars = {
+        "role": pooled_role_duration,
+        "observed_shot_scale": pooled_observed_duration,
+        "unknown_shot_scale": pooled_unknown_duration,
+        "nonwide": pooled_nonwide_duration,
+    }
+    for name, expected in expected_pooled_scalars.items():
+        if not math.isclose(
+            _finite(pooled.get(name), f"chorus pooled {name}"),
+            expected,
+            abs_tol=1e-9,
+        ):
+            raise ProfessionalMontagePolicyError(
+                f"chorus pooled {name} duration mismatch"
+            )
+    pooled_sizes = _mapping(pooled.get("shot_size"), "chorus pooled shot_size")
+    if set(pooled_sizes) != set(SHOT_SIZE_NAMES):
+        raise ProfessionalMontagePolicyError(
+            "chorus pooled shot-size duration schema mismatch"
+        )
+    for size in SHOT_SIZE_NAMES:
+        if not math.isclose(
+            _finite(pooled_sizes.get(size), f"chorus pooled {size}"),
+            pooled_size_durations[size],
+            abs_tol=1e-9,
+        ):
+            raise ProfessionalMontagePolicyError(
+                f"chorus pooled {size} duration mismatch"
+            )
+
+    pooled_counts = _mapping(chorus.get("pooled_counts"), "chorus pooled_counts")
+    if _integer(
+        pooled_counts.get("consecutive_wide_run_count"),
+        "chorus pooled consecutive_wide_run_count",
+    ) != len(wide_run_durations):
+        raise ProfessionalMontagePolicyError(
+            "chorus pooled consecutive wide-run count mismatch"
+        )
+    run_events = _mapping(
+        chorus.get("wide_run_event_distributions"),
+        "chorus wide_run_event_distributions",
+    )
+    if set(run_events) != {
+        "consecutive_wide_run_shot_count",
+        "consecutive_wide_run_duration_seconds",
+        "semantics",
+    } or run_events.get("semantics") != (
+        "maximal_contiguous_known_wide_shots_within_one_"
+        "acoustic_role_single_wide_shot_is_a_run"
+    ):
+        raise ProfessionalMontagePolicyError(
+            "chorus consecutive wide-run semantics mismatch"
+        )
+    if not wide_run_durations:
+        raise ProfessionalMontagePolicyError(
+            "chorus has no observed consecutive wide-run evidence"
+        )
+    _validate_distribution_against_values(
+        _mapping(
+            run_events.get("consecutive_wide_run_duration_seconds"),
+            "wide-run duration event distribution",
+        ),
+        wide_run_durations,
+        name="chorus wide-run duration event",
+        reference_floor=False,
+    )
+    _validate_distribution_against_values(
+        _mapping(
+            run_events.get("consecutive_wide_run_shot_count"),
+            "wide-run shot-count event distribution",
+        ),
+        wide_run_shot_counts,
+        name="chorus wide-run shot-count event",
+        reference_floor=False,
+    )
+    return close_values, nonwide_values, maximum_wide_run_values
+
+
+def _duration_policy_targets(
+    identity: ProfessionalMontageProfileIdentity,
+    *,
+    close_values: list[float],
+    nonwide_values: list[float],
+) -> tuple[
+    ProfileInformedProductMinimum,
+    ProfileInformedProductMinimum,
+    ProfileDerivedPreferredTarget,
+    ProfileDerivedPreferredTarget,
+]:
+    def minimum(name: str, path: str, values: list[float]) -> ProfileInformedProductMinimum:
+        value = _nearest_rank_empirical_quantile(
+            values, DURATION_PRODUCT_MINIMUM_QUANTILE
+        )
+        if not 0.0 < value <= 1.0:
+            raise ProfessionalMontagePolicyError(
+                f"{name} cannot supply a positive duration product minimum"
+            )
+        return ProfileInformedProductMinimum(
+            name=name,
+            value=value,
+            reference_count=len(values),
+            provenance=ProfileStatisticProvenance(
+                profile_identity=identity,
+                statistic_path=path,
+                statistic=(
+                    "pooled_reference_nearest_rank_p25_observed_duration_"
+                    "fraction_product_minimum"
+                ),
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+                reference_floor_basis=None,
+            ),
+        )
+
+    def preferred(name: str, path: str, values: list[float]) -> ProfileDerivedPreferredTarget:
+        value = _nearest_rank_empirical_quantile(
+            values, DURATION_PREFERRED_TARGET_QUANTILE
+        )
+        if not 0.0 < value <= 1.0:
+            raise ProfessionalMontagePolicyError(
+                f"{name} cannot supply a positive duration preferred target"
+            )
+        return ProfileDerivedPreferredTarget(
+            name=name,
+            value=value,
+            reference_count=len(values),
+            provenance=ProfileStatisticProvenance(
+                profile_identity=identity,
+                statistic_path=path,
+                statistic=(
+                    "pooled_reference_nearest_rank_p50_observed_duration_"
+                    "fraction_soft_preferred_target"
+                ),
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+                reference_floor_basis=None,
+            ),
+        )
+
+    return (
+        minimum(
+            "highlight_pooled_product_minimum_close_duration_fraction",
+            HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+            close_values,
+        ),
+        minimum(
+            "highlight_pooled_product_minimum_nonwide_duration_fraction",
+            HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+            nonwide_values,
+        ),
+        preferred(
+            "preferred_close_duration_fraction",
+            HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+            close_values,
+        ),
+        preferred(
+            "preferred_nonwide_duration_fraction",
+            HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+            nonwide_values,
+        ),
+    )
+
+
+def _wide_run_policy_targets(
+    identity: ProfessionalMontageProfileIdentity,
+    values: list[float],
+) -> tuple[ProfileInformedProductMaximum, ProfileDerivedPreferredMaximum]:
+    hard_maximum = _nearest_rank_empirical_quantile(
+        values, WIDE_RUN_HARD_MAXIMUM_QUANTILE
+    )
+    preferred_maximum = _nearest_rank_empirical_quantile(
+        values, WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE
+    )
+    if hard_maximum <= 0.0 or not 0.0 <= preferred_maximum <= hard_maximum:
+        raise ProfessionalMontagePolicyError(
+            "wide-run evidence cannot supply ordered positive upper policies"
+        )
+    return (
+        ProfileInformedProductMaximum(
+            name="maximum_consecutive_wide_run_seconds",
+            value=hard_maximum,
+            reference_count=len(values),
+            provenance=ProfileStatisticProvenance(
+                profile_identity=identity,
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                statistic="observed_human_maximum_consecutive_wide_run_hard_limit",
+                quantile=WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+                reference_floor_basis=None,
+            ),
+        ),
+        ProfileDerivedPreferredMaximum(
+            name="preferred_maximum_consecutive_wide_run_seconds",
+            value=preferred_maximum,
+            reference_count=len(values),
+            provenance=ProfileStatisticProvenance(
+                profile_identity=identity,
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                statistic=(
+                    "observed_reference_nearest_rank_p75_maximum_consecutive_"
+                    "wide_run_soft_upper_target"
+                ),
+                quantile=WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+                reference_floor_basis=None,
+            ),
+        ),
+    )
+
+
+def _positive_role_duration_values(
+    profile: Mapping[str, Any],
+    *,
+    role_name: str,
+) -> tuple[list[float], list[float], list[float]]:
+    """Recompute duration fractions for every positive instance of one role."""
+
+    close_values: list[float] = []
+    nonwide_values: list[float] = []
+    maximum_wide_run_values: list[float] = []
+    for song_index, raw_song in enumerate(_array(profile.get("songs"), "songs")):
+        song = _mapping(raw_song, f"song {song_index}")
+        for reference_index, raw_reference in enumerate(
+            _array(song.get("references"), f"song {song_index} references")
+        ):
+            label = (
+                f"song {song_index} reference {reference_index} {role_name}"
+            )
+            reference = _mapping(raw_reference, label)
+            roles = _mapping(reference.get("by_acoustic_role"), f"{label} roles")
+            role = _mapping(roles.get(role_name), label)
+            if role.get("role") != role_name:
+                raise ProfessionalMontagePolicyError(
+                    f"{label} role label mismatch"
+                )
+            role_duration = _finite(
+                role.get("role_duration_seconds"), f"{label} role duration"
+            )
+            if role_duration < 0.0:
+                raise ProfessionalMontagePolicyError(
+                    f"{label} role duration cannot be negative"
+                )
+            if role_duration == 0.0:
+                continue
+
+            observed_duration = _finite(
+                role.get("observed_shot_scale_duration_seconds"),
+                f"{label} observed shot-scale duration",
+            )
+            unknown_duration = _finite(
+                role.get("unknown_shot_scale_duration_seconds"),
+                f"{label} unknown shot-scale duration",
+            )
+            if (
+                observed_duration <= 0.0
+                or unknown_duration < 0.0
+                or not math.isclose(
+                    observed_duration + unknown_duration,
+                    role_duration,
+                    abs_tol=1e-10,
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} has invalid duration coverage"
+                )
+            raw_durations = _mapping(
+                role.get("shot_size_duration_seconds"),
+                f"{label} shot-size durations",
+            )
+            raw_fractions = _mapping(
+                role.get("shot_size_duration_fractions"),
+                f"{label} shot-size duration fractions",
+            )
+            if set(raw_durations) != set(SHOT_SIZE_NAMES) or set(
+                raw_fractions
+            ) != set(SHOT_SIZE_NAMES):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} shot-size duration schema mismatch"
+                )
+            durations = {
+                name: _finite(raw_durations.get(name), f"{label} {name} duration")
+                for name in SHOT_SIZE_NAMES
+            }
+            if any(value < 0.0 for value in durations.values()) or not math.isclose(
+                sum(durations.values()), observed_duration, abs_tol=1e-10
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} shot-size durations mismatch observed duration"
+                )
+            fractions = {
+                name: _finite(raw_fractions.get(name), f"{label} {name} fraction")
+                for name in SHOT_SIZE_NAMES
+            }
+            if any(
+                not 0.0 <= fractions[name] <= 1.0
+                or not math.isclose(
+                    fractions[name],
+                    durations[name] / observed_duration,
+                    abs_tol=1e-12,
+                )
+                for name in SHOT_SIZE_NAMES
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} shot-size duration fractions mismatch"
+                )
+            nonwide_duration = _finite(
+                role.get("nonwide_duration_seconds"),
+                f"{label} explicit nonwide duration",
+            )
+            nonwide_fraction = _finite(
+                role.get("nonwide_duration_fraction"),
+                f"{label} explicit nonwide duration fraction",
+            )
+            expected_nonwide = durations["medium"] + durations["close"]
+            if (
+                not math.isclose(
+                    nonwide_duration, expected_nonwide, abs_tol=1e-10
+                )
+                or not 0.0 <= nonwide_fraction <= 1.0
+                or not math.isclose(
+                    nonwide_fraction,
+                    nonwide_duration / observed_duration,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} explicit nonwide duration mismatch"
+                )
+            run_count = _integer(
+                role.get("consecutive_wide_run_count"),
+                f"{label} consecutive wide-run count",
+            )
+            run_durations = [
+                _finite(value, f"{label} consecutive wide-run duration")
+                for value in _array(
+                    role.get("consecutive_wide_run_durations_seconds"),
+                    f"{label} consecutive wide-run durations",
+                )
+            ]
+            if (
+                run_count != len(run_durations)
+                or any(value <= 0.0 for value in run_durations)
+                or not math.isclose(
+                    sum(run_durations), durations["wide"], abs_tol=1e-10
+                )
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} consecutive wide-run evidence mismatch"
+                )
+            maximum_wide_run = _finite(
+                role.get("maximum_consecutive_wide_run_seconds"),
+                f"{label} maximum consecutive wide run",
+            )
+            if not math.isclose(
+                maximum_wide_run,
+                max(run_durations) if run_durations else 0.0,
+                abs_tol=1e-10,
+            ):
+                raise ProfessionalMontagePolicyError(
+                    f"{label} maximum consecutive wide-run mismatch"
+                )
+            close_values.append(fractions["close"])
+            nonwide_values.append(nonwide_fraction)
+            maximum_wide_run_values.append(maximum_wide_run)
+    return close_values, nonwide_values, maximum_wide_run_values
+
+
+def _role_conditioned_duration_policy(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+    *,
+    role_name: str,
+) -> RoleConditionedDurationPolicy | None:
+    close_values, nonwide_values, wide_run_values = (
+        _positive_role_duration_values(profile, role_name=role_name)
+    )
+    aggregate_roles = _mapping(
+        profile.get("aggregate_by_acoustic_role"),
+        "aggregate_by_acoustic_role",
+    )
+    aggregate = _mapping(aggregate_roles.get(role_name), f"{role_name} aggregate")
+    if not close_values:
+        if aggregate:
+            raise ProfessionalMontagePolicyError(
+                f"{role_name} aggregate exists without positive-duration evidence"
+            )
+        return None
+    if set(aggregate) != _CHORUS_KEYS:
+        raise ProfessionalMontagePolicyError(
+            f"{role_name} aggregate schema mismatch"
+        )
+    reference_count = len(close_values)
+    if _integer(
+        aggregate.get("contributing_reference_count"),
+        f"{role_name} contributing_reference_count",
+    ) != reference_count:
+        raise ProfessionalMontagePolicyError(
+            f"{role_name} contributing reference count mismatch"
+        )
+    distributions = _mapping(
+        aggregate.get("reference_distributions"),
+        f"{role_name} reference distributions",
+    )
+    shot_sizes = _mapping(
+        distributions.get("shot_size_duration_fractions"),
+        f"{role_name} shot-size duration distributions",
+    )
+    close_distribution = _mapping(
+        shot_sizes.get("close"), f"{role_name} close duration distribution"
+    )
+    nonwide_distribution = _mapping(
+        distributions.get("nonwide_duration_fraction"),
+        f"{role_name} nonwide duration distribution",
+    )
+    wide_run_distribution = _mapping(
+        distributions.get("maximum_consecutive_wide_run_seconds"),
+        f"{role_name} maximum wide-run distribution",
+    )
+    _validate_distribution_against_values(
+        close_distribution,
+        close_values,
+        name=f"{role_name} close duration fraction",
+        reference_floor=True,
+    )
+    _validate_distribution_against_values(
+        nonwide_distribution,
+        nonwide_values,
+        name=f"{role_name} nonwide duration fraction",
+        reference_floor=True,
+    )
+    _validate_distribution_against_values(
+        wide_run_distribution,
+        wide_run_values,
+        name=f"{role_name} maximum consecutive wide-run seconds",
+        reference_floor=True,
+    )
+
+    close_path = (
+        f"aggregate_by_acoustic_role.{role_name}.reference_distributions."
+        "shot_size_duration_fractions.close"
+    )
+    nonwide_path = (
+        f"aggregate_by_acoustic_role.{role_name}.reference_distributions."
+        "nonwide_duration_fraction"
+    )
+    wide_path = (
+        f"aggregate_by_acoustic_role.{role_name}.reference_distributions."
+        "maximum_consecutive_wide_run_seconds"
+    )
+
+    def provenance(
+        *, path: str, statistic: str, quantile: float, floor: bool = False
+    ) -> ProfileStatisticProvenance:
+        return ProfileStatisticProvenance(
+            profile_identity=identity,
+            statistic_path=path,
+            statistic=statistic,
+            quantile=quantile,
+            reference_floor_basis=REFERENCE_FLOOR_BASIS if floor else None,
+        )
+
+    def local_minimum(
+        name: str, path: str, distribution: Mapping[str, Any]
+    ) -> ProfileDerivedMinimum | None:
+        value = _finite(distribution.get("p10"), f"{path}.p10")
+        if value == 0.0:
+            return None
+        return ProfileDerivedMinimum(
+            name=name,
+            value=value,
+            provenance=provenance(
+                path=path,
+                statistic="profile_reference_floor_p10",
+                quantile=REFERENCE_FLOOR_QUANTILE,
+                floor=True,
+            ),
+        )
+
+    def product_minimum(
+        name: str, path: str, distribution: Mapping[str, Any]
+    ) -> ProfileInformedProductMinimum | None:
+        value = _finite(distribution.get("p25"), f"{path}.p25")
+        if value == 0.0:
+            return None
+        return ProfileInformedProductMinimum(
+            name=name,
+            value=value,
+            reference_count=reference_count,
+            provenance=provenance(
+                path=path,
+                statistic=(
+                    "profile_empirical_linear_p25_role_pooled_duration_"
+                    "fraction_product_minimum"
+                ),
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+            ),
+        )
+
+    def preferred(
+        name: str, path: str, distribution: Mapping[str, Any]
+    ) -> ProfileDerivedPreferredTarget:
+        return ProfileDerivedPreferredTarget(
+            name=name,
+            value=_finite(distribution.get("median"), f"{path}.median"),
+            reference_count=reference_count,
+            provenance=provenance(
+                path=path,
+                statistic=(
+                    "profile_empirical_linear_p50_role_pooled_duration_"
+                    "fraction_soft_preferred_target"
+                ),
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+            ),
+        )
+
+    return RoleConditionedDurationPolicy(
+        role=role_name,
+        reference_count=reference_count,
+        local_minimum_close_duration_fraction=local_minimum(
+            f"{role_name}_minimum_close_duration_fraction",
+            close_path,
+            close_distribution,
+        ),
+        local_minimum_nonwide_duration_fraction=local_minimum(
+            f"{role_name}_minimum_nonwide_duration_fraction",
+            nonwide_path,
+            nonwide_distribution,
+        ),
+        pooled_product_minimum_close_duration_fraction=product_minimum(
+            f"{role_name}_pooled_product_minimum_close_duration_fraction",
+            close_path,
+            close_distribution,
+        ),
+        pooled_product_minimum_nonwide_duration_fraction=product_minimum(
+            f"{role_name}_pooled_product_minimum_nonwide_duration_fraction",
+            nonwide_path,
+            nonwide_distribution,
+        ),
+        preferred_close_duration_fraction=preferred(
+            f"{role_name}_preferred_close_duration_fraction",
+            close_path,
+            close_distribution,
+        ),
+        preferred_nonwide_duration_fraction=preferred(
+            f"{role_name}_preferred_nonwide_duration_fraction",
+            nonwide_path,
+            nonwide_distribution,
+        ),
+        maximum_consecutive_wide_run_seconds=ProfileInformedProductMaximum(
+            name=f"{role_name}_maximum_consecutive_wide_run_seconds",
+            value=_finite(wide_run_distribution.get("maximum"), f"{wide_path}.maximum"),
+            reference_count=reference_count,
+            provenance=provenance(
+                path=wide_path,
+                statistic="observed_human_role_p100_maximum_wide_run_hard_limit",
+                quantile=WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+            ),
+        ),
+        preferred_maximum_consecutive_wide_run_seconds=(
+            ProfileDerivedPreferredMaximum(
+                name=(
+                    f"{role_name}_preferred_maximum_consecutive_wide_run_seconds"
+                ),
+                value=_finite(wide_run_distribution.get("p75"), f"{wide_path}.p75"),
+                reference_count=reference_count,
+                provenance=provenance(
+                    path=wide_path,
+                    statistic=(
+                        "profile_empirical_linear_p75_role_maximum_wide_run_"
+                        "soft_upper_target"
+                    ),
+                    quantile=WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+                ),
+            )
+        ),
+    )
+
+
+def _role_conditioned_duration_policies(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+) -> tuple[RoleConditionedDurationPolicy, ...]:
+    policies = tuple(
+        policy
+        for role_name in ROLE_CONDITIONED_DURATION_ROLES
+        if (
+            policy := _role_conditioned_duration_policy(
+                profile,
+                identity,
+                role_name=role_name,
+            )
+        )
+        is not None
+    )
+    if not any(item.role == "chorus_like" for item in policies):
+        raise ProfessionalMontagePolicyError(
+            "role-conditioned duration policy is missing chorus evidence"
+        )
+    return policies
+
+
 def _derived_highlight_cadence(
     profile: Mapping[str, Any],
     identity: ProfessionalMontageProfileIdentity,
@@ -878,6 +2149,7 @@ def _event_minimum(
             quantile=REFERENCE_FLOOR_QUANTILE,
             reference_floor_basis=None,
         ),
+        reference_count=count,
     )
 
 
@@ -885,8 +2157,6 @@ def _collect_zero_reference_floors(
     profile: Mapping[str, Any],
     identity: ProfessionalMontageProfileIdentity,
 ) -> tuple[UnusableReferenceFloor, ...]:
-    root_path = "aggregate_by_acoustic_role.chorus_like.reference_distributions"
-    root = _mapping(_at(profile, root_path), root_path)
     found: list[UnusableReferenceFloor] = []
 
     def visit(value: Mapping[str, Any], path: str) -> None:
@@ -931,7 +2201,16 @@ def _collect_zero_reference_floors(
             if isinstance(child, Mapping):
                 visit(child, f"{path}.{key}")
 
-    visit(root, root_path)
+    for role_name in ROLE_CONDITIONED_DURATION_ROLES:
+        root_path = (
+            f"aggregate_by_acoustic_role.{role_name}.reference_distributions"
+        )
+        root_value = _at(profile, root_path)
+        if root_value is None:
+            continue
+        root = _mapping(root_value, root_path)
+        if root:
+            visit(root, root_path)
     if not found:
         raise ProfessionalMontagePolicyError(
             "profile has no explicit zero reference floors to mark unusable"
@@ -960,6 +2239,15 @@ def load_professional_montage_policy(
         expected_file_sha256=expected_file_sha256,
     )
     chorus = _validate_profile_contract(profile)
+    (
+        close_duration_values,
+        nonwide_duration_values,
+        maximum_wide_run_values,
+    ) = _duration_fraction_and_wide_run_evidence(profile, chorus)
+    role_conditioned_duration_policies = _role_conditioned_duration_policies(
+        profile,
+        identity,
+    )
 
     reference_root = (
         "aggregate_by_acoustic_role.chorus_like.reference_distributions"
@@ -989,7 +2277,11 @@ def load_professional_montage_policy(
     reference_specs = (
         (
             "minimum_close_duration_fraction",
-            f"{reference_root}.shot_size_fractions.close",
+            f"{reference_root}.shot_size_duration_fractions.close",
+        ),
+        (
+            "minimum_nonwide_duration_fraction",
+            f"{reference_root}.nonwide_duration_fraction",
         ),
         (
             "minimum_early_wide_anchor_fraction",
@@ -1021,6 +2313,31 @@ def load_professional_montage_policy(
         path=f"{reference_root}.source_switch_with_wide_fraction",
         fraction=True,
     )
+    (
+        product_minimum_close_duration,
+        product_minimum_nonwide_duration,
+        preferred_close_duration,
+        preferred_nonwide_duration,
+    ) = _duration_policy_targets(
+        identity,
+        close_values=close_duration_values,
+        nonwide_values=nonwide_duration_values,
+    )
+    if not (
+        reference_minimums["minimum_close_duration_fraction"].value
+        <= product_minimum_close_duration.value
+        <= preferred_close_duration.value
+        and reference_minimums["minimum_nonwide_duration_fraction"].value
+        <= product_minimum_nonwide_duration.value
+        <= preferred_nonwide_duration.value
+    ):
+        raise ProfessionalMontagePolicyError(
+            "duration p10, product p25, and preferred p50 policies are not ordered"
+        )
+    (
+        maximum_consecutive_wide_run,
+        preferred_maximum_consecutive_wide_run,
+    ) = _wide_run_policy_targets(identity, maximum_wide_run_values)
     (
         highlight_cadence_minimum,
         highlight_cadence_preferred,
@@ -1071,6 +2388,23 @@ def load_professional_montage_policy(
     return ProfessionalMontagePolicy(
         identity=identity,
         **reference_minimums,
+        highlight_pooled_product_minimum_close_duration_fraction=(
+            product_minimum_close_duration
+        ),
+        highlight_pooled_product_minimum_nonwide_duration_fraction=(
+            product_minimum_nonwide_duration
+        ),
+        preferred_close_duration_fraction=preferred_close_duration,
+        preferred_nonwide_duration_fraction=preferred_nonwide_duration,
+        maximum_consecutive_wide_run_seconds=(
+            maximum_consecutive_wide_run
+        ),
+        preferred_maximum_consecutive_wide_run_seconds=(
+            preferred_maximum_consecutive_wide_run
+        ),
+        role_conditioned_duration_policies=(
+            role_conditioned_duration_policies
+        ),
         preferred_wide_involved_source_switch_fraction=(
             preferred_wide_switch_target
         ),
@@ -1084,9 +2418,8 @@ def load_professional_montage_policy(
             highlight_cadence_reference_count
         ),
         **event_minimums,
-        minimum_nonwide_duration_fraction=None,
         nonwide_duration_fraction_policy=(
-            "unavailable_never_derived_from_one_minus_wide"
+            "explicit_observed_duration_p10_never_derived_from_one_minus_wide"
         ),
         unusable_zero_reference_floors=_collect_zero_reference_floors(
             profile, identity

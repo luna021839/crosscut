@@ -20,9 +20,10 @@ import cv2
 import numpy as np
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ANALYSIS_BASIS = (
-    "full_final_decode_temporal_pumping_and_exact_source_retention_v1"
+    "full_final_decode_temporal_pumping_exact_source_retention_and_"
+    "structure_binding_v2"
 )
 
 
@@ -105,6 +106,10 @@ class PerceptualQualityConfig:
     retention_ratio_p10_fail: float = 0.55
     retention_ratio_median_conditional: float = 0.85
     retention_ratio_median_fail: float = 0.70
+    exact_structure_similarity_p10_conditional: float = 0.50
+    exact_structure_similarity_p10_fail: float = 0.30
+    exact_structure_similarity_median_conditional: float = 0.55
+    exact_structure_similarity_median_fail: float = 0.40
 
     def __post_init__(self) -> None:
         if self.analysis_width < 64 or self.analysis_width > 1024:
@@ -165,6 +170,19 @@ class PerceptualQualityConfig:
             <= self.retention_ratio_median_conditional
         ):
             raise ValueError("retention fail bounds cannot exceed warning bounds")
+        if not (
+            0.0
+            <= self.exact_structure_similarity_p10_fail
+            <= self.exact_structure_similarity_p10_conditional
+            <= 1.0
+            and 0.0
+            <= self.exact_structure_similarity_median_fail
+            <= self.exact_structure_similarity_median_conditional
+            <= 1.0
+        ):
+            raise ValueError(
+                "exact structure similarity bounds are invalid"
+            )
 
     def to_dict(self) -> dict[str, int | float]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -414,6 +432,37 @@ def _frame_scalar(
 
 def _structure_delta(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.mean(np.abs(left - right)) / 6.0)
+
+
+def _structure_similarity(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> float | None:
+    denominator = float(
+        np.sqrt(np.sum(left * left) * np.sum(right * right))
+    )
+    if not math.isfinite(denominator) or denominator <= 1e-9:
+        return None
+    value = float(np.sum(left * right) / denominator)
+    return min(1.0, max(-1.0, value)) if math.isfinite(value) else None
+
+
+def _geometry_structure(frame: np.ndarray) -> np.ndarray:
+    """Return a color-grade-resistant spatial edge descriptor."""
+
+    compact = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+    lightness = cv2.cvtColor(compact, cv2.COLOR_BGR2LAB)[..., 0].astype(
+        np.float32
+    )
+    horizontal = cv2.Sobel(lightness, cv2.CV_32F, 1, 0, ksize=3)
+    vertical = cv2.Sobel(lightness, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = np.sqrt(horizontal * horizontal + vertical * vertical)
+    magnitude = np.log1p(magnitude)
+    magnitude = (magnitude - float(np.mean(magnitude))) / max(
+        0.10,
+        float(np.std(magnitude)),
+    )
+    return np.clip(magnitude, -3.0, 3.0)
 
 
 def _sharpness_log_delta(left: _FrameScalar, right: _FrameScalar) -> float:
@@ -671,7 +720,8 @@ def _retention_candidates(
     config: PerceptualQualityConfig,
 ) -> dict[int, list[int]]:
     stride = max(1, int(round(fps / config.retention_samples_per_second)))
-    by_source: defaultdict[int, list[int]] = defaultdict(list)
+    mandatory_by_source: defaultdict[int, list[int]] = defaultdict(list)
+    additional_by_source: defaultdict[int, list[int]] = defaultdict(list)
     for span in spans:
         first = (
             span.start_frame
@@ -681,16 +731,58 @@ def _retention_candidates(
         last = span.end_frame - config.retention_segment_guard_frames - 1
         if last < first:
             continue
-        by_source[span.source_index].append((first + last) // 2)
+        mandatory_by_source[span.source_index].append((first + last) // 2)
         aligned = ((first + stride - 1) // stride) * stride
-        by_source[span.source_index].extend(range(aligned, last + 1, stride))
-    return {
-        source_index: _evenly_limited(
-            indices,
-            config.maximum_retention_samples_per_source,
+        additional_by_source[span.source_index].extend(
+            range(aligned, last + 1, stride)
         )
-        for source_index, indices in by_source.items()
-    }
+    candidates: dict[int, list[int]] = {}
+    for source_index in sorted(
+        set(mandatory_by_source) | set(additional_by_source)
+    ):
+        mandatory = sorted(set(mandatory_by_source[source_index]))
+        mandatory_set = set(mandatory)
+        additional = [
+            frame_index
+            for frame_index in sorted(
+                set(additional_by_source[source_index])
+            )
+            if frame_index not in mandatory_set
+        ]
+        candidates[source_index] = sorted(
+            mandatory
+            + _evenly_limited(
+                additional,
+                config.maximum_retention_samples_per_source,
+            )
+        )
+    return candidates
+
+
+def _rendered_source_frame_index(
+    span: _Span,
+    *,
+    relative_time: float,
+    source_fps: float,
+) -> int:
+    """Mirror the renderer's ``trim -> setpts -> fps`` source-frame clock.
+
+    FFmpeg ``trim=start=...`` retains the first frame whose presentation time is
+    at or after the six-decimal start serialized by :mod:`crosscut.render`.
+    ``setpts=PTS-STARTPTS`` then makes that retained frame the segment-local
+    origin.  Rounding the absolute source time loses this reset and is one frame
+    early whenever a non-frame-aligned start lies below the half-frame mark.
+    """
+
+    serialized_start = float(f"{span.source_start:.6f}")
+    first_source_frame = max(
+        0,
+        int(math.ceil(serialized_start * source_fps - 1e-9)),
+    )
+    relative_source_frame = int(
+        round(relative_time * span.source_rate * source_fps)
+    )
+    return max(0, first_source_frame + relative_source_frame)
 
 
 def _span_for_frame(spans: Sequence[_Span], frame_index: int) -> _Span:
@@ -802,6 +894,17 @@ def evaluate_post_render_perceptual_quality(
     for span in spans:
         source_by_frame[span.start_frame : span.end_frame] = span.source_index
         run_by_frame[span.start_frame : span.end_frame] = span.run_index
+    planned_retention_candidates = _retention_candidates(
+        spans,
+        fps=fps,
+        config=settings,
+    )
+    retention_output_indices = {
+        frame_index
+        for frame_indices in planned_retention_candidates.values()
+        for frame_index in frame_indices
+    }
+    retention_output_structures: dict[int, np.ndarray] = {}
 
     capture = capture_factory(str(Path(video_path)))
     if not capture.isOpened():
@@ -837,6 +940,10 @@ def evaluate_post_render_perceptual_quality(
                 break
             scalar, structure = _frame_scalar(frame, size)
             frame_scalars.append(scalar)
+            if frame_index in retention_output_indices:
+                retention_output_structures[frame_index] = (
+                    _geometry_structure(frame)
+                )
             if frame_index < expected_frames:
                 source_index = int(source_by_frame[frame_index])
                 run_index = int(run_by_frame[frame_index])
@@ -1213,24 +1320,43 @@ def evaluate_post_render_perceptual_quality(
             fail=settings.rapid_high_shock_fraction_fail,
         )
 
-    candidates = _retention_candidates(spans, fps=fps, config=settings)
     candidates = {
         source_index: [
             frame_index
             for frame_index in frame_indices
             if frame_index < len(frame_scalars)
         ]
-        for source_index, frame_indices in candidates.items()
+        for source_index, frame_indices in planned_retention_candidates.items()
     }
+    requested_by_segment = {span.segment_index: 0 for span in spans}
+    for source_index, frame_indices in candidates.items():
+        for frame_index in frame_indices:
+            span = _span_for_frame(spans, frame_index)
+            if span.source_index != source_index:
+                raise ValueError(
+                    "retention candidate escaped its render-plan source"
+                )
+            requested_by_segment[span.segment_index] += 1
     retention_ratios: list[float] = []
+    exact_structure_similarities: list[float] = []
     per_source_retention: list[dict[str, Any]] = []
     decoded_by_source: dict[int, int] = {}
     low_detail_by_source: dict[int, int] = {}
     geometry_failure_by_source: dict[int, int] = {}
+    decoded_by_segment: defaultdict[int, int] = defaultdict(int)
+    low_detail_by_segment: defaultdict[int, int] = defaultdict(int)
+    geometry_failure_by_segment: defaultdict[int, int] = defaultdict(int)
+    retention_ratios_by_segment: defaultdict[int, list[float]] = defaultdict(
+        list
+    )
+    structure_similarities_by_segment: defaultdict[
+        int, list[float]
+    ] = defaultdict(list)
     for source_index in used_sources:
         indices = candidates.get(source_index, [])
         source_capture = capture_factory(str(sources[source_index]))
         ratios: list[float] = []
+        structure_similarities: list[float] = []
         low_detail = 0
         geometry_failures = 0
         decoded = 0
@@ -1244,13 +1370,20 @@ def evaluate_post_render_perceptual_quality(
                 for output_index in indices:
                     span = _span_for_frame(spans, output_index)
                     relative_time = (output_index - span.start_frame) / fps
-                    source_time = span.source_start + relative_time * span.source_rate
-                    source_frame_index = max(0, int(round(source_time * source_fps)))
-                    source_capture.set(cv2.CAP_PROP_POS_FRAMES, source_frame_index)
+                    source_frame_index = _rendered_source_frame_index(
+                        span,
+                        relative_time=relative_time,
+                        source_fps=source_fps,
+                    )
+                    source_capture.set(
+                        cv2.CAP_PROP_POS_FRAMES,
+                        source_frame_index,
+                    )
                     success, source_frame = source_capture.read()
                     if not success or source_frame is None:
                         continue
                     decoded += 1
+                    decoded_by_segment[span.segment_index] += 1
                     try:
                         reference_view = _reference_view_for_span(
                             source_frame,
@@ -1260,10 +1393,18 @@ def evaluate_post_render_perceptual_quality(
                         )
                     except ValueError:
                         geometry_failures += 1
+                        geometry_failure_by_segment[span.segment_index] += 1
                         continue
-                    reference_scalar, _ = _frame_scalar(reference_view, size)
+                    reference_scalar, _reference_structure = _frame_scalar(
+                        reference_view,
+                        size,
+                    )
+                    reference_geometry_structure = _geometry_structure(
+                        reference_view
+                    )
                     if reference_scalar.detail < settings.minimum_reference_detail:
                         low_detail += 1
+                        low_detail_by_segment[span.segment_index] += 1
                         continue
                     output_scalar = frame_scalars[output_index]
                     ratio = _contrast_normalized_detail(
@@ -1272,6 +1413,26 @@ def evaluate_post_render_perceptual_quality(
                     if math.isfinite(ratio):
                         ratios.append(ratio)
                         retention_ratios.append(ratio)
+                        retention_ratios_by_segment[span.segment_index].append(
+                            ratio
+                        )
+                    output_structure = retention_output_structures.get(
+                        output_index
+                    )
+                    similarity = (
+                        _structure_similarity(
+                            output_structure,
+                            reference_geometry_structure,
+                        )
+                        if output_structure is not None
+                        else None
+                    )
+                    if similarity is not None:
+                        structure_similarities.append(similarity)
+                        exact_structure_similarities.append(similarity)
+                        structure_similarities_by_segment[
+                            span.segment_index
+                        ].append(similarity)
             finally:
                 source_capture.release()
         else:
@@ -1297,7 +1458,13 @@ def evaluate_post_render_perceptual_quality(
                 "low_detail_excluded_count": low_detail,
                 "geometry_reprojection_failure_count": geometry_failures,
                 "comparable_sample_count": len(ratios),
+                "structure_comparable_sample_count": len(
+                    structure_similarities
+                ),
                 "detail_retention_ratio": _distribution(ratios),
+                "exact_structure_similarity": _distribution(
+                    structure_similarities
+                ),
                 "source_fps": (
                     source_fps
                     if math.isfinite(source_fps) and source_fps > 0.0
@@ -1305,19 +1472,112 @@ def evaluate_post_render_perceptual_quality(
                 ),
             }
         )
+    per_segment_retention: list[dict[str, Any]] = []
+    for span in spans:
+        segment_index = span.segment_index
+        requested = requested_by_segment[segment_index]
+        decoded = decoded_by_segment[segment_index]
+        segment_ratios = retention_ratios_by_segment[segment_index]
+        segment_structures = structure_similarities_by_segment[segment_index]
+        structure_distribution = _distribution(segment_structures)
+        structure_covered = bool(segment_structures)
+        structure_maximum = structure_distribution["maximum"]
+        structure_binding_passed = bool(
+            structure_covered
+            and structure_maximum is not None
+            and structure_maximum
+            >= settings.exact_structure_similarity_p10_fail
+        )
+        if requested == 0:
+            incomparability_reason = (
+                "no_non_overlap_interior_frame_after_transition_and_guard"
+            )
+        elif decoded == 0:
+            incomparability_reason = "source_frame_decode_unavailable"
+        elif geometry_failure_by_segment[segment_index]:
+            incomparability_reason = "geometry_reprojection_failed"
+        elif not segment_structures:
+            incomparability_reason = (
+                "reference_detail_or_structure_below_comparability_floor"
+            )
+        else:
+            incomparability_reason = None
+        per_segment_retention.append(
+            {
+                "segment_index": segment_index,
+                "source_index": span.source_index,
+                "start_frame": span.start_frame,
+                "end_frame": span.end_frame,
+                "incoming_transition_frames": (
+                    span.incoming_transition_frames
+                ),
+                "requested_sample_count": requested,
+                "decoded_source_sample_count": decoded,
+                "low_detail_excluded_count": low_detail_by_segment[
+                    segment_index
+                ],
+                "geometry_reprojection_failure_count": (
+                    geometry_failure_by_segment[segment_index]
+                ),
+                "comparable_sample_count": len(segment_ratios),
+                "structure_comparable_sample_count": len(
+                    segment_structures
+                ),
+                "detail_retention_ratio": _distribution(segment_ratios),
+                "exact_structure_similarity": structure_distribution,
+                "structure_coverage_passed": structure_covered,
+                "structure_binding_passed": structure_binding_passed,
+                "incomparability_reason": incomparability_reason,
+            }
+        )
     retention_distribution = _distribution(retention_ratios)
+    structure_similarity_distribution = _distribution(
+        exact_structure_similarities
+    )
     covered_sources = sum(
         item["comparable_sample_count"] >= settings.minimum_retention_samples_per_source
         for item in per_source_retention
     )
+    structure_covered_sources = sum(
+        item["structure_comparable_sample_count"]
+        >= settings.minimum_retention_samples_per_source
+        for item in per_source_retention
+    )
+    structure_covered_segments = sum(
+        item["structure_coverage_passed"]
+        for item in per_segment_retention
+    )
+    structure_bound_segments = sum(
+        item["structure_binding_passed"]
+        for item in per_segment_retention
+    )
+    uncovered_segment_indices = [
+        item["segment_index"]
+        for item in per_segment_retention
+        if not item["structure_coverage_passed"]
+    ]
+    failed_binding_segment_indices = [
+        item["segment_index"]
+        for item in per_segment_retention
+        if item["structure_coverage_passed"]
+        and not item["structure_binding_passed"]
+    ]
     metrics["exact_source_retention"] = {
         "mapping_basis": (
-            "output_frame_index_to_segment_source_local_start_plus_"
-            "segment_relative_time_times_source_playback_rate"
+            "ffmpeg_trim_first_frame_at_or_after_six_decimal_source_start_"
+            "plus_segment_relative_time_times_source_playback_rate"
         ),
         "comparison_domain": (
             "render_plan_crop_pan_and_editorial_geometry_reprojected_"
-            "contrast_normalized_detail_on_non_overlap_interior_frames"
+            "contrast_normalized_detail_and_photometric_normalized_"
+            "structure_on_non_overlap_interior_frames"
+        ),
+        "segment_sampling_policy": (
+            "one_mandatory_safe_interior_midpoint_per_render_segment_"
+            "then_source_capped_additional_samples"
+        ),
+        "maximum_additional_samples_per_source": (
+            settings.maximum_retention_samples_per_source
         ),
         "used_source_count": len(used_sources),
         "adequately_covered_source_count": covered_sources,
@@ -1325,12 +1585,28 @@ def evaluate_post_render_perceptual_quality(
         "requested_sample_count": sum(len(values) for values in candidates.values()),
         "decoded_source_sample_count": sum(decoded_by_source.values()),
         "comparable_sample_count": len(retention_ratios),
+        "structure_comparable_sample_count": len(
+            exact_structure_similarities
+        ),
+        "structure_adequately_covered_source_count": (
+            structure_covered_sources
+        ),
+        "render_segment_count": len(spans),
+        "structure_covered_segment_count": structure_covered_segments,
+        "structure_bound_segment_count": structure_bound_segments,
+        "structure_segment_coverage_complete": (
+            structure_covered_segments == len(spans)
+        ),
+        "uncovered_segment_indices": uncovered_segment_indices,
+        "failed_binding_segment_indices": failed_binding_segment_indices,
         "low_detail_excluded_count": sum(low_detail_by_source.values()),
         "geometry_reprojection_failure_count": sum(
             geometry_failure_by_source.values()
         ),
         "detail_retention_ratio": retention_distribution,
+        "exact_structure_similarity": structure_similarity_distribution,
         "per_source": per_source_retention,
+        "per_segment": per_segment_retention,
     }
     if sum(geometry_failure_by_source.values()):
         issues.add(
@@ -1365,6 +1641,72 @@ def evaluate_post_render_perceptual_quality(
             value=covered_sources,
             threshold=len(used_sources),
         )
+    if not exact_structure_similarities:
+        issues.add(
+            "perceptual_exact_structure_binding_unavailable",
+            "fail",
+            "No final-frame sample could be structurally bound to its exact rendered source view.",
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "structure_comparable_sample_count"
+            ),
+            value=0,
+            threshold=max(1, settings.minimum_retention_samples_per_source),
+        )
+    elif structure_covered_sources != len(used_sources):
+        issues.add(
+            "perceptual_exact_structure_binding_coverage_incomplete",
+            "fail",
+            "Every used source must have enough exact final-frame structure checks.",
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "structure_adequately_covered_source_count"
+            ),
+            value=structure_covered_sources,
+            threshold=len(used_sources),
+        )
+    if structure_covered_segments != len(spans):
+        issues.add(
+            "perceptual_exact_structure_segment_coverage_incomplete",
+            "fail",
+            (
+                "Every render segment must provide at least one exact "
+                "non-overlap structure comparison."
+            ),
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "structure_covered_segment_count"
+            ),
+            value={
+                "covered_segment_count": structure_covered_segments,
+                "render_segment_count": len(spans),
+                "uncovered_segment_indices": uncovered_segment_indices,
+            },
+            threshold={
+                "covered_segment_count": len(spans),
+                "uncovered_segment_indices": [],
+            },
+        )
+    if failed_binding_segment_indices:
+        issues.add(
+            "perceptual_exact_structure_segment_binding_failed",
+            "fail",
+            (
+                "At least one covered render segment has no frame that "
+                "matches its exact RenderPlan geometry."
+            ),
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "failed_binding_segment_indices"
+            ),
+            value=failed_binding_segment_indices,
+            threshold={
+                "maximum_similarity_at_least": (
+                    settings.exact_structure_similarity_p10_fail
+                ),
+                "failed_binding_segment_indices": [],
+            },
+        )
     retention_p10 = retention_distribution["p10"]
     retention_median = retention_distribution["median"]
     if retention_p10 is not None:
@@ -1392,6 +1734,44 @@ def evaluate_post_render_perceptual_quality(
             value=float(retention_median),
             conditional=settings.retention_ratio_median_conditional,
             fail=settings.retention_ratio_median_fail,
+        )
+    structure_p10 = structure_similarity_distribution["p10"]
+    structure_median = structure_similarity_distribution["median"]
+    if structure_p10 is not None:
+        _add_lower_gate(
+            issues,
+            code="perceptual_exact_structure_similarity_p10",
+            message=(
+                "The weakest final-frame samples do not match the exact "
+                "RenderPlan crop and transform geometry."
+            ),
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "exact_structure_similarity.p10"
+            ),
+            value=float(structure_p10),
+            conditional=(
+                settings.exact_structure_similarity_p10_conditional
+            ),
+            fail=settings.exact_structure_similarity_p10_fail,
+        )
+    if structure_median is not None:
+        _add_lower_gate(
+            issues,
+            code="perceptual_exact_structure_similarity_median",
+            message=(
+                "Typical final-frame samples do not match the exact "
+                "RenderPlan crop and transform geometry."
+            ),
+            path=(
+                "perceptual_quality.exact_source_retention."
+                "exact_structure_similarity.median"
+            ),
+            value=float(structure_median),
+            conditional=(
+                settings.exact_structure_similarity_median_conditional
+            ),
+            fail=settings.exact_structure_similarity_median_fail,
         )
     return _payload(settings, metrics, issues)
 

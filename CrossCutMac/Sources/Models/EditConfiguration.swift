@@ -27,7 +27,7 @@ enum EditMode: String, CaseIterable, Codable, Identifiable {
     var detail: String {
         switch self {
         case .group: "박자·포즈·실루엣을 맞춘 교차컷에, 얼굴이 확실한 경계만 짧은 블렌드를 씁니다. 자동 모드는 10개를 목표로 하고 8개부터 진행합니다."
-        case .member: "선택 멤버의 공식 세로 직캠을 원본 그대로 연결합니다. 자동 모드는 10개를 우선 찾고, 최소 8개부터 균등하게 돌려 씁니다."
+        case .member: "선택 멤버의 공식 세로 직캠을 원본 그대로 연결합니다. 10개를 목표로 찾되 소스 하한만 4개이며, 전환 밀도를 유지한 채 같은 직캠의 다른 시간대도 비인접 구간에 재사용합니다."
         }
     }
 
@@ -83,7 +83,7 @@ enum OutputAspectRatio: String, CaseIterable, Codable, Identifiable {
 
 struct EditRequest: Codable, Equatable {
     static let automaticMemberSourceCount = 10
-    static let minimumAutomaticMemberSourceCount = 8
+    static let minimumAutomaticMemberSourceCount = 4
 
     let song: String
     let targetMember: String?

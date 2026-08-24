@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -29,9 +31,12 @@ from crosscut.stage_edit_head_materializer import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
     SourceCandidateToken,
     StageEditSequence,
     StageEditReadinessReport,
+    StageEditTemporalPoseSidecar,
     StageEditToken,
     StageEditTransformerConfig,
     mlx_runtime_version,
@@ -52,6 +57,41 @@ def _candidate(source_id: str, value: float, *, hard_gate: bool = True):
         missing_mask=(False,) * schema.raw_source_dimension,
         available=True,
         hard_gate_passed=hard_gate,
+    )
+
+
+def _candidate_with_pose(
+    source_id: str,
+    value: float,
+    pose_embedding: tuple[float, ...] | None,
+    *,
+    partial_missing_index: int | None = None,
+) -> SourceCandidateToken:
+    schema = DEFAULT_STAGE_EDIT_SCHEMA
+    features = [value] * schema.raw_source_dimension
+    missing = [False] * schema.raw_source_dimension
+    pose_indices = tuple(
+        schema.source_feature_names.index(name)
+        for name in STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES
+    )
+    if pose_embedding is None:
+        for index in pose_indices:
+            missing[index] = True
+    else:
+        if len(pose_embedding) != len(pose_indices):
+            raise ValueError("test pose embedding must contain 60 values")
+        for index, coordinate in zip(
+            pose_indices, pose_embedding, strict=True
+        ):
+            features[index] = coordinate
+    if partial_missing_index is not None:
+        missing[pose_indices[partial_missing_index]] = True
+    return SourceCandidateToken(
+        source_id=source_id,
+        features=tuple(features),
+        missing_mask=tuple(missing),
+        available=True,
+        hard_gate_passed=True,
     )
 
 
@@ -213,6 +253,16 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
             0.8,
             frames[0].source_continuity[0].camera_motion_x,
         )
+        self.assertEqual(
+            (0.8,) * len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+            frames[0].source_continuity[0].pose_model_embedding,
+        )
+        serialized_continuity = frames[0].to_dict()["source_continuity"][0]
+        pose_evidence = serialized_continuity["same_time_pose_evidence"]
+        self.assertTrue(pose_evidence["observed"])
+        self.assertEqual(60, pose_evidence["feature_dimension"])
+        self.assertEqual(64, len(pose_evidence["content_sha256"]))
+        self.assertNotIn("pose_model_embedding", serialized_continuity)
         self.assertEqual((999.0, 999.0, 999.0, 999.0), frames[0].crop)
         self.assertAlmostEqual(0.2, frames[0].section_progress)
         self.assertAlmostEqual(0.1, frames[0].phrase_progress)
@@ -222,6 +272,101 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
         self.assertTrue(decoded.eligible, decoded.rejection_reasons)
         assert decoded.track is not None
         self.assertEqual(1.0, decoded.track.keyframes[1].time_seconds)
+
+    def test_source_exact_temporal_sidecar_reaches_head_continuity(self) -> None:
+        sidecar = StageEditTemporalPoseSidecar(
+            embeddings=((0.1,) * 60, (0.2,) * 60),
+            interval_seconds=0.04,
+            sampling_contract=(
+                STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+            ),
+        )
+        first_token = self.sequence.tokens[0]
+        # The supplied first token is padded B,A. Canonical head order is A,B.
+        modified_sequence = replace(
+            self.sequence,
+            tokens=(
+                replace(
+                    first_token,
+                    source_candidates=(
+                        first_token.source_candidates[0],
+                        replace(
+                            first_token.source_candidates[1],
+                            temporal_pose_sidecar=sidecar,
+                        ),
+                    ),
+                ),
+                self.sequence.tokens[1],
+            ),
+        )
+        with mx.stream(mx.cpu):
+            batch = tensorize_stage_edit_batch(
+                (modified_sequence,),
+                DEFAULT_STAGE_EDIT_SCHEMA,
+                self.config,
+                device=mx.cpu,
+            )
+            mx.eval(
+                batch.source_features,
+                batch.source_candidate_mask,
+                batch.hard_source_gate_mask,
+            )
+        frames = stage_edit_head_frames_from_dynamic_crop_output_v2(
+            sequence=modified_sequence,
+            batch=batch,
+            output=self._output(),
+            canonical_source_ids=("A", "B"),
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            metadata=self.metadata,
+        )
+        self.assertEqual(frames[0].source_continuity[0].temporal_pose_sidecar, sidecar)
+        self.assertIsNone(frames[0].source_continuity[1].temporal_pose_sidecar)
+        serialized = frames[0].to_dict()["source_continuity"][0]
+        temporal_evidence = serialized["temporal_pose_evidence"]
+        self.assertTrue(temporal_evidence["observed"])
+        self.assertEqual(2, temporal_evidence["sample_count"])
+        self.assertEqual(60, temporal_evidence["feature_dimension"])
+        self.assertEqual(
+            sidecar.producer_backend,
+            temporal_evidence["trusted_producer_contract"],
+        )
+        self.assertEqual(64, len(temporal_evidence["content_sha256"]))
+        self.assertNotIn("temporal_pose_sidecar", serialized)
+
+        alternate_sidecar = replace(
+            sidecar,
+            embeddings=((0.1,) * 60, (0.21,) * 60),
+        )
+        alternate_frame = replace(
+            frames[0],
+            source_continuity=(
+                replace(
+                    frames[0].source_continuity[0],
+                    temporal_pose_sidecar=alternate_sidecar,
+                ),
+                *frames[0].source_continuity[1:],
+            ),
+        )
+
+        def frame_sha256(frame: object) -> str:
+            return hashlib.sha256(
+                json.dumps(
+                    frame.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+        alternate_evidence = alternate_frame.to_dict()["source_continuity"][
+            0
+        ]["temporal_pose_evidence"]
+        self.assertNotEqual(
+            temporal_evidence["content_sha256"],
+            alternate_evidence["content_sha256"],
+        )
+        self.assertNotEqual(frame_sha256(frames[0]), frame_sha256(alternate_frame))
 
     def test_output_mask_mismatch_fails_before_beam(self) -> None:
         output = self._output()
@@ -281,6 +426,129 @@ class StageEditHeadMaterializerTests(unittest.TestCase):
         self.assertIsNone(frames[1].dynamic_crop_v3_by_source[1])
         self.assertEqual((True, False), frames[1].effective_source_mask)
         self.assertIsNone(frames[0].dynamic_crop_v2)
+        self.assertEqual(
+            (0.8,) * len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+            frames[0].source_continuity[0].pose_model_embedding,
+        )
+
+    def test_pose_embedding_missingness_is_explicit_and_partial_fails_closed(
+        self,
+    ) -> None:
+        missing_candidate = _candidate_with_pose("A", 0.8, None)
+        missing_sequence = replace(
+            self.sequence,
+            tokens=(
+                replace(
+                    self.sequence.tokens[0],
+                    source_candidates=(
+                        self.sequence.tokens[0].source_candidates[0],
+                        missing_candidate,
+                    ),
+                ),
+                self.sequence.tokens[1],
+            ),
+        )
+        with mx.stream(mx.cpu):
+            missing_batch = tensorize_stage_edit_batch(
+                (missing_sequence,),
+                DEFAULT_STAGE_EDIT_SCHEMA,
+                self.config,
+                device=mx.cpu,
+            )
+        missing_frames = stage_edit_head_frames_from_dynamic_crop_output_v2(
+            sequence=missing_sequence,
+            batch=missing_batch,
+            output=self._output(),
+            canonical_source_ids=("A", "B"),
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            metadata=self.metadata,
+        )
+        self.assertIsNone(
+            missing_frames[0].source_continuity[0].pose_model_embedding
+        )
+        missing_pose_evidence = missing_frames[0].to_dict()[
+            "source_continuity"
+        ][0]["same_time_pose_evidence"]
+        self.assertFalse(missing_pose_evidence["observed"])
+        self.assertIsNone(missing_pose_evidence["content_sha256"])
+
+        partial_candidate = _candidate_with_pose(
+            "A",
+            0.8,
+            (0.25,) * len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+            partial_missing_index=17,
+        )
+        partial_sequence = replace(
+            missing_sequence,
+            tokens=(
+                replace(
+                    missing_sequence.tokens[0],
+                    source_candidates=(
+                        missing_sequence.tokens[0].source_candidates[0],
+                        partial_candidate,
+                    ),
+                ),
+                missing_sequence.tokens[1],
+            ),
+        )
+        with mx.stream(mx.cpu):
+            partial_batch = tensorize_stage_edit_batch(
+                (partial_sequence,),
+                DEFAULT_STAGE_EDIT_SCHEMA,
+                self.config,
+                device=mx.cpu,
+            )
+        with self.assertRaisesRegex(
+            StageEditHeadMaterializerInputError,
+            "all 60 coordinates observed or all 60 missing",
+        ):
+            stage_edit_head_frames_from_dynamic_crop_output_v2(
+                sequence=partial_sequence,
+                batch=partial_batch,
+                output=self._output(),
+                canonical_source_ids=("A", "B"),
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                metadata=self.metadata,
+            )
+
+    def test_observed_pose_embedding_must_be_finite_and_bounded(self) -> None:
+        invalid_candidate = _candidate_with_pose(
+            "A",
+            0.8,
+            (1.01,) * len(STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES),
+        )
+        invalid_sequence = replace(
+            self.sequence,
+            tokens=(
+                replace(
+                    self.sequence.tokens[0],
+                    source_candidates=(
+                        self.sequence.tokens[0].source_candidates[0],
+                        invalid_candidate,
+                    ),
+                ),
+                self.sequence.tokens[1],
+            ),
+        )
+        with mx.stream(mx.cpu):
+            invalid_batch = tensorize_stage_edit_batch(
+                (invalid_sequence,),
+                DEFAULT_STAGE_EDIT_SCHEMA,
+                self.config,
+                device=mx.cpu,
+            )
+        with self.assertRaisesRegex(
+            StageEditHeadMaterializerInputError,
+            r"finite and lie in \[-1, 1\]",
+        ):
+            stage_edit_head_frames_from_dynamic_crop_output_v3(
+                sequence=invalid_sequence,
+                batch=invalid_batch,
+                output=self._output_v3(),
+                canonical_source_ids=("A", "B"),
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                metadata=self.metadata_v3,
+            )
 
     def test_v3_duplicate_padded_source_identity_fails_closed(self) -> None:
         bad_batch = replace(

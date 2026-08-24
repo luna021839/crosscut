@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+import math
 from pathlib import Path
 import unittest
 
-from crosscut.pose import FormationPersonDescriptor
+from crosscut.pose import FormationPersonDescriptor, POSE_BACKEND
 from crosscut.timeline import ShotType
 from crosscut.timeline_review import review_timeline
 from crosscut.boundary_repair import BoundaryRepairConfig
+from crosscut.stage_edit_temporal_pose_motion import (
+    TemporalPoseMotionThresholds,
+)
 from crosscut.visual_boundary_repair import (
     _passes_production_transition_gates,
     _visual_evidence,
@@ -41,6 +46,30 @@ def _descriptor(center: float) -> FrameVisualDescriptor:
     )
 
 
+def _pose_descriptor(center: float, angle: float) -> FrameVisualDescriptor:
+    embedding = (
+        math.cos(angle),
+        math.sin(angle),
+        *((0.0,) * 58),
+    )
+    return replace(
+        _descriptor(center),
+        pose_embedding=embedding,
+        pose_backend=POSE_BACKEND,
+        pose_confidence=0.95,
+    )
+
+
+def _temporal_thresholds() -> TemporalPoseMotionThresholds:
+    return TemporalPoseMotionThresholds(
+        minimum_boundary_motion_magnitude=0.5,
+        minimum_endpoint_pose_cosine=0.95,
+        minimum_velocity_direction_cosine=0.8,
+        minimum_phase_compatibility=0.9,
+        pose_norm_epsilon=1e-8,
+    )
+
+
 def _choice(index: int, source: int) -> VisualTimelineChoice:
     return VisualTimelineChoice(
         segment_index=index,
@@ -61,6 +90,165 @@ def _choice(index: int, source: int) -> VisualTimelineChoice:
 
 
 class VisualBoundaryRepairTests(unittest.TestCase):
+    def test_unbound_temporal_pose_motion_preserves_exact_prior_cost(self) -> None:
+        kwargs = {
+            "outgoing_preceding": _pose_descriptor(0.5, -0.20),
+            "incoming_following": _pose_descriptor(0.5, 0.22),
+            "side_sample_span_seconds": 0.10,
+        }
+        prior = _visual_evidence(
+            _pose_descriptor(0.5, 0.0),
+            _pose_descriptor(0.5, 0.02),
+            **kwargs,
+        )
+        unbound = _visual_evidence(
+            _pose_descriptor(0.5, 0.0),
+            _pose_descriptor(0.5, 0.02),
+            temporal_pose_motion_thresholds=None,
+            temporal_pose_motion_preference_weight=100.0,
+            **kwargs,
+        )
+
+        self.assertEqual(unbound.total_cost, prior.total_cost)
+        self.assertEqual(unbound.base_total_cost, prior.base_total_cost)
+        self.assertEqual(
+            unbound.temporal_pose_motion.classification,
+            "calibration_unbound",
+        )
+        self.assertFalse(
+            unbound.temporal_pose_motion.direction_evidence_available
+        )
+        self.assertFalse(
+            unbound.temporal_pose_motion.dynamic_direction_match_proven
+        )
+        self.assertEqual(
+            unbound.temporal_pose_motion.soft_preference_applied,
+            0.0,
+        )
+
+    def test_arbitrary_threshold_activation_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "immutable evidence loader/registry",
+        ):
+            _visual_evidence(
+                _pose_descriptor(0.5, 0.0),
+                _pose_descriptor(0.5, 0.02),
+                outgoing_preceding=_pose_descriptor(0.5, -0.20),
+                incoming_following=_pose_descriptor(0.5, 0.22),
+                side_sample_span_seconds=0.10,
+                temporal_pose_motion_thresholds=_temporal_thresholds(),
+                temporal_pose_motion_preference_weight=1.0,
+            )
+
+    def test_repair_rejects_arbitrary_threshold_activation(self) -> None:
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "immutable evidence loader/registry",
+        ):
+            repair_visual_timeline_boundaries(
+                visual_timeline=plan,
+                sources=(Path("a"), Path("b")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                config=BoundaryRepairConfig(
+                    temporal_pose_motion_thresholds=_temporal_thresholds(),
+                    temporal_pose_motion_preference_weight=1.0,
+                ),
+            )
+
+    def test_missing_real_60d_pose_stays_neutral_while_calibration_unbound(self) -> None:
+        missing = _visual_evidence(
+            _pose_descriptor(0.5, 0.0),
+            _pose_descriptor(0.5, 0.02),
+            outgoing_preceding=_descriptor(0.5),
+            incoming_following=_pose_descriptor(0.5, 0.22),
+            side_sample_span_seconds=0.10,
+            temporal_pose_motion_thresholds=None,
+            temporal_pose_motion_preference_weight=10.0,
+        )
+
+        motion = missing.temporal_pose_motion
+        self.assertFalse(motion.analysis_executed)
+        self.assertFalse(motion.input_valid)
+        self.assertFalse(motion.qualifies)
+        self.assertEqual(motion.classification, "calibration_unbound")
+        self.assertIn(
+            "temporal_pose_motion_thresholds_unbound",
+            motion.failure_reasons,
+        )
+        self.assertFalse(motion.direction_evidence_available)
+        self.assertFalse(motion.dynamic_direction_match_proven)
+        self.assertEqual(motion.soft_preference_applied, 0.0)
+        self.assertEqual(missing.total_cost, missing.base_total_cost)
+        # Missing direction evidence is neutral to the pre-existing geometry
+        # and professional transition gates.
+        self.assertTrue(_passes_production_transition_gates(missing))
+
+    def test_temporal_pose_motion_serialization_is_scalar_only_and_covered(
+        self,
+    ) -> None:
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+
+        def provider(_source: int, seconds: float) -> FrameVisualDescriptor:
+            return _pose_descriptor(0.5, 0.8 * seconds)
+
+        repaired = repair_visual_timeline_boundaries(
+            visual_timeline=plan,
+            sources=(Path("a"), Path("b")),
+            audio_offsets=(0.0, 0.0),
+            scene_cut_times=((), ()),
+            descriptor_provider=provider,
+            config=BoundaryRepairConfig(
+                temporal_pose_motion_thresholds=None,
+                temporal_pose_motion_preference_weight=1.0,
+            ),
+        )
+
+        payload = repaired.to_dict()
+        configuration = payload["temporal_pose_motion_configuration"]
+        self.assertEqual(
+            configuration["calibration_status"],
+            "calibration_unbound",
+        )
+        self.assertEqual(configuration["preference_weight"], 1.0)
+        self.assertIsNone(configuration["threshold_identity_sha256"])
+        motion_coverage = payload["evidence_coverage"][
+            "temporal_pose_motion"
+        ]
+        self.assertEqual(
+            motion_coverage["dynamic_pose_phase_match_count"],
+            0,
+        )
+        motion = payload["repairs"][0]["selected_visual_evidence"][
+            "temporal_pose_motion"
+        ]
+        self.assertIsNone(motion["feature_dimension"])
+        self.assertEqual(motion["classification"], "calibration_unbound")
+        self.assertEqual(motion["soft_preference_applied"], 0.0)
+        serialized = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("normalized_velocity", serialized)
+        self.assertNotIn("pose_embedding", serialized)
+        self.assertNotIn("embeddings", serialized)
+
+        def assert_no_raw_numeric_vectors(value: object) -> None:
+            if isinstance(value, dict):
+                for nested in value.values():
+                    assert_no_raw_numeric_vectors(nested)
+            elif isinstance(value, list):
+                if value and all(
+                    isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    for item in value
+                ):
+                    self.assertNotIn(len(value), {60, 120})
+                for nested in value:
+                    assert_no_raw_numeric_vectors(nested)
+
+        assert_no_raw_numeric_vectors(payload)
+
     def test_hog_structure_is_never_serialized_or_gated_as_pose(self) -> None:
         evidence = _visual_evidence(
             _descriptor(0.48),
@@ -77,14 +265,22 @@ class VisualBoundaryRepairTests(unittest.TestCase):
         self.assertTrue(evidence.evidence_coverage.professional_gate_passed)
         self.assertTrue(_passes_production_transition_gates(evidence))
 
-        unknown_backend = replace(
-            _descriptor(0.50),
-            pose_embedding=(0.1,) * 60,
-            pose_backend="unknown_pose_backend",
-        )
-        unknown = _visual_evidence(unknown_backend, unknown_backend)
-        self.assertEqual(unknown.pose_basis, "actual_pose_pair_unavailable")
-        self.assertIsNone(unknown.pose_mismatch)
+        for forged_backend in (
+            "unknown_pose_backend",
+            f"{POSE_BACKEND}_forged_suffix",
+        ):
+            with self.subTest(pose_backend=forged_backend):
+                forged = replace(
+                    _descriptor(0.50),
+                    pose_embedding=(0.1,) * 60,
+                    pose_backend=forged_backend,
+                )
+                evidence = _visual_evidence(forged, forged)
+                self.assertEqual(
+                    evidence.pose_basis,
+                    "actual_pose_pair_unavailable",
+                )
+                self.assertIsNone(evidence.pose_mismatch)
 
     def test_nearest_interior_actual_pose_is_separate_from_exact_frame(self) -> None:
         outgoing = _descriptor(0.50)

@@ -75,13 +75,16 @@ from .stage_edit_transformer import (
     StageEditTokenSchema,
     stage_edit_readiness_report,
 )
+from .stage_edit_temporal_pose_motion import (
+    require_scalar_stage_edit_pose_payload,
+)
 from .timewarp import TimeWarpMap
 
 
-STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 3
+STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 4
 STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT = (
     "explicit_snapshot_dynamic_crop_v2_v3_profile_chorus_anchor_"
-    "continuity_authority_semimarkov_retention_v3"
+    "continuity_authority_temporal_pose_sidecar_semimarkov_retention_v4"
 )
 
 
@@ -316,11 +319,14 @@ class StageEditPipelineBridgePreflight:
 
     def to_dict(self) -> dict[str, Any]:
         self._validate_learned_scorer_identity()
-        return {
+        payload = {
             "snapshot_path": str(self.snapshot_path),
             "snapshot_sha256": self.snapshot.snapshot_sha256,
             "snapshot_sequence_id": self.snapshot.sequence.sequence_id,
             "snapshot_token_count": len(self.snapshot.sequence.tokens),
+            "temporal_pose_sidecar": (
+                self.snapshot.temporal_pose_sidecar_audit()
+            ),
             "checkpoint_directory": str(self.checkpoint_directory),
             "dynamic_crop_version": self.dynamic_crop_version,
             "checkpoint_format": f"dynamic_crop_v{self.dynamic_crop_version}",
@@ -352,6 +358,11 @@ class StageEditPipelineBridgePreflight:
             },
             "readiness": self.readiness.to_dict(),
         }
+        require_scalar_stage_edit_pose_payload(
+            payload,
+            context="StageEdit pipeline bridge preflight",
+        )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,7 +374,7 @@ class RetainedStageEditCandidate:
     timewarped_segment_count: int
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "rank": self.rank,
             "score": self.score,
             "exact_clock_reprojected": self.exact_clock_reprojected,
@@ -371,6 +382,11 @@ class RetainedStageEditCandidate:
             "selected_for_render": False,
             "stage_edit": self.edit.to_dict(),
         }
+        require_scalar_stage_edit_pose_payload(
+            payload,
+            context="retained StageEdit candidate",
+        )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,6 +440,12 @@ class StageEditPipelineBridgeResult:
             raise ValueError("StageEdit bridge cannot replace the visual baseline")
         if self.selection_policy.get("selected_for_render") is not False:
             raise ValueError("StageEdit bridge cannot select an unreviewed candidate")
+        if self.selection_policy.get("temporal_pose_sidecar") != (
+            self.preflight.snapshot.temporal_pose_sidecar_audit()
+        ):
+            raise ValueError(
+                "StageEdit bridge temporal-pose snapshot audit differs from preflight"
+            )
         if (
             self.source_derivative_diversity is not None
             and not self.source_derivative_diversity.production_ready
@@ -586,7 +608,7 @@ class StageEditPipelineBridgeResult:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "contract": self.contract,
             "activation": self.preflight.to_dict(),
@@ -611,6 +633,11 @@ class StageEditPipelineBridgeResult:
                 item.to_dict() for item in self.retained_candidates
             ],
         }
+        require_scalar_stage_edit_pose_payload(
+            payload,
+            context="StageEdit pipeline bridge result",
+        )
+        return payload
 
     def write_json(self, path: Path) -> Path:
         destination = Path(path).expanduser().resolve()
@@ -1194,6 +1221,9 @@ def run_stage_edit_pipeline_bridge(
             "continuity_authority": preflight.continuity_authority,
             "continuity_scorer_contract": expected_scorer_contract,
             "continuity_scorer_fingerprint": expected_scorer_fingerprint,
+            "temporal_pose_sidecar": (
+                preflight.snapshot.temporal_pose_sidecar_audit()
+            ),
             "source_derivative_policy": (
                 "verified_actual_pts_families_required"
                 if require_verified_source_derivative_metadata

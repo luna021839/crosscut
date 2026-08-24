@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from crosscut.ive import AspectRatio
+from crosscut.professional_montage_policy import (
+    close_burst_policy_binding_sha256,
+)
 from crosscut.section_director import (
     SectionDirective,
     SectionPlan,
@@ -24,18 +29,25 @@ from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
 from crosscut.stage_edit_semimarkov_beam import (
     CONTINUITY_AUTHORITY_CONTRACT,
     DECODER_CONTRACT,
+    DECODER_SCHEMA_VERSION,
     HANDCRAFTED_CONTINUITY_AUTHORITY,
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     StageEditCheckpointNotReadyError,
     StageEditDecodeInputError,
     StageEditHeadFrame,
+    StageEditHighlightMotionCalibration,
     StageEditNoValidTimelineError,
     StageEditSectionConstraint,
     StageEditSemiMarkovConfig,
     StageEditSourceContinuity,
     StageEditSourceMetadata,
+    StageEditTemporalPoseMotionCalibration,
     _formation_wide_evidence,
+    _boundary_motion_amount_plus_continuity_evidence,
+    _highlight_motion_calibration_audit,
+    _highlight_policy_provenance,
+    _close_only_multi_source_burst_evidence,
     _montage_grammar_score_raw,
     _wide_switch_preferred_target_score_raw,
     decode_stage_edit_semimarkov_beam,
@@ -49,7 +61,12 @@ from crosscut.stage_edit_source_pair_scorer import (
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_DECISION_HISTORY_OWNER,
+    STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
     StageEditReadinessReport,
+    StageEditTemporalPoseSidecar,
+)
+from crosscut.stage_edit_temporal_pose_motion import (
+    TemporalPoseMotionThresholds,
 )
 from crosscut.stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
@@ -243,12 +260,103 @@ def _single_feature_scorer(feature_name: str) -> StageEditSourcePairScorer:
     return StageEditSourcePairScorer(tuple(weights))
 
 
+def _actual_highlight_motion_calibration() -> StageEditHighlightMotionCalibration:
+    return StageEditHighlightMotionCalibration(
+        analysis_basis=(
+            "ive_20_reference_snapshot_source_pair_supervision_v3_calibration"
+        ),
+        human_reference_count=20,
+        source_pair_negative_samples=2,
+        maximum_sources=32,
+        confirmed_source_switch_count=170,
+        highlight_role_close_involved_switch_count=54,
+        build_close_involved_switch_count=10,
+        chorus_close_involved_switch_count=29,
+        bridge_close_involved_switch_count=15,
+        pose_pair_observed_switch_count=23,
+        continuity_observed_switch_count=54,
+        pose_embedding_cosine_observed_switch_count=14,
+        sharpness_pair_observed_switch_count=0,
+        pose_motion_minimum_quantiles=(
+            0.0002705025925969218,
+            0.0013651752724601618,
+            0.0024240018497856952,
+            0.010089000247239965,
+        ),
+        continuity_score_quantiles=(
+            -0.49213925079872173,
+            -0.39991898058929115,
+            -0.32434112477150095,
+            -0.2522282468388802,
+        ),
+        pose_embedding_cosine_quantiles=(
+            0.7354177153190032,
+            0.7831558357163766,
+            0.8486102174679631,
+            0.8940526060955091,
+        ),
+        sharpness_minimum_quantiles=None,
+    )
+
+
+def _pose60(angle_radians: float) -> tuple[float, ...]:
+    return (
+        math.cos(angle_radians),
+        math.sin(angle_radians),
+        *(0.0 for _ in range(58)),
+    )
+
+
+def _temporal_sidecar(
+    first_angle: float,
+    second_angle: float,
+) -> StageEditTemporalPoseSidecar:
+    return StageEditTemporalPoseSidecar(
+        embeddings=(_pose60(first_angle), _pose60(second_angle)),
+        interval_seconds=0.1,
+        sampling_contract=(
+            STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT
+        ),
+    )
+
+
 def _assert_finite_tree(test: unittest.TestCase, value: object) -> None:
     if isinstance(value, float):
         test.assertTrue(math.isfinite(value))
     elif isinstance(value, dict):
         for item in value.values():
             _assert_finite_tree(test, item)
+
+
+def _assert_no_raw_pose_vectors(
+    test: unittest.TestCase,
+    value: object,
+) -> None:
+    forbidden_keys = {
+        "pose_model_embedding",
+        "normalized_velocity",
+        "pose_embedding",
+        "embeddings",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key)
+            test.assertFalse(
+                normalized_key in forbidden_keys
+                or normalized_key.endswith("_pose_embedding")
+                or normalized_key.endswith("_normalized_velocity")
+                or normalized_key.endswith("_embeddings"),
+                key,
+            )
+            _assert_no_raw_pose_vectors(test, item)
+    elif isinstance(value, (tuple, list)):
+        if value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            for item in value
+        ):
+            test.assertNotIn(len(value), {60, 120})
+        for item in value:
+            _assert_no_raw_pose_vectors(test, item)
     elif isinstance(value, (tuple, list)):
         for item in value:
             _assert_finite_tree(test, item)
@@ -413,6 +521,368 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             prior_wide_involved_source_switch_boundaries=1,
         )
         self.assertGreater(burst, enter_nonwide)
+
+    def test_per_shot_prior_stops_rewarding_closeups_past_p50_target(
+        self,
+    ) -> None:
+        directive = _section(0, 0.0, 10.0)
+        config = StageEditSemiMarkovConfig()
+        common = {
+            "directive": directive,
+            "shot_size": "closeup",
+            "start_seconds": 5.0,
+            "duration_seconds": 1.0,
+            "derivative_family_source_switched": True,
+            "previous_formation_wide_evidenced": False,
+            "formation_person_count_normalized": 0.0,
+            "formation_pose_coverage": 0.0,
+            "config": config,
+        }
+        toward_target = _montage_grammar_score_raw(
+            previous_shot_size="medium",
+            previous_duration_seconds=1.0,
+            prior_section_known_duration_seconds=4.0,
+            prior_section_closeup_duration_seconds=1.0,
+            prior_section_nonwide_duration_seconds=2.0,
+            **common,
+        )
+        past_target = _montage_grammar_score_raw(
+            previous_shot_size="closeup",
+            previous_duration_seconds=1.0,
+            prior_section_known_duration_seconds=5.0,
+            prior_section_closeup_duration_seconds=2.0,
+            prior_section_nonwide_duration_seconds=3.0,
+            **common,
+        )
+        self.assertGreater(toward_target, past_target)
+        self.assertEqual(0.0, past_target)
+
+    def test_profile_v3_motion_distribution_is_audited_without_a_hard_default(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        config = StageEditSemiMarkovConfig(
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_pose_phase_cosine=(
+                calibration.pose_embedding_cosine_quantiles[0]
+            ),
+        )
+
+        audit = _highlight_motion_calibration_audit(config)
+
+        self.assertTrue(audit["profile_v3_calibration_input_bound"])
+        self.assertTrue(audit["soft_bonus_active"])
+        self.assertEqual(0, audit["hard_minimum_supported_boundary_count"])
+        self.assertEqual(
+            170,
+            audit["calibration"]["counts"][
+                "confirmed_source_switch_count"
+            ],
+        )
+        self.assertEqual(
+            54,
+            audit["calibration"]["counts"][
+                "highlight_role_close_involved_switch_count"
+            ],
+        )
+        self.assertEqual(
+            23,
+            audit["calibration"]["distributions"][
+                "pose_motion_minimum"
+            ]["observed_switch_count"],
+        )
+        self.assertEqual(
+            {"build": 10, "chorus_like": 29, "bridge": 15},
+            audit["calibration"]["counts"][
+                "highlight_role_close_involved_switch_count_by_role"
+            ],
+        )
+        self.assertEqual(
+            14,
+            audit["calibration"]["distributions"][
+                "same_time_pose_embedding_cosine_proxy"
+            ]["observed_switch_count"],
+        )
+        self.assertTrue(
+            audit["calibration"]["distributions"][
+                "same_time_pose_embedding_cosine_proxy"
+            ]["runtime_pair_feature_available"]
+        )
+        self.assertEqual(
+            0,
+            audit["calibration"]["distributions"]["sharpness_minimum"][
+                "observed_switch_count"
+            ],
+        )
+        self.assertIsNone(
+            audit["calibration"]["distributions"]["sharpness_minimum"][
+                "values"
+            ]
+        )
+        self.assertEqual("p10", audit["selected_thresholds"]["pose_motion_quantile"])
+        self.assertEqual(
+            "p10",
+            audit["selected_thresholds"]["continuity_score_quantile"],
+        )
+        self.assertEqual(
+            "p10",
+            audit["selected_thresholds"]["pose_phase_cosine_quantile"],
+        )
+        self.assertTrue(audit["pose_phase_threshold_bound"])
+        self.assertTrue(
+            audit["soft_bonus_requires_pose_phase_when_threshold_bound"]
+        )
+        self.assertFalse(audit["pose_phase_direction_or_velocity_proven"])
+        self.assertEqual(
+            64,
+            len(audit["calibration"]["calibration_fingerprint_sha256"]),
+        )
+
+    def test_motion_closeup_bonus_needs_profile_authority_and_stops_at_p50(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        calibrated = StageEditSemiMarkovConfig(
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_pose_phase_cosine=(
+                calibration.pose_embedding_cosine_quantiles[0]
+            ),
+        )
+        unbound = StageEditSemiMarkovConfig(
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+        )
+        common = {
+            "directive": _section(0, 0.0, 10.0),
+            "shot_size": "closeup",
+            "start_seconds": 5.0,
+            "duration_seconds": 1.0,
+            "previous_shot_size": "wide",
+            "previous_duration_seconds": 1.0,
+            "derivative_family_source_switched": True,
+            "previous_formation_wide_evidenced": False,
+            "formation_person_count_normalized": 0.0,
+            "formation_pose_coverage": 0.0,
+            "prior_source_switch_boundaries": 0,
+            "prior_wide_involved_source_switch_boundaries": 0,
+            "prior_section_known_duration_seconds": 4.0,
+            "prior_section_closeup_duration_seconds": 1.0,
+            "prior_section_nonwide_duration_seconds": 2.0,
+        }
+        static_score = _montage_grammar_score_raw(
+            config=calibrated,
+            boundary_motion_accent_supported=False,
+            **common,
+        )
+        moving_score = _montage_grammar_score_raw(
+            config=calibrated,
+            boundary_motion_accent_supported=True,
+            **common,
+        )
+        authority_missing_score = _montage_grammar_score_raw(
+            config=unbound,
+            boundary_motion_accent_supported=True,
+            **common,
+        )
+        self.assertAlmostEqual(0.12, moving_score - static_score)
+        self.assertAlmostEqual(static_score, authority_missing_score)
+
+        past_target = dict(common)
+        past_target.update(
+            prior_section_known_duration_seconds=5.0,
+            prior_section_closeup_duration_seconds=2.0,
+            prior_section_nonwide_duration_seconds=3.0,
+        )
+        past_static = _montage_grammar_score_raw(
+            config=calibrated,
+            boundary_motion_accent_supported=False,
+            **past_target,
+        )
+        past_moving = _montage_grammar_score_raw(
+            config=calibrated,
+            boundary_motion_accent_supported=True,
+            **past_target,
+        )
+        self.assertAlmostEqual(past_static, past_moving)
+
+    def test_zero_observed_sharpness_cannot_activate_a_profile_threshold(self) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "no calibrated observations",
+        ):
+            StageEditSemiMarkovConfig(
+                highlight_motion_calibration=calibration,
+                highlight_motion_boundary_minimum_pose_motion=(
+                    calibration.pose_motion_minimum_quantiles[0]
+                ),
+                highlight_motion_boundary_minimum_continuity_score=(
+                    calibration.continuity_score_quantiles[0]
+                ),
+                highlight_motion_boundary_minimum_sharpness=0.5,
+            )
+
+    def test_semimarkov_highlight_policy_identity_is_exact_and_immutable(self) -> None:
+        identity = {
+            "analysis_basis": "ive_human_reference_visual_montage_grammar_v2",
+            "schema_version": 2,
+            "path": "/tmp/ive-professional-montage-v2.json",
+            "file_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+        }
+        binding = close_burst_policy_binding_sha256(
+            profile_identity=identity,
+            policy_fingerprint_sha256="c" * 64,
+            minimum_shot_count=2.0,
+            minimum_duration_seconds=2.1503940144767864,
+            minimum_source_switch_fraction=2.0 / 3.0,
+            event_reference_count=6,
+        )
+        config = StageEditSemiMarkovConfig(
+            highlight_policy_profile_analysis_basis=identity["analysis_basis"],
+            highlight_policy_profile_schema_version=identity["schema_version"],
+            highlight_policy_profile_path=identity["path"],
+            highlight_policy_profile_file_sha256=identity["file_sha256"],
+            highlight_policy_profile_content_sha256=identity["content_sha256"],
+            highlight_policy_fingerprint_sha256="c" * 64,
+            highlight_minimum_close_burst_shot_count=2.0,
+            highlight_minimum_close_burst_duration_seconds=2.1503940144767864,
+            highlight_minimum_close_burst_source_switch_fraction=2.0 / 3.0,
+            highlight_close_burst_event_reference_count=6,
+            highlight_close_burst_policy_binding_sha256=binding,
+        )
+
+        provenance = _highlight_policy_provenance(config)
+
+        self.assertTrue(provenance["profile_identity_bound"])
+        self.assertEqual("c" * 64, provenance["policy_fingerprint_sha256"])
+        self.assertEqual(
+            "/tmp/ive-professional-montage-v2.json",
+            provenance["profile_identity"]["path"],
+        )
+        self.assertEqual(
+            "minimum_close_duration_fraction",
+            provenance["metrics"]["local_closeup_duration_minimum"][
+                "professional_montage_policy_member"
+            ],
+        )
+        self.assertEqual(
+            binding,
+            provenance["close_burst_soft_policy_binding"]["binding_sha256"],
+        )
+
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "missing its close-burst",
+        ):
+            replace(
+                config,
+                highlight_close_burst_policy_binding_sha256=None,
+            )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "binding SHA-256 mismatch",
+        ):
+            replace(
+                config,
+                highlight_minimum_close_burst_duration_seconds=2.2,
+            )
+
+    def test_close_only_burst_is_conditional_soft_evidence_not_a_quota(self) -> None:
+        identity = {
+            "analysis_basis": "ive_human_reference_visual_montage_grammar_v2",
+            "schema_version": 2,
+            "path": "/tmp/ive-professional-montage-v2.json",
+            "file_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+        }
+        values = {
+            "minimum_shot_count": 2.0,
+            "minimum_duration_seconds": 2.1503940144767864,
+            "minimum_source_switch_fraction": 2.0 / 3.0,
+            "event_reference_count": 6,
+        }
+        binding = close_burst_policy_binding_sha256(
+            profile_identity=identity,
+            policy_fingerprint_sha256="c" * 64,
+            **values,
+        )
+        config = StageEditSemiMarkovConfig(
+            highlight_policy_profile_analysis_basis=identity["analysis_basis"],
+            highlight_policy_profile_schema_version=identity["schema_version"],
+            highlight_policy_profile_path=identity["path"],
+            highlight_policy_profile_file_sha256=identity["file_sha256"],
+            highlight_policy_profile_content_sha256=identity["content_sha256"],
+            highlight_policy_fingerprint_sha256="c" * 64,
+            highlight_minimum_close_burst_shot_count=values["minimum_shot_count"],
+            highlight_minimum_close_burst_duration_seconds=values[
+                "minimum_duration_seconds"
+            ],
+            highlight_minimum_close_burst_source_switch_fraction=values[
+                "minimum_source_switch_fraction"
+            ],
+            highlight_close_burst_event_reference_count=6,
+            highlight_close_burst_policy_binding_sha256=binding,
+        )
+
+        def decision(index: int, shot_size: str, family: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                shot_index=index,
+                shot_size=shot_size,
+                derivative_family_id=family,
+                duration_seconds=1.1,
+                master_start_seconds=index * 1.1,
+                master_end_seconds=(index + 1) * 1.1,
+                boundary_motion_amount_plus_continuity_supported=True,
+                boundary_pose_phase_match_proven=True,
+                boundary_pose_direction_or_velocity_proven=False,
+            )
+
+        absent = _close_only_multi_source_burst_evidence(
+            (
+                decision(0, "medium", 0),
+                decision(1, "closeup", 1),
+                decision(2, "medium", 2),
+            ),
+            config,
+        )
+        self.assertEqual(0, absent["candidate_event_count"])
+        self.assertEqual(0.0, absent["saturated_soft_preference_score"])
+        self.assertFalse(absent["absence_is_hard_failure"])
+
+        qualified = _close_only_multi_source_burst_evidence(
+            (
+                decision(0, "medium", 0),
+                decision(1, "closeup", 1),
+                decision(2, "extreme_closeup", 2),
+                decision(3, "closeup", 3),
+                decision(4, "full", 0),
+            ),
+            config,
+        )
+        self.assertEqual(1, qualified["qualified_event_count"])
+        self.assertEqual(1.0, qualified["saturated_soft_preference_score"])
+        event = qualified["events"][0]
+        self.assertEqual(3, event["shot_count"])
+        self.assertEqual(2, event["source_switch_count"])
+        self.assertEqual(2, event["same_time_pose_phase_matched_switch_count"])
+        self.assertEqual(0, event["temporal_direction_proven_switch_count"])
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -827,7 +1297,8 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         self.assertEqual(
             "ive_human_reference_wide_transition_floor_plus_"
             "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-            "highlight_burst_reset_and_reference_cadence_target_v6",
+            "highlight_burst_reset_reference_cadence_and_close_burst_"
+            "soft_target_v7",
             grammar["contract"],
         )
         section = grammar["sections"][0]
@@ -894,6 +1365,657 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             cadence["soft_preferred_target_per_minute"],
         )
         self.assertFalse(cadence["product_minimum_is_reference_floor"])
+        aggregate = grammar["highlight_aggregate"]
+        self.assertTrue(aggregate["passed"])
+        self.assertGreaterEqual(
+            aggregate["observed"]["closeup_duration_fraction"],
+            aggregate["hard_targets"][
+                "pooled_product_minimum_closeup_duration_fraction"
+            ],
+        )
+        self.assertGreaterEqual(
+            aggregate["observed"]["nonwide_duration_fraction"],
+            aggregate["hard_targets"][
+                "pooled_product_minimum_nonwide_duration_fraction"
+            ],
+        )
+        self.assertIn(
+            "highlight_aggregate_soft_target",
+            result.timelines[0].score_components,
+        )
+        self.assertFalse(
+            aggregate["soft_targets"]["over_close_past_target_is_rewarded"]
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_candidate_support_below_local_and_pooled_need_fails_before_render(
+        self, _mocked
+    ) -> None:
+        frames = tuple(
+            replace(
+                frame,
+                hard_source_gate_mask=tuple(
+                    source_index in {0, 3, 5} for source_index in range(6)
+                ),
+            )
+            for frame in self._forced_frames((0, 3, 5, 0, 3, 5))
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_pooled_closeup_candidate_support_insufficient",
+        ):
+            _decode(
+                duration=6,
+                source_count=6,
+                frames=frames,
+                metadata=_metadata(6, 6.0),
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_same_shot_size_run=6,
+                    recent_shot_size_window=6,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_pooled_highlight_cannot_rescue_local_p10_failure(
+        self, _mocked
+    ) -> None:
+        sequence = (0, 1, 2, 3, 5, 0, 3, 2, 4, 8, 7, 9)
+        frames = tuple(
+            replace(
+                frame,
+                hard_source_gate_mask=tuple(
+                    source_index in {sequence[index], 11, 12}
+                    for source_index in range(13)
+                ),
+                section_progress=(index % 6) / 5.0,
+            )
+            for index, frame in enumerate(
+                self._forced_frames(sequence, source_count=13)
+            )
+        )
+        plan = SectionPlan(
+            (_section(0, 0.0, 6.0), _section(1, 6.0, 12.0))
+        )
+        constraints = tuple(
+            StageEditSectionConstraint(
+                section_index=index,
+                minimum_shot_seconds=1.0,
+                maximum_shot_seconds=1.0,
+                maximum_switches_per_minute=60.0,
+            )
+            for index in range(2)
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_closeup_fraction_below_floor",
+        ):
+            _decode(
+                duration=12,
+                source_count=13,
+                frames=frames,
+                metadata=_metadata(
+                    13,
+                    12.0,
+                    internal_cuts={
+                        11: tuple(0.5 + index for index in range(12)),
+                        12: tuple(0.5 + index for index in range(12)),
+                    },
+                ),
+                plan=plan,
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=constraints,
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_human_maximum_consecutive_wide_run_is_a_hard_gate(
+        self, _mocked
+    ) -> None:
+        sequence = (
+            0,
+            3,
+            5,
+            8,
+            10,
+            0,
+            3,
+            5,
+            8,
+            1,
+            2,
+            6,
+            4,
+            10,
+            12,
+            7,
+            1,
+            10,
+            6,
+            2,
+        )
+        frames = tuple(
+            replace(
+                frame,
+                hard_source_gate_mask=tuple(
+                    source_index == sequence[index]
+                    for source_index in range(13)
+                ),
+            )
+            for index, frame in enumerate(
+                self._forced_frames(sequence, source_count=13)
+            )
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_maximum_consecutive_wide_run_exceeded",
+        ):
+            _decode(
+                duration=20,
+                source_count=13,
+                frames=frames,
+                metadata=_metadata(13, 20.0),
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_same_shot_size_run=12,
+                    recent_shot_size_window=12,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
+                    ),
+                ),
+            )
+
+    def test_high_pose_motion_alone_cannot_claim_compatible_closeup_cut(
+        self,
+    ) -> None:
+        config = StageEditSemiMarkovConfig(
+            highlight_motion_boundary_minimum_pose_motion=0.5,
+            highlight_motion_boundary_minimum_continuity_score=-0.10,
+            highlight_motion_boundary_minimum_sharpness=0.5,
+            highlight_minimum_motion_closeup_switch_boundaries=1,
+        )
+        frame = replace(
+            _frames(1, 2)[0],
+            source_continuity=(
+                StageEditSourceContinuity(
+                    pose_motion=0.9,
+                    camera_motion_x=0.8,
+                    camera_motion_y=0.0,
+                    sharpness=0.9,
+                ),
+                StageEditSourceContinuity(
+                    pose_motion=0.9,
+                    camera_motion_x=-0.8,
+                    camera_motion_y=0.0,
+                    sharpness=0.9,
+                ),
+            ),
+        )
+        incompatible = _boundary_motion_amount_plus_continuity_evidence(
+            frame=frame,
+            outgoing_source_index=0,
+            incoming_source_index=1,
+            derivative_family_ids=(0, 1),
+            continuity_score=-0.8,
+            config=config,
+        )
+        self.assertTrue(incompatible["evidence_complete"])
+        self.assertFalse(incompatible["accent_supported"])
+
+        blurred = replace(
+            frame,
+            source_continuity=(
+                frame.source_continuity[0],
+                replace(frame.source_continuity[1], sharpness=0.1),
+            ),
+        )
+        blur_rejected = _boundary_motion_amount_plus_continuity_evidence(
+            frame=blurred,
+            outgoing_source_index=0,
+            incoming_source_index=1,
+            derivative_family_ids=(0, 1),
+            continuity_score=-0.01,
+            config=config,
+        )
+        self.assertTrue(blur_rejected["evidence_complete"])
+        self.assertFalse(blur_rejected["accent_supported"])
+
+    def test_pose_phase_soft_qualification_needs_complete_same_time_pair(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        config = StageEditSemiMarkovConfig(
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_pose_phase_cosine=(
+                calibration.pose_embedding_cosine_quantiles[0]
+            ),
+        )
+        same_phase = (1.0,) + (0.0,) * 59
+        opposite_phase = (-1.0,) + (0.0,) * 59
+
+        def evidence(
+            incoming_pose: tuple[float, ...] | None,
+            *,
+            outgoing_motion: float = 0.8,
+            incoming_motion: float = 0.8,
+            families: tuple[int, int] = (0, 1),
+        ) -> dict[str, object]:
+            frame = replace(
+                _frames(1, 2)[0],
+                source_continuity=(
+                    StageEditSourceContinuity(
+                        pose_motion=outgoing_motion,
+                        pose_model_embedding=same_phase,
+                    ),
+                    StageEditSourceContinuity(
+                        pose_motion=incoming_motion,
+                        pose_model_embedding=incoming_pose,
+                    ),
+                ),
+            )
+            return _boundary_motion_amount_plus_continuity_evidence(
+                frame=frame,
+                outgoing_source_index=0,
+                incoming_source_index=1,
+                derivative_family_ids=families,
+                continuity_score=-0.01,
+                config=config,
+            )
+
+        missing = evidence(None)
+        self.assertFalse(missing["pose_phase_evidence_observed"])
+        self.assertFalse(missing["evidence_complete"])
+        self.assertFalse(missing["pose_phase_match_proven"])
+        self.assertFalse(missing["accent_supported"])
+
+        opposite = evidence(opposite_phase)
+        self.assertAlmostEqual(-1.0, opposite["pose_phase_cosine"])
+        self.assertTrue(opposite["pose_phase_evidence_observed"])
+        self.assertTrue(opposite["evidence_complete"])
+        self.assertFalse(opposite["pose_phase_match_proven"])
+        self.assertFalse(opposite["accent_supported"])
+
+        matched = evidence(same_phase)
+        self.assertAlmostEqual(1.0, matched["pose_phase_cosine"])
+        self.assertTrue(matched["pose_phase_match_proven"])
+        self.assertTrue(matched["accent_supported"])
+        self.assertFalse(matched["pose_direction_or_velocity_proven"])
+
+        phase_without_motion = evidence(
+            same_phase,
+            outgoing_motion=0.0,
+            incoming_motion=0.0,
+        )
+        self.assertTrue(phase_without_motion["pose_phase_match_proven"])
+        self.assertFalse(phase_without_motion["accent_supported"])
+
+        same_family = evidence(same_phase, families=(3, 3))
+        self.assertIsNone(same_family["pose_phase_cosine"])
+        self.assertFalse(same_family["pose_phase_match_proven"])
+        self.assertFalse(same_family["accent_supported"])
+
+    def test_sparse_temporal_sidecars_are_audit_only_without_cut_alignment(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        config = StageEditSemiMarkovConfig(
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+        )
+        outgoing_frame = replace(
+            _frames(1, 2)[0],
+            source_continuity=(
+                StageEditSourceContinuity(
+                    pose_motion=0.8,
+                    pose_model_embedding=_pose60(0.1),
+                    temporal_pose_sidecar=_temporal_sidecar(0.9, 0.0),
+                ),
+                StageEditSourceContinuity(pose_motion=0.8),
+            ),
+        )
+
+        def evidence(
+            outgoing_sidecar: StageEditTemporalPoseSidecar | None,
+            incoming_sidecar: StageEditTemporalPoseSidecar | None,
+        ) -> dict[str, object]:
+            incoming_frame = replace(
+                _frames(1, 2)[0],
+                source_continuity=(
+                    StageEditSourceContinuity(
+                        pose_motion=0.8,
+                        pose_model_embedding=_pose60(0.1),
+                        temporal_pose_sidecar=outgoing_sidecar,
+                    ),
+                    StageEditSourceContinuity(
+                        pose_motion=0.8,
+                        pose_model_embedding=_pose60(0.1),
+                        temporal_pose_sidecar=incoming_sidecar,
+                    ),
+                ),
+            )
+            return _boundary_motion_amount_plus_continuity_evidence(
+                frame=incoming_frame,
+                outgoing_frame=outgoing_frame,
+                outgoing_source_index=0,
+                incoming_source_index=1,
+                derivative_family_ids=(0, 1),
+                continuity_score=-0.01,
+                config=config,
+            )
+
+        moving = evidence(
+            _temporal_sidecar(0.0, 0.1),
+            _temporal_sidecar(0.1, 0.2),
+        )
+        self.assertFalse(moving["temporal_pose_motion_thresholds_bound"])
+        self.assertFalse(moving["temporal_pose_motion_input_valid"])
+        self.assertEqual(
+            moving["temporal_classification"], "boundary_alignment_unproven"
+        )
+        self.assertIn(
+            "boundary_alignment_unproven",
+            moving["temporal_failure_reasons"],
+        )
+        self.assertFalse(moving["temporal_dynamic_pose_phase_match"])
+        self.assertFalse(moving["pose_direction_or_velocity_proven"])
+        # Exact same-time endpoint pose and independently calibrated
+        # both-moving/continuity evidence remain a safe non-directional soft
+        # preference even though sparse sidecars prove no phase direction.
+        self.assertTrue(moving["accent_supported"])
+        self.assertEqual(0.0, moving["temporal_confidence"])
+        self.assertIsNone(moving["temporal_endpoint_pose_cosine"])
+        self.assertIsNone(moving["temporal_velocity_direction_cosine"])
+        self.assertIsNone(moving["temporal_phase_compatibility"])
+        self.assertEqual(60, moving["pose_phase_feature_dimension"])
+        self.assertEqual(60, moving["temporal_feature_dimension"])
+        self.assertTrue(moving["temporal_outgoing_sidecar_observed"])
+        self.assertTrue(moving["temporal_incoming_sidecar_observed"])
+        for key in (
+            "pose_phase_outgoing_content_sha256",
+            "pose_phase_incoming_content_sha256",
+            "pose_phase_pair_content_sha256",
+            "temporal_outgoing_content_sha256",
+            "temporal_incoming_content_sha256",
+            "temporal_pair_content_sha256",
+        ):
+            self.assertEqual(64, len(moving[key]))
+
+        static = evidence(
+            _temporal_sidecar(0.0, 0.0),
+            _temporal_sidecar(0.1, 0.1),
+        )
+        opposite = evidence(
+            _temporal_sidecar(0.0, 0.1),
+            _temporal_sidecar(0.1, 0.0),
+        )
+        for unqualified in (static, opposite):
+            self.assertEqual(
+                "boundary_alignment_unproven",
+                unqualified["temporal_classification"],
+            )
+            self.assertFalse(unqualified["temporal_static_pose_match"])
+            self.assertFalse(unqualified["pose_direction_or_velocity_proven"])
+            self.assertIsNone(
+                unqualified["temporal_velocity_direction_cosine"]
+            )
+
+        missing = evidence(_temporal_sidecar(0.0, 0.1), None)
+        self.assertFalse(missing["temporal_pose_motion_input_valid"])
+        self.assertFalse(missing["pose_direction_or_velocity_proven"])
+        self.assertEqual(
+            "temporal_pose_sidecar_missing",
+            missing["temporal_classification"],
+        )
+        self.assertIn(
+            "boundary_alignment_unproven",
+            missing["temporal_failure_reasons"],
+        )
+        self.assertIn(
+            "temporal_incoming_sidecar_missing",
+            missing["temporal_failure_reasons"],
+        )
+
+        with patch(
+            "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+            return_value=_ready_report(),
+        ):
+            decoded = _decode()
+        decision = replace(
+            decoded.timelines[0].decisions[0],
+            boundary_pose_phase_feature_dimension=(
+                moving["pose_phase_feature_dimension"]
+            ),
+            boundary_pose_phase_outgoing_observed=True,
+            boundary_pose_phase_incoming_observed=True,
+            boundary_pose_phase_trusted_producer_contract=(
+                moving["pose_phase_trusted_producer_contract"]
+            ),
+            boundary_pose_phase_outgoing_content_sha256=(
+                moving["pose_phase_outgoing_content_sha256"]
+            ),
+            boundary_pose_phase_incoming_content_sha256=(
+                moving["pose_phase_incoming_content_sha256"]
+            ),
+            boundary_pose_phase_pair_content_sha256=(
+                moving["pose_phase_pair_content_sha256"]
+            ),
+            boundary_temporal_feature_dimension=(
+                moving["temporal_feature_dimension"]
+            ),
+            boundary_temporal_outgoing_sidecar_observed=True,
+            boundary_temporal_incoming_sidecar_observed=True,
+            boundary_temporal_outgoing_trusted_producer_contract=(
+                moving["temporal_outgoing_trusted_producer_contract"]
+            ),
+            boundary_temporal_incoming_trusted_producer_contract=(
+                moving["temporal_incoming_trusted_producer_contract"]
+            ),
+            boundary_temporal_outgoing_content_sha256=(
+                moving["temporal_outgoing_content_sha256"]
+            ),
+            boundary_temporal_incoming_content_sha256=(
+                moving["temporal_incoming_content_sha256"]
+            ),
+            boundary_temporal_pair_content_sha256=(
+                moving["temporal_pair_content_sha256"]
+            ),
+        )
+        decision_payload = json.loads(json.dumps(decision.to_dict()))
+        _assert_no_raw_pose_vectors(self, decision_payload)
+        temporal_payload = decision_payload[
+            "boundary_motion_amount_plus_continuity"
+        ]["temporal_pose_motion"]
+        self.assertEqual(
+            moving["temporal_pair_content_sha256"],
+            temporal_payload["pair_content_sha256"],
+        )
+        poisoned_audit = replace(
+            decoded.audit,
+            input_summary={
+                **decoded.audit.input_summary,
+                "pose_embedding": [0.0] * 60,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "forbidden raw pose vector"):
+            poisoned_audit.to_dict()
+
+        audit = _highlight_motion_calibration_audit(config)
+        self.assertFalse(audit["temporal_pose_motion"]["calibration_bound"])
+        self.assertFalse(audit["temporal_pose_motion"]["activation_available"])
+        self.assertFalse(
+            audit["temporal_pose_motion"]["boundary_alignment_proven"]
+        )
+        self.assertTrue(
+            audit["temporal_pose_motion"]
+            ["sparse_sidecars_are_scalar_hash_audit_only"]
+        )
+        self.assertEqual(audit["temporal_pose_motion"]["new_hard_boundary_quota"], 0)
+        self.assertFalse(
+            audit["temporal_pose_motion"]["static_pose_match_can_receive_dynamic_bonus"]
+        )
+        self.assertEqual(
+            StageEditSemiMarkovConfig(**asdict(config)),
+            config,
+        )
+
+    def test_temporal_direction_is_unbound_by_default_and_needs_separate_calibration(
+        self,
+    ) -> None:
+        default = StageEditSemiMarkovConfig()
+        self.assertIsNone(default.highlight_temporal_pose_motion_calibration)
+        audit = _highlight_motion_calibration_audit(default)
+        self.assertFalse(audit["temporal_pose_motion"]["calibration_bound"])
+        self.assertFalse(audit["temporal_direction_proof_capability_bound"])
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "immutable evidence loader/registry",
+        ):
+            StageEditSemiMarkovConfig(
+                highlight_temporal_pose_motion_calibration=(
+                    StageEditTemporalPoseMotionCalibration(
+                        analysis_basis="separate_temporal_evidence",
+                        source_evidence_sha256="e" * 64,
+                        observed_boundary_count=10,
+                        thresholds=TemporalPoseMotionThresholds(
+                            minimum_boundary_motion_magnitude=0.1,
+                            minimum_endpoint_pose_cosine=0.8,
+                            minimum_velocity_direction_cosine=0.5,
+                            minimum_phase_compatibility=0.7,
+                            pose_norm_epsilon=1.0e-9,
+                        ),
+                    )
+                )
+            )
+
+    def test_pose_phase_threshold_is_calibrated_optional_and_not_a_hard_default(
+        self,
+    ) -> None:
+        calibration = _actual_highlight_motion_calibration()
+        self.assertIsNone(
+            StageEditSemiMarkovConfig()
+            .highlight_motion_boundary_minimum_pose_phase_cosine
+        )
+        self.assertEqual(
+            0,
+            StageEditSemiMarkovConfig()
+            .highlight_minimum_motion_closeup_switch_boundaries,
+        )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "immutable motion calibration",
+        ):
+            StageEditSemiMarkovConfig(
+                highlight_motion_boundary_minimum_pose_motion=0.5,
+                highlight_motion_boundary_minimum_continuity_score=-0.1,
+                highlight_motion_boundary_minimum_pose_phase_cosine=0.8,
+            )
+
+        configured = StageEditSemiMarkovConfig(
+            highlight_motion_calibration=calibration,
+            highlight_motion_boundary_minimum_pose_motion=(
+                calibration.pose_motion_minimum_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_continuity_score=(
+                calibration.continuity_score_quantiles[0]
+            ),
+            highlight_motion_boundary_minimum_pose_phase_cosine=(
+                calibration.pose_embedding_cosine_quantiles[0]
+            ),
+        )
+        round_tripped = StageEditSemiMarkovConfig(**asdict(configured))
+        self.assertEqual(configured, round_tripped)
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "not a calibrated quantile",
+        ):
+            StageEditSemiMarkovConfig(
+                highlight_motion_calibration=calibration,
+                highlight_motion_boundary_minimum_pose_motion=(
+                    calibration.pose_motion_minimum_quantiles[0]
+                ),
+                highlight_motion_boundary_minimum_continuity_score=(
+                    calibration.continuity_score_quantiles[0]
+                ),
+                highlight_motion_boundary_minimum_pose_phase_cosine=0.8,
+            )
+
+    def test_pose_serialization_is_scalar_hash_only_and_bounds_are_explicit(
+        self,
+    ) -> None:
+        pose = (1.0,) + (0.0,) * 59
+        continuity = StageEditSourceContinuity(
+            pose_motion=0.5,
+            pose_model_embedding=pose,
+        )
+        payload = continuity.to_dict()
+        evidence = payload["same_time_pose_evidence"]
+        self.assertTrue(evidence["observed"])
+        self.assertEqual(60, evidence["feature_dimension"])
+        self.assertEqual(64, len(evidence["content_sha256"]))
+        self.assertNotIn("pose_model_embedding", payload)
+        missing = StageEditSourceContinuity().to_dict()[
+            "same_time_pose_evidence"
+        ]
+        self.assertFalse(missing["observed"])
+        self.assertIsNone(missing["content_sha256"])
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "exactly 60",
+        ):
+            StageEditSourceContinuity(pose_model_embedding=(1.0,))
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            r"lie in \[-1, 1\]",
+        ):
+            StageEditSourceContinuity(
+                pose_model_embedding=(1.01,) + (0.0,) * 59
+            )
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -1847,13 +2969,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
 
         result = _decode(frames=frames)
 
-        self.assertEqual(10, result.audit.schema_version)
+        self.assertEqual(DECODER_SCHEMA_VERSION, result.audit.schema_version)
         self.assertEqual(
             "verified_derivative_family_not_file_source",
             result.audit.input_summary["diversity_semantics"],
         )
         self.assertEqual(
-            9,
+            12,
             result.audit.input_summary["decoder_schema_migration"]["supersedes"],
         )
         self.assertEqual(

@@ -36,10 +36,15 @@ from .reference_training_materialization_job import (
     ANALYSIS_BASIS as MATERIALIZATION_ANALYSIS_BASIS,
     SCHEMA_VERSION as MATERIALIZATION_SCHEMA_VERSION,
 )
-from .stage_edit_feature_materializer import StageEditFeatureSnapshot
+from .stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_CONTRACT,
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
 from .stage_edit_feature_snapshot_job import (
-    ACTION_FORMATION_EXTRACTION_CONTRACT,
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    FEATURE_SNAPSHOT_JOB_INPUT_POLICY,
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
     FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
 )
 from .stage_edit_production_train_cli import main as production_train_main
@@ -71,12 +76,7 @@ PRODUCTION_FOLDS: Mapping[str, str] = {
     "heldout-blackhole": "IVE-BLACKHOLE",
 }
 REQUIRED_FEATURE_PROVENANCE_CONTRACTS = frozenset(
-    {
-        ACTION_FORMATION_EXTRACTION_CONTRACT,
-        "reference_match_scores_and_current_or_future_targets_excluded",
-        "synchronized_source_causal_stage_edit_feature_snapshot_v2",
-        "visual_descriptors_decoded_once_per_source_in_forward_order",
-    }
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS
 )
 PRODUCTION_RECENT_HISTORY_MASK_CONTRACT: Mapping[str, Any] = (
     stage_edit_recent_history_mask_contract(DEFAULT_STAGE_EDIT_SCHEMA)
@@ -433,19 +433,14 @@ def _validate_feature_manifest(
     if payload.get("source_count") != EXPECTED_SOURCE_COUNT_PER_SONG:
         raise ProductionFoldPreflightError(f"{song_id} feature source count is not ten")
     input_policy = _mapping(payload.get("input_policy"), "feature input policy")
-    required_policy = {
-        "features_available_before_current_editorial_choice": True,
-        "strictly_past_causal_edit_history_only": True,
-        "reference_match_scores_present": False,
-        "selected_or_rejected_source_targets_present": False,
-        "raw_frames_persisted": False,
-        "identity_embeddings_persisted": False,
-    }
-    if any(input_policy.get(key) is not expected for key, expected in required_policy.items()):
+    if dict(input_policy) != dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY):
         raise ProductionFoldPreflightError(f"{song_id} feature leakage policy mismatch")
     provenance = _mapping(payload.get("feature_provenance"), "feature provenance")
     contracts = set(_array(provenance.get("contracts"), "feature contracts"))
-    if not REQUIRED_FEATURE_PROVENANCE_CONTRACTS <= contracts:
+    if (
+        provenance.get("producer") != FEATURE_MATERIALIZER_CONTRACT
+        or contracts != REQUIRED_FEATURE_PROVENANCE_CONTRACTS
+    ):
         raise ProductionFoldPreflightError(
             f"{song_id} feature provenance contracts are incomplete"
         )
@@ -543,6 +538,10 @@ def _validate_feature_manifest(
             snapshot_payload,
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
         )
+        if snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+            raise ProductionFoldPreflightError(
+                f"{song_id}:{reference_id} snapshot schema is not v3"
+            )
         if snapshot.snapshot_sha256 != item.get("snapshot_sha256"):
             raise ProductionFoldPreflightError(
                 f"{song_id}:{reference_id} snapshot content hash mismatch"

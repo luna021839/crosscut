@@ -22,6 +22,8 @@ from dataclasses import dataclass
 import math
 from typing import Any, Callable, Mapping
 
+from .stage_edit_temporal_pose_motion import TemporalPoseMotionThresholds
+
 
 BOUNDARY_REPAIR_POLICY = (
     "fixed_source_local_frame_search_scene_safe_visual_primary_soft_beat_v1"
@@ -54,7 +56,10 @@ class BoundaryRepairConfig:
     ``visual_cost_slack`` defines a near-equivalent visual band.  Beat cadence
     may choose within that band, but can never promote a candidate whose visual
     cost lies farther from the best safe candidate.  This keeps cadence soft
-    rather than turning a beat grid into a mandatory cutoff.
+    rather than turning a beat grid into a mandatory cutoff. Temporal
+    pose-motion thresholds and their zero-mismatch evidence weight are fully
+    caller-injected: the unbound/zero defaults are audit-neutral and preserve
+    the prior visual cost exactly.
     """
 
     search_radius_frames: int = 3
@@ -62,6 +67,8 @@ class BoundaryRepairConfig:
     interior_scene_cut_guard_frames: int = 4
     visual_cost_slack: float = 0.015
     beat_penalty_weight: float = 0.04
+    temporal_pose_motion_thresholds: TemporalPoseMotionThresholds | None = None
+    temporal_pose_motion_preference_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if (
@@ -95,10 +102,30 @@ class BoundaryRepairConfig:
             )
         slack = _finite(self.visual_cost_slack, "visual_cost_slack")
         beat_weight = _finite(self.beat_penalty_weight, "beat_penalty_weight")
-        if slack < 0.0 or beat_weight < 0.0:
-            raise ValueError("cost slack and beat penalty weight cannot be negative")
+        pose_motion_weight = _finite(
+            self.temporal_pose_motion_preference_weight,
+            "temporal pose-motion preference weight",
+        )
+        if slack < 0.0 or beat_weight < 0.0 or pose_motion_weight < 0.0:
+            raise ValueError(
+                "cost slack and preference/penalty weights cannot be negative"
+            )
+        thresholds = self.temporal_pose_motion_thresholds
+        if thresholds is not None and not isinstance(
+            thresholds,
+            TemporalPoseMotionThresholds,
+        ):
+            raise TypeError(
+                "temporal_pose_motion_thresholds must be "
+                "TemporalPoseMotionThresholds or None"
+            )
         object.__setattr__(self, "visual_cost_slack", slack)
         object.__setattr__(self, "beat_penalty_weight", beat_weight)
+        object.__setattr__(
+            self,
+            "temporal_pose_motion_preference_weight",
+            pose_motion_weight,
+        )
 
 
 @dataclass(frozen=True, slots=True)

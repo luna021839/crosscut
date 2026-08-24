@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from crosscut.audio import AlignmentResult, SourceAlignment
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.ive import AspectRatio
+from crosscut.ive_product_quality_floor import APP_RESULT_EXPOSURE_CONTRACT
 from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
     AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT,
@@ -20,6 +21,7 @@ from crosscut.pipeline import (
     _enforce_automatic_stage_edit_post_render_qa,
     analyze,
 )
+from crosscut.post_render_qa import fingerprint_post_render_artifacts
 from crosscut.render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -277,6 +279,7 @@ def _bridge_result(count: int = 8) -> StageEditPipelineBridgeResult:
             "continuity_scorer_fingerprint": (
                 HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
             ),
+            "temporal_pose_sidecar": snapshot.temporal_pose_sidecar_audit(),
         },
     )
 
@@ -458,17 +461,25 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     _retained_dynamic_crop_version(invalid)
 
     @staticmethod
-    def _post_render_report(verdict: str) -> SimpleNamespace:
+    def _post_render_report(
+        verdict: str,
+        *,
+        input_artifact_fingerprints: dict[str, object] | None = None,
+    ) -> SimpleNamespace:
         passed = verdict == "PASS"
+        payload = {
+            "issue_count": 0 if passed else 1,
+            "fail_issue_count": 0,
+            "conditional_issue_count": 0 if passed else 1,
+            "input_artifact_fingerprints": (
+                input_artifact_fingerprints or {}
+            ),
+        }
         return SimpleNamespace(
             verdict=SimpleNamespace(value=verdict),
             passed=passed,
             analysis_basis="mandatory_stage_edit_post_render_test_v1",
-            to_dict=lambda: {
-                "issue_count": 0 if passed else 1,
-                "fail_issue_count": 0,
-                "conditional_issue_count": 0 if passed else 1,
-            },
+            to_dict=lambda: dict(payload),
         )
 
     @staticmethod
@@ -484,7 +495,21 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
         )
         video.write_bytes(b"preserved final mp4")
         manifest: dict[str, object] = {
-            "render": {"video_path": str(video)},
+            "request": {
+                "group": "IVE",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+            },
+            "artifact_role": "pending_qa",
+            "app_result_exposure": {
+                "contract": APP_RESULT_EXPOSURE_CONTRACT,
+                "video_output_exposed": False,
+                "delivery_completion_message_allowed": False,
+            },
+            "render": {
+                "video_path": str(video),
+                "artifact_role": "pending_qa",
+            },
             "stage_edit_generation": {
                 "activation": {
                     "activation": "automatic_registered_production_bundle"
@@ -500,16 +525,34 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             analysis, video, manifest = self._post_render_artifact_shell(root)
-            report = self._post_render_report("PASS")
 
-            def evaluate(artifact_set, *, trusted_registered_stage_edit):
+            def evaluate(
+                artifact_set,
+                *,
+                output_path,
+                declared_artifact_set,
+                trusted_registered_stage_edit,
+            ):
                 self.assertTrue(trusted_registered_stage_edit)
+                self.assertEqual(
+                    artifact_set.default_report_path,
+                    output_path,
+                )
+                self.assertEqual(analysis, declared_artifact_set.analysis_path)
                 self.assertTrue(artifact_set.analysis_path.is_file())
                 self.assertTrue(artifact_set.render_plan_path.is_file())
                 self.assertTrue(artifact_set.selection_path.is_file())
                 self.assertTrue(artifact_set.video_path.is_file())
-                report_path = artifact_set.default_report_path
-                report_path.write_text('{"verdict":"PASS"}', encoding="utf-8")
+                report = self._post_render_report(
+                    "PASS",
+                    input_artifact_fingerprints=(
+                        fingerprint_post_render_artifacts(artifact_set)
+                    ),
+                )
+                report_path = output_path
+                report_path.write_text(
+                    json.dumps(report.to_dict()), encoding="utf-8"
+                )
                 return report, report_path
 
             with patch(
@@ -529,6 +572,15 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             self.assertTrue(report_path.is_file())
             self.assertTrue(video.is_file())
             persisted = json.loads(analysis.read_text(encoding="utf-8"))
+            self.assertEqual("delivery", persisted["artifact_role"])
+            self.assertTrue(
+                persisted["app_result_exposure"]["video_output_exposed"]
+            )
+            self.assertTrue(
+                persisted["app_result_exposure"][
+                    "delivery_completion_message_allowed"
+                ]
+            )
             provenance = persisted["post_render_qa"]
             self.assertEqual("PASS", provenance["verdict"])
             self.assertTrue(provenance["passed"])
@@ -548,13 +600,29 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             analysis, video, manifest = self._post_render_artifact_shell(root)
-            report = self._post_render_report("CONDITIONAL")
 
-            def evaluate(artifact_set, *, trusted_registered_stage_edit):
+            def evaluate(
+                artifact_set,
+                *,
+                output_path,
+                declared_artifact_set,
+                trusted_registered_stage_edit,
+            ):
                 self.assertTrue(trusted_registered_stage_edit)
-                report_path = artifact_set.default_report_path
+                self.assertEqual(
+                    artifact_set.default_report_path,
+                    output_path,
+                )
+                self.assertEqual(analysis, declared_artifact_set.analysis_path)
+                report = self._post_render_report(
+                    "CONDITIONAL",
+                    input_artifact_fingerprints=(
+                        fingerprint_post_render_artifacts(artifact_set)
+                    ),
+                )
+                report_path = output_path
                 report_path.write_text(
-                    '{"verdict":"CONDITIONAL"}', encoding="utf-8"
+                    json.dumps(report.to_dict()), encoding="utf-8"
                 )
                 return report, report_path
 
@@ -564,7 +632,8 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "verdict CONDITIONAL.*final MP4 preserved.*QA report preserved",
+                    "verdict CONDITIONAL.*retained only for diagnostics.*"
+                    "QA report preserved",
                 ):
                     _enforce_automatic_stage_edit_post_render_qa(
                         registered_stage_edit_bundle=SimpleNamespace(),
@@ -579,6 +648,15 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             self.assertTrue(video.is_file())
             self.assertTrue(report_path.is_file())
             persisted = json.loads(analysis.read_text(encoding="utf-8"))
+            self.assertEqual("rejected", persisted["artifact_role"])
+            self.assertFalse(
+                persisted["app_result_exposure"]["video_output_exposed"]
+            )
+            self.assertFalse(
+                persisted["app_result_exposure"][
+                    "delivery_completion_message_allowed"
+                ]
+            )
             self.assertEqual("CONDITIONAL", persisted["post_render_qa"]["verdict"])
             self.assertFalse(persisted["post_render_qa"]["passed"])
 
@@ -1309,6 +1387,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             reviewer_report.write_text("{}", encoding="utf-8")
             request = AnalysisRequest.from_dict(
                 {
+                    "group": "IVE",
                     "song": "BANG BANG",
                     "edit_mode": "group",
                     "aspect_ratio": "16:9",
@@ -1577,7 +1656,15 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
             def _montage_review(*, bundle, **_kwargs):
                 self.assertIsNotNone(bundle.stage_edit_exact_shot_clock)
                 return (
-                    {"passed": True, "failures": []},
+                    {
+                        "passed": True,
+                        "failures": [],
+                        "highlight_aggregate": {
+                            "soft_targets": {
+                                "aggregate_alignment_score": 0.80,
+                            }
+                        },
+                    },
                     {
                         "stage_edit_exact_shot_clock": (
                             bundle.stage_edit_exact_shot_clock
@@ -1586,6 +1673,26 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                 )
 
             montage_review = Mock(side_effect=_montage_review)
+
+            def _pass_post_render_qa(artifact_set, **_kwargs):
+                report = self._post_render_report(
+                    "PASS",
+                    input_artifact_fingerprints=(
+                        fingerprint_post_render_artifacts(artifact_set)
+                    ),
+                )
+                report_path = artifact_set.default_report_path
+                report_path.write_text(
+                    json.dumps(report.to_dict()), encoding="utf-8"
+                )
+                return report, report_path
+
+            def _write_final_plan(_plan, output_path: Path) -> None:
+                output_path.write_text("{}", encoding="utf-8")
+
+            def _render_final(plan: RenderPlan) -> str:
+                plan.output.write_bytes(b"fixture final mp4")
+                return "h264_videotoolbox"
 
             derivative_metadata = SimpleNamespace(
                 production_ready=True,
@@ -1643,6 +1750,7 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                         lambda *_args, **_kwargs: derivative_metadata
                     ),
                     _review_stage_edit_bundle_montage=montage_review,
+                    evaluate_and_write_post_render_qa=_pass_post_render_qa,
                 ),
                 patch(
                     "crosscut.pipeline.run_stage_edit_pipeline_bridge",
@@ -1679,10 +1787,13 @@ class StageEditVisualCandidateAdapterTests(unittest.TestCase):
                     "crosscut.pipeline._attempt_stage_edit_windowed_beam_reedit",
                     side_effect=_stage_beam_repair,
                 ) as stage_beam_repair,
-                patch("crosscut.pipeline.write_plan"),
+                patch(
+                    "crosscut.pipeline.write_plan",
+                    side_effect=_write_final_plan,
+                ),
                 patch(
                     "crosscut.pipeline.render",
-                    return_value="h264_videotoolbox",
+                    side_effect=_render_final,
                 ),
             ):
                 artifact = analyze(

@@ -10,6 +10,8 @@ pose, framing and structure discontinuity.  The output is a new immutable
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -23,6 +25,7 @@ from .boundary_repair import (
     BoundaryRepairResult,
     repair_boundary,
 )
+from .pose import POSE_BACKEND
 from .timeline import (
     BoundarySideStability,
     ShotType,
@@ -32,6 +35,12 @@ from .timeline import (
 )
 from .timeline_review import TimelineReview, TimelineReviewConfig, review_timeline
 from .timewarp import TimeWarpMap
+from .stage_edit_temporal_pose_motion import (
+    TemporalPoseMotionBoundaryAnalysis,
+    TemporalPoseMotionThresholds,
+    TemporalPoseWindow,
+    analyze_temporal_pose_motion_boundary,
+)
 from .visual_score import (
     FrameVisualDescriptor,
     VisualTimelineChoice,
@@ -42,7 +51,8 @@ from .visual_score import (
 
 
 ANALYSIS_BASIS = (
-    "decoded_plus_minus_three_frame_formation_layout_and_actual_pose_boundary_repair_v3"
+    "decoded_plus_minus_three_frame_formation_layout_and_actual_pose_boundary_"
+    "repair_v3+temporal_pose_motion_audit_v1"
 )
 _PRODUCTION_REVIEW_GATES = TimelineReviewConfig()
 _NEAREST_TEMPORAL_POSE_RADIUS_FRAMES = 3
@@ -53,9 +63,96 @@ def _actual_pose_available(descriptor: FrameVisualDescriptor | None) -> bool:
 
     return bool(
         descriptor is not None
-        and descriptor.pose_backend.startswith("opencv_zoo_mediapipe_pose")
+        and descriptor.pose_backend == POSE_BACKEND
         and descriptor.pose_embedding
     )
+
+
+def _actual_temporal_pose_available(
+    descriptor: FrameVisualDescriptor | None,
+) -> bool:
+    """Require the exact production pose contract used by the motion analyzer."""
+
+    return bool(
+        _actual_pose_available(descriptor)
+        and len(descriptor.pose_embedding) == 60
+    )
+
+
+def _temporal_pose_motion_threshold_values(
+    thresholds: TemporalPoseMotionThresholds,
+) -> dict[str, float]:
+    return {
+        "minimum_boundary_motion_magnitude": float(
+            thresholds.minimum_boundary_motion_magnitude
+        ),
+        "minimum_endpoint_pose_cosine": float(
+            thresholds.minimum_endpoint_pose_cosine
+        ),
+        "minimum_velocity_direction_cosine": float(
+            thresholds.minimum_velocity_direction_cosine
+        ),
+        "minimum_phase_compatibility": float(
+            thresholds.minimum_phase_compatibility
+        ),
+        "pose_norm_epsilon": float(thresholds.pose_norm_epsilon),
+    }
+
+
+def _sha256_json(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _temporal_pose_motion_configuration(
+    thresholds: TemporalPoseMotionThresholds | None,
+    preference_weight: float,
+) -> dict[str, Any]:
+    if thresholds is not None:
+        raise ValueError(
+            "temporal pose-motion calibration activation is unavailable until "
+            "an immutable evidence loader/registry verifies its thresholds"
+        )
+    threshold_values = (
+        _temporal_pose_motion_threshold_values(thresholds)
+        if thresholds is not None
+        else None
+    )
+    threshold_identity = (
+        _sha256_json(
+            {
+                "contract": "temporal_pose_motion_thresholds_v1",
+                "values": threshold_values,
+            }
+        )
+        if threshold_values is not None
+        else None
+    )
+    fingerprint_payload = {
+        "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+        "threshold_identity_sha256": threshold_identity,
+        "preference_weight": float(preference_weight),
+    }
+    return {
+        "contract": fingerprint_payload["contract"],
+        "calibration_status": (
+            "calibration_bound"
+            if thresholds is not None
+            else "calibration_unbound"
+        ),
+        "threshold_values": threshold_values,
+        "threshold_identity_sha256": threshold_identity,
+        "preference_weight": float(preference_weight),
+        "configuration_fingerprint_sha256": _sha256_json(
+            fingerprint_payload
+        ),
+    }
 
 
 def _rms(left: Sequence[float], right: Sequence[float]) -> float | None:
@@ -125,6 +222,77 @@ def _shot_type_mismatch(left: ShotType, right: ShotType) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class TemporalPoseMotionEvidence:
+    """Scalar-only audit of temporal choreography continuity at one cut."""
+
+    calibration_status: str
+    analysis_executed: bool
+    input_valid: bool
+    qualifies: bool
+    classification: str
+    failure_reasons: tuple[str, ...]
+    feature_dimension: int | None
+    outgoing_sample_count: int
+    incoming_sample_count: int
+    outgoing_boundary_motion_magnitude: float | None
+    incoming_boundary_motion_magnitude: float | None
+    endpoint_pose_cosine: float | None
+    velocity_direction_cosine: float | None
+    phase_compatibility: float | None
+    confidence: float
+    static_pose_match: bool
+    dynamic_pose_phase_match: bool
+    direction_evidence_available: bool
+    dynamic_direction_match_proven: bool
+    soft_preference_applied: float
+    threshold_values: dict[str, float] | None
+    threshold_identity_sha256: str | None
+    preference_weight: float
+    configuration_fingerprint_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "scalar_temporal_pose_motion_boundary_evidence_v1",
+            "calibration_status": self.calibration_status,
+            "analysis_executed": self.analysis_executed,
+            "input_valid": self.input_valid,
+            "qualifies": self.qualifies,
+            "classification": self.classification,
+            "failure_reasons": list(self.failure_reasons),
+            "feature_dimension": self.feature_dimension,
+            "outgoing_sample_count": self.outgoing_sample_count,
+            "incoming_sample_count": self.incoming_sample_count,
+            "outgoing_boundary_motion_magnitude": (
+                self.outgoing_boundary_motion_magnitude
+            ),
+            "incoming_boundary_motion_magnitude": (
+                self.incoming_boundary_motion_magnitude
+            ),
+            "endpoint_pose_cosine": self.endpoint_pose_cosine,
+            "velocity_direction_cosine": self.velocity_direction_cosine,
+            "phase_compatibility": self.phase_compatibility,
+            "confidence": self.confidence,
+            "static_pose_match": self.static_pose_match,
+            "dynamic_pose_phase_match": self.dynamic_pose_phase_match,
+            "direction_evidence_available": self.direction_evidence_available,
+            "dynamic_direction_match_proven": (
+                self.dynamic_direction_match_proven
+            ),
+            "soft_preference_applied": self.soft_preference_applied,
+            "threshold_values": (
+                dict(self.threshold_values)
+                if self.threshold_values is not None
+                else None
+            ),
+            "threshold_identity_sha256": self.threshold_identity_sha256,
+            "preference_weight": self.preference_weight,
+            "configuration_fingerprint_sha256": (
+                self.configuration_fingerprint_sha256
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BoundaryEvidenceCoverage:
     """Availability mask for the non-identifying evidence at one exact cut.
 
@@ -167,6 +335,7 @@ class BoundaryEvidenceCoverage:
 @dataclass(frozen=True, slots=True)
 class BoundaryVisualEvidence:
     total_cost: float
+    base_total_cost: float
     formation_mismatch: float | None
     pose_mismatch: float | None
     pose_basis: str
@@ -179,6 +348,7 @@ class BoundaryVisualEvidence:
     structure_mismatch: float | None
     shot_scale_delta: float
     shot_type_mismatch: float
+    temporal_pose_motion: TemporalPoseMotionEvidence
     evidence_coverage: BoundaryEvidenceCoverage
     outgoing_side_stability: BoundarySideStability | None = None
     incoming_side_stability: BoundarySideStability | None = None
@@ -186,6 +356,7 @@ class BoundaryVisualEvidence:
     def to_dict(self) -> dict[str, Any]:
         return {
             "total_cost": self.total_cost,
+            "base_total_cost": self.base_total_cost,
             "formation_mismatch": self.formation_mismatch,
             "pose_mismatch": self.pose_mismatch,
             "pose_basis": self.pose_basis,
@@ -200,6 +371,7 @@ class BoundaryVisualEvidence:
             "structure_mismatch": self.structure_mismatch,
             "shot_scale_delta": self.shot_scale_delta,
             "shot_type_mismatch": self.shot_type_mismatch,
+            "temporal_pose_motion": self.temporal_pose_motion.to_dict(),
             "evidence_coverage": self.evidence_coverage.to_dict(),
             "outgoing_side_stability": (
                 self.outgoing_side_stability.to_dict()
@@ -241,6 +413,8 @@ class VisualBoundaryRepairPlan:
     requested_boundary_indices: tuple[int, ...] | None = None
     geometry_provider_attempt_count: int = 0
     geometry_provider_failure_count: int = 0
+    temporal_pose_motion_thresholds: TemporalPoseMotionThresholds | None = None
+    temporal_pose_motion_preference_weight: float = 0.0
     analysis_basis: str = ANALYSIS_BASIS
 
     @property
@@ -256,6 +430,10 @@ class VisualBoundaryRepairPlan:
             item.selected_visual_evidence.evidence_coverage
             for item in self.repairs
         )
+        temporal_pose_motion = tuple(
+            item.selected_visual_evidence.temporal_pose_motion
+            for item in self.repairs
+        )
 
         def side_count(name: str) -> int:
             return sum(sum(getattr(item, name)) for item in coverage)
@@ -267,6 +445,15 @@ class VisualBoundaryRepairPlan:
         for item in coverage:
             for name in item.missing_mask:
                 missing_counts[name] = missing_counts.get(name, 0) + 1
+        classification_counts: dict[str, int] = {}
+        calibration_status_counts: dict[str, int] = {}
+        for item in temporal_pose_motion:
+            classification_counts[item.classification] = (
+                classification_counts.get(item.classification, 0) + 1
+            )
+            calibration_status_counts[item.calibration_status] = (
+                calibration_status_counts.get(item.calibration_status, 0) + 1
+            )
         return {
             "boundary_count": len(coverage),
             "side_count": 2 * len(coverage),
@@ -331,6 +518,43 @@ class VisualBoundaryRepairPlan:
                 == "structure_hog_fallback"
                 for item in self.repairs
             ),
+            "temporal_pose_motion": {
+                "calibration_status_counts": dict(
+                    sorted(calibration_status_counts.items())
+                ),
+                "classification_counts": dict(
+                    sorted(classification_counts.items())
+                ),
+                "analysis_executed_count": sum(
+                    item.analysis_executed for item in temporal_pose_motion
+                ),
+                "valid_analysis_count": sum(
+                    item.input_valid for item in temporal_pose_motion
+                ),
+                "dynamic_pose_phase_match_count": sum(
+                    item.dynamic_pose_phase_match
+                    for item in temporal_pose_motion
+                ),
+                "static_pose_match_count": sum(
+                    item.static_pose_match for item in temporal_pose_motion
+                ),
+                "direction_evidence_available_count": sum(
+                    item.direction_evidence_available
+                    for item in temporal_pose_motion
+                ),
+                "dynamic_direction_match_proven_count": sum(
+                    item.dynamic_direction_match_proven
+                    for item in temporal_pose_motion
+                ),
+                "soft_preference_applied_count": sum(
+                    item.soft_preference_applied > 0.0
+                    for item in temporal_pose_motion
+                ),
+                "soft_preference_applied_total": sum(
+                    item.soft_preference_applied
+                    for item in temporal_pose_motion
+                ),
+            },
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -351,6 +575,12 @@ class VisualBoundaryRepairPlan:
             ),
             "geometry_provider_failure_count": (
                 self.geometry_provider_failure_count
+            ),
+            "temporal_pose_motion_configuration": (
+                _temporal_pose_motion_configuration(
+                    self.temporal_pose_motion_thresholds,
+                    self.temporal_pose_motion_preference_weight,
+                )
             ),
             "evidence_coverage": self._coverage_summary(),
             "repairs": [item.to_dict() for item in self.repairs],
@@ -469,6 +699,147 @@ def _professional_evidence_basis(
     return "insufficient_combined_geometry_evidence"
 
 
+def _temporal_pose_motion_evidence(
+    *,
+    outgoing_preceding: FrameVisualDescriptor | None,
+    outgoing_exact: FrameVisualDescriptor,
+    incoming_exact: FrameVisualDescriptor,
+    incoming_following: FrameVisualDescriptor | None,
+    output_fps: float,
+    side_sample_span_seconds: float | None,
+    thresholds: TemporalPoseMotionThresholds | None,
+    preference_weight: float,
+) -> TemporalPoseMotionEvidence:
+    configuration = _temporal_pose_motion_configuration(
+        thresholds,
+        preference_weight,
+    )
+    if thresholds is None:
+        return TemporalPoseMotionEvidence(
+            calibration_status="calibration_unbound",
+            analysis_executed=False,
+            input_valid=False,
+            qualifies=False,
+            classification="calibration_unbound",
+            failure_reasons=("temporal_pose_motion_thresholds_unbound",),
+            feature_dimension=None,
+            outgoing_sample_count=0,
+            incoming_sample_count=0,
+            outgoing_boundary_motion_magnitude=None,
+            incoming_boundary_motion_magnitude=None,
+            endpoint_pose_cosine=None,
+            velocity_direction_cosine=None,
+            phase_compatibility=None,
+            confidence=0.0,
+            static_pose_match=False,
+            dynamic_pose_phase_match=False,
+            direction_evidence_available=False,
+            dynamic_direction_match_proven=False,
+            soft_preference_applied=0.0,
+            threshold_values=None,
+            threshold_identity_sha256=None,
+            preference_weight=float(preference_weight),
+            configuration_fingerprint_sha256=str(
+                configuration["configuration_fingerprint_sha256"]
+            ),
+        )
+
+    span = (
+        float(side_sample_span_seconds)
+        if side_sample_span_seconds is not None
+        and math.isfinite(side_sample_span_seconds)
+        and side_sample_span_seconds > 0.0
+        else 3.0 / float(output_fps)
+    )
+    outgoing_pair_available = (
+        _actual_temporal_pose_available(outgoing_preceding)
+        and _actual_temporal_pose_available(outgoing_exact)
+    )
+    incoming_pair_available = (
+        _actual_temporal_pose_available(incoming_exact)
+        and _actual_temporal_pose_available(incoming_following)
+    )
+    outgoing_window = (
+        TemporalPoseWindow(
+            times_seconds=(-span, 0.0),
+            embeddings=(
+                outgoing_preceding.pose_embedding,
+                outgoing_exact.pose_embedding,
+            ),
+        )
+        if outgoing_pair_available and outgoing_preceding is not None
+        else None
+    )
+    incoming_window = (
+        TemporalPoseWindow(
+            times_seconds=(0.0, span),
+            embeddings=(
+                incoming_exact.pose_embedding,
+                incoming_following.pose_embedding,
+            ),
+        )
+        if incoming_pair_available and incoming_following is not None
+        else None
+    )
+    analysis: TemporalPoseMotionBoundaryAnalysis = (
+        analyze_temporal_pose_motion_boundary(
+            outgoing=outgoing_window,
+            incoming=incoming_window,
+            thresholds=thresholds,
+        )
+    )
+    missing_reasons: list[str] = []
+    for name, descriptor in (
+        ("outgoing_preceding", outgoing_preceding),
+        ("outgoing_exact", outgoing_exact),
+        ("incoming_exact", incoming_exact),
+        ("incoming_following", incoming_following),
+    ):
+        if not _actual_temporal_pose_available(descriptor):
+            missing_reasons.append(f"missing_{name}_actual_60d_pose")
+    return TemporalPoseMotionEvidence(
+        calibration_status="calibration_bound",
+        analysis_executed=True,
+        input_valid=analysis.input_valid,
+        qualifies=analysis.qualifies,
+        classification=analysis.classification,
+        failure_reasons=tuple(
+            dict.fromkeys((*analysis.failure_reasons, *missing_reasons))
+        ),
+        feature_dimension=analysis.feature_dimension,
+        outgoing_sample_count=analysis.outgoing_sample_count,
+        incoming_sample_count=analysis.incoming_sample_count,
+        outgoing_boundary_motion_magnitude=(
+            analysis.outgoing_boundary_motion_magnitude
+        ),
+        incoming_boundary_motion_magnitude=(
+            analysis.incoming_boundary_motion_magnitude
+        ),
+        endpoint_pose_cosine=analysis.endpoint_pose_cosine,
+        velocity_direction_cosine=analysis.velocity_direction_cosine,
+        phase_compatibility=analysis.phase_compatibility,
+        confidence=analysis.confidence,
+        static_pose_match=analysis.static_pose_match,
+        dynamic_pose_phase_match=analysis.dynamic_pose_phase_match,
+        direction_evidence_available=(
+            analysis.input_valid
+            and analysis.velocity_direction_cosine is not None
+        ),
+        dynamic_direction_match_proven=analysis.qualifies,
+        soft_preference_applied=0.0,
+        threshold_values=dict(
+            configuration["threshold_values"]  # type: ignore[arg-type]
+        ),
+        threshold_identity_sha256=str(
+            configuration["threshold_identity_sha256"]
+        ),
+        preference_weight=float(preference_weight),
+        configuration_fingerprint_sha256=str(
+            configuration["configuration_fingerprint_sha256"]
+        ),
+    )
+
+
 def _visual_evidence(
     outgoing: FrameVisualDescriptor,
     incoming: FrameVisualDescriptor,
@@ -483,6 +854,8 @@ def _visual_evidence(
     ] = (),
     output_fps: float = 29.97,
     side_sample_span_seconds: float | None = None,
+    temporal_pose_motion_thresholds: TemporalPoseMotionThresholds | None = None,
+    temporal_pose_motion_preference_weight: float = 0.0,
 ) -> BoundaryVisualEvidence:
     formation = formation_assignment_mismatch(
         outgoing.formation_people,
@@ -587,6 +960,16 @@ def _visual_evidence(
         and side_sample_span_seconds is not None
         else None
     )
+    temporal_pose_motion = _temporal_pose_motion_evidence(
+        outgoing_preceding=outgoing_preceding,
+        outgoing_exact=outgoing,
+        incoming_exact=incoming,
+        incoming_following=incoming_following,
+        output_fps=output_fps,
+        side_sample_span_seconds=side_sample_span_seconds,
+        thresholds=temporal_pose_motion_thresholds,
+        preference_weight=temporal_pose_motion_preference_weight,
+    )
 
     formation_counts = (
         len(outgoing.formation_people),
@@ -679,8 +1062,27 @@ def _visual_evidence(
         if value is not None:
             weighted += factor * value
             weight += factor
+    base_total_cost = weighted / weight
+    if (
+        temporal_pose_motion.dynamic_pose_phase_match
+        and temporal_pose_motion_preference_weight > 0.0
+    ):
+        # A calibrated dynamic match contributes only a caller-weighted
+        # zero-mismatch evidence term. It cannot reject a candidate, bypass
+        # the professional gates, or create a quota. The resulting preference
+        # is mathematically bounded between zero and the unchanged base cost.
+        total_cost = weighted / (
+            weight + temporal_pose_motion_preference_weight
+        )
+        temporal_pose_motion = replace(
+            temporal_pose_motion,
+            soft_preference_applied=base_total_cost - total_cost,
+        )
+    else:
+        total_cost = base_total_cost
     return BoundaryVisualEvidence(
-        total_cost=weighted / weight,
+        total_cost=total_cost,
+        base_total_cost=base_total_cost,
         formation_mismatch=formation,
         pose_mismatch=pose,
         pose_basis=pose_basis,
@@ -693,6 +1095,7 @@ def _visual_evidence(
         structure_mismatch=structure,
         shot_scale_delta=scale,
         shot_type_mismatch=shot_type,
+        temporal_pose_motion=temporal_pose_motion,
         evidence_coverage=coverage,
         outgoing_side_stability=outgoing_stability,
         incoming_side_stability=incoming_stability,
@@ -973,6 +1376,14 @@ def repair_visual_timeline_boundaries(
         raise ValueError("boundary-repair source arrays must have matching lengths")
     if not math.isfinite(output_fps) or output_fps <= 0.0:
         raise ValueError("output_fps must be positive and finite")
+    settings = config or BoundaryRepairConfig()
+    # Reject unauthorized calibration before opening media, invoking a
+    # descriptor provider, or discovering that every requested boundary can
+    # be skipped.
+    _temporal_pose_motion_configuration(
+        settings.temporal_pose_motion_thresholds,
+        settings.temporal_pose_motion_preference_weight,
+    )
     boundary_count = len(visual_timeline.choices) - 1
     requested_boundary_indices: tuple[int, ...] | None
     if boundary_indices is None:
@@ -1083,7 +1494,6 @@ def repair_visual_timeline_boundaries(
     repairs: list[VisualBoundaryRepair] = []
     failures: list[dict[str, Any]] = []
     same_source = 0
-    settings = config or BoundaryRepairConfig()
     try:
         for boundary_index in boundary_indices_to_review:
             outgoing = choices[boundary_index]
@@ -1203,6 +1613,12 @@ def repair_visual_timeline_boundaries(
                     ),
                     output_fps=output_fps,
                     side_sample_span_seconds=side_sample_span_seconds,
+                    temporal_pose_motion_thresholds=(
+                        settings.temporal_pose_motion_thresholds
+                    ),
+                    temporal_pose_motion_preference_weight=(
+                        settings.temporal_pose_motion_preference_weight
+                    ),
                 )
                 evidence_by_offset[context.frame_offset] = (
                     evidence,
@@ -1266,6 +1682,9 @@ def repair_visual_timeline_boundaries(
                             ),
                             "missing_mask": list(
                                 item[0].evidence_coverage.missing_mask
+                            ),
+                            "temporal_pose_motion": (
+                                item[0].temporal_pose_motion.to_dict()
                             ),
                         }
                         for frame_offset, item in sorted(
@@ -1372,7 +1791,10 @@ def repair_visual_timeline_boundaries(
     repaired_timeline = VisualTimelinePlan(
         choices=tuple(choices),
         optimizer_score=visual_timeline.optimizer_score,
-        analysis_basis=f"{visual_timeline.analysis_basis}+local_boundary_repair_v3",
+        analysis_basis=(
+            f"{visual_timeline.analysis_basis}+local_boundary_repair_v3+"
+            "temporal_pose_motion_audit_v1"
+        ),
         selected_candidate_index=visual_timeline.selected_candidate_index,
         candidate_generation_basis=visual_timeline.candidate_generation_basis,
         candidate_review_summaries=visual_timeline.candidate_review_summaries,
@@ -1386,6 +1808,12 @@ def repair_visual_timeline_boundaries(
         requested_boundary_indices=requested_boundary_indices,
         geometry_provider_attempt_count=len(geometry_provider_attempts),
         geometry_provider_failure_count=len(geometry_provider_failures),
+        temporal_pose_motion_thresholds=(
+            settings.temporal_pose_motion_thresholds
+        ),
+        temporal_pose_motion_preference_weight=(
+            settings.temporal_pose_motion_preference_weight
+        ),
     )
 
 
@@ -1393,6 +1821,7 @@ __all__ = [
     "ANALYSIS_BASIS",
     "BoundaryEvidenceCoverage",
     "BoundaryVisualEvidence",
+    "TemporalPoseMotionEvidence",
     "VisualBoundaryRepair",
     "VisualBoundaryRepairPlan",
     "repair_visual_timeline_boundaries",

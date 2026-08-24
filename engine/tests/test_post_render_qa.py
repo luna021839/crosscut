@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -24,17 +25,24 @@ from crosscut.cut_local_sync import (
     _canonical_sha256,
     _used_source_indices,
 )
+from crosscut.ive import AspectRatio
 from crosscut.post_render_qa import (
     PostRenderArtifactSet,
     PostRenderQAConfig,
     PostRenderQAReport,
     PostRenderQAVerdict,
+    _cadence_and_repetition_metrics,
     _IssueCollector,
+    _selected_boundary_repair_contracts,
     _sync_quality_metrics,
     _transform_metrics,
+    _validate_selection,
     _validate_plan_invariants,
     discover_completed_artifact_sets,
     evaluate_post_render_qa,
+)
+from crosscut.ive_product_quality_floor import (
+    APP_RESULT_EXPOSURE_CONTRACT,
 )
 from crosscut.pipeline import _source_index_mapping
 from crosscut.professional_montage_grammar import (
@@ -45,9 +53,23 @@ from crosscut.rendered_montage_grammar_review import (
     RenderedMontageGrammarConfig,
     review_rendered_montage_grammar,
 )
+from crosscut.render import (
+    RenderPlan,
+    RenderSegment,
+    RenderTransition,
+    segment_frame_counts,
+)
+from crosscut.rendered_proxy_review import (
+    OutputSubjectGeometry,
+    _segment_interior_geometry_evidence,
+    _segment_interior_schedule,
+)
 from crosscut.stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
     StageEditTransitionAuthority,
+)
+from crosscut.stage_edit_windowed_beam_redecode import (
+    STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
 )
 
 
@@ -58,7 +80,12 @@ _DURATION = 32.0
 _FRAME_COUNT = 960
 _REGULAR_SEGMENT_DURATION = 3.5
 _MONTAGE_TEST_CONFIG = RenderedMontageGrammarConfig(
-    burst_maximum_run_seconds=4.0
+    burst_maximum_run_seconds=4.0,
+    # The compact nine-shot fixture predates the immutable 20-reference
+    # cadence profile.  Production/default-config cadence is covered by the
+    # dedicated rendered-grammar tests below; this legacy fixture keeps its
+    # explicit synthetic threshold instead of pretending it has extra cuts.
+    highlight_product_minimum_source_switches_per_minute=15.0,
 )
 
 
@@ -179,6 +206,164 @@ def _promote_boundary_repairs_to_actual_pose_v3(
             )
 
 
+def _promote_boundary_repairs_to_unbound_temporal_pose_motion_v1(
+    analysis: dict,
+    selection: dict,
+) -> None:
+    _promote_boundary_repairs_to_actual_pose_v3(analysis, selection)
+    selected_index = selection["selected_candidate_index"]
+    selected_candidate = next(
+        item
+        for item in selection["complete_candidates"]
+        if item.get("candidate_index") == selected_index
+    )
+    configuration_fingerprint = _canonical_sha256(
+        {
+            "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+            "threshold_identity_sha256": None,
+            "preference_weight": 0.0,
+        }
+    )
+    configuration = {
+        "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+        "calibration_status": "calibration_unbound",
+        "threshold_values": None,
+        "threshold_identity_sha256": None,
+        "preference_weight": 0.0,
+        "configuration_fingerprint_sha256": configuration_fingerprint,
+    }
+    plans = (
+        analysis["visual_boundary_repairs"],
+        selected_candidate["boundary_repairs"],
+    )
+    for repair_plan in plans:
+        repair_plan["analysis_basis"] += "+temporal_pose_motion_audit_v1"
+        repair_plan["temporal_pose_motion_configuration"] = deepcopy(
+            configuration
+        )
+        for repair in repair_plan["repairs"]:
+            evidence = repair["selected_visual_evidence"]
+            evidence["base_total_cost"] = evidence["total_cost"]
+            evidence["temporal_pose_motion"] = {
+                "contract": "scalar_temporal_pose_motion_boundary_evidence_v1",
+                "calibration_status": "calibration_unbound",
+                "analysis_executed": False,
+                "input_valid": False,
+                "qualifies": False,
+                "classification": "calibration_unbound",
+                "failure_reasons": [
+                    "temporal_pose_motion_thresholds_unbound"
+                ],
+                "feature_dimension": None,
+                "outgoing_sample_count": 0,
+                "incoming_sample_count": 0,
+                "outgoing_boundary_motion_magnitude": None,
+                "incoming_boundary_motion_magnitude": None,
+                "endpoint_pose_cosine": None,
+                "velocity_direction_cosine": None,
+                "phase_compatibility": None,
+                "confidence": 0.0,
+                "static_pose_match": False,
+                "dynamic_pose_phase_match": False,
+                "direction_evidence_available": False,
+                "dynamic_direction_match_proven": False,
+                "soft_preference_applied": 0.0,
+                "threshold_values": None,
+                "threshold_identity_sha256": None,
+                "preference_weight": 0.0,
+                "configuration_fingerprint_sha256": (
+                    configuration_fingerprint
+                ),
+            }
+
+
+def _bind_synthetic_temporal_pose_motion_fixture(
+    analysis: dict,
+    selection: dict,
+) -> None:
+    """Exercise the injected QA contract without claiming real calibration."""
+
+    _promote_boundary_repairs_to_unbound_temporal_pose_motion_v1(
+        analysis,
+        selection,
+    )
+    selected_index = selection["selected_candidate_index"]
+    selected_candidate = next(
+        item
+        for item in selection["complete_candidates"]
+        if item.get("candidate_index") == selected_index
+    )
+    thresholds = {
+        "minimum_boundary_motion_magnitude": 0.5,
+        "minimum_endpoint_pose_cosine": 0.9,
+        "minimum_velocity_direction_cosine": 0.8,
+        "minimum_phase_compatibility": 0.85,
+        "pose_norm_epsilon": 1e-8,
+    }
+    threshold_identity = _canonical_sha256(
+        {
+            "contract": "temporal_pose_motion_thresholds_v1",
+            "values": thresholds,
+        }
+    )
+    configuration_fingerprint = _canonical_sha256(
+        {
+            "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+            "threshold_identity_sha256": threshold_identity,
+            "preference_weight": 1.0,
+        }
+    )
+    configuration = {
+        "contract": "visual_boundary_temporal_pose_motion_preference_v1",
+        "calibration_status": "calibration_bound",
+        "threshold_values": thresholds,
+        "threshold_identity_sha256": threshold_identity,
+        "preference_weight": 1.0,
+        "configuration_fingerprint_sha256": configuration_fingerprint,
+    }
+    plans = (
+        analysis["visual_boundary_repairs"],
+        selected_candidate["boundary_repairs"],
+    )
+    for repair_plan in plans:
+        repair_plan["temporal_pose_motion_configuration"] = deepcopy(
+            configuration
+        )
+        for repair in repair_plan["repairs"]:
+            evidence = repair["selected_visual_evidence"]
+            evidence["base_total_cost"] = 0.08
+            evidence["total_cost"] = 0.075
+            evidence["temporal_pose_motion"] = {
+                "contract": "scalar_temporal_pose_motion_boundary_evidence_v1",
+                "calibration_status": "calibration_bound",
+                "analysis_executed": True,
+                "input_valid": True,
+                "qualifies": True,
+                "classification": "dynamic_pose_phase_match",
+                "failure_reasons": [],
+                "feature_dimension": 60,
+                "outgoing_sample_count": 2,
+                "incoming_sample_count": 2,
+                "outgoing_boundary_motion_magnitude": 1.2,
+                "incoming_boundary_motion_magnitude": 1.1,
+                "endpoint_pose_cosine": 0.98,
+                "velocity_direction_cosine": 0.95,
+                "phase_compatibility": 0.975,
+                "confidence": 0.975,
+                "static_pose_match": False,
+                "dynamic_pose_phase_match": True,
+                "direction_evidence_available": True,
+                "dynamic_direction_match_proven": True,
+                "soft_preference_applied": 0.005,
+                "threshold_values": thresholds,
+                "threshold_identity_sha256": threshold_identity,
+                "preference_weight": 1.0,
+                "configuration_fingerprint_sha256": (
+                    configuration_fingerprint
+                ),
+            }
+
+
 def _proxy_boundary(index: int) -> dict[str, object]:
     cut_frame = int(round(_REGULAR_SEGMENT_DURATION * (index + 1) * _FPS))
     geometry = {
@@ -233,6 +418,9 @@ def _final_review() -> dict[str, object]:
             "decoded_frame_count": _FRAME_COUNT,
             "duration_seconds": _DURATION,
             "render_codec": "libx264",
+            "content_sha256": hashlib.sha256(
+                b"synthetic decoded proxy fixture"
+            ).hexdigest(),
             "temporary_proxy_removed_after_review": True,
         },
         "overall_quality": {
@@ -488,6 +676,11 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
     artifacts = PostRenderArtifactSet.from_analysis_path(
         root / f"{_BASE}-analysis.json"
     )
+    source_paths = tuple(root / f"source-{index}.mp4" for index in range(8))
+    for index, source_path in enumerate(source_paths):
+        source_path.write_bytes(
+            f"non-empty synthetic source fixture {index}\n".encode("utf-8")
+        )
     transitions = [_transition(index) for index in range(8)]
     source_sequence = [0, 1, 2, 3, 4, 5, 6, 7, 0]
     segments = [
@@ -512,7 +705,7 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
         for index, source_index in enumerate(source_sequence)
     ]
     plan = {
-        "sources": [str(root / f"source-{index}.mp4") for index in range(8)],
+        "sources": [str(source_path) for source_path in source_paths],
         "segments": segments,
         "reference_source": 0,
         "aspect_ratio": "landscape",
@@ -584,6 +777,9 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
             "source_index": source_index,
             "canonical_master_start": _segment_bounds(index)[0],
             "canonical_master_end": _segment_bounds(index)[1],
+            "duration_seconds": (
+                _segment_bounds(index)[1] - _segment_bounds(index)[0]
+            ),
             "shot_type": "close_up",
             "entry_shot_type": "close_up",
             "exit_shot_type": "close_up",
@@ -616,7 +812,7 @@ def _fixture_payloads(root: Path) -> tuple[PostRenderArtifactSet, dict, dict, di
         "transitions": deepcopy(transitions),
     }
     analysis = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": "2026-08-23T12:34:56+00:00",
         "source_index_mapping": {
             "request_index_domain": "request_source_index",
@@ -741,6 +937,91 @@ def _persist_fixture(
     return artifacts, analysis, plan, selection
 
 
+def _install_valid_windowed_semimarkov_redecode(selection: dict) -> None:
+    initial_sha = "1" * 64
+    final_sha = "2" * 64
+    input_sha = "3" * 64
+    evidence = {
+        "actual_semimarkov_redecode": True,
+        "new_proxy_review_available": True,
+        "new_proxy_passed": True,
+        "proposal_materialization_lineage_preserved": True,
+        "final_authoritative_exact_shot_clock_count": 1,
+        "source_sequence_changed_by_redecode": True,
+        "perceptual_targeted_source_substitution_required": True,
+        "perceptual_targeted_source_substitution_satisfied": True,
+        "new_proxy_perceptual_source_admission_passed": True,
+    }
+    lineage_event = {
+        "stage": "reviewer_issue_window_actual_semimarkov_redecode",
+        "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+        "repair_loop_input_sha256": input_sha,
+        "initial_edit_sha256": initial_sha,
+        "final_edit_sha256": final_sha,
+        "committed_iteration_count": 1,
+        "actual_public_decoder_invoked": True,
+        "decoded_proxy_revalidated_after_splice": True,
+        "heuristic_timing_repair_used_as_reviewer_repair": False,
+        "proposal_materialization_lineage_event_count": 0,
+        **evidence,
+    }
+    lineage = [
+        {"stage": "windowed_semimarkov_proposal_lineage", "event_count": 0},
+        lineage_event,
+    ]
+    selection["final_selected_version"] = "windowed_semimarkov_redecode"
+    selection["proxy_triggered_partial_reedit"] = {
+        "analysis_basis": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+        "attempted": True,
+        "actual_local_semimarkov_redecode": True,
+        "heuristic_timing_repair_used": False,
+        "selected_version": "windowed_semimarkov_redecode",
+        "reason": "strict_objectives_improved_and_proxy_revalidated",
+        "before_review": deepcopy(selection["candidates"][0]["review"]),
+        "after_review": deepcopy(selection["final_selected_review"]),
+        "repair_loop_changed": True,
+        "changed": True,
+        "repair_loop": {
+            "orchestrator": "stage_edit_repair_loop_v1",
+            "input_sha256": input_sha,
+            "selected_candidate_index": 0,
+            "initial_edit_sha256": initial_sha,
+            "final_edit_sha256": final_sha,
+            "initial_review": {"decoded_objective": 1.0},
+            "final_review": {"decoded_objective": 2.0},
+            "iterations": [
+                {
+                    "iteration": 1,
+                    "committed_proposal_id": "actual-windowed-semimarkov-i01-r01",
+                    "committed_edit_sha256": final_sha,
+                }
+            ],
+            "committed_iteration_count": 1,
+        },
+        "windowed_beam_redecode": {
+            "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+            "actual_public_decoder": (
+                "crosscut.stage_edit_semimarkov_beam."
+                "decode_stage_edit_semimarkov_beam"
+            ),
+            "call_count": 1,
+            "calls": [
+                {
+                    "contract": STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+                    "iteration": 1,
+                }
+            ],
+        },
+        "selected_redecode_evidence": evidence,
+        "candidate_lineage_after": lineage,
+    }
+    selection["stage_edit_render_promotion"] = {
+        "selected_version": "windowed_semimarkov_redecode",
+        "selected_candidate_index": selection["selected_candidate_index"],
+        "selected_candidate_lineage": deepcopy(lineage),
+    }
+
+
 def _ffprobe_payload(
     *,
     frame_count: int = _FRAME_COUNT,
@@ -772,9 +1053,10 @@ def _ffprobe_payload(
 
 def _perceptual_pass_payload() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "analysis": (
-            "full_final_decode_temporal_pumping_and_exact_source_retention_v1"
+            "full_final_decode_temporal_pumping_exact_source_retention_and_"
+            "structure_binding_v2"
         ),
         "verdict": "PASS",
         "passed": True,
@@ -892,6 +1174,15 @@ def _install_valid_registered_montage_evidence(
             "transitions": deepcopy(plan["transitions"])
         }
         _promote_review_to_domain_aware_v3(candidate["review"], plan)
+    request = analysis.get("request")
+    if (
+        isinstance(request, dict)
+        and str(request.get("group") or "").strip().upper() == "IVE"
+        and str(request.get("edit_mode") or "").strip().lower() == "group"
+        and str(request.get("source_mode") or "").strip().lower()
+        == "automatic"
+    ):
+        _attach_valid_segment_interior_geometry(analysis, plan, selection)
     analysis["rendered_proxy_review"] = deepcopy(
         selection["final_selected_review"]
     )
@@ -905,6 +1196,81 @@ def _install_valid_registered_montage_evidence(
         "path": "/fixture/stable/professional-montage-profile.json",
     }
     analysis["rendered_montage_grammar_review"] = review
+
+
+def _attach_valid_segment_interior_geometry(
+    analysis: dict,
+    plan: dict,
+    selection: dict,
+) -> None:
+    """Give the automatic-IVE fixture real hash-bound interior samples."""
+
+    proxy_plan = RenderPlan(
+        sources=tuple(Path(source) for source in plan["sources"]),
+        segments=tuple(
+            RenderSegment(
+                source_index=segment["source_index"],
+                source_start=segment["source_start"],
+                duration=segment["duration"],
+                master_start=segment["master_start"],
+                source_duration=segment["source_duration"],
+            )
+            for segment in plan["segments"]
+        ),
+        reference_source=plan["reference_source"],
+        aspect_ratio=AspectRatio.LANDSCAPE,
+        output=Path(plan["output"]),
+        master_audio_start=plan["master_audio_start"],
+        width=854,
+        height=480,
+        fps=plan["fps"],
+        transitions=tuple(
+            RenderTransition(
+                kind=transition["kind"],
+                frame_count=transition["frame_count"],
+                reason=transition["reason"],
+                tier=transition["tier"],
+            )
+            for transition in plan["transitions"]
+        ),
+    )
+    counts = segment_frame_counts(proxy_plan)
+    schedule = _segment_interior_schedule(proxy_plan, counts)
+    choices = analysis["visual_timeline"]["choices"]
+    class_codes = {"wide": 1, "medium": 2, "close": 3}
+    frames: dict[int, np.ndarray] = {}
+    for sample in schedule:
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        frame[0, 0, 0] = class_codes[
+            str(choices[sample.segment_index]["shot_type"])
+        ]
+        frames[sample.frame_index] = frame
+
+    def geometry_provider(frame: np.ndarray) -> OutputSubjectGeometry:
+        shot_class = {1: "wide", 2: "medium", 3: "close"}[
+            int(frame[0, 0, 0])
+        ]
+        if shot_class == "wide":
+            return OutputSubjectGeometry(face_count=0)
+        height = 0.15 if shot_class == "medium" else 0.30
+        return OutputSubjectGeometry(
+            face_count=1,
+            face_bbox_xywh=(0.35, 0.20, 0.20, height),
+            face_backend="synthetic",
+        )
+
+    final_review = selection["final_selected_review"]
+    evidence = _segment_interior_geometry_evidence(
+        plan=proxy_plan,
+        counts=counts,
+        schedule=schedule,
+        frames=frames,
+        geometry_provider=geometry_provider,
+        proxy_identity=final_review["proxy"],
+    )
+    final_review["segment_interior_geometry"] = evidence
+    for candidate in selection["candidates"]:
+        candidate["review"]["segment_interior_geometry"] = deepcopy(evidence)
 
 
 def _activate_registered_cut_local_sync(
@@ -1235,6 +1601,64 @@ class PostRenderQATests(unittest.TestCase):
         self._perceptual_patcher.start()
         self.addCleanup(self._perceptual_patcher.stop)
 
+    def test_automatic_ive_whole_song_band_accepts_profile_preferred_cadence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _artifacts, analysis, plan, _selection = _fixture_payloads(
+                Path(directory)
+            )
+        preferred_rate = 23.505554096533405
+        # Eight exact source switches at this duration yield the immutable
+        # chorus-profile P75 target.  The legacy global 17.5 ceiling must not
+        # mark an automatic IVE delivery conditional.
+        plan["duration"] = 8.0 * 60.0 / preferred_rate
+        analysis["timeline_review"]["source_switches_per_minute"] = (
+            preferred_rate
+        )
+        analysis["request"] = {
+            "group": "IVE",
+            "edit_mode": "group",
+            "source_mode": "automatic",
+        }
+        automatic_collector = _IssueCollector()
+        automatic_metrics = _cadence_and_repetition_metrics(
+            analysis,
+            plan,
+            PostRenderQAConfig(),
+            automatic_collector,
+        )
+
+        self.assertTrue(
+            automatic_metrics[
+                "automatic_ive_product_cadence_band_applied"
+            ]
+        )
+        self.assertEqual(
+            [13.5, 30.0],
+            automatic_metrics["preferred_source_switches_per_minute_band"],
+        )
+        self.assertNotIn(
+            "source_switch_density_outside_professional_band",
+            {issue.code for issue in automatic_collector.issues},
+        )
+
+        analysis.pop("request")
+        legacy_collector = _IssueCollector()
+        legacy_metrics = _cadence_and_repetition_metrics(
+            analysis,
+            plan,
+            PostRenderQAConfig(),
+            legacy_collector,
+        )
+        self.assertFalse(
+            legacy_metrics["automatic_ive_product_cadence_band_applied"]
+        )
+        self.assertIn(
+            "source_switch_density_outside_professional_band",
+            {issue.code for issue in legacy_collector.issues},
+        )
+
     def test_discovers_only_exact_nonempty_timestamp_bound_sets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1365,6 +1789,110 @@ class PostRenderQATests(unittest.TestCase):
         self.assertEqual(evidence["formation_pair_count"], 8)
         self.assertEqual(
             evidence["professional_gate_failure_boundary_indices"], []
+        )
+
+    def test_unbound_temporal_pose_motion_is_audited_without_direction_claim(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, _plan: dict, selection: dict) -> None:
+            _promote_boundary_repairs_to_unbound_temporal_pose_motion_v1(
+                analysis,
+                selection,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(artifacts, runner=_FakeRunner())
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        temporal = report.metrics["boundary_pose_evidence"][
+            "temporal_pose_motion"
+        ]
+        self.assertTrue(temporal["available"])
+        self.assertTrue(temporal["passed"])
+        self.assertEqual(
+            temporal["calibration_status_counts"],
+            {"calibration_unbound": 8},
+        )
+        self.assertEqual(
+            temporal["classification_counts"],
+            {"calibration_unbound": 8},
+        )
+        self.assertEqual(temporal["direction_evidence_available_count"], 0)
+        self.assertEqual(temporal["dynamic_direction_match_proven_count"], 0)
+        self.assertEqual(temporal["soft_preference_applied_count"], 0)
+
+    def test_bound_temporal_pose_motion_scalar_contract_reconciles_cost(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, _plan: dict, selection: dict) -> None:
+            _bind_synthetic_temporal_pose_motion_fixture(
+                analysis,
+                selection,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(artifacts, runner=_FakeRunner())
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        temporal = report.metrics["boundary_pose_evidence"][
+            "temporal_pose_motion"
+        ]
+        self.assertTrue(temporal["passed"])
+        self.assertEqual(
+            temporal["classification_counts"],
+            {"dynamic_pose_phase_match": 8},
+        )
+        self.assertEqual(temporal["direction_evidence_available_count"], 8)
+        self.assertEqual(temporal["dynamic_direction_match_proven_count"], 8)
+        self.assertEqual(temporal["soft_preference_applied_count"], 8)
+        self.assertAlmostEqual(
+            temporal["soft_preference_applied_total"],
+            0.04,
+        )
+
+    def test_temporal_pose_motion_rejects_raw_vectors_or_unbound_masquerade(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, _plan: dict, selection: dict) -> None:
+            _promote_boundary_repairs_to_unbound_temporal_pose_motion_v1(
+                analysis,
+                selection,
+            )
+            selected = selection["complete_candidates"][0]
+            motion = selected["boundary_repairs"]["repairs"][0][
+                "selected_visual_evidence"
+            ]["temporal_pose_motion"]
+            motion["direction_evidence_available"] = True
+            motion["outgoing_normalized_velocity"] = [1.0] * 60
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(artifacts, runner=_FakeRunner())
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        self.assertIn(
+            "boundary_temporal_pose_motion_contract_invalid",
+            {issue.code for issue in report.issues},
+        )
+        invalid = report.metrics["boundary_pose_evidence"][
+            "temporal_pose_motion"
+        ]["invalid_records"]
+        reasons = set(invalid[0]["reasons"])
+        self.assertIn(
+            "evidence_keys_invalid_or_nonscalar_payload_present",
+            reasons,
+        )
+        self.assertIn(
+            "unbound_evidence_masquerades_as_direction_proof",
+            reasons,
         )
 
     def test_actual_pose_v3_rejects_hog_mislabeled_as_pose(self) -> None:
@@ -1659,6 +2187,163 @@ class PostRenderQATests(unittest.TestCase):
                 if choice["shot_type"] == "wide"
             )
         )
+
+    def test_explicit_automatic_ive_group_still_requires_product_montage_floor(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, plan: dict, selection: dict) -> None:
+            analysis["request"] = {
+                "group": "IVE",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+            }
+            analysis["stage_edit_generation"] = {
+                "activation": {"activation": "explicit_request_bundle"}
+            }
+            selection["stage_edit_render_promotion"] = {
+                "activation": "explicit_stage_edit_generation_request_only",
+                "candidate_pool": "stage_edit_generation_only",
+            }
+            analysis["render"].update(
+                {
+                    "candidate_origin": "explicit_stage_edit_generation",
+                    "stage_edit_promotion_contract": "fixture_stage_edit",
+                }
+            )
+            _install_valid_registered_montage_evidence(
+                analysis,
+                plan,
+                selection,
+            )
+            selection["complete_candidates"][0]["visual_timeline"][
+                "candidate_review_summaries"
+            ] = [
+                {
+                    "candidate_index": 0,
+                    "selected": True,
+                    "passed": True,
+                    "hard_failure_codes": [],
+                }
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                config=_registered_qa_config(),
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        montage = report.metrics["rendered_montage_grammar"]
+        product = report.metrics["ive_product_quality_floor"]
+        self.assertTrue(montage["ive_product_scope_required"])
+        self.assertTrue(montage["passed"])
+        self.assertTrue(product["required"])
+        self.assertTrue(product["passed"])
+        self.assertEqual(
+            product["evaluation_mode"],
+            "modern_role_conditioned_profile_gate",
+        )
+        self.assertTrue(
+            product["metrics"]["whole_song_i_am_absolute_floor"]["passed"]
+        )
+        self.assertGreaterEqual(
+            product["metrics"]["whole_song_i_am_absolute_floor"][
+                "close_duration_fraction"
+            ],
+            product["baseline"]["thresholds"]["close_duration_fraction"],
+        )
+        self.assertFalse(
+            product["metrics"]["legacy_whole_song_fallback_applied"]
+        )
+
+    def test_explicit_new_ive_generation_missing_role_evidence_fails_not_legacy(
+        self,
+    ) -> None:
+        def mutate(analysis: dict, _plan: dict, selection: dict) -> None:
+            analysis["request"] = {
+                "group": "IVE",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+            }
+            analysis["stage_edit_generation"] = {
+                "activation": {"activation": "explicit_request_bundle"}
+            }
+            selection["stage_edit_render_promotion"] = {
+                "activation": "explicit_stage_edit_generation_request_only",
+                "candidate_pool": "stage_edit_generation_only",
+            }
+            analysis["render"].update(
+                {
+                    "candidate_origin": "explicit_stage_edit_generation",
+                    "stage_edit_promotion_contract": "fixture_stage_edit",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.FAIL)
+        product = report.metrics["ive_product_quality_floor"]
+        self.assertEqual(
+            product["evaluation_mode"],
+            "modern_missing_role_conditioned_evidence",
+        )
+        self.assertFalse(
+            product["metrics"]["legacy_whole_song_fallback_applied"]
+        )
+        self.assertIn(
+            "ive_product_quality_floor_failed",
+            {issue.code for issue in report.issues},
+        )
+
+    def test_explicit_app_hidden_comparison_is_not_a_product_delivery(self) -> None:
+        def mutate(analysis: dict, _plan: dict, _selection: dict) -> None:
+            analysis["request"] = {
+                "group": "IVE",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+            }
+            analysis["artifact_role"] = "comparison"
+            analysis["app_result_exposure"] = {
+                "contract": APP_RESULT_EXPOSURE_CONTRACT,
+                "video_output_exposed": False,
+                "delivery_completion_message_allowed": False,
+            }
+            analysis["render"].update(
+                {
+                    "artifact_role": "comparison",
+                    "allow_failed_comparison_render": True,
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts, _analysis, _plan, _selection = _persist_fixture(
+                Path(directory), mutate=mutate
+            )
+            report = evaluate_post_render_qa(
+                artifacts,
+                runner=_FakeRunner(),
+            )
+
+        self.assertEqual(report.verdict, PostRenderQAVerdict.PASS)
+        product = report.metrics["ive_product_quality_floor"]
+        montage = report.metrics["rendered_montage_grammar"]
+        self.assertFalse(product["required"])
+        self.assertEqual(
+            product["evaluation_mode"],
+            "explicit_non_delivery_artifact",
+        )
+        self.assertFalse(montage["ive_product_scope_required"])
 
     def test_registered_stage_edit_flat_wide_montage_fails_closed(self) -> None:
         def mutate(analysis: dict, plan: dict, selection: dict) -> None:
@@ -2560,6 +3245,93 @@ class PostRenderQATests(unittest.TestCase):
         self.assertEqual(repair["selected_frame_offset"], 8)
         self.assertEqual(repair["maximum_allowed_frames"], 8)
         self.assertTrue(repair["passed"])
+
+    def test_windowed_semimarkov_redecode_passes_only_with_changed_revalidated_lineage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _artifacts, analysis, plan, selection = _fixture_payloads(
+                Path(directory)
+            )
+        _install_valid_windowed_semimarkov_redecode(selection)
+        collector = _IssueCollector()
+        metrics, _review = _validate_selection(
+            analysis,
+            plan,
+            selection,
+            _registered_qa_config(),
+            collector,
+        )
+
+        self.assertFalse(collector.issues)
+        contract = metrics["windowed_semimarkov_redecode"]
+        self.assertTrue(contract["repair_changed"])
+        self.assertTrue(contract["decoded_final_review_contract"])
+        self.assertTrue(contract["candidate_lineage_contract"])
+        self.assertTrue(contract["promotion_lineage_contract"])
+
+    def test_windowed_semimarkov_redecode_tampering_fails_closed(self) -> None:
+        cases = {
+            "unchanged": lambda selection: selection[
+                "proxy_triggered_partial_reedit"
+            ].__setitem__("changed", False),
+            "stale_final_review": lambda selection: selection[
+                "proxy_triggered_partial_reedit"
+            ].__setitem__("after_review", {"passed": True}),
+            "lineage_removed": lambda selection: selection[
+                "proxy_triggered_partial_reedit"
+            ].__setitem__("candidate_lineage_after", []),
+        }
+        for name, tamper in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                _artifacts, analysis, plan, selection = _fixture_payloads(
+                    Path(directory)
+                )
+            _install_valid_windowed_semimarkov_redecode(selection)
+            tamper(selection)
+            collector = _IssueCollector()
+            _validate_selection(
+                analysis,
+                plan,
+                selection,
+                _registered_qa_config(),
+                collector,
+            )
+
+            self.assertTrue(
+                any(
+                    issue.code.startswith("windowed_semimarkov_redecode_")
+                    for issue in collector.issues
+                )
+            )
+
+    def test_windowed_final_boundary_bundle_supersedes_stale_complete_candidate(
+        self,
+    ) -> None:
+        final_repair = _repair(0, offset=2)
+        final_repair["selected_visual_evidence"]["bundle_marker"] = "final"
+        stale_repair = _repair(0, offset=-3)
+        stale_repair["selected_visual_evidence"]["bundle_marker"] = "stale"
+        plans, repairs = _selected_boundary_repair_contracts(
+            {"visual_boundary_repairs": {"repairs": [final_repair]}},
+            {
+                "final_selected_version": "windowed_semimarkov_redecode",
+                "selected_candidate_index": 0,
+                "complete_candidates": [
+                    {
+                        "candidate_index": 0,
+                        "boundary_repairs": {"repairs": [stale_repair]},
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(repairs[0]["result"]["selected_frame_offset"], 2)
+        self.assertEqual(
+            repairs[0]["selected_visual_evidence"]["bundle_marker"],
+            "final",
+        )
 
     def test_stale_partial_metadata_cannot_expand_original_repair_radius(self) -> None:
         def mutate(_analysis: dict, _plan: dict, selection: dict) -> None:

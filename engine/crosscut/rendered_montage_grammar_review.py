@@ -9,21 +9,60 @@ contain medium/close coverage and at least one short non-wide source burst.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
+from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .professional_montage_policy import (
+    CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+    DURATION_PREFERRED_TARGET_QUANTILE,
+    DURATION_PRODUCT_MINIMUM_QUANTILE,
+    HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT,
+    HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE,
+    HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE,
+    HIGHLIGHT_CADENCE_STATISTIC_PATH,
+    HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+    HIGHLIGHT_DURATION_EVIDENCE_CONTRACT,
+    HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+    HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT,
+    HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+    REFERENCE_FLOOR_QUANTILE,
+    ROLE_CONDITIONED_DURATION_EVIDENCE_CONTRACT,
+    WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+    WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+    close_burst_policy_binding_payload,
+    close_burst_policy_binding_sha256,
+)
+from .rendered_proxy_review import (
+    SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
+    SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+    SEGMENT_INTERIOR_SAMPLE_FRACTIONS,
+    verified_file_content_sha256,
+)
 
 
 RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS = (
     "rendered_selected_plan_exact_phrase_and_section_anchor_formation_"
-    "highlight_closeup_and_wide_switch_soft_target_grammar_v3"
+    "role_conditioned_duration_chorus_cadence_close_burst_and_"
+    "interior_geometry_grammar_v5"
 )
 EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT = (
     "serialized_inference_token_section_and_phrase_progress_per_selected_shot_v1"
 )
+HIGHLIGHT_AGGREGATE_CONTRACT = (
+    "professional_montage_policy_v2_strict_highlight_duration_gate_v1"
+)
+RENDERED_SEGMENT_INTERIOR_GEOMETRY_REVIEW_CONTRACT = (
+    "content_hash_bound_sampled_rendered_segment_geometry_duration_review_v2"
+)
 _WIDE = frozenset({"wide", "full"})
 _CLOSE = frozenset({"close"})
 _NONWIDE = frozenset({"medium", "close"})
+_DURATION_GATED_ROLES = frozenset({"build", "chorus_like", "bridge_like"})
 _SECTION_ROLES = frozenset(
     {"intro", "verse_like", "build", "chorus_like", "bridge_like", "outro"}
 )
@@ -33,7 +72,27 @@ _RENDER_PLAN_SOURCE_INDEX_DOMAIN = "render_plan_sources_array_index"
 _RENDER_PLAN_BOUNDARY_INDEX_DOMAIN = "render_plan_transition_index"
 _HARD_CUT = "hard_cut"
 _FACE_DISSOLVE = "face_dissolve"
+_STABLE_PROXY_IDENTITY_FIELDS = (
+    "width",
+    "height",
+    "fps",
+    "decoded_frame_count",
+    "duration_seconds",
+    "render_codec",
+    "content_sha256",
+)
 _EPSILON = 1.0e-6
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _finite(value: Any, name: str) -> float:
@@ -80,10 +139,12 @@ def _shot_class(value: Any) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RenderedMontageGrammarConfig:
+    # Retained only so archived configuration payloads stay explicit.  The
+    # release gate no longer uses duration to exempt a short chorus.
     highlight_minimum_duration_seconds: float = 5.0
     minimum_known_shot_fraction: float = 0.80
-    minimum_closeup_fraction: float = 0.15096153846153848
-    minimum_nonwide_fraction: float = 0.35
+    minimum_closeup_fraction: float = 0.1696555074498807
+    minimum_nonwide_fraction: float = 0.33771372775759073
     minimum_wide_involved_source_switch_fraction: float = (
         0.37333333333333335
     )
@@ -99,12 +160,94 @@ class RenderedMontageGrammarConfig:
     minimum_post_burst_formation_reset_count: int = 1
     minimum_motion_accent_count: int = 1
     minimum_closeup_proxy_face_coverage: float = 0.80
+    # The existing visual-score classifier uses face_height / 0.42 and calls
+    # values below 0.22 wide: 0.42 * 0.22 = 0.0924.
+    minimum_nonwide_proxy_face_height_fraction: float = 0.0924
     minimum_closeup_proxy_face_height_fraction: float = 0.2184
+    pooled_product_minimum_closeup_fraction: float = 0.22343208166310066
+    pooled_product_minimum_nonwide_fraction: float = 0.48417342818793935
+    preferred_closeup_fraction: float = 0.3267829794497803
+    preferred_nonwide_fraction: float = 0.6607923807246032
+    maximum_consecutive_wide_run_seconds: float = 8.258529233180866
+    preferred_maximum_consecutive_wide_run_seconds: float = (
+        5.833280462440257
+    )
+    chorus_role_pooled_product_minimum_closeup_fraction: float = (
+        0.2532731561991967
+    )
+    chorus_role_pooled_product_minimum_nonwide_fraction: float = (
+        0.48842910464414785
+    )
+    chorus_role_preferred_closeup_fraction: float = 0.3409589126803301
+    chorus_role_preferred_nonwide_fraction: float = 0.6631535806873134
+    chorus_role_preferred_maximum_consecutive_wide_run_seconds: float = (
+        5.872243112415582
+    )
+    build_minimum_closeup_fraction: float | None = None
+    build_minimum_nonwide_fraction: float | None = None
+    build_pooled_product_minimum_closeup_fraction: float = (
+        0.11876455826051503
+    )
+    build_pooled_product_minimum_nonwide_fraction: float = (
+        0.1511882107564876
+    )
+    build_preferred_closeup_fraction: float = 0.251412375006117
+    build_preferred_nonwide_fraction: float = 0.3118626699888136
+    build_maximum_consecutive_wide_run_seconds: float = 7.633375911839522
+    build_preferred_maximum_consecutive_wide_run_seconds: float = (
+        4.145836014419238
+    )
+    build_duration_reference_count: int = 20
+    bridge_minimum_closeup_fraction: float | None = None
+    bridge_minimum_nonwide_fraction: float | None = 0.28697576489194593
+    bridge_pooled_product_minimum_closeup_fraction: float = (
+        0.2725037829221335
+    )
+    bridge_pooled_product_minimum_nonwide_fraction: float = (
+        0.4220031799500228
+    )
+    bridge_preferred_closeup_fraction: float = 0.4312104569122468
+    bridge_preferred_nonwide_fraction: float = 0.5808194894277292
+    bridge_maximum_consecutive_wide_run_seconds: float = 12.077887222555745
+    bridge_preferred_maximum_consecutive_wide_run_seconds: float = (
+        4.075505767656015
+    )
+    bridge_duration_reference_count: int = 18
+    highlight_product_minimum_source_switches_per_minute: float = (
+        18.642084765823732
+    )
+    highlight_preferred_source_switches_per_minute: float = (
+        23.505554096533405
+    )
+    highlight_cadence_reference_count: int = 20
+    policy_profile_analysis_basis: str | None = None
+    policy_profile_schema_version: int | None = None
+    policy_profile_path: str | None = None
+    policy_profile_file_sha256: str | None = None
+    policy_profile_content_sha256: str | None = None
+    policy_fingerprint_sha256: str | None = None
+    minimum_close_burst_shot_count: float | None = None
+    minimum_close_burst_duration_seconds: float | None = None
+    minimum_close_burst_source_switch_fraction: float | None = None
+    close_burst_event_reference_count: int | None = None
+    close_burst_policy_binding_sha256: str | None = None
+    # This counts only bounded editorial transform accents at a close/nonwide
+    # source switch.  It is intentionally not called choreography-motion proof.
+    minimum_closeup_editorial_motion_accent_switch_boundaries: int = 0
 
     def __post_init__(self) -> None:
         for name in (
             "highlight_minimum_duration_seconds",
             "burst_maximum_run_seconds",
+            "maximum_consecutive_wide_run_seconds",
+            "preferred_maximum_consecutive_wide_run_seconds",
+            "chorus_role_preferred_maximum_consecutive_wide_run_seconds",
+            "build_maximum_consecutive_wide_run_seconds",
+            "build_preferred_maximum_consecutive_wide_run_seconds",
+            "bridge_maximum_consecutive_wide_run_seconds",
+            "bridge_preferred_maximum_consecutive_wide_run_seconds",
+            "highlight_product_minimum_source_switches_per_minute",
+            "highlight_preferred_source_switches_per_minute",
         ):
             if _finite(getattr(self, name), name) <= 0.0:
                 raise ValueError(f"{name} must be positive")
@@ -117,11 +260,37 @@ class RenderedMontageGrammarConfig:
             "minimum_early_wide_anchor_fraction",
             "minimum_phrase_entry_wide_anchor_fraction",
             "minimum_closeup_proxy_face_coverage",
+            "minimum_nonwide_proxy_face_height_fraction",
             "minimum_closeup_proxy_face_height_fraction",
+            "pooled_product_minimum_closeup_fraction",
+            "pooled_product_minimum_nonwide_fraction",
+            "preferred_closeup_fraction",
+            "preferred_nonwide_fraction",
+            "chorus_role_pooled_product_minimum_closeup_fraction",
+            "chorus_role_pooled_product_minimum_nonwide_fraction",
+            "chorus_role_preferred_closeup_fraction",
+            "chorus_role_preferred_nonwide_fraction",
+            "build_pooled_product_minimum_closeup_fraction",
+            "build_pooled_product_minimum_nonwide_fraction",
+            "build_preferred_closeup_fraction",
+            "build_preferred_nonwide_fraction",
+            "bridge_pooled_product_minimum_closeup_fraction",
+            "bridge_pooled_product_minimum_nonwide_fraction",
+            "bridge_preferred_closeup_fraction",
+            "bridge_preferred_nonwide_fraction",
         ):
             number = _finite(getattr(self, name), name)
             if not 0.0 <= number <= 1.0:
                 raise ValueError(f"{name} must lie in [0, 1]")
+        for name in (
+            "build_minimum_closeup_fraction",
+            "build_minimum_nonwide_fraction",
+            "bridge_minimum_closeup_fraction",
+            "bridge_minimum_nonwide_fraction",
+        ):
+            value = getattr(self, name)
+            if value is not None and not 0.0 < _finite(value, name) <= 1.0:
+                raise ValueError(f"{name} must be None or lie in (0, 1]")
         for name in (
             "minimum_nonwide_burst_boundaries",
             "formation_anchor_run_window",
@@ -130,6 +299,10 @@ class RenderedMontageGrammarConfig:
             "minimum_post_burst_formation_reset_count",
             "minimum_motion_accent_count",
             "wide_involved_source_switch_reference_count",
+            "minimum_closeup_editorial_motion_accent_switch_boundaries",
+            "highlight_cadence_reference_count",
+            "build_duration_reference_count",
+            "bridge_duration_reference_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -151,8 +324,175 @@ class RenderedMontageGrammarConfig:
             raise ValueError(
                 "wide-switch preferred target needs at least one reference"
             )
+        if self.highlight_cadence_reference_count < 1:
+            raise ValueError("highlight cadence needs at least one reference")
+        if self.build_duration_reference_count < 1:
+            raise ValueError("build duration policy needs at least one reference")
+        if self.bridge_duration_reference_count < 1:
+            raise ValueError("bridge duration policy needs at least one reference")
         if self.minimum_closeup_fraction > self.minimum_nonwide_fraction:
             raise ValueError("close-up floor cannot exceed non-wide floor")
+        if (
+            self.minimum_nonwide_proxy_face_height_fraction
+            >= self.minimum_closeup_proxy_face_height_fraction
+        ):
+            raise ValueError(
+                "non-wide proxy face threshold must remain below close-up threshold"
+            )
+        if (
+            self.pooled_product_minimum_closeup_fraction + _EPSILON
+            < self.minimum_closeup_fraction
+            or self.pooled_product_minimum_nonwide_fraction + _EPSILON
+            < self.minimum_nonwide_fraction
+        ):
+            raise ValueError(
+                "pooled P25 product minimum cannot be below local P10 floor"
+            )
+        if (
+            self.preferred_closeup_fraction + _EPSILON
+            < self.pooled_product_minimum_closeup_fraction
+            or self.preferred_nonwide_fraction + _EPSILON
+            < self.pooled_product_minimum_nonwide_fraction
+        ):
+            raise ValueError(
+                "P50 preferred target cannot be below P25 product minimum"
+            )
+        if (
+            self.preferred_maximum_consecutive_wide_run_seconds
+            > self.maximum_consecutive_wide_run_seconds + _EPSILON
+        ):
+            raise ValueError(
+                "P75 preferred wide-run maximum cannot exceed hard maximum"
+            )
+        if (
+            self.chorus_role_preferred_closeup_fraction + _EPSILON
+            < self.chorus_role_pooled_product_minimum_closeup_fraction
+            or self.chorus_role_preferred_nonwide_fraction + _EPSILON
+            < self.chorus_role_pooled_product_minimum_nonwide_fraction
+        ):
+            raise ValueError("chorus role P50 cannot be below role-pooled P25")
+        if (
+            self.chorus_role_preferred_maximum_consecutive_wide_run_seconds
+            > self.maximum_consecutive_wide_run_seconds + _EPSILON
+        ):
+            raise ValueError("chorus role P75 wide target cannot exceed P100")
+        for role in ("build", "bridge"):
+            local_close = getattr(self, f"{role}_minimum_closeup_fraction")
+            local_nonwide = getattr(self, f"{role}_minimum_nonwide_fraction")
+            pooled_close = getattr(
+                self, f"{role}_pooled_product_minimum_closeup_fraction"
+            )
+            pooled_nonwide = getattr(
+                self, f"{role}_pooled_product_minimum_nonwide_fraction"
+            )
+            preferred_close = getattr(self, f"{role}_preferred_closeup_fraction")
+            preferred_nonwide = getattr(self, f"{role}_preferred_nonwide_fraction")
+            if local_close is not None and pooled_close + _EPSILON < local_close:
+                raise ValueError(f"{role} pooled close P25 cannot be below P10")
+            if local_nonwide is not None and pooled_nonwide + _EPSILON < local_nonwide:
+                raise ValueError(f"{role} pooled nonwide P25 cannot be below P10")
+            if (
+                preferred_close + _EPSILON < pooled_close
+                or preferred_nonwide + _EPSILON < pooled_nonwide
+            ):
+                raise ValueError(f"{role} P50 target cannot be below P25")
+            if (
+                getattr(
+                    self,
+                    f"{role}_preferred_maximum_consecutive_wide_run_seconds",
+                )
+                > getattr(self, f"{role}_maximum_consecutive_wide_run_seconds")
+                + _EPSILON
+            ):
+                raise ValueError(f"{role} P75 wide target cannot exceed P100")
+        if (
+            self.highlight_preferred_source_switches_per_minute + _EPSILON
+            < self.highlight_product_minimum_source_switches_per_minute
+        ):
+            raise ValueError("highlight preferred cadence cannot be below minimum")
+        provenance_values = (
+            self.policy_profile_analysis_basis,
+            self.policy_profile_schema_version,
+            self.policy_profile_path,
+            self.policy_profile_file_sha256,
+            self.policy_profile_content_sha256,
+            self.policy_fingerprint_sha256,
+        )
+        if any(value is not None for value in provenance_values):
+            if any(value is None for value in provenance_values):
+                raise ValueError("policy provenance identity must be complete")
+            assert self.policy_profile_schema_version is not None
+            if (
+                isinstance(self.policy_profile_schema_version, bool)
+                or not isinstance(self.policy_profile_schema_version, int)
+                or self.policy_profile_schema_version < 1
+            ):
+                raise ValueError("policy profile schema version must be positive")
+            for name in ("policy_profile_analysis_basis", "policy_profile_path"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{name} cannot be blank")
+            if not Path(str(self.policy_profile_path)).is_absolute():
+                raise ValueError("policy profile path must be absolute")
+            for name in (
+                "policy_profile_file_sha256",
+                "policy_profile_content_sha256",
+                "policy_fingerprint_sha256",
+            ):
+                value = getattr(self, name)
+                if not (
+                    isinstance(value, str)
+                    and len(value) == 64
+                    and all(character in "0123456789abcdef" for character in value)
+                ):
+                    raise ValueError(f"{name} must be lowercase SHA-256")
+        identity_bound = all(value is not None for value in provenance_values)
+        close_burst_values = (
+            self.minimum_close_burst_shot_count,
+            self.minimum_close_burst_duration_seconds,
+            self.minimum_close_burst_source_switch_fraction,
+            self.close_burst_event_reference_count,
+            self.close_burst_policy_binding_sha256,
+        )
+        if identity_bound and any(value is None for value in close_burst_values):
+            raise ValueError(
+                "hash-bound montage policy is missing its close-burst soft "
+                "preference binding"
+            )
+        if not identity_bound and any(value is not None for value in close_burst_values):
+            raise ValueError(
+                "close-burst soft preference requires complete hash-bound "
+                "montage policy identity"
+            )
+        if identity_bound:
+            assert self.minimum_close_burst_shot_count is not None
+            assert self.minimum_close_burst_duration_seconds is not None
+            assert self.minimum_close_burst_source_switch_fraction is not None
+            assert self.close_burst_event_reference_count is not None
+            assert self.close_burst_policy_binding_sha256 is not None
+            assert self.policy_fingerprint_sha256 is not None
+            expected_binding = close_burst_policy_binding_sha256(
+                profile_identity={
+                    "analysis_basis": self.policy_profile_analysis_basis,
+                    "schema_version": self.policy_profile_schema_version,
+                    "path": self.policy_profile_path,
+                    "file_sha256": self.policy_profile_file_sha256,
+                    "content_sha256": self.policy_profile_content_sha256,
+                },
+                policy_fingerprint_sha256=self.policy_fingerprint_sha256,
+                minimum_shot_count=self.minimum_close_burst_shot_count,
+                minimum_duration_seconds=(
+                    self.minimum_close_burst_duration_seconds
+                ),
+                minimum_source_switch_fraction=(
+                    self.minimum_close_burst_source_switch_fraction
+                ),
+                event_reference_count=self.close_burst_event_reference_count,
+            )
+            if self.close_burst_policy_binding_sha256 != expected_binding:
+                raise ValueError(
+                    "close-burst soft preference binding SHA-256 mismatch"
+                )
         if (
             self.preferred_wide_involved_source_switch_fraction + _EPSILON
             < self.minimum_wide_involved_source_switch_fraction
@@ -337,6 +677,147 @@ def _visible_runs(
     return tuple(runs)
 
 
+def _close_only_multi_source_burst_evidence(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    section_start: float,
+    section_end: float,
+    motion_segment_indices: set[int],
+    config: RenderedMontageGrammarConfig,
+) -> dict[str, Any]:
+    """Recompute maximal close-only family-switch runs from rendered choices."""
+
+    active = config.close_burst_policy_binding_sha256 is not None
+    if not active:
+        return {
+            "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+            "policy_binding_active": False,
+            "policy_binding": None,
+            "candidate_event_count": 0,
+            "qualified_event_count": 0,
+            "events": [],
+            "saturated_soft_preference_score": None,
+            "absence_is_hard_failure": False,
+            "hard_gate": False,
+        }
+    assert config.minimum_close_burst_shot_count is not None
+    assert config.minimum_close_burst_duration_seconds is not None
+    assert config.minimum_close_burst_source_switch_fraction is not None
+    assert config.close_burst_event_reference_count is not None
+    assert config.policy_fingerprint_sha256 is not None
+    policy_binding = close_burst_policy_binding_payload(
+        profile_identity={
+            "analysis_basis": config.policy_profile_analysis_basis,
+            "schema_version": config.policy_profile_schema_version,
+            "path": config.policy_profile_path,
+            "file_sha256": config.policy_profile_file_sha256,
+            "content_sha256": config.policy_profile_content_sha256,
+        },
+        policy_fingerprint_sha256=config.policy_fingerprint_sha256,
+        minimum_shot_count=config.minimum_close_burst_shot_count,
+        minimum_duration_seconds=config.minimum_close_burst_duration_seconds,
+        minimum_source_switch_fraction=(
+            config.minimum_close_burst_source_switch_fraction
+        ),
+        event_reference_count=config.close_burst_event_reference_count,
+    )
+    policy_binding["binding_sha256"] = config.close_burst_policy_binding_sha256
+
+    clipped: list[dict[str, Any]] = []
+    for raw in runs:
+        start = max(section_start, float(raw["start_seconds"]))
+        end = min(section_end, float(raw["end_seconds"]))
+        if end - start <= _EPSILON:
+            continue
+        clipped.append(
+            {
+                **dict(raw),
+                "start_seconds": start,
+                "end_seconds": end,
+                "duration_seconds": end - start,
+            }
+        )
+
+    maximal_close_runs: list[tuple[dict[str, Any], ...]] = []
+    current: list[dict[str, Any]] = []
+    for run in clipped:
+        if run["shot_class"] in _CLOSE:
+            current.append(run)
+            continue
+        if current:
+            maximal_close_runs.append(tuple(current))
+            current = []
+    if current:
+        maximal_close_runs.append(tuple(current))
+
+    events: list[dict[str, Any]] = []
+    for close_run in maximal_close_runs:
+        switch_positions = tuple(
+            position
+            for position, (left, right) in enumerate(
+                zip(close_run, close_run[1:]),
+                start=1,
+            )
+            if left["derivative_family_id"] != right["derivative_family_id"]
+        )
+        if not switch_positions:
+            continue
+        shot_count = len(close_run)
+        duration_seconds = sum(float(item["duration_seconds"]) for item in close_run)
+        source_switch_count = len(switch_positions)
+        source_switch_fraction = source_switch_count / max(1, shot_count - 1)
+        qualified = bool(
+            shot_count + _EPSILON >= config.minimum_close_burst_shot_count
+            and duration_seconds + _EPSILON
+            >= config.minimum_close_burst_duration_seconds
+            and source_switch_fraction + _EPSILON
+            >= config.minimum_close_burst_source_switch_fraction
+        )
+        accented_switch_count = sum(
+            int(
+                int(close_run[position - 1]["last_segment_index"])
+                in motion_segment_indices
+                or int(close_run[position]["first_segment_index"])
+                in motion_segment_indices
+            )
+            for position in switch_positions
+        )
+        events.append(
+            {
+                "first_segment_index": int(close_run[0]["first_segment_index"]),
+                "last_segment_index": int(close_run[-1]["last_segment_index"]),
+                "start_seconds": float(close_run[0]["start_seconds"]),
+                "end_seconds": float(close_run[-1]["end_seconds"]),
+                "shot_count": shot_count,
+                "duration_seconds": duration_seconds,
+                "source_switch_count": source_switch_count,
+                "source_switch_fraction": source_switch_fraction,
+                "derivative_family_ids": [
+                    int(item["derivative_family_id"]) for item in close_run
+                ],
+                "editorial_motion_accent_switch_count": accented_switch_count,
+                "editorial_motion_is_choreography_motion_proof": False,
+                "qualified": qualified,
+            }
+        )
+    qualified_count = sum(int(item["qualified"]) for item in events)
+    return {
+        "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+        "policy_binding_active": True,
+        "policy_binding": policy_binding,
+        "candidate_event_count": len(events),
+        "qualified_event_count": qualified_count,
+        "events": events,
+        "saturated_soft_preference_score": 1.0 if qualified_count else 0.0,
+        "saturation": "one_or_more_qualified_events",
+        "absence_is_hard_failure": False,
+        "hard_gate": False,
+        "medium_to_close_counts_as_close_only": False,
+        "constituent_switch_motion_preference_remains_separate": True,
+        "temporal_direction_proven": False,
+    }
+
+
 def _overlap(left: float, right: float, start: float, end: float) -> float:
     return max(0.0, min(right, end) - max(left, start))
 
@@ -400,9 +881,9 @@ def _motion_accent_segment_indices(analysis: Mapping[str, Any]) -> set[int]:
     return result
 
 
-def _geometry_proves_closeup(
-    value: Any, config: RenderedMontageGrammarConfig
-) -> bool:
+def _normalized_face_geometry(
+    value: Any,
+) -> tuple[int, tuple[float, float, float, float]] | None:
     geometry = value if isinstance(value, Mapping) else {}
     bbox = geometry.get("face_bbox_xywh")
     face_count = geometry.get("face_count")
@@ -419,17 +900,53 @@ def _geometry_proves_closeup(
             for item in bbox
         )
     ):
-        return False
+        return None
     x, y, width, height = tuple(float(item) for item in bbox)
-    return bool(
+    if not (
         0.0 <= x <= 1.0
         and 0.0 <= y <= 1.0
         and 0.0 < width <= 1.0
         and 0.0 < height <= 1.0
         and x + width <= 1.000001
         and y + height <= 1.000001
-        and height >= config.minimum_closeup_proxy_face_height_fraction
-    )
+    ):
+        return None
+    return int(face_count), (x, y, width, height)
+
+
+def _proxy_geometry_shot_class(
+    value: Any,
+    config: RenderedMontageGrammarConfig,
+) -> str:
+    geometry = value if isinstance(value, Mapping) else {}
+    face_count = geometry.get("face_count")
+    if (
+        isinstance(face_count, int)
+        and not isinstance(face_count, bool)
+        and face_count == 0
+        and geometry.get("face_bbox_xywh") is None
+    ):
+        # Match visual_score exactly: detector success with no face uses
+        # shot_scale=0.12, which is below the 0.22 group-wide boundary.
+        return "wide"
+    parsed = _normalized_face_geometry(value)
+    if parsed is None:
+        return "unknown"
+    face_count, (_x, _y, _width, height) = parsed
+    # Reuse the production visual-score classifier exactly: four detected
+    # faces is a group wide regardless of dominant-face size; otherwise the
+    # 0.42-normalized 0.22/0.52 shot-scale boundaries become 0.0924/0.2184.
+    if face_count >= 4 or height < config.minimum_nonwide_proxy_face_height_fraction:
+        return "wide"
+    if height < config.minimum_closeup_proxy_face_height_fraction:
+        return "medium"
+    return "close"
+
+
+def _geometry_proves_closeup(
+    value: Any, config: RenderedMontageGrammarConfig
+) -> bool:
+    return _proxy_geometry_shot_class(value, config) == "close"
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,7 +1271,9 @@ def _render_plan_binding(
             "bound_segment_count": len(segments),
             "bound_transition_count": len(bound_boundaries),
             "fps": fps,
+            "master_audio_start": master_audio_start,
             "output_frame_count": expected_output_frame_count,
+            "segment_frame_counts": list(frame_counts),
             "clock_mapping": (
                 "canonical_master_minus_master_audio_start_to_output_master"
             ),
@@ -762,6 +1281,551 @@ def _render_plan_binding(
             "boundary_index_domain": _RENDER_PLAN_BOUNDARY_INDEX_DOMAIN,
         },
         tuple(bound_boundaries),
+    )
+
+
+def _automatic_ive_product_scope(analysis: Mapping[str, Any]) -> bool:
+    request = analysis.get("request")
+    if not isinstance(request, Mapping):
+        return False
+    automatic_ive = bool(
+        str(request.get("group") or "").strip().upper() == "IVE"
+        and str(request.get("edit_mode") or "").strip().lower() == "group"
+        and str(request.get("source_mode") or "").strip().lower() == "automatic"
+    )
+    if not automatic_ive:
+        return False
+    role = analysis.get("artifact_role")
+    exposure = analysis.get("app_result_exposure")
+    explicitly_hidden = bool(
+        role in {"diagnostic", "comparison"}
+        and isinstance(exposure, Mapping)
+        and exposure.get("video_output_exposed") is False
+        and exposure.get("delivery_completion_message_allowed") is False
+    )
+    return not explicitly_hidden
+
+
+def _serialized_render_timeline_binding_payload(
+    plan: Mapping[str, Any],
+    *,
+    frame_counts: Sequence[int],
+    source_content_sha256: Sequence[str],
+) -> dict[str, Any]:
+    sources = _sequence(plan.get("sources"), "render_plan.sources")
+    segments = _sequence(plan.get("segments"), "render_plan.segments")
+    transitions = _sequence(plan.get("transitions"), "render_plan.transitions")
+    if len(frame_counts) != len(segments):
+        raise ValueError("render plan frame-count binding is inconsistent")
+    content_digests = tuple(source_content_sha256)
+    if len(content_digests) != len(sources) or any(
+        not (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(
+                character in "0123456789abcdef" for character in value
+            )
+        )
+        for value in content_digests
+    ):
+        raise ValueError("render plan source content SHA-256 binding is invalid")
+    return {
+        "source_content_sha256": list(content_digests),
+        "master_audio_start": _finite(
+            plan.get("master_audio_start"), "render_plan.master_audio_start"
+        ),
+        "fps": _finite(plan.get("fps"), "render_plan.fps"),
+        "output_frame_count": _nonnegative_integer(
+            plan.get("output_frame_count"), "render_plan.output_frame_count"
+        ),
+        "segments": [
+            {
+                "segment_index": index,
+                "source_index": _nonnegative_integer(
+                    _mapping(raw, f"render segment {index}").get("source_index"),
+                    f"render segment {index} source_index",
+                ),
+                "master_start": _finite(
+                    _mapping(raw, f"render segment {index}").get("master_start"),
+                    f"render segment {index} master_start",
+                ),
+                "duration": _finite(
+                    _mapping(raw, f"render segment {index}").get("duration"),
+                    f"render segment {index} duration",
+                ),
+                "source_start": _finite(
+                    _mapping(raw, f"render segment {index}").get("source_start"),
+                    f"render segment {index} source_start",
+                ),
+                "source_duration": _mapping(
+                    raw, f"render segment {index}"
+                ).get("source_duration"),
+                "effective_source_duration": _finite(
+                    _mapping(raw, f"render segment {index}").get(
+                        "effective_source_duration"
+                    ),
+                    f"render segment {index} effective_source_duration",
+                ),
+                "crop": _mapping(raw, f"render segment {index}").get("crop"),
+                "pan_crop": _mapping(raw, f"render segment {index}").get(
+                    "pan_crop"
+                ),
+                "editorial_transform": _mapping(
+                    raw, f"render segment {index}"
+                ).get("editorial_transform"),
+                "look_adjustment": _mapping(
+                    raw, f"render segment {index}"
+                ).get("look_adjustment"),
+                "boundary_look_track": _mapping(
+                    raw, f"render segment {index}"
+                ).get("boundary_look_track"),
+                "output_frame_count": int(frame_counts[index]),
+            }
+            for index, raw in enumerate(segments)
+        ],
+        "transitions": [
+            {
+                "boundary_index": index,
+                "kind": str(
+                    _mapping(raw, f"render transition {index}").get("kind")
+                    or ""
+                ),
+                "frame_count": _nonnegative_integer(
+                    _mapping(raw, f"render transition {index}").get(
+                        "frame_count"
+                    ),
+                    f"render transition {index} frame_count",
+                ),
+            }
+            for index, raw in enumerate(transitions)
+        ],
+    }
+
+
+def _segment_sample_offsets(frame_count: int) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            {
+                min(
+                    frame_count - 1,
+                    max(
+                        0,
+                        int(
+                            math.floor(
+                                (frame_count - 1) * fraction + 0.5
+                            )
+                        ),
+                    ),
+                )
+                for fraction in SEGMENT_INTERIOR_SAMPLE_FRACTIONS
+            }
+        )
+    )
+
+
+def _expected_segment_sampling_schedule(
+    *,
+    plan: Mapping[str, Any],
+    frame_counts: Sequence[int],
+) -> tuple[dict[str, int], ...]:
+    segments = _sequence(plan.get("segments"), "render_plan.segments")
+    schedule: list[dict[str, int]] = []
+    segment_frame_start = 0
+    for segment_index, (raw_segment, frame_count) in enumerate(
+        zip(segments, frame_counts, strict=True)
+    ):
+        segment = _mapping(raw_segment, f"render segment {segment_index}")
+        source_index = _nonnegative_integer(
+            segment.get("source_index"),
+            f"render segment {segment_index} source_index",
+        )
+        offsets = _segment_sample_offsets(int(frame_count))
+        represented_starts = [0]
+        represented_starts.extend(
+            (left + right + 1) // 2
+            for left, right in zip(offsets, offsets[1:])
+        )
+        represented_ends = [*represented_starts[1:], int(frame_count)]
+        for offset, represented_start, represented_end in zip(
+            offsets,
+            represented_starts,
+            represented_ends,
+            strict=True,
+        ):
+            schedule.append(
+                {
+                    "segment_index": segment_index,
+                    "source_index": source_index,
+                    "segment_frame_offset": offset,
+                    "frame_index": segment_frame_start + offset,
+                    "represented_frame_start": (
+                        segment_frame_start + represented_start
+                    ),
+                    "represented_frame_end": (
+                        segment_frame_start + represented_end
+                    ),
+                    "represented_frame_count": represented_end - represented_start,
+                }
+            )
+        segment_frame_start += int(frame_count)
+    return tuple(schedule)
+
+
+def _review_segment_interior_geometry(
+    *,
+    choices: Sequence[Any],
+    rendered_proxy_review: Mapping[str, Any],
+    render_plan: Mapping[str, Any],
+    render_plan_binding: Mapping[str, Any],
+    config: RenderedMontageGrammarConfig,
+    required: bool,
+) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], ...]]:
+    raw_evidence = rendered_proxy_review.get("segment_interior_geometry")
+    if raw_evidence is None:
+        if required:
+            return (
+                {
+                    "contract": RENDERED_SEGMENT_INTERIOR_GEOMETRY_REVIEW_CONTRACT,
+                    "required": True,
+                    "available": False,
+                    "passed": False,
+                    "failure_codes": [
+                        "rendered_segment_interior_geometry_evidence_missing"
+                    ],
+                },
+                (),
+            )
+        return None, ()
+    evidence = dict(_mapping(raw_evidence, "segment interior geometry evidence"))
+    evidence_sha256 = evidence.pop("evidence_sha256", None)
+    if not (
+        isinstance(evidence_sha256, str)
+        and len(evidence_sha256) == 64
+        and all(character in "0123456789abcdef" for character in evidence_sha256)
+    ):
+        raise ValueError("segment interior geometry evidence SHA-256 is invalid")
+    if _canonical_sha256(evidence) != evidence_sha256:
+        raise ValueError("segment interior geometry evidence SHA-256 mismatch")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("analysis_basis")
+        != SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS
+        or evidence.get("contract") != SEGMENT_INTERIOR_GEOMETRY_CONTRACT
+    ):
+        raise ValueError("segment interior geometry evidence contract changed")
+    if evidence.get("source_index_domain") != _RENDER_PLAN_SOURCE_INDEX_DOMAIN:
+        raise ValueError("segment interior geometry source domain changed")
+    if evidence.get("output_frame_index_domain") != (
+        "decoded_proxy_output_frame_index"
+    ):
+        raise ValueError("segment interior geometry frame domain changed")
+    sampling_policy = _mapping(
+        evidence.get("sampling_policy"), "segment interior sampling policy"
+    )
+    if tuple(sampling_policy.get("sample_fractions") or ()) != (
+        SEGMENT_INTERIOR_SAMPLE_FRACTIONS
+    ):
+        raise ValueError("segment interior sampling fractions changed")
+    if sampling_policy.get("rounding") != (
+        "nearest_output_frame_half_up_unique"
+    ):
+        raise ValueError("segment interior sampling rounding changed")
+
+    serialized_proxy_identity = _mapping(
+        rendered_proxy_review.get("proxy"), "rendered proxy identity"
+    )
+    proxy_identity = {
+        field: serialized_proxy_identity[field]
+        for field in _STABLE_PROXY_IDENTITY_FIELDS
+        if field in serialized_proxy_identity
+    }
+    proxy_content_sha256 = proxy_identity.get("content_sha256")
+    if not (
+        isinstance(proxy_content_sha256, str)
+        and len(proxy_content_sha256) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in proxy_content_sha256
+        )
+    ):
+        raise ValueError("rendered proxy content SHA-256 is invalid")
+    if evidence.get("proxy_identity") != proxy_identity:
+        raise ValueError("segment geometry proxy identity differs from proxy review")
+    if evidence.get("proxy_identity_sha256") != _canonical_sha256(proxy_identity):
+        raise ValueError("segment geometry proxy identity hash mismatch")
+    frame_counts = tuple(
+        _nonnegative_integer(value, "bound segment frame count")
+        for value in _sequence(
+            render_plan_binding.get("segment_frame_counts"),
+            "bound segment frame counts",
+        )
+    )
+    plan_sources = _sequence(render_plan.get("sources"), "render_plan.sources")
+    source_content_sha256 = tuple(
+        verified_file_content_sha256(Path(str(path))) for path in plan_sources
+    )
+    timeline_binding = _serialized_render_timeline_binding_payload(
+        render_plan,
+        frame_counts=frame_counts,
+        source_content_sha256=source_content_sha256,
+    )
+    if evidence.get("render_timeline_binding_sha256") != _canonical_sha256(
+        timeline_binding
+    ):
+        raise ValueError("segment geometry RenderPlan binding hash mismatch")
+    expected_schedule = _expected_segment_sampling_schedule(
+        plan=render_plan,
+        frame_counts=frame_counts,
+    )
+    if evidence.get("sampling_schedule_sha256") != _canonical_sha256(
+        expected_schedule
+    ):
+        raise ValueError("segment geometry sampling schedule hash mismatch")
+
+    raw_segments = _sequence(
+        evidence.get("segments"), "segment interior geometry segments"
+    )
+    if len(raw_segments) != len(choices) or evidence.get("segment_count") != len(
+        choices
+    ):
+        raise ValueError("segment interior geometry segment count mismatch")
+    expected_by_segment: defaultdict[int, list[Mapping[str, int]]] = defaultdict(
+        list
+    )
+    for item in expected_schedule:
+        expected_by_segment[int(item["segment_index"])].append(item)
+    cells: list[dict[str, Any]] = []
+    segment_records: list[dict[str, Any]] = []
+    unknown_sample_count = 0
+    provider_failure_sample_count = 0
+    close_claim_contradiction_count = 0
+    nonwide_claim_wide_contradiction_count = 0
+    observed_sample_count = 0
+    for segment_index, (raw_segment, raw_choice) in enumerate(
+        zip(raw_segments, choices, strict=True)
+    ):
+        segment = _mapping(
+            raw_segment, f"segment interior geometry segment {segment_index}"
+        )
+        choice = _mapping(raw_choice, f"visual choice {segment_index}")
+        expected_samples = expected_by_segment[segment_index]
+        frame_count = int(frame_counts[segment_index])
+        frame_start = sum(frame_counts[:segment_index])
+        render_segment = _mapping(
+            _sequence(render_plan.get("segments"), "render_plan.segments")[
+                segment_index
+            ],
+            f"render segment {segment_index}",
+        )
+        source_index = _nonnegative_integer(
+            render_segment.get("source_index"),
+            f"render segment {segment_index} source_index",
+        )
+        expected_segment_identity = {
+            "segment_index": segment_index,
+            "source_index": source_index,
+            "source_content_sha256": source_content_sha256[source_index],
+            "segment_frame_start": frame_start,
+            "segment_frame_end": frame_start + frame_count,
+            "segment_frame_count": frame_count,
+        }
+        for field, expected_value in expected_segment_identity.items():
+            if segment.get(field) != expected_value:
+                raise ValueError(
+                    f"segment interior geometry {field} differs from RenderPlan"
+                )
+        raw_samples = _sequence(
+            segment.get("samples"),
+            f"segment interior geometry segment {segment_index} samples",
+        )
+        if len(raw_samples) != len(expected_samples):
+            raise ValueError("segment interior geometry sample count mismatch")
+        choice_start = _finite(
+            choice.get("canonical_master_start"), "visual choice start"
+        )
+        choice_end = _finite(
+            choice.get("canonical_master_end"), "visual choice end"
+        )
+        declared_class = _shot_class(choice.get("shot_type"))
+        classifications: list[str] = []
+        for sample_position, (raw_sample, expected) in enumerate(
+            zip(raw_samples, expected_samples, strict=True)
+        ):
+            sample = _mapping(
+                raw_sample,
+                (
+                    f"segment interior geometry segment {segment_index} "
+                    f"sample {sample_position}"
+                ),
+            )
+            for field in (
+                "segment_frame_offset",
+                "frame_index",
+                "represented_frame_start",
+                "represented_frame_end",
+                "represented_frame_count",
+            ):
+                if sample.get(field) != expected[field]:
+                    raise ValueError(
+                        f"segment interior geometry {field} differs from schedule"
+                    )
+            failed = sample.get("geometry_provider_failed")
+            if not isinstance(failed, bool):
+                raise ValueError("segment geometry provider failure flag is invalid")
+            proxy_class = (
+                "unknown"
+                if failed
+                else _proxy_geometry_shot_class(
+                    sample.get("subject_geometry"), config
+                )
+            )
+            classifications.append(proxy_class)
+            observed_sample_count += 1
+            provider_failure_sample_count += int(failed)
+            unknown_sample_count += int(proxy_class == "unknown")
+            close_claim_contradiction_count += int(
+                declared_class == "close" and proxy_class != "close"
+            )
+            nonwide_claim_wide_contradiction_count += int(
+                declared_class in _NONWIDE and proxy_class == "wide"
+            )
+            local_start_frames = int(expected["represented_frame_start"]) - frame_start
+            local_end_frames = int(expected["represented_frame_end"]) - frame_start
+            duration = choice_end - choice_start
+            cell_start = choice_start + duration * local_start_frames / frame_count
+            cell_end = choice_start + duration * local_end_frames / frame_count
+            cells.append(
+                {
+                    "segment_index": segment_index,
+                    "source_index": source_index,
+                    "sample_position": sample_position,
+                    "sample_frame_index": int(expected["frame_index"]),
+                    "start_seconds": cell_start,
+                    "end_seconds": cell_end,
+                    "duration_seconds": cell_end - cell_start,
+                    "shot_class": proxy_class,
+                    "declared_shot_class": declared_class,
+                }
+            )
+        segment_records.append(
+            {
+                "segment_index": segment_index,
+                "source_index": source_index,
+                "declared_shot_class": declared_class,
+                "sampled_proxy_shot_classes": classifications,
+                "sample_count": len(classifications),
+                "all_samples_known": all(
+                    value != "unknown" for value in classifications
+                ),
+                "declared_nonwide_contradicted_by_wide_interior": bool(
+                    declared_class in _NONWIDE and "wide" in classifications
+                ),
+            }
+        )
+
+    if evidence.get("sample_count") != observed_sample_count:
+        raise ValueError("segment interior geometry total sample count mismatch")
+    serialized_provider_failures = _nonnegative_integer(
+        evidence.get("geometry_provider_failure_count"),
+        "segment interior geometry provider failure count",
+    )
+    if serialized_provider_failures != provider_failure_sample_count:
+        raise ValueError("segment geometry provider failure count mismatch")
+    evidence_complete = evidence.get("complete")
+    if not isinstance(evidence_complete, bool):
+        raise ValueError("segment interior geometry completeness is invalid")
+    expected_complete = provider_failure_sample_count == 0
+    if evidence_complete != expected_complete:
+        raise ValueError("segment interior geometry completeness mismatch")
+
+    total_duration = sum(float(item["duration_seconds"]) for item in cells)
+    known_duration = sum(
+        float(item["duration_seconds"])
+        for item in cells
+        if item["shot_class"] != "unknown"
+    )
+    close_duration = sum(
+        float(item["duration_seconds"])
+        for item in cells
+        if item["shot_class"] == "close"
+    )
+    nonwide_duration = sum(
+        float(item["duration_seconds"])
+        for item in cells
+        if item["shot_class"] in _NONWIDE
+    )
+    maximum_wide_run = _maximum_consecutive_wide_run_seconds(
+        cells,
+        section_start=float(cells[0]["start_seconds"]),
+        section_end=float(cells[-1]["end_seconds"]),
+    )
+    failure_codes: list[str] = []
+    if not evidence_complete or provider_failure_sample_count:
+        failure_codes.append("rendered_segment_interior_geometry_provider_failure")
+    if unknown_sample_count:
+        failure_codes.append("rendered_segment_interior_geometry_unclassifiable")
+    if nonwide_claim_wide_contradiction_count:
+        failure_codes.append(
+            "rendered_nonwide_claim_contradicted_by_wide_interior_geometry"
+        )
+    summary_core: dict[str, Any] = {
+        "contract": RENDERED_SEGMENT_INTERIOR_GEOMETRY_REVIEW_CONTRACT,
+        "required": required,
+        "available": True,
+        "source_evidence_sha256": evidence_sha256,
+        "source_sampling_schedule_sha256": evidence[
+            "sampling_schedule_sha256"
+        ],
+        "source_render_timeline_binding_sha256": evidence[
+            "render_timeline_binding_sha256"
+        ],
+        "classification_policy": {
+            "basis": "existing_visual_score_face_scale_thresholds",
+            "four_or_more_faces_is_wide": True,
+            "minimum_nonwide_face_height_fraction": (
+                config.minimum_nonwide_proxy_face_height_fraction
+            ),
+            "minimum_closeup_face_height_fraction": (
+                config.minimum_closeup_proxy_face_height_fraction
+            ),
+            "missing_face_geometry": "unknown_fail_closed_when_required",
+            "duration_semantics": (
+                "nearest_sample_frame_cell_proxy_estimate_not_all_frame_claim"
+            ),
+        },
+        "sample_count": observed_sample_count,
+        "unknown_sample_count": unknown_sample_count,
+        "provider_failure_sample_count": provider_failure_sample_count,
+        "close_claim_contradiction_count": close_claim_contradiction_count,
+        "nonwide_claim_wide_contradiction_count": (
+            nonwide_claim_wide_contradiction_count
+        ),
+        "segment_records": segment_records,
+        "whole_song_observed": {
+            "total_duration_seconds": total_duration,
+            "known_duration_seconds": known_duration,
+            "known_duration_fraction": (
+                known_duration / total_duration if total_duration > 0.0 else 0.0
+            ),
+            "close_duration_seconds": close_duration,
+            "nonwide_duration_seconds": nonwide_duration,
+            "close_duration_fraction": (
+                close_duration / known_duration if known_duration > 0.0 else 0.0
+            ),
+            "nonwide_duration_fraction": (
+                nonwide_duration / known_duration if known_duration > 0.0 else 0.0
+            ),
+            "maximum_consecutive_wide_run_seconds": maximum_wide_run,
+        },
+        "failure_codes": failure_codes,
+        "passed": not failure_codes,
+    }
+    return (
+        {
+            **summary_core,
+            "review_evidence_sha256": _canonical_sha256(summary_core),
+        },
+        tuple(cells),
     )
 
 
@@ -1179,6 +2243,476 @@ def _exact_stage_edit_anchor_metrics(
     }
 
 
+def _maximum_consecutive_wide_run_seconds(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    section_start: float,
+    section_end: float,
+) -> float:
+    maximum = 0.0
+    current = 0.0
+    for item in runs:
+        duration = _overlap(
+            float(item["start_seconds"]),
+            float(item["end_seconds"]),
+            section_start,
+            section_end,
+        )
+        if duration <= _EPSILON:
+            continue
+        if item["shot_class"] in _WIDE:
+            current += duration
+            maximum = max(maximum, current)
+        else:
+            current = 0.0
+    return maximum
+
+
+def _symmetric_fraction_target_evidence(
+    observed: float,
+    target: float,
+) -> dict[str, float | bool]:
+    deviation = abs(observed - target)
+    return {
+        "target": target,
+        "observed": observed,
+        "absolute_deviation": deviation,
+        "shortfall": max(0.0, target - observed),
+        "excess": max(0.0, observed - target),
+        "alignment_score": max(0.0, 1.0 - deviation),
+        "hard_gate": False,
+    }
+
+
+def _wide_run_soft_target_evidence(
+    observed: float,
+    preferred_maximum: float,
+    hard_maximum: float,
+) -> dict[str, float | bool | str]:
+    excess = max(0.0, observed - preferred_maximum)
+    span = max(_EPSILON, hard_maximum - preferred_maximum)
+    return {
+        "target": preferred_maximum,
+        "observed": observed,
+        "upper_target_excess_seconds": excess,
+        "alignment_score": (
+            1.0 if excess <= _EPSILON else max(0.0, 1.0 - excess / span)
+        ),
+        "preference": "at_or_below",
+        "saturated_at_or_below_target": True,
+        "hard_gate": False,
+    }
+
+
+def _role_duration_thresholds(
+    config: RenderedMontageGrammarConfig,
+    role: str,
+) -> dict[str, Any] | None:
+    """Return primitive, JSON-safe thresholds for one gated editing role."""
+
+    if role == "chorus_like":
+        return {
+            "role": role,
+            "reference_count": config.highlight_cadence_reference_count,
+            "local_minimum_closeup_fraction": config.minimum_closeup_fraction,
+            "local_minimum_nonwide_fraction": config.minimum_nonwide_fraction,
+            "pooled_product_minimum_closeup_fraction": (
+                config.chorus_role_pooled_product_minimum_closeup_fraction
+            ),
+            "pooled_product_minimum_nonwide_fraction": (
+                config.chorus_role_pooled_product_minimum_nonwide_fraction
+            ),
+            "preferred_closeup_fraction": (
+                config.chorus_role_preferred_closeup_fraction
+            ),
+            "preferred_nonwide_fraction": (
+                config.chorus_role_preferred_nonwide_fraction
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                config.maximum_consecutive_wide_run_seconds
+            ),
+            "preferred_maximum_consecutive_wide_run_seconds": (
+                config.chorus_role_preferred_maximum_consecutive_wide_run_seconds
+            ),
+        }
+    if role not in {"build", "bridge_like"}:
+        return None
+    prefix = "build" if role == "build" else "bridge"
+    return {
+        "role": role,
+        "reference_count": getattr(config, f"{prefix}_duration_reference_count"),
+        "local_minimum_closeup_fraction": getattr(
+            config, f"{prefix}_minimum_closeup_fraction"
+        ),
+        "local_minimum_nonwide_fraction": getattr(
+            config, f"{prefix}_minimum_nonwide_fraction"
+        ),
+        "pooled_product_minimum_closeup_fraction": getattr(
+            config, f"{prefix}_pooled_product_minimum_closeup_fraction"
+        ),
+        "pooled_product_minimum_nonwide_fraction": getattr(
+            config, f"{prefix}_pooled_product_minimum_nonwide_fraction"
+        ),
+        "preferred_closeup_fraction": getattr(
+            config, f"{prefix}_preferred_closeup_fraction"
+        ),
+        "preferred_nonwide_fraction": getattr(
+            config, f"{prefix}_preferred_nonwide_fraction"
+        ),
+        "maximum_consecutive_wide_run_seconds": getattr(
+            config, f"{prefix}_maximum_consecutive_wide_run_seconds"
+        ),
+        "preferred_maximum_consecutive_wide_run_seconds": getattr(
+            config, f"{prefix}_preferred_maximum_consecutive_wide_run_seconds"
+        ),
+    }
+
+
+def _role_duration_failure_code(role: str, suffix: str) -> str:
+    prefix = "highlight" if role == "chorus_like" else role.removesuffix("_like")
+    return f"{prefix}_{suffix}"
+
+
+def _highlight_policy_provenance(
+    config: RenderedMontageGrammarConfig,
+) -> dict[str, Any]:
+    identity_bound = config.policy_fingerprint_sha256 is not None
+    profile_identity = (
+        {
+            "analysis_basis": config.policy_profile_analysis_basis,
+            "schema_version": config.policy_profile_schema_version,
+            "path": config.policy_profile_path,
+            "file_sha256": config.policy_profile_file_sha256,
+            "content_sha256": config.policy_profile_content_sha256,
+        }
+        if identity_bound
+        else None
+    )
+    close_burst_binding = None
+    if identity_bound:
+        assert profile_identity is not None
+        assert config.policy_fingerprint_sha256 is not None
+        assert config.minimum_close_burst_shot_count is not None
+        assert config.minimum_close_burst_duration_seconds is not None
+        assert config.minimum_close_burst_source_switch_fraction is not None
+        assert config.close_burst_event_reference_count is not None
+        close_burst_binding = close_burst_policy_binding_payload(
+            profile_identity=profile_identity,
+            policy_fingerprint_sha256=config.policy_fingerprint_sha256,
+            minimum_shot_count=config.minimum_close_burst_shot_count,
+            minimum_duration_seconds=config.minimum_close_burst_duration_seconds,
+            minimum_source_switch_fraction=(
+                config.minimum_close_burst_source_switch_fraction
+            ),
+            event_reference_count=config.close_burst_event_reference_count,
+        )
+        close_burst_binding["binding_sha256"] = (
+            config.close_burst_policy_binding_sha256
+        )
+
+    def metric(
+        *,
+        config_field: str,
+        policy_member: str,
+        value: float,
+        statistic_path: str,
+        quantile: float,
+        hard_gate: bool,
+        scope: str,
+        comparison: str,
+    ) -> dict[str, Any]:
+        return {
+            "config_field": config_field,
+            "professional_montage_policy_member": policy_member,
+            "value": value,
+            "statistic_path": statistic_path,
+            "quantile": quantile,
+            "hard_gate": hard_gate,
+            "scope": scope,
+            "comparison": comparison,
+        }
+
+    return {
+        "contract": HIGHLIGHT_AGGREGATE_CONTRACT,
+        "profile_identity_bound": identity_bound,
+        "profile_identity": profile_identity,
+        "policy_fingerprint_sha256": config.policy_fingerprint_sha256,
+        "close_burst_soft_policy_binding": close_burst_binding,
+        "duration_evidence_contract": HIGHLIGHT_DURATION_EVIDENCE_CONTRACT,
+        "wide_run_evidence_contract": HIGHLIGHT_WIDE_RUN_EVIDENCE_CONTRACT,
+        "cadence_evidence_contract": HIGHLIGHT_CADENCE_EVIDENCE_CONTRACT,
+        "role_conditioned_duration_evidence_contract": (
+            ROLE_CONDITIONED_DURATION_EVIDENCE_CONTRACT
+        ),
+        "role_conditioned_duration_thresholds": {
+            role: _role_duration_thresholds(config, role)
+            for role in ("build", "chorus_like", "bridge_like")
+        },
+        "metrics": {
+            "local_closeup_duration_minimum": metric(
+                config_field="minimum_closeup_fraction",
+                policy_member="minimum_close_duration_fraction",
+                value=config.minimum_closeup_fraction,
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=REFERENCE_FLOOR_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="greater_than_or_equal",
+            ),
+            "local_nonwide_duration_minimum": metric(
+                config_field="minimum_nonwide_fraction",
+                policy_member="minimum_nonwide_duration_fraction",
+                value=config.minimum_nonwide_fraction,
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=REFERENCE_FLOOR_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_closeup_duration_product_minimum": metric(
+                config_field=(
+                    "chorus_role_pooled_product_minimum_closeup_fraction"
+                ),
+                policy_member=(
+                    "highlight_pooled_product_minimum_close_duration_fraction"
+                ),
+                value=(
+                    config.chorus_role_pooled_product_minimum_closeup_fraction
+                ),
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+                hard_gate=True,
+                scope="pooled_strict_highlights",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_nonwide_duration_product_minimum": metric(
+                config_field=(
+                    "chorus_role_pooled_product_minimum_nonwide_fraction"
+                ),
+                policy_member=(
+                    "highlight_pooled_product_minimum_nonwide_duration_fraction"
+                ),
+                value=(
+                    config.chorus_role_pooled_product_minimum_nonwide_fraction
+                ),
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PRODUCT_MINIMUM_QUANTILE,
+                hard_gate=True,
+                scope="pooled_strict_highlights",
+                comparison="greater_than_or_equal",
+            ),
+            "pooled_closeup_duration_preferred_target": metric(
+                config_field="chorus_role_preferred_closeup_fraction",
+                policy_member="preferred_close_duration_fraction",
+                value=config.chorus_role_preferred_closeup_fraction,
+                statistic_path=HIGHLIGHT_CLOSE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+                hard_gate=False,
+                scope="pooled_strict_highlights",
+                comparison="symmetric_target_deviation",
+            ),
+            "pooled_nonwide_duration_preferred_target": metric(
+                config_field="chorus_role_preferred_nonwide_fraction",
+                policy_member="preferred_nonwide_duration_fraction",
+                value=config.chorus_role_preferred_nonwide_fraction,
+                statistic_path=HIGHLIGHT_NONWIDE_DURATION_STATISTIC_PATH,
+                quantile=DURATION_PREFERRED_TARGET_QUANTILE,
+                hard_gate=False,
+                scope="pooled_strict_highlights",
+                comparison="symmetric_target_deviation",
+            ),
+            "maximum_consecutive_wide_run": metric(
+                config_field="maximum_consecutive_wide_run_seconds",
+                policy_member="maximum_consecutive_wide_run_seconds",
+                value=config.maximum_consecutive_wide_run_seconds,
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                quantile=WIDE_RUN_HARD_MAXIMUM_QUANTILE,
+                hard_gate=True,
+                scope="each_strict_highlight",
+                comparison="less_than_or_equal",
+            ),
+            "preferred_maximum_consecutive_wide_run": metric(
+                config_field=(
+                    "chorus_role_preferred_maximum_consecutive_wide_run_seconds"
+                ),
+                policy_member=(
+                    "preferred_maximum_consecutive_wide_run_seconds"
+                ),
+                value=(
+                    config.chorus_role_preferred_maximum_consecutive_wide_run_seconds
+                ),
+                statistic_path=HIGHLIGHT_WIDE_RUN_STATISTIC_PATH,
+                quantile=WIDE_RUN_PREFERRED_MAXIMUM_QUANTILE,
+                hard_gate=False,
+                scope="maximum_across_strict_highlights",
+                comparison="soft_upper_target",
+            ),
+            "highlight_source_switch_cadence_product_minimum": metric(
+                config_field=(
+                    "highlight_product_minimum_source_switches_per_minute"
+                ),
+                policy_member=(
+                    "highlight_product_minimum_source_switches_per_minute"
+                ),
+                value=(
+                    config.highlight_product_minimum_source_switches_per_minute
+                ),
+                statistic_path=HIGHLIGHT_CADENCE_STATISTIC_PATH,
+                quantile=HIGHLIGHT_CADENCE_PRODUCT_MINIMUM_QUANTILE,
+                hard_gate=True,
+                scope="each_positive_duration_chorus",
+                comparison="greater_than_or_equal",
+            ),
+            "highlight_source_switch_cadence_preferred_target": metric(
+                config_field="highlight_preferred_source_switches_per_minute",
+                policy_member="highlight_preferred_source_switches_per_minute",
+                value=config.highlight_preferred_source_switches_per_minute,
+                statistic_path=HIGHLIGHT_CADENCE_STATISTIC_PATH,
+                quantile=HIGHLIGHT_CADENCE_PREFERRED_TARGET_QUANTILE,
+                hard_gate=False,
+                scope="each_positive_duration_chorus",
+                comparison="absolute_target_deviation",
+            ),
+        },
+    }
+
+
+def _role_duration_aggregates(
+    records_by_role: Mapping[str, Sequence[Mapping[str, Any]]],
+    config: RenderedMontageGrammarConfig,
+) -> dict[str, dict[str, Any]]:
+    aggregates: dict[str, dict[str, Any]] = {}
+    for role in ("build", "chorus_like", "bridge_like"):
+        records = records_by_role.get(role, ())
+        thresholds = _role_duration_thresholds(config, role)
+        assert thresholds is not None
+        known_duration = sum(
+            float(item["known_duration_seconds"]) for item in records
+        )
+        close_duration = sum(
+            float(item["closeup_duration_seconds"]) for item in records
+        )
+        nonwide_duration = sum(
+            float(item["nonwide_duration_seconds"]) for item in records
+        )
+        close_fraction = (
+            close_duration / known_duration if known_duration > 0.0 else 0.0
+        )
+        nonwide_fraction = (
+            nonwide_duration / known_duration if known_duration > 0.0 else 0.0
+        )
+        maximum_wide_run = max(
+            (
+                float(item["maximum_consecutive_wide_run_seconds"])
+                for item in records
+            ),
+            default=0.0,
+        )
+        failures: list[str] = []
+        if records:
+            pooled_close = thresholds[
+                "pooled_product_minimum_closeup_fraction"
+            ]
+            if (
+                pooled_close is not None
+                and close_fraction + _EPSILON < float(pooled_close)
+            ):
+                failures.append(
+                    _role_duration_failure_code(
+                        role,
+                        "pooled_closeup_fraction_below_product_minimum",
+                    )
+                )
+            pooled_nonwide = thresholds[
+                "pooled_product_minimum_nonwide_fraction"
+            ]
+            if (
+                pooled_nonwide is not None
+                and nonwide_fraction + _EPSILON < float(pooled_nonwide)
+            ):
+                failures.append(
+                    _role_duration_failure_code(
+                        role,
+                        "pooled_nonwide_fraction_below_product_minimum",
+                    )
+                )
+        close_target = _symmetric_fraction_target_evidence(
+            close_fraction,
+            float(thresholds["preferred_closeup_fraction"]),
+        )
+        nonwide_target = _symmetric_fraction_target_evidence(
+            nonwide_fraction,
+            float(thresholds["preferred_nonwide_fraction"]),
+        )
+        wide_target = _wide_run_soft_target_evidence(
+            maximum_wide_run,
+            float(
+                thresholds[
+                    "preferred_maximum_consecutive_wide_run_seconds"
+                ]
+            ),
+            float(thresholds["maximum_consecutive_wide_run_seconds"]),
+        )
+        aggregates[role] = {
+            "contract": ROLE_CONDITIONED_DURATION_EVIDENCE_CONTRACT,
+            "positive_duration_section_indices": [
+                int(item["section_index"]) for item in records
+            ],
+            "positive_duration_section_count": len(records),
+            "duration_weighting": (
+                "sum_observed_known_shot_duration_within_role"
+            ),
+            "reference_count": thresholds["reference_count"],
+            "observed": {
+                "known_duration_seconds": known_duration,
+                "closeup_duration_seconds": close_duration,
+                "nonwide_duration_seconds": nonwide_duration,
+                "closeup_duration_fraction": close_fraction,
+                "nonwide_duration_fraction": nonwide_fraction,
+                "maximum_consecutive_wide_run_seconds": maximum_wide_run,
+            },
+            "hard_targets": {
+                "local_minimum_closeup_duration_fraction": thresholds[
+                    "local_minimum_closeup_fraction"
+                ],
+                "local_minimum_nonwide_duration_fraction": thresholds[
+                    "local_minimum_nonwide_fraction"
+                ],
+                "pooled_product_minimum_closeup_duration_fraction": thresholds[
+                    "pooled_product_minimum_closeup_fraction"
+                ],
+                "pooled_product_minimum_nonwide_duration_fraction": thresholds[
+                    "pooled_product_minimum_nonwide_fraction"
+                ],
+                "maximum_consecutive_wide_run_seconds": thresholds[
+                    "maximum_consecutive_wide_run_seconds"
+                ],
+                "zero_p10_promoted_to_positive_minimum": False,
+            },
+            "soft_targets": {
+                "closeup_p50": close_target,
+                "nonwide_p50": nonwide_target,
+                "maximum_wide_run_p75": wide_target,
+                "aggregate_alignment_score": (
+                    float(close_target["alignment_score"])
+                    + float(nonwide_target["alignment_score"])
+                    + float(wide_target["alignment_score"])
+                )
+                / 3.0,
+                "score_is_hard_gate": False,
+            },
+            "local_section_failures": {
+                str(item["section_index"]): list(item["local_failure_codes"])
+                for item in records
+                if item["local_failure_codes"]
+            },
+            "failure_codes": failures,
+            "passed": not failures
+            and all(not item["local_failure_codes"] for item in records),
+        }
+    return aggregates
+
+
 def review_rendered_montage_grammar(
     analysis: Mapping[str, Any],
     *,
@@ -1206,13 +2740,43 @@ def review_rendered_montage_grammar(
         choices,
         render_plan,
     )
+    bound_render_plan = _mapping(render_plan, "render_plan")
+    proxy = _mapping(root.get("rendered_proxy_review"), "rendered_proxy_review")
+    interior_required = bool(
+        _automatic_ive_product_scope(root)
+        or proxy.get("segment_interior_geometry") is not None
+    )
+    (
+        rendered_segment_interior_geometry,
+        rendered_geometry_duration_runs,
+    ) = _review_segment_interior_geometry(
+        choices=choices,
+        rendered_proxy_review=proxy,
+        render_plan=bound_render_plan,
+        render_plan_binding=plan_binding,
+        config=config,
+        required=interior_required,
+    )
+    duration_runs: Sequence[Mapping[str, Any]] = (
+        rendered_geometry_duration_runs
+        if rendered_geometry_duration_runs
+        else runs
+    )
     motion_segments = _motion_accent_segment_indices(root)
 
     timeline_start = float(runs[0]["start_seconds"])
     timeline_end = float(runs[-1]["end_seconds"])
 
-    all_failures: list[str] = []
+    all_failures: list[str] = (
+        list(rendered_segment_interior_geometry["failure_codes"])
+        if rendered_segment_interior_geometry is not None
+        else []
+    )
     section_metrics: list[dict[str, Any]] = []
+    strict_highlight_records: list[dict[str, Any]] = []
+    role_duration_records: dict[str, list[dict[str, Any]]] = {
+        role: [] for role in _DURATION_GATED_ROLES
+    }
     previous_end: float | None = None
     for position, raw in enumerate(sections):
         section = _mapping(raw, f"section {position}")
@@ -1246,8 +2810,19 @@ def review_rendered_montage_grammar(
             )
             > _EPSILON
         ]
+        relevant_duration_runs = [
+            item
+            for item in duration_runs
+            if _overlap(
+                float(item["start_seconds"]),
+                float(item["end_seconds"]),
+                start,
+                end,
+            )
+            > _EPSILON
+        ]
         class_durations = {"wide": 0.0, "medium": 0.0, "close": 0.0, "unknown": 0.0}
-        for item in relevant_runs:
+        for item in relevant_duration_runs:
             amount = _overlap(
                 float(item["start_seconds"]),
                 float(item["end_seconds"]),
@@ -1266,10 +2841,28 @@ def review_rendered_montage_grammar(
             class_durations["medium"] + class_durations["close"]
         ) / known if known else 0.0
         wide_fraction = class_durations["wide"] / known if known else 0.0
+        maximum_consecutive_wide_run_seconds = (
+            _maximum_consecutive_wide_run_seconds(
+                relevant_duration_runs,
+                section_start=start,
+                section_end=end,
+            )
+        )
+        close_only_burst_evidence = _close_only_multi_source_burst_evidence(
+            relevant_runs,
+            section_start=start,
+            section_end=end,
+            motion_segment_indices=motion_segments,
+            config=config,
+        )
         burst_count = 0
         burst_right_positions: list[int] = []
         source_switch_count = 0
         wide_involved_source_switch_count = 0
+        closeup_involved_source_switch_count = 0
+        nonwide_involved_source_switch_count = 0
+        closeup_editorial_motion_accent_switch_count = 0
+        nonwide_editorial_motion_accent_switch_count = 0
         for run_position, (left, right) in enumerate(
             zip(relevant_runs, relevant_runs[1:])
         ):
@@ -1279,6 +2872,28 @@ def review_rendered_montage_grammar(
             if left["derivative_family_id"] == right["derivative_family_id"]:
                 continue
             source_switch_count += 1
+            closeup_involved = bool(
+                left["shot_class"] in _CLOSE
+                or right["shot_class"] in _CLOSE
+            )
+            nonwide_involved = bool(
+                left["shot_class"] in _NONWIDE
+                or right["shot_class"] in _NONWIDE
+            )
+            editorial_motion_accent = bool(
+                int(left["last_segment_index"]) in motion_segments
+                or int(right["first_segment_index"]) in motion_segments
+            )
+            if closeup_involved:
+                closeup_involved_source_switch_count += 1
+                closeup_editorial_motion_accent_switch_count += int(
+                    editorial_motion_accent
+                )
+            if nonwide_involved:
+                nonwide_involved_source_switch_count += 1
+                nonwide_editorial_motion_accent_switch_count += int(
+                    editorial_motion_accent
+                )
             if (
                 left["shot_class"] in _WIDE
                 or right["shot_class"] in _WIDE
@@ -1335,18 +2950,95 @@ def review_rendered_montage_grammar(
             )
             for item in relevant_runs
         )
-        strict_highlight = (
-            role == "chorus_like"
-            and end - start >= config.highlight_minimum_duration_seconds
+        role_duration_thresholds = _role_duration_thresholds(config, role)
+        strict_role_duration_gate = role_duration_thresholds is not None
+        strict_highlight = role == "chorus_like"
+        achieved_source_switches_per_minute = (
+            source_switch_count * 60.0 / (end - start)
+            if strict_highlight
+            else None
         )
         failures: list[str] = []
-        if strict_highlight:
+        duration_local_failures: list[str] = []
+        if strict_role_duration_gate:
+            assert role_duration_thresholds is not None
             if known_fraction + _EPSILON < config.minimum_known_shot_fraction:
-                failures.append("highlight_shot_type_evidence_incomplete")
-            if close_fraction + _EPSILON < config.minimum_closeup_fraction:
-                failures.append("highlight_closeup_fraction_below_floor")
-            if nonwide_fraction + _EPSILON < config.minimum_nonwide_fraction:
-                failures.append("highlight_nonwide_fraction_below_floor")
+                duration_local_failures.append(
+                    _role_duration_failure_code(
+                        role, "shot_type_evidence_incomplete"
+                    )
+                )
+            local_close = role_duration_thresholds[
+                "local_minimum_closeup_fraction"
+            ]
+            if (
+                local_close is not None
+                and close_fraction + _EPSILON < float(local_close)
+            ):
+                duration_local_failures.append(
+                    _role_duration_failure_code(
+                        role, "closeup_fraction_below_floor"
+                    )
+                )
+            local_nonwide = role_duration_thresholds[
+                "local_minimum_nonwide_fraction"
+            ]
+            if (
+                local_nonwide is not None
+                and nonwide_fraction + _EPSILON < float(local_nonwide)
+            ):
+                duration_local_failures.append(
+                    _role_duration_failure_code(
+                        role, "nonwide_fraction_below_floor"
+                    )
+                )
+            if (
+                maximum_consecutive_wide_run_seconds
+                > float(
+                    role_duration_thresholds[
+                        "maximum_consecutive_wide_run_seconds"
+                    ]
+                )
+                + _EPSILON
+            ):
+                duration_local_failures.append(
+                    _role_duration_failure_code(
+                        role, "maximum_consecutive_wide_run_exceeded"
+                    )
+                )
+            failures.extend(duration_local_failures)
+            role_duration_records[role].append(
+                {
+                    "section_index": position,
+                    "known_duration_seconds": known,
+                    "closeup_duration_seconds": class_durations["close"],
+                    "nonwide_duration_seconds": (
+                        class_durations["medium"] + class_durations["close"]
+                    ),
+                    "maximum_consecutive_wide_run_seconds": (
+                        maximum_consecutive_wide_run_seconds
+                    ),
+                    "source_switch_count": source_switch_count,
+                    "duration_seconds": end - start,
+                    "local_failure_codes": tuple(duration_local_failures),
+                }
+            )
+        if strict_highlight:
+            assert achieved_source_switches_per_minute is not None
+            if (
+                achieved_source_switches_per_minute + _EPSILON
+                < config.highlight_product_minimum_source_switches_per_minute
+            ):
+                failures.append(
+                    "highlight_source_switches_per_minute_below_product_minimum"
+                )
+            if (
+                closeup_editorial_motion_accent_switch_count
+                < config.minimum_closeup_editorial_motion_accent_switch_boundaries
+            ):
+                failures.append(
+                    "highlight_closeup_editorial_motion_accent_switch_missing"
+                )
             if (
                 source_switch_count > 0
                 and wide_involved_source_switch_fraction + _EPSILON
@@ -1375,6 +3067,40 @@ def review_rendered_montage_grammar(
                 and motion_count < config.minimum_motion_accent_count
             ):
                 failures.append("highlight_motion_accent_missing")
+            strict_highlight_records.append(
+                {
+                    "section_index": position,
+                    "known_duration_seconds": known,
+                    "closeup_duration_seconds": class_durations["close"],
+                    "nonwide_duration_seconds": (
+                        class_durations["medium"] + class_durations["close"]
+                    ),
+                    "maximum_consecutive_wide_run_seconds": (
+                        maximum_consecutive_wide_run_seconds
+                    ),
+                    "closeup_editorial_motion_accent_switch_count": (
+                        closeup_editorial_motion_accent_switch_count
+                    ),
+                    "closeup_involved_source_switch_count": (
+                        closeup_involved_source_switch_count
+                    ),
+                    "nonwide_editorial_motion_accent_switch_count": (
+                        nonwide_editorial_motion_accent_switch_count
+                    ),
+                    "nonwide_involved_source_switch_count": (
+                        nonwide_involved_source_switch_count
+                    ),
+                    "source_switch_count": source_switch_count,
+                    "duration_seconds": end - start,
+                    "achieved_source_switches_per_minute": (
+                        achieved_source_switches_per_minute
+                    ),
+                    "close_only_multi_source_burst": (
+                        close_only_burst_evidence
+                    ),
+                    "local_failure_codes": tuple(failures),
+                }
+            )
         all_failures.extend(f"section_{position}:{item}" for item in failures)
         section_metrics.append(
             {
@@ -1382,6 +3108,10 @@ def review_rendered_montage_grammar(
                 "role": role,
                 "duration_seconds": end - start,
                 "strict_highlight_gate_applied": strict_highlight,
+                "strict_role_duration_gate_applied": (
+                    strict_role_duration_gate
+                ),
+                "short_section_duration_exemption_applied": False,
                 "visible_run_count": len(relevant_runs),
                 "visible_source_switch_count": source_switch_count,
                 "wide_involved_source_switch_count": (
@@ -1408,10 +3138,103 @@ def review_rendered_montage_grammar(
                     config.wide_involved_source_switch_reference_count
                 ),
                 "known_duration_fraction": known_fraction,
+                "known_duration_seconds": known,
                 "wide_duration_fraction": wide_fraction,
+                "wide_duration_seconds": class_durations["wide"],
                 "nonwide_duration_fraction": nonwide_fraction,
+                "nonwide_duration_seconds": (
+                    class_durations["medium"] + class_durations["close"]
+                ),
                 "closeup_duration_fraction": close_fraction,
+                "closeup_duration_seconds": class_durations["close"],
+                "maximum_consecutive_wide_run_seconds": (
+                    maximum_consecutive_wide_run_seconds
+                ),
+                "maximum_consecutive_wide_run_hard_limit_seconds": (
+                    role_duration_thresholds[
+                        "maximum_consecutive_wide_run_seconds"
+                    ]
+                    if role_duration_thresholds is not None
+                    else None
+                ),
+                "preferred_maximum_consecutive_wide_run_seconds": (
+                    role_duration_thresholds[
+                        "preferred_maximum_consecutive_wide_run_seconds"
+                    ]
+                    if role_duration_thresholds is not None
+                    else None
+                ),
+                "closeup_preferred_target": (
+                    _symmetric_fraction_target_evidence(
+                        close_fraction,
+                        float(
+                            role_duration_thresholds[
+                                "preferred_closeup_fraction"
+                            ]
+                        ),
+                    )
+                    if role_duration_thresholds is not None
+                    else None
+                ),
+                "nonwide_preferred_target": (
+                    _symmetric_fraction_target_evidence(
+                        nonwide_fraction,
+                        float(
+                            role_duration_thresholds[
+                                "preferred_nonwide_fraction"
+                            ]
+                        ),
+                    )
+                    if role_duration_thresholds is not None
+                    else None
+                ),
+                "wide_run_preferred_target": (
+                    _wide_run_soft_target_evidence(
+                        maximum_consecutive_wide_run_seconds,
+                        float(
+                            role_duration_thresholds[
+                                "preferred_maximum_consecutive_wide_run_seconds"
+                            ]
+                        ),
+                        float(
+                            role_duration_thresholds[
+                                "maximum_consecutive_wide_run_seconds"
+                            ]
+                        ),
+                    )
+                    if role_duration_thresholds is not None
+                    else None
+                ),
+                "source_switches_per_minute": (
+                    achieved_source_switches_per_minute
+                ),
+                "source_switches_per_minute_hard_minimum": (
+                    config.highlight_product_minimum_source_switches_per_minute
+                    if strict_highlight
+                    else None
+                ),
+                "source_switches_per_minute_preferred_target": (
+                    config.highlight_preferred_source_switches_per_minute
+                    if strict_highlight
+                    else None
+                ),
+                "source_switches_per_minute_preferred_target_evidence": (
+                    {
+                        "target": (
+                            config.highlight_preferred_source_switches_per_minute
+                        ),
+                        "observed": achieved_source_switches_per_minute,
+                        "absolute_deviation": abs(
+                            float(achieved_source_switches_per_minute)
+                            - config.highlight_preferred_source_switches_per_minute
+                        ),
+                        "hard_gate": False,
+                    }
+                    if strict_highlight
+                    else None
+                ),
                 "nonwide_burst_boundary_count": burst_count,
+                "close_only_multi_source_burst": close_only_burst_evidence,
                 "post_burst_formation_wide_reset_count": len(
                     post_burst_formation_resets
                 ),
@@ -1426,6 +3249,37 @@ def review_rendered_montage_grammar(
                     default=None,
                 ),
                 "motion_accent_run_count": motion_count,
+                "editorial_motion_accent_switch_boundaries": {
+                    "evidence_contract": (
+                        "bounded_nonidentity_editorial_transform_overlap_v1"
+                    ),
+                    "is_choreography_motion_proof": False,
+                    "profile_v2_human_distribution_available": False,
+                    "profile_v3_derivation_required": True,
+                    "closeup_involved_source_switch_boundary_count": (
+                        closeup_involved_source_switch_count
+                    ),
+                    "closeup_accented_source_switch_boundary_count": (
+                        closeup_editorial_motion_accent_switch_count
+                    ),
+                    "closeup_static_source_switch_boundary_count": (
+                        closeup_involved_source_switch_count
+                        - closeup_editorial_motion_accent_switch_count
+                    ),
+                    "nonwide_involved_source_switch_boundary_count": (
+                        nonwide_involved_source_switch_count
+                    ),
+                    "nonwide_accented_source_switch_boundary_count": (
+                        nonwide_editorial_motion_accent_switch_count
+                    ),
+                    "nonwide_static_source_switch_boundary_count": (
+                        nonwide_involved_source_switch_count
+                        - nonwide_editorial_motion_accent_switch_count
+                    ),
+                    "minimum_closeup_accented_switch_boundary_count": (
+                        config.minimum_closeup_editorial_motion_accent_switch_boundaries
+                    ),
+                },
                 "failure_codes": failures,
                 "passed": not failures,
             }
@@ -1434,18 +3288,284 @@ def review_rendered_montage_grammar(
     if not math.isclose(previous_end or 0.0, timeline_end, abs_tol=_EPSILON):
         raise ValueError("section plan end does not match visual timeline")
 
+    role_duration_aggregates = _role_duration_aggregates(
+        role_duration_records,
+        config,
+    )
+    for role in ("build", "bridge_like"):
+        all_failures.extend(
+            role_duration_aggregates[role]["failure_codes"]
+        )
+
+    aggregate_known_duration = sum(
+        float(item["known_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_duration = sum(
+        float(item["closeup_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_duration = sum(
+        float(item["nonwide_duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_fraction = (
+        aggregate_closeup_duration / aggregate_known_duration
+        if aggregate_known_duration
+        else 0.0
+    )
+    aggregate_nonwide_fraction = (
+        aggregate_nonwide_duration / aggregate_known_duration
+        if aggregate_known_duration
+        else 0.0
+    )
+    aggregate_maximum_wide_run = max(
+        (
+            float(item["maximum_consecutive_wide_run_seconds"])
+            for item in strict_highlight_records
+        ),
+        default=0.0,
+    )
+    aggregate_closeup_switch_count = sum(
+        int(item["closeup_involved_source_switch_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_closeup_motion_switch_count = sum(
+        int(item["closeup_editorial_motion_accent_switch_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_switch_count = sum(
+        int(item["nonwide_involved_source_switch_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_nonwide_motion_switch_count = sum(
+        int(item["nonwide_editorial_motion_accent_switch_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_source_switch_count = sum(
+        int(item["source_switch_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_highlight_duration = sum(
+        float(item["duration_seconds"])
+        for item in strict_highlight_records
+    )
+    aggregate_source_switches_per_minute = (
+        aggregate_source_switch_count * 60.0 / aggregate_highlight_duration
+        if aggregate_highlight_duration > 0.0
+        else 0.0
+    )
+    aggregate_close_burst_candidate_count = sum(
+        int(item["close_only_multi_source_burst"]["candidate_event_count"])
+        for item in strict_highlight_records
+    )
+    aggregate_close_burst_qualified_count = sum(
+        int(item["close_only_multi_source_burst"]["qualified_event_count"])
+        for item in strict_highlight_records
+    )
+    close_burst_binding_active = bool(
+        strict_highlight_records
+        and strict_highlight_records[0]["close_only_multi_source_burst"][
+            "policy_binding_active"
+        ]
+    )
+    close_burst_soft_score = (
+        1.0 if aggregate_close_burst_qualified_count else 0.0
+    ) if close_burst_binding_active else None
+    close_burst_occurrence_support_weight = (
+        min(
+            1.0,
+            config.close_burst_event_reference_count
+            / config.highlight_cadence_reference_count,
+        )
+        if close_burst_binding_active
+        and config.close_burst_event_reference_count is not None
+        else None
+    )
+    aggregate_close_burst_events = [
+        {"section_index": int(item["section_index"]), **dict(event)}
+        for item in strict_highlight_records
+        for event in item["close_only_multi_source_burst"]["events"]
+    ]
+    aggregate_failures: list[str] = [
+        f"section_{item['section_index']}:{failure}"
+        for item in strict_highlight_records
+        for failure in item["local_failure_codes"]
+    ]
+    if strict_highlight_records:
+        if (
+            aggregate_closeup_fraction + _EPSILON
+            < config.chorus_role_pooled_product_minimum_closeup_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_closeup_fraction_below_product_minimum"
+            )
+        if (
+            aggregate_nonwide_fraction + _EPSILON
+            < config.chorus_role_pooled_product_minimum_nonwide_fraction
+        ):
+            aggregate_failures.append(
+                "highlight_pooled_nonwide_fraction_below_product_minimum"
+            )
+    all_failures.extend(
+        item for item in aggregate_failures if not item.startswith("section_")
+    )
+    closeup_target = _symmetric_fraction_target_evidence(
+        aggregate_closeup_fraction,
+        config.chorus_role_preferred_closeup_fraction,
+    )
+    nonwide_target = _symmetric_fraction_target_evidence(
+        aggregate_nonwide_fraction,
+        config.chorus_role_preferred_nonwide_fraction,
+    )
+    wide_run_target = _wide_run_soft_target_evidence(
+        aggregate_maximum_wide_run,
+        config.chorus_role_preferred_maximum_consecutive_wide_run_seconds,
+        config.maximum_consecutive_wide_run_seconds,
+    )
+    soft_target_score = (
+        (
+            float(closeup_target["alignment_score"])
+            + float(nonwide_target["alignment_score"])
+            + float(wide_run_target["alignment_score"])
+        )
+        / 3.0
+        if strict_highlight_records
+        else None
+    )
+    highlight_aggregate = {
+        "contract": HIGHLIGHT_AGGREGATE_CONTRACT,
+        "strict_highlight_section_indices": [
+            int(item["section_index"]) for item in strict_highlight_records
+        ],
+        "strict_highlight_section_count": len(strict_highlight_records),
+        "duration_weighting": (
+            "sum_observed_known_shot_duration_across_strict_highlights"
+        ),
+        "observed": {
+            "known_duration_seconds": aggregate_known_duration,
+            "closeup_duration_seconds": aggregate_closeup_duration,
+            "nonwide_duration_seconds": aggregate_nonwide_duration,
+            "closeup_duration_fraction": aggregate_closeup_fraction,
+            "nonwide_duration_fraction": aggregate_nonwide_fraction,
+            "maximum_consecutive_wide_run_seconds": (
+                aggregate_maximum_wide_run
+            ),
+            "closeup_involved_source_switch_boundary_count": (
+                aggregate_closeup_switch_count
+            ),
+            "editorial_motion_accent_closeup_switch_boundary_count": (
+                aggregate_closeup_motion_switch_count
+            ),
+            "static_closeup_switch_boundary_count": (
+                aggregate_closeup_switch_count
+                - aggregate_closeup_motion_switch_count
+            ),
+            "nonwide_involved_source_switch_boundary_count": (
+                aggregate_nonwide_switch_count
+            ),
+            "editorial_motion_accent_nonwide_switch_boundary_count": (
+                aggregate_nonwide_motion_switch_count
+            ),
+            "static_nonwide_switch_boundary_count": (
+                aggregate_nonwide_switch_count
+                - aggregate_nonwide_motion_switch_count
+            ),
+            "editorial_motion_is_choreography_motion_proof": False,
+            "source_switch_count": aggregate_source_switch_count,
+            "source_switches_per_minute": (
+                aggregate_source_switches_per_minute
+            ),
+            "close_only_multi_source_burst_candidate_event_count": (
+                aggregate_close_burst_candidate_count
+            ),
+            "close_only_multi_source_burst_qualified_event_count": (
+                aggregate_close_burst_qualified_count
+            ),
+        },
+        "hard_targets": {
+            "local_minimum_closeup_duration_fraction": (
+                config.minimum_closeup_fraction
+            ),
+            "local_minimum_nonwide_duration_fraction": (
+                config.minimum_nonwide_fraction
+            ),
+            "pooled_product_minimum_closeup_duration_fraction": (
+                config.chorus_role_pooled_product_minimum_closeup_fraction
+            ),
+            "pooled_product_minimum_nonwide_duration_fraction": (
+                config.chorus_role_pooled_product_minimum_nonwide_fraction
+            ),
+            "maximum_consecutive_wide_run_seconds": (
+                config.maximum_consecutive_wide_run_seconds
+            ),
+            "minimum_source_switches_per_minute": (
+                config.highlight_product_minimum_source_switches_per_minute
+            ),
+        },
+        "soft_targets": {
+            "closeup_p50": closeup_target,
+            "nonwide_p50": nonwide_target,
+            "maximum_wide_run_p75": wide_run_target,
+            "source_switches_per_minute_p75": {
+                "target": config.highlight_preferred_source_switches_per_minute,
+                "observed": aggregate_source_switches_per_minute,
+                "absolute_deviation": abs(
+                    aggregate_source_switches_per_minute
+                    - config.highlight_preferred_source_switches_per_minute
+                ),
+                "hard_gate": False,
+                "reference_count": config.highlight_cadence_reference_count,
+            },
+            "close_only_multi_source_burst_event_p10": {
+                "contract": CLOSE_BURST_EVENT_EVIDENCE_CONTRACT,
+                "policy_binding_active": close_burst_binding_active,
+                "policy_binding": (
+                    strict_highlight_records[0][
+                        "close_only_multi_source_burst"
+                    ]["policy_binding"]
+                    if close_burst_binding_active
+                    else None
+                ),
+                "candidate_event_count": aggregate_close_burst_candidate_count,
+                "qualified_event_count": aggregate_close_burst_qualified_count,
+                "events": aggregate_close_burst_events,
+                "alignment_score": close_burst_soft_score,
+                "event_occurrence_support_weight": (
+                    close_burst_occurrence_support_weight
+                ),
+                "evidence_weighted_alignment_score": (
+                    close_burst_soft_score * close_burst_occurrence_support_weight
+                    if close_burst_soft_score is not None
+                    and close_burst_occurrence_support_weight is not None
+                    else None
+                ),
+                "observed_event_count": config.close_burst_event_reference_count,
+                "human_reference_count": config.highlight_cadence_reference_count,
+                "saturated_at_one_or_more_qualified_events": True,
+                "absence_is_hard_failure": False,
+                "hard_gate": False,
+                "per_reference_occurrence_p10": 0.0,
+                "per_reference_occurrence_median": 0.0,
+                "medium_to_close_counts_as_close_only": False,
+            },
+            "aggregate_alignment_score": soft_target_score,
+            "score_is_hard_gate": False,
+            "over_close_past_target_is_rewarded": False,
+        },
+        "policy_provenance": _highlight_policy_provenance(config),
+        "local_section_failures": {
+            str(item["section_index"]): list(item["local_failure_codes"])
+            for item in strict_highlight_records
+            if item["local_failure_codes"]
+        },
+        "failure_codes": aggregate_failures,
+        "passed": not aggregate_failures,
+    }
+
     strict_chorus_present = any(
         str(_mapping(raw, f"section {index}").get("role") or "")
         == "chorus_like"
-        and _finite(
-            _mapping(raw, f"section {index}").get("end_seconds"),
-            "section end",
-        )
-        - _finite(
-            _mapping(raw, f"section {index}").get("start_seconds"),
-            "section start",
-        )
-        >= config.highlight_minimum_duration_seconds
         for index, raw in enumerate(sections)
     )
     if strict_chorus_present:
@@ -1472,7 +3592,6 @@ def review_rendered_montage_grammar(
                 "highlight_phrase_entry_wide_anchor_fraction_below_reference_floor"
             )
 
-    proxy = _mapping(root.get("rendered_proxy_review"), "rendered_proxy_review")
     closeup_proxy = _proxy_closeup_face_coverage(
         choices=choices,
         rendered_proxy_review=proxy,
@@ -1502,8 +3621,13 @@ def review_rendered_montage_grammar(
         "visible_runs": [dict(item) for item in runs],
         "render_plan_binding": plan_binding,
         "sections": section_metrics,
+        "highlight_aggregate": highlight_aggregate,
+        "role_conditioned_duration_aggregates": role_duration_aggregates,
         "exact_anchor_metrics": exact_anchor_metrics,
         "rendered_closeup_proxy": closeup_proxy,
+        "rendered_segment_interior_geometry": (
+            rendered_segment_interior_geometry
+        ),
         "policy": {
             "formation_wide": (
                 "identity_free_weak_person_plus_upper_body_or_strong_four_"
@@ -1511,12 +3635,22 @@ def review_rendered_montage_grammar(
                 "proof"
             ),
             "highlight": (
-                "reference_close_wide_transition_exact_section_and_phrase_"
-                "anchor_floors_plus_reference_median_wide_switch_soft_target_"
-                "plus_explicit_ive_product_nonwide_burst_requirement"
+                "every_positive_build_chorus_bridge_section_uses_role_p10_"
+                "when_positive_plus_role_pooled_p25_and_p100_wide_run_hard_"
+                "gates_with_p50_p75_soft_targets_no_short_chorus_bypass"
             ),
-            "motion": "bounded_learned_or_evidence_safe_accent_not_random_quota",
-            "pixel_proof": "plan_closeup_claim_requires_decoded_proxy_face_geometry",
+            "highlight_cadence": (
+                "every_positive_chorus_uses_hash_bound_p50_source_switch_"
+                "rate_hard_minimum_and_p75_soft_target"
+            ),
+            "motion": (
+                "bounded_editorial_accent_audit_not_choreography_motion_proof_"
+                "profile_v3_distribution_required"
+            ),
+            "pixel_proof": (
+                "plan_closeup_endpoints_plus_hash_bound_segment_interior_"
+                "sampled_geometry_duration_and_wide_run_proxy_estimate"
+            ),
         },
     }
 
@@ -1524,6 +3658,7 @@ def review_rendered_montage_grammar(
 __all__ = [
     "EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT",
     "RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS",
+    "RENDERED_SEGMENT_INTERIOR_GEOMETRY_REVIEW_CONTRACT",
     "RenderedMontageGrammarConfig",
     "review_rendered_montage_grammar",
 ]

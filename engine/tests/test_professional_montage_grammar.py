@@ -11,10 +11,21 @@ from crosscut.professional_montage_grammar import (
     MontageGrammarConfig,
     MontageGrammarEvidenceError,
     MontageSongInput,
+    PROFILE_ANALYSIS_BASIS,
+    PROFILE_SCHEMA_VERSION,
     ProfessionalMontageGrammarProfile,
     build_professional_montage_grammar_profile,
 )
-from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
+from crosscut.stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_CONTRACT,
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
+from crosscut.stage_edit_feature_snapshot_job import (
+    FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    FEATURE_SNAPSHOT_JOB_INPUT_POLICY,
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+)
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     SourceCandidateToken,
@@ -187,25 +198,21 @@ class _SyntheticSong:
             for source_id in self.source_ids
         ]
         unsigned_manifest = {
-            "schema_version": 2,
-            "analysis_basis": (
-                "synchronized_source_causal_stage_edit_feature_snapshot_v2"
-            ),
+            "schema_version": FEATURE_MATERIALIZER_SCHEMA_VERSION,
+            "analysis_basis": FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
             "song_id": song_id,
-            "input_policy": {
-                "features_available_before_current_editorial_choice": True,
-                "strictly_past_causal_edit_history_only": True,
-                "reference_match_scores_present": False,
-                "selected_or_rejected_source_targets_present": False,
-                "raw_frames_persisted": False,
-                "identity_embeddings_persisted": False,
-            },
+            "input_policy": dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY),
             "sampling": {},
             "source_catalog_sha256": _canonical_sha256(self.source_catalog),
             "source_count": 3,
             "source_content": source_content,
             "supervision_inputs": supervision_records,
-            "feature_provenance": {},
+            "feature_provenance": {
+                "producer": FEATURE_MATERIALIZER_CONTRACT,
+                "contracts": list(
+                    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS
+                ),
+            },
             "snapshots": snapshot_records,
             "statistics": {
                 "reference_count": 2,
@@ -326,7 +333,10 @@ class _SyntheticSong:
             start = float(index)
             if cut_clock_offset and index == 1:
                 start += 0.001
-            end = float(index + 1)
+            # Make the final wide chorus shot three seconds long.  The count
+            # distribution therefore differs materially from the duration
+            # distribution and catches count-as-duration regressions.
+            end = 8.0 if index == 5 else float(index + 1)
             labels.append(
                 {
                     "record_id": f"{reference_id}:{index}",
@@ -405,6 +415,13 @@ class ProfessionalMontageGrammarTest(unittest.TestCase):
     def test_measures_wide_switches_anchors_and_closeup_bursts(self) -> None:
         profile = self._profile()
         payload = profile.to_dict()
+        self.assertEqual(2, PROFILE_SCHEMA_VERSION)
+        self.assertEqual(
+            "ive_human_reference_visual_montage_grammar_v2",
+            PROFILE_ANALYSIS_BASIS,
+        )
+        self.assertEqual(PROFILE_SCHEMA_VERSION, payload["schema_version"])
+        self.assertEqual(PROFILE_ANALYSIS_BASIS, payload["analysis_basis"])
         self.assertEqual(2, profile.song_count)
         self.assertEqual(4, profile.reference_count)
         verse = payload["aggregate_by_acoustic_role"]["verse_like"]
@@ -438,6 +455,39 @@ class ProfessionalMontageGrammarTest(unittest.TestCase):
             chorus["reference_distributions"]
             ["phrase_entry_wide_anchor_fraction"]["reference_floor"]["value"],
         )
+        self.assertEqual(
+            0.25,
+            chorus["reference_distributions"]["shot_size_fractions"]["wide"]
+            ["median"],
+        )
+        self.assertEqual(
+            0.5,
+            chorus["reference_distributions"]["shot_size_duration_fractions"]
+            ["wide"]["median"],
+        )
+        self.assertEqual(
+            0.5,
+            chorus["reference_distributions"]["nonwide_duration_fraction"]
+            ["median"],
+        )
+        self.assertEqual(
+            3.0,
+            chorus["reference_distributions"]
+            ["maximum_consecutive_wide_run_seconds"]["median"],
+        )
+        self.assertEqual(
+            3.0,
+            chorus["wide_run_event_distributions"]
+            ["consecutive_wide_run_duration_seconds"]["maximum"],
+        )
+        self.assertEqual(
+            12.0,
+            chorus["pooled_durations_seconds"]["shot_size"]["wide"],
+        )
+        self.assertEqual(
+            12.0,
+            chorus["pooled_durations_seconds"]["nonwide"],
+        )
 
     def test_person_count_is_evidence_not_a_formation_assertion(self) -> None:
         payload = self._profile().to_dict()
@@ -459,6 +509,50 @@ class ProfessionalMontageGrammarTest(unittest.TestCase):
         self.assertEqual(1, verse["unknown_shot_scale_count"])
         self.assertEqual(1, verse["unknown_shot_scale_reasons"]["missing_mask"])
         self.assertEqual(1, verse["shot_size_counts"]["wide"])
+        self.assertEqual(1.0, verse["shot_size_duration_seconds"]["wide"])
+        self.assertEqual(
+            1.0,
+            verse["unknown_shot_scale_duration_seconds"],
+        )
+        self.assertEqual(
+            1.0,
+            verse["maximum_consecutive_wide_run_seconds"],
+        )
+
+    def test_duration_and_wide_run_tampering_fails_closed(self) -> None:
+        mutations = (
+            (
+                "duration fraction",
+                lambda metric: metric["shot_size_duration_fractions"].__setitem__(
+                    "close", metric["shot_size_fractions"]["close"]
+                ),
+                "duration fraction mismatch",
+            ),
+            (
+                "explicit nonwide",
+                lambda metric: metric.__setitem__(
+                    "nonwide_duration_fraction",
+                    1.0 - metric["shot_size_fractions"]["wide"],
+                ),
+                "explicit nonwide duration fraction mismatch",
+            ),
+            (
+                "wide run maximum",
+                lambda metric: metric.__setitem__(
+                    "maximum_consecutive_wide_run_seconds", 99.0
+                ),
+                "maximum consecutive wide-run duration mismatch",
+            ),
+        )
+        for name, mutate, error in mutations:
+            with self.subTest(name=name):
+                payload = self._profile().to_dict()
+                metric = payload["songs"][0]["references"][0][
+                    "by_acoustic_role"
+                ]["chorus_like"]
+                mutate(metric)
+                with self.assertRaisesRegex(MontageGrammarEvidenceError, error):
+                    ProfessionalMontageGrammarProfile.from_mapping(payload)
 
     def test_round_trip_rebuilds_from_immutable_inputs(self) -> None:
         profile = self._profile()
@@ -501,6 +595,31 @@ class ProfessionalMontageGrammarTest(unittest.TestCase):
         payload["statistics"]["reference_count"] = 999
         _write_json(first.feature_path, payload)
         with self.assertRaisesRegex(MontageGrammarEvidenceError, "content hash"):
+            build_professional_montage_grammar_profile(
+                (first.input, second.input),
+                config=self.config,
+            )
+
+    def test_legacy_v2_feature_manifest_is_not_silently_accepted(self) -> None:
+        first = _SyntheticSong(self.root, "IVE-SONG-A")
+        second = _SyntheticSong(self.root, "IVE-SONG-B")
+        payload = json.loads(first.feature_path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 2
+        payload["analysis_basis"] = (
+            "synchronized_source_causal_stage_edit_feature_snapshot_v2"
+        )
+        payload.pop("manifest_sha256")
+        digest = _canonical_sha256(payload)
+        payload["manifest_sha256"] = digest
+        first.feature_path = first.root / (
+            f"stageedit-feature-snapshot-job-manifest-{digest[:16]}.json"
+        )
+        _write_json(first.feature_path, payload)
+
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "feature manifest schema version mismatch",
+        ):
             build_professional_montage_grammar_profile(
                 (first.input, second.input),
                 config=self.config,

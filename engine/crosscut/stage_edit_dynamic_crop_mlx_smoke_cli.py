@@ -85,9 +85,15 @@ from .stage_edit_dynamic_crop_head_v2 import (
 from .stage_edit_dynamic_crop_training import (
     build_stage_edit_dynamic_crop_training_corpus_v2,
 )
-from .stage_edit_feature_materializer import StageEditFeatureSnapshot
+from .stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_CONTRACT,
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
 from .stage_edit_feature_snapshot_job import (
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
+    FEATURE_SNAPSHOT_JOB_INPUT_POLICY,
+    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
     FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
 )
 from .stage_edit_production_training import (
@@ -282,6 +288,8 @@ def _load_bbr_feature_dataset(
         unsigned.pop("manifest_sha256", None)
         records = manifest.get("snapshots")
         statistics = manifest.get("statistics")
+        input_policy = manifest.get("input_policy")
+        feature_provenance = manifest.get("feature_provenance")
         if (
             manifest.get("schema_version") != FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION
             or manifest.get("analysis_basis") != FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS
@@ -294,6 +302,13 @@ def _load_bbr_feature_dataset(
             or not isinstance(statistics, Mapping)
             or statistics.get("reference_count")
             != EXPECTED_REFERENCE_COUNT_PER_SONG
+            or not isinstance(input_policy, Mapping)
+            or dict(input_policy) != dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY)
+            or not isinstance(feature_provenance, Mapping)
+            or feature_provenance.get("producer")
+            != FEATURE_MATERIALIZER_CONTRACT
+            or set(feature_provenance.get("contracts") or ())
+            != set(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS)
         ):
             raise StageEditMlxSmokeRunnerError(
                 f"{song} feature manifest contract differs"
@@ -332,6 +347,7 @@ def _load_bbr_feature_dataset(
             }
             if (
                 raw_record.get("snapshot_sha256") != snapshot.snapshot_sha256
+                or snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION
                 or raw_record.get("token_count") != token_count
                 or raw_record.get("source_count") != 10
                 or not candidate_counts
