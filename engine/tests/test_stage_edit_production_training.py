@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 import hashlib
 import json
@@ -16,11 +17,25 @@ from crosscut.section_director import (
     SectionRole,
 )
 from crosscut.stage_edit_dynamic_crop_head_v2 import (
+    DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
     DynamicCropTrajectoryTargetV2,
     StageEditDynamicCropTargetSequenceV2,
 )
+from crosscut.stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+    DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+    DYNAMIC_CROP_V3_MODEL_CONTRACT,
+    DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+    DYNAMIC_CROP_V3_TARGET_CONTRACT,
+    StageEditTransformerDynamicCropV3,
+    load_stage_edit_dynamic_crop_checkpoint_v3,
+)
 from crosscut.stage_edit_dynamic_crop_training import (
     StageEditDynamicCropTrainingCorpusV2,
+)
+from crosscut.stage_edit_dynamic_crop_training_v3 import (
+    StageEditDynamicCropTrainingCorpusV3,
+    build_stage_edit_dynamic_crop_training_corpus_v3,
 )
 from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
     DYNAMIC_CROP_V2_SEMIMARKOV_ADAPTER_CONTRACT,
@@ -29,11 +44,14 @@ from crosscut.stage_edit_head_materializer import (
     materialize_stage_edit_head_frames_v2,
 )
 from crosscut.stage_edit_production_training import (
+    DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
     ProductionQualityThresholds,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
     _HierarchicalSourceWindowSampler,
     _balanced_cut_windows,
     _cut_only_pretraining_loss_contract,
+    _dynamic_crop_v3_validation_selection_evidence,
+    _require_unambiguous_checkpoint_namespace,
     _source_only_pretraining_loss_contract,
     _source_pretraining_inventory,
     _structured_head_coverage_gate,
@@ -148,7 +166,124 @@ def _passing_dynamic_metrics() -> dict:
     }
 
 
+def _passing_dynamic_v3_metrics() -> dict:
+    return {
+        "schema_version": 3,
+        "target_contract": DYNAMIC_CROP_V3_TARGET_CONTRACT,
+        "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
+        "output_contract": DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+        "trajectory": {
+            "track_label_count": 10,
+            "keyframe_label_count": 20,
+            "target_source_slot_mismatch_count": 0,
+            "coordinates": {
+                "zoom": {"label_count": 20, "mean_absolute_error": 0.03},
+                "center_x": {"label_count": 20, "mean_absolute_error": 0.03},
+                "center_y": {"label_count": 20, "mean_absolute_error": 0.03},
+                "roll_degrees": {
+                    "label_count": 20,
+                    "mean_absolute_error": 0.30,
+                },
+            },
+            "aggregate_normalized_improvement_over_static_prior": 0.04,
+            "teacher_forced_count_normalized_time_mae": 0.03,
+            "count": {"label_count": 10, "exact_accuracy": 0.60},
+            "motion": {"label_count": 10, "accuracy": 0.70},
+            "renderer_decode": {
+                "attempt_count": 10,
+                "eligible_count": 10,
+                "eligible_rate": 1.0,
+                "minimum_safe_zoom_projection_count": 0,
+                "rejection_reasons": {},
+            },
+        },
+        "legacy_v2_checkpoint_or_output_used": False,
+        "legacy_static_crop_head_used_for_trajectory": False,
+    }
+
+
 class StageEditProductionQualityTests(unittest.TestCase):
+    def test_checkpoint_namespace_never_reinterprets_v2_as_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory)
+            (checkpoint / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME).write_text(
+                "{}", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "other model format"):
+                _require_unambiguous_checkpoint_namespace(
+                    checkpoint,
+                    dynamic_crop_version=3,
+                )
+
+    def test_dynamic_crop_v3_checkpoint_selection_gate_is_exact(self) -> None:
+        passing = _dynamic_crop_v3_validation_selection_evidence(
+            _passing_dynamic_v3_metrics()
+        )
+        self.assertTrue(passing["selectable"])
+        self.assertEqual(
+            DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
+            passing["contract"],
+        )
+        self.assertGreater(passing["score_component"], 0.0)
+        self.assertFalse(passing["static_prior_can_be_selected"])
+
+        mutations = (
+            (
+                ("trajectory", "renderer_decode", "eligible_rate"),
+                0.99,
+                "dynamic_crop_v3_validation_renderer_decode_not_exact",
+            ),
+            (
+                (
+                    "trajectory",
+                    "renderer_decode",
+                    "minimum_safe_zoom_projection_count",
+                ),
+                1,
+                "dynamic_crop_v3_validation_projection_not_zero",
+            ),
+            (
+                ("trajectory", "target_source_slot_mismatch_count"),
+                1,
+                "dynamic_crop_v3_validation_source_slot_mismatch",
+            ),
+            (
+                (
+                    "trajectory",
+                    "aggregate_normalized_improvement_over_static_prior",
+                ),
+                0.0,
+                "dynamic_crop_v3_validation_did_not_beat_static_prior",
+            ),
+        )
+        for path, value, expected_reason in mutations:
+            with self.subTest(reason=expected_reason):
+                metrics = copy.deepcopy(_passing_dynamic_v3_metrics())
+                destination = metrics
+                for key in path[:-1]:
+                    destination = destination[key]
+                destination[path[-1]] = value
+                rejected = _dynamic_crop_v3_validation_selection_evidence(
+                    metrics
+                )
+                self.assertFalse(rejected["selectable"])
+                self.assertIn(expected_reason, rejected["reasons"])
+
+    def test_dynamic_crop_v3_quality_uses_count_and_exact_renderer_schema(
+        self,
+    ) -> None:
+        passed = evaluate_stage_edit_production_quality(
+            _passing_metrics(),
+            dynamic_crop_v3_metrics=_passing_dynamic_v3_metrics(),
+        )
+        self.assertTrue(passed.passed)
+        with self.assertRaisesRegex(ValueError, "exactly one dynamic crop version"):
+            evaluate_stage_edit_production_quality(
+                _passing_metrics(),
+                dynamic_crop_v2_metrics=_passing_dynamic_metrics(),
+                dynamic_crop_v3_metrics=_passing_dynamic_v3_metrics(),
+            )
+
     def test_renderer_owned_structured_coverage_keeps_duration_and_skips_logits(
         self,
     ) -> None:
@@ -450,6 +585,14 @@ def _dynamic_crop_corpus(
     )
 
 
+def _dynamic_crop_corpus_v3(
+    examples: tuple[ReferenceTrainingExample, ...],
+) -> StageEditDynamicCropTrainingCorpusV3:
+    return build_stage_edit_dynamic_crop_training_corpus_v3(
+        _dynamic_crop_corpus(examples)
+    )
+
+
 def _source_balance_example(
     song: str,
     reference: str,
@@ -559,6 +702,167 @@ class StageEditSourcePretrainingTests(unittest.TestCase):
 
 @unittest.skipUnless(mlx_runtime_version() is not None, "MLX is optional")
 class StageEditProductionTrainingSmokeTests(unittest.TestCase):
+    def test_v3_trains_saves_reloads_and_reports_distinct_contracts(self) -> None:
+        schema = DEFAULT_STAGE_EDIT_SCHEMA
+        examples = tuple(
+            _training_example(song, f"{song}-v3-ref-{index}")
+            for song in ("BANG", "BLACKHOLE", "XOXZ")
+            for index in range(2)
+        )
+        corpus = ReferenceTrainingCorpus(
+            examples=examples,
+            data_id="3" * 64,
+            source_paths=(),
+            statistics={
+                "crop_coordinate_supervision_count": 24,
+                "transition_supervision_count": 6,
+            },
+        )
+        dynamic_corpus = _dynamic_crop_corpus_v3(examples)
+        config = StageEditTransformerConfig.from_schema(
+            schema,
+            model_dimension=16,
+            num_heads=4,
+            num_layers=1,
+            feed_forward_dimension=32,
+            max_sequence_length=8,
+            max_sources=2,
+            dropout=0.0,
+        )
+        thresholds = ProductionQualityThresholds(
+            minimum_cut_labels=2,
+            minimum_cut_positives=1,
+            minimum_cut_negatives=1,
+            minimum_cut_auroc=0.0,
+            minimum_cut_balanced_accuracy=0.0,
+            minimum_source_groups=1,
+            minimum_source_top1_accuracy=0.0,
+            minimum_source_mrr=0.0,
+            minimum_duration_labels=1,
+            minimum_duration_accuracy=0.0,
+            minimum_transition_labels=1,
+            minimum_transition_accuracy=0.0,
+            minimum_crop_labels_per_coordinate=1,
+            maximum_zoom_mae=100.0,
+            maximum_center_mae=100.0,
+            maximum_roll_mae_degrees=100.0,
+            minimum_dynamic_crop_tracks=1,
+            minimum_dynamic_crop_keyframes=1,
+            minimum_dynamic_crop_motion_labels=1,
+            maximum_dynamic_crop_zoom_mae=100.0,
+            maximum_dynamic_crop_center_mae=100.0,
+            maximum_dynamic_crop_roll_mae_degrees=100.0,
+            maximum_dynamic_crop_normalized_time_mae=100.0,
+            minimum_dynamic_crop_presence_f1=0.0,
+            minimum_dynamic_crop_keyframe_count_accuracy=0.0,
+            minimum_dynamic_crop_motion_accuracy=0.0,
+            minimum_dynamic_crop_renderer_decode_rate=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "v3-checkpoint"
+            result = train_production_stage_edit(
+                corpus,
+                checkpoint_directory=checkpoint,
+                held_out_song_ids=("XOXZ",),
+                model_config=config,
+                epochs=8,
+                early_stopping_patience=16,
+                batch_size=2,
+                learning_rate=3.0e-3,
+                cut_pretrain_steps=0,
+                source_pretrain_steps=0,
+                finetune_warmup_steps=0,
+                minimum_finetune_optimizer_steps=1,
+                minimum_checkpoint_selection_finetune_steps=1,
+                seed=29,
+                device=mx.cpu,
+                dynamic_crop_corpus=dynamic_corpus,
+                quality_thresholds=thresholds,
+                authorize_production_activation=False,
+            )
+
+            self.assertTrue(
+                (checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME).is_file()
+            )
+            self.assertTrue(
+                (checkpoint / DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME).is_file()
+            )
+            self.assertFalse((checkpoint / "dynamic-crop-v2-metadata.json").exists())
+            reloaded_model, reloaded_metadata = (
+                load_stage_edit_dynamic_crop_checkpoint_v3(
+                    checkpoint,
+                    expected_schema=schema,
+                )
+            )
+            self.assertIsInstance(
+                reloaded_model, StageEditTransformerDynamicCropV3
+            )
+            self.assertEqual(
+                DYNAMIC_CROP_V3_MODEL_CONTRACT,
+                reloaded_metadata.model_contract,
+            )
+            self.assertGreater(reloaded_metadata.training_steps, 0)
+
+            report = result.report
+            self.assertEqual(3, report["checkpoint"]["dynamic_crop_version"])
+            self.assertTrue(report["checkpoint"]["dynamic_crop_v3_checkpoint"])
+            self.assertFalse(report["checkpoint"]["dynamic_crop_v2_checkpoint"])
+            self.assertEqual(3, report["model"]["dynamic_crop_version"])
+            self.assertTrue(report["model"]["dynamic_crop_v3_enabled"])
+            self.assertFalse(report["model"]["dynamic_crop_v2_enabled"])
+            self.assertIsNone(report["data"]["dynamic_crop_v2"])
+            self.assertEqual(
+                dynamic_corpus.data_id,
+                report["data"]["dynamic_crop_v3"]["data_id"],
+            )
+            self.assertEqual(3, report["data"]["dynamic_crop_version"])
+            selected = report["optimization"][
+                "best_validation_selection_evidence"
+            ]
+            self.assertTrue(selected["selectable"])
+            self.assertGreater(selected["dynamic_crop_v3_score_component"], 0.0)
+            self.assertTrue(
+                selected["dynamic_crop_v3_selection_gate"]["selectable"]
+            )
+            self.assertEqual(
+                DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
+                report["optimization"]["dynamic_crop_v3_model_selection"],
+            )
+            self.assertEqual(
+                report["optimization"][
+                    "effective_dynamic_crop_v3_loss_contract"
+                ],
+                report["optimization"][
+                    "effective_dynamic_crop_loss_contract"
+                ],
+            )
+            self.assertTrue(
+                report["optimization"][
+                    "reloaded_checkpoint_validation_selection_evidence"
+                ]["dynamic_crop_v3_selection_gate"]["selectable"]
+            )
+            self.assertIsNotNone(
+                report["history"][0][
+                    "training_song_reference_validation_dynamic_crop_v3"
+                ]
+            )
+            self.assertIsNone(
+                report["history"][0][
+                    "training_song_reference_validation_dynamic_crop_v2"
+                ]
+            )
+            self.assertIsNotNone(
+                report["held_out_evaluation"]["dynamic_crop_v3_metrics"]
+            )
+            self.assertIsNone(
+                report["held_out_evaluation"]["dynamic_crop_v2_metrics"]
+            )
+            self.assertFalse(
+                report["held_out_evaluation"][
+                    "heldout_dynamic_crop_metrics_used_for_checkpoint_selection"
+                ]
+            )
+
     def test_exact_saved_checkpoint_needs_song_gate_and_explicit_authorization(self) -> None:
         schema = DEFAULT_STAGE_EDIT_SCHEMA
         examples = tuple(

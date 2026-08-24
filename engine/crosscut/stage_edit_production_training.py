@@ -40,8 +40,28 @@ from .stage_edit_dynamic_crop_head_v2 import (
     stage_edit_dynamic_crop_v2_parameter_count,
     tensorize_stage_edit_dynamic_crop_supervision_v2,
 )
+from .stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+    DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+    DYNAMIC_CROP_V3_MODEL_CONTRACT,
+    DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+    DYNAMIC_CROP_V3_SCHEMA_VERSION,
+    DYNAMIC_CROP_V3_TARGET_CONTRACT,
+    DynamicCropV3LossContract,
+    StageEditTransformerDynamicCropV3,
+    evaluate_stage_edit_dynamic_crop_v3,
+    load_stage_edit_dynamic_crop_checkpoint_v3,
+    new_stage_edit_dynamic_crop_checkpoint_metadata_v3,
+    save_stage_edit_dynamic_crop_checkpoint_v3,
+    stage_edit_dynamic_crop_v3_loss,
+    stage_edit_dynamic_crop_v3_parameter_count,
+    tensorize_stage_edit_dynamic_crop_supervision_v3,
+)
 from .stage_edit_dynamic_crop_training import (
     StageEditDynamicCropTrainingCorpusV2,
+)
+from .stage_edit_dynamic_crop_training_v3 import (
+    StageEditDynamicCropTrainingCorpusV3,
 )
 from .stage_edit_reference_adapter import (
     ReferenceTrainingCorpus,
@@ -118,6 +138,9 @@ STAGE_EDIT_TRAINING_SONG_EXPANSION_CONTRACT = (
 STAGE_EDIT_SELECTION_FREEZE_FILENAME = (
     "selection-frozen-before-heldout.json"
 )
+DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
+    "dynamic_crop_v3_renderer_exact_static_prior_improvement_gate_v1"
+)
 
 
 def _require_mlx() -> None:
@@ -136,10 +159,143 @@ def _finite_metric(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _dynamic_crop_v3_validation_selection_evidence(
+    metrics: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Fail closed on the renderer-exact v3 validation selection contract."""
+
+    reasons: list[str] = []
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+        reasons.append("dynamic_crop_v3_validation_metrics_missing")
+    if metrics.get("schema_version") != DYNAMIC_CROP_V3_SCHEMA_VERSION:
+        reasons.append("dynamic_crop_v3_validation_schema_mismatch")
+    if metrics.get("model_contract") != DYNAMIC_CROP_V3_MODEL_CONTRACT:
+        reasons.append("dynamic_crop_v3_validation_model_contract_mismatch")
+    if metrics.get("target_contract") != DYNAMIC_CROP_V3_TARGET_CONTRACT:
+        reasons.append("dynamic_crop_v3_validation_target_contract_mismatch")
+    if metrics.get("output_contract") != DYNAMIC_CROP_V3_OUTPUT_CONTRACT:
+        reasons.append("dynamic_crop_v3_validation_output_contract_mismatch")
+    if metrics.get("legacy_v2_checkpoint_or_output_used") is not False:
+        reasons.append("dynamic_crop_v3_validation_used_legacy_v2")
+    if metrics.get("legacy_static_crop_head_used_for_trajectory") is not False:
+        reasons.append("dynamic_crop_v3_validation_used_static_crop_head")
+
+    trajectory = metrics.get("trajectory")
+    if not isinstance(trajectory, Mapping):
+        trajectory = {}
+        reasons.append("dynamic_crop_v3_validation_trajectory_missing")
+    renderer_decode = trajectory.get("renderer_decode")
+    if not isinstance(renderer_decode, Mapping):
+        renderer_decode = {}
+        reasons.append("dynamic_crop_v3_validation_renderer_decode_missing")
+
+    attempt_count = renderer_decode.get("attempt_count")
+    eligible_count = renderer_decode.get("eligible_count")
+    eligible_rate = _finite_metric(renderer_decode.get("eligible_rate"))
+    if (
+        isinstance(attempt_count, bool)
+        or not isinstance(attempt_count, int)
+        or attempt_count < 1
+    ):
+        reasons.append("dynamic_crop_v3_validation_renderer_attempts_missing")
+    if (
+        isinstance(eligible_count, bool)
+        or not isinstance(eligible_count, int)
+        or not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or eligible_count != attempt_count
+        or eligible_rate != 1.0
+    ):
+        reasons.append("dynamic_crop_v3_validation_renderer_decode_not_exact")
+
+    projection_count = renderer_decode.get(
+        "minimum_safe_zoom_projection_count"
+    )
+    if (
+        isinstance(projection_count, bool)
+        or not isinstance(projection_count, int)
+        or projection_count != 0
+    ):
+        reasons.append("dynamic_crop_v3_validation_projection_not_zero")
+
+    source_slot_mismatch_count = trajectory.get(
+        "target_source_slot_mismatch_count"
+    )
+    if (
+        isinstance(source_slot_mismatch_count, bool)
+        or not isinstance(source_slot_mismatch_count, int)
+        or source_slot_mismatch_count != 0
+    ):
+        reasons.append("dynamic_crop_v3_validation_source_slot_mismatch")
+
+    improvement = _finite_metric(
+        trajectory.get("aggregate_normalized_improvement_over_static_prior")
+    )
+    if improvement is None or improvement <= 0.0:
+        reasons.append("dynamic_crop_v3_validation_did_not_beat_static_prior")
+
+    return {
+        "contract": DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
+        "selectable": not reasons,
+        "reasons": reasons,
+        "score_component": improvement,
+        "renderer_decode_attempt_count": attempt_count,
+        "renderer_decode_eligible_count": eligible_count,
+        "renderer_decode_eligible_rate": eligible_rate,
+        "minimum_safe_zoom_projection_count": projection_count,
+        "target_source_slot_mismatch_count": source_slot_mismatch_count,
+        "aggregate_normalized_improvement_over_static_prior": improvement,
+        "static_prior_can_be_selected": False,
+        "heldout_metrics_consumed": False,
+    }
+
+
+def _stage_edit_validation_selection_with_dynamic_crop_v3(
+    base_selection: Mapping[str, Any],
+    dynamic_crop_v3_metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add v3 validation utility without changing the base selection identity."""
+
+    dynamic_evidence = _dynamic_crop_v3_validation_selection_evidence(
+        dynamic_crop_v3_metrics
+    )
+    base_score = _finite_metric(base_selection.get("score"))
+    dynamic_score = _finite_metric(dynamic_evidence.get("score_component"))
+    selectable = bool(
+        base_selection.get("selectable")
+        and dynamic_evidence["selectable"]
+        and base_score is not None
+        and dynamic_score is not None
+    )
+    combined_score = (
+        base_score + dynamic_score if selectable else None
+    )
+    return {
+        **dict(base_selection),
+        "selectable": selectable,
+        "score": combined_score,
+        "base_selection_score": base_score,
+        "dynamic_crop_v3_score_component": dynamic_score,
+        "components": {
+            **dict(base_selection.get("components", {})),
+            "dynamic_crop_v3_aggregate_normalized_improvement_over_static_prior": (
+                dynamic_score
+            ),
+        },
+        "formula": (
+            f"{base_selection.get('formula')} + "
+            "dynamic_crop_v3_aggregate_normalized_improvement_over_static_prior"
+        ),
+        "dynamic_crop_v3_selection_gate": dynamic_evidence,
+        "heldout_metrics_consumed": False,
+    }
+
+
 def _require_unambiguous_checkpoint_namespace(
     checkpoint_root: Path,
     *,
-    dynamic_crop_v2_enabled: bool,
+    dynamic_crop_version: int | None,
 ) -> None:
     """Refuse to overwrite a directory owned by the other model format."""
 
@@ -151,14 +307,27 @@ def _require_unambiguous_checkpoint_namespace(
         checkpoint_root / "metadata.json",
         checkpoint_root / "model.safetensors",
     )
-    dynamic_files = (
+    dynamic_v2_files = (
         checkpoint_root / DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
         checkpoint_root / DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
     )
-    incompatible = legacy_files if dynamic_crop_v2_enabled else dynamic_files
+    dynamic_v3_files = (
+        checkpoint_root / DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
+        checkpoint_root / DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+    )
+    if dynamic_crop_version == 2:
+        incompatible = legacy_files + dynamic_v3_files
+        requested = "Dynamic Crop v2"
+    elif dynamic_crop_version == 3:
+        incompatible = legacy_files + dynamic_v2_files
+        requested = "Dynamic Crop v3"
+    elif dynamic_crop_version is None:
+        incompatible = dynamic_v2_files + dynamic_v3_files
+        requested = "legacy"
+    else:
+        raise ValueError("unsupported dynamic crop checkpoint version")
     present = tuple(path.name for path in incompatible if path.exists())
     if present:
-        requested = "Dynamic Crop v2" if dynamic_crop_v2_enabled else "legacy"
         raise ValueError(
             f"cannot train {requested} checkpoint into a directory containing "
             f"the other model format: {', '.join(present)}"
@@ -323,19 +492,23 @@ def evaluate_stage_edit_production_quality(
     metrics: Mapping[str, Any],
     *,
     dynamic_crop_v2_metrics: Mapping[str, Any] | None = None,
+    dynamic_crop_v3_metrics: Mapping[str, Any] | None = None,
     thresholds: ProductionQualityThresholds = ProductionQualityThresholds(),
     transition_authority: str = LEARNED_TRANSITION_AUTHORITY,
 ) -> ProductionQualityGate:
     """Fail closed unless every renderer-active head generalizes unseen.
 
-    Dynamic Crop v2 checkpoints always carry the legacy four-value crop head
+    Dynamic Crop v2/v3 checkpoints always carry the legacy four-value crop head
     because they share the v1 trunk/output namespace, but v2 decoding never
     consumes that head: an ineligible trajectory means identity geometry, not
     a static-head fallback.  Therefore the legacy crop metric remains in the
     report as auxiliary evidence and is activation-critical only when no v2
     trajectory metrics were supplied.  The stricter K=8 trajectory, timing,
-    presence, motion, and real renderer-decode gates remain mandatory for v2.
+    presence/count, motion, and real renderer-decode gates remain mandatory.
     """
+
+    if dynamic_crop_v2_metrics is not None and dynamic_crop_v3_metrics is not None:
+        raise ValueError("quality evaluation accepts exactly one dynamic crop version")
 
     authority = StageEditTransitionAuthority(mode=transition_authority)
     reasons: list[str] = []
@@ -497,7 +670,8 @@ def evaluate_stage_edit_production_quality(
             "heldout_transition_label_entropy_below_threshold",
         )
     dynamic_crop_v2_active = isinstance(dynamic_crop_v2_metrics, Mapping)
-    if not dynamic_crop_v2_active:
+    dynamic_crop_v3_active = isinstance(dynamic_crop_v3_metrics, Mapping)
+    if not (dynamic_crop_v2_active or dynamic_crop_v3_active):
         if not isinstance(crop, Mapping) or not isinstance(
             crop.get("coordinates"), Mapping
         ):
@@ -525,14 +699,18 @@ def evaluate_stage_edit_production_quality(
                     maximum,
                     f"heldout_crop_{name}_mae_above_threshold",
                 )
-    trajectory = (
-        dynamic_crop_v2_metrics.get("trajectory")
-        if isinstance(dynamic_crop_v2_metrics, Mapping)
-        else None
-    )
+    trajectory = None
+    if dynamic_crop_v2_active:
+        trajectory = dynamic_crop_v2_metrics.get("trajectory")
+    elif dynamic_crop_v3_active:
+        trajectory = dynamic_crop_v3_metrics.get("trajectory")
     if not isinstance(trajectory, Mapping):
-        reasons.append("dynamic_crop_v2_metrics_missing")
-    else:
+        reasons.append(
+            "dynamic_crop_v3_metrics_missing"
+            if dynamic_crop_v3_active
+            else "dynamic_crop_v2_metrics_missing"
+        )
+    elif dynamic_crop_v2_active:
         minimum_count(
             trajectory.get("track_label_count"),
             thresholds.minimum_dynamic_crop_tracks,
@@ -617,6 +795,109 @@ def evaluate_stage_edit_production_quality(
                 thresholds.minimum_dynamic_crop_renderer_decode_rate,
                 "heldout_dynamic_crop_renderer_decode_rate_below_threshold",
             )
+    else:
+        minimum_count(
+            trajectory.get("track_label_count"),
+            thresholds.minimum_dynamic_crop_tracks,
+            "insufficient_heldout_dynamic_crop_tracks",
+        )
+        minimum_count(
+            trajectory.get("keyframe_label_count"),
+            thresholds.minimum_dynamic_crop_keyframes,
+            "insufficient_heldout_dynamic_crop_keyframes",
+        )
+        coordinates = trajectory.get("coordinates")
+        dynamic_maximums = {
+            "zoom": thresholds.maximum_dynamic_crop_zoom_mae,
+            "center_x": thresholds.maximum_dynamic_crop_center_mae,
+            "center_y": thresholds.maximum_dynamic_crop_center_mae,
+            "roll_degrees": thresholds.maximum_dynamic_crop_roll_mae_degrees,
+        }
+        if not isinstance(coordinates, Mapping):
+            reasons.append("dynamic_crop_v3_coordinate_metrics_missing")
+        else:
+            for name, maximum in dynamic_maximums.items():
+                coordinate = coordinates.get(name)
+                if not isinstance(coordinate, Mapping):
+                    reasons.append(
+                        f"heldout_dynamic_crop_{name}_metrics_missing"
+                    )
+                    continue
+                minimum_count(
+                    coordinate.get("label_count"),
+                    thresholds.minimum_dynamic_crop_keyframes,
+                    f"insufficient_heldout_dynamic_crop_{name}_labels",
+                )
+                maximum_metric(
+                    coordinate.get("mean_absolute_error"),
+                    maximum,
+                    f"heldout_dynamic_crop_{name}_mae_above_threshold",
+                )
+        maximum_metric(
+            trajectory.get("teacher_forced_count_normalized_time_mae"),
+            thresholds.maximum_dynamic_crop_normalized_time_mae,
+            "heldout_dynamic_crop_time_mae_above_threshold",
+        )
+        count = trajectory.get("count")
+        if not isinstance(count, Mapping):
+            reasons.append("dynamic_crop_v3_count_metrics_missing")
+        else:
+            minimum_metric(
+                count.get("exact_accuracy"),
+                thresholds.minimum_dynamic_crop_keyframe_count_accuracy,
+                "heldout_dynamic_crop_keyframe_count_below_threshold",
+            )
+        motion = trajectory.get("motion")
+        if not isinstance(motion, Mapping):
+            reasons.append("dynamic_crop_v3_motion_metrics_missing")
+        else:
+            minimum_count(
+                motion.get("label_count"),
+                thresholds.minimum_dynamic_crop_motion_labels,
+                "insufficient_heldout_dynamic_crop_motion_labels",
+            )
+            minimum_metric(
+                motion.get("accuracy"),
+                thresholds.minimum_dynamic_crop_motion_accuracy,
+                "heldout_dynamic_crop_motion_accuracy_below_threshold",
+            )
+        renderer_decode = trajectory.get("renderer_decode")
+        if not isinstance(renderer_decode, Mapping):
+            reasons.append("dynamic_crop_v3_renderer_decode_metrics_missing")
+        else:
+            minimum_count(
+                renderer_decode.get("attempt_count"),
+                thresholds.minimum_dynamic_crop_tracks,
+                "insufficient_heldout_dynamic_crop_renderer_attempts",
+            )
+            renderer_rate = _finite_metric(renderer_decode.get("eligible_rate"))
+            if renderer_rate != 1.0:
+                reasons.append("heldout_dynamic_crop_renderer_decode_not_exact")
+            projection_count = renderer_decode.get(
+                "minimum_safe_zoom_projection_count"
+            )
+            if (
+                isinstance(projection_count, bool)
+                or not isinstance(projection_count, int)
+                or projection_count != 0
+            ):
+                reasons.append("heldout_dynamic_crop_projection_not_zero")
+        source_slot_mismatch_count = trajectory.get(
+            "target_source_slot_mismatch_count"
+        )
+        if (
+            isinstance(source_slot_mismatch_count, bool)
+            or not isinstance(source_slot_mismatch_count, int)
+            or source_slot_mismatch_count != 0
+        ):
+            reasons.append("heldout_dynamic_crop_source_slot_mismatch")
+        aggregate_improvement = _finite_metric(
+            trajectory.get(
+                "aggregate_normalized_improvement_over_static_prior"
+            )
+        )
+        if aggregate_improvement is None or aggregate_improvement <= 0.0:
+            reasons.append("heldout_dynamic_crop_did_not_beat_static_prior")
     return ProductionQualityGate(
         passed=not reasons,
         reasons=tuple(reasons),
@@ -1418,9 +1699,16 @@ def train_production_stage_edit(
     seed: int = 20260824,
     device: Any = None,
     loss_contract: StageEditLossContract = StageEditLossContract(),
-    dynamic_crop_corpus: StageEditDynamicCropTrainingCorpusV2 | None = None,
+    dynamic_crop_corpus: (
+        StageEditDynamicCropTrainingCorpusV2
+        | StageEditDynamicCropTrainingCorpusV3
+        | None
+    ) = None,
     dynamic_crop_loss_contract: DynamicCropV2LossContract = (
         DynamicCropV2LossContract()
+    ),
+    dynamic_crop_v3_loss_contract: DynamicCropV3LossContract = (
+        DynamicCropV3LossContract()
     ),
     quality_thresholds: ProductionQualityThresholds = ProductionQualityThresholds(),
     authorize_production_activation: bool = False,
@@ -1479,6 +1767,22 @@ def train_production_stage_edit(
         ):
             raise ValueError(f"{name} is invalid")
 
+    dynamic_crop_v2_enabled = isinstance(
+        dynamic_crop_corpus, StageEditDynamicCropTrainingCorpusV2
+    )
+    dynamic_crop_v3_enabled = isinstance(
+        dynamic_crop_corpus, StageEditDynamicCropTrainingCorpusV3
+    )
+    if dynamic_crop_corpus is not None and not (
+        dynamic_crop_v2_enabled or dynamic_crop_v3_enabled
+    ):
+        raise TypeError(
+            "dynamic crop corpus must be an explicit v2 or v3 training corpus"
+        )
+    dynamic_crop_version = (
+        3 if dynamic_crop_v3_enabled else 2 if dynamic_crop_v2_enabled else None
+    )
+
     split = production_song_split(
         corpus,
         held_out_song_ids=held_out_song_ids,
@@ -1522,10 +1826,19 @@ def train_production_stage_edit(
         raise ValueError(
             "source pretraining requires positive listwise and pairwise weights"
         )
-    effective_dynamic_crop_loss_contract = replace(
+    effective_dynamic_crop_v2_loss_contract = replace(
         dynamic_crop_loss_contract,
         base=replace(
             dynamic_crop_loss_contract.base,
+            cut_positive_weight=float(
+                cut_imbalance_contract["applied_positive_weight"]
+            ),
+        ),
+    )
+    effective_dynamic_crop_v3_loss_contract = replace(
+        dynamic_crop_v3_loss_contract,
+        base=replace(
+            dynamic_crop_v3_loss_contract.base,
             cut_positive_weight=float(
                 cut_imbalance_contract["applied_positive_weight"]
             ),
@@ -1544,11 +1857,16 @@ def train_production_stage_edit(
     config = model_config or production_stage_edit_config(schema)
     if config.token_schema_fingerprint != schema.fingerprint:
         raise ValueError("production model configuration and token schema differ")
+    selected_dynamic_base_contract = (
+        effective_dynamic_crop_v3_loss_contract.base
+        if dynamic_crop_v3_enabled
+        else effective_dynamic_crop_v2_loss_contract.base
+    )
     if (
         config.transition_authority
         != effective_loss_contract.transition_authority
         or config.transition_authority
-        != effective_dynamic_crop_loss_contract.base.transition_authority
+        != selected_dynamic_base_contract.transition_authority
     ):
         raise ValueError(
             "model, base loss, and Dynamic Crop base transition authority differ"
@@ -1573,7 +1891,6 @@ def train_production_stage_edit(
             f"{config.max_sources}"
         )
 
-    dynamic_crop_v2_enabled = dynamic_crop_corpus is not None
     expected_sequence_ids = {
         example.sequence.sequence_id for example in corpus.examples
     }
@@ -1600,7 +1917,7 @@ def train_production_stage_edit(
     checkpoint_root = Path(checkpoint_directory).expanduser().resolve()
     _require_unambiguous_checkpoint_namespace(
         checkpoint_root,
-        dynamic_crop_v2_enabled=dynamic_crop_v2_enabled,
+        dynamic_crop_version=dynamic_crop_version,
     )
     report_path = checkpoint_root / PRODUCTION_TRAINING_REPORT_FILENAME
     active_device = device if device is not None else mx.default_device()
@@ -1642,7 +1959,9 @@ def train_production_stage_edit(
     with mx.stream(active_device):
         mx.random.seed(seed)
         model = (
-            StageEditTransformerDynamicCropV2(config)
+            StageEditTransformerDynamicCropV3(config)
+            if dynamic_crop_v3_enabled
+            else StageEditTransformerDynamicCropV2(config)
             if dynamic_crop_v2_enabled
             else StageEditTransformer(config)
         )
@@ -1907,7 +2226,21 @@ def train_production_stage_edit(
                 "fresh multi-head optimizer did not start at phase-local step zero"
             )
 
-        if dynamic_crop_v2_enabled:
+        if dynamic_crop_v3_enabled:
+            def loss_function(
+                trained_model: Any,
+                batch: Any,
+                supervision: Any,
+                dynamic_supervision: Any,
+            ) -> Any:
+                return stage_edit_dynamic_crop_v3_loss(
+                    trained_model,
+                    batch,
+                    supervision,
+                    dynamic_supervision,
+                    effective_dynamic_crop_v3_loss_contract,
+                )[0]
+        elif dynamic_crop_v2_enabled:
             def loss_function(
                 trained_model: Any,
                 batch: Any,
@@ -1919,7 +2252,7 @@ def train_production_stage_edit(
                     batch,
                     supervision,
                     dynamic_supervision,
-                    effective_dynamic_crop_loss_contract,
+                    effective_dynamic_crop_v2_loss_contract,
                 )[0]
         else:
             def loss_function(
@@ -1952,7 +2285,13 @@ def train_production_stage_edit(
             device=active_device,
         )
         validation_dynamic_supervision = (
-            tensorize_stage_edit_dynamic_crop_supervision_v2(
+            tensorize_stage_edit_dynamic_crop_supervision_v3(
+                dynamic_sequences_for(split.validation),
+                validation_batch,
+                device=active_device,
+            )
+            if dynamic_crop_v3_enabled
+            else tensorize_stage_edit_dynamic_crop_supervision_v2(
                 dynamic_sequences_for(split.validation),
                 validation_batch,
                 device=active_device,
@@ -1984,7 +2323,13 @@ def train_production_stage_edit(
                     device=active_device,
                 )
                 dynamic_supervision = (
-                    tensorize_stage_edit_dynamic_crop_supervision_v2(
+                    tensorize_stage_edit_dynamic_crop_supervision_v3(
+                        dynamic_sequences_for(examples),
+                        batch,
+                        device=active_device,
+                    )
+                    if dynamic_crop_v3_enabled
+                    else tensorize_stage_edit_dynamic_crop_supervision_v2(
                         dynamic_sequences_for(examples),
                         batch,
                         device=active_device,
@@ -2018,13 +2363,27 @@ def train_production_stage_edit(
                 validation_supervision,
                 loss_contract=effective_loss_contract,
             )
-            if dynamic_crop_v2_enabled:
+            validation_dynamic_metrics = None
+            if dynamic_crop_v3_enabled:
+                validation_dynamic_metrics = evaluate_stage_edit_dynamic_crop_v3(
+                    model,
+                    validation_batch,
+                    validation_supervision,
+                    validation_dynamic_supervision,
+                    contract=effective_dynamic_crop_v3_loss_contract,
+                )
+                validation_metrics = {
+                    **validation_base_metrics,
+                    "total_loss": validation_dynamic_metrics["total_loss"],
+                    "dynamic_crop_v3": validation_dynamic_metrics,
+                }
+            elif dynamic_crop_v2_enabled:
                 validation_dynamic_metrics = evaluate_stage_edit_dynamic_crop_v2(
                     model,
                     validation_batch,
                     validation_supervision,
                     validation_dynamic_supervision,
-                    contract=effective_dynamic_crop_loss_contract,
+                    contract=effective_dynamic_crop_v2_loss_contract,
                 )
                 validation_metrics = {
                     **validation_base_metrics,
@@ -2037,6 +2396,13 @@ def train_production_stage_edit(
             validation_selection = stage_edit_validation_selection_score(
                 validation_metrics
             )
+            if dynamic_crop_v3_enabled:
+                validation_selection = (
+                    _stage_edit_validation_selection_with_dynamic_crop_v3(
+                        validation_selection,
+                        validation_dynamic_metrics,
+                    )
+                )
             validation_selection_score = _finite_metric(
                 validation_selection.get("score")
             )
@@ -2102,6 +2468,21 @@ def train_production_stage_edit(
                         if dynamic_crop_v2_enabled
                         else None
                     ),
+                    "training_song_reference_validation_dynamic_crop_v3": (
+                        validation_dynamic_metrics
+                        if dynamic_crop_v3_enabled
+                        else None
+                    ),
+                    "training_song_reference_validation_dynamic_crop_version": (
+                        dynamic_crop_version
+                    ),
+                    "training_song_reference_validation_dynamic_crop_selection_gate": (
+                        validation_selection.get(
+                            "dynamic_crop_v3_selection_gate"
+                        )
+                        if dynamic_crop_v3_enabled
+                        else None
+                    ),
                     "checkpoint_selection_eligible_after_burn_in": (
                         checkpoint_selection_eligible
                     ),
@@ -2124,7 +2505,25 @@ def train_production_stage_edit(
                     f"production-{corpus.data_id[:16]}-seed{seed}-"
                     f"step{optimizer_steps}"
                 )
-                if dynamic_crop_v2_enabled:
+                if dynamic_crop_v3_enabled:
+                    metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v3(
+                        checkpoint_id,
+                        schema,
+                        config,
+                        training_steps=optimizer_steps,
+                        weights_trained=True,
+                        training_data_id=(
+                            f"{corpus.data_id}+{dynamic_crop_corpus.data_id}"
+                            if dynamic_crop_corpus is not None
+                            else corpus.data_id
+                        ),
+                    )
+                    saved_metadata = save_stage_edit_dynamic_crop_checkpoint_v3(
+                        checkpoint_root,
+                        model,
+                        metadata,
+                    )
+                elif dynamic_crop_v2_enabled:
                     metadata = new_stage_edit_dynamic_crop_checkpoint_metadata_v2(
                         checkpoint_id,
                         schema,
@@ -2197,7 +2596,14 @@ def train_production_stage_edit(
         )
 
     with mx.stream(active_device):
-        if dynamic_crop_v2_enabled:
+        if dynamic_crop_v3_enabled:
+            best_model, loaded_metadata = (
+                load_stage_edit_dynamic_crop_checkpoint_v3(
+                    checkpoint_root,
+                    expected_schema=schema,
+                )
+            )
+        elif dynamic_crop_v2_enabled:
             best_model, loaded_metadata = (
                 load_stage_edit_dynamic_crop_checkpoint_v2(
                     checkpoint_root,
@@ -2237,14 +2643,32 @@ def train_production_stage_edit(
             loss_contract=effective_loss_contract,
             cut_probability_threshold=selected_cut_threshold,
         )
-        if dynamic_crop_v2_enabled:
+        selected_validation_dynamic_metrics = None
+        if dynamic_crop_v3_enabled:
+            selected_validation_dynamic_metrics = (
+                evaluate_stage_edit_dynamic_crop_v3(
+                    best_model,
+                    validation_batch,
+                    validation_supervision,
+                    validation_dynamic_supervision,
+                    contract=effective_dynamic_crop_v3_loss_contract,
+                )
+            )
+            selected_validation_metrics = {
+                **selected_validation_base_metrics,
+                "total_loss": selected_validation_dynamic_metrics[
+                    "total_loss"
+                ],
+                "dynamic_crop_v3": selected_validation_dynamic_metrics,
+            }
+        elif dynamic_crop_v2_enabled:
             selected_validation_dynamic_metrics = (
                 evaluate_stage_edit_dynamic_crop_v2(
                     best_model,
                     validation_batch,
                     validation_supervision,
                     validation_dynamic_supervision,
-                    contract=effective_dynamic_crop_loss_contract,
+                    contract=effective_dynamic_crop_v2_loss_contract,
                 )
             )
             selected_validation_metrics = {
@@ -2256,6 +2680,32 @@ def train_production_stage_edit(
             }
         else:
             selected_validation_metrics = selected_validation_base_metrics
+        reloaded_validation_selection = stage_edit_validation_selection_score(
+            selected_validation_metrics
+        )
+        if dynamic_crop_v3_enabled:
+            reloaded_validation_selection = (
+                _stage_edit_validation_selection_with_dynamic_crop_v3(
+                    reloaded_validation_selection,
+                    selected_validation_dynamic_metrics,
+                )
+            )
+        reloaded_validation_selection_score = _finite_metric(
+            reloaded_validation_selection.get("score")
+        )
+        if (
+            reloaded_validation_selection.get("selectable") is not True
+            or reloaded_validation_selection_score is None
+            or abs(
+                reloaded_validation_selection_score
+                - best_validation_selection_score
+            )
+            > 1.0e-8
+        ):
+            raise RuntimeError(
+                "reloaded checkpoint no longer satisfies its frozen validation "
+                "selection evidence"
+            )
         selection_freeze_evidence = _write_selection_freeze(
             checkpoint_root,
             {
@@ -2270,6 +2720,15 @@ def train_production_stage_edit(
                 ),
                 "checkpoint_id": loaded_metadata.checkpoint_id,
                 "checkpoint_weight_sha256": loaded_metadata.weight_sha256,
+                "dynamic_crop_version": dynamic_crop_version,
+                "dynamic_crop_model_contract": getattr(
+                    loaded_metadata, "model_contract", None
+                ),
+                "dynamic_crop_corpus_data_id": (
+                    dynamic_crop_corpus.data_id
+                    if dynamic_crop_corpus is not None
+                    else None
+                ),
                 "selected_training_step": best_step,
                 "selected_finetune_optimizer_step": (
                     best_finetune_optimizer_step
@@ -2283,6 +2742,9 @@ def train_production_stage_edit(
                 ),
                 "validation_selection": dict(
                     best_validation_selection_evidence
+                ),
+                "reloaded_validation_selection": dict(
+                    reloaded_validation_selection
                 ),
                 "selected_validation_metrics": selected_validation_metrics,
                 "cut_threshold_freeze": frozen_cut_threshold,
@@ -2335,8 +2797,24 @@ def train_production_stage_edit(
                 ),
             },
         }
-        held_out_dynamic_metrics = None
-        if dynamic_crop_v2_enabled:
+        held_out_dynamic_v2_metrics = None
+        held_out_dynamic_v3_metrics = None
+        if dynamic_crop_v3_enabled:
+            held_out_dynamic_supervision = (
+                tensorize_stage_edit_dynamic_crop_supervision_v3(
+                    dynamic_sequences_for(split.held_out),
+                    held_out_batch,
+                    device=active_device,
+                )
+            )
+            held_out_dynamic_v3_metrics = evaluate_stage_edit_dynamic_crop_v3(
+                best_model,
+                held_out_batch,
+                held_out_supervision,
+                held_out_dynamic_supervision,
+                contract=effective_dynamic_crop_v3_loss_contract,
+            )
+        elif dynamic_crop_v2_enabled:
             held_out_dynamic_supervision = (
                 tensorize_stage_edit_dynamic_crop_supervision_v2(
                     dynamic_sequences_for(split.held_out),
@@ -2344,16 +2822,17 @@ def train_production_stage_edit(
                     device=active_device,
                 )
             )
-            held_out_dynamic_metrics = evaluate_stage_edit_dynamic_crop_v2(
+            held_out_dynamic_v2_metrics = evaluate_stage_edit_dynamic_crop_v2(
                 best_model,
                 held_out_batch,
                 held_out_supervision,
                 held_out_dynamic_supervision,
-                contract=effective_dynamic_crop_loss_contract,
+                contract=effective_dynamic_crop_v2_loss_contract,
             )
     quality_gate = evaluate_stage_edit_production_quality(
         held_out_metrics,
-        dynamic_crop_v2_metrics=held_out_dynamic_metrics,
+        dynamic_crop_v2_metrics=held_out_dynamic_v2_metrics,
+        dynamic_crop_v3_metrics=held_out_dynamic_v3_metrics,
         thresholds=quality_thresholds,
         transition_authority=config.transition_authority,
     )
@@ -2375,6 +2854,21 @@ def train_production_stage_edit(
     )
     checkpoint_evidence = {
         "directory": str(checkpoint_root),
+        "checkpoint_format": (
+            "dynamic_crop_v3"
+            if dynamic_crop_v3_enabled
+            else "dynamic_crop_v2"
+            if dynamic_crop_v2_enabled
+            else "legacy"
+        ),
+        "dynamic_crop_version": dynamic_crop_version,
+        "metadata_filename": (
+            DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
+            if dynamic_crop_v3_enabled
+            else DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME
+            if dynamic_crop_v2_enabled
+            else "metadata.json"
+        ),
         "checkpoint_id": loaded_metadata.checkpoint_id,
         "training_steps": loaded_metadata.training_steps,
         "weights_trained": loaded_metadata.weights_trained,
@@ -2385,8 +2879,23 @@ def train_production_stage_edit(
         "dynamic_crop_v2_checkpoint": dynamic_crop_v2_enabled,
         "dynamic_crop_v2_data_id": (
             dynamic_crop_corpus.data_id
-            if dynamic_crop_corpus is not None
+            if dynamic_crop_v2_enabled
             else None
+        ),
+        "dynamic_crop_v3_checkpoint": dynamic_crop_v3_enabled,
+        "dynamic_crop_v3_data_id": (
+            dynamic_crop_corpus.data_id
+            if dynamic_crop_v3_enabled
+            else None
+        ),
+        "dynamic_crop_model_contract": getattr(
+            loaded_metadata, "model_contract", None
+        ),
+        "dynamic_crop_target_contract": getattr(
+            loaded_metadata, "target_contract", None
+        ),
+        "dynamic_crop_output_contract": getattr(
+            loaded_metadata, "output_contract", None
         ),
     }
     report: dict[str, Any] = {
@@ -2424,6 +2933,7 @@ def train_production_stage_edit(
         "structured_head_coverage_gate": structured_head_coverage_gate,
         "data": {
             "data_id": corpus.data_id,
+            "dynamic_crop_version": dynamic_crop_version,
             "source_paths": list(corpus.source_paths),
             "statistics": dict(corpus.statistics),
             "corpus_manifest_sha256": _canonical_digest(corpus.manifest()),
@@ -2435,7 +2945,21 @@ def train_production_stage_edit(
                         dynamic_crop_corpus.manifest()
                     ),
                 }
-                if dynamic_crop_corpus is not None
+                if dynamic_crop_v2_enabled
+                else None
+            ),
+            "dynamic_crop_v3": (
+                {
+                    "data_id": dynamic_crop_corpus.data_id,
+                    "source_v2_data_id": dynamic_crop_corpus.source_v2_data_id,
+                    "contract": dynamic_crop_corpus.contract,
+                    "target_contract": dynamic_crop_corpus.target_contract,
+                    "statistics": dict(dynamic_crop_corpus.statistics),
+                    "manifest_sha256": _canonical_digest(
+                        dynamic_crop_corpus.manifest()
+                    ),
+                }
+                if dynamic_crop_v3_enabled
                 else None
             ),
         },
@@ -2455,18 +2979,34 @@ def train_production_stage_edit(
         "model": {
             "config": config.to_dict(),
             "parameter_count": (
-                stage_edit_dynamic_crop_v2_parameter_count(config)
+                stage_edit_dynamic_crop_v3_parameter_count(config)
+                if dynamic_crop_v3_enabled
+                else stage_edit_dynamic_crop_v2_parameter_count(config)
                 if dynamic_crop_v2_enabled
                 else stage_edit_parameter_count(config)
             ),
             "mlx_version": mlx_runtime_version(),
             "device": str(active_device),
             "architecture": (
-                "causal_long_context_transformer_with_k8_dynamic_crop_v2"
+                "causal_long_context_transformer_with_source_conditioned_"
+                "dynamic_crop_v3"
+                if dynamic_crop_v3_enabled
+                else "causal_long_context_transformer_with_k8_dynamic_crop_v2"
                 if dynamic_crop_v2_enabled
                 else "causal_long_context_multi_head_transformer_legacy_crop"
             ),
+            "dynamic_crop_version": dynamic_crop_version,
             "dynamic_crop_v2_enabled": dynamic_crop_v2_enabled,
+            "dynamic_crop_v3_enabled": dynamic_crop_v3_enabled,
+            "dynamic_crop_model_contract": getattr(
+                loaded_metadata, "model_contract", None
+            ),
+            "dynamic_crop_target_contract": getattr(
+                loaded_metadata, "target_contract", None
+            ),
+            "dynamic_crop_output_contract": getattr(
+                loaded_metadata, "output_contract", None
+            ),
         },
         "optimization": {
             "seed": seed,
@@ -2558,9 +3098,24 @@ def train_production_stage_edit(
             "gradient_clip_norm": gradient_clip_norm,
             "effective_loss_contract": asdict(effective_loss_contract),
             "effective_dynamic_crop_loss_contract": (
-                asdict(effective_dynamic_crop_loss_contract)
+                asdict(effective_dynamic_crop_v3_loss_contract)
+                if dynamic_crop_v3_enabled
+                else asdict(effective_dynamic_crop_v2_loss_contract)
                 if dynamic_crop_v2_enabled
                 else None
+            ),
+            "effective_dynamic_crop_v2_loss_contract": (
+                asdict(effective_dynamic_crop_v2_loss_contract)
+                if dynamic_crop_v2_enabled
+                else None
+            ),
+            "effective_dynamic_crop_v3_loss_contract": (
+                asdict(effective_dynamic_crop_v3_loss_contract)
+                if dynamic_crop_v3_enabled
+                else None
+            ),
+            "effective_dynamic_crop_loss_contract_version": (
+                dynamic_crop_version
             ),
             "gradient_clipping_supported": clipping_supported,
             "early_stopping_patience": early_stopping_patience,
@@ -2628,7 +3183,15 @@ def train_production_stage_edit(
             "selected_checkpoint_validation_metrics": (
                 selected_validation_metrics
             ),
+            "reloaded_checkpoint_validation_selection_evidence": dict(
+                reloaded_validation_selection
+            ),
             "model_selection": STAGE_EDIT_VALIDATION_SELECTION_CONTRACT,
+            "dynamic_crop_v3_model_selection": (
+                DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT
+                if dynamic_crop_v3_enabled
+                else None
+            ),
             "unseen_song_used_for_model_selection": False,
         },
         "checkpoint": checkpoint_evidence,
@@ -2645,7 +3208,10 @@ def train_production_stage_edit(
                 "freeze_sha256"
             ],
             "metrics": reported_held_out_metrics,
-            "dynamic_crop_v2_metrics": held_out_dynamic_metrics,
+            "dynamic_crop_version": dynamic_crop_version,
+            "dynamic_crop_v2_metrics": held_out_dynamic_v2_metrics,
+            "dynamic_crop_v3_metrics": held_out_dynamic_v3_metrics,
+            "heldout_dynamic_crop_metrics_used_for_checkpoint_selection": False,
             "quality_gate": quality_gate.to_dict(),
         },
         "cut_pretraining_history": cut_pretraining_history,
@@ -2677,6 +3243,7 @@ def train_production_stage_edit(
 
 
 __all__ = [
+    "DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT",
     "PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION",
     "STAGE_EDIT_SELECTION_FREEZE_FILENAME",
     "STAGE_EDIT_TRAINING_SONG_EXPANSION_CONTRACT",
