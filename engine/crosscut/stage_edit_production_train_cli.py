@@ -12,6 +12,10 @@ from .stage_edit_dynamic_crop_training import (
     build_stage_edit_dynamic_crop_training_corpus_v2,
 )
 from .stage_edit_dynamic_crop_head_v2 import DynamicCropV2LossContract
+from .stage_edit_dynamic_crop_head_v3 import DynamicCropV3LossContract
+from .stage_edit_dynamic_crop_training_v3 import (
+    build_stage_edit_dynamic_crop_training_corpus_v3,
+)
 from .reference_dynamic_crop_job import (
     validate_reference_dynamic_crop_manifest,
 )
@@ -241,6 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
             "song instead of expanding hundreds of per-shot arguments."
         ),
     )
+    parser.add_argument(
+        "--dynamic-crop-version",
+        type=int,
+        choices=(2, 3),
+        default=2,
+        help=(
+            "Dynamic Crop checkpoint/corpus contract to train. Version 2 is "
+            "kept as the compatibility default; production v3 launchers must "
+            "request --dynamic-crop-version 3 explicitly."
+        ),
+    )
     parser.add_argument("--checkpoint-dir", required=True, type=Path)
     parser.add_argument("--adapted-manifest-path", type=Path)
     parser.add_argument("--epochs", type=int, default=30)
@@ -272,7 +287,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cut-pretrain-window-length", type=int, default=32)
     parser.add_argument("--cut-pretrain-warmup-steps", type=int, default=50)
+    parser.add_argument(
+        "--source-pretrain-steps",
+        type=int,
+        default=500,
+        help=(
+            "Song/reference-balanced source-choice pretraining steps. Use 0 "
+            "only for an explicit diagnostic ablation; enabled runs require "
+            "at least 500."
+        ),
+    )
+    parser.add_argument(
+        "--source-pretrain-learning-rate", type=float, default=3.0e-4
+    )
+    parser.add_argument("--source-pretrain-window-length", type=int, default=32)
+    parser.add_argument("--source-pretrain-warmup-steps", type=int, default=50)
     parser.add_argument("--finetune-warmup-steps", type=int, default=8)
+    parser.add_argument(
+        "--minimum-finetune-optimizer-steps", type=int, default=120
+    )
+    parser.add_argument(
+        "--minimum-checkpoint-selection-finetune-steps",
+        type=int,
+        default=60,
+    )
     parser.add_argument(
         "--minimum-learning-rate-ratio", type=float, default=0.10
     )
@@ -297,7 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dynamic-crop-loss-contract-json",
         help=(
-            "Canonical DynamicCropV2LossContract JSON. Must be paired with the "
+            "Canonical DynamicCropV2LossContract or DynamicCropV3LossContract "
+            "JSON matching --dynamic-crop-version. Must be paired with the "
             "other explicit release contracts."
         ),
     )
@@ -363,7 +402,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "--dynamic-crop-loss-contract-json base must be an object"
             )
-        dynamic_crop_loss_contract = DynamicCropV2LossContract(
+        dynamic_loss_type = (
+            DynamicCropV3LossContract
+            if args.dynamic_crop_version == 3
+            else DynamicCropV2LossContract
+        )
+        dynamic_crop_loss_contract = dynamic_loss_type(
             **{
                 **dynamic_payload,
                 "base": StageEditLossContract(**dynamic_base_payload),
@@ -380,7 +424,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         model_config = production_stage_edit_config()
         base_loss_contract = StageEditLossContract()
-        dynamic_crop_loss_contract = DynamicCropV2LossContract()
+        dynamic_crop_loss_contract = (
+            DynamicCropV3LossContract()
+            if args.dynamic_crop_version == 3
+            else DynamicCropV2LossContract()
+        )
     if args.production_registry is not None and not (
         args.authorize_production_activation
     ):
@@ -435,14 +483,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         corpus.write_manifest(args.adapted_manifest_path)
     if not args.dynamic_crop_artifact and not args.dynamic_crop_manifest:
         raise ValueError(
-            "production Dynamic Crop v2 training requires artifacts or manifests"
+            "production Dynamic Crop training requires artifacts or manifests"
         )
-    dynamic_crop_corpus = build_stage_edit_dynamic_crop_training_corpus_v2(
+    dynamic_crop_v2_corpus = build_stage_edit_dynamic_crop_training_corpus_v2(
         corpus.examples,
         artifact_paths_by_reference=_dynamic_artifact_map(
             args.dynamic_crop_artifact,
             args.dynamic_crop_manifest,
         ),
+    )
+    dynamic_crop_corpus = (
+        build_stage_edit_dynamic_crop_training_corpus_v3(dynamic_crop_v2_corpus)
+        if args.dynamic_crop_version == 3
+        else dynamic_crop_v2_corpus
     )
     config = model_config
     device = None
@@ -467,13 +520,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         cut_pretrain_learning_rate=args.cut_pretrain_learning_rate,
         cut_pretrain_window_length=args.cut_pretrain_window_length,
         cut_pretrain_warmup_steps=args.cut_pretrain_warmup_steps,
+        source_pretrain_steps=args.source_pretrain_steps,
+        source_pretrain_learning_rate=args.source_pretrain_learning_rate,
+        source_pretrain_window_length=args.source_pretrain_window_length,
+        source_pretrain_warmup_steps=args.source_pretrain_warmup_steps,
         finetune_warmup_steps=args.finetune_warmup_steps,
+        minimum_finetune_optimizer_steps=args.minimum_finetune_optimizer_steps,
+        minimum_checkpoint_selection_finetune_steps=(
+            args.minimum_checkpoint_selection_finetune_steps
+        ),
         minimum_learning_rate_ratio=args.minimum_learning_rate_ratio,
         seed=args.seed,
         device=device,
         loss_contract=base_loss_contract,
         dynamic_crop_corpus=dynamic_crop_corpus,
-        dynamic_crop_loss_contract=dynamic_crop_loss_contract,
+        **(
+            {"dynamic_crop_v3_loss_contract": dynamic_crop_loss_contract}
+            if args.dynamic_crop_version == 3
+            else {"dynamic_crop_loss_contract": dynamic_crop_loss_contract}
+        ),
         authorize_production_activation=args.authorize_production_activation,
     )
     registered_production_bundle = None

@@ -187,6 +187,12 @@ class DynamicCropCapacityFoldLauncherTests(unittest.TestCase):
                 "--patience",
                 "--batch-size",
                 "--cut-pretrain-steps",
+                "--source-pretrain-steps",
+                "--source-pretrain-learning-rate",
+                "--source-pretrain-window-length",
+                "--source-pretrain-warmup-steps",
+                "--minimum-finetune-optimizer-steps",
+                "--minimum-checkpoint-selection-finetune-steps",
                 "--device",
             ):
                 self.assertIn(flag, args)
@@ -195,6 +201,27 @@ class DynamicCropCapacityFoldLauncherTests(unittest.TestCase):
                 args[args.index("--epochs") + 1],
             )
             self.assertEqual("gpu", args[args.index("--device") + 1])
+            self.assertEqual(
+                str(
+                    launcher.PROBE_TRAINING_SCHEDULE[
+                        "source_pretraining_steps"
+                    ]
+                ),
+                args[args.index("--source-pretrain-steps") + 1],
+            )
+            self.assertEqual(
+                str(
+                    launcher.PROBE_TRAINING_SCHEDULE[
+                        "minimum_checkpoint_selection_finetune_steps"
+                    ]
+                ),
+                args[
+                    args.index(
+                        "--minimum-checkpoint-selection-finetune-steps"
+                    )
+                    + 1
+                ],
+            )
             self.assertNotIn("--authorize-production-activation", args)
             self.assertNotIn("--production-registry", args)
             self.assertNotIn("--professional-montage-grammar-profile", args)
