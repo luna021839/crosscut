@@ -59,7 +59,7 @@ _NONWIDE_SHOT_SIZES = frozenset({"medium", "closeup", "extreme_closeup"})
 MONTAGE_GRAMMAR_CONTRACT = (
     "ive_human_reference_wide_transition_floor_plus_"
     "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-    "highlight_burst_and_reset_v4"
+    "highlight_burst_reset_and_median_soft_target_v5"
 )
 
 
@@ -465,6 +465,8 @@ class StageEditSemiMarkovConfig:
     highlight_minimum_wide_involved_source_switch_fraction: float = (
         0.37333333333333335
     )
+    highlight_preferred_wide_involved_source_switch_fraction: float = 0.80
+    highlight_wide_involved_source_switch_reference_count: int = 17
     highlight_minimum_early_wide_anchor_fraction: float = 1.0 / 3.0
     highlight_minimum_phrase_entry_wide_anchor_fraction: float = (
         0.2785714285714286
@@ -499,6 +501,7 @@ class StageEditSemiMarkovConfig:
             "highlight_minimum_nonwide_burst_boundaries",
             "formation_anchor_decision_window",
             "highlight_minimum_post_burst_formation_resets",
+            "highlight_wide_involved_source_switch_reference_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -567,6 +570,7 @@ class StageEditSemiMarkovConfig:
             "highlight_minimum_closeup_fraction",
             "highlight_minimum_nonwide_fraction",
             "highlight_minimum_wide_involved_source_switch_fraction",
+            "highlight_preferred_wide_involved_source_switch_fraction",
             "highlight_minimum_early_wide_anchor_fraction",
             "highlight_minimum_phrase_entry_wide_anchor_fraction",
             "minimum_formation_anchor_person_count_normalized",
@@ -581,6 +585,15 @@ class StageEditSemiMarkovConfig:
         ):
             raise StageEditDecodeInputError(
                 "highlight close-up floor cannot exceed the non-wide floor"
+            )
+        if (
+            self.highlight_preferred_wide_involved_source_switch_fraction
+            + _TIME_EPSILON
+            < self.highlight_minimum_wide_involved_source_switch_fraction
+        ):
+            raise StageEditDecodeInputError(
+                "highlight preferred wide-switch target cannot be below its "
+                "reference floor"
             )
 
 
@@ -858,6 +871,9 @@ class _ResolvedSectionConstraint:
 class _BeamState:
     current_index: int
     current_source: int | None
+    current_section_index: int | None
+    section_local_source_switch_boundaries: int
+    section_local_wide_involved_source_switch_boundaries: int
     recent_sources: tuple[int, ...]
     recent_shot_sizes: tuple[str, ...]
     recent_shot_durations: tuple[float, ...]
@@ -1180,6 +1196,61 @@ def _formation_wide_evidence(
     )
 
 
+def _wide_switch_preferred_target_score_raw(
+    *,
+    prior_source_switch_boundaries: int,
+    prior_wide_involved_source_switch_boundaries: int,
+    derivative_family_source_switched: bool,
+    wide_involved_switch: bool,
+    preferred_fraction: float,
+) -> float:
+    """Return a bounded soft reward only when a switch approaches the median.
+
+    The first wide-involved switch can establish the visual punctuation, but
+    repeating wide-to-wide family switches at a running ratio of 1.0 receives
+    no further target reward. A non-wide switch may receive the reward when it
+    pulls an over-wide sequence back toward the profile median. Hard floors and
+    the non-wide burst/reset gates remain separate.
+    """
+
+    if (
+        isinstance(prior_source_switch_boundaries, bool)
+        or not isinstance(prior_source_switch_boundaries, int)
+        or isinstance(prior_wide_involved_source_switch_boundaries, bool)
+        or not isinstance(prior_wide_involved_source_switch_boundaries, int)
+        or prior_source_switch_boundaries < 0
+        or prior_wide_involved_source_switch_boundaries < 0
+        or prior_wide_involved_source_switch_boundaries
+        > prior_source_switch_boundaries
+    ):
+        raise StageEditDecodeInputError("wide-switch target counts are invalid")
+    target = _finite(preferred_fraction, "preferred_fraction")
+    if not 0.0 <= target <= 1.0:
+        raise StageEditDecodeInputError("preferred_fraction must lie in [0, 1]")
+    if not derivative_family_source_switched:
+        return 0.0
+
+    before_fraction = (
+        prior_wide_involved_source_switch_boundaries
+        / prior_source_switch_boundaries
+        if prior_source_switch_boundaries
+        else 0.0
+    )
+    after_switches = prior_source_switch_boundaries + 1
+    after_wide = (
+        prior_wide_involved_source_switch_boundaries
+        + int(wide_involved_switch)
+    )
+    after_fraction = after_wide / after_switches
+    before_distance = abs(before_fraction - target)
+    after_distance = abs(after_fraction - target)
+    if after_distance + _TIME_EPSILON >= before_distance:
+        return 0.0
+    # Retain f284's +0.10 maximum while replacing its unconditional bonus with
+    # a profile-target-aware alignment reward.
+    return 0.10 * max(0.0, 1.0 - after_distance)
+
+
 def _montage_grammar_score_raw(
     *,
     directive: Any,
@@ -1193,6 +1264,8 @@ def _montage_grammar_score_raw(
     formation_person_count_normalized: float | None,
     formation_pose_coverage: float | None,
     config: StageEditSemiMarkovConfig,
+    prior_source_switch_boundaries: int = 0,
+    prior_wide_involved_source_switch_boundaries: int = 0,
 ) -> float:
     """Bounded structural prior; learned logits still own the edit decision.
 
@@ -1231,19 +1304,35 @@ def _montage_grammar_score_raw(
             raw -= 0.12
 
     if directive.role is SectionRole.CHORUS_LIKE:
-        if (
+        wide_involved_switch = bool(
             derivative_family_source_switched
             and previous_shot_size is not None
             and (
                 previous_shot_size in _WIDE_SHOT_SIZES
                 or shot_size in _WIDE_SHOT_SIZES
             )
+        )
+        soft_target_raw = _wide_switch_preferred_target_score_raw(
+            prior_source_switch_boundaries=prior_source_switch_boundaries,
+            prior_wide_involved_source_switch_boundaries=(
+                prior_wide_involved_source_switch_boundaries
+            ),
+            derivative_family_source_switched=(
+                derivative_family_source_switched
+            ),
+            wide_involved_switch=wide_involved_switch,
+            preferred_fraction=(
+                config.highlight_preferred_wide_involved_source_switch_fraction
+            ),
+        )
+        raw += soft_target_raw
+        if (
+            wide_involved_switch
+            and soft_target_raw > 0.0
         ):
-            # Human references put a wide on at least one side of 80% of the
-            # median chorus camera-family switches (P10 hard floor 37.33%).
-            # Keep this a small bounded prior: learned source logits still
-            # contribute far more than this term after its 0.24 weight.
-            raw += 0.10
+            # Formation evidence is an additional confidence adjustment only
+            # while this switch moves the running ratio toward the profile
+            # median. It cannot keep rewarding a wide-only ratio of 1.0.
             if previous_formation_wide_evidenced or _formation_wide_evidence(
                 shot_size=shot_size,
                 formation_person_count_normalized=(
@@ -1618,6 +1707,10 @@ def _evaluate_montage_grammar(
             if source_switch_boundaries
             else 0.0
         )
+        wide_switch_preferred_target_deviation = abs(
+            wide_involved_source_switch_fraction
+            - config.highlight_preferred_wide_involved_source_switch_fraction
+        )
         anchor_window = selected[: config.formation_anchor_decision_window]
         generic_wide_anchor_present = any(
             item.shot_size in _WIDE_SHOT_SIZES for item in anchor_window
@@ -1765,6 +1858,20 @@ def _evaluate_montage_grammar(
                 "wide_involved_source_switch_fraction": (
                     wide_involved_source_switch_fraction
                 ),
+                "wide_involved_source_switch_preferred_target": (
+                    config.highlight_preferred_wide_involved_source_switch_fraction
+                ),
+                "wide_involved_source_switch_preferred_target_deviation": (
+                    wide_switch_preferred_target_deviation
+                ),
+                "wide_involved_source_switch_preferred_target_shortfall": max(
+                    0.0,
+                    config.highlight_preferred_wide_involved_source_switch_fraction
+                    - wide_involved_source_switch_fraction,
+                ),
+                "wide_involved_source_switch_preferred_target_is_hard_gate": (
+                    False
+                ),
                 "formation_anchor_decision_window": (
                     config.formation_anchor_decision_window
                 ),
@@ -1839,11 +1946,25 @@ def _evaluate_montage_grammar(
             ),
             "learned_logits_remain_primary": True,
             "chorus_wide_involved_family_switch_prior": {
-                "reference_p10_hard_floor": 0.37333333333333335,
-                "reference_median": 0.8,
-                "generic_wide_involved_switch_raw_bonus": 0.10,
+                "reference_p10_hard_floor": (
+                    config.highlight_minimum_wide_involved_source_switch_fraction
+                ),
+                "reference_median": (
+                    config.highlight_preferred_wide_involved_source_switch_fraction
+                ),
+                "reference_median_soft_preferred_target": (
+                    config.highlight_preferred_wide_involved_source_switch_fraction
+                ),
+                "eligible_human_reference_count": (
+                    config.highlight_wide_involved_source_switch_reference_count
+                ),
+                "maximum_target_alignment_raw_bonus": 0.10,
                 "formation_evidenced_wide_additional_raw_bonus": 0.06,
                 "same_source_or_derivative_family_bonus": 0.0,
+                "repeated_wide_only_switch_bonus_after_no_target_improvement": (
+                    0.0
+                ),
+                "hard_gate": False,
                 "applied_through_montage_grammar_weight": (
                     config.montage_grammar_score_weight
                 ),
@@ -1864,6 +1985,9 @@ def _evaluate_montage_grammar(
             ),
             "highlight_minimum_wide_involved_source_switch_fraction": (
                 config.highlight_minimum_wide_involved_source_switch_fraction
+            ),
+            "highlight_preferred_wide_involved_source_switch_fraction": (
+                config.highlight_preferred_wide_involved_source_switch_fraction
             ),
             "highlight_minimum_early_wide_anchor_fraction": (
                 config.highlight_minimum_early_wide_anchor_fraction
@@ -2499,6 +2623,9 @@ def decode_stage_edit_semimarkov_beam(
     empty_state = _BeamState(
         current_index=0,
         current_source=None,
+        current_section_index=None,
+        section_local_source_switch_boundaries=0,
+        section_local_wide_involved_source_switch_boundaries=0,
         recent_sources=(),
         recent_shot_sizes=(),
         recent_shot_durations=(),
@@ -2559,6 +2686,16 @@ def decode_stage_edit_semimarkov_beam(
         minimum_duration = constraint.minimum_shot_seconds
 
         for state in states:
+            prior_source_switch_boundaries = (
+                state.section_local_source_switch_boundaries
+                if state.current_section_index == section_index
+                else 0
+            )
+            prior_wide_involved_source_switch_boundaries = (
+                state.section_local_wide_involved_source_switch_boundaries
+                if state.current_section_index == section_index
+                else 0
+            )
             for end_index in range(start_index + 1, terminal_index + 1):
                 endpoint_records[start_index]["span_candidate_count"] += 1
                 end_time = all_times[end_index]
@@ -2846,6 +2983,19 @@ def decode_stage_edit_semimarkov_beam(
                             == section_index
                             else None
                         )
+                        derivative_family_source_switched = bool(
+                            previous_in_section is not None
+                            and previous_in_section.derivative_family_id
+                            != candidate_family
+                        )
+                        wide_involved_source_switch = bool(
+                            derivative_family_source_switched
+                            and (
+                                previous_in_section.shot_size
+                                in _WIDE_SHOT_SIZES
+                                or shot_size in _WIDE_SHOT_SIZES
+                            )
+                        )
                         montage_grammar_raw = _montage_grammar_score_raw(
                             directive=directive,
                             shot_size=shot_size,
@@ -2862,9 +3012,7 @@ def decode_stage_edit_semimarkov_beam(
                                 else None
                             ),
                             derivative_family_source_switched=(
-                                previous_in_section is not None
-                                and previous_in_section.derivative_family_id
-                                != candidate_family
+                                derivative_family_source_switched
                             ),
                             previous_formation_wide_evidenced=(
                                 previous_in_section is not None
@@ -2888,6 +3036,12 @@ def decode_stage_edit_semimarkov_beam(
                                 selected_continuity.formation_pose_coverage
                             ),
                             config=config,
+                            prior_source_switch_boundaries=(
+                                prior_source_switch_boundaries
+                            ),
+                            prior_wide_involved_source_switch_boundaries=(
+                                prior_wide_involved_source_switch_boundaries
+                            ),
                         )
                         components = (
                             _component("cut", cut_raw, config.cut_score_weight),
@@ -3014,6 +3168,15 @@ def decode_stage_edit_semimarkov_beam(
                         new_state = _BeamState(
                             current_index=end_index,
                             current_source=source_index,
+                            current_section_index=section_index,
+                            section_local_source_switch_boundaries=(
+                                prior_source_switch_boundaries
+                                + int(derivative_family_source_switched)
+                            ),
+                            section_local_wide_involved_source_switch_boundaries=(
+                                prior_wide_involved_source_switch_boundaries
+                                + int(wide_involved_source_switch)
+                            ),
                             recent_sources=recent_sources,
                             recent_shot_sizes=recent_sizes,
                             recent_shot_durations=recent_durations,

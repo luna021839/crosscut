@@ -27,6 +27,7 @@ from crosscut.stage_edit_semimarkov_beam import (
     StageEditSourceContinuity,
     StageEditSourceMetadata,
     _montage_grammar_score_raw,
+    _wide_switch_preferred_target_score_raw,
     decode_stage_edit_semimarkov_beam,
     stage_edit_boundary_continuity_score,
 )
@@ -254,7 +255,13 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         directive = _section(0, 0.0, 6.0)
         config = StageEditSemiMarkovConfig()
 
-        def score(*, switched: bool, formation: bool) -> float:
+        def score(
+            *,
+            switched: bool,
+            formation: bool,
+            prior_switches: int = 4,
+            prior_wide_switches: int = 3,
+        ) -> float:
             return _montage_grammar_score_raw(
                 directive=directive,
                 shot_size="medium",
@@ -267,17 +274,85 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                 formation_person_count_normalized=0.0,
                 formation_pose_coverage=0.0,
                 config=config,
+                prior_source_switch_boundaries=prior_switches,
+                prior_wide_involved_source_switch_boundaries=(
+                    prior_wide_switches
+                ),
             )
 
         same_family = score(switched=False, formation=True)
         generic_wide_switch = score(switched=True, formation=False)
         formation_wide_switch = score(switched=True, formation=True)
+        repeated_wide_only_switch = score(
+            switched=True,
+            formation=True,
+            prior_switches=2,
+            prior_wide_switches=2,
+        )
         self.assertAlmostEqual(0.10, generic_wide_switch - same_family)
         self.assertAlmostEqual(0.06, formation_wide_switch - generic_wide_switch)
+        self.assertAlmostEqual(same_family, repeated_wide_only_switch)
         self.assertLess(
             config.montage_grammar_score_weight * formation_wide_switch,
             config.source_score_weight,
         )
+
+    def test_nonwide_burst_prior_breaks_wide_only_run_during_soft_target_dip(
+        self,
+    ) -> None:
+        directive = _section(0, 0.0, 6.0)
+        config = StageEditSemiMarkovConfig()
+        temporary_dip_bonus = _wide_switch_preferred_target_score_raw(
+            prior_source_switch_boundaries=1,
+            prior_wide_involved_source_switch_boundaries=1,
+            derivative_family_source_switched=True,
+            wide_involved_switch=False,
+            preferred_fraction=0.8,
+        )
+        self.assertEqual(temporary_dip_bonus, 0.0)
+
+        common = {
+            "directive": directive,
+            "start_seconds": 3.0,
+            "duration_seconds": 1.0,
+            "previous_shot_size": "wide",
+            "previous_duration_seconds": 1.0,
+            "derivative_family_source_switched": True,
+            "previous_formation_wide_evidenced": True,
+            "config": config,
+            "prior_source_switch_boundaries": 1,
+            "prior_wide_involved_source_switch_boundaries": 1,
+        }
+        stay_wide = _montage_grammar_score_raw(
+            shot_size="wide",
+            formation_person_count_normalized=1.0,
+            formation_pose_coverage=1.0,
+            **common,
+        )
+        enter_nonwide = _montage_grammar_score_raw(
+            shot_size="medium",
+            formation_person_count_normalized=0.0,
+            formation_pose_coverage=0.0,
+            **common,
+        )
+        self.assertGreater(enter_nonwide, stay_wide)
+
+        burst = _montage_grammar_score_raw(
+            directive=directive,
+            shot_size="closeup",
+            start_seconds=4.0,
+            duration_seconds=1.0,
+            previous_shot_size="medium",
+            previous_duration_seconds=1.0,
+            derivative_family_source_switched=True,
+            previous_formation_wide_evidenced=False,
+            formation_person_count_normalized=0.0,
+            formation_pose_coverage=0.0,
+            config=config,
+            prior_source_switch_boundaries=2,
+            prior_wide_involved_source_switch_boundaries=1,
+        )
+        self.assertGreater(burst, enter_nonwide)
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -691,7 +766,7 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
         self.assertEqual(
             "ive_human_reference_wide_transition_floor_plus_"
             "exact_section_and_phrase_wide_anchor_plus_formation_evidenced_"
-            "highlight_burst_and_reset_v4",
+            "highlight_burst_reset_and_median_soft_target_v5",
             grammar["contract"],
         )
         section = grammar["sections"][0]
@@ -723,6 +798,25 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             grammar["policy"]["chorus_wide_involved_family_switch_prior"][
                 "reference_median"
             ],
+        )
+        self.assertEqual(
+            17,
+            grammar["policy"]["chorus_wide_involved_family_switch_prior"][
+                "eligible_human_reference_count"
+            ],
+        )
+        self.assertEqual(
+            0.8,
+            section["wide_involved_source_switch_preferred_target"],
+        )
+        self.assertFalse(
+            section[
+                "wide_involved_source_switch_preferred_target_is_hard_gate"
+            ]
+        )
+        self.assertGreaterEqual(
+            section["wide_involved_source_switch_preferred_target_deviation"],
+            0.0,
         )
 
     @patch(
@@ -763,6 +857,52 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
                         minimum_shot_seconds=3.0,
                         maximum_shot_seconds=3.0,
                         maximum_switches_per_minute=20.0,
+                    ),
+                ),
+            )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_soft_target_does_not_replace_p10_wide_switch_hard_floor(
+        self, _mocked
+    ) -> None:
+        source_sequence = (0, 1, 2, 6, 7, 4, 3)
+        frames = tuple(
+            replace(
+                frame,
+                hard_source_gate_mask=tuple(
+                    source_index == source_sequence[time_index]
+                    for source_index in range(8)
+                ),
+            )
+            for time_index, frame in enumerate(
+                self._forced_frames(source_sequence, source_count=8)
+            )
+        )
+        with self.assertRaisesRegex(
+            StageEditNoValidTimelineError,
+            "highlight_wide_involved_source_switch_fraction_below_reference_floor",
+        ):
+            _decode(
+                duration=7,
+                source_count=8,
+                frames=frames,
+                metadata=_metadata(8, 7.0),
+                config=StageEditSemiMarkovConfig(
+                    beam_width=32,
+                    timeline_count=8,
+                    minimum_unique_sources=3,
+                    enforce_montage_grammar=True,
+                    maximum_global_switches_per_minute=60.0,
+                ),
+                constraints=(
+                    StageEditSectionConstraint(
+                        section_index=0,
+                        minimum_shot_seconds=1.0,
+                        maximum_shot_seconds=1.0,
+                        maximum_switches_per_minute=60.0,
                     ),
                 ),
             )
@@ -1140,6 +1280,14 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             StageEditSemiMarkovConfig(
                 recent_shot_size_window=2,
                 maximum_same_shot_size_run=3,
+            )
+        with self.assertRaisesRegex(
+            StageEditDecodeInputError,
+            "preferred wide-switch target",
+        ):
+            StageEditSemiMarkovConfig(
+                highlight_minimum_wide_involved_source_switch_fraction=0.9,
+                highlight_preferred_wide_involved_source_switch_fraction=0.8,
             )
 
     @staticmethod

@@ -1629,6 +1629,29 @@ class PostRenderQATests(unittest.TestCase):
             highlight["wide_involved_source_switch_fraction"],
             _MONTAGE_TEST_CONFIG.minimum_wide_involved_source_switch_fraction,
         )
+        self.assertLess(
+            highlight["wide_involved_source_switch_fraction"],
+            _MONTAGE_TEST_CONFIG.preferred_wide_involved_source_switch_fraction,
+        )
+        self.assertEqual(
+            highlight["wide_involved_source_switch_preferred_target"],
+            _MONTAGE_TEST_CONFIG.preferred_wide_involved_source_switch_fraction,
+        )
+        self.assertEqual(
+            highlight["wide_involved_source_switch_reference_count"],
+            17,
+        )
+        self.assertFalse(
+            highlight[
+                "wide_involved_source_switch_preferred_target_is_hard_gate"
+            ]
+        )
+        self.assertAlmostEqual(
+            highlight[
+                "wide_involved_source_switch_preferred_target_shortfall"
+            ],
+            0.05,
+        )
         self.assertTrue(
             all(
                 max(choice["formation_upper_body_counts"]) >= 1

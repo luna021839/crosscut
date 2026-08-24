@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 
 RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS = (
     "rendered_selected_plan_exact_phrase_and_section_anchor_formation_"
-    "highlight_closeup_grammar_v2"
+    "highlight_closeup_and_wide_switch_soft_target_grammar_v3"
 )
 EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT = (
     "serialized_inference_token_section_and_phrase_progress_per_selected_shot_v1"
@@ -87,6 +87,8 @@ class RenderedMontageGrammarConfig:
     minimum_wide_involved_source_switch_fraction: float = (
         0.37333333333333335
     )
+    preferred_wide_involved_source_switch_fraction: float = 0.80
+    wide_involved_source_switch_reference_count: int = 17
     minimum_early_wide_anchor_fraction: float = 1.0 / 3.0
     minimum_phrase_entry_wide_anchor_fraction: float = 0.2785714285714286
     burst_maximum_run_seconds: float = 1.50
@@ -110,6 +112,7 @@ class RenderedMontageGrammarConfig:
             "minimum_closeup_fraction",
             "minimum_nonwide_fraction",
             "minimum_wide_involved_source_switch_fraction",
+            "preferred_wide_involved_source_switch_fraction",
             "minimum_early_wide_anchor_fraction",
             "minimum_phrase_entry_wide_anchor_fraction",
             "minimum_closeup_proxy_face_coverage",
@@ -124,6 +127,7 @@ class RenderedMontageGrammarConfig:
             "minimum_formation_anchor_person_count",
             "minimum_post_burst_formation_reset_count",
             "minimum_motion_accent_count",
+            "wide_involved_source_switch_reference_count",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -134,8 +138,19 @@ class RenderedMontageGrammarConfig:
             raise ValueError(
                 "minimum_formation_anchor_person_count must be at least one"
             )
+        if self.wide_involved_source_switch_reference_count < 1:
+            raise ValueError(
+                "wide-switch preferred target needs at least one reference"
+            )
         if self.minimum_closeup_fraction > self.minimum_nonwide_fraction:
             raise ValueError("close-up floor cannot exceed non-wide floor")
+        if (
+            self.preferred_wide_involved_source_switch_fraction + _EPSILON
+            < self.minimum_wide_involved_source_switch_fraction
+        ):
+            raise ValueError(
+                "preferred wide-switch target cannot be below its reference floor"
+            )
 
 
 def _count_evidence(value: Any, name: str) -> tuple[int, ...]:
@@ -1275,6 +1290,10 @@ def review_rendered_montage_grammar(
             if source_switch_count
             else 0.0
         )
+        wide_switch_preferred_target_deviation = abs(
+            wide_involved_source_switch_fraction
+            - config.preferred_wide_involved_source_switch_fraction
+        )
         anchor_runs = relevant_runs[: config.formation_anchor_run_window]
         generic_wide_anchor = any(
             item["shot_class"] in _WIDE for item in anchor_runs
@@ -1357,6 +1376,23 @@ def review_rendered_montage_grammar(
                 ),
                 "wide_involved_source_switch_fraction": (
                     wide_involved_source_switch_fraction
+                ),
+                "wide_involved_source_switch_preferred_target": (
+                    config.preferred_wide_involved_source_switch_fraction
+                ),
+                "wide_involved_source_switch_preferred_target_deviation": (
+                    wide_switch_preferred_target_deviation
+                ),
+                "wide_involved_source_switch_preferred_target_shortfall": max(
+                    0.0,
+                    config.preferred_wide_involved_source_switch_fraction
+                    - wide_involved_source_switch_fraction,
+                ),
+                "wide_involved_source_switch_preferred_target_is_hard_gate": (
+                    False
+                ),
+                "wide_involved_source_switch_reference_count": (
+                    config.wide_involved_source_switch_reference_count
                 ),
                 "known_duration_fraction": known_fraction,
                 "wide_duration_fraction": wide_fraction,
@@ -1462,8 +1498,8 @@ def review_rendered_montage_grammar(
             ),
             "highlight": (
                 "reference_close_wide_transition_exact_section_and_phrase_"
-                "anchor_floors_plus_explicit_ive_product_nonwide_burst_"
-                "requirement"
+                "anchor_floors_plus_reference_median_wide_switch_soft_target_"
+                "plus_explicit_ive_product_nonwide_burst_requirement"
             ),
             "motion": "bounded_learned_or_evidence_safe_accent_not_random_quota",
             "pixel_proof": "plan_closeup_claim_requires_decoded_proxy_face_geometry",

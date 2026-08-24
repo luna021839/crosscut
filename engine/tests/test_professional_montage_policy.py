@@ -29,16 +29,22 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
-def _reference_distribution(value: float, *, count: int = 20) -> dict[str, object]:
+def _reference_distribution(
+    value: float,
+    *,
+    count: int = 20,
+    median: float | None = None,
+) -> dict[str, object]:
+    resolved_median = value if median is None else median
     return {
         "count": count,
         "minimum": 0.0 if value == 0.0 else value * 0.5,
         "p10": value,
         "p25": value,
-        "median": value,
-        "p75": value,
-        "p90": value,
-        "maximum": value,
+        "median": resolved_median,
+        "p75": max(value, resolved_median),
+        "p90": max(value, resolved_median),
+        "maximum": max(value, resolved_median),
         "reference_floor": {
             "quantile": 0.1,
             "value": value,
@@ -82,6 +88,7 @@ def _profile() -> dict[str, object]:
             "source_switch_with_wide_fraction": _reference_distribution(
                 0.37333333333333335,
                 count=17,
+                median=0.8,
             ),
             "nonwide_multi_source_burst_rate_per_minute": (
                 _reference_distribution(0.0)
@@ -256,6 +263,22 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 self.assertIn("chorus_like", threshold.provenance.statistic_path)
                 self.assertEqual(threshold.provenance.quantile, 0.1)
 
+            preferred = (
+                policy.preferred_wide_involved_source_switch_fraction
+            )
+            self.assertEqual(preferred.value, 0.8)
+            self.assertEqual(preferred.reference_count, 17)
+            self.assertEqual(preferred.provenance.quantile, 0.5)
+            self.assertEqual(
+                preferred.provenance.statistic,
+                "profile_reference_median_soft_preferred_target",
+            )
+            serialized_preferred = policy.to_dict()[
+                "profile_derived_preferred_targets"
+            ]["preferred_wide_involved_source_switch_fraction"]
+            self.assertFalse(serialized_preferred["hard_gate"])
+            self.assertEqual(serialized_preferred["reference_count"], 17)
+
             self.assertIsNone(policy.minimum_nonwide_duration_fraction)
             self.assertEqual(
                 policy.nonwide_duration_fraction_policy,
@@ -305,6 +328,32 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
             self.assertFalse(product.formation_evidence_proves_full_group_formation)
             self.assertFalse(product.missing_or_zero_formation_evidence_passes)
             self.assertFalse(product.is_reference_floor)
+
+            from crosscut.pipeline import (
+                _rendered_montage_config_from_policy,
+                _stage_edit_semimarkov_config_from_montage_policy,
+            )
+
+            decode_config = _stage_edit_semimarkov_config_from_montage_policy(
+                policy
+            )
+            rendered_config = _rendered_montage_config_from_policy(policy)
+            self.assertEqual(
+                decode_config.highlight_preferred_wide_involved_source_switch_fraction,
+                0.8,
+            )
+            self.assertEqual(
+                decode_config.highlight_wide_involved_source_switch_reference_count,
+                17,
+            )
+            self.assertEqual(
+                rendered_config.preferred_wide_involved_source_switch_fraction,
+                0.8,
+            )
+            self.assertEqual(
+                rendered_config.wide_involved_source_switch_reference_count,
+                17,
+            )
 
     def test_expected_raw_file_hash_is_optional_but_strict_when_supplied(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -413,6 +462,20 @@ class ProfessionalMontagePolicyTests(unittest.TestCase):
                 "cannot supply a positive production minimum",
             ):
                 load_professional_montage_policy(zero_path)
+
+            inverted = _profile()
+            wide_switch = inverted["aggregate_by_acoustic_role"][  # type: ignore[index]
+                "chorus_like"
+            ]["reference_distributions"]["source_switch_with_wide_fraction"]
+            wide_switch["median"] = 0.2
+            _rehash(inverted)
+            inverted_path = Path(temporary) / "inverted-median.json"
+            _write(inverted_path, inverted)
+            with self.assertRaisesRegex(
+                ProfessionalMontagePolicyError,
+                "reference-median target",
+            ):
+                load_professional_montage_policy(inverted_path)
 
     def test_event_distribution_count_must_match_pooled_count(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

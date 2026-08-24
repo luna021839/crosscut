@@ -44,6 +44,7 @@ REFERENCE_FLOOR_BASIS = (
     "lower_quantile_of_contributing_human_reference_edits"
 )
 REFERENCE_FLOOR_QUANTILE = 0.10
+REFERENCE_PREFERRED_TARGET_QUANTILE = 0.50
 FORMATION_EVIDENCE_THRESHOLD_NORMALIZED = 1.0 / 6.0
 EXPECTED_SONG_COUNT = 4
 EXPECTED_REFERENCE_COUNT = 20
@@ -292,6 +293,25 @@ class ProfileDerivedMinimum:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfileDerivedPreferredTarget:
+    """A descriptive human-reference target that is never a hard gate."""
+
+    name: str
+    value: float
+    reference_count: int
+    provenance: ProfileStatisticProvenance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "reference_count": self.reference_count,
+            "hard_gate": False,
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class UnusableReferenceFloor:
     statistic_path: str
     value: float
@@ -353,6 +373,9 @@ class ProfessionalMontagePolicy:
     minimum_early_wide_anchor_fraction: ProfileDerivedMinimum
     minimum_phrase_entry_wide_anchor_fraction: ProfileDerivedMinimum
     minimum_wide_involved_source_switch_fraction: ProfileDerivedMinimum
+    preferred_wide_involved_source_switch_fraction: (
+        ProfileDerivedPreferredTarget
+    )
     minimum_nonwide_burst_shot_count: ProfileDerivedMinimum
     minimum_nonwide_burst_duration_seconds: ProfileDerivedMinimum
     minimum_nonwide_burst_source_switch_fraction: ProfileDerivedMinimum
@@ -385,6 +408,11 @@ class ProfessionalMontagePolicy:
             "profile_identity": self.profile_identity,
             "profile_derived_minimums": {
                 name: getattr(self, name).to_dict() for name in threshold_names
+            },
+            "profile_derived_preferred_targets": {
+                "preferred_wide_involved_source_switch_fraction": (
+                    self.preferred_wide_involved_source_switch_fraction.to_dict()
+                )
             },
             "minimum_nonwide_duration_fraction": None,
             "nonwide_duration_fraction_policy": (
@@ -590,6 +618,41 @@ def _reference_minimum(
     )
 
 
+def _reference_preferred_target(
+    profile: Mapping[str, Any],
+    identity: ProfessionalMontageProfileIdentity,
+    *,
+    name: str,
+    path: str,
+    fraction: bool,
+) -> ProfileDerivedPreferredTarget:
+    distribution = _mapping(_at(profile, path), path)
+    count = _integer(distribution.get("count"), f"{path}.count")
+    p10 = _finite(distribution.get("p10"), f"{path}.p10")
+    median = _finite(distribution.get("median"), f"{path}.median")
+    if (
+        count < 1
+        or median <= 0.0
+        or median + 1.0e-12 < p10
+        or (fraction and median > 1.0)
+    ):
+        raise ProfessionalMontagePolicyError(
+            f"{path} cannot supply a positive reference-median target"
+        )
+    return ProfileDerivedPreferredTarget(
+        name=name,
+        value=median,
+        reference_count=count,
+        provenance=ProfileStatisticProvenance(
+            profile_identity=identity,
+            statistic_path=path,
+            statistic="profile_reference_median_soft_preferred_target",
+            quantile=REFERENCE_PREFERRED_TARGET_QUANTILE,
+            reference_floor_basis=None,
+        ),
+    )
+
+
 def _event_minimum(
     profile: Mapping[str, Any],
     identity: ProfessionalMontageProfileIdentity,
@@ -751,6 +814,13 @@ def load_professional_montage_policy(
         )
         for name, path in reference_specs
     }
+    preferred_wide_switch_target = _reference_preferred_target(
+        profile,
+        identity,
+        name="preferred_wide_involved_source_switch_fraction",
+        path=f"{reference_root}.source_switch_with_wide_fraction",
+        fraction=True,
+    )
     event_specs = (
         (
             "minimum_nonwide_burst_shot_count",
@@ -796,6 +866,9 @@ def load_professional_montage_policy(
     return ProfessionalMontagePolicy(
         identity=identity,
         **reference_minimums,
+        preferred_wide_involved_source_switch_fraction=(
+            preferred_wide_switch_target
+        ),
         **event_minimums,
         minimum_nonwide_duration_fraction=None,
         nonwide_duration_fraction_policy=(

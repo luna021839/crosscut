@@ -5377,6 +5377,12 @@ def _stage_edit_semimarkov_config_from_montage_policy(
         highlight_minimum_wide_involved_source_switch_fraction=(
             policy.minimum_wide_involved_source_switch_fraction.value
         ),
+        highlight_preferred_wide_involved_source_switch_fraction=(
+            policy.preferred_wide_involved_source_switch_fraction.value
+        ),
+        highlight_wide_involved_source_switch_reference_count=(
+            policy.preferred_wide_involved_source_switch_fraction.reference_count
+        ),
         highlight_minimum_early_wide_anchor_fraction=(
             policy.minimum_early_wide_anchor_fraction.value
         ),
@@ -5404,6 +5410,12 @@ def _rendered_montage_config_from_policy(
         minimum_nonwide_fraction=0.35,
         minimum_wide_involved_source_switch_fraction=(
             policy.minimum_wide_involved_source_switch_fraction.value
+        ),
+        preferred_wide_involved_source_switch_fraction=(
+            policy.preferred_wide_involved_source_switch_fraction.value
+        ),
+        wide_involved_source_switch_reference_count=(
+            policy.preferred_wide_involved_source_switch_fraction.reference_count
         ),
         minimum_early_wide_anchor_fraction=(
             policy.minimum_early_wide_anchor_fraction.value
