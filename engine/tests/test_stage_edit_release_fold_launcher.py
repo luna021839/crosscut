@@ -21,6 +21,9 @@ from tests.test_professional_montage_policy import _profile, _write
 from tests.test_stage_edit_dynamic_crop_capacity_probe import BUDGET, _inputs
 
 
+BLIND_SONG = "IVE-NEW-SONG"
+
+
 def _write_dummy_manifests(
     root: Path, song_ids: tuple[str, ...]
 ) -> tuple[dict[str, Path], dict[str, Path], dict[str, Path]]:
@@ -645,17 +648,22 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 development = _create_development_plan(
                     root, root / "development-checkpoint"
                 )
+                supplied = {
+                    song_id: root / f"unused-{song_id}.json"
+                    for song_id in (*launcher.FINAL_TRAINING_SONG_IDS, BLIND_SONG)
+                }
                 with patch.object(launcher, "_song_records") as song_records:
                     with self.assertRaisesRegex(
                         launcher.ReleaseFoldPreflightError,
                         "regular non-symlink",
                     ):
                         launcher.create_stage_edit_release_final_plan(
+                            blind_song_id=BLIND_SONG,
                             development_plan_path=development,
                             development_freeze_path=root / "missing-freeze.json",
-                            materialization_manifests={},
-                            feature_manifests={},
-                            dynamic_crop_manifests={},
+                            materialization_manifests=supplied,
+                            feature_manifests=supplied,
+                            dynamic_crop_manifests=supplied,
                             checkpoint_directory=root / "final",
                             output_directory=root,
                             professional_montage_grammar_profile=(
@@ -663,6 +671,46 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                             ),
                         )
                     song_records.assert_not_called()
+
+    def test_quarantined_and_development_blind_ids_reject_before_any_path_io(
+        self,
+    ) -> None:
+        invalid_song_ids = (launcher.ATTITUDE, *launcher.DEVELOPMENT_SONG_IDS)
+        supplied = {
+            song_id: Path(f"/must-not-open/{song_id}.json")
+            for song_id in (*launcher.FINAL_TRAINING_SONG_IDS, BLIND_SONG)
+        }
+        for invalid_song_id in invalid_song_ids:
+            with self.subTest(blind_song_id=invalid_song_id):
+                with (
+                    patch.object(Path, "resolve") as resolve,
+                    patch.object(Path, "stat") as stat,
+                    patch.object(Path, "open") as open_file,
+                    patch.object(launcher, "_strict_development_plan") as strict_dev,
+                    patch.object(launcher, "_file_sha256") as file_sha256,
+                ):
+                    with self.assertRaisesRegex(
+                        launcher.ReleaseFoldPreflightError,
+                        "blind_song_id",
+                    ):
+                        launcher.create_stage_edit_release_final_plan(
+                            blind_song_id=invalid_song_id,
+                            development_plan_path=Path("/must-not-open/dev.json"),
+                            development_freeze_path=Path("/must-not-open/freeze.json"),
+                            materialization_manifests=supplied,
+                            feature_manifests=supplied,
+                            dynamic_crop_manifests=supplied,
+                            checkpoint_directory=Path("/must-not-open/checkpoint"),
+                            output_directory=Path("/must-not-open/output"),
+                            professional_montage_grammar_profile=Path(
+                                "/must-not-open/profile.json"
+                            ),
+                        )
+                resolve.assert_not_called()
+                stat.assert_not_called()
+                open_file.assert_not_called()
+                strict_dev.assert_not_called()
+                file_sha256.assert_not_called()
 
     def test_freeze_rebinds_report_selection_config_and_weights(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -725,25 +773,26 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         )
                     ):
                         manifests[index][song_id] = Path(record[key]["path"])
-                attitude = _write_dummy_manifests(root, (launcher.ATTITUDE,))
+                blind = _write_dummy_manifests(root, (BLIND_SONG,))
                 for index in range(3):
-                    manifests[index].update(attitude[index])
+                    manifests[index].update(blind[index])
                 montage_profile = _write_montage_profile(root)
                 real_file_sha256 = launcher._file_sha256
 
-                def reject_premarker_attitude_hash(path, name):
-                    if launcher.ATTITUDE in str(path):
+                def reject_premarker_blind_hash(path, name):
+                    if BLIND_SONG in str(path):
                         raise AssertionError(
-                            "ATTITUDE was hashed before blind consumption"
+                            "blind song was hashed before blind consumption"
                         )
                     return real_file_sha256(path, name)
 
                 with patch.object(
                     launcher,
                     "_file_sha256",
-                    side_effect=reject_premarker_attitude_hash,
+                    side_effect=reject_premarker_blind_hash,
                 ):
                     final = launcher.create_stage_edit_release_final_plan(
+                        blind_song_id=BLIND_SONG,
                         development_plan_path=development,
                         development_freeze_path=freeze,
                         materialization_manifests=manifests[0],
@@ -755,6 +804,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         production_registry=root / "active.json",
                     )
                     second_final = launcher.create_stage_edit_release_final_plan(
+                        blind_song_id=BLIND_SONG,
                         development_plan_path=development,
                         development_freeze_path=freeze,
                         materialization_manifests=manifests[0],
@@ -765,11 +815,50 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         professional_montage_grammar_profile=montage_profile,
                         production_registry=root / "active.json",
                     )
+                    alternate_blind_song = "IVE-OTHER-NEW-SONG"
+                    alternate_blind = _write_dummy_manifests(
+                        root, (alternate_blind_song,)
+                    )
+                    alternate_manifests = [
+                        {
+                            **manifests[index],
+                            alternate_blind_song: alternate_blind[index][
+                                alternate_blind_song
+                            ],
+                        }
+                        for index in range(3)
+                    ]
+                    for family in alternate_manifests:
+                        family.pop(BLIND_SONG)
+                    alternate_final = launcher.create_stage_edit_release_final_plan(
+                        blind_song_id=alternate_blind_song,
+                        development_plan_path=development,
+                        development_freeze_path=freeze,
+                        materialization_manifests=alternate_manifests[0],
+                        feature_manifests=alternate_manifests[1],
+                        dynamic_crop_manifests=alternate_manifests[2],
+                        checkpoint_directory=root / "alternate-final-checkpoint",
+                        output_directory=root,
+                        professional_montage_grammar_profile=montage_profile,
+                        production_registry=root / "active.json",
+                    )
                     first_payload = launcher._strict_final_plan(final)
                     second_payload = launcher._strict_final_plan(second_final)
+                    alternate_payload = launcher._strict_final_plan(
+                        alternate_final
+                    )
                 self.assertEqual(
                     launcher.FINAL_RELEASE_PLAN_SCHEMA_VERSION,
                     first_payload["schema_version"],
+                )
+                self.assertEqual(BLIND_SONG, first_payload["blind_song_id"])
+                self.assertEqual(
+                    list(launcher.FINAL_TRAINING_SONG_IDS),
+                    first_payload["release_contract"]["training_song_ids"],
+                )
+                self.assertEqual(
+                    BLIND_SONG,
+                    first_payload["release_contract"]["held_out_song_id"],
                 )
                 self.assertEqual(
                     development_payload["capacity_selection"],
@@ -780,6 +869,10 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     second_payload["blind_consumption_marker"],
                 )
                 self.assertEqual(
+                    first_payload["blind_consumption_marker"],
+                    alternate_payload["blind_consumption_marker"],
+                )
+                self.assertEqual(
                     str(montage_profile),
                     first_payload["professional_montage_grammar_profile"][
                         "path"
@@ -787,34 +880,34 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(4, len(first_payload["songs"]))
                 self.assertNotIn(
-                    launcher.ATTITUDE,
+                    BLIND_SONG,
                     {item["song_id"] for item in first_payload["songs"]},
                 )
-                deferred_attitude = first_payload[
+                deferred_blind = first_payload[
                     "deferred_blind_held_out_song"
                 ]
                 self.assertEqual(
                     launcher.DEFERRED_BLIND_MANIFEST_CONTRACT,
-                    deferred_attitude["inspection_contract"],
+                    deferred_blind["inspection_contract"],
                 )
                 self.assertFalse(
-                    any("sha256" in key for key in deferred_attitude)
+                    any("sha256" in key for key in deferred_blind)
                 )
                 blind_marker = Path(first_payload["blind_consumption_marker"])
                 materializations, features = _bindings(
-                    root, launcher.FINAL_SONG_IDS
+                    root, (*launcher.FINAL_TRAINING_SONG_IDS, BLIND_SONG)
                 )
-                attitude_validations = []
+                blind_validations = []
 
                 def guarded_release_hash(path, name):
-                    if launcher.ATTITUDE in str(path):
+                    if BLIND_SONG in str(path):
                         self.assertTrue(blind_marker.is_file())
                     return real_file_sha256(path, name)
 
                 def materialization(_pointer, *, song_id):
-                    if song_id == launcher.ATTITUDE:
+                    if song_id == BLIND_SONG:
                         self.assertTrue(blind_marker.is_file())
-                        attitude_validations.append(song_id)
+                        blind_validations.append(song_id)
                     return (
                         launcher.legacy.ManifestPointer(root / "m", "a" * 64),
                         materializations[song_id],
@@ -867,15 +960,15 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     self.assertEqual((), result.train_cli_args)
                     self.assertTrue(result.held_out_manifest_inspection_deferred)
                     self.assertNotIn(
-                        launcher.ATTITUDE, result.reference_ids_by_song
+                        BLIND_SONG, result.reference_ids_by_song
                     )
-                    self.assertEqual([], attitude_validations)
+                    self.assertEqual([], blind_validations)
                     self.assertEqual(
                         0, launcher.launch_stage_edit_release_final(final)
                     )
                     consumed_args = train.call_args.args[0]
 
-            self.assertEqual([launcher.ATTITUDE], attitude_validations)
+            self.assertEqual([BLIND_SONG], blind_validations)
             self.assertTrue(blind_marker.is_file())
             self.assertEqual(25, consumed_args.count("--input"))
             self.assertEqual(
@@ -884,7 +977,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             self.assertEqual(
                 4, consumed_args.count("--required-training-song")
             )
-            self.assertEqual(launcher.ATTITUDE, result.held_out_song_id)
+            self.assertEqual(BLIND_SONG, result.held_out_song_id)
             self.assertIn(
                 "--authorize-production-activation", consumed_args
             )
@@ -931,11 +1024,12 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         )
                     ):
                         manifests[index][song_id] = Path(records[song_id][key]["path"])
-                attitude = _write_dummy_manifests(root, (launcher.ATTITUDE,))
+                blind = _write_dummy_manifests(root, (BLIND_SONG,))
                 for index in range(3):
-                    manifests[index].update(attitude[index])
+                    manifests[index].update(blind[index])
                 montage_profile = _write_montage_profile(root)
                 final = launcher.create_stage_edit_release_final_plan(
+                    blind_song_id=BLIND_SONG,
                     development_plan_path=development,
                     development_freeze_path=freeze,
                     materialization_manifests=manifests[0],
@@ -985,7 +1079,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             parsed.capacity_selection,
         )
 
-    def test_create_final_parser_requires_explicit_montage_profile(self) -> None:
+    def test_create_final_parser_requires_blind_id_and_montage_profile(self) -> None:
         parser = launcher.build_parser()
         minimal = [
             "create-final",
@@ -1009,6 +1103,8 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
         parsed = parser.parse_args(
             [
                 *minimal,
+                "--blind-song-id",
+                BLIND_SONG,
                 "--professional-montage-grammar-profile",
                 "/tmp/montage.json",
             ]
@@ -1018,21 +1114,21 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             parsed.professional_montage_grammar_profile,
         )
 
-    def test_attitude_cli_path_is_normalized_without_resolve_or_stat(self) -> None:
+    def test_blind_cli_path_is_normalized_without_resolve_or_stat(self) -> None:
         with patch.object(
             Path,
             "resolve",
-            side_effect=AssertionError("ATTITUDE path must remain deferred"),
+            side_effect=AssertionError("blind path must remain deferred"),
         ) as resolve:
             result = launcher._keyed_paths(
-                [f"{launcher.ATTITUDE}=/tmp/blind/../attitude.json"],
-                expected_song_ids=(launcher.ATTITUDE,),
+                [f"{BLIND_SONG}=/tmp/blind/../new-song.json"],
+                expected_song_ids=(BLIND_SONG,),
                 option="--materialization-manifest",
-                content_inspection_deferred_song_ids=(launcher.ATTITUDE,),
+                content_inspection_deferred_song_ids=(BLIND_SONG,),
             )
         resolve.assert_not_called()
         self.assertEqual(
-            Path("/tmp/attitude.json"), result[launcher.ATTITUDE]
+            Path("/tmp/new-song.json"), result[BLIND_SONG]
         )
 
     def test_create_final_cli_forwards_explicit_montage_profile(self) -> None:
@@ -1047,6 +1143,8 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
             "/tmp/checkpoint",
             "--output-directory",
             "/tmp/output",
+            "--blind-song-id",
+            BLIND_SONG,
             "--materialization-manifest",
             "song=/tmp/materialization.json",
             "--feature-manifest",
@@ -1072,6 +1170,41 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 "professional_montage_grammar_profile"
             ],
         )
+        self.assertEqual(BLIND_SONG, create_final.call_args.kwargs["blind_song_id"])
+
+    def test_create_final_cli_rejects_ineligible_blind_before_keying_paths(
+        self,
+    ) -> None:
+        base = [
+            "create-final",
+            "--development-plan",
+            "/must-not-open/development.json",
+            "--development-freeze",
+            "/must-not-open/freeze.json",
+            "--checkpoint-dir",
+            "/must-not-open/checkpoint",
+            "--output-directory",
+            "/must-not-open/output",
+            "--materialization-manifest",
+            "IVE-BANG-BANG=/must-not-open/materialization.json",
+            "--feature-manifest",
+            "IVE-BANG-BANG=/must-not-open/features.json",
+            "--dynamic-crop-manifest",
+            "IVE-BANG-BANG=/must-not-open/dynamic.json",
+            "--professional-montage-grammar-profile",
+            "/must-not-open/profile.json",
+        ]
+        for invalid_song_id in (launcher.ATTITUDE, *launcher.DEVELOPMENT_SONG_IDS):
+            with self.subTest(blind_song_id=invalid_song_id):
+                with patch.object(launcher, "_keyed_paths") as keyed_paths:
+                    with self.assertRaisesRegex(
+                        launcher.ReleaseFoldPreflightError,
+                        "blind_song_id",
+                    ):
+                        launcher.main(
+                            [*base, "--blind-song-id", invalid_song_id]
+                        )
+                keyed_paths.assert_not_called()
 
     def test_final_launch_consumes_marker_even_when_quality_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1081,7 +1214,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 stage="final_blind",
                 plan_path=root / "plan.json",
                 plan_sha256="a" * 64,
-                held_out_song_id=launcher.ATTITUDE,
+                held_out_song_id=BLIND_SONG,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=root / "checkpoint",
                 capacity_selection={"selected_candidate_id": "a" * 64},
@@ -1094,7 +1227,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 stage="final_blind",
                 plan_path=preflight.plan_path,
                 plan_sha256=preflight.plan_sha256,
-                held_out_song_id=launcher.ATTITUDE,
+                held_out_song_id=BLIND_SONG,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=preflight.checkpoint_directory,
                 capacity_selection=preflight.capacity_selection,
@@ -1114,7 +1247,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 self.assertEqual(marker, consumption_marker)
                 self.assertTrue(marker.is_file())
                 self.assertEqual(["directory_fsynced"], ordering)
-                ordering.append("attitude_inspection")
+                ordering.append("blind_inspection")
                 return consumed
 
             with (
@@ -1150,10 +1283,10 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     launcher.launch_stage_edit_release_final(root / "plan.json")
                 train.assert_called_once_with(consumed.train_cli_args)
                 self.assertEqual(
-                    ["directory_fsynced", "attitude_inspection"], ordering
+                    ["directory_fsynced", "blind_inspection"], ordering
                 )
 
-    def test_attitude_manifest_failure_after_marker_cannot_retry(self) -> None:
+    def test_blind_manifest_failure_after_marker_cannot_retry(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             marker = root / "blind-consumed.json"
@@ -1161,7 +1294,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 stage="final_blind",
                 plan_path=root / "plan.json",
                 plan_sha256="b" * 64,
-                held_out_song_id=launcher.ATTITUDE,
+                held_out_song_id=BLIND_SONG,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=root / "checkpoint",
                 capacity_selection={"selected_candidate_id": "b" * 64},
@@ -1171,11 +1304,11 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 reference_ids_by_song={},
             )
 
-            def reject_attitude(_plan, *, consumption_marker):
+            def reject_blind(_plan, *, consumption_marker):
                 self.assertEqual(marker, consumption_marker)
                 self.assertTrue(marker.is_file())
                 raise launcher.ReleaseFoldPreflightError(
-                    "ATTITUDE manifest invalid after consumption"
+                    "blind manifest invalid after consumption"
                 )
 
             with (
@@ -1187,7 +1320,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 patch.object(
                     launcher,
                     "_preflight_consumed_stage_edit_release_final",
-                    side_effect=reject_attitude,
+                    side_effect=reject_blind,
                 ) as consumed_preflight,
                 patch.object(launcher, "production_train_main") as train,
             ):

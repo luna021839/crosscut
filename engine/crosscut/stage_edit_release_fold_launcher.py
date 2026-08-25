@@ -7,8 +7,9 @@ once REBEL HEART is available:
 * development: BANG BANG + BLACKHOLE + REBEL HEART train, XOXZ held out;
 * immutable development freeze: report, selection freeze, model config and
   selected checkpoint weights are all rebound by SHA-256; and
-* final: the four development songs train, ATTITUDE is evaluated exactly once
-  as the blind held-out song.  Only this final run carries activation authority.
+* final: the four development songs train, while one new, explicitly named IVE
+  song is evaluated exactly once as the blind held-out song.  Only this final
+  run carries activation authority.
 
 The low-level trainer remains :mod:`stage_edit_production_train_cli`.  In
 particular, checkpoint and cut-threshold selection still happen on whole
@@ -61,10 +62,11 @@ from .stage_edit_transition_authority import (
 
 
 RELEASE_PLAN_SCHEMA_VERSION = 4
-FINAL_RELEASE_PLAN_SCHEMA_VERSION = 6
+DEVELOPMENT_FREEZE_SCHEMA_VERSION = 5
+FINAL_RELEASE_PLAN_SCHEMA_VERSION = 7
 DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v4"
-DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v4"
-FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_attitude_blind_release_plan_v6"
+DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v5"
+FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_generic_blind_release_plan_v7"
 MODEL_TRAINING_CONTRACT_VERSION = 2
 STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 2
 CAPACITY_SELECTION_BINDING_VERSION = 1
@@ -81,7 +83,7 @@ ATTITUDE = "IVE-ATTITUDE"
 DEVELOPMENT_TRAINING_SONG_IDS = (BANG_BANG, BLACKHOLE, REBEL_HEART)
 DEVELOPMENT_SONG_IDS = (*DEVELOPMENT_TRAINING_SONG_IDS, XOXZ)
 FINAL_TRAINING_SONG_IDS = (*DEVELOPMENT_TRAINING_SONG_IDS, XOXZ)
-FINAL_SONG_IDS = (*FINAL_TRAINING_SONG_IDS, ATTITUDE)
+QUARANTINED_BLIND_SONG_IDS = frozenset({ATTITUDE})
 
 DEFAULT_RELEASE_TRAINING_CONFIG: Mapping[str, Any] = {
     "epochs": 30,
@@ -647,6 +649,40 @@ def _release_contract(
     }
 
 
+def _validate_blind_song_id(value: object) -> str:
+    """Validate a new IVE blind-song identity without touching any paths."""
+
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ReleaseFoldPreflightError(
+            "blind_song_id must be a non-empty canonical IVE song id"
+        )
+    if (
+        not value.startswith("IVE-")
+        or value.endswith("-")
+        or "--" in value
+        or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+            for character in value
+        )
+    ):
+        raise ReleaseFoldPreflightError(
+            "blind_song_id must use canonical IVE-UPPERCASE-HYPHEN form"
+        )
+    if value in DEVELOPMENT_SONG_IDS:
+        raise ReleaseFoldPreflightError(
+            "blind_song_id must not reuse any of the four development songs"
+        )
+    if value in QUARANTINED_BLIND_SONG_IDS:
+        raise ReleaseFoldPreflightError(
+            "blind_song_id is quarantined and cannot carry strict-blind authority"
+        )
+    return value
+
+
+def _final_song_ids(blind_song_id: object) -> tuple[str, ...]:
+    return (*FINAL_TRAINING_SONG_IDS, _validate_blind_song_id(blind_song_id))
+
+
 def _song_records(
     song_ids: Sequence[str],
     *,
@@ -694,34 +730,39 @@ def _normalized_absolute_path_without_inspection(path: Path, name: str) -> str:
 
 def _deferred_blind_song_record(
     *,
+    blind_song_id: str,
     materialization_manifest: Path,
     feature_manifest: Path,
     dynamic_crop_manifest: Path,
 ) -> dict[str, Any]:
+    blind_song_id = _validate_blind_song_id(blind_song_id)
     return {
-        "song_id": ATTITUDE,
+        "song_id": blind_song_id,
         "inspection_contract": DEFERRED_BLIND_MANIFEST_CONTRACT,
         "materialization_manifest_path": (
             _normalized_absolute_path_without_inspection(
                 materialization_manifest,
-                "ATTITUDE materialization manifest",
+                f"{blind_song_id} blind materialization manifest",
             )
         ),
         "feature_manifest_path": _normalized_absolute_path_without_inspection(
             feature_manifest,
-            "ATTITUDE feature manifest",
+            f"{blind_song_id} blind feature manifest",
         ),
         "dynamic_crop_manifest_path": (
             _normalized_absolute_path_without_inspection(
                 dynamic_crop_manifest,
-                "ATTITUDE dynamic crop manifest",
+                f"{blind_song_id} blind dynamic crop manifest",
             )
         ),
     }
 
 
-def _strict_deferred_blind_song_record(value: object) -> dict[str, Any]:
-    record = dict(_mapping(value, "deferred ATTITUDE manifest record"))
+def _strict_deferred_blind_song_record(
+    value: object, *, expected_blind_song_id: str
+) -> dict[str, Any]:
+    expected_blind_song_id = _validate_blind_song_id(expected_blind_song_id)
+    record = dict(_mapping(value, "deferred blind manifest record"))
     expected_keys = {
         "song_id",
         "inspection_contract",
@@ -731,14 +772,14 @@ def _strict_deferred_blind_song_record(value: object) -> dict[str, Any]:
     }
     if set(record) != expected_keys:
         raise ReleaseFoldPreflightError(
-            "deferred ATTITUDE manifest record keys are not exact"
+            "deferred blind manifest record keys are not exact"
         )
     if (
-        record.get("song_id") != ATTITUDE
+        record.get("song_id") != expected_blind_song_id
         or record.get("inspection_contract") != DEFERRED_BLIND_MANIFEST_CONTRACT
     ):
         raise ReleaseFoldPreflightError(
-            "deferred ATTITUDE manifest inspection contract is invalid"
+            "deferred blind manifest inspection contract is invalid"
         )
     for key in (
         "materialization_manifest_path",
@@ -748,34 +789,37 @@ def _strict_deferred_blind_song_record(value: object) -> dict[str, Any]:
         raw = record.get(key)
         if not isinstance(raw, str) or not Path(raw).is_absolute():
             raise ReleaseFoldPreflightError(
-                "deferred ATTITUDE manifest path is not absolute"
+                "deferred blind manifest path is not absolute"
             )
         if os.path.normpath(raw) != raw:
             raise ReleaseFoldPreflightError(
-                "deferred ATTITUDE manifest path is not lexically normalized"
+                "deferred blind manifest path is not lexically normalized"
             )
     return record
 
 
 def _materialize_deferred_blind_song_record(
-    value: object,
+    value: object, *, expected_blind_song_id: str
 ) -> dict[str, Any]:
-    """Read/hash ATTITUDE evidence only after a verified consumption marker."""
+    """Read/hash blind evidence only after a verified consumption marker."""
 
-    record = _strict_deferred_blind_song_record(value)
+    blind_song_id = _validate_blind_song_id(expected_blind_song_id)
+    record = _strict_deferred_blind_song_record(
+        value, expected_blind_song_id=blind_song_id
+    )
     return {
-        "song_id": ATTITUDE,
+        "song_id": blind_song_id,
         "materialization_manifest": _pointer(
             Path(record["materialization_manifest_path"]),
-            "ATTITUDE materialization manifest",
+            f"{blind_song_id} blind materialization manifest",
         ),
         "feature_manifest": _pointer(
             Path(record["feature_manifest_path"]),
-            "ATTITUDE feature manifest",
+            f"{blind_song_id} blind feature manifest",
         ),
         "dynamic_crop_manifest": _pointer(
             Path(record["dynamic_crop_manifest_path"]),
-            "ATTITUDE dynamic crop manifest",
+            f"{blind_song_id} blind dynamic crop manifest",
         ),
     }
 
@@ -1402,7 +1446,7 @@ def _assert_development_report(
 def freeze_stage_edit_release_development(
     plan_path: Path, *, output_directory: Path
 ) -> Path:
-    """Freeze a passing inactive XOXZ development run before ATTITUDE planning."""
+    """Freeze a passing inactive XOXZ development run before blind planning."""
 
     resolved_plan = Path(plan_path).expanduser().resolve()
     plan = _strict_development_plan(resolved_plan)
@@ -1429,7 +1473,7 @@ def freeze_stage_edit_release_development(
         raise ReleaseFoldPreflightError("report does not bind the selection freeze")
     config = dict(_mapping(report["model"], "development model")["config"])
     unsigned = {
-        "schema_version": RELEASE_PLAN_SCHEMA_VERSION,
+        "schema_version": DEVELOPMENT_FREEZE_SCHEMA_VERSION,
         "analysis_basis": DEVELOPMENT_FREEZE_ANALYSIS_BASIS,
         "stage": "development_frozen",
         "development_plan": _pointer(resolved_plan, "development plan"),
@@ -1450,7 +1494,7 @@ def freeze_stage_edit_release_development(
         "development_held_out_song_id": XOXZ,
         "development_quality_gate_passed": True,
         "production_activation_authorized": False,
-        "attitude_evidence_opened": False,
+        "blind_evidence_opened": False,
     }
     return _write_content_addressed(
         unsigned,
@@ -1480,7 +1524,7 @@ _DEVELOPMENT_FREEZE_KEYS = {
     "development_held_out_song_id",
     "development_quality_gate_passed",
     "production_activation_authorized",
-    "attitude_evidence_opened",
+    "blind_evidence_opened",
     "freeze_sha256",
 }
 
@@ -1494,6 +1538,7 @@ def _strict_development_freeze(
         schema_basis=DEVELOPMENT_FREEZE_ANALYSIS_BASIS,
         prefix="stageedit-release-development-freeze",
         hash_field="freeze_sha256",
+        expected_schema_version=DEVELOPMENT_FREEZE_SCHEMA_VERSION,
     )
     if (
         payload.get("stage") != "development_frozen"
@@ -1502,7 +1547,7 @@ def _strict_development_freeze(
         or payload.get("development_held_out_song_id") != XOXZ
         or payload.get("development_quality_gate_passed") is not True
         or payload.get("production_activation_authorized") is not False
-        or payload.get("attitude_evidence_opened") is not False
+        or payload.get("blind_evidence_opened") is not False
     ):
         raise ReleaseFoldPreflightError("development freeze policy is invalid")
     plan_path = _verify_pointer(payload.get("development_plan"), "development plan")
@@ -1575,6 +1620,7 @@ def _strict_development_freeze(
 
 def create_stage_edit_release_final_plan(
     *,
+    blind_song_id: str,
     development_plan_path: Path,
     development_freeze_path: Path,
     materialization_manifests: Mapping[str, Path],
@@ -1585,7 +1631,24 @@ def create_stage_edit_release_final_plan(
     professional_montage_grammar_profile: Path,
     production_registry: Path | None = None,
 ) -> Path:
-    """Create the final ATTITUDE plan only after a valid development freeze."""
+    """Freeze one new blind song after a valid development freeze."""
+
+    # This identity check is deliberately the first operation. In particular,
+    # a quarantined/development song cannot cause even a stat of caller-supplied
+    # final manifests (or a read of any other release artifact).
+    blind_song_id = _validate_blind_song_id(blind_song_id)
+    final_song_ids = _final_song_ids(blind_song_id)
+    required_songs = set(final_song_ids)
+    for name, manifests in (
+        ("materialization", materialization_manifests),
+        ("feature", feature_manifests),
+        ("dynamic crop", dynamic_crop_manifests),
+    ):
+        if set(manifests) != required_songs or len(manifests) != 5:
+            raise ReleaseFoldPreflightError(
+                f"{name} manifests must name exactly the four development songs "
+                "plus the frozen blind_song_id"
+            )
 
     resolved_development = Path(development_plan_path).expanduser().resolve()
     development = _strict_development_plan(resolved_development)
@@ -1615,16 +1678,6 @@ def create_stage_edit_release_final_plan(
         raise ReleaseFoldPreflightError(
             "professional montage grammar profile path identity changed"
         )
-    required_songs = set(FINAL_SONG_IDS)
-    for name, manifests in (
-        ("materialization", materialization_manifests),
-        ("feature", feature_manifests),
-        ("dynamic crop", dynamic_crop_manifests),
-    ):
-        if set(manifests) != required_songs:
-            raise ReleaseFoldPreflightError(
-                f"{name} manifests must name the exact five release songs"
-            )
     records = _song_records(
         DEVELOPMENT_SONG_IDS,
         materialization_manifests={
@@ -1639,10 +1692,11 @@ def create_stage_edit_release_final_plan(
             for song in DEVELOPMENT_SONG_IDS
         },
     )
-    deferred_attitude = _deferred_blind_song_record(
-        materialization_manifest=materialization_manifests[ATTITUDE],
-        feature_manifest=feature_manifests[ATTITUDE],
-        dynamic_crop_manifest=dynamic_crop_manifests[ATTITUDE],
+    deferred_blind = _deferred_blind_song_record(
+        blind_song_id=blind_song_id,
+        materialization_manifest=materialization_manifests[blind_song_id],
+        feature_manifest=feature_manifests[blind_song_id],
+        dynamic_crop_manifest=dynamic_crop_manifests[blind_song_id],
     )
     development_records = _indexed_song_records(development, DEVELOPMENT_SONG_IDS)
     final_records = {str(item["song_id"]): item for item in records}
@@ -1658,21 +1712,24 @@ def create_stage_edit_release_final_plan(
     )
     # The marker is keyed by the immutable development freeze, not by the
     # caller-selected final checkpoint path.  Choosing another output directory
-    # therefore cannot reset the one-shot ATTITUDE budget.
+    # therefore cannot reset the one-shot blind-evaluation budget. The marker
+    # is also song-agnostic, so creating a second plan with another song cannot
+    # mint a second attempt from the same immutable development freeze.
     freeze_digest = str(freeze["freeze_sha256"])
     development_checkpoint = Path(
         str(freeze["development_checkpoint_directory"])
     ).resolve()
     marker = development_checkpoint.parent / (
-        f"stageedit-release-{freeze_digest[:16]}.attitude-blind-consumed.json"
+        f"stageedit-release-{freeze_digest[:16]}.blind-consumed.json"
     )
     unsigned = {
         "schema_version": FINAL_RELEASE_PLAN_SCHEMA_VERSION,
         "analysis_basis": FINAL_PLAN_ANALYSIS_BASIS,
         "stage": "final_blind",
+        "blind_song_id": blind_song_id,
         "release_contract": _release_contract(
             training_song_ids=FINAL_TRAINING_SONG_IDS,
-            held_out_song_id=ATTITUDE,
+            held_out_song_id=blind_song_id,
             stage="final_blind",
         ),
         "required_volume": str(legacy.PRODUCTION_VOLUME_ROOT),
@@ -1696,12 +1753,12 @@ def create_stage_edit_release_final_plan(
         "professional_montage_grammar_profile": montage_profile_identity,
         "production_registry": registry,
         "songs": records,
-        "deferred_blind_held_out_song": deferred_attitude,
+        "deferred_blind_held_out_song": deferred_blind,
     }
     return _write_content_addressed(
         unsigned,
         output_directory=output_directory,
-        prefix="stageedit-release-attitude-blind-plan",
+        prefix="stageedit-release-blind-plan",
         hash_field="plan_sha256",
     )
 
@@ -1710,6 +1767,7 @@ _FINAL_PLAN_KEYS = {
     "schema_version",
     "analysis_basis",
     "stage",
+    "blind_song_id",
     "release_contract",
     "required_volume",
     "minimum_free_bytes",
@@ -1735,13 +1793,16 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
         path,
         expected_keys=_FINAL_PLAN_KEYS,
         schema_basis=FINAL_PLAN_ANALYSIS_BASIS,
-        prefix="stageedit-release-attitude-blind-plan",
+        prefix="stageedit-release-blind-plan",
         hash_field="plan_sha256",
         expected_schema_version=FINAL_RELEASE_PLAN_SCHEMA_VERSION,
     )
+    # Validate the frozen blind identity before following any pointer from the
+    # plan. A forged plan cannot repurpose development/quarantined evidence.
+    blind_song_id = _validate_blind_song_id(payload.get("blind_song_id"))
     if payload.get("stage") != "final_blind" or payload.get("release_contract") != _release_contract(
         training_song_ids=FINAL_TRAINING_SONG_IDS,
-        held_out_song_id=ATTITUDE,
+        held_out_song_id=blind_song_id,
         stage="final_blind",
     ):
         raise ReleaseFoldPreflightError("final blind release contract is not exact")
@@ -1791,7 +1852,8 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
     )
     final_records = _indexed_song_records(payload, DEVELOPMENT_SONG_IDS)
     _strict_deferred_blind_song_record(
-        payload.get("deferred_blind_held_out_song")
+        payload.get("deferred_blind_held_out_song"),
+        expected_blind_song_id=blind_song_id,
     )
     development_records = _indexed_song_records(development, DEVELOPMENT_SONG_IDS)
     for song_id in DEVELOPMENT_SONG_IDS:
@@ -1806,7 +1868,7 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
     ).resolve()
     expected_marker = development_checkpoint.parent / (
         f"stageedit-release-{str(freeze['freeze_sha256'])[:16]}."
-        "attitude-blind-consumed.json"
+        "blind-consumed.json"
     )
     if marker != expected_marker:
         raise ReleaseFoldPreflightError("blind consumption marker path is not canonical")
@@ -1857,24 +1919,25 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
 
 
 def preflight_stage_edit_release_final(plan_path: Path) -> ReleaseFoldPreflight:
-    """Validate final authority without reading or exposing ATTITUDE inputs."""
+    """Validate final authority without reading or exposing blind inputs."""
 
     payload = _strict_final_plan(plan_path)
+    blind_song_id = _validate_blind_song_id(payload["blind_song_id"])
     checkpoint = Path(str(payload["checkpoint_directory"])).resolve()
     legacy._validate_storage(checkpoint)
     marker = Path(str(payload["blind_consumption_marker"])).resolve()
     if marker.exists() or marker.is_symlink():
         raise ReleaseFoldPreflightError(
-            "ATTITUDE blind evaluation was already consumed for this release"
+            "blind evaluation was already consumed for this release"
         )
     # BANG BANG / BLACKHOLE / REBEL HEART / XOXZ are already inside the
-    # development evidence boundary. ATTITUDE remains path-only and unopened.
+    # development evidence boundary. The frozen blind song remains path-only.
     _, references, _ = _manifest_cli_args(payload, DEVELOPMENT_SONG_IDS)
     return ReleaseFoldPreflight(
         stage="final_blind",
         plan_path=Path(plan_path).expanduser().resolve(),
         plan_sha256=str(payload["plan_sha256"]),
-        held_out_song_id=ATTITUDE,
+        held_out_song_id=blind_song_id,
         training_song_ids=FINAL_TRAINING_SONG_IDS,
         checkpoint_directory=checkpoint,
         capacity_selection=dict(payload["capacity_selection"]),
@@ -1889,11 +1952,13 @@ def _blind_consumption_marker_payload(
     preflight: ReleaseFoldPreflight,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "contract": "attitude_one_shot_blind_evaluation_consumed_v1",
+        "schema_version": 2,
+        "contract": "stageedit_one_shot_blind_evaluation_consumed_v2",
         "final_plan_path": str(preflight.plan_path),
         "final_plan_sha256": preflight.plan_sha256,
-        "held_out_song_id": ATTITUDE,
+        "held_out_song_id": _validate_blind_song_id(
+            preflight.held_out_song_id
+        ),
         "held_out_used_for_model_or_threshold_selection": False,
         "retry_allowed": False,
     }
@@ -1912,21 +1977,22 @@ def _fsync_parent_directory(path: Path) -> None:
 def _preflight_consumed_stage_edit_release_final(
     plan_path: Path, *, consumption_marker: Path
 ) -> ReleaseFoldPreflight:
-    """Expand ATTITUDE evidence only after the one-shot marker is durable."""
+    """Expand blind evidence only after the one-shot marker is durable."""
 
     payload = _strict_final_plan(plan_path)
+    blind_song_id = _validate_blind_song_id(payload["blind_song_id"])
     checkpoint = Path(str(payload["checkpoint_directory"])).resolve()
     marker = Path(str(payload["blind_consumption_marker"])).resolve()
     if marker != Path(consumption_marker).expanduser().resolve():
         raise ReleaseFoldPreflightError(
             "consumed final preflight received a different marker"
         )
-    marker_evidence = _read_json_object(marker, "ATTITUDE blind consumption marker")
+    marker_evidence = _read_json_object(marker, "blind consumption marker")
     marker_preflight = ReleaseFoldPreflight(
         stage="final_blind",
         plan_path=Path(plan_path).expanduser().resolve(),
         plan_sha256=str(payload["plan_sha256"]),
-        held_out_song_id=ATTITUDE,
+        held_out_song_id=blind_song_id,
         training_song_ids=FINAL_TRAINING_SONG_IDS,
         checkpoint_directory=checkpoint,
         capacity_selection=dict(payload["capacity_selection"]),
@@ -1937,25 +2003,28 @@ def _preflight_consumed_stage_edit_release_final(
     )
     if marker_evidence != _blind_consumption_marker_payload(marker_preflight):
         raise ReleaseFoldPreflightError(
-            "ATTITUDE blind consumption marker is invalid or mismatched"
+            "blind consumption marker is invalid or mismatched"
         )
 
-    # No ATTITUDE pointer, hash, manifest, or supervision content is touched
+    # No blind pointer, hash, manifest, or supervision content is touched
     # above this line. Materialization below is authorized by the durable marker.
     expanded_payload = dict(payload)
     expanded_payload["songs"] = [
         *_array(payload.get("songs"), "frozen development songs"),
         _materialize_deferred_blind_song_record(
-            payload.get("deferred_blind_held_out_song")
+            payload.get("deferred_blind_held_out_song"),
+            expected_blind_song_id=blind_song_id,
         ),
     ]
-    args, references, _ = _manifest_cli_args(expanded_payload, FINAL_SONG_IDS)
+    args, references, _ = _manifest_cli_args(
+        expanded_payload, _final_song_ids(blind_song_id)
+    )
     for song_id in FINAL_TRAINING_SONG_IDS:
         args.extend(["--required-training-song", song_id])
     args.extend(
         [
             "--held-out-song",
-            ATTITUDE,
+            blind_song_id,
             "--checkpoint-dir",
             str(checkpoint),
             "--negative-samples-per-hold",
@@ -1981,7 +2050,7 @@ def _preflight_consumed_stage_edit_release_final(
         stage="final_blind",
         plan_path=Path(plan_path).expanduser().resolve(),
         plan_sha256=str(payload["plan_sha256"]),
-        held_out_song_id=ATTITUDE,
+        held_out_song_id=blind_song_id,
         training_song_ids=FINAL_TRAINING_SONG_IDS,
         checkpoint_directory=checkpoint,
         capacity_selection=dict(payload["capacity_selection"]),
@@ -1993,7 +2062,7 @@ def _preflight_consumed_stage_edit_release_final(
 
 
 def launch_stage_edit_release_final(plan_path: Path) -> int:
-    """Consume the ATTITUDE blind run once, then delegate to the strict CLI."""
+    """Consume the generic blind run once, then delegate to the strict CLI."""
 
     preflight = preflight_stage_edit_release_final(plan_path)
     assert preflight.blind_consumption_marker is not None
@@ -2020,7 +2089,7 @@ def launch_stage_edit_release_final(plan_path: Path) -> int:
         _fsync_parent_directory(marker)
     except FileExistsError as exc:
         raise ReleaseFoldPreflightError(
-            "ATTITUDE blind evaluation was already consumed"
+            "blind evaluation was already consumed"
         ) from exc
     # The general CLI registers only when every fixed held-out gate passes.
     # A failed final blind run remains inactive and the marker remains consumed.
@@ -2078,7 +2147,7 @@ def _add_manifest_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the frozen IVE StageEdit development-to-ATTITUDE release protocol"
+        description="Run the frozen IVE StageEdit development-to-blind release protocol"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     create_dev = commands.add_parser("create-development")
@@ -2102,6 +2171,14 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--output-directory", required=True, type=Path)
     create_final = commands.add_parser("create-final")
     _add_manifest_options(create_final)
+    create_final.add_argument(
+        "--blind-song-id",
+        required=True,
+        help=(
+            "New canonical IVE song id frozen as the one-shot final holdout; "
+            "development songs and quarantined ATTITUDE are rejected."
+        ),
+    )
     create_final.add_argument("--development-plan", required=True, type=Path)
     create_final.add_argument("--development-freeze", required=True, type=Path)
     create_final.add_argument("--checkpoint-dir", required=True, type=Path)
@@ -2158,27 +2235,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"freeze_path": str(path)}, ensure_ascii=False, indent=2))
         return 0
     if args.command == "create-final":
-        expected = FINAL_SONG_IDS
+        # Identity rejection happens before _keyed_paths can resolve/stat any
+        # caller-supplied final manifest path.
+        blind_song_id = _validate_blind_song_id(args.blind_song_id)
+        expected = _final_song_ids(blind_song_id)
         path = create_stage_edit_release_final_plan(
+            blind_song_id=blind_song_id,
             development_plan_path=args.development_plan,
             development_freeze_path=args.development_freeze,
             materialization_manifests=_keyed_paths(
                 args.materialization_manifest,
                 expected_song_ids=expected,
                 option="--materialization-manifest",
-                content_inspection_deferred_song_ids=(ATTITUDE,),
+                content_inspection_deferred_song_ids=(blind_song_id,),
             ),
             feature_manifests=_keyed_paths(
                 args.feature_manifest,
                 expected_song_ids=expected,
                 option="--feature-manifest",
-                content_inspection_deferred_song_ids=(ATTITUDE,),
+                content_inspection_deferred_song_ids=(blind_song_id,),
             ),
             dynamic_crop_manifests=_keyed_paths(
                 args.dynamic_crop_manifest,
                 expected_song_ids=expected,
                 option="--dynamic-crop-manifest",
-                content_inspection_deferred_song_ids=(ATTITUDE,),
+                content_inspection_deferred_song_ids=(blind_song_id,),
             ),
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
@@ -2205,7 +2286,6 @@ __all__ = [
     "DEFAULT_RELEASE_TRAINING_CONFIG",
     "DEVELOPMENT_SONG_IDS",
     "DEVELOPMENT_TRAINING_SONG_IDS",
-    "FINAL_SONG_IDS",
     "FINAL_TRAINING_SONG_IDS",
     "ReleaseFoldPreflight",
     "ReleaseFoldPreflightError",
