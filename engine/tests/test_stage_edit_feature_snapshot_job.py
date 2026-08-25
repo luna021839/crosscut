@@ -32,7 +32,9 @@ from crosscut.stage_edit_feature_snapshot_job import (
     FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
     FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
     _SAFE_ARTIFACT_ID,
+    _SourceRecord,
     _reference_scaffold,
+    _source_observations,
     _write_content_addressed_json,
     build_stage_edit_feature_snapshots,
     map_reference_master_to_source_seconds,
@@ -185,6 +187,41 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
         broken["control_points"][1]["source_seconds"] = 2.0
         with self.assertRaisesRegex(ValueError, "monotonic"):
             map_reference_master_to_source_seconds(broken, 5.0)
+
+    def test_slightly_negative_source_time_is_unavailable_before_rounding(self) -> None:
+        source = _SourceRecord(
+            source_id="A",
+            path=Path("/unused/A.mp4"),
+            clock=_clock(-1.04),
+            frame_rate=10.0,
+            declared_frame_count=300,
+            sync_confidence=0.9,
+            sync_margin=0.2,
+            sync_residual_normalized=0.0,
+            content_sha256="a" * 64,
+        )
+
+        with patch(
+            "crosscut.stage_edit_feature_snapshot_job."
+            "decode_target_frames_sequential",
+            return_value=DecodedTargetFrames(
+                frame_rate=10.0,
+                declared_frame_count=300,
+                requested_indices=(),
+                frames={},
+            ),
+        ) as decode:
+            observations, _feature_sha256, statistics = _source_observations(
+                (source,),
+                (1.0,),
+                working_width=320,
+            )
+
+        self.assertEqual(decode.call_args.args[1], ())
+        observation = observations["A"][1.0]
+        self.assertFalse(observation.available)
+        self.assertFalse(observation.hard_gate_passed)
+        self.assertEqual(statistics["A"]["available_time_count"], 0)
 
     def test_content_addressed_writer_is_idempotent_and_collision_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

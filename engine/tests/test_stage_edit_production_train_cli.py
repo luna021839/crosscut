@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
@@ -12,8 +13,17 @@ from crosscut.stage_edit_continuity_authority import (
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
 from crosscut.stage_edit_dynamic_crop_head_v3 import DynamicCropV3LossContract
+from crosscut.stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3,
+    FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+    SourceFeatureObservation,
+    StageEditFeatureFrame,
+    _payload_sha256,
+    materialize_stage_edit_feature_snapshot,
+)
 from crosscut.stage_edit_production_train_cli import (
     _dynamic_artifact_map,
+    _snapshot_map,
     _training_result_exit_code,
     build_parser,
     main,
@@ -21,6 +31,44 @@ from crosscut.stage_edit_production_train_cli import (
 
 
 class StageEditProductionTrainCliTests(unittest.TestCase):
+    def test_legacy_schema3_snapshot_fails_production_snapshot_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "legacy-schema3-feature-snapshot.json"
+            snapshot = materialize_stage_edit_feature_snapshot(
+                "ive:legacy-schema3-gate-probe",
+                (
+                    StageEditFeatureFrame(
+                        0.5,
+                        (SourceFeatureObservation("source-a"),),
+                    ),
+                ),
+                performance_end_seconds=1.0,
+                inspection_only_without_causal_sensing=True,
+            )
+            legacy = deepcopy(snapshot.to_dict())
+            legacy["schema_version"] = FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            legacy["provenance"]["producer"] = (
+                FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3
+            )
+            legacy.pop("causal_sensing_binding")
+            legacy["input_policy"] = {
+                "training_inference_materializer_shared": True,
+                "reference_attribution_match_inputs_present": False,
+                "selected_labels_present": False,
+                "missing_values_are_explicitly_masked": True,
+                "source_availability_and_hard_gate_are_distinct": True,
+                "temporal_pose_sidecar_hash_bound": True,
+                "temporal_pose_sidecar_enters_transformer_tensors": False,
+                "legacy_snapshots_cannot_claim_pose_direction": True,
+            }
+            unsigned = deepcopy(legacy)
+            unsigned.pop("snapshot_sha256")
+            legacy["snapshot_sha256"] = _payload_sha256(unsigned)
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "inspection-only"):
+                _snapshot_map((f"reference-a={path}",))
+
     def test_evaluation_only_exit_code_tracks_the_heldout_gate(self) -> None:
         self.assertEqual(
             0,

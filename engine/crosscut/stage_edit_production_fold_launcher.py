@@ -39,7 +39,11 @@ from .reference_training_materialization_job import (
 from .stage_edit_feature_materializer import (
     FEATURE_MATERIALIZER_CONTRACT,
     FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+    STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+    StageEditCausalSensingBinding,
     StageEditFeatureSnapshot,
+    validate_production_causal_sensing_gate_payload,
 )
 from .stage_edit_feature_snapshot_job import (
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
@@ -76,7 +80,11 @@ PRODUCTION_FOLDS: Mapping[str, str] = {
     "heldout-blackhole": "IVE-BLACKHOLE",
 }
 REQUIRED_FEATURE_PROVENANCE_CONTRACTS = frozenset(
-    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS
+    (
+        *FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+        STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+        STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+    )
 )
 PRODUCTION_RECENT_HISTORY_MASK_CONTRACT: Mapping[str, Any] = (
     stage_edit_recent_history_mask_contract(DEFAULT_STAGE_EDIT_SCHEMA)
@@ -435,6 +443,45 @@ def _validate_feature_manifest(
     input_policy = _mapping(payload.get("input_policy"), "feature input policy")
     if dict(input_policy) != dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY):
         raise ProductionFoldPreflightError(f"{song_id} feature leakage policy mismatch")
+    raw_binding = _mapping(
+        payload.get("causal_sensing_binding"),
+        "feature causal-sensing binding",
+    )
+    raw_sensing_gate = _mapping(
+        payload.get("production_causal_sensing_gate"),
+        "feature production causal-sensing gate",
+    )
+    try:
+        causal_sensing_binding = StageEditCausalSensingBinding.from_dict(raw_binding)
+        expected_sensing_gate = validate_production_causal_sensing_gate_payload(
+            raw_sensing_gate,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProductionFoldPreflightError(
+            f"{song_id} production causal-sensing binding is incomplete: {exc}"
+        ) from exc
+    if (
+        causal_sensing_binding.shooting_grammar_content_sha256
+        != expected_sensing_gate["shooting_grammar_content_sha256"]
+        or causal_sensing_binding.member_state_graph_content_sha256
+        != expected_sensing_gate["member_state_graph_content_sha256"]
+        or causal_sensing_binding.ive_performer_state_content_sha256
+        != expected_sensing_gate["ive_performer_state_content_sha256"]
+        or causal_sensing_binding.target_member
+        != expected_sensing_gate["target_member"]
+    ):
+        raise ProductionFoldPreflightError(
+            f"{song_id} production causal-sensing gate/binding differs"
+        )
+    if (
+        expected_sensing_gate["edit_mode"] != "group"
+        or expected_sensing_gate["target_member"] is not None
+        or expected_sensing_gate["member_feature_mode"] != "group_no_target"
+    ):
+        raise ProductionFoldPreflightError(
+            f"{song_id} production group fold requires group_no_target sensing"
+        )
     provenance = _mapping(payload.get("feature_provenance"), "feature provenance")
     contracts = set(_array(provenance.get("contracts"), "feature contracts"))
     if (
@@ -540,7 +587,25 @@ def _validate_feature_manifest(
         )
         if snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
             raise ProductionFoldPreflightError(
-                f"{song_id}:{reference_id} snapshot schema is not v3"
+                f"{song_id}:{reference_id} snapshot schema is not current"
+            )
+        try:
+            snapshot_gate = snapshot.require_production_causal_sensing(
+                edit_mode=expected_sensing_gate["edit_mode"],
+                target_member=expected_sensing_gate["target_member"],
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProductionFoldPreflightError(
+                f"{song_id}:{reference_id} production causal sensing is "
+                f"invalid: {exc}"
+            ) from exc
+        if (
+            snapshot_gate != expected_sensing_gate
+            or snapshot.causal_sensing_binding.to_dict() != dict(raw_binding)
+        ):
+            raise ProductionFoldPreflightError(
+                f"{song_id}:{reference_id} causal-sensing manifest binding differs"
             )
         if snapshot.snapshot_sha256 != item.get("snapshot_sha256"):
             raise ProductionFoldPreflightError(

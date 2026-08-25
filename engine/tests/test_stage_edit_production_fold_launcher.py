@@ -75,11 +75,17 @@ def _write_plan(root: Path, checkpoint_root: Path) -> Path:
 
 
 class StageEditProductionFoldLauncherTests(unittest.TestCase):
-    def test_production_feature_contract_is_exact_current_v3(self) -> None:
-        self.assertEqual(FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION, 3)
+    def test_production_feature_contract_is_exact_current_v4(self) -> None:
+        self.assertEqual(FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION, 4)
         self.assertEqual(
             launcher.REQUIRED_FEATURE_PROVENANCE_CONTRACTS,
-            frozenset(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS),
+            frozenset(
+                (
+                    *FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+                    launcher.STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+                    launcher.STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+                )
+            ),
         )
         self.assertNotIn(
             "synchronized_source_causal_stage_edit_feature_snapshot_v2",

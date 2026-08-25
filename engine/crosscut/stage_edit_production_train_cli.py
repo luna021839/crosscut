@@ -84,7 +84,12 @@ def _song_map(values: Sequence[str]) -> dict[str, str]:
     return output
 
 
-def _snapshot_map(values: Sequence[str]) -> dict[str, StageEditFeatureSnapshot]:
+def _snapshot_map(
+    values: Sequence[str],
+    *,
+    edit_mode: object = "group",
+    target_member: object | None = None,
+) -> dict[str, StageEditFeatureSnapshot]:
     output: dict[str, StageEditFeatureSnapshot] = {}
     for value in values:
         reference, separator, raw_path = value.partition("=")
@@ -100,10 +105,16 @@ def _snapshot_map(values: Sequence[str]) -> dict[str, StageEditFeatureSnapshot]:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError(f"feature snapshot root must be an object: {path}")
-        output[reference] = StageEditFeatureSnapshot.from_dict(
+        snapshot = StageEditFeatureSnapshot.from_dict(
             payload,
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
         )
+        snapshot.require_production_causal_sensing(
+            edit_mode=edit_mode,
+            target_member=target_member,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+        output[reference] = snapshot
     return output
 
 
@@ -228,6 +239,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="REFERENCE_ID=PATH",
     )
+    parser.add_argument("--edit-mode", choices=("group", "member"), default="group")
+    parser.add_argument("--target-member")
     parser.add_argument(
         "--dynamic-crop-artifact",
         action="append",
@@ -580,11 +593,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.checkpoint_dir = checkpoint_directory
     corpus = load_reference_training_corpus(
         args.input,
-        feature_snapshot_by_reference=_snapshot_map(args.feature_snapshot),
+        feature_snapshot_by_reference=_snapshot_map(
+            args.feature_snapshot,
+            edit_mode=args.edit_mode,
+            target_member=args.target_member,
+        ),
         song_id_by_reference=_song_map(args.song_id),
         negative_samples_per_hold=args.negative_samples_per_hold,
         boundary_guard_seconds=args.boundary_guard_seconds,
         max_sources=args.max_sources,
+        production_edit_mode=args.edit_mode,
+        production_target_member=args.target_member,
     )
     if args.adapted_manifest_path is not None:
         corpus.write_manifest(args.adapted_manifest_path)

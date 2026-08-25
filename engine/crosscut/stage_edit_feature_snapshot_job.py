@@ -436,7 +436,11 @@ def _source_observations(
             # its immediate follower.  Keep candidate availability identical
             # to that media contract: a catalog's final native frame is not a
             # usable decision cell even though the current frame alone exists.
-            if index < 0 or index + 1 >= source.declared_frame_count:
+            if (
+                source_time < 0.0
+                or index < 0
+                or index + 1 >= source.declared_frame_count
+            ):
                 index_by_time[timestamp] = None
                 continue
             index_by_time[timestamp] = index
