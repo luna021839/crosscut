@@ -27,13 +27,17 @@ import hashlib
 import hmac
 import json
 import math
-import os
 from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
-import uuid
 
+from .causal_artifact_io import (
+    CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES,
+    load_bounded_json_artifact,
+    publish_json_content_addressed,
+    streaming_canonical_json_identity,
+)
 from .ive import IVEMember
 
 
@@ -44,7 +48,8 @@ OBSERVATION_BASIS = (
 )
 _CONTENT_HASH_BASIS = "sha256_canonical_json_with_content_sha256_null_v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_MAXIMUM_ARTIFACT_BYTES = 32 * 1024 * 1024
+MEMBER_STATE_ARTIFACT_MAXIMUM_BYTES = CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES
+_MAXIMUM_ARTIFACT_BYTES = MEMBER_STATE_ARTIFACT_MAXIMUM_BYTES
 _MEMBERS = tuple(IVEMember)
 _FORBIDDEN_PERSISTED_KEY_PARTS = (
     "raw_frame",
@@ -143,7 +148,12 @@ def _reject_json_constant(value: str) -> object:
 def _content_sha256(value: Mapping[str, Any]) -> str:
     normalized = dict(value)
     normalized["content_sha256"] = None
-    return hashlib.sha256(_canonical_json_bytes(normalized)).hexdigest()
+    digest, _size = streaming_canonical_json_identity(
+        normalized,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=MemberStateArtifactError,
+    )
+    return digest
 
 
 def _strict_mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -2035,7 +2045,7 @@ class MemberStateGraphArtifact:
 def _artifact_payload(
     graph: MemberStateGraph,
     provenance: MemberStateArtifactProvenance,
-) -> tuple[dict[str, Any], str, bytes]:
+) -> tuple[dict[str, Any], str]:
     provenance.validate_for_graph(graph)
     payload: dict[str, Any] = {
         "contract": MEMBER_STATE_GRAPH_CONTRACT,
@@ -2054,10 +2064,14 @@ def _artifact_payload(
     _reject_forbidden_persisted_keys(payload)
     digest = _content_sha256(payload)
     payload["content_sha256"] = digest
-    encoded = _canonical_json_bytes(payload)
-    if not 1 <= len(encoded) <= _MAXIMUM_ARTIFACT_BYTES:
-        raise MemberStateArtifactError("member-state artifact size is invalid")
-    return (payload, digest, encoded)
+    # Measure the final schema too: replacing JSON null with a digest is larger
+    # than the unsigned content-hash form.
+    streaming_canonical_json_identity(
+        payload,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=MemberStateArtifactError,
+    )
+    return (payload, digest)
 
 
 def _safe_directory(parent: Path, name: str) -> Path:
@@ -2083,7 +2097,7 @@ def write_member_state_graph_artifact(
         raise MemberStateArtifactError(
             "provenance must be MemberStateArtifactProvenance"
         )
-    _payload, digest, encoded = _artifact_payload(graph, provenance)
+    payload, digest = _artifact_payload(graph, provenance)
     root = Path(artifact_directory).expanduser()
     if root.is_symlink():
         raise MemberStateArtifactError("artifact root cannot be a symbolic link")
@@ -2093,50 +2107,21 @@ def write_member_state_graph_artifact(
     contract_directory = _safe_directory(root, MEMBER_STATE_GRAPH_CONTRACT)
     shard = _safe_directory(contract_directory, digest[:2])
     path = shard / f"{digest}.json"
-    if path.is_symlink():
-        raise MemberStateArtifactError("artifact path cannot be a symbolic link")
-    if path.exists():
-        try:
-            existing = path.read_bytes()
-        except OSError as exc:
-            raise MemberStateArtifactError("cannot read existing artifact") from exc
-        if not hmac.compare_digest(existing, encoded):
-            raise MemberStateArtifactError(
-                "content-addressed artifact path already contains different bytes"
-            )
-        return MemberStateGraphArtifact(path, digest, graph, provenance)
-
-    temporary = shard / f".{digest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with temporary.open("xb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.chmod(0o444)
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            existing = path.read_bytes()
-            if not hmac.compare_digest(existing, encoded):
-                raise MemberStateArtifactError(
-                    "concurrent artifact writer published different bytes"
-                )
-        directory_fd = os.open(shard, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except (OSError, MemberStateArtifactError) as exc:
-        if isinstance(exc, MemberStateArtifactError):
-            raise
-        raise MemberStateArtifactError("failed to publish member-state artifact") from exc
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+    publish_json_content_addressed(
+        path,
+        payload,
+        content_sha256=digest,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=MemberStateArtifactError,
+    )
+    verified = load_member_state_graph_artifact(
+        path,
+        expected_content_sha256=digest,
+    )
+    if verified.graph != graph or verified.provenance != provenance:
+        raise MemberStateArtifactError(
+            "published member-state artifact verification failed"
+        )
     return MemberStateGraphArtifact(path, digest, graph, provenance)
 
 
@@ -2148,22 +2133,13 @@ def load_member_state_graph_artifact(
     """Load and semantically validate a content-addressed graph artifact."""
 
     artifact_path = Path(path).expanduser()
-    if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise MemberStateArtifactError("artifact must be a non-symlink regular file")
-    try:
-        size = artifact_path.stat().st_size
-        if not 1 <= size <= _MAXIMUM_ARTIFACT_BYTES:
-            raise MemberStateArtifactError("artifact size is invalid")
-        encoded = artifact_path.read_bytes()
-        payload = json.loads(
-            encoded.decode("utf-8"),
-            object_pairs_hook=_strict_json_object,
-            parse_constant=_reject_json_constant,
-        )
-    except MemberStateArtifactError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise MemberStateArtifactError("cannot decode member-state artifact") from exc
+    payload = load_bounded_json_artifact(
+        artifact_path,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=MemberStateArtifactError,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
     mapping = _strict_mapping(payload, "member-state artifact")
     _strict_keys(
         mapping,
@@ -2234,6 +2210,7 @@ __all__ = [
     "CausalMemberObservation",
     "CorroboratedIdentityEvidence",
     "IdentityEvidenceKind",
+    "MEMBER_STATE_ARTIFACT_MAXIMUM_BYTES",
     "MEMBER_STATE_GRAPH_CONTRACT",
     "MEMBER_STATE_GRAPH_SCHEMA_VERSION",
     "MemberProbabilityMass",

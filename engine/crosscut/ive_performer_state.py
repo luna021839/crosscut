@@ -26,17 +26,19 @@ nor serialized.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import hmac
 import json
 import math
-import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
+from .causal_artifact_io import (
+    CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES,
+    load_bounded_json_artifact,
+    publish_json_content_addressed,
+    streaming_canonical_json_identity,
+)
 from .causal_shooting_grammar import CausalShootingGrammarRecord
 from .ive import IVEMember
 from .member_state_graph import (
@@ -91,7 +93,10 @@ MAX_ACTIVE_PERFORMER_KNOWN_MASS = 0.95
 _MEMBERS = tuple(IVEMember)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PROVENANCE_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
-_MAXIMUM_ARTIFACT_BYTES = 32 * 1024 * 1024
+IVE_PERFORMER_STATE_ARTIFACT_MAXIMUM_BYTES = (
+    CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES
+)
+_MAXIMUM_ARTIFACT_BYTES = IVE_PERFORMER_STATE_ARTIFACT_MAXIMUM_BYTES
 _EPSILON = 1e-15
 _FORBIDDEN_PERSISTED_KEY_PARTS = (
     "raw_frame",
@@ -134,7 +139,12 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 
 def _canonical_sha256(value: object) -> str:
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+    digest, _size = streaming_canonical_json_identity(
+        value,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=IVEPerformerStateArtifactError,
+    )
+    return digest
 
 
 def _finite(value: object, name: str) -> float:
@@ -1616,8 +1626,9 @@ class IVEPerformerStateArtifact:
             "record_count"
         ] != len(records):
             raise IVEPerformerStateArtifactError("artifact counts disagree")
-        if _canonical_json_bytes(artifact.to_dict()) != _canonical_json_bytes(
-            dict(payload)
+        if not hmac.compare_digest(
+            _canonical_sha256(artifact.to_dict()),
+            _canonical_sha256(dict(payload)),
         ):
             raise IVEPerformerStateArtifactError(
                 "artifact serialized derived values disagree"
@@ -1673,54 +1684,14 @@ def write_ive_performer_state_artifact(
     contract_directory = _safe_directory(root, IVE_PERFORMER_STATE_CONTRACT)
     shard = _safe_directory(contract_directory, artifact.content_sha256[:2])
     destination = shard / f"{artifact.content_sha256}.json"
-    encoded = _canonical_json_bytes(artifact.to_dict())
-    if not 1 <= len(encoded) <= _MAXIMUM_ARTIFACT_BYTES:
-        raise IVEPerformerStateArtifactError("artifact size is invalid")
-    if destination.is_symlink():
-        raise IVEPerformerStateArtifactError(
-            "artifact destination cannot be a symbolic link"
-        )
-    if destination.exists():
-        existing = destination.read_bytes()
-        if not hmac.compare_digest(existing, encoded):
-            raise IVEPerformerStateArtifactError(
-                "content-addressed destination contains different bytes"
-            )
-        return destination
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{artifact.content_sha256}.",
-        suffix=".tmp",
-        dir=shard,
+    payload = artifact.to_dict()
+    publish_json_content_addressed(
+        destination,
+        payload,
+        content_sha256=artifact.content_sha256,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=IVEPerformerStateArtifactError,
     )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.chmod(0o444)
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            existing = destination.read_bytes()
-            if not hmac.compare_digest(existing, encoded):
-                raise IVEPerformerStateArtifactError(
-                    "concurrent immutable artifact differs"
-                )
-        directory_fd = os.open(shard, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except IVEPerformerStateArtifactError:
-        raise
-    except OSError as exc:
-        raise IVEPerformerStateArtifactError(
-            "failed to publish performer-state artifact"
-        ) from exc
-    finally:
-        temporary.unlink(missing_ok=True)
     verified = load_ive_performer_state_artifact(
         destination,
         expected_content_sha256=artifact.content_sha256,
@@ -1743,47 +1714,13 @@ def load_ive_performer_state_artifact(
     """Load, verify, and optionally reject replay against different inputs."""
 
     requested = Path(path).expanduser()
-    if requested.is_symlink():
-        raise IVEPerformerStateArtifactError(
-            "content-addressed artifact path cannot be a symlink"
-        )
-    try:
-        before = requested.stat()
-    except OSError as exc:
-        raise IVEPerformerStateArtifactError("artifact path is not readable") from exc
-    if not stat.S_ISREG(before.st_mode):
-        raise IVEPerformerStateArtifactError("artifact path is not a regular file")
-    if not 1 <= before.st_size <= _MAXIMUM_ARTIFACT_BYTES:
-        raise IVEPerformerStateArtifactError("artifact size is invalid")
-    try:
-        encoded = requested.read_bytes()
-        after = requested.stat()
-    except OSError as exc:
-        raise IVEPerformerStateArtifactError("cannot read artifact") from exc
-    stable_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
+    payload = load_bounded_json_artifact(
+        requested,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=IVEPerformerStateArtifactError,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_nonfinite_json,
     )
-    stable_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    )
-    if stable_before != stable_after or len(encoded) != before.st_size:
-        raise IVEPerformerStateArtifactError("artifact changed while being read")
-    try:
-        payload = json.loads(
-            encoded.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_nonfinite_json,
-        )
-    except IVEPerformerStateArtifactError:
-        raise
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise IVEPerformerStateArtifactError("cannot decode artifact JSON") from exc
     artifact = IVEPerformerStateArtifact.from_dict(payload)
     if requested.name != f"{artifact.content_sha256}.json":
         raise IVEPerformerStateArtifactError(
@@ -1831,6 +1768,7 @@ def load_ive_performer_state_artifact(
 __all__ = [
     "CausalPerformerEvidence",
     "IVE_PERFORMER_STATE_ANALYSIS_BASIS",
+    "IVE_PERFORMER_STATE_ARTIFACT_MAXIMUM_BYTES",
     "IVE_PERFORMER_STATE_ARTIFACT_KIND",
     "IVE_PERFORMER_STATE_CONTRACT",
     "IVE_PERFORMER_STATE_CONTENT_HASH_BASIS",

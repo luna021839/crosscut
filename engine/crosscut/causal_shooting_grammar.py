@@ -15,15 +15,20 @@ integration without coupling this artifact to the current Transformer version.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
+import hmac
 import json
 import math
 from numbers import Integral, Real
-import os
 from pathlib import Path
 import re
-import tempfile
 from typing import Any, Mapping, Sequence
+
+from .causal_artifact_io import (
+    CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES,
+    load_bounded_json_artifact,
+    publish_json_content_addressed,
+    streaming_canonical_json_identity,
+)
 
 
 SHOOTING_GRAMMAR_SCHEMA_VERSION = 1
@@ -68,6 +73,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PROVENANCE_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PROBABILITY_SUM_TOLERANCE = 1e-6
 _STABLE_DECIMALS = 12
+SHOOTING_GRAMMAR_ARTIFACT_MAXIMUM_BYTES = (
+    CAUSAL_SCALAR_ARTIFACT_MAXIMUM_BYTES
+)
+_MAXIMUM_ARTIFACT_BYTES = SHOOTING_GRAMMAR_ARTIFACT_MAXIMUM_BYTES
 _SHOT_STATES = frozenset({"closeup", "medium", "wide", "unknown", "missing"})
 _ZOOM_STATES = frozenset({"in", "out", "static", "unknown", "missing"})
 _PAN_DIRECTIONS = frozenset({"left", "right", "static", "missing"})
@@ -100,7 +109,12 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 
 def _canonical_sha256(value: object) -> str:
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+    digest, _size = streaming_canonical_json_identity(
+        value,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=ValueError,
+    )
+    return digest
 
 
 def _finite(value: object, name: str) -> float:
@@ -1392,8 +1406,9 @@ class CausalShootingGrammarArtifact:
             artifact_content_sha256=digest,
             schema_version=raw_schema_version,
         )
-        if _canonical_json_bytes(artifact.to_dict()) != _canonical_json_bytes(
-            dict(payload)
+        if not hmac.compare_digest(
+            _canonical_sha256(artifact.to_dict()),
+            _canonical_sha256(dict(payload)),
         ):
             raise ValueError("shooting-grammar artifact derived fields disagree")
         return artifact
@@ -1405,56 +1420,29 @@ class CausalShootingGrammarArtifact:
         existing file is rejected and never replaced.
         """
 
-        directory = Path(root).expanduser().resolve()
+        directory = Path(root).expanduser()
+        if directory.is_symlink():
+            raise ValueError("shooting-grammar artifact root cannot be a symlink")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.is_dir():
+            raise ValueError("shooting-grammar artifact root must be a directory")
         shard = directory / self.artifact_content_sha256[:2]
+        if shard.is_symlink():
+            raise ValueError("shooting-grammar artifact shard cannot be a symlink")
         shard.mkdir(parents=True, exist_ok=True)
+        if not shard.is_dir():
+            raise ValueError("shooting-grammar artifact shard is not a directory")
         destination = shard / f"{self.artifact_content_sha256}.json"
-        expected_bytes = (
-            json.dumps(
-                self.to_dict(),
-                allow_nan=False,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode("utf-8")
-        if destination.exists() or destination.is_symlink():
-            existing = self.load_content_addressed(
-                destination,
-                expected_content_sha256=self.artifact_content_sha256,
-            )
-            if existing.to_dict() != self.to_dict():
-                raise FileExistsError(
-                    f"immutable shooting-grammar artifact differs: {destination}"
-                )
-            return destination
-
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self.artifact_content_sha256}.",
-            suffix=".tmp",
-            dir=shard,
+        payload = self.to_dict()
+        publish_json_content_addressed(
+            destination,
+            payload,
+            content_sha256=self.artifact_content_sha256,
+            maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+            error_type=ValueError,
+            indent=2,
+            trailing_newline=True,
         )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(expected_bytes)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(temporary, destination)
-            except FileExistsError:
-                existing = self.load_content_addressed(
-                    destination,
-                    expected_content_sha256=self.artifact_content_sha256,
-                )
-                if existing.to_dict() != self.to_dict():
-                    raise FileExistsError(
-                        "raced immutable shooting-grammar artifact differs: "
-                        f"{destination}"
-                    )
-        finally:
-            temporary.unlink(missing_ok=True)
         verified = self.load_content_addressed(
             destination,
             expected_content_sha256=self.artifact_content_sha256,
@@ -1510,8 +1498,10 @@ def _reject_duplicate_json_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, A
 
 
 def _load_strict_json(path: Path) -> Any:
-    return json.loads(
-        path.read_text(encoding="utf-8"),
+    return load_bounded_json_artifact(
+        path,
+        maximum_bytes=_MAXIMUM_ARTIFACT_BYTES,
+        error_type=ValueError,
         object_pairs_hook=_reject_duplicate_json_keys,
         parse_constant=_reject_json_constant,
     )
@@ -1557,6 +1547,7 @@ __all__ = [
     "MAX_DETECTED_PERSON_COUNT",
     "MAX_FORMATION_PERSON_COUNT",
     "SHOOTING_GRAMMAR_ANALYSIS_BASIS",
+    "SHOOTING_GRAMMAR_ARTIFACT_MAXIMUM_BYTES",
     "SHOOTING_GRAMMAR_ARTIFACT_KIND",
     "SHOOTING_GRAMMAR_CONTENT_HASH_BASIS",
     "SHOOTING_GRAMMAR_PRODUCER",
