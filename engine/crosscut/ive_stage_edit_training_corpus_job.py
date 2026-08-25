@@ -115,6 +115,9 @@ IVE_STAGE_EDIT_NATIVE_CUT_ANALYSIS_BASIS = (
 )
 IVE_STAGE_EDIT_NATIVE_CUT_SAMPLE_EVERY_SOURCE_FRAMES = 2
 IVE_STAGE_EDIT_MAXIMUM_SOURCE_TIME_CELLS = 50_000
+IVE_STAGE_EDIT_ACQUISITION_AUTHORITY_ALIAS_CONTRACT = (
+    "verified_byte_identical_acquisition_authority_alias_v1"
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SOURCE_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._:-]{0,159}")
@@ -252,6 +255,14 @@ class _DerivedInputs:
     source_catalog_sha256: str
     total_media_bytes: int
     total_duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _StableJsonObservation:
+    path: Path
+    encoded: bytes
+    payload: Mapping[str, Any]
+    file_identity: tuple[int, int, int, int, int]
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -446,6 +457,164 @@ def _stable_json(
     if not isinstance(payload, Mapping):
         raise IVEStageEditTrainingCorpusError(f"{name} root must be an object")
     return path, encoded, payload
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _stable_json_observation(
+    value: Path | str,
+    *,
+    maximum_bytes: int,
+    name: str,
+) -> _StableJsonObservation:
+    """Read one canonical absolute JSON path with an outer stat fence.
+
+    ``_stable_json`` already rejects symlinks and changes during its descriptor
+    read.  The outer identity is retained so a multi-path authority check can
+    also prove that no participant changed between its first and replay pass.
+    """
+
+    lexical_path = _absolute_lexical_path(value, name)
+    try:
+        outer_before = lexical_path.lstat()
+        if lexical_path.is_symlink() or not stat.S_ISREG(outer_before.st_mode):
+            raise IVEStageEditTrainingCorpusError(
+                f"{name} must be a non-symlink regular file"
+            )
+        path, encoded, payload = _stable_json(
+            lexical_path,
+            maximum_bytes=maximum_bytes,
+            name=name,
+        )
+        outer_after = lexical_path.lstat()
+    except IVEStageEditTrainingCorpusError:
+        raise
+    except OSError as exc:
+        raise IVEStageEditTrainingCorpusError(
+            f"cannot observe {name}: {lexical_path}: {exc}"
+        ) from exc
+    if (
+        lexical_path != path
+        or _stat_identity(outer_before) != _stat_identity(outer_after)
+        or lexical_path.is_symlink()
+        or not stat.S_ISREG(outer_after.st_mode)
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            f"{name} changed during stable observation"
+        )
+    return _StableJsonObservation(
+        path=path,
+        encoded=encoded,
+        payload=payload,
+        file_identity=_stat_identity(outer_after),
+    )
+
+
+def _verify_byte_identical_acquisition_authority_alias(
+    acquisition_pointers: Sequence[Mapping[str, Any]],
+) -> tuple[_StableJsonObservation, Mapping[str, Any]]:
+    """Verify exactly two immutable paths carrying one acquisition authority."""
+
+    if len(acquisition_pointers) < 2:
+        raise IVEStageEditTrainingCorpusError(
+            "acquisition authority alias requires multiple references"
+        )
+    by_path: dict[str, Mapping[str, Any]] = {}
+    for pointer in acquisition_pointers:
+        raw_path = pointer.get("path")
+        if not isinstance(raw_path, str):
+            raise IVEStageEditTrainingCorpusError(
+                "acquisition authority alias path is invalid"
+            )
+        previous = by_path.setdefault(raw_path, pointer)
+        if dict(previous) != dict(pointer):
+            raise IVEStageEditTrainingCorpusError(
+                "acquisition authority alias path has conflicting identities"
+            )
+    if len(by_path) != 2:
+        raise IVEStageEditTrainingCorpusError(
+            "acquisition authority alias requires exactly two distinct paths"
+        )
+    declared_hashes = {
+        _sha256(pointer.get("file_sha256"), "acquisition alias file SHA-256")
+        for pointer in by_path.values()
+    }
+    if len(declared_hashes) != 1:
+        raise IVEStageEditTrainingCorpusError(
+            "acquisition authority aliases declare different file SHA-256"
+        )
+    declared_sha256 = next(iter(declared_hashes))
+    ordered_paths = tuple(sorted(by_path))
+
+    first_pass = tuple(
+        _stable_json_observation(
+            path,
+            maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
+            name=f"acquisition authority alias {index}",
+        )
+        for index, path in enumerate(ordered_paths)
+    )
+    replay_pass = tuple(
+        _stable_json_observation(
+            path,
+            maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
+            name=f"acquisition authority alias replay {index}",
+        )
+        for index, path in enumerate(ordered_paths)
+    )
+    for initial, replay in zip(first_pass, replay_pass, strict=True):
+        if (
+            initial.path != replay.path
+            or initial.file_identity != replay.file_identity
+            or initial.encoded != replay.encoded
+            or dict(initial.payload) != dict(replay.payload)
+        ):
+            raise IVEStageEditTrainingCorpusError(
+                "acquisition authority alias changed between verification passes"
+            )
+    observed_hashes = {
+        hashlib.sha256(item.encoded).hexdigest() for item in first_pass
+    }
+    canonical_payload_hashes = {
+        _canonical_sha256(item.payload) for item in first_pass
+    }
+    if (
+        observed_hashes != {declared_sha256}
+        or len(canonical_payload_hashes) != 1
+        or any(item.encoded != first_pass[0].encoded for item in first_pass[1:])
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "acquisition authority aliases are not byte-identical JSON"
+        )
+    canonical_payload_sha256 = next(iter(canonical_payload_hashes))
+    provenance = {
+        "contract": IVE_STAGE_EDIT_ACQUISITION_AUTHORITY_ALIAS_CONTRACT,
+        "authority_count": 2,
+        "authorities": [
+            {
+                "path": str(item.path),
+                "file_sha256": declared_sha256,
+                "canonical_payload_sha256": canonical_payload_sha256,
+            }
+            for item in first_pass
+        ],
+        "verification": {
+            "absolute_regular_non_symlink_paths": True,
+            "stable_pre_post_stat_replay": True,
+            "declared_and_observed_file_sha256_equal": True,
+            "byte_identical": True,
+            "canonical_payload_identical": True,
+        },
+    }
+    return first_pass[0], provenance
 
 
 def _stable_media_sha256(value: Path | str) -> tuple[Path, str, os.stat_result]:
@@ -940,10 +1109,9 @@ def _derive_inputs(
             "five references do not share one exact source catalog"
         )
     acquisition_pointers = tuple(value[0] for value in pointers)
-    if len({_canonical_sha256(value) for value in acquisition_pointers}) != 1:
-        raise IVEStageEditTrainingCorpusError(
-            "five references do not share one acquisition authority"
-        )
+    acquisition_alias_required = len(
+        {_canonical_sha256(value) for value in acquisition_pointers}
+    ) != 1
     alignment_pointers = tuple(
         value[1] for value in pointers if value[1] is not None
     )
@@ -953,20 +1121,35 @@ def _derive_inputs(
         raise IVEStageEditTrainingCorpusError(
             "reference corpus lacks one unambiguous alignment authority"
         )
-    acquisition_pointer = acquisition_pointers[0]
     alignment_pointer = alignment_pointers[0]
+    acquisition_paths = tuple(
+        sorted({str(pointer["path"]) for pointer in acquisition_pointers})
+    )
     reject_attitude_before_ive_causal_sensing_access(
         song=song_id,
-        source_paths=(
+        source_paths=(*acquisition_paths, alignment_pointer["path"]),
+    )
+    acquisition_alias_provenance: Mapping[str, Any] | None = None
+    if acquisition_alias_required:
+        acquisition_observation, acquisition_alias_provenance = (
+            _verify_byte_identical_acquisition_authority_alias(
+                acquisition_pointers
+            )
+        )
+        acquisition_path = acquisition_observation.path
+        acquisition_bytes = acquisition_observation.encoded
+        acquisition = acquisition_observation.payload
+        acquisition_pointer: Mapping[str, Any] = {
+            "path": str(acquisition_path),
+            "file_sha256": hashlib.sha256(acquisition_bytes).hexdigest(),
+        }
+    else:
+        acquisition_pointer = acquisition_pointers[0]
+        acquisition_path, acquisition_bytes, acquisition = _stable_json(
             acquisition_pointer["path"],
-            alignment_pointer["path"],
-        ),
-    )
-    acquisition_path, acquisition_bytes, acquisition = _stable_json(
-        acquisition_pointer["path"],
-        maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
-        name="training source acquisition manifest",
-    )
+            maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
+            name="training source acquisition manifest",
+        )
     alignment_path, alignment_bytes, alignment = _stable_json(
         alignment_pointer["path"],
         maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
@@ -1290,6 +1473,24 @@ def _derive_inputs(
             "source_catalog_sha256": catalog_hashes[0],
         },
     }
+    if acquisition_alias_provenance is not None:
+        acquisition_alias_record = dict(acquisition_alias_provenance)
+        acquisition_alias_record.update(
+            {
+                "source_catalog_sha256": catalog_hashes[0],
+                "expected_source_count": expected_source_count,
+                "same_ten_source_acquisition_catalog_identity": True,
+                "acquisition_catalog_identity_sha256": _canonical_sha256(
+                    {
+                        "source_catalog_sha256": catalog_hashes[0],
+                        "acquisition_manifest": acquisition,
+                    }
+                ),
+            }
+        )
+        upstream_evidence["acquisition_authority_alias"] = (
+            acquisition_alias_record
+        )
     return _DerivedInputs(
         supervisions=supervision_records,
         upstream_evidence=upstream_evidence,
@@ -1610,6 +1811,15 @@ def preflight_ive_stage_edit_training_corpus_request(
             for value in upstream.values()
             if isinstance(value, Mapping)
         )
+        acquisition_alias = upstream.get("acquisition_authority_alias")
+        if isinstance(acquisition_alias, Mapping):
+            raw_authorities = acquisition_alias.get("authorities")
+            if isinstance(raw_authorities, list):
+                embedded_paths.extend(
+                    item.get("path")
+                    for item in raw_authorities
+                    if isinstance(item, Mapping)
+                )
     gallery = request.get("gallery_installation")
     if isinstance(gallery, Mapping):
         embedded_paths.extend(
