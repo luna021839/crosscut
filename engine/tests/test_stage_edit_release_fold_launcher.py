@@ -262,6 +262,28 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 ):
                     launcher._strict_development_plan(stale)
 
+    def test_synthetic_or_fake_opt_in_fails_development_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            with patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root):
+                current = _create_development_plan(root, root / "checkpoint")
+                payload = json.loads(current.read_text(encoding="utf-8"))
+                payload.pop("plan_sha256")
+                payload["release_contract"][
+                    "synthetic_or_fake_training_data_allowed"
+                ] = True
+                forged = launcher._write_content_addressed(
+                    payload,
+                    output_directory=root / "forged",
+                    prefix="stageedit-release-development-plan",
+                    hash_field="plan_sha256",
+                )
+                with self.assertRaisesRegex(
+                    launcher.ReleaseFoldPreflightError,
+                    "development release contract is not exact",
+                ):
+                    launcher.preflight_stage_edit_release_development(forged)
+
     def test_development_expands_four_songs_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
@@ -963,10 +985,22 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         BLIND_SONG, result.reference_ids_by_song
                     )
                     self.assertEqual([], blind_validations)
-                    self.assertEqual(
-                        0, launcher.launch_stage_edit_release_final(final)
+                    with self.assertRaisesRegex(
+                        launcher.ReleaseFoldPreflightError,
+                        "legacy/non-v3",
+                    ):
+                        launcher.launch_stage_edit_release_final(final)
+                    train.assert_not_called()
+                    blind_marker.write_text(
+                        json.dumps(
+                            launcher._blind_consumption_marker_payload(result)
+                        ),
+                        encoding="utf-8",
                     )
-                    consumed_args = train.call_args.args[0]
+                    consumed_args = launcher._preflight_consumed_stage_edit_release_final(
+                        final,
+                        consumption_marker=blind_marker,
+                    ).train_cli_args
 
             self.assertEqual([BLIND_SONG], blind_validations)
             self.assertTrue(blind_marker.is_file())
@@ -1050,7 +1084,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                         launcher.preflight_stage_edit_release_final(final)
                     validate_storage.assert_not_called()
 
-    def test_create_development_parser_requires_capacity_selection(self) -> None:
+    def test_create_development_parser_requires_v3_freeze_and_receipt(self) -> None:
         parser = launcher.build_parser()
         minimal = [
             "create-development",
@@ -1070,14 +1104,163 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
         parsed = parser.parse_args(
             [
                 *minimal,
-                "--capacity-selection",
-                "/tmp/dynamic-crop-v2-capacity-selection.json",
+                "--dynamic-crop-v3-release-freeze",
+                "/tmp/dynamic-crop-v3-release-freeze.json",
+                "--dynamic-crop-v3-final-fit-receipt",
+                "/tmp/dynamic-crop-v3-final-fit-receipt.json",
             ]
         )
         self.assertEqual(
-            Path("/tmp/dynamic-crop-v2-capacity-selection.json"),
-            parsed.capacity_selection,
+            Path("/tmp/dynamic-crop-v3-release-freeze.json"),
+            parsed.dynamic_crop_v3_release_freeze,
         )
+        self.assertEqual(
+            Path("/tmp/dynamic-crop-v3-final-fit-receipt.json"),
+            parsed.dynamic_crop_v3_final_fit_receipt,
+        )
+
+    def test_v3_development_plan_binds_exact_final_fit_manifest_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            manifests = _write_dummy_manifests(
+                root, launcher.DEVELOPMENT_SONG_IDS
+            )
+            records = launcher._song_records(
+                launcher.DEVELOPMENT_SONG_IDS,
+                materialization_manifests=manifests[0],
+                feature_manifests=manifests[1],
+                dynamic_crop_manifests=manifests[2],
+            )
+            tuples = launcher._v3_training_manifest_tuples_from_release_songs(
+                records
+            )
+            readiness = {
+                "binding_version": launcher.V3_RELEASE_READINESS_BINDING_VERSION,
+                "training_manifest_tuples": tuples,
+                "training_manifest_graph_sha256": launcher._canonical_sha256(
+                    tuples
+                ),
+            }
+            contract = {
+                "contract_version": launcher.MODEL_TRAINING_CONTRACT_V3_VERSION
+            }
+            with (
+                patch.object(launcher.legacy, "PRODUCTION_VOLUME_ROOT", root),
+                patch.object(
+                    launcher,
+                    "_load_verified_v3_release_readiness",
+                    return_value=(readiness, contract),
+                ),
+            ):
+                plan = launcher.create_stage_edit_release_development_plan(
+                    materialization_manifests=manifests[0],
+                    feature_manifests=manifests[1],
+                    dynamic_crop_manifests=manifests[2],
+                    checkpoint_directory=root / "checkpoint",
+                    output_directory=root / "plans",
+                    dynamic_crop_v3_release_freeze_path=root / "freeze.json",
+                    dynamic_crop_v3_final_fit_receipt_path=root / "receipt.json",
+                )
+                payload = json.loads(plan.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    launcher.RELEASE_PLAN_V3_SCHEMA_VERSION,
+                    payload["schema_version"],
+                )
+                mismatched = json.loads(json.dumps(readiness))
+                mismatched["training_manifest_tuples"][0][
+                    "feature_manifest"
+                ]["file_sha256"] = "0" * 64
+                with patch.object(
+                    launcher,
+                    "_load_verified_v3_release_readiness",
+                    return_value=(mismatched, contract),
+                ):
+                    with self.assertRaisesRegex(
+                        launcher.ReleaseFoldPreflightError,
+                        "manifest.*differ",
+                    ):
+                        launcher.create_stage_edit_release_development_plan(
+                            materialization_manifests=manifests[0],
+                            feature_manifests=manifests[1],
+                            dynamic_crop_manifests=manifests[2],
+                            checkpoint_directory=root / "checkpoint-2",
+                            output_directory=root / "plans-2",
+                            dynamic_crop_v3_release_freeze_path=(
+                                root / "freeze.json"
+                            ),
+                            dynamic_crop_v3_final_fit_receipt_path=(
+                                root / "receipt.json"
+                            ),
+                        )
+
+    def test_v3_release_cli_schedule_and_launch_authority_are_exact(self) -> None:
+        validated = {
+            "contract_version": launcher.MODEL_TRAINING_CONTRACT_V3_VERSION,
+            "model_config": {},
+            "base_loss_contract": {},
+            "dynamic_crop_loss_contract": {},
+            "v3_training_schedule": dict(launcher.V3_PROBE_TRAINING_SCHEDULE),
+        }
+        with patch.object(
+            launcher,
+            "_validate_model_training_contract",
+            return_value=validated,
+        ):
+            args = launcher._model_training_cli_args(validated)
+        self.assertEqual(1, args.count("--dynamic-crop-version"))
+        self.assertEqual(
+            "3", args[args.index("--dynamic-crop-version") + 1]
+        )
+        self.assertEqual(
+            "500", args[args.index("--source-pretrain-steps") + 1]
+        )
+        self.assertEqual(
+            "500",
+            args[
+                args.index("--dynamic-crop-v3-prior-pretrain-steps") + 1
+            ],
+        )
+        self.assertEqual(
+            "120",
+            args[args.index("--minimum-finetune-optimizer-steps") + 1],
+        )
+        readiness = {
+            "binding_version": launcher.V3_RELEASE_READINESS_BINDING_VERSION,
+            "dynamic_crop_version": 3,
+            "final_fit_checkpoint_usage": (
+                launcher.V3_FINAL_FIT_CHECKPOINT_USAGE
+            ),
+        }
+        with patch.object(
+            launcher,
+            "_verify_capacity_selection_binding",
+            return_value=(readiness, validated),
+        ):
+            launcher._require_dynamic_crop_v3_release_launch(
+                {"capacity_selection": readiness},
+                (
+                    "--dynamic-crop-version",
+                    "3",
+                    "--continuity-authority",
+                    launcher.HANDCRAFTED_CONTINUITY_AUTHORITY,
+                    "--authorize-production-activation",
+                ),
+                activation_authorized=True,
+            )
+            with self.assertRaisesRegex(
+                launcher.ReleaseFoldPreflightError,
+                "readiness-only",
+            ):
+                launcher._require_dynamic_crop_v3_release_launch(
+                    {"capacity_selection": readiness},
+                    (
+                        "--dynamic-crop-version",
+                        "3",
+                        "--init-checkpoint",
+                        "/tmp/final-fit",
+                    ),
+                    activation_authorized=False,
+                )
 
     def test_create_final_parser_requires_blind_id_and_montage_profile(self) -> None:
         parser = launcher.build_parser()
@@ -1210,6 +1393,13 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             marker = root / "blind-consumed.json"
+            v3_readiness = {
+                "binding_version": launcher.V3_RELEASE_READINESS_BINDING_VERSION,
+                "dynamic_crop_version": 3,
+                "final_fit_checkpoint_usage": (
+                    launcher.V3_FINAL_FIT_CHECKPOINT_USAGE
+                ),
+            }
             preflight = launcher.ReleaseFoldPreflight(
                 stage="final_blind",
                 plan_path=root / "plan.json",
@@ -1217,7 +1407,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 held_out_song_id=BLIND_SONG,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=root / "checkpoint",
-                capacity_selection={"selected_candidate_id": "a" * 64},
+                capacity_selection=v3_readiness,
                 blind_consumption_marker=marker,
                 held_out_manifest_inspection_deferred=True,
                 train_cli_args=(),
@@ -1233,7 +1423,13 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 capacity_selection=preflight.capacity_selection,
                 blind_consumption_marker=marker,
                 held_out_manifest_inspection_deferred=False,
-                train_cli_args=("--authorize-production-activation",),
+                train_cli_args=(
+                    "--dynamic-crop-version",
+                    "3",
+                    "--continuity-authority",
+                    launcher.HANDCRAFTED_CONTINUITY_AUTHORITY,
+                    "--authorize-production-activation",
+                ),
                 reference_ids_by_song={},
             )
             ordering = []
@@ -1255,6 +1451,26 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     launcher,
                     "preflight_stage_edit_release_final",
                     return_value=preflight,
+                ),
+                patch.object(
+                    launcher,
+                    "_strict_final_plan",
+                    return_value={
+                        "schema_version": launcher.FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION,
+                        "capacity_selection": v3_readiness,
+                    },
+                ),
+                patch.object(
+                    launcher,
+                    "_verify_capacity_selection_binding",
+                    return_value=(
+                        v3_readiness,
+                        {
+                            "contract_version": (
+                                launcher.MODEL_TRAINING_CONTRACT_V3_VERSION
+                            )
+                        },
+                    ),
                 ),
                 patch.object(
                     launcher,
@@ -1290,6 +1506,13 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
             marker = root / "blind-consumed.json"
+            v3_readiness = {
+                "binding_version": launcher.V3_RELEASE_READINESS_BINDING_VERSION,
+                "dynamic_crop_version": 3,
+                "final_fit_checkpoint_usage": (
+                    launcher.V3_FINAL_FIT_CHECKPOINT_USAGE
+                ),
+            }
             preflight = launcher.ReleaseFoldPreflight(
                 stage="final_blind",
                 plan_path=root / "plan.json",
@@ -1297,7 +1520,7 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                 held_out_song_id=BLIND_SONG,
                 training_song_ids=launcher.FINAL_TRAINING_SONG_IDS,
                 checkpoint_directory=root / "checkpoint",
-                capacity_selection={"selected_candidate_id": "b" * 64},
+                capacity_selection=v3_readiness,
                 blind_consumption_marker=marker,
                 held_out_manifest_inspection_deferred=True,
                 train_cli_args=(),
@@ -1316,6 +1539,26 @@ class StageEditReleaseFoldLauncherTests(unittest.TestCase):
                     launcher,
                     "preflight_stage_edit_release_final",
                     return_value=preflight,
+                ),
+                patch.object(
+                    launcher,
+                    "_strict_final_plan",
+                    return_value={
+                        "schema_version": launcher.FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION,
+                        "capacity_selection": v3_readiness,
+                    },
+                ),
+                patch.object(
+                    launcher,
+                    "_verify_capacity_selection_binding",
+                    return_value=(
+                        v3_readiness,
+                        {
+                            "contract_version": (
+                                launcher.MODEL_TRAINING_CONTRACT_V3_VERSION
+                            )
+                        },
+                    ),
                 ),
                 patch.object(
                     launcher,

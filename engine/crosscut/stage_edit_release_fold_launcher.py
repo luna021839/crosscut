@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
@@ -41,6 +41,24 @@ from .stage_edit_production_training import (
 )
 from .stage_edit_reference_adapter import load_reference_training_corpus
 from .stage_edit_dynamic_crop_head_v2 import DynamicCropV2LossContract
+from .stage_edit_dynamic_crop_head_v3 import (
+    DYNAMIC_CROP_V3_LOSS_CONTRACT,
+    DYNAMIC_CROP_V3_MODEL_CONTRACT,
+    DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+    DYNAMIC_CROP_V3_SCHEMA_VERSION,
+    DYNAMIC_CROP_V3_TARGET_CONTRACT,
+    DynamicCropHeadV3Config,
+    DynamicCropV3LossContract,
+)
+from .stage_edit_dynamic_crop_v3_capacity_smoke import (
+    V3_PROBE_TRAINING_SCHEDULE,
+)
+from .stage_edit_dynamic_crop_v3_final_release_launcher import (
+    DynamicCropV3FinalReleaseError,
+    load_dynamic_crop_v3_final_fit_plan,
+    load_dynamic_crop_v3_final_fit_receipt,
+    load_dynamic_crop_v3_release_freeze,
+)
 from .stage_edit_dynamic_crop_capacity_probe import (
     DynamicCropCapacityProbeError,
     load_dynamic_crop_capacity_selection,
@@ -59,17 +77,40 @@ from .stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
     StageEditTransitionAuthority,
 )
+from .stage_edit_continuity_authority import (
+    HANDCRAFTED_CONTINUITY_AUTHORITY,
+)
 
 
 RELEASE_PLAN_SCHEMA_VERSION = 4
+RELEASE_PLAN_V3_SCHEMA_VERSION = 5
 DEVELOPMENT_FREEZE_SCHEMA_VERSION = 5
+DEVELOPMENT_FREEZE_V3_SCHEMA_VERSION = 6
 FINAL_RELEASE_PLAN_SCHEMA_VERSION = 7
+FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION = 8
 DEVELOPMENT_PLAN_ANALYSIS_BASIS = "ive_stageedit_release_development_plan_v4"
+DEVELOPMENT_PLAN_V3_ANALYSIS_BASIS = (
+    "ive_stageedit_dynamic_crop_v3_release_development_plan_v5"
+)
 DEVELOPMENT_FREEZE_ANALYSIS_BASIS = "ive_stageedit_development_freeze_v5"
+DEVELOPMENT_FREEZE_V3_ANALYSIS_BASIS = (
+    "ive_stageedit_dynamic_crop_v3_development_freeze_v6"
+)
 FINAL_PLAN_ANALYSIS_BASIS = "ive_stageedit_generic_blind_release_plan_v7"
+FINAL_PLAN_V3_ANALYSIS_BASIS = (
+    "ive_stageedit_dynamic_crop_v3_generic_blind_release_plan_v8"
+)
 MODEL_TRAINING_CONTRACT_VERSION = 2
+MODEL_TRAINING_CONTRACT_V3_VERSION = 3
 STRUCTURED_HEAD_PREFLIGHT_CONTRACT_VERSION = 2
 CAPACITY_SELECTION_BINDING_VERSION = 1
+V3_RELEASE_READINESS_BINDING_VERSION = 2
+V3_RELEASE_READINESS_KIND = (
+    "dynamic_crop_v3_loso_freeze_and_inactive_final_fit_v1"
+)
+V3_FINAL_FIT_CHECKPOINT_USAGE = (
+    "readiness_only_no_optimizer_initialization_v1"
+)
 DEFERRED_BLIND_MANIFEST_CONTRACT = (
     "absolute_paths_only_until_blind_consumption_marker_v1"
 )
@@ -101,6 +142,37 @@ DEFAULT_RELEASE_TRAINING_CONFIG: Mapping[str, Any] = {
     "minimum_learning_rate_ratio": 0.10,
     "seed": 20260824,
     "device": "gpu",
+}
+
+DEFAULT_RELEASE_TRAINING_CONFIG_V3: Mapping[str, Any] = {
+    **dict(DEFAULT_RELEASE_TRAINING_CONFIG),
+    "epochs": V3_PROBE_TRAINING_SCHEDULE["requested_epochs"],
+    "patience": V3_PROBE_TRAINING_SCHEDULE["early_stopping_patience"],
+    "batch_size": V3_PROBE_TRAINING_SCHEDULE["batch_size"],
+    "learning_rate": V3_PROBE_TRAINING_SCHEDULE["learning_rate"],
+    "weight_decay": V3_PROBE_TRAINING_SCHEDULE["weight_decay"],
+    "gradient_clip_norm": V3_PROBE_TRAINING_SCHEDULE[
+        "gradient_clip_norm"
+    ],
+    "cut_pretrain_steps": V3_PROBE_TRAINING_SCHEDULE[
+        "cut_pretraining_steps"
+    ],
+    "cut_pretrain_learning_rate": V3_PROBE_TRAINING_SCHEDULE[
+        "cut_pretraining_peak_learning_rate"
+    ],
+    "cut_pretrain_window_length": V3_PROBE_TRAINING_SCHEDULE[
+        "cut_pretraining_window_length"
+    ],
+    "cut_pretrain_warmup_steps": V3_PROBE_TRAINING_SCHEDULE[
+        "cut_pretraining_warmup_steps"
+    ],
+    "finetune_warmup_steps": V3_PROBE_TRAINING_SCHEDULE[
+        "finetune_warmup_steps"
+    ],
+    "minimum_learning_rate_ratio": V3_PROBE_TRAINING_SCHEDULE[
+        "minimum_learning_rate_ratio"
+    ],
+    "seed": V3_PROBE_TRAINING_SCHEDULE["seed"],
 }
 
 ReleaseFoldPreflightError = legacy.ProductionFoldPreflightError
@@ -324,7 +396,7 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
     """Validate the immutable capacity and base-loss contract used by the CLI."""
 
     contract = dict(_mapping(value, "release model/training contract"))
-    expected_keys = {
+    common_keys = {
         "contract_version",
         "model_config",
         "model_config_sha256",
@@ -336,11 +408,27 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
         "transition_authority_contract",
         "transition_authority_contract_sha256",
     }
+    version = contract.get("contract_version")
+    v3_keys = {
+        "dynamic_crop_version",
+        "dynamic_crop_config",
+        "dynamic_crop_config_sha256",
+        "v3_training_schedule",
+        "v3_training_schedule_sha256",
+    }
+    expected_keys = (
+        common_keys | v3_keys
+        if version == MODEL_TRAINING_CONTRACT_V3_VERSION
+        else common_keys
+    )
     if set(contract) != expected_keys:
         raise ReleaseFoldPreflightError(
             "release model/training contract keys are not exact"
         )
-    if contract.get("contract_version") != MODEL_TRAINING_CONTRACT_VERSION:
+    if version not in {
+        MODEL_TRAINING_CONTRACT_VERSION,
+        MODEL_TRAINING_CONTRACT_V3_VERSION,
+    }:
         raise ReleaseFoldPreflightError(
             "release model/training contract version is invalid"
         )
@@ -391,7 +479,11 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
         _mapping(dynamic_payload.get("base"), "dynamic crop base loss contract")
     )
     try:
-        DynamicCropV2LossContract(
+        dynamic_loss = (
+            DynamicCropV3LossContract
+            if version == MODEL_TRAINING_CONTRACT_V3_VERSION
+            else DynamicCropV2LossContract
+        )(
             **{
                 **dynamic_payload,
                 "base": StageEditLossContract(**dynamic_base),
@@ -405,6 +497,48 @@ def _validate_model_training_contract(value: object) -> dict[str, Any]:
         raise ReleaseFoldPreflightError(
             "release dynamic crop and base source objectives differ"
         )
+    if version == MODEL_TRAINING_CONTRACT_V3_VERSION:
+        if contract.get("dynamic_crop_version") != DYNAMIC_CROP_V3_SCHEMA_VERSION:
+            raise ReleaseFoldPreflightError(
+                "release Dynamic Crop v3 version binding differs"
+            )
+        dynamic_config_payload = dict(
+            _mapping(contract.get("dynamic_crop_config"), "dynamic crop v3 config")
+        )
+        if contract.get("dynamic_crop_config_sha256") != _canonical_sha256(
+            dynamic_config_payload
+        ):
+            raise ReleaseFoldPreflightError(
+                "release Dynamic Crop v3 config hash mismatch"
+            )
+        try:
+            dynamic_config = DynamicCropHeadV3Config(**dynamic_config_payload)
+        except (TypeError, ValueError) as exc:
+            raise ReleaseFoldPreflightError(
+                f"release Dynamic Crop v3 config is invalid: {exc}"
+            ) from exc
+        if dynamic_config != DynamicCropHeadV3Config():
+            raise ReleaseFoldPreflightError(
+                "release Dynamic Crop v3 config is not the renderer contract"
+            )
+        schedule = dict(
+            _mapping(contract.get("v3_training_schedule"), "v3 training schedule")
+        )
+        if (
+            contract.get("v3_training_schedule_sha256")
+            != _canonical_sha256(schedule)
+            or schedule != dict(V3_PROBE_TRAINING_SCHEDULE)
+        ):
+            raise ReleaseFoldPreflightError(
+                "release Dynamic Crop v3 training schedule differs from freeze"
+            )
+        if (
+            not isinstance(dynamic_loss, DynamicCropV3LossContract)
+            or dynamic_loss.contract != DYNAMIC_CROP_V3_LOSS_CONTRACT
+        ):
+            raise ReleaseFoldPreflightError(
+                "release Dynamic Crop v3 loss contract differs"
+            )
     authority = StageEditTransitionAuthority(
         mode=RENDERER_OWNED_TRANSITION_AUTHORITY
     )
@@ -434,6 +568,325 @@ _CAPACITY_SELECTION_BINDING_KEYS = {
     "release_model_training_contract_origin",
     "release_model_training_contract_sha256",
 }
+
+_V3_RELEASE_READINESS_BINDING_KEYS = {
+    "binding_version",
+    "readiness_kind",
+    "dynamic_crop_version",
+    "release_freeze",
+    "release_freeze_content_sha256",
+    "final_fit_receipt",
+    "final_fit_receipt_content_sha256",
+    "final_fit_plan",
+    "final_fit_plan_content_sha256",
+    "training_manifest_tuples",
+    "training_manifest_graph_sha256",
+    "professional_montage_profile",
+    "professional_montage_profile_identity",
+    "candidate_name",
+    "candidate_id",
+    "candidate_contract_sha256",
+    "v3_training_schedule_sha256",
+    "final_fit_checkpoint_id",
+    "final_fit_checkpoint_weight_sha256",
+    "final_fit_checkpoint_metadata",
+    "final_fit_checkpoint_weights",
+    "release_model_training_contract_sha256",
+    "final_fit_checkpoint_usage",
+    "production_activation_authorized",
+}
+
+
+def _v3_training_manifest_tuples_from_final_fit_plan(
+    plan: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for raw in _array(plan.get("songs"), "v3 final-fit songs"):
+        item = _mapping(raw, "v3 final-fit song")
+        song_id = str(item.get("song_id") or "")
+        if song_id in indexed:
+            raise ReleaseFoldPreflightError(
+                "Dynamic Crop v3 final-fit manifest graph has duplicate songs"
+            )
+        indexed[song_id] = item
+    if set(indexed) != set(DEVELOPMENT_TRAINING_SONG_IDS):
+        raise ReleaseFoldPreflightError(
+            "Dynamic Crop v3 final-fit manifest graph is not the exact "
+            "three-song training scope"
+        )
+    return [
+        {
+            "song_id": song_id,
+            "materialization_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("materialization_manifest"),
+                    f"{song_id} v3 materialization pointer",
+                )
+            ),
+            "feature_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("feature_manifest"),
+                    f"{song_id} v3 feature pointer",
+                )
+            ),
+            "dynamic_crop_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("dynamic_crop_manifest"),
+                    f"{song_id} v3 dynamic-crop pointer",
+                )
+            ),
+        }
+        for song_id in DEVELOPMENT_TRAINING_SONG_IDS
+    ]
+
+
+def _v3_training_manifest_tuples_from_release_songs(
+    songs: object,
+) -> list[dict[str, Any]]:
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for raw in _array(songs, "release songs"):
+        item = _mapping(raw, "release song")
+        song_id = str(item.get("song_id") or "")
+        if song_id in indexed:
+            raise ReleaseFoldPreflightError("duplicate release song id")
+        indexed[song_id] = item
+    if not set(DEVELOPMENT_TRAINING_SONG_IDS).issubset(indexed):
+        raise ReleaseFoldPreflightError(
+            "release plan lacks the exact v3 training-song manifest graph"
+        )
+    return [
+        {
+            "song_id": song_id,
+            "materialization_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("materialization_manifest"),
+                    f"{song_id} release materialization pointer",
+                )
+            ),
+            "feature_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("feature_manifest"),
+                    f"{song_id} release feature pointer",
+                )
+            ),
+            "dynamic_crop_manifest": dict(
+                _mapping(
+                    indexed[song_id].get("dynamic_crop_manifest"),
+                    f"{song_id} release dynamic-crop pointer",
+                )
+            ),
+        }
+        for song_id in DEVELOPMENT_TRAINING_SONG_IDS
+    ]
+
+
+def _v3_model_training_contract(
+    freeze: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate = dict(
+        _mapping(freeze.get("candidate_contract"), "frozen v3 candidate contract")
+    )
+    expected_candidate_keys = {
+        "dynamic_crop_version",
+        "model_contract",
+        "target_contract",
+        "output_contract",
+        "loss_contract",
+        "model_class",
+        "loss_class",
+        "activation_checkpointing",
+        "legacy_v2_checkpoint_compatible",
+        "v2_model_or_loss_accepted",
+        "model_config",
+        "base_loss_contract",
+        "dynamic_crop_config",
+        "dynamic_crop_loss_contract",
+        "parameter_count",
+        "semantic_model_selection_authorized",
+    }
+    if set(candidate) != expected_candidate_keys or (
+        candidate.get("dynamic_crop_version") != DYNAMIC_CROP_V3_SCHEMA_VERSION
+        or candidate.get("model_contract") != DYNAMIC_CROP_V3_MODEL_CONTRACT
+        or candidate.get("target_contract") != DYNAMIC_CROP_V3_TARGET_CONTRACT
+        or candidate.get("output_contract") != DYNAMIC_CROP_V3_OUTPUT_CONTRACT
+        or candidate.get("loss_contract") != DYNAMIC_CROP_V3_LOSS_CONTRACT
+        or candidate.get("model_class") != "StageEditTransformerDynamicCropV3"
+        or candidate.get("loss_class") != "DynamicCropV3LossContract"
+        or candidate.get("legacy_v2_checkpoint_compatible") is not False
+        or candidate.get("v2_model_or_loss_accepted") is not False
+    ):
+        raise ReleaseFoldPreflightError(
+            "frozen release candidate is not the exact Dynamic Crop v3 contract"
+        )
+    model_payload = dict(_mapping(candidate.get("model_config"), "v3 model config"))
+    base_payload = dict(
+        _mapping(candidate.get("base_loss_contract"), "v3 base loss contract")
+    )
+    dynamic_config = dict(
+        _mapping(candidate.get("dynamic_crop_config"), "v3 crop config")
+    )
+    dynamic_loss = dict(
+        _mapping(candidate.get("dynamic_crop_loss_contract"), "v3 loss contract")
+    )
+    schedule = dict(
+        _mapping(freeze.get("training_schedule"), "v3 frozen training schedule")
+    )
+    try:
+        base = StageEditLossContract(**base_payload)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"frozen v3 base loss contract is invalid: {exc}"
+        ) from exc
+    authority = StageEditTransitionAuthority(
+        mode=RENDERER_OWNED_TRANSITION_AUTHORITY
+    )
+    contract = {
+        "contract_version": MODEL_TRAINING_CONTRACT_V3_VERSION,
+        "dynamic_crop_version": DYNAMIC_CROP_V3_SCHEMA_VERSION,
+        "model_config": model_payload,
+        "model_config_sha256": _canonical_sha256(model_payload),
+        "base_loss_contract": base_payload,
+        "base_loss_contract_sha256": _canonical_sha256(base_payload),
+        "dynamic_crop_config": dynamic_config,
+        "dynamic_crop_config_sha256": _canonical_sha256(dynamic_config),
+        "dynamic_crop_loss_contract": dynamic_loss,
+        "dynamic_crop_loss_contract_sha256": _canonical_sha256(dynamic_loss),
+        "v3_training_schedule": schedule,
+        "v3_training_schedule_sha256": _canonical_sha256(schedule),
+        "source_objective": base.source_objective,
+        "transition_authority_contract": authority.to_dict(),
+        "transition_authority_contract_sha256": authority.fingerprint,
+    }
+    return _validate_model_training_contract(contract)
+
+
+def _load_verified_v3_release_readiness(
+    release_freeze_path: Path,
+    final_fit_receipt_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    freeze_raw = Path(release_freeze_path).expanduser()
+    receipt_raw = Path(final_fit_receipt_path).expanduser()
+    for path, label in (
+        (freeze_raw, "Dynamic Crop v3 release freeze"),
+        (receipt_raw, "Dynamic Crop v3 final-fit receipt"),
+    ):
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            raise ReleaseFoldPreflightError(f"{label} is missing or unsafe")
+    freeze_before = _file_sha256(freeze_raw, "Dynamic Crop v3 release freeze")
+    receipt_before = _file_sha256(
+        receipt_raw, "Dynamic Crop v3 final-fit receipt"
+    )
+    try:
+        freeze = load_dynamic_crop_v3_release_freeze(freeze_raw)
+        receipt = load_dynamic_crop_v3_final_fit_receipt(receipt_raw)
+    except (DynamicCropV3FinalReleaseError, OSError, RuntimeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"Dynamic Crop v3 release readiness is invalid: {exc}"
+        ) from exc
+    if (
+        _file_sha256(freeze_raw, "Dynamic Crop v3 release freeze") != freeze_before
+        or _file_sha256(receipt_raw, "Dynamic Crop v3 final-fit receipt")
+        != receipt_before
+    ):
+        raise ReleaseFoldPreflightError(
+            "Dynamic Crop v3 release readiness changed while loading"
+        )
+    freeze_path = freeze_raw.resolve()
+    receipt_path = receipt_raw.resolve()
+    final_fit_plan_path = _verify_pointer(
+        receipt.get("plan"), "Dynamic Crop v3 final-fit plan"
+    )
+    try:
+        final_fit_plan = load_dynamic_crop_v3_final_fit_plan(
+            final_fit_plan_path
+        )
+    except (DynamicCropV3FinalReleaseError, OSError, RuntimeError, ValueError) as exc:
+        raise ReleaseFoldPreflightError(
+            f"Dynamic Crop v3 final-fit manifest graph is invalid: {exc}"
+        ) from exc
+    if (
+        receipt.get("release_freeze")
+        != _pointer(freeze_path, "Dynamic Crop v3 release freeze")
+        or receipt.get("candidate_id") != freeze.get("candidate_id")
+        or receipt.get("candidate_name") != freeze.get("candidate_name")
+        or receipt.get("dynamic_crop_version") != DYNAMIC_CROP_V3_SCHEMA_VERSION
+        or receipt.get("production_activation_authorized") is not False
+    ):
+        raise ReleaseFoldPreflightError(
+            "Dynamic Crop v3 final-fit checkpoint differs from its LOSO freeze"
+        )
+    contract = _v3_model_training_contract(freeze)
+    manifest_tuples = _v3_training_manifest_tuples_from_final_fit_plan(
+        final_fit_plan
+    )
+    candidate_contract = dict(
+        _mapping(freeze.get("candidate_contract"), "v3 candidate contract")
+    )
+    binding = {
+        "binding_version": V3_RELEASE_READINESS_BINDING_VERSION,
+        "readiness_kind": V3_RELEASE_READINESS_KIND,
+        "dynamic_crop_version": DYNAMIC_CROP_V3_SCHEMA_VERSION,
+        "release_freeze": _pointer(freeze_path, "Dynamic Crop v3 release freeze"),
+        "release_freeze_content_sha256": freeze["freeze_content_sha256"],
+        "final_fit_receipt": _pointer(
+            receipt_path, "Dynamic Crop v3 final-fit receipt"
+        ),
+        "final_fit_receipt_content_sha256": receipt["artifact_content_sha256"],
+        "final_fit_plan": _pointer(
+            final_fit_plan_path, "Dynamic Crop v3 final-fit plan"
+        ),
+        "final_fit_plan_content_sha256": final_fit_plan[
+            "plan_content_sha256"
+        ],
+        "training_manifest_tuples": manifest_tuples,
+        "training_manifest_graph_sha256": _canonical_sha256(
+            manifest_tuples
+        ),
+        "professional_montage_profile": dict(
+            freeze["professional_montage_profile"]
+        ),
+        "professional_montage_profile_identity": dict(
+            freeze["professional_montage_profile_identity"]
+        ),
+        "candidate_name": freeze["candidate_name"],
+        "candidate_id": freeze["candidate_id"],
+        "candidate_contract_sha256": _canonical_sha256(candidate_contract),
+        "v3_training_schedule_sha256": _canonical_sha256(
+            freeze["training_schedule"]
+        ),
+        "final_fit_checkpoint_id": receipt["checkpoint_id"],
+        "final_fit_checkpoint_weight_sha256": receipt[
+            "checkpoint_weight_sha256"
+        ],
+        "final_fit_checkpoint_metadata": dict(receipt["checkpoint_metadata"]),
+        "final_fit_checkpoint_weights": dict(receipt["checkpoint_weights"]),
+        "release_model_training_contract_sha256": _canonical_sha256(contract),
+        "final_fit_checkpoint_usage": V3_FINAL_FIT_CHECKPOINT_USAGE,
+        "production_activation_authorized": False,
+    }
+    if (
+        set(binding) != _V3_RELEASE_READINESS_BINDING_KEYS
+        or not all(
+            _is_sha256(binding[name])
+            for name in (
+                "release_freeze_content_sha256",
+                "final_fit_receipt_content_sha256",
+                "final_fit_plan_content_sha256",
+                "training_manifest_graph_sha256",
+                "candidate_id",
+                "candidate_contract_sha256",
+                "v3_training_schedule_sha256",
+                "final_fit_checkpoint_weight_sha256",
+                "release_model_training_contract_sha256",
+            )
+        )
+        or binding.get("final_fit_checkpoint_usage")
+        != V3_FINAL_FIT_CHECKPOINT_USAGE
+    ):
+        raise ReleaseFoldPreflightError(
+            "Dynamic Crop v3 release readiness identity is invalid"
+        )
+    return binding, contract
 
 
 def _load_verified_capacity_selection(
@@ -564,6 +1017,33 @@ def _verify_capacity_selection_binding(
     value: object,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     binding = dict(_mapping(value, "capacity selection binding"))
+    if binding.get("binding_version") == V3_RELEASE_READINESS_BINDING_VERSION:
+        if (
+            set(binding) != _V3_RELEASE_READINESS_BINDING_KEYS
+            or binding.get("readiness_kind") != V3_RELEASE_READINESS_KIND
+            or binding.get("dynamic_crop_version")
+            != DYNAMIC_CROP_V3_SCHEMA_VERSION
+            or binding.get("production_activation_authorized") is not False
+        ):
+            raise ReleaseFoldPreflightError(
+                "Dynamic Crop v3 release readiness binding is not exact"
+            )
+        freeze_path = _verify_pointer(
+            binding.get("release_freeze"), "Dynamic Crop v3 release freeze"
+        )
+        receipt_path = _verify_pointer(
+            binding.get("final_fit_receipt"),
+            "Dynamic Crop v3 final-fit receipt",
+        )
+        observed, contract = _load_verified_v3_release_readiness(
+            freeze_path,
+            receipt_path,
+        )
+        if observed != binding:
+            raise ReleaseFoldPreflightError(
+                "Dynamic Crop v3 release readiness binding changed"
+            )
+        return observed, contract
     if set(binding) != _CAPACITY_SELECTION_BINDING_KEYS:
         raise ReleaseFoldPreflightError(
             "capacity selection binding keys are not exact"
@@ -831,7 +1311,9 @@ def create_stage_edit_release_development_plan(
     dynamic_crop_manifests: Mapping[str, Path],
     checkpoint_directory: Path,
     output_directory: Path,
-    capacity_selection_path: Path,
+    capacity_selection_path: Path | None = None,
+    dynamic_crop_v3_release_freeze_path: Path | None = None,
+    dynamic_crop_v3_final_fit_receipt_path: Path | None = None,
     training_config: Mapping[str, Any] = DEFAULT_RELEASE_TRAINING_CONFIG,
 ) -> Path:
     """Bind the exact four-song development fold without activation authority."""
@@ -842,12 +1324,83 @@ def create_stage_edit_release_development_plan(
         raise ReleaseFoldPreflightError(
             f"development checkpoint must be on {volume}: {checkpoint}"
         )
-    _, capacity_selection, model_training_contract = (
-        _load_verified_capacity_selection(capacity_selection_path)
+    v3_values = (
+        dynamic_crop_v3_release_freeze_path,
+        dynamic_crop_v3_final_fit_receipt_path,
+    )
+    if any(value is not None for value in v3_values):
+        if capacity_selection_path is not None or not all(
+            value is not None for value in v3_values
+        ):
+            raise ReleaseFoldPreflightError(
+                "development requires either one legacy capacity selection or "
+                "the complete Dynamic Crop v3 freeze/final-fit pair"
+            )
+        capacity_selection, model_training_contract = (
+            _load_verified_v3_release_readiness(
+                dynamic_crop_v3_release_freeze_path,
+                dynamic_crop_v3_final_fit_receipt_path,
+            )
+        )
+    else:
+        if capacity_selection_path is None:
+            raise ReleaseFoldPreflightError(
+                "development release readiness evidence is required"
+            )
+        _, capacity_selection, model_training_contract = (
+            _load_verified_capacity_selection(capacity_selection_path)
+        )
+    if capacity_selection.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    ):
+        requested_training = dict(training_config)
+        if requested_training == dict(DEFAULT_RELEASE_TRAINING_CONFIG):
+            effective_training_config = dict(DEFAULT_RELEASE_TRAINING_CONFIG_V3)
+        elif requested_training == dict(DEFAULT_RELEASE_TRAINING_CONFIG_V3):
+            effective_training_config = requested_training
+        else:
+            raise ReleaseFoldPreflightError(
+                "Dynamic Crop v3 development schedule must match the frozen "
+                "capacity/final-fit schedule"
+            )
+    else:
+        effective_training_config = dict(training_config)
+    song_records = _song_records(
+        DEVELOPMENT_SONG_IDS,
+        materialization_manifests=materialization_manifests,
+        feature_manifests=feature_manifests,
+        dynamic_crop_manifests=dynamic_crop_manifests,
+    )
+    if capacity_selection.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    ):
+        current_manifest_tuples = (
+            _v3_training_manifest_tuples_from_release_songs(song_records)
+        )
+        if (
+            current_manifest_tuples
+            != capacity_selection.get("training_manifest_tuples")
+            or _canonical_sha256(current_manifest_tuples)
+            != capacity_selection.get("training_manifest_graph_sha256")
+        ):
+            raise ReleaseFoldPreflightError(
+                "release training manifests differ from the Dynamic Crop v3 "
+                "LOSO/final-fit manifest graph"
+            )
+    is_v3_release = capacity_selection.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
     )
     unsigned = {
-        "schema_version": RELEASE_PLAN_SCHEMA_VERSION,
-        "analysis_basis": DEVELOPMENT_PLAN_ANALYSIS_BASIS,
+        "schema_version": (
+            RELEASE_PLAN_V3_SCHEMA_VERSION
+            if is_v3_release
+            else RELEASE_PLAN_SCHEMA_VERSION
+        ),
+        "analysis_basis": (
+            DEVELOPMENT_PLAN_V3_ANALYSIS_BASIS
+            if is_v3_release
+            else DEVELOPMENT_PLAN_ANALYSIS_BASIS
+        ),
         "stage": "development",
         "release_contract": _release_contract(
             training_song_ids=DEVELOPMENT_TRAINING_SONG_IDS,
@@ -856,19 +1409,14 @@ def create_stage_edit_release_development_plan(
         ),
         "required_volume": str(legacy.PRODUCTION_VOLUME_ROOT),
         "minimum_free_bytes": legacy.MINIMUM_FREE_BYTES,
-        "training_config": _validate_training_config(training_config),
+        "training_config": _validate_training_config(effective_training_config),
         "capacity_selection": capacity_selection,
         "model_training_contract": model_training_contract,
         "structured_head_preflight_contract": (
             _structured_head_preflight_contract()
         ),
         "checkpoint_directory": str(checkpoint),
-        "songs": _song_records(
-            DEVELOPMENT_SONG_IDS,
-            materialization_manifests=materialization_manifests,
-            feature_manifests=feature_manifests,
-            dynamic_crop_manifests=dynamic_crop_manifests,
-        ),
+        "songs": song_records,
     }
     return _write_content_addressed(
         unsigned,
@@ -896,12 +1444,25 @@ _DEVELOPMENT_PLAN_KEYS = {
 
 
 def _strict_development_plan(path: Path) -> dict[str, Any]:
+    raw = _read_json_object(
+        Path(path).expanduser().resolve(), "development release plan"
+    )
+    schema_version = raw.get("schema_version")
+    if schema_version == RELEASE_PLAN_V3_SCHEMA_VERSION:
+        expected_basis = DEVELOPMENT_PLAN_V3_ANALYSIS_BASIS
+    elif schema_version == RELEASE_PLAN_SCHEMA_VERSION:
+        expected_basis = DEVELOPMENT_PLAN_ANALYSIS_BASIS
+    else:
+        raise ReleaseFoldPreflightError(
+            "development release plan schema mismatch or unsupported"
+        )
     payload = _strict_content_addressed(
         path,
         expected_keys=_DEVELOPMENT_PLAN_KEYS,
-        schema_basis=DEVELOPMENT_PLAN_ANALYSIS_BASIS,
+        schema_basis=expected_basis,
         prefix="stageedit-release-development-plan",
         hash_field="plan_sha256",
+        expected_schema_version=int(schema_version),
     )
     expected = _release_contract(
         training_song_ids=DEVELOPMENT_TRAINING_SONG_IDS,
@@ -916,9 +1477,27 @@ def _strict_development_plan(path: Path) -> dict[str, Any]:
     ):
         raise ReleaseFoldPreflightError("development storage contract mismatch")
     _validate_training_config(payload.get("training_config"))
-    _, selected_contract = _verify_capacity_selection_binding(
+    selected_binding, selected_contract = _verify_capacity_selection_binding(
         payload.get("capacity_selection")
     )
+    is_v3_binding = selected_binding.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    )
+    if is_v3_binding != (
+        schema_version == RELEASE_PLAN_V3_SCHEMA_VERSION
+    ):
+        raise ReleaseFoldPreflightError(
+            "development plan schema does not match its v3 readiness binding"
+        )
+    if (
+        selected_binding.get("binding_version")
+        == V3_RELEASE_READINESS_BINDING_VERSION
+        and payload.get("training_config")
+        != dict(DEFAULT_RELEASE_TRAINING_CONFIG_V3)
+    ):
+        raise ReleaseFoldPreflightError(
+            "Dynamic Crop v3 development training schedule is not frozen"
+        )
     planned_contract = _validate_model_training_contract(
         payload.get("model_training_contract")
     )
@@ -930,6 +1509,24 @@ def _strict_development_plan(path: Path) -> dict[str, Any]:
         payload.get("structured_head_preflight_contract")
     )
     _indexed_song_records(payload, DEVELOPMENT_SONG_IDS)
+    if selected_binding.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    ):
+        current_manifest_tuples = (
+            _v3_training_manifest_tuples_from_release_songs(
+                payload.get("songs")
+            )
+        )
+        if (
+            current_manifest_tuples
+            != selected_binding.get("training_manifest_tuples")
+            or _canonical_sha256(current_manifest_tuples)
+            != selected_binding.get("training_manifest_graph_sha256")
+        ):
+            raise ReleaseFoldPreflightError(
+                "development manifest graph differs from frozen Dynamic Crop v3 "
+                "readiness"
+            )
     return payload
 
 
@@ -981,7 +1578,7 @@ def _training_config_cli_args(config: Mapping[str, Any]) -> list[str]:
 
 def _model_training_cli_args(contract: object) -> list[str]:
     validated = _validate_model_training_contract(contract)
-    return [
+    args = [
         "--model-config-json",
         _canonical_bytes(validated["model_config"]).decode("utf-8"),
         "--base-loss-contract-json",
@@ -989,6 +1586,37 @@ def _model_training_cli_args(contract: object) -> list[str]:
         "--dynamic-crop-loss-contract-json",
         _canonical_bytes(validated["dynamic_crop_loss_contract"]).decode("utf-8"),
     ]
+    if validated["contract_version"] == MODEL_TRAINING_CONTRACT_V3_VERSION:
+        schedule = validated["v3_training_schedule"]
+        args.extend(
+            [
+                "--dynamic-crop-version",
+                "3",
+                "--source-pretrain-steps",
+                str(schedule["source_pretraining_steps"]),
+                "--source-pretrain-learning-rate",
+                str(schedule["source_pretraining_peak_learning_rate"]),
+                "--source-pretrain-window-length",
+                str(schedule["source_pretraining_window_length"]),
+                "--source-pretrain-warmup-steps",
+                str(schedule["source_pretraining_warmup_steps"]),
+                "--dynamic-crop-v3-prior-pretrain-steps",
+                str(schedule["dynamic_crop_v3_prior_pretraining_steps"]),
+                "--dynamic-crop-v3-prior-pretrain-learning-rate",
+                str(
+                    schedule[
+                        "dynamic_crop_v3_prior_pretraining_peak_learning_rate"
+                    ]
+                ),
+                "--dynamic-crop-v3-prior-pretrain-warmup-steps",
+                str(schedule["dynamic_crop_v3_prior_pretraining_warmup_steps"]),
+                "--minimum-finetune-optimizer-steps",
+                str(schedule["minimum_finetune_optimizer_steps"]),
+                "--minimum-checkpoint-selection-finetune-steps",
+                str(schedule["minimum_checkpoint_selection_finetune_steps"]),
+            ]
+        )
+    return args
 
 
 def _manifest_cli_args(
@@ -1291,6 +1919,90 @@ def preflight_stage_edit_release_development(
     )
 
 
+def _require_dynamic_crop_v3_release_launch(
+    payload: Mapping[str, Any],
+    train_cli_args: Sequence[str],
+    *,
+    activation_authorized: bool,
+) -> None:
+    """Reject every legacy/default-head route before production training."""
+
+    readiness, model_contract = _verify_capacity_selection_binding(
+        payload.get("capacity_selection")
+    )
+    if (
+        readiness.get("binding_version")
+        != V3_RELEASE_READINESS_BINDING_VERSION
+        or readiness.get("dynamic_crop_version")
+        != DYNAMIC_CROP_V3_SCHEMA_VERSION
+        or readiness.get("final_fit_checkpoint_usage")
+        != V3_FINAL_FIT_CHECKPOINT_USAGE
+        or model_contract.get("contract_version")
+        != MODEL_TRAINING_CONTRACT_V3_VERSION
+    ):
+        raise ReleaseFoldPreflightError(
+            "release launch requires the frozen Dynamic Crop v3 LOSO/final-fit "
+            "readiness tuple; legacy capacity evidence cannot launch"
+        )
+    args = list(train_cli_args)
+    if args.count("--dynamic-crop-version") != 1:
+        raise ReleaseFoldPreflightError(
+            "release launch must bind Dynamic Crop v3 exactly once"
+        )
+    version_index = args.index("--dynamic-crop-version")
+    if version_index + 1 >= len(args) or args[version_index + 1] != "3":
+        raise ReleaseFoldPreflightError(
+            "release launch attempted a non-v3 dynamic crop head"
+        )
+    if any(
+        option in args
+        for option in (
+            "--init-checkpoint",
+            "--initial-checkpoint",
+            "--warm-start-checkpoint",
+        )
+    ):
+        raise ReleaseFoldPreflightError(
+            "inactive v3 final-fit checkpoint is readiness-only and cannot "
+            "silently initialize release optimization"
+        )
+    has_activation = "--authorize-production-activation" in args
+    if has_activation != activation_authorized:
+        raise ReleaseFoldPreflightError(
+            "release activation authority differs from the launch stage"
+        )
+    if activation_authorized:
+        if args.count("--continuity-authority") != 1:
+            raise ReleaseFoldPreflightError(
+                "authorized v3 release requires one continuity authority"
+            )
+        continuity_index = args.index("--continuity-authority")
+        if (
+            continuity_index + 1 >= len(args)
+            or args[continuity_index + 1] != HANDCRAFTED_CONTINUITY_AUTHORITY
+        ):
+            raise ReleaseFoldPreflightError(
+                "current v3 release contract requires handcrafted continuity"
+            )
+    elif "--continuity-authority" in args:
+        raise ReleaseFoldPreflightError(
+            "inactive development launch acquired continuity activation authority"
+        )
+
+
+def launch_stage_edit_release_development(plan_path: Path) -> int:
+    """Launch only the current frozen v3 development fold."""
+
+    preflight = preflight_stage_edit_release_development(plan_path)
+    payload = _strict_development_plan(preflight.plan_path)
+    _require_dynamic_crop_v3_release_launch(
+        payload,
+        preflight.train_cli_args,
+        activation_authorized=False,
+    )
+    return production_train_main(preflight.train_cli_args)
+
+
 def _read_json_object(path: Path, name: str) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         raise ReleaseFoldPreflightError(f"{name} is missing or unsafe: {path}")
@@ -1472,9 +2184,18 @@ def freeze_stage_edit_release_development(
     ):
         raise ReleaseFoldPreflightError("report does not bind the selection freeze")
     config = dict(_mapping(report["model"], "development model")["config"])
+    is_v3_release = plan.get("schema_version") == RELEASE_PLAN_V3_SCHEMA_VERSION
     unsigned = {
-        "schema_version": DEVELOPMENT_FREEZE_SCHEMA_VERSION,
-        "analysis_basis": DEVELOPMENT_FREEZE_ANALYSIS_BASIS,
+        "schema_version": (
+            DEVELOPMENT_FREEZE_V3_SCHEMA_VERSION
+            if is_v3_release
+            else DEVELOPMENT_FREEZE_SCHEMA_VERSION
+        ),
+        "analysis_basis": (
+            DEVELOPMENT_FREEZE_V3_ANALYSIS_BASIS
+            if is_v3_release
+            else DEVELOPMENT_FREEZE_ANALYSIS_BASIS
+        ),
         "stage": "development_frozen",
         "development_plan": _pointer(resolved_plan, "development plan"),
         "development_checkpoint_directory": str(checkpoint),
@@ -1532,13 +2253,29 @@ _DEVELOPMENT_FREEZE_KEYS = {
 def _strict_development_freeze(
     freeze_path: Path, *, expected_plan_path: Path | None = None
 ) -> dict[str, Any]:
+    resolved_freeze = Path(freeze_path).expanduser().resolve()
+    if not resolved_freeze.is_file() or resolved_freeze.is_symlink():
+        raise ReleaseFoldPreflightError(
+            "release evidence must be a regular non-symlink file: "
+            f"{resolved_freeze}"
+        )
+    raw = _read_json_object(resolved_freeze, "development release freeze")
+    schema_version = raw.get("schema_version")
+    if schema_version == DEVELOPMENT_FREEZE_V3_SCHEMA_VERSION:
+        expected_basis = DEVELOPMENT_FREEZE_V3_ANALYSIS_BASIS
+    elif schema_version == DEVELOPMENT_FREEZE_SCHEMA_VERSION:
+        expected_basis = DEVELOPMENT_FREEZE_ANALYSIS_BASIS
+    else:
+        raise ReleaseFoldPreflightError(
+            "development freeze schema is unsupported"
+        )
     payload = _strict_content_addressed(
         freeze_path,
         expected_keys=_DEVELOPMENT_FREEZE_KEYS,
-        schema_basis=DEVELOPMENT_FREEZE_ANALYSIS_BASIS,
+        schema_basis=expected_basis,
         prefix="stageedit-release-development-freeze",
         hash_field="freeze_sha256",
-        expected_schema_version=DEVELOPMENT_FREEZE_SCHEMA_VERSION,
+        expected_schema_version=int(schema_version),
     )
     if (
         payload.get("stage") != "development_frozen"
@@ -1554,6 +2291,12 @@ def _strict_development_freeze(
     if expected_plan_path is not None and plan_path != Path(expected_plan_path).resolve():
         raise ReleaseFoldPreflightError("development freeze binds a different plan")
     plan = _strict_development_plan(plan_path)
+    if (
+        schema_version == DEVELOPMENT_FREEZE_V3_SCHEMA_VERSION
+    ) != (plan.get("schema_version") == RELEASE_PLAN_V3_SCHEMA_VERSION):
+        raise ReleaseFoldPreflightError(
+            "development freeze schema differs from its development plan"
+        )
     if payload.get("training_config") != plan.get("training_config"):
         raise ReleaseFoldPreflightError("development training config freeze mismatch")
     if payload.get("capacity_selection") != plan.get("capacity_selection"):
@@ -1678,6 +2421,32 @@ def create_stage_edit_release_final_plan(
         raise ReleaseFoldPreflightError(
             "professional montage grammar profile path identity changed"
         )
+    readiness = dict(
+        _mapping(freeze.get("capacity_selection"), "release readiness")
+    )
+    is_v3_release = readiness.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    )
+    if is_v3_release:
+        frozen_profile_pointer = dict(
+            _mapping(
+                readiness.get("professional_montage_profile"),
+                "frozen Dynamic Crop v3 montage profile",
+            )
+        )
+        if (
+            montage_profile_identity
+            != readiness.get("professional_montage_profile_identity")
+            or frozen_profile_pointer
+            != {
+                "path": montage_profile_identity.get("path"),
+                "file_sha256": montage_profile_identity.get("file_sha256"),
+            }
+        ):
+            raise ReleaseFoldPreflightError(
+                "final montage profile differs from the Dynamic Crop v3 LOSO "
+                "freeze"
+            )
     records = _song_records(
         DEVELOPMENT_SONG_IDS,
         materialization_manifests={
@@ -1723,8 +2492,16 @@ def create_stage_edit_release_final_plan(
         f"stageedit-release-{freeze_digest[:16]}.blind-consumed.json"
     )
     unsigned = {
-        "schema_version": FINAL_RELEASE_PLAN_SCHEMA_VERSION,
-        "analysis_basis": FINAL_PLAN_ANALYSIS_BASIS,
+        "schema_version": (
+            FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION
+            if is_v3_release
+            else FINAL_RELEASE_PLAN_SCHEMA_VERSION
+        ),
+        "analysis_basis": (
+            FINAL_PLAN_V3_ANALYSIS_BASIS
+            if is_v3_release
+            else FINAL_PLAN_ANALYSIS_BASIS
+        ),
         "stage": "final_blind",
         "blind_song_id": blind_song_id,
         "release_contract": _release_contract(
@@ -1789,13 +2566,25 @@ _FINAL_PLAN_KEYS = {
 
 
 def _strict_final_plan(path: Path) -> dict[str, Any]:
+    raw = _read_json_object(
+        Path(path).expanduser().resolve(), "final blind release plan"
+    )
+    schema_version = raw.get("schema_version")
+    if schema_version == FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION:
+        expected_basis = FINAL_PLAN_V3_ANALYSIS_BASIS
+    elif schema_version == FINAL_RELEASE_PLAN_SCHEMA_VERSION:
+        expected_basis = FINAL_PLAN_ANALYSIS_BASIS
+    else:
+        raise ReleaseFoldPreflightError(
+            "final blind release plan schema is unsupported"
+        )
     payload = _strict_content_addressed(
         path,
         expected_keys=_FINAL_PLAN_KEYS,
-        schema_basis=FINAL_PLAN_ANALYSIS_BASIS,
+        schema_basis=expected_basis,
         prefix="stageedit-release-blind-plan",
         hash_field="plan_sha256",
-        expected_schema_version=FINAL_RELEASE_PLAN_SCHEMA_VERSION,
+        expected_schema_version=int(schema_version),
     )
     # Validate the frozen blind identity before following any pointer from the
     # plan. A forged plan cannot repurpose development/quarantined evidence.
@@ -1827,9 +2616,25 @@ def _strict_final_plan(path: Path) -> dict[str, Any]:
         raise ReleaseFoldPreflightError(
             "final capacity selection differs from development freeze"
         )
-    _, selected_contract = _verify_capacity_selection_binding(
+    selected_binding, selected_contract = _verify_capacity_selection_binding(
         payload.get("capacity_selection")
     )
+    is_v3_binding = selected_binding.get("binding_version") == (
+        V3_RELEASE_READINESS_BINDING_VERSION
+    )
+    if is_v3_binding != (
+        schema_version == FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION
+    ):
+        raise ReleaseFoldPreflightError(
+            "final release schema does not match its v3 readiness binding"
+        )
+    if is_v3_binding and (
+        payload.get("professional_montage_grammar_profile")
+        != selected_binding.get("professional_montage_profile_identity")
+    ):
+        raise ReleaseFoldPreflightError(
+            "final montage profile differs from frozen Dynamic Crop v3 readiness"
+        )
     if payload.get("model_training_contract") != freeze.get(
         "model_training_contract"
     ):
@@ -2041,6 +2846,8 @@ def _preflight_consumed_stage_edit_release_final(
         [
             "--professional-montage-grammar-profile",
             str(payload["professional_montage_grammar_profile"]["path"]),
+            "--continuity-authority",
+            HANDCRAFTED_CONTINUITY_AUTHORITY,
         ]
     )
     args.append("--authorize-production-activation")
@@ -2065,6 +2872,21 @@ def launch_stage_edit_release_final(plan_path: Path) -> int:
     """Consume the generic blind run once, then delegate to the strict CLI."""
 
     preflight = preflight_stage_edit_release_final(plan_path)
+    frozen_plan = _strict_final_plan(preflight.plan_path)
+    readiness, model_contract = _verify_capacity_selection_binding(
+        frozen_plan.get("capacity_selection")
+    )
+    if (
+        frozen_plan.get("schema_version")
+        != FINAL_RELEASE_PLAN_V3_SCHEMA_VERSION
+        or readiness.get("binding_version")
+        != V3_RELEASE_READINESS_BINDING_VERSION
+        or model_contract.get("contract_version")
+        != MODEL_TRAINING_CONTRACT_V3_VERSION
+    ):
+        raise ReleaseFoldPreflightError(
+            "blind marker cannot be consumed by a legacy/non-v3 release plan"
+        )
     assert preflight.blind_consumption_marker is not None
     marker = preflight.blind_consumption_marker
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -2096,6 +2918,11 @@ def launch_stage_edit_release_final(plan_path: Path) -> int:
     consumed = _preflight_consumed_stage_edit_release_final(
         preflight.plan_path,
         consumption_marker=marker,
+    )
+    _require_dynamic_crop_v3_release_launch(
+        frozen_plan,
+        consumed.train_cli_args,
+        activation_authorized=True,
     )
     return production_train_main(consumed.train_cli_args)
 
@@ -2156,12 +2983,23 @@ def build_parser() -> argparse.ArgumentParser:
     create_dev.add_argument("--output-directory", required=True, type=Path)
     create_dev.add_argument(
         "--capacity-selection",
-        required=True,
         type=Path,
         help=(
-            "Verified content-addressed Dynamic Crop v2 capacity-selection "
-            "artifact; its selected model/loss contract is mandatory."
+            "Legacy read/replay compatibility only. Current CLI creation "
+            "requires the v3 freeze and final-fit receipt and rejects this."
         ),
+    )
+    create_dev.add_argument(
+        "--dynamic-crop-v3-release-freeze",
+        required=True,
+        type=Path,
+        help="Verified content-addressed three-fold Dynamic Crop v3 LOSO freeze.",
+    )
+    create_dev.add_argument(
+        "--dynamic-crop-v3-final-fit-receipt",
+        required=True,
+        type=Path,
+        help="Verified inactive all-reference Dynamic Crop v3 final-fit receipt.",
     )
     for name in ("preflight-development", "launch-development"):
         command = commands.add_parser(name)
@@ -2218,6 +3056,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_directory=args.checkpoint_dir,
             output_directory=args.output_directory,
             capacity_selection_path=args.capacity_selection,
+            dynamic_crop_v3_release_freeze_path=(
+                args.dynamic_crop_v3_release_freeze
+            ),
+            dynamic_crop_v3_final_fit_receipt_path=(
+                args.dynamic_crop_v3_final_fit_receipt
+            ),
         )
         print(json.dumps({"plan_path": str(path)}, ensure_ascii=False, indent=2))
         return 0
@@ -2226,8 +3070,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0
     if args.command == "launch-development":
-        result = preflight_stage_edit_release_development(args.plan)
-        return production_train_main(result.train_cli_args)
+        return launch_stage_edit_release_development(args.plan)
     if args.command == "freeze-development":
         path = freeze_stage_edit_release_development(
             args.plan, output_directory=args.output_directory
@@ -2293,6 +3136,7 @@ __all__ = [
     "create_stage_edit_release_final_plan",
     "freeze_stage_edit_release_development",
     "launch_stage_edit_release_final",
+    "launch_stage_edit_release_development",
     "preflight_stage_edit_release_development",
     "preflight_stage_edit_release_final",
 ]
