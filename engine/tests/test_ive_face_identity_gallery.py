@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,6 +21,8 @@ from crosscut.ive_face_identity_gallery import (
     IDENTITY_PROVIDER_ID,
     PRIVATE_LOCAL_DISTRIBUTION_POLICY,
     AuthorizedFaceEmbeddingSample,
+    IVEFaceGalleryAmbiguityConflict,
+    IVEFaceGalleryAmbiguityError,
     IVEFaceGalleryArtifactError,
     IVEFaceGalleryConfig,
     IVEFaceGalleryError,
@@ -51,6 +56,20 @@ def _mixed_vector(left_index: int, right_index: int) -> tuple[float, ...]:
     return tuple(float(value) for value in vector)
 
 
+def _weighted_vector(
+    left_index: int,
+    right_index: int,
+    *,
+    left_weight: float,
+    right_weight: float,
+) -> tuple[float, ...]:
+    vector = np.zeros(128, dtype=np.float64)
+    vector[left_index] = left_weight
+    vector[right_index] = right_weight
+    vector /= np.linalg.norm(vector)
+    return tuple(float(value) for value in vector)
+
+
 def _provenance(member: IVEMember, video_number: int) -> OfficialTargetMemberFancamProvenance:
     member_index = tuple(IVEMember).index(member)
     marker = f"member-{member_index}-video-{video_number}"
@@ -59,7 +78,7 @@ def _provenance(member: IVEMember, video_number: int) -> OfficialTargetMemberFan
         target_member=member,
         video_id=f"M{member_index}{video_number:02d}abc",
         title=f"IVE {member.value} Fancam TEST SONG",
-        broadcast_date=f"2026-0{video_number + 1}-01",
+        broadcast_date=f"2026-{video_number % 12 + 1:02d}-01",
         broadcast_program=f"Music Show {video_number}",
         channel_id=f"UCIVE{video_number:02d}",
         metadata_authority_sha256=_sha(f"metadata-{marker}"),
@@ -157,6 +176,32 @@ def _mixed_authority_samples() -> list[AuthorizedFaceEmbeddingSample]:
 
 
 class AuthorizedProvenanceTests(unittest.TestCase):
+    def test_ambiguity_conflict_is_typed_distinct_and_canonical(self) -> None:
+        conflict = IVEFaceGalleryAmbiguityConflict(
+            left_member=IVEMember.REI,
+            right_member="가을",
+            left_source_provenance_sha256=_sha("rei-provenance"),
+            right_source_provenance_sha256=_sha("gaeul-provenance"),
+            left_source_media_sha256=_sha("rei-media"),
+            right_source_media_sha256=_sha("gaeul-media"),
+            similarity=0.81,
+            maximum_allowed_similarity=0.78,
+        )
+
+        self.assertEqual(conflict.left_member, IVEMember.GAEUL)
+        self.assertEqual(conflict.right_member, IVEMember.REI)
+        self.assertEqual(
+            conflict.left_source_media_sha256,
+            _sha("gaeul-media"),
+        )
+        with self.assertRaisesRegex(IVEFaceGalleryError, "two different"):
+            replace(conflict, right_member=IVEMember.GAEUL)
+        with self.assertRaisesRegex(IVEFaceGalleryError, "must be distinct"):
+            replace(
+                conflict,
+                right_source_media_sha256=conflict.left_source_media_sha256,
+            )
+
     def test_title_member_authority_and_media_hash_are_mandatory(self) -> None:
         valid = _provenance(IVEMember.GAEUL, 0)
         self.assertEqual(valid.group, "IVE")
@@ -239,6 +284,15 @@ class AuthorizedProvenanceTests(unittest.TestCase):
 
 
 class GalleryBuildTests(unittest.TestCase):
+    def test_ambiguity_outlier_margin_cannot_weaken_sealed_minimum(self) -> None:
+        with self.assertRaisesRegex(
+            IVEFaceGalleryError,
+            "cannot weaken",
+        ):
+            IVEFaceGalleryConfig(
+                minimum_ambiguity_outlier_cohesion_margin=0.119,
+            )
+
     def test_same_member_multi_video_clusters_build_six_explicit_members(self) -> None:
         gallery = build_ive_face_identity_gallery(_complete_samples())
 
@@ -283,6 +337,223 @@ class GalleryBuildTests(unittest.TestCase):
         }
         self.assertEqual(reasons, {"same_member_video_outlier"})
 
+    def test_one_cross_member_ambiguous_source_is_removed_maximally(self) -> None:
+        samples = _complete_samples()
+        contaminated = _provenance(IVEMember.REI, 2)
+        ambiguous = _weighted_vector(
+            1,
+            2,
+            left_weight=0.8,
+            right_weight=0.6,
+        )
+        rewritten = [
+            (
+                _sample(
+                    item.provenance,
+                    item.frame_index // 17,
+                    vector=ambiguous,
+                )
+                if item.provenance == contaminated
+                else item
+            )
+            for item in samples
+        ]
+
+        gallery = build_ive_face_identity_gallery(rewritten)
+        reversed_gallery = build_ive_face_identity_gallery(
+            list(reversed(rewritten))
+        )
+
+        self.assertEqual(len(gallery.prototypes), 17)
+        self.assertEqual(len(gallery.prototypes_for(IVEMember.REI)), 2)
+        self.assertEqual(
+            {
+                item.reason
+                for item in gallery.rejections
+                if item.source_provenance_sha256
+                == contaminated.provenance_sha256
+            },
+            {"inter_member_ambiguous_outlier_source"},
+        )
+        self.assertEqual(
+            gallery.fingerprint_sha256,
+            reversed_gallery.fingerprint_sha256,
+        )
+
+    def test_ambiguous_outlier_is_not_removed_without_independent_floor_peers(
+        self,
+    ) -> None:
+        samples = _complete_samples(videos_per_member=2)
+        contaminated = _provenance(IVEMember.REI, 1)
+        ambiguous = _weighted_vector(
+            1,
+            2,
+            left_weight=0.8,
+            right_weight=0.6,
+        )
+        rewritten = [
+            (
+                _sample(
+                    item.provenance,
+                    item.frame_index // 17,
+                    vector=ambiguous,
+                )
+                if item.provenance == contaminated
+                else item
+            )
+            for item in samples
+        ]
+
+        with self.assertRaisesRegex(
+            IVEFaceGalleryAmbiguityError,
+            "inter-member ambiguity",
+        ):
+            build_ive_face_identity_gallery(rewritten)
+
+    def test_global_cap_can_replace_a_capped_in_ambiguous_source(self) -> None:
+        samples = _complete_samples()
+        contaminated = _provenance(IVEMember.REI, 2)
+        ambiguous = _weighted_vector(
+            1,
+            2,
+            left_weight=0.8,
+            right_weight=0.6,
+        )
+        rewritten = [
+            (
+                _sample(
+                    item.provenance,
+                    item.frame_index // 17,
+                    vector=ambiguous,
+                )
+                if item.provenance == contaminated
+                else item
+            )
+            for item in samples
+        ]
+
+        gallery = build_ive_face_identity_gallery(
+            rewritten,
+            config=IVEFaceGalleryConfig(maximum_videos_per_member=2),
+        )
+
+        self.assertEqual(len(gallery.prototypes), 12)
+        self.assertEqual(len(gallery.prototypes_for(IVEMember.REI)), 2)
+        self.assertNotIn(
+            contaminated.provenance_sha256,
+            {
+                item.source_provenance_sha256
+                for item in gallery.prototypes_for(IVEMember.REI)
+            },
+        )
+        ambiguous_audit = [
+            item.to_dict()
+            for item in gallery.rejections
+            if item.source_provenance_sha256
+            == contaminated.provenance_sha256
+        ]
+        self.assertTrue(ambiguous_audit)
+        self.assertEqual(
+            {item["reason"] for item in ambiguous_audit},
+            {"inter_member_ambiguous_outlier_source"},
+        )
+        for item in ambiguous_audit:
+            self.assertNotIn("embedding", item)
+            self.assertNotIn("path", item)
+            self.assertNotIn("video_id", item)
+
+    def test_duplicate_immutable_video_identities_fail_before_floor_counting(
+        self,
+    ) -> None:
+        samples = _complete_samples(videos_per_member=2)
+        first = _provenance(IVEMember.GAEUL, 0)
+        second = _provenance(IVEMember.GAEUL, 1)
+
+        duplicate_media = replace(
+            second,
+            media_content_sha256=first.media_content_sha256,
+        )
+        media_rewritten = [
+            (
+                _sample(
+                    duplicate_media,
+                    item.frame_index // 17,
+                    vector=item.embedding,
+                )
+                if item.provenance == second
+                else item
+            )
+            for item in samples
+        ]
+        with self.assertRaisesRegex(
+            IVEFaceGalleryError,
+            "duplicate media content.*independent videos",
+        ):
+            build_ive_face_identity_gallery(media_rewritten)
+
+        duplicate_video_id = replace(second, video_id=first.video_id)
+        video_rewritten = [
+            (
+                _sample(
+                    duplicate_video_id,
+                    item.frame_index // 17,
+                    vector=item.embedding,
+                )
+                if item.provenance == second
+                else item
+            )
+            for item in samples
+        ]
+        with self.assertRaisesRegex(
+            IVEFaceGalleryError,
+            "duplicate video ID.*independent videos",
+        ):
+            build_ive_face_identity_gallery(video_rewritten)
+
+    def test_policy_maximum_of_72_candidates_is_bounded_and_deterministic(
+        self,
+    ) -> None:
+        samples = _complete_samples(videos_per_member=12)
+
+        started = time.monotonic()
+        gallery = build_ive_face_identity_gallery(samples)
+        elapsed = time.monotonic() - started
+        reversed_gallery = build_ive_face_identity_gallery(
+            tuple(reversed(samples))
+        )
+
+        self.assertEqual(len(gallery.prototypes), 72)
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(gallery.to_dict(), reversed_gallery.to_dict())
+
+    def test_excessive_pairwise_resolution_states_fail_closed(self) -> None:
+        samples = _complete_samples(videos_per_member=26)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            IVEFaceGalleryError,
+            "deterministic state budget",
+        ):
+            build_ive_face_identity_gallery(samples)
+
+        self.assertLess(time.monotonic() - started, 15.0)
+
+    def test_global_member_video_cap_is_applied_after_source_validation(
+        self,
+    ) -> None:
+        samples = _complete_samples(videos_per_member=4)
+
+        gallery = build_ive_face_identity_gallery(
+            samples,
+            config=IVEFaceGalleryConfig(maximum_videos_per_member=3),
+        )
+
+        self.assertEqual(len(gallery.prototypes), 18)
+        self.assertEqual(
+            sum(item.reason == "member_video_cap" for item in gallery.rejections),
+            6 * 4,
+        )
+
     def test_inter_member_lookalike_prototypes_reject_gallery(self) -> None:
         samples = _complete_samples()
         rewritten: list[AuthorizedFaceEmbeddingSample] = []
@@ -297,8 +568,37 @@ class GalleryBuildTests(unittest.TestCase):
                 )
             else:
                 rewritten.append(sample)
-        with self.assertRaisesRegex(IVEFaceGalleryError, "inter-member ambiguity"):
+        with self.assertRaisesRegex(
+            IVEFaceGalleryAmbiguityError,
+            "inter-member ambiguity",
+        ) as captured:
             build_ive_face_identity_gallery(rewritten)
+        diagnostics = captured.exception.diagnostics
+        self.assertEqual(
+            diagnostics["contract"],
+            "ive_face_gallery_scalar_ambiguity_diagnostics_v1",
+        )
+        self.assertFalse(diagnostics["feasible_safe_subset_found"])
+        self.assertTrue(diagnostics["conflicts"])
+        self.assertEqual(
+            diagnostics["privacy"],
+            {
+                "contains_raw_embeddings": False,
+                "contains_raw_frames": False,
+                "contains_local_paths": False,
+                "contains_plain_video_ids": False,
+            },
+        )
+        for conflict in diagnostics["conflicts"]:
+            self.assertEqual(len(conflict["left_source_provenance_sha256"]), 64)
+            self.assertEqual(len(conflict["right_source_provenance_sha256"]), 64)
+            self.assertGreaterEqual(
+                conflict["similarity"],
+                conflict["maximum_allowed_similarity"],
+            )
+            self.assertNotIn("video_id", conflict)
+            self.assertNotIn("path", conflict)
+            self.assertNotIn("embedding", conflict)
 
     def test_video_and_temporal_caps_prevent_one_video_from_dominating(self) -> None:
         samples = _complete_samples()
@@ -426,6 +726,31 @@ class PrivateArtifactTests(unittest.TestCase):
                 payload["privacy"]["general_audit_json_export_permitted"]
             )
             self.assertNotIn("source_path", first.path.read_text(encoding="utf-8"))
+
+    def test_exfat_without_hard_links_uses_locked_atomic_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch(
+                "crosscut.ive_face_identity_gallery.os.link",
+                side_effect=OSError(errno.ENOTSUP, "hard links unsupported"),
+            ):
+                artifact = write_ive_face_identity_gallery_artifact(
+                    root,
+                    self.gallery,
+                )
+
+            restored = load_ive_face_identity_gallery_artifact(
+                artifact.path,
+                expected_content_sha256=artifact.content_sha256,
+            )
+            self.assertEqual(restored.gallery.to_dict(), self.gallery.to_dict())
+            self.assertFalse(
+                any(
+                    path.name.endswith(".publish-lock")
+                    or path.name.endswith(".tmp")
+                    for path in root.rglob("*")
+                )
+            )
 
     def test_tamper_symlink_duplicate_key_and_nonfinite_json_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

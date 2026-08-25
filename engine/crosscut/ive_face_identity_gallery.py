@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import errno
 import hashlib
 import hmac
 import json
@@ -56,7 +57,7 @@ from .visual_score import (
 
 
 IVE_FACE_IDENTITY_GALLERY_CONTRACT = "ive_private_face_identity_gallery_v1"
-IVE_FACE_IDENTITY_GALLERY_SCHEMA_VERSION = 1
+IVE_FACE_IDENTITY_GALLERY_SCHEMA_VERSION = 2
 PRIVATE_LOCAL_DISTRIBUTION_POLICY = (
     "private_local_only_never_stageedit_snapshot_or_general_audit_v1"
 )
@@ -81,6 +82,23 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _VIDEO_ID = re.compile(r"[0-9A-Za-z_-]{6,32}")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _MEMBERS = tuple(IVEMember)
+_MINIMUM_AMBIGUITY_OUTLIER_COHESION_MARGIN = 0.12
+_MAXIMUM_AMBIGUITY_RESOLUTION_STATES = 10_000
+_UNSUPPORTED_HARD_LINK_ERRNOS = frozenset(
+    {
+        errno.EPERM,
+        errno.EXDEV,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
 
 _MEMBER_TITLE_SIGNALS: Mapping[IVEMember, tuple[str, ...]] = MappingProxyType(
     {
@@ -101,6 +119,174 @@ _MEMBER_TITLE_SIGNALS: Mapping[IVEMember, tuple[str, ...]] = MappingProxyType(
 
 class IVEFaceGalleryError(ValueError):
     """Invalid gallery inputs or a failed conservative build gate."""
+
+
+@dataclass(frozen=True, slots=True)
+class IVEFaceGalleryAmbiguityConflict:
+    """Scalar-only provenance for one unsafe cross-member prototype pair."""
+
+    left_member: IVEMember | str
+    right_member: IVEMember | str
+    left_source_provenance_sha256: str
+    right_source_provenance_sha256: str
+    left_source_media_sha256: str
+    right_source_media_sha256: str
+    similarity: float
+    maximum_allowed_similarity: float
+
+    def __post_init__(self) -> None:
+        left_member = _member(self.left_member, "left_member")
+        right_member = _member(self.right_member, "right_member")
+        if left_member is right_member:
+            raise IVEFaceGalleryError(
+                "ambiguity conflict must join two different IVE members"
+            )
+        object.__setattr__(self, "left_member", left_member)
+        object.__setattr__(self, "right_member", right_member)
+        for name in (
+            "left_source_provenance_sha256",
+            "right_source_provenance_sha256",
+            "left_source_media_sha256",
+            "right_source_media_sha256",
+        ):
+            object.__setattr__(self, name, _sha256(getattr(self, name), name))
+        similarity = _finite(self.similarity, "inter-member similarity")
+        maximum = _probability(
+            self.maximum_allowed_similarity,
+            "maximum inter-member similarity",
+        )
+        if not -1.0 <= similarity <= 1.0:
+            raise IVEFaceGalleryError(
+                "inter-member similarity must be in [-1, 1]"
+            )
+        if similarity < maximum:
+            raise IVEFaceGalleryError(
+                "ambiguity conflict must meet the configured ceiling"
+            )
+        object.__setattr__(self, "similarity", similarity)
+        object.__setattr__(self, "maximum_allowed_similarity", maximum)
+        if self.left_source_provenance_sha256 == self.right_source_provenance_sha256:
+            raise IVEFaceGalleryError(
+                "ambiguity conflict provenance sources must be distinct"
+            )
+        if self.left_source_media_sha256 == self.right_source_media_sha256:
+            raise IVEFaceGalleryError(
+                "ambiguity conflict media sources must be distinct"
+            )
+        if _MEMBERS.index(left_member) > _MEMBERS.index(right_member):
+            object.__setattr__(self, "left_member", right_member)
+            object.__setattr__(self, "right_member", left_member)
+            for left_name, right_name in (
+                (
+                    "left_source_provenance_sha256",
+                    "right_source_provenance_sha256",
+                ),
+                ("left_source_media_sha256", "right_source_media_sha256"),
+            ):
+                left_value = getattr(self, left_name)
+                right_value = getattr(self, right_name)
+                object.__setattr__(self, left_name, right_value)
+                object.__setattr__(self, right_name, left_value)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "left_member": self.left_member.value,
+            "right_member": self.right_member.value,
+            "left_source_provenance_sha256": (
+                self.left_source_provenance_sha256
+            ),
+            "right_source_provenance_sha256": (
+                self.right_source_provenance_sha256
+            ),
+            "left_source_media_sha256": self.left_source_media_sha256,
+            "right_source_media_sha256": self.right_source_media_sha256,
+            "similarity": self.similarity,
+            "maximum_allowed_similarity": self.maximum_allowed_similarity,
+        }
+
+
+class IVEFaceGalleryAmbiguityError(IVEFaceGalleryError):
+    """Cross-member ambiguity lacks a conservative evidence-safe resolution."""
+
+    def __init__(
+        self,
+        conflicts: Sequence[IVEFaceGalleryAmbiguityConflict],
+        *,
+        candidate_count_by_member: Mapping[str, int],
+        minimum_videos_per_member: int,
+        search_state_count: int,
+    ) -> None:
+        provided = tuple(conflicts)
+        if not provided or not all(
+            isinstance(item, IVEFaceGalleryAmbiguityConflict)
+            for item in provided
+        ):
+            raise IVEFaceGalleryError(
+                "ambiguity error requires typed scalar conflicts"
+            )
+        values = tuple(
+            sorted(
+                provided,
+                key=lambda item: (
+                    _MEMBERS.index(item.left_member),
+                    item.left_source_provenance_sha256,
+                    _MEMBERS.index(item.right_member),
+                    item.right_source_provenance_sha256,
+                ),
+            )
+        )
+        if not isinstance(candidate_count_by_member, Mapping):
+            raise IVEFaceGalleryError(
+                "ambiguity candidate counts must be a mapping"
+            )
+        expected_members = {member.value for member in _MEMBERS}
+        if set(candidate_count_by_member) != expected_members:
+            raise IVEFaceGalleryError(
+                "ambiguity candidate counts must cover exactly six IVE members"
+            )
+        normalized_counts: dict[str, int] = {}
+        for member, count in candidate_count_by_member.items():
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise IVEFaceGalleryError(
+                    "ambiguity candidate counts must be non-negative integers"
+                )
+            normalized_counts[member] = count
+        if (
+            isinstance(minimum_videos_per_member, bool)
+            or not isinstance(minimum_videos_per_member, int)
+            or minimum_videos_per_member < 1
+        ):
+            raise IVEFaceGalleryError(
+                "ambiguity minimum video floor must be a positive integer"
+            )
+        if (
+            isinstance(search_state_count, bool)
+            or not isinstance(search_state_count, int)
+            or search_state_count < 1
+        ):
+            raise IVEFaceGalleryError(
+                "ambiguity search state count must be a positive integer"
+            )
+        self.conflicts = values
+        self.diagnostics = {
+            "contract": "ive_face_gallery_scalar_ambiguity_diagnostics_v1",
+            "feasible_safe_subset_found": False,
+            "candidate_count_by_member": dict(sorted(normalized_counts.items())),
+            "minimum_videos_per_member": minimum_videos_per_member,
+            "search_state_count": search_state_count,
+            "conflict_count": len(values),
+            "conflicts": [item.to_dict() for item in values],
+            "privacy": {
+                "contains_raw_embeddings": False,
+                "contains_raw_frames": False,
+                "contains_local_paths": False,
+                "contains_plain_video_ids": False,
+            },
+        }
+        super().__init__(
+            "inter-member ambiguity cannot be resolved without weakening "
+            "independent outlier evidence or the per-member video floor"
+        )
 
 
 class IVEFaceGalleryArtifactError(IVEFaceGalleryError):
@@ -605,6 +791,7 @@ class IVEFaceGalleryConfig:
     minimum_within_video_similarity: float = 0.45
     minimum_same_member_video_similarity: float = 0.42
     maximum_inter_member_similarity: float = 0.78
+    minimum_ambiguity_outlier_cohesion_margin: float = 0.12
     minimum_open_set_similarity: float = 0.48
     minimum_open_set_top_two_margin: float = 0.08
     probability_temperature: float = 0.08
@@ -642,6 +829,7 @@ class IVEFaceGalleryConfig:
             "minimum_within_video_similarity",
             "minimum_same_member_video_similarity",
             "maximum_inter_member_similarity",
+            "minimum_ambiguity_outlier_cohesion_margin",
             "minimum_open_set_similarity",
             "minimum_open_set_top_two_margin",
         ):
@@ -653,6 +841,12 @@ class IVEFaceGalleryConfig:
         if self.maximum_inter_member_similarity <= self.minimum_open_set_similarity:
             raise IVEFaceGalleryError(
                 "inter-member ambiguity ceiling must exceed open-set similarity gate"
+            )
+        if self.minimum_ambiguity_outlier_cohesion_margin < (
+            _MINIMUM_AMBIGUITY_OUTLIER_COHESION_MARGIN
+        ):
+            raise IVEFaceGalleryError(
+                "ambiguity outlier cohesion margin cannot weaken the sealed minimum"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1072,6 +1266,322 @@ def _robust_medoid_index(vectors: Sequence[Sequence[float]]) -> int:
     return max(scored, key=lambda item: (item[0], item[1], -item[2]))[2]
 
 
+@dataclass(frozen=True, slots=True)
+class _GalleryCentroidNode:
+    member: IVEMember
+    provenance: OfficialTargetMemberFancamProvenance
+    vector: tuple[float, ...]
+    inliers: tuple[AuthorizedFaceEmbeddingSample, ...]
+    same_member_cohesion: float
+    peer_cluster_cohesion: float
+    independently_supported_outlier: bool
+
+
+def _select_member_cap_exact(
+    nodes: Sequence[_GalleryCentroidNode], maximum: int
+) -> tuple[tuple[_GalleryCentroidNode, ...], tuple[_GalleryCentroidNode, ...]]:
+    """Maximize count, song coverage, cohesion, then digest deterministically."""
+
+    values = tuple(
+        sorted(nodes, key=lambda item: item.provenance.provenance_sha256)
+    )
+    if len(values) <= maximum:
+        return (values, ())
+
+    by_song: dict[str, list[_GalleryCentroidNode]] = {}
+    for node in values:
+        by_song.setdefault(node.provenance.song.casefold(), []).append(node)
+    for song_nodes in by_song.values():
+        song_nodes.sort(
+            key=lambda item: (
+                -item.same_member_cohesion,
+                item.provenance.provenance_sha256,
+            )
+        )
+
+    representatives = [song_nodes[0] for song_nodes in by_song.values()]
+    representatives.sort(
+        key=lambda item: (
+            -item.same_member_cohesion,
+            item.provenance.provenance_sha256,
+        )
+    )
+    if len(representatives) >= maximum:
+        selected_values = representatives[:maximum]
+    else:
+        selected_values = list(representatives)
+        selected_digests = {
+            item.provenance.provenance_sha256 for item in selected_values
+        }
+        remaining = sorted(
+            (
+                item
+                for item in values
+                if item.provenance.provenance_sha256 not in selected_digests
+            ),
+            key=lambda item: (
+                -item.same_member_cohesion,
+                item.provenance.provenance_sha256,
+            ),
+        )
+        selected_values.extend(remaining[: maximum - len(selected_values)])
+
+    selected_digest_set = {
+        item.provenance.provenance_sha256 for item in selected_values
+    }
+    selected = tuple(
+        item
+        for item in values
+        if item.provenance.provenance_sha256 in selected_digest_set
+    )
+    rejected = tuple(
+        item
+        for item in values
+        if item.provenance.provenance_sha256 not in selected_digest_set
+    )
+    return (selected, rejected)
+
+
+def _maximum_safe_inter_member_subset(
+    accepted_centroids: Mapping[
+        IVEMember,
+        Sequence[
+            tuple[
+                OfficialTargetMemberFancamProvenance,
+                tuple[float, ...],
+                tuple[AuthorizedFaceEmbeddingSample, ...],
+            ]
+        ],
+    ],
+    policy: IVEFaceGalleryConfig,
+) -> tuple[
+    dict[
+        IVEMember,
+        list[
+            tuple[
+                OfficialTargetMemberFancamProvenance,
+                tuple[float, ...],
+                tuple[AuthorizedFaceEmbeddingSample, ...],
+            ]
+        ],
+    ],
+    tuple[_GalleryCentroidNode, ...],
+    tuple[_GalleryCentroidNode, ...],
+    tuple[IVEFaceGalleryAmbiguityConflict, ...],
+    int,
+]:
+    """Select the largest evidence-safe source set without weakening gates.
+
+    The resolver sees only per-video centroids that already passed within-video
+    and same-member robustness.  A cross-member edge may remove a source only
+    when at least two independent same-member peers form a robust cluster and
+    the source trails that peer cluster by the fixed conservative margin.  A
+    symmetric, genuinely lookalike collision fails closed.  This evidence-first
+    reduction is linear after pairwise scoring, so the 72-source policy maximum
+    has no exponential independent-set search.  No vector leaves this process;
+    failures expose only scalar similarities and content digests.
+    """
+
+    nodes: list[_GalleryCentroidNode] = []
+    for member in _MEMBERS:
+        member_values = tuple(
+            sorted(
+                accepted_centroids[member],
+                key=lambda item: item[0].provenance_sha256,
+            )
+        )
+        for provenance, vector, inliers in member_values:
+            peers = [
+                (other_provenance, other_vector)
+                for other_provenance, other_vector, _other_inliers in member_values
+                if other_provenance.provenance_sha256
+                != provenance.provenance_sha256
+            ]
+            peer_vectors = [item[1] for item in peers]
+            cohesion = (
+                math.fsum(_similarity(vector, peer) for peer in peer_vectors)
+                / len(peer_vectors)
+                if peer_vectors
+                else 1.0
+            )
+            peer_pair_similarities = [
+                _similarity(left_peer, right_peer)
+                for left_index, left_peer in enumerate(peer_vectors)
+                for right_peer in peer_vectors[left_index + 1 :]
+            ]
+            peer_cluster_cohesion = (
+                math.fsum(peer_pair_similarities)
+                / len(peer_pair_similarities)
+                if peer_pair_similarities
+                else 1.0
+            )
+            peer_cluster_is_independent_and_robust = (
+                len(peer_vectors)
+                >= max(2, policy.minimum_videos_per_member)
+                and bool(peer_pair_similarities)
+                and min(peer_pair_similarities)
+                >= policy.minimum_same_member_video_similarity
+            )
+            nodes.append(
+                _GalleryCentroidNode(
+                    member=member,
+                    provenance=provenance,
+                    vector=vector,
+                    inliers=inliers,
+                    same_member_cohesion=cohesion,
+                    peer_cluster_cohesion=peer_cluster_cohesion,
+                    independently_supported_outlier=(
+                        peer_cluster_is_independent_and_robust
+                        and peer_cluster_cohesion - cohesion
+                        >= policy.minimum_ambiguity_outlier_cohesion_margin
+                    ),
+                )
+            )
+
+    candidate_count_by_member = {
+        member: sum(node.member is member for node in nodes) for member in _MEMBERS
+    }
+    pairwise_resolution_states = sum(
+        candidate_count_by_member[left_member]
+        * candidate_count_by_member[right_member]
+        for left_index, left_member in enumerate(_MEMBERS)
+        for right_member in _MEMBERS[left_index + 1 :]
+    )
+    resolution_state_count = 1 + len(nodes) + pairwise_resolution_states
+    if resolution_state_count > _MAXIMUM_AMBIGUITY_RESOLUTION_STATES:
+        raise IVEFaceGalleryError(
+            "inter-member ambiguity resolution exceeded its deterministic "
+            "state budget"
+        )
+
+    adjacency = [0] * len(nodes)
+    conflicts: list[IVEFaceGalleryAmbiguityConflict] = []
+    conflict_node_pairs: list[tuple[int, int]] = []
+    for left_index, left in enumerate(nodes):
+        for right_index in range(left_index + 1, len(nodes)):
+            right = nodes[right_index]
+            if left.member is right.member:
+                continue
+            similarity = _similarity(left.vector, right.vector)
+            if similarity < policy.maximum_inter_member_similarity:
+                continue
+            adjacency[left_index] |= 1 << right_index
+            adjacency[right_index] |= 1 << left_index
+            conflict_node_pairs.append((left_index, right_index))
+            conflicts.append(
+                IVEFaceGalleryAmbiguityConflict(
+                    left_member=left.member,
+                    right_member=right.member,
+                    left_source_provenance_sha256=(
+                        left.provenance.provenance_sha256
+                    ),
+                    right_source_provenance_sha256=(
+                        right.provenance.provenance_sha256
+                    ),
+                    left_source_media_sha256=(
+                        left.provenance.media_content_sha256
+                    ),
+                    right_source_media_sha256=(
+                        right.provenance.media_content_sha256
+                    ),
+                    similarity=similarity,
+                    maximum_allowed_similarity=(
+                        policy.maximum_inter_member_similarity
+                    ),
+                )
+            )
+
+    ordered_conflicts = tuple(
+        sorted(
+            conflicts,
+            key=lambda item: (
+                _MEMBERS.index(item.left_member),
+                item.left_source_provenance_sha256,
+                _MEMBERS.index(item.right_member),
+                item.right_source_provenance_sha256,
+            ),
+        )
+    )
+    safe_outlier_indices = {
+        index
+        for index, node in enumerate(nodes)
+        if adjacency[index] and node.independently_supported_outlier
+    }
+    unresolved_conflicts = tuple(
+        conflict
+        for conflict, (left_index, right_index) in zip(
+            conflicts, conflict_node_pairs, strict=True
+        )
+        if left_index not in safe_outlier_indices
+        and right_index not in safe_outlier_indices
+    )
+    if unresolved_conflicts:
+        raise IVEFaceGalleryAmbiguityError(
+            unresolved_conflicts,
+            candidate_count_by_member={
+                member.value: len(accepted_centroids[member])
+                for member in _MEMBERS
+            },
+            minimum_videos_per_member=policy.minimum_videos_per_member,
+            search_state_count=resolution_state_count,
+        )
+
+    ambiguity_rejected = tuple(
+        nodes[index] for index in sorted(safe_outlier_indices)
+    )
+    evidence_safe_nodes = tuple(
+        node
+        for index, node in enumerate(nodes)
+        if index not in safe_outlier_indices
+    )
+    safe_count_by_member = {
+        member: sum(node.member is member for node in evidence_safe_nodes)
+        for member in _MEMBERS
+    }
+    if any(
+        safe_count_by_member[member] < policy.minimum_videos_per_member
+        for member in _MEMBERS
+    ):
+        raise IVEFaceGalleryAmbiguityError(
+            ordered_conflicts,
+            candidate_count_by_member={
+                member.value: len(accepted_centroids[member])
+                for member in _MEMBERS
+            },
+            minimum_videos_per_member=policy.minimum_videos_per_member,
+            search_state_count=resolution_state_count,
+        )
+
+    selected: dict[
+        IVEMember,
+        list[
+            tuple[
+                OfficialTargetMemberFancamProvenance,
+                tuple[float, ...],
+                tuple[AuthorizedFaceEmbeddingSample, ...],
+            ]
+        ],
+    ] = {member: [] for member in _MEMBERS}
+    cap_rejected: list[_GalleryCentroidNode] = []
+    for member in _MEMBERS:
+        retained, capped = _select_member_cap_exact(
+            tuple(node for node in evidence_safe_nodes if node.member is member),
+            policy.maximum_videos_per_member,
+        )
+        cap_rejected.extend(capped)
+        for node in retained:
+            selected[node.member].append(
+                (node.provenance, node.vector, node.inliers)
+            )
+    return (
+        selected,
+        ambiguity_rejected,
+        tuple(cap_rejected),
+        ordered_conflicts,
+        resolution_state_count,
+    )
+
+
 def build_ive_face_identity_gallery(
     samples: Sequence[AuthorizedFaceEmbeddingSample],
     *,
@@ -1094,8 +1604,9 @@ def build_ive_face_identity_gallery(
     }
     media_labels: dict[str, IVEMember] = {}
     video_labels: dict[str, IVEMember] = {}
-    for item in provided:
-        provenance = item.provenance
+    media_sources: dict[str, str] = {}
+    video_sources: dict[str, str] = {}
+    for provenance in sources.values():
         for key, labels in (
             (provenance.media_content_sha256, media_labels),
             (provenance.video_id, video_labels),
@@ -1106,6 +1617,19 @@ def build_ive_face_identity_gallery(
                     "one authorized source is labelled as multiple IVE members"
                 )
             labels[key] = provenance.target_member
+        for key, independent_sources, identity_name in (
+            (provenance.media_content_sha256, media_sources, "media content"),
+            (provenance.video_id, video_sources, "video ID"),
+        ):
+            previous_source = independent_sources.get(key)
+            if (
+                previous_source is not None
+                and previous_source != provenance.provenance_sha256
+            ):
+                raise IVEFaceGalleryError(
+                    f"duplicate {identity_name} cannot count as independent videos"
+                )
+            independent_sources[key] = provenance.provenance_sha256
 
     rejections: list[IVEFaceGalleryRejection] = []
     candidate_centroids: dict[
@@ -1131,21 +1655,7 @@ def build_ive_face_identity_gallery(
                 f"{member.value} needs at least {policy.minimum_videos_per_member} "
                 "independent authorized videos"
             )
-        selected_source_digests = tuple(sorted(by_source))[
-            : policy.maximum_videos_per_member
-        ]
-        for source_digest in sorted(set(by_source) - set(selected_source_digests)):
-            for sample in by_source[source_digest]:
-                rejections.append(
-                    IVEFaceGalleryRejection(
-                        member,
-                        source_digest,
-                        sample.sample_sha256,
-                        "member_video_cap",
-                    )
-                )
-
-        for source_digest in selected_source_digests:
+        for source_digest in sorted(by_source):
             ordered = sorted(by_source[source_digest], key=_sample_sort_key)
             temporally_spaced: list[AuthorizedFaceEmbeddingSample] = []
             for sample in ordered:
@@ -1265,20 +1775,33 @@ def build_ive_face_identity_gallery(
                 f"{member.value} same-member video cluster is not robust"
             )
 
-    for left_index, left_member in enumerate(_MEMBERS):
-        for right_member in _MEMBERS[left_index + 1 :]:
-            for _left_source, left_vector, _left_samples in accepted_centroids[
-                left_member
-            ]:
-                for _right_source, right_vector, _right_samples in accepted_centroids[
-                    right_member
-                ]:
-                    if _similarity(left_vector, right_vector) >= (
-                        policy.maximum_inter_member_similarity
-                    ):
-                        raise IVEFaceGalleryError(
-                            "inter-member ambiguity gate rejected the gallery"
-                        )
+    (
+        accepted_centroids,
+        ambiguity_rejected,
+        cap_rejected,
+        _ambiguity_conflicts,
+        _ambiguity_search_state_count,
+    ) = _maximum_safe_inter_member_subset(accepted_centroids, policy)
+    for node in ambiguity_rejected:
+        for sample in node.inliers:
+            rejections.append(
+                IVEFaceGalleryRejection(
+                    node.member,
+                    node.provenance.provenance_sha256,
+                    sample.sample_sha256,
+                    "inter_member_ambiguous_outlier_source",
+                )
+            )
+    for node in cap_rejected:
+        for sample in node.inliers:
+            rejections.append(
+                IVEFaceGalleryRejection(
+                    node.member,
+                    node.provenance.provenance_sha256,
+                    sample.sample_sha256,
+                    "member_video_cap",
+                )
+            )
 
     prototypes: list[IVEFacePrototype] = []
     for member in _MEMBERS:
@@ -1607,6 +2130,114 @@ def _safe_directory(parent: Path, name: str) -> Path:
     return child
 
 
+def _fsync_artifact_directory(directory: Path) -> None:
+    """Flush a directory entry where the backing filesystem supports it."""
+
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _publish_without_hard_links(
+    *,
+    temporary: Path,
+    destination: Path,
+    encoded: bytes,
+    shard: Path,
+    digest: str,
+) -> None:
+    """Atomically publish on ExFAT-like filesystems under an exclusive lock.
+
+    Hard-link publication gives POSIX no-clobber semantics, but ExFAT rejects
+    ``link(2)``.  The fallback serializes cooperative writers with an
+    exclusively-created lock, then renames the already-fsynced temporary file
+    on the same filesystem.  A stale lock fails closed; an already published
+    destination is accepted only when its bytes are exactly identical.
+    """
+
+    lock = shard / f".{digest}.publish-lock"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(lock, flags, 0o600)
+    except FileExistsError as exc:
+        if destination.exists() and not destination.is_symlink():
+            existing = _read_regular_nonsymlink(destination)
+            if hmac.compare_digest(existing, encoded):
+                return
+        raise IVEFaceGalleryArtifactError(
+            "gallery artifact publication lock is already held"
+        ) from exc
+
+    lock_identity = os.fstat(lock_descriptor)
+    marker = f"{os.getpid()}:{uuid.uuid4().hex}\n".encode("ascii")
+    try:
+        if os.write(lock_descriptor, marker) != len(marker):
+            raise IVEFaceGalleryArtifactError(
+                "gallery artifact publication lock write was incomplete"
+            )
+        os.fsync(lock_descriptor)
+        if destination.is_symlink():
+            raise IVEFaceGalleryArtifactError(
+                "gallery artifact path became a symlink"
+            )
+        if destination.exists():
+            existing = _read_regular_nonsymlink(destination)
+            if not hmac.compare_digest(existing, encoded):
+                raise IVEFaceGalleryArtifactError(
+                    "concurrent gallery writer published different bytes"
+                )
+        else:
+            os.replace(temporary, destination)
+            destination.chmod(0o400)
+        published = _read_regular_nonsymlink(destination)
+        if not hmac.compare_digest(published, encoded):
+            raise IVEFaceGalleryArtifactError(
+                "published gallery artifact bytes do not reproduce"
+            )
+        _fsync_artifact_directory(shard)
+    finally:
+        os.close(lock_descriptor)
+        try:
+            current = os.lstat(lock)
+            owned_lock = (
+                stat.S_ISREG(current.st_mode)
+                and (current.st_dev, current.st_ino)
+                == (lock_identity.st_dev, lock_identity.st_ino)
+            )
+            if not owned_lock and stat.S_ISREG(current.st_mode):
+                # ExFAT can report an unstable synthetic inode after close.
+                # Re-authenticate the exact random marker before removing the
+                # lock rather than leaving every successful publication stale.
+                lock_reader = os.open(
+                    lock,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    opened = os.fstat(lock_reader)
+                    owned_lock = bool(
+                        stat.S_ISREG(opened.st_mode)
+                        and opened.st_size == len(marker)
+                        and os.read(lock_reader, len(marker) + 1) == marker
+                    )
+                finally:
+                    os.close(lock_reader)
+            if owned_lock:
+                lock.unlink()
+        except OSError:
+            pass
+
+
 def write_ive_face_identity_gallery_artifact(
     artifact_directory: Path,
     gallery: IVEFaceIdentityGallery,
@@ -1653,11 +2284,17 @@ def write_ive_face_identity_gallery_artifact(
                 raise IVEFaceGalleryArtifactError(
                     "concurrent gallery writer published different bytes"
                 )
-        directory_fd = os.open(shard, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_HARD_LINK_ERRNOS:
+                raise
+            _publish_without_hard_links(
+                temporary=temporary,
+                destination=destination,
+                encoded=encoded,
+                shard=shard,
+                digest=digest,
+            )
+        _fsync_artifact_directory(shard)
     except IVEFaceGalleryArtifactError:
         raise
     except OSError as exc:
@@ -1796,6 +2433,8 @@ __all__ = [
     "SINGLE_DOMINANT_YUNET_FACE_CONTRACT",
     "TITLE_MEMBER_AUTHORIZATION_CONTRACT",
     "AuthorizedFaceEmbeddingSample",
+    "IVEFaceGalleryAmbiguityConflict",
+    "IVEFaceGalleryAmbiguityError",
     "IVEFaceGalleryArtifact",
     "IVEFaceGalleryArtifactError",
     "IVEFaceGalleryConfig",
