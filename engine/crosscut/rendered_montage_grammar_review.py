@@ -823,27 +823,40 @@ def _overlap(left: float, right: float, start: float, end: float) -> float:
     return max(0.0, min(right, end) - max(left, start))
 
 
-def _transform_has_nonidentity(value: Any, name: str) -> bool:
+def _transform_has_within_segment_motion(value: Any, name: str) -> bool:
+    """Return whether a track changes while one rendered shot is on screen.
+
+    A constant non-identity Dynamic Crop track is safe shot framing, not an
+    editorial motion accent.  In particular, different constant crops on two
+    sides of a hard cut must never satisfy the highlight motion requirement.
+    The release-bound Dynamic Crop v3 authority applies a stricter model-logit
+    and renderer-sampled physical-range gate later; this structural review
+    first ensures that track presence or a cut-time reframe cannot qualify on
+    its own.
+    """
+
     transform = _mapping(value, name)
     if transform.get("keyframes") is None:
         return False
     keyframes = _sequence(transform.get("keyframes"), f"{name}.keyframes")
     if not keyframes:
         return False
-    nonidentity = False
+    states: list[tuple[float, float, float, float]] = []
     for index, raw in enumerate(keyframes):
         keyframe = _mapping(raw, f"{name}.keyframes[{index}]")
         zoom = _finite(keyframe.get("zoom"), "editorial zoom")
         center_x = _finite(keyframe.get("center_x"), "editorial center_x")
         center_y = _finite(keyframe.get("center_y"), "editorial center_y")
         roll = _finite(keyframe.get("roll_degrees"), "editorial roll")
-        nonidentity = nonidentity or not (
-            math.isclose(zoom, 1.0, abs_tol=_EPSILON)
-            and math.isclose(center_x, 0.5, abs_tol=_EPSILON)
-            and math.isclose(center_y, 0.5, abs_tol=_EPSILON)
-            and math.isclose(roll, 0.0, abs_tol=_EPSILON)
+        states.append((zoom, center_x, center_y, roll))
+    first = states[0]
+    return any(
+        any(
+            not math.isclose(left, right, abs_tol=_EPSILON)
+            for left, right in zip(first, state, strict=True)
         )
-    return nonidentity
+        for state in states[1:]
+    )
 
 
 def _motion_accent_segment_indices(analysis: Mapping[str, Any]) -> set[int]:
@@ -859,7 +872,7 @@ def _motion_accent_segment_indices(analysis: Mapping[str, Any]) -> set[int]:
                 if (
                     isinstance(index, int)
                     and not isinstance(index, bool)
-                    and _transform_has_nonidentity(
+                    and _transform_has_within_segment_motion(
                         {"keyframes": raw.get("keyframes")},
                         f"editorial_motion.segments[{index}]",
                     )
@@ -873,7 +886,7 @@ def _motion_accent_segment_indices(analysis: Mapping[str, Any]) -> set[int]:
                 if (
                     isinstance(raw, Mapping)
                     and raw.get("editorial_transform") is not None
-                    and _transform_has_nonidentity(
+                    and _transform_has_within_segment_motion(
                         raw.get("editorial_transform"),
                         f"render.segments[{position}].editorial_transform",
                     )
@@ -3400,7 +3413,7 @@ def review_rendered_montage_grammar(
                 "motion_accent_run_count": motion_count,
                 "editorial_motion_accent_switch_boundaries": {
                     "evidence_contract": (
-                        "bounded_nonidentity_editorial_transform_overlap_v1"
+                        "bounded_within_segment_editorial_transform_change_v1"
                     ),
                     "is_choreography_motion_proof": False,
                     "profile_v2_human_distribution_available": False,

@@ -1261,6 +1261,47 @@ class RenderedMontageGrammarReviewTests(unittest.TestCase):
             result["failure_codes"],
         )
 
+    def test_constant_nonidentity_framing_does_not_count_as_motion_accent(
+        self,
+    ) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        for segment in fixture["editorial_motion"]["segments"]:
+            segment["applied"] = True
+            segment["keyframes"] = [
+                {
+                    "time_seconds": 0.0,
+                    "zoom": 1.02,
+                    "center_x": 0.51,
+                    "center_y": 0.49,
+                    "roll_degrees": 0.2,
+                },
+                {
+                    "time_seconds": 0.75,
+                    "zoom": 1.02,
+                    "center_x": 0.51,
+                    "center_y": 0.49,
+                    "roll_degrees": 0.2,
+                },
+            ]
+
+        result = _review(fixture)
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "section_0:highlight_motion_accent_missing",
+            result["failure_codes"],
+        )
+
     def test_same_derivative_camera_family_does_not_create_a_multicam_burst(self) -> None:
         fixture = _analysis(
             ("group_wide", "medium", "close_up", "full_shot", "medium", "close_up"),
