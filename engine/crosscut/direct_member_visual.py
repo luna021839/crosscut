@@ -4129,7 +4129,8 @@ def _bounded_same_source_hold_visual_path(
     source_order: Sequence[int],
     candidate_validity: Sequence[Sequence[bool]],
     span_durations: Sequence[float],
-    protected_cut_boundary_indices: Sequence[int] = (),
+    priority_cut_boundary_indices: Sequence[int] = (),
+    maximum_priority_cut_hold_count: int = 0,
     config: DirectMemberVisualConfig,
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Find a safe all-source path with a small number of no-cut holds.
@@ -4139,7 +4140,9 @@ def _bounded_same_source_hold_visual_path(
     ineligible.  The fallback is attempted only after the strict all-cut path
     fails, preserves the exact balanced quotas and duration gate, and caps
     both the total and consecutive holds so MEMBER edits retain normal cut
-    density even with four to six available fancams.
+    density even with sparse fancams. Priority boundaries use a separate,
+    caller-audited redundancy budget; their remaining cut density is never
+    inferred by this optimizer.
     """
 
     span_count = len(matrices) + 1
@@ -4153,16 +4156,22 @@ def _bounded_same_source_hold_visual_path(
     ):
         raise ValueError("same-source hold fallback shape is invalid")
     boundary_count = span_count - 1
-    protected_boundaries = frozenset(
-        int(value) for value in protected_cut_boundary_indices
+    priority_boundaries = frozenset(
+        int(value) for value in priority_cut_boundary_indices
     )
     if any(
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 0 <= value < boundary_count
-        for value in protected_cut_boundary_indices
+        for value in priority_cut_boundary_indices
     ):
-        raise ValueError("protected cut boundary indices are invalid")
+        raise ValueError("priority cut boundary indices are invalid")
+    if (
+        isinstance(maximum_priority_cut_hold_count, bool)
+        or not isinstance(maximum_priority_cut_hold_count, int)
+        or maximum_priority_cut_hold_count < 0
+    ):
+        raise ValueError("maximum priority cut hold count is invalid")
     maximum_hold_count = min(
         config.maximum_same_source_hold_count,
         max(
@@ -4206,6 +4215,7 @@ def _bounded_same_source_hold_visual_path(
                 int,
                 int,
                 int,
+                int,
                 tuple[float, ...],
             ],
             _BeamNode,
@@ -4227,6 +4237,7 @@ def _bounded_same_source_hold_visual_path(
                     -1,
                     0,
                     0,
+                    0,
                     _duration_signature(duration_totals),
                 )
             ] = _BeamNode(cost, (source_index,), tuple(duration_totals))
@@ -4243,6 +4254,7 @@ def _bounded_same_source_hold_visual_path(
                     int,
                     int,
                     int,
+                    int,
                     tuple[float, ...],
                 ],
                 _BeamNode,
@@ -4253,6 +4265,7 @@ def _bounded_same_source_hold_visual_path(
                 previous_previous,
                 hold_count,
                 consecutive_hold_count,
+                priority_hold_count,
                 _duration_state,
             ), node in states.items():
                 for source_index in source_order:
@@ -4262,12 +4275,19 @@ def _bounded_same_source_hold_visual_path(
                     ):
                         continue
                     is_hold = source_index == previous
+                    is_priority_hold = bool(
+                        is_hold and position - 1 in priority_boundaries
+                    )
                     if is_hold:
                         if (
-                            position - 1 in protected_boundaries
-                            or hold_count >= maximum_hold_count
+                            hold_count >= maximum_hold_count
                             or consecutive_hold_count
                             >= config.maximum_consecutive_same_source_holds
+                            or (
+                                is_priority_hold
+                                and priority_hold_count
+                                >= maximum_priority_cut_hold_count
+                            )
                         ):
                             continue
                         same_source_run_seconds = durations[position]
@@ -4295,6 +4315,9 @@ def _bounded_same_source_hold_visual_path(
                         continue
                     next_hold_count = hold_count + int(is_hold)
                     next_consecutive = consecutive_hold_count + 1 if is_hold else 0
+                    next_priority_hold_count = (
+                        priority_hold_count + int(is_priority_hold)
+                    )
                     transition_cost = (
                         config.same_source_hold_penalty
                         if is_hold
@@ -4322,6 +4345,7 @@ def _bounded_same_source_hold_visual_path(
                         previous,
                         next_hold_count,
                         next_consecutive,
+                        next_priority_hold_count,
                         _duration_signature(duration_totals),
                     )
                     existing = next_states.get(key)
@@ -4353,13 +4377,16 @@ def _bounded_same_source_hold_visual_path(
             else:
                 states = next_states
 
-        eligible: list[tuple[int, _BeamNode, tuple[float, ...]]] = []
+        eligible: list[
+            tuple[int, int, _BeamNode, tuple[float, ...]]
+        ] = []
         for (
             counts,
             _last,
             _previous,
             hold_count,
             _consecutive,
+            priority_hold_count,
             _duration_state,
         ), node in states.items():
             if counts != tuple(source_quotas):
@@ -4375,7 +4402,9 @@ def _bounded_same_source_hold_visual_path(
                 max(deviations)
                 <= config.maximum_source_duration_relative_deviation + 1e-9
             ):
-                eligible.append((hold_count, node, deviations))
+                eligible.append(
+                    (hold_count, priority_hold_count, node, deviations)
+                )
         attempt_diagnostics.append(
             {
                 "beam_width": width,
@@ -4387,12 +4416,13 @@ def _bounded_same_source_hold_visual_path(
             }
         )
         if eligible:
-            hold_count, best, deviations = min(
+            hold_count, priority_hold_count, best, deviations = min(
                 eligible,
                 key=lambda item: (
-                    item[1].cost,
+                    item[2].cost,
                     item[0],
-                    item[1].path,
+                    item[1],
+                    item[2].path,
                 ),
             )
             return (
@@ -4413,10 +4443,13 @@ def _bounded_same_source_hold_visual_path(
                     "maximum_same_source_run_seconds": (
                         config.maximum_same_source_run_seconds
                     ),
-                    "protected_cut_boundary_indices": sorted(
-                        protected_boundaries
+                    "priority_cut_boundary_indices": sorted(
+                        priority_boundaries
                     ),
-                    "protected_cut_boundary_hold_count": 0,
+                    "priority_cut_boundary_hold_count": priority_hold_count,
+                    "maximum_priority_cut_hold_count": (
+                        maximum_priority_cut_hold_count
+                    ),
                     "cross_source_severe_edge_count_selected": 0,
                     "all_source_quotas_satisfied": True,
                     "maximum_duration_relative_deviation": max(deviations),
@@ -4828,7 +4861,8 @@ def select_balanced_direct_member_sources(
     continuous_official_portrait_fancam_contract: bool = False,
     preferred_source_order: Sequence[int] | None = None,
     extra_quota_source_indices: Sequence[int] | None = None,
-    protected_cut_boundary_indices: Sequence[int] = (),
+    priority_cut_boundary_indices: Sequence[int] = (),
+    maximum_priority_cut_hold_count: int = 0,
     config: DirectMemberVisualConfig | None = None,
     descriptor_provider: DescriptorProvider | None = None,
 ) -> DirectMemberVisualSelection:
@@ -4845,6 +4879,9 @@ def select_balanced_direct_member_sources(
     ``extra_quota_source_indices`` changes only which sources receive the
     remainder slots of an otherwise exactly balanced quota.  It never changes
     source search order, content validity, severe-edge, or duration gates.
+    ``priority_cut_boundary_indices`` identifies section-critical cuts whose
+    no-cut continuations are separately capped by
+    ``maximum_priority_cut_hold_count``.
     """
 
     resolved_sources = tuple(Path(source) for source in sources)
@@ -4868,18 +4905,24 @@ def select_balanced_direct_member_sources(
             abs_tol=1e-7,
         ):
             raise ValueError("direct visual spans must be contiguous")
-    protected_boundaries = tuple(
-        int(value) for value in protected_cut_boundary_indices
+    priority_boundaries = tuple(
+        int(value) for value in priority_cut_boundary_indices
     )
     if any(
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 0 <= value < len(spans) - 1
-        for value in protected_cut_boundary_indices
+        for value in priority_cut_boundary_indices
     ):
-        raise ValueError("protected cut boundary indices are invalid")
-    if len(set(protected_boundaries)) != len(protected_boundaries):
-        raise ValueError("protected cut boundary indices must be unique")
+        raise ValueError("priority cut boundary indices are invalid")
+    if len(set(priority_boundaries)) != len(priority_boundaries):
+        raise ValueError("priority cut boundary indices must be unique")
+    if (
+        isinstance(maximum_priority_cut_hold_count, bool)
+        or not isinstance(maximum_priority_cut_hold_count, int)
+        or maximum_priority_cut_hold_count < 0
+    ):
+        raise ValueError("maximum priority cut hold count is invalid")
     if len(audio_offsets) != source_count:
         raise ValueError("direct visual audio_offsets must match sources")
     offsets = tuple(float(value) for value in audio_offsets)
@@ -5381,7 +5424,10 @@ def select_balanced_direct_member_sources(
                 source_order=order,
                 candidate_validity=candidate_validity,
                 span_durations=tuple(end - start for start, end in spans),
-                protected_cut_boundary_indices=protected_boundaries,
+                priority_cut_boundary_indices=priority_boundaries,
+                maximum_priority_cut_hold_count=(
+                    maximum_priority_cut_hold_count
+                ),
                 config=resolved_config,
             )
             if hold_fallback_authorized
@@ -5454,16 +5500,17 @@ def select_balanced_direct_member_sources(
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,
         "source_quota_assignment": quota_assignment_provenance,
-        "protected_cut_boundary_indices": list(protected_boundaries),
+        "priority_cut_boundary_indices": list(priority_boundaries),
+        "maximum_priority_cut_hold_count": maximum_priority_cut_hold_count,
     }
-    protected_hold_indices = tuple(
+    priority_hold_indices = tuple(
         boundary_index
-        for boundary_index in protected_boundaries
+        for boundary_index in priority_boundaries
         if path[boundary_index] == path[boundary_index + 1]
     )
-    if protected_hold_indices:
+    if len(priority_hold_indices) > maximum_priority_cut_hold_count:
         raise RuntimeError(
-            "direct member visual path consumed a protected cut boundary"
+            "direct member visual path exceeded priority cut hold limit"
         )
     current_source = path[0]
     current_run_seconds = spans[0][1] - spans[0][0]

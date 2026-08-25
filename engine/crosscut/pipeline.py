@@ -323,10 +323,12 @@ _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS = 3.5
 _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS = 4.2
 _DIRECT_MEMBER_MAX_RUN_SECONDS = 7.2
 _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS = 2.25
-_DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 18.8
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS = 1.8
+_DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 19.3
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE = 18.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE = 2.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS = 8.0
+_DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT = 2
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT = 64
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
@@ -3530,7 +3532,7 @@ def _direct_member_highlight_priority_boundary_indices(
     spans: Sequence[_DirectFullFrameSpan],
     intervals: Sequence[tuple[float, float]],
 ) -> tuple[int, ...]:
-    """Return cut boundaries that a no-cut fallback may not consume."""
+    """Return section-critical cuts governed by the compensated-hold budget."""
 
     items = tuple(spans)
     if len(items) < 2 or not intervals:
@@ -3553,8 +3555,9 @@ def _densify_direct_full_frame_highlights(
     """Add musically bound highlight cuts without weakening visual gates.
 
     The reference cadence remains roughly four timing units outside active
-    sections.  Inside BUILD/CHORUS-like intervals, selected four/six-unit holds
-    are split only at boundaries already emitted by ``build_group_draft``.
+    sections.  Inside BUILD/CHORUS-like intervals, long holds are split only
+    at boundaries already emitted by ``build_group_draft``. A one-unit child
+    is eligible only when its real duration still reaches the 1.8-second floor.
     The global target is deliberately bounded below the 19.5/min hard ceiling;
     the visual selector must still independently approve every added cut.
     """
@@ -3599,7 +3602,7 @@ def _densify_direct_full_frame_highlights(
         ] = []
         unit_start = 0
         for span_index, count in enumerate(counts):
-            if count < 4:
+            if count < 2:
                 unit_start += count
                 continue
             group_start = items[unit_start].canonical_master_start
@@ -3614,7 +3617,7 @@ def _densify_direct_full_frame_highlights(
             if overlap_fraction < 0.50:
                 unit_start += count
                 continue
-            for split_offset in range(2, count - 1):
+            for split_offset in range(1, count):
                 boundary_unit = items[unit_start + split_offset - 1]
                 boundary_seconds = boundary_unit.canonical_master_end
                 if not _direct_member_boundary_is_highlight(
@@ -3624,7 +3627,11 @@ def _densify_direct_full_frame_highlights(
                     continue
                 left_duration = boundary_seconds - group_start
                 right_duration = group_end - boundary_seconds
-                if min(left_duration, right_duration) <= 0.0:
+                if (
+                    min(left_duration, right_duration)
+                    + 1e-9
+                    < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+                ):
                     continue
                 reasons = set(boundary_unit.end_boundary_reasons)
                 musical_penalty = (
@@ -4324,13 +4331,13 @@ def _direct_full_frame_proof_directed_child_profiles(
         left_units, right_units = parent.unit_counts[
             boundary_index : boundary_index + 2
         ]
-        if left_units < 2 or right_units < 2:
+        if left_units < 1 or right_units < 1:
             continue
-        # One-unit moves preserve the established 5+3/3+5 operator.  The
-        # two-unit alternatives are a single-boundary representation of the
-        # same adjacent compensation and are admitted only if both resulting
-        # musical spans remain at least two timing units and pass every cadence
-        # and 7.2-second duration gate below.
+        # Unit counts are not durations: one draft unit can be a complete
+        # 1.9-second musical phraselet.  Admit a one-unit side only when the
+        # materialized span independently passes the real-time 1.8-second
+        # professional floor below.  The two-unit alternatives remain a
+        # single-boundary representation of the same adjacent compensation.
         shift_options = (
             (1, -1, 2, -2)
             if proof.trigger
@@ -4340,7 +4347,7 @@ def _direct_full_frame_proof_directed_child_profiles(
         for shift_units in shift_options:
             left_count = left_units + shift_units
             right_count = right_units - shift_units
-            if left_count < 2 or right_count < 2:
+            if left_count < 1 or right_count < 1:
                 continue
             counts = list(parent.unit_counts)
             counts[boundary_index : boundary_index + 2] = [
@@ -4353,6 +4360,15 @@ def _direct_full_frame_proof_directed_child_profiles(
             try:
                 spans = _direct_full_frame_spans_from_partition(items, signature)
             except ValueError:
+                continue
+            if (
+                min(
+                    spans[boundary_index].duration_seconds,
+                    spans[boundary_index + 1].duration_seconds,
+                )
+                + 1e-9
+                < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+            ):
                 continue
             duration = sum(span.duration_seconds for span in spans)
             switches_per_minute = (len(spans) - 1) * 60.0 / duration
@@ -5351,8 +5367,13 @@ def _direct_member_highlight_cadence_payload(
             + _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE
         ):
             failure_reasons.append("highlight_density_lift_below_minimum")
-        if highlight_hold_indices:
-            failure_reasons.append("highlight_boundary_consumed_by_no_cut_hold")
+        if (
+            len(highlight_hold_indices)
+            > _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT
+        ):
+            failure_reasons.append(
+                "compensated_highlight_hold_budget_exceeded"
+            )
     return {
         "contract": "human_like_section_aware_member_cut_density_v1",
         "audit_required": audit_required,
@@ -5366,6 +5387,10 @@ def _direct_member_highlight_cadence_payload(
         "actual_non_highlight_cut_count": len(non_highlight_cut_indices),
         "highlight_no_cut_hold_count": len(highlight_hold_indices),
         "highlight_no_cut_hold_boundary_indices": list(highlight_hold_indices),
+        "maximum_compensated_highlight_hold_count": (
+            _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT
+        ),
+        "highlight_holds_require_redundant_cut_density": True,
         "highlight_source_switches_per_minute": (
             highlight_switches_per_minute
         ),
@@ -6242,11 +6267,27 @@ def _select_direct_member_partition_profile(
             *,
             extra_quota_source_indices: Sequence[int] | None = None,
         ) -> DirectMemberVisualSelection:
-            protected_cut_boundary_indices = (
+            priority_cut_boundary_indices = (
                 _direct_member_highlight_priority_boundary_indices(
                     profile.spans,
                     normalized_highlight_intervals,
                 )
+            )
+            highlight_duration_seconds = sum(
+                end - start for start, end in normalized_highlight_intervals
+            )
+            minimum_required_highlight_cut_count = math.ceil(
+                highlight_duration_seconds
+                * _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+                / 60.0
+            )
+            maximum_priority_cut_hold_count = min(
+                _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT,
+                max(
+                    0,
+                    len(priority_cut_boundary_indices)
+                    - minimum_required_highlight_cut_count,
+                ),
             )
             return select_balanced_direct_member_sources(
                 sources=eligible_sources,
@@ -6262,8 +6303,11 @@ def _select_direct_member_partition_profile(
                 ),
                 preferred_source_order=source_cycle,
                 extra_quota_source_indices=extra_quota_source_indices,
-                protected_cut_boundary_indices=(
-                    protected_cut_boundary_indices
+                priority_cut_boundary_indices=(
+                    priority_cut_boundary_indices
+                ),
+                maximum_priority_cut_hold_count=(
+                    maximum_priority_cut_hold_count
                 ),
                 config=config,
                 descriptor_provider=provider,
@@ -7627,13 +7671,19 @@ def _select_direct_member_partition_profile(
             "highlight_target_run_seconds": (
                 _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
             ),
-            "protected_selected_boundary_indices": list(
+            "priority_selected_boundary_indices": list(
                 _direct_member_highlight_priority_boundary_indices(
                     selected_profile.spans,
                     normalized_highlight_intervals,
                 )
             ),
-            "no_cut_hold_allowed_on_protected_boundaries": False,
+            "maximum_compensated_highlight_hold_count": (
+                _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT
+            ),
+            "minimum_highlight_switches_per_minute_after_holds": (
+                _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+            ),
+            "priority_hold_requires_remaining_density_gate": True,
             "visual_selector_recheck_required_for_every_added_cut": True,
         },
         "fallback_used": bool(
