@@ -257,7 +257,14 @@ def _title_has_authorized_signals(title: str, member: IVEMember) -> bool:
     group_signal = "ive" in folded or "아이브" in folded
     fancam_signal = any(
         token in folded
-        for token in ("직캠", "fancam", "facecam", "fanfacecam")
+        for token in (
+            "직캠",
+            "fancam",
+            "facecam",
+            "fanfacecam",
+            "closeup",
+            "클로즈업",
+        )
     )
     member_signal = any(
         "".join(character for character in token.casefold() if character.isalnum())
@@ -277,6 +284,8 @@ def _title_has_closeup_facecam_signal(title: str) -> bool:
             "얼빡직캠",
             "얼굴직캠",
             "클로즈업직캠",
+            "closeup",
+            "클로즈업",
         )
     )
 
