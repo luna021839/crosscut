@@ -125,7 +125,17 @@ private let defaultEnginePreparationProbe: EnginePreparationProbe = {
     return .ready(pythonURL)
 }
 
+enum CompletedEngineOutputMode: String, Equatable, Sendable {
+    case group
+    case member
+
+    init(_ editMode: EditMode) {
+        self = editMode == .member ? .member : .group
+    }
+}
+
 struct CompletedEngineOutputSet: Equatable, Sendable {
+    let editMode: CompletedEngineOutputMode
     let timestamp: String
     let outputURLs: [URL]
 }
@@ -165,6 +175,14 @@ enum CompletedEngineOutputSetDiscovery {
         "automatic_ive_group_app_result_exposure_v1"
     private static let automaticIVEGroupPostRenderQAContract =
         "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
+    private static let automaticIVEMemberAppResultExposureContract =
+        "automatic_ive_member_app_result_exposure_v1"
+    private static let automaticIVEMemberPostRenderQAContract =
+        "automatic_ive_member_mandatory_post_render_qa_v1"
+    private static let automaticIVEMemberPostRenderQAAnalysis =
+        "automatic_ive_member_final_media_and_pixel_provenance_qa_v1"
+    private static let automaticIVEMemberRenderReceiptContract =
+        "automatic_ive_member_exact_source_time_pixel_provenance_receipt_v1"
 
     private struct ProxyMetadata: Decodable, Equatable {
         let path: String?
@@ -322,12 +340,16 @@ enum CompletedEngineOutputSetDiscovery {
         let editMode: String
         let sourceMode: String
         let outputDirectory: String
+        let aspectRatio: String?
+        let targetMember: String?
 
         enum CodingKeys: String, CodingKey {
             case group
             case editMode = "edit_mode"
             case sourceMode = "source_mode"
             case outputDirectory = "output_directory"
+            case aspectRatio = "aspect_ratio"
+            case targetMember = "target_member"
         }
     }
 
@@ -343,10 +365,16 @@ enum CompletedEngineOutputSetDiscovery {
                 "delivery_completion_message_allowed"
         }
 
-        var authorizesDelivery: Bool {
-            contract
-                == CompletedEngineOutputSetDiscovery
+        func authorizesDelivery(for editMode: CompletedEngineOutputMode) -> Bool {
+            let expectedContract = switch editMode {
+            case .group:
+                CompletedEngineOutputSetDiscovery
                     .automaticIVEGroupAppResultExposureContract
+            case .member:
+                CompletedEngineOutputSetDiscovery
+                    .automaticIVEMemberAppResultExposureContract
+            }
+            return contract == expectedContract
                 && videoOutputExposed
                 && deliveryCompletionMessageAllowed
         }
@@ -357,42 +385,67 @@ enum CompletedEngineOutputSetDiscovery {
         let required: Bool
         let verdict: String
         let passed: Bool
+        let reportPath: String?
+        let reportPassed: Bool?
+        let contentBindingPassed: Bool?
 
-        var authorizesDelivery: Bool {
-            contract
-                == CompletedEngineOutputSetDiscovery
+        enum CodingKeys: String, CodingKey {
+            case contract
+            case required
+            case verdict
+            case passed
+            case reportPath = "report_path"
+            case reportPassed = "report_passed"
+            case contentBindingPassed = "content_binding_passed"
+        }
+
+        func authorizesDelivery(for editMode: CompletedEngineOutputMode) -> Bool {
+            let expectedContract = switch editMode {
+            case .group:
+                CompletedEngineOutputSetDiscovery
                     .automaticIVEGroupPostRenderQAContract
+            case .member:
+                CompletedEngineOutputSetDiscovery
+                    .automaticIVEMemberPostRenderQAContract
+            }
+            return contract == expectedContract
                 && required
                 && verdict == "PASS"
                 && passed
+                && (editMode != .member || reportPassed == true)
+                && (editMode != .member || contentBindingPassed == true)
         }
     }
 
     private struct AnalysisCapabilities: Decodable {
-        let groupVideoRendered: Bool
+        let groupVideoRendered: Bool?
+        let memberVideoRendered: Bool?
+        let memberDirectFullFrameReady: Bool?
 
         enum CodingKeys: String, CodingKey {
             case groupVideoRendered = "group_video_rendered"
+            case memberVideoRendered = "member_video_rendered"
+            case memberDirectFullFrameReady = "member_direct_full_frame_ready"
         }
     }
 
-    private struct AnalysisRender: Decodable {
-        struct Interchange: Decodable {
-            let fcpxmlPath: String
-            let otioPath: String
-            let edlPath: String
-            let fidelityAuditPath: String
-            let authoritativePixels: String
+    private struct Interchange: Decodable {
+        let fcpxmlPath: String
+        let otioPath: String
+        let edlPath: String
+        let fidelityAuditPath: String
+        let authoritativePixels: String
 
-            enum CodingKeys: String, CodingKey {
-                case fcpxmlPath = "fcpxml_path"
-                case otioPath = "otio_path"
-                case edlPath = "edl_path"
-                case fidelityAuditPath = "fidelity_audit_path"
-                case authoritativePixels = "authoritative_pixels"
-            }
+        enum CodingKeys: String, CodingKey {
+            case fcpxmlPath = "fcpxml_path"
+            case otioPath = "otio_path"
+            case edlPath = "edl_path"
+            case fidelityAuditPath = "fidelity_audit_path"
+            case authoritativePixels = "authoritative_pixels"
         }
+    }
 
+    private struct GroupAnalysisRender: Decodable {
         let videoPath: String
         let planPath: String
         let videoCodec: String
@@ -410,6 +463,28 @@ enum CompletedEngineOutputSetDiscovery {
             case interchange
             case renderedProxyReview = "rendered_proxy_review"
             case renderedCandidateSelection = "rendered_candidate_selection"
+            case artifactRole = "artifact_role"
+            case appResultExposure = "app_result_exposure"
+            case postRenderQA = "post_render_qa"
+        }
+    }
+
+    private struct MemberAnalysisRender: Decodable {
+        let videoPath: String
+        let planPath: String
+        let videoCodec: String
+        let interchange: Interchange
+        let directFullFrame: Bool
+        let artifactRole: String
+        let appResultExposure: AppResultExposure
+        let postRenderQA: PostRenderQAEvidence
+
+        enum CodingKeys: String, CodingKey {
+            case videoPath = "video_path"
+            case planPath = "plan_path"
+            case videoCodec = "video_codec"
+            case interchange
+            case directFullFrame = "direct_full_frame"
             case artifactRole = "artifact_role"
             case appResultExposure = "app_result_exposure"
             case postRenderQA = "post_render_qa"
@@ -444,13 +519,13 @@ enum CompletedEngineOutputSetDiscovery {
         }
     }
 
-    private struct AnalysisManifest: Decodable {
+    private struct GroupAnalysisManifest: Decodable {
         let schemaVersion: Int
         let createdAt: String
         let request: AnalysisRequest
         let renderedProxyReview: ProxyReview
         let renderedCandidateSelection: CandidateSelection
-        let render: AnalysisRender
+        let render: GroupAnalysisRender
         let capabilities: AnalysisCapabilities
         let artifactRole: String
         let appResultExposure: AppResultExposure
@@ -467,6 +542,84 @@ enum CompletedEngineOutputSetDiscovery {
             case artifactRole = "artifact_role"
             case appResultExposure = "app_result_exposure"
             case postRenderQA = "post_render_qa"
+        }
+    }
+
+    private struct MemberDirectFullFrame: Decodable {
+        let enabled: Bool
+    }
+
+    private struct MemberAnalysisManifest: Decodable {
+        let schemaVersion: Int
+        let createdAt: String
+        let request: AnalysisRequest
+        let memberDirectFullFrame: MemberDirectFullFrame
+        let render: MemberAnalysisRender
+        let capabilities: AnalysisCapabilities
+        let artifactRole: String
+        let appResultExposure: AppResultExposure
+        let postRenderQA: PostRenderQAEvidence
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case createdAt = "created_at"
+            case request
+            case memberDirectFullFrame = "member_direct_full_frame"
+            case render
+            case capabilities
+            case artifactRole = "artifact_role"
+            case appResultExposure = "app_result_exposure"
+            case postRenderQA = "post_render_qa"
+        }
+    }
+
+    private struct MemberPostRenderQAReport: Decodable {
+        struct ArtifactSet: Decodable {
+            let analysisPath: String
+            let renderPlanPath: String
+            let videoPath: String
+
+            enum CodingKeys: String, CodingKey {
+                case analysisPath = "analysis_path"
+                case renderPlanPath = "render_plan_path"
+                case videoPath = "video_path"
+            }
+        }
+
+        struct RenderReceipt: Decodable {
+            let contract: String
+            let allEligibleSourcesPixelProven: Bool
+            let sourceFileIdentitiesStable: Bool
+            let artifactContentStable: Bool
+            let passed: Bool
+
+            enum CodingKeys: String, CodingKey {
+                case contract
+                case allEligibleSourcesPixelProven =
+                    "all_eligible_sources_pixel_proven"
+                case sourceFileIdentitiesStable =
+                    "source_file_identities_stable"
+                case artifactContentStable = "artifact_content_stable"
+                case passed
+            }
+        }
+
+        let schemaVersion: Int
+        let analysis: String
+        let artifactSet: ArtifactSet
+        let verdict: String
+        let passed: Bool
+        let issueCount: Int
+        let renderReceipt: RenderReceipt
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case analysis
+            case artifactSet = "artifact_set"
+            case verdict
+            case passed
+            case issueCount = "issue_count"
+            case renderReceipt = "render_receipt"
         }
     }
 
@@ -490,7 +643,10 @@ enum CompletedEngineOutputSetDiscovery {
         }
     }
 
-    static func latest(in outputDirectory: URL) -> CompletedEngineOutputSet? {
+    static func latest(
+        in outputDirectory: URL,
+        editMode: CompletedEngineOutputMode
+    ) -> CompletedEngineOutputSet? {
         let directory = outputDirectory.standardizedFileURL
         let resourceKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
@@ -514,39 +670,119 @@ enum CompletedEngineOutputSetDiscovery {
             let filename = analysisURL.lastPathComponent
             let prefix = String(filename.dropLast(suffix.count))
             guard let timestamp = timestamp(in: prefix) else { continue }
-            let expectedNames = [
-                "\(prefix)-analysis.json",
-                "\(prefix)-render-plan.json",
-                "\(prefix)-rendered-candidate-selection.json",
-                "\(prefix)-group-timeline.fcpxml",
-                "\(prefix)-group-timeline.otio",
-                "\(prefix)-group-timeline.edl",
-                "\(prefix)-group-timeline-interchange-audit.json",
-                "\(prefix)-group-crosscut.mp4",
-            ]
-            guard expectedNames.allSatisfy({ byName[$0] != nil }) else { continue }
-            let urls = expectedNames.compactMap { byName[$0]?.standardizedFileURL }
-            guard urls.count == expectedNames.count,
-                  urls.allSatisfy({ isNonemptyRegularFile($0, keys: resourceKeys) }),
-                  validate(
-                    analysisURL: urls[0],
-                    planURL: urls[1],
-                    selectionURL: urls[2],
-                    fcpxmlURL: urls[3],
-                    otioURL: urls[4],
-                    edlURL: urls[5],
-                    interchangeAuditURL: urls[6],
-                    videoURL: urls[7],
-                    outputDirectory: directory,
-                    timestamp: timestamp
-                  ) else {
-                continue
+            let result: CompletedEngineOutputSet?
+            switch editMode {
+            case .group:
+                result = completedGroupOutput(
+                    prefix: prefix,
+                    timestamp: timestamp,
+                    byName: byName,
+                    resourceKeys: resourceKeys,
+                    outputDirectory: directory
+                )
+            case .member:
+                result = completedMemberOutput(
+                    prefix: prefix,
+                    timestamp: timestamp,
+                    analysisURL: analysisURL,
+                    byName: byName,
+                    resourceKeys: resourceKeys,
+                    outputDirectory: directory
+                )
             }
-            completed.append(
-                CompletedEngineOutputSet(timestamp: timestamp, outputURLs: urls)
-            )
+            if let result { completed.append(result) }
         }
         return completed.max { $0.timestamp < $1.timestamp }
+    }
+
+    private static func completedGroupOutput(
+        prefix: String,
+        timestamp: String,
+        byName: [String: URL],
+        resourceKeys: Set<URLResourceKey>,
+        outputDirectory: URL
+    ) -> CompletedEngineOutputSet? {
+        let expectedNames = [
+            "\(prefix)-analysis.json",
+            "\(prefix)-render-plan.json",
+            "\(prefix)-rendered-candidate-selection.json",
+            "\(prefix)-group-timeline.fcpxml",
+            "\(prefix)-group-timeline.otio",
+            "\(prefix)-group-timeline.edl",
+            "\(prefix)-group-timeline-interchange-audit.json",
+            "\(prefix)-group-crosscut.mp4",
+        ]
+        let urls = expectedNames.compactMap { byName[$0]?.standardizedFileURL }
+        guard urls.count == expectedNames.count,
+              urls.allSatisfy({ isNonemptyRegularFile($0, keys: resourceKeys) }),
+              validateGroup(
+                analysisURL: urls[0],
+                planURL: urls[1],
+                selectionURL: urls[2],
+                fcpxmlURL: urls[3],
+                otioURL: urls[4],
+                edlURL: urls[5],
+                interchangeAuditURL: urls[6],
+                videoURL: urls[7],
+                outputDirectory: outputDirectory,
+                timestamp: timestamp
+              ) else {
+            return nil
+        }
+        return CompletedEngineOutputSet(
+            editMode: .group,
+            timestamp: timestamp,
+            outputURLs: urls
+        )
+    }
+
+    private static func completedMemberOutput(
+        prefix: String,
+        timestamp: String,
+        analysisURL: URL,
+        byName: [String: URL],
+        resourceKeys: Set<URLResourceKey>,
+        outputDirectory: URL
+    ) -> CompletedEngineOutputSet? {
+        guard let analysis = decode(MemberAnalysisManifest.self, from: analysisURL),
+              let targetMember = analysis.request.targetMember,
+              IVEMember(rawValue: targetMember) != nil else {
+            return nil
+        }
+        let artifactPrefix = "\(prefix)-\(targetMember)"
+        let expectedNames = [
+            "\(prefix)-analysis.json",
+            "\(artifactPrefix)-render-plan.json",
+            "\(artifactPrefix)-member-post-render-qa.json",
+            "\(artifactPrefix)-member-timeline.fcpxml",
+            "\(artifactPrefix)-member-timeline.otio",
+            "\(artifactPrefix)-member-timeline.edl",
+            "\(artifactPrefix)-member-timeline-interchange-audit.json",
+            "\(artifactPrefix)-member-crosscut.mp4",
+        ]
+        let urls = expectedNames.compactMap { byName[$0]?.standardizedFileURL }
+        guard urls.count == expectedNames.count,
+              urls.allSatisfy({ isNonemptyRegularFile($0, keys: resourceKeys) }),
+              validateMember(
+                analysis: analysis,
+                analysisURL: urls[0],
+                planURL: urls[1],
+                postRenderQAURL: urls[2],
+                fcpxmlURL: urls[3],
+                otioURL: urls[4],
+                edlURL: urls[5],
+                interchangeAuditURL: urls[6],
+                videoURL: urls[7],
+                outputDirectory: outputDirectory,
+                timestamp: timestamp
+              ) else {
+            return nil
+        }
+        return CompletedEngineOutputSet(
+            editMode: .member,
+            timestamp: timestamp,
+            outputURLs: urls
+        )
     }
 
     private static func timestamp(in prefix: String) -> String? {
@@ -620,7 +856,7 @@ enum CompletedEngineOutputSetDiscovery {
         return abs(createdAt.timeIntervalSince(filenameDate)) < 1.0
     }
 
-    private static func validate(
+    private static func validateGroup(
         analysisURL: URL,
         planURL: URL,
         selectionURL: URL,
@@ -632,7 +868,7 @@ enum CompletedEngineOutputSetDiscovery {
         outputDirectory: URL,
         timestamp: String
     ) -> Bool {
-        guard let analysis = decode(AnalysisManifest.self, from: analysisURL),
+        guard let analysis = decode(GroupAnalysisManifest.self, from: analysisURL),
               let plan = decode(RenderPlanSummary.self, from: planURL),
               let selection = decode(CandidateSelection.self, from: selectionURL),
               let interchangeAudit = decode(
@@ -646,14 +882,14 @@ enum CompletedEngineOutputSetDiscovery {
               analysis.request.sourceMode == "automatic",
               samePath(analysis.request.outputDirectory, outputDirectory),
               analysis.artifactRole == "delivery",
-              analysis.appResultExposure.authorizesDelivery,
-              analysis.postRenderQA.authorizesDelivery,
+              analysis.appResultExposure.authorizesDelivery(for: .group),
+              analysis.postRenderQA.authorizesDelivery(for: .group),
               analysis.render.artifactRole == analysis.artifactRole,
               analysis.render.appResultExposure == analysis.appResultExposure,
-              analysis.render.appResultExposure.authorizesDelivery,
+              analysis.render.appResultExposure.authorizesDelivery(for: .group),
               analysis.render.postRenderQA == analysis.postRenderQA,
-              analysis.render.postRenderQA.authorizesDelivery,
-              analysis.capabilities.groupVideoRendered,
+              analysis.render.postRenderQA.authorizesDelivery(for: .group),
+              analysis.capabilities.groupVideoRendered == true,
               analysis.render.videoCodec == "h264_videotoolbox"
                 || analysis.render.videoCodec == "libx264",
               samePath(analysis.render.videoPath, videoURL),
@@ -687,6 +923,101 @@ enum CompletedEngineOutputSetDiscovery {
               plan.aspectRatio == "16:9",
               plan.width == 1_920,
               plan.height == 1_080,
+              plan.fps > 0,
+              plan.renderDuration > 0,
+              plan.outputFrameCount > 0,
+              abs(
+                plan.renderDuration
+                    - Double(plan.outputFrameCount) / plan.fps
+              ) < 1e-6,
+              samePath(plan.output, videoURL) else {
+            return false
+        }
+        return true
+    }
+
+    private static func validateMember(
+        analysis: MemberAnalysisManifest,
+        analysisURL: URL,
+        planURL: URL,
+        postRenderQAURL: URL,
+        fcpxmlURL: URL,
+        otioURL: URL,
+        edlURL: URL,
+        interchangeAuditURL: URL,
+        videoURL: URL,
+        outputDirectory: URL,
+        timestamp: String
+    ) -> Bool {
+        guard let plan = decode(RenderPlanSummary.self, from: planURL),
+              let postRenderQA = decode(
+                MemberPostRenderQAReport.self,
+                from: postRenderQAURL
+              ),
+              let interchangeAudit = decode(
+                InterchangeAudit.self,
+                from: interchangeAuditURL
+              ),
+              analysis.schemaVersion == 1,
+              createdAtMatches(analysis.createdAt, timestamp: timestamp),
+              analysis.request.group == "IVE",
+              analysis.request.editMode == "member",
+              analysis.request.sourceMode == "automatic",
+              analysis.request.aspectRatio == "9:16",
+              analysis.request.targetMember.flatMap(IVEMember.init(rawValue:)) != nil,
+              samePath(analysis.request.outputDirectory, outputDirectory),
+              analysis.memberDirectFullFrame.enabled,
+              analysis.artifactRole == "delivery",
+              analysis.appResultExposure.authorizesDelivery(for: .member),
+              analysis.postRenderQA.authorizesDelivery(for: .member),
+              samePath(analysis.postRenderQA.reportPath ?? "", postRenderQAURL),
+              analysis.render.artifactRole == analysis.artifactRole,
+              analysis.render.appResultExposure == analysis.appResultExposure,
+              analysis.render.appResultExposure.authorizesDelivery(for: .member),
+              analysis.render.postRenderQA == analysis.postRenderQA,
+              analysis.render.postRenderQA.authorizesDelivery(for: .member),
+              analysis.render.directFullFrame,
+              analysis.capabilities.memberVideoRendered == true,
+              analysis.capabilities.memberDirectFullFrameReady == true,
+              analysis.render.videoCodec == "h264_videotoolbox"
+                || analysis.render.videoCodec == "libx264",
+              samePath(analysis.render.videoPath, videoURL),
+              samePath(analysis.render.planPath, planURL),
+              samePath(analysis.render.interchange.fcpxmlPath, fcpxmlURL),
+              samePath(analysis.render.interchange.otioPath, otioURL),
+              samePath(analysis.render.interchange.edlPath, edlURL),
+              samePath(
+                analysis.render.interchange.fidelityAuditPath,
+                interchangeAuditURL
+              ),
+              samePath(analysis.render.interchange.authoritativePixels, videoURL),
+              interchangeAudit.schemaVersion == 1,
+              interchangeAudit.analysisBasis
+                == "reviewed_render_plan_interchange_bundle_v1",
+              samePath(interchangeAudit.authoritativeOutput, videoURL),
+              interchangeAudit.outputFrameCount == plan.outputFrameCount,
+              isSHA256(interchangeAudit.contentSHA256),
+              Set(interchangeAudit.artifacts.keys) == Set(["fcpxml", "otio", "edl"]),
+              interchangeAudit.artifacts.values.allSatisfy({
+                $0.sizeBytes > 0 && isSHA256($0.sha256)
+              }),
+              postRenderQA.schemaVersion == 1,
+              postRenderQA.analysis == automaticIVEMemberPostRenderQAAnalysis,
+              postRenderQA.verdict == "PASS",
+              postRenderQA.passed,
+              postRenderQA.issueCount == 0,
+              samePath(postRenderQA.artifactSet.analysisPath, analysisURL),
+              samePath(postRenderQA.artifactSet.renderPlanPath, planURL),
+              samePath(postRenderQA.artifactSet.videoPath, videoURL),
+              postRenderQA.renderReceipt.contract
+                == automaticIVEMemberRenderReceiptContract,
+              postRenderQA.renderReceipt.allEligibleSourcesPixelProven,
+              postRenderQA.renderReceipt.sourceFileIdentitiesStable,
+              postRenderQA.renderReceipt.artifactContentStable,
+              postRenderQA.renderReceipt.passed,
+              plan.aspectRatio == "9:16",
+              plan.width == 1_080,
+              plan.height == 1_920,
               plan.fps > 0,
               plan.renderDuration > 0,
               plan.outputFrameCount > 0,
@@ -747,8 +1078,9 @@ final class EngineRunner: ObservableObject {
         engineURL = locateEngine()
     }
 
-    func restoreLatestCompletedGroupResult(
+    func restoreLatestCompletedResult(
         in outputDirectory: URL,
+        editMode: EditMode,
         reportMissing: Bool = true,
         clearExistingOutputsOnMissing: Bool = false
     ) {
@@ -759,13 +1091,18 @@ final class EngineRunner: ObservableObject {
         activeCompletedOutputDiscoveryID = discoveryID
         isRestoringCompletedOutputs = true
         let directory = outputDirectory.standardizedFileURL
+        let outputMode = CompletedEngineOutputMode(editMode)
         completedOutputDiscoveryTask = Task { [weak self] in
             let result = await Task.detached(priority: .utility) {
-                CompletedEngineOutputSetDiscovery.latest(in: directory)
+                CompletedEngineOutputSetDiscovery.latest(
+                    in: directory,
+                    editMode: outputMode
+                )
             }.value
             guard !Task.isCancelled else { return }
             self?.completeCompletedOutputDiscovery(
                 result,
+                editMode: outputMode,
                 discoveryID: discoveryID,
                 reportMissing: reportMissing,
                 clearExistingOutputsOnMissing: clearExistingOutputsOnMissing
@@ -856,6 +1193,7 @@ final class EngineRunner: ObservableObject {
 
     private func completeCompletedOutputDiscovery(
         _ result: CompletedEngineOutputSet?,
+        editMode: CompletedEngineOutputMode,
         discoveryID: UUID,
         reportMissing: Bool,
         clearExistingOutputsOnMissing: Bool
@@ -877,12 +1215,17 @@ final class EngineRunner: ObservableObject {
                 }
             }
             if reportMissing {
-                let message = "선택한 폴더에서 완성된 자동 그룹 교차편집 결과를 찾지 못했습니다."
+                let modeName = editMode == .member
+                    ? "멤버 교차직캠"
+                    : "단체 교차편집"
+                let message = "선택한 폴더에서 완성된 자동 \(modeName) 결과를 찾지 못했습니다."
                 statusMessage = message
                 appendLog(message, level: .warning)
             }
             return
         }
+
+        guard result.editMode == editMode else { return }
 
         outputURLs = result.outputURLs
         renderedVideoURL = RenderedVideoOutputDiscovery.firstValidVideo(

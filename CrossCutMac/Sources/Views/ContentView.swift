@@ -111,15 +111,17 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            runner.restoreLatestCompletedGroupResult(
+            runner.restoreLatestCompletedResult(
                 in: outputDirectory,
+                editMode: editMode,
                 reportMissing: false,
                 clearExistingOutputsOnMissing: true
             )
         }
         .onChange(of: outputDirectory) {
-            runner.restoreLatestCompletedGroupResult(
+            runner.restoreLatestCompletedResult(
                 in: outputDirectory,
+                editMode: editMode,
                 reportMissing: false,
                 clearExistingOutputsOnMissing: true
             )
@@ -127,6 +129,12 @@ struct ContentView: View {
         .onChange(of: editMode) {
             applyAspectRatioPolicy()
             validationMessage = nil
+            runner.restoreLatestCompletedResult(
+                in: outputDirectory,
+                editMode: editMode,
+                reportMissing: false,
+                clearExistingOutputsOnMissing: true
+            )
         }
         .onChange(of: sourceMode) {
             applyAspectRatioPolicy()
@@ -630,8 +638,9 @@ struct ContentView: View {
                     HStack(spacing: 10) {
                         if !runner.state.isRunning {
                             Button {
-                                runner.restoreLatestCompletedGroupResult(
+                                runner.restoreLatestCompletedResult(
                                     in: outputDirectory,
+                                    editMode: editMode,
                                     clearExistingOutputsOnMissing: true
                                 )
                             } label: {

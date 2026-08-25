@@ -224,6 +224,188 @@ final class EngineContractTests: XCTestCase {
         ]
     }
 
+    @discardableResult
+    private func makeCompletedAutomaticMemberOutputSet(
+        in directory: URL,
+        timestamp: String,
+        targetMember: String = "가을",
+        mutateAnalysis: ((inout [String: Any]) -> Void)? = nil,
+        mutatePostRenderQA: ((inout [String: Any]) -> Void)? = nil
+    ) throws -> [URL] {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let prefix = "IVE-ATTITUDE-\(timestamp)"
+        let memberPrefix = "\(prefix)-\(targetMember)"
+        let analysisURL = directory.appendingPathComponent("\(prefix)-analysis.json")
+        let planURL = directory.appendingPathComponent(
+            "\(memberPrefix)-render-plan.json"
+        )
+        let postRenderQAURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-post-render-qa.json"
+        )
+        let fcpxmlURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-timeline.fcpxml"
+        )
+        let otioURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-timeline.otio"
+        )
+        let edlURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-timeline.edl"
+        )
+        let interchangeAuditURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-timeline-interchange-audit.json"
+        )
+        let videoURL = directory.appendingPathComponent(
+            "\(memberPrefix)-member-crosscut.mp4"
+        )
+        let interchangeFiles: [(String, URL, Data)] = [
+            ("fcpxml", fcpxmlURL, Data("<fcpxml/>".utf8)),
+            ("otio", otioURL, Data("{\"OTIO_SCHEMA\":\"Timeline.1\"}".utf8)),
+            ("edl", edlURL, Data("TITLE: MEMBER TEST\n".utf8)),
+        ]
+        for (_, url, data) in interchangeFiles {
+            try data.write(to: url, options: .atomic)
+        }
+        try Data([0, 0, 0, 1]).write(to: videoURL, options: .atomic)
+
+        let outputFrameCount = 3_000
+        let fps = 30.0
+        let interchangeAudit: [String: Any] = [
+            "schema_version": 1,
+            "analysis_basis": "reviewed_render_plan_interchange_bundle_v1",
+            "authoritative_output": videoURL.path,
+            "output_frame_count": outputFrameCount,
+            "content_sha256": String(repeating: "d", count: 64),
+            "artifacts": Dictionary(
+                uniqueKeysWithValues: interchangeFiles.map { name, _, data in
+                    (
+                        name,
+                        [
+                            "sha256": String(repeating: "a", count: 64),
+                            "size_bytes": data.count,
+                        ] as [String: Any]
+                    )
+                }
+            ),
+        ]
+        let plan: [String: Any] = [
+            "aspect_ratio": "9:16",
+            "output": videoURL.path,
+            "width": 1_080,
+            "height": 1_920,
+            "fps": fps,
+            "render_duration": Double(outputFrameCount) / fps,
+            "output_frame_count": outputFrameCount,
+        ]
+
+        let filenameFormatter = DateFormatter()
+        filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
+        filenameFormatter.calendar = Calendar(identifier: .gregorian)
+        filenameFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        filenameFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        let creationDate = try XCTUnwrap(filenameFormatter.date(from: timestamp))
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let exposure: [String: Any] = [
+            "contract": "automatic_ive_member_app_result_exposure_v1",
+            "video_output_exposed": true,
+            "delivery_completion_message_allowed": true,
+        ]
+        let postRenderQAEvidence: [String: Any] = [
+            "contract": "automatic_ive_member_mandatory_post_render_qa_v1",
+            "required": true,
+            "verdict": "PASS",
+            "report_passed": true,
+            "content_binding_passed": true,
+            "passed": true,
+            "report_path": postRenderQAURL.path,
+        ]
+        let interchange: [String: Any] = [
+            "fcpxml_path": fcpxmlURL.path,
+            "otio_path": otioURL.path,
+            "edl_path": edlURL.path,
+            "fidelity_audit_path": interchangeAuditURL.path,
+            "authoritative_pixels": videoURL.path,
+        ]
+        var analysis: [String: Any] = [
+            "schema_version": 1,
+            "created_at": isoFormatter.string(from: creationDate),
+            "request": [
+                "group": "IVE",
+                "edit_mode": "member",
+                "source_mode": "automatic",
+                "output_directory": directory.path,
+                "aspect_ratio": "9:16",
+                "target_member": targetMember,
+            ],
+            "member_direct_full_frame": ["enabled": true],
+            "artifact_role": "delivery",
+            "app_result_exposure": exposure,
+            "post_render_qa": postRenderQAEvidence,
+            "render": [
+                "artifact_role": "delivery",
+                "app_result_exposure": exposure,
+                "post_render_qa": postRenderQAEvidence,
+                "video_path": videoURL.path,
+                "plan_path": planURL.path,
+                "video_codec": "libx264",
+                "direct_full_frame": true,
+                "interchange": interchange,
+            ],
+            "capabilities": [
+                "member_video_rendered": true,
+                "member_direct_full_frame_ready": true,
+            ],
+        ]
+        mutateAnalysis?(&analysis)
+
+        var postRenderQA: [String: Any] = [
+            "schema_version": 1,
+            "analysis": "automatic_ive_member_final_media_and_pixel_provenance_qa_v1",
+            "artifact_set": [
+                "analysis_path": analysisURL.path,
+                "render_plan_path": planURL.path,
+                "video_path": videoURL.path,
+            ],
+            "verdict": "PASS",
+            "passed": true,
+            "issue_count": 0,
+            "render_receipt": [
+                "contract": "automatic_ive_member_exact_source_time_pixel_provenance_receipt_v1",
+                "all_eligible_sources_pixel_proven": true,
+                "source_file_identities_stable": true,
+                "artifact_content_stable": true,
+                "passed": true,
+            ],
+        ]
+        mutatePostRenderQA?(&postRenderQA)
+
+        for (object, url) in [
+            (analysis, analysisURL),
+            (plan, planURL),
+            (postRenderQA, postRenderQAURL),
+            (interchangeAudit, interchangeAuditURL),
+        ] {
+            let data = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try data.write(to: url, options: .atomic)
+        }
+        return [
+            analysisURL,
+            planURL,
+            postRenderQAURL,
+            fcpxmlURL,
+            otioURL,
+            edlURL,
+            interchangeAuditURL,
+            videoURL,
+        ]
+    }
+
     private func mutateRender(
         in analysis: inout [String: Any],
         _ mutation: (inout [String: Any]) -> Void
@@ -260,10 +442,156 @@ final class EngineContractTests: XCTestCase {
             line: line
         )
         XCTAssertNil(
-            CompletedEngineOutputSetDiscovery.latest(in: root),
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .group),
             file: file,
             line: line
         )
+    }
+
+    private func assertAutomaticMemberOutputIsNotRestorable(
+        timestamp: String = "20260825-120000",
+        mutateAnalysis: ((inout [String: Any]) -> Void)? = nil,
+        mutatePostRenderQA: ((inout [String: Any]) -> Void)? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ive-crosscut-member-output-rejected-\(UUID().uuidString)"
+            )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let files = try makeCompletedAutomaticMemberOutputSet(
+            in: root,
+            timestamp: timestamp,
+            mutateAnalysis: mutateAnalysis,
+            mutatePostRenderQA: mutatePostRenderQA
+        )
+
+        XCTAssertEqual(files.count, 8, file: file, line: line)
+        XCTAssertTrue(
+            files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) },
+            file: file,
+            line: line
+        )
+        XCTAssertNil(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .member),
+            file: file,
+            line: line
+        )
+    }
+
+    func testCompletedOutputDiscoverySeparatesGroupAndMemberResults() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ive-crosscut-mode-separated-output-\(UUID().uuidString)"
+            )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let member = try makeCompletedAutomaticMemberOutputSet(
+            in: root,
+            timestamp: "20260825-020202"
+        )
+        let group = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260825-030303"
+        )
+
+        let restoredMember = try XCTUnwrap(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .member)
+        )
+        XCTAssertEqual(restoredMember.editMode, .member)
+        XCTAssertEqual(restoredMember.timestamp, "20260825-020202")
+        XCTAssertEqual(restoredMember.outputURLs, member.map(\.standardizedFileURL))
+
+        let restoredGroup = try XCTUnwrap(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .group)
+        )
+        XCTAssertEqual(restoredGroup.editMode, .group)
+        XCTAssertEqual(restoredGroup.timestamp, "20260825-030303")
+        XCTAssertEqual(restoredGroup.outputURLs, group.map(\.standardizedFileURL))
+    }
+
+    func testCompletedMemberOutputDiscoveryRejectsNonDeliveryOrExposureMismatch() throws {
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            analysis["artifact_role"] = "rejected"
+            self.mutateRender(in: &analysis) { $0["artifact_role"] = "rejected" }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var exposure = analysis["app_result_exposure"] as? [String: Any] ?? [:]
+            exposure["video_output_exposed"] = false
+            analysis["app_result_exposure"] = exposure
+            self.mutateRender(in: &analysis) {
+                $0["app_result_exposure"] = exposure
+            }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            self.mutateRender(in: &analysis) { render in
+                var exposure = render["app_result_exposure"]
+                    as? [String: Any] ?? [:]
+                exposure["contract"] = "automatic_ive_group_app_result_exposure_v1"
+                render["app_result_exposure"] = exposure
+            }
+        })
+    }
+
+    func testCompletedMemberOutputDiscoveryRejectsWrongOrUnboundMemberQA() throws {
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+            qa["contract"] = "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
+            analysis["post_render_qa"] = qa
+            self.mutateRender(in: &analysis) { $0["post_render_qa"] = qa }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+            qa["report_passed"] = false
+            analysis["post_render_qa"] = qa
+            self.mutateRender(in: &analysis) { $0["post_render_qa"] = qa }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+            qa["content_binding_passed"] = false
+            analysis["post_render_qa"] = qa
+            self.mutateRender(in: &analysis) { $0["post_render_qa"] = qa }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var qa = analysis["post_render_qa"] as? [String: Any] ?? [:]
+            qa["report_path"] = "/tmp/unrelated-member-qa.json"
+            analysis["post_render_qa"] = qa
+            self.mutateRender(in: &analysis) { $0["post_render_qa"] = qa }
+        })
+    }
+
+    func testCompletedMemberOutputDiscoveryRequiresDirectFullFrameContract() throws {
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            analysis["member_direct_full_frame"] = ["enabled": false]
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            self.mutateRender(in: &analysis) { $0["direct_full_frame"] = false }
+        })
+        try assertAutomaticMemberOutputIsNotRestorable(mutateAnalysis: { analysis in
+            var capabilities = analysis["capabilities"] as? [String: Any] ?? [:]
+            capabilities["member_direct_full_frame_ready"] = false
+            analysis["capabilities"] = capabilities
+        })
+    }
+
+    func testCompletedMemberOutputDiscoveryRequiresPassingPixelProvenanceReceipt() throws {
+        let receiptMutations: [(inout [String: Any]) -> Void] = [
+            { $0["all_eligible_sources_pixel_proven"] = false },
+            { $0["source_file_identities_stable"] = false },
+            { $0["artifact_content_stable"] = false },
+            { $0["passed"] = false },
+            { $0["contract"] = "unknown_receipt" },
+        ]
+        for mutation in receiptMutations {
+            try assertAutomaticMemberOutputIsNotRestorable(
+                mutatePostRenderQA: { report in
+                    var receipt = report["render_receipt"]
+                        as? [String: Any] ?? [:]
+                    mutation(&receipt)
+                    report["render_receipt"] = receipt
+                }
+            )
+        }
     }
 
     func testCompletedOutputDiscoveryUsesLatestValidSameTimestampSet() throws {
@@ -292,7 +620,10 @@ final class EngineContractTests: XCTestCase {
             to: root.appendingPathComponent(".ive-crosscut-candidate-proxy-00.mp4")
         )
 
-        let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.latest(in: root))
+        let result = try XCTUnwrap(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .group)
+        )
+        XCTAssertEqual(result.editMode, .group)
         XCTAssertEqual(result.timestamp, "20260823-010101")
         XCTAssertEqual(
             result.outputURLs,
@@ -311,7 +642,10 @@ final class EngineContractTests: XCTestCase {
             proxySchemaVersion: 3
         )
 
-        let result = try XCTUnwrap(CompletedEngineOutputSetDiscovery.latest(in: root))
+        let result = try XCTUnwrap(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .group)
+        )
+        XCTAssertEqual(result.editMode, .group)
         XCTAssertEqual(result.timestamp, "20260823-060606")
         XCTAssertEqual(result.outputURLs, expected.map(\.standardizedFileURL))
     }
@@ -564,7 +898,9 @@ final class EngineContractTests: XCTestCase {
             withDestinationURL: realVideo
         )
 
-        XCTAssertNil(CompletedEngineOutputSetDiscovery.latest(in: root))
+        XCTAssertNil(
+            CompletedEngineOutputSetDiscovery.latest(in: root, editMode: .group)
+        )
     }
 
     @MainActor
@@ -580,7 +916,7 @@ final class EngineContractTests: XCTestCase {
         )
         let runner = EngineRunner(locateEngine: { nil })
 
-        runner.restoreLatestCompletedGroupResult(in: root)
+        runner.restoreLatestCompletedResult(in: root, editMode: .group)
         for _ in 0..<100 {
             if !runner.isRestoringCompletedOutputs { break }
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -590,8 +926,9 @@ final class EngineContractTests: XCTestCase {
         XCTAssertEqual(runner.progress, 1)
         XCTAssertEqual(runner.outputURLs, expected.map(\.standardizedFileURL))
 
-        runner.restoreLatestCompletedGroupResult(
+        runner.restoreLatestCompletedResult(
             in: empty,
+            editMode: .group,
             reportMissing: false,
             clearExistingOutputsOnMissing: true
         )
@@ -602,6 +939,46 @@ final class EngineContractTests: XCTestCase {
         XCTAssertFalse(runner.isRestoringCompletedOutputs)
         XCTAssertEqual(runner.state, .idle)
         XCTAssertTrue(runner.outputURLs.isEmpty)
+    }
+
+    @MainActor
+    func testEngineRunnerRestoresGroupAndMemberModesIndependently() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ive-crosscut-runner-mode-restore-\(UUID().uuidString)"
+            )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let member = try makeCompletedAutomaticMemberOutputSet(
+            in: root,
+            timestamp: "20260825-060606"
+        )
+        let group = try makeCompletedAutomaticGroupOutputSet(
+            in: root,
+            timestamp: "20260825-070707"
+        )
+        let runner = EngineRunner(locateEngine: { nil })
+
+        runner.restoreLatestCompletedResult(in: root, editMode: .member)
+        for _ in 0..<100 {
+            if !runner.isRestoringCompletedOutputs { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(runner.outputURLs, member.map(\.standardizedFileURL))
+        XCTAssertEqual(
+            runner.renderedVideoURL,
+            member.last?.standardizedFileURL
+        )
+
+        runner.restoreLatestCompletedResult(in: root, editMode: .group)
+        for _ in 0..<100 {
+            if !runner.isRestoringCompletedOutputs { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(runner.outputURLs, group.map(\.standardizedFileURL))
+        XCTAssertEqual(
+            runner.renderedVideoURL,
+            group.last?.standardizedFileURL
+        )
     }
 
     func testLargeMediaDefaultsUseDedicatedExternalVolumeWhenMounted() throws {
