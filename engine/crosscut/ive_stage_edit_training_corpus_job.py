@@ -124,6 +124,11 @@ _SOURCE_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._:-]{0,159}")
 _FILE_BLOCK_BYTES = 4 * 1024 * 1024
 _MAXIMUM_SUPERVISION_BYTES = 64 * 1024 * 1024
 _MAXIMUM_UPSTREAM_JSON_BYTES = 64 * 1024 * 1024
+_MAXIMUM_SCHEMA4_FEATURE_SNAPSHOT_BYTES = 512 * 1024 * 1024
+_SCHEMA4_FEATURE_SNAPSHOT_FIXED_JSON_BYTES = 4 * 1024 * 1024
+_SCHEMA4_FEATURE_TOKEN_FIXED_JSON_BYTES = 64 * 1024
+_SCHEMA4_FEATURE_SOURCE_CELL_FIXED_JSON_BYTES = 4 * 1024
+_SCHEMA4_FEATURE_NUMERIC_SCALAR_JSON_BYTES = 32
 _MAXIMUM_REQUEST_BYTES = 16 * 1024 * 1024
 _MAXIMUM_NATIVE_CUT_MANIFEST_BYTES = 64 * 1024 * 1024
 _MAXIMUM_RECEIPT_BYTES = 16 * 1024 * 1024
@@ -140,6 +145,53 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
 
 class IVEStageEditTrainingCorpusError(RuntimeError):
     """The requested production corpus cannot be proved without guessing."""
+
+
+def _schema4_feature_snapshot_maximum_bytes(
+    *,
+    token_count: int,
+    source_count: int,
+) -> int:
+    """Return a schema-derived stable-file envelope for one snapshot.
+
+    A snapshot contains one complete source token for every reference-time x
+    source cell.  The former generic 64 MiB JSON envelope rejected a valid
+    BLACKHOLE reference with 369 x 10 cells.  This bound scales with the
+    current encoded source dimension, retains a fixed per-token allowance for
+    context/provenance, and remains capped by both the corpus cell ceiling and
+    an absolute 512 MiB stable-read limit.
+    """
+
+    if (
+        isinstance(token_count, bool)
+        or not isinstance(token_count, int)
+        or token_count <= 0
+        or isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count <= 0
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "schema4 feature snapshot dimensions must be positive integers"
+        )
+    source_time_cells = token_count * source_count
+    if source_time_cells > IVE_STAGE_EDIT_MAXIMUM_SOURCE_TIME_CELLS:
+        raise IVEStageEditTrainingCorpusError(
+            "schema4 feature snapshot exceeds the corpus source-time cell limit"
+        )
+    per_source_cell_bytes = (
+        _SCHEMA4_FEATURE_SOURCE_CELL_FIXED_JSON_BYTES
+        + DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension
+        * _SCHEMA4_FEATURE_NUMERIC_SCALAR_JSON_BYTES
+    )
+    derived = (
+        _SCHEMA4_FEATURE_SNAPSHOT_FIXED_JSON_BYTES
+        + token_count * _SCHEMA4_FEATURE_TOKEN_FIXED_JSON_BYTES
+        + source_time_cells * per_source_cell_bytes
+    )
+    return min(
+        _MAXIMUM_SCHEMA4_FEATURE_SNAPSHOT_BYTES,
+        max(_MAXIMUM_UPSTREAM_JSON_BYTES, derived),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2102,6 +2154,194 @@ def _materialize_native_cut_manifest(
     return artifact, tuple(records)
 
 
+def _strictly_reload_existing_native_cut_manifest(
+    *,
+    preflight: TrainingCorpusPreflightResult,
+    manifest_path: Path,
+) -> tuple[TrainingCorpusArtifactIdentity, tuple[Mapping[str, Any], ...]]:
+    """Resume one immutable native-cut manifest without decoding frames."""
+
+    resolved, encoded, payload = _stable_json(
+        manifest_path,
+        maximum_bytes=_MAXIMUM_NATIVE_CUT_MANIFEST_BYTES,
+        name="existing native-cut manifest",
+    )
+    unsigned = dict(payload)
+    artifact_content_sha256 = unsigned.pop("artifact_content_sha256", None)
+    if (
+        not isinstance(artifact_content_sha256, str)
+        or _SHA256.fullmatch(artifact_content_sha256) is None
+        or _canonical_sha256(unsigned) != artifact_content_sha256
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "existing native-cut manifest content identity differs"
+        )
+    output_root = _absolute_lexical_path(
+        preflight.request_payload["outputs"]["native_cut_artifact_directory"],
+        "native-cut artifact directory",
+    ).resolve(strict=True)
+    expected_path = (
+        output_root
+        / IVE_STAGE_EDIT_NATIVE_CUT_MANIFEST_CONTRACT
+        / artifact_content_sha256[:2]
+        / f"{artifact_content_sha256}.json"
+    )
+    if resolved != expected_path.resolve(strict=True):
+        raise IVEStageEditTrainingCorpusError(
+            "existing native-cut manifest left its content-addressed output"
+        )
+
+    request = preflight.request_payload
+    raw_records = payload.get("sources")
+    expected_top = {
+        "schema_version": IVE_STAGE_EDIT_NATIVE_CUT_MANIFEST_SCHEMA_VERSION,
+        "contract": IVE_STAGE_EDIT_NATIVE_CUT_MANIFEST_CONTRACT,
+        "scope": dict(request["scope"]),
+        "request_content_sha256": preflight.request.content_sha256,
+        "decision_grid_sha256": preflight.decision_grid_sha256,
+        "detector": request["native_cut_detector"],
+        "source_count": preflight.source_count,
+        "future_native_cuts_used": False,
+        "raw_frames_persisted": False,
+    }
+    if (
+        set(unsigned) != set(expected_top) | {"sources"}
+        or any(unsigned.get(key) != value for key, value in expected_top.items())
+        or not isinstance(raw_records, list)
+        or len(raw_records) != preflight.source_count
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "existing native-cut manifest changed request authority"
+        )
+
+    records: list[Mapping[str, Any]] = []
+    for source, raw_record in zip(request["sources"], raw_records):
+        if not isinstance(raw_record, Mapping):
+            raise IVEStageEditTrainingCorpusError(
+                "existing native-cut source record is invalid"
+            )
+        unsigned_record = dict(raw_record)
+        evidence_sha256 = unsigned_record.pop(
+            "native_cut_evidence_sha256", None
+        )
+        raw_changes = unsigned_record.get("changes")
+        expected_record = {
+            "source_id": source["source_id"],
+            "media_content_sha256": source["media_content_sha256"],
+            "clock_sha256": source["clock_sha256"],
+            "decision_grid_sha256": preflight.decision_grid_sha256,
+            "frame_rate": source["frame_rate"],
+            "declared_frame_count": source["declared_frame_count"],
+            "live_media_probe": dict(source["live_media_probe"]),
+            "media_probe_evidence_sha256": source[
+                "media_probe_evidence_sha256"
+            ],
+            "acquisition_record_sha256": source[
+                "acquisition_record_sha256"
+            ],
+            "alignment_catalog_record_sha256": source[
+                "alignment_catalog_record_sha256"
+            ],
+            "unavailable_master_times": list(
+                source["unavailable_master_times"]
+            ),
+            "unavailable_master_time_evidence_sha256": source[
+                "unavailable_master_time_evidence_sha256"
+            ],
+            "availability_reason": (
+                "mapped_native_current_plus_following_frame_outside_media_edges"
+            ),
+            "interior_clock_gaps_allowed": False,
+            "detector": request["native_cut_detector"],
+            "raw_frames_persisted": False,
+        }
+        if (
+            set(unsigned_record) != set(expected_record) | {"changes"}
+            or any(
+                unsigned_record.get(key) != value
+                for key, value in expected_record.items()
+            )
+            or not isinstance(raw_changes, list)
+        ):
+            raise IVEStageEditTrainingCorpusError(
+                "existing native-cut source authority differs: "
+                f"{source['source_id']}"
+            )
+        frame_indices: list[int] = []
+        for raw_change in raw_changes:
+            if (
+                not isinstance(raw_change, Mapping)
+                or set(raw_change)
+                != {
+                    "frame_index",
+                    "source_seconds",
+                    "score",
+                    "frame_difference",
+                    "histogram_distance",
+                }
+            ):
+                raise IVEStageEditTrainingCorpusError(
+                    "existing native-cut change record is invalid"
+                )
+            frame_index = raw_change.get("frame_index")
+            if (
+                isinstance(frame_index, bool)
+                or not isinstance(frame_index, int)
+                or frame_index < 0
+                or frame_index >= source["declared_frame_count"]
+            ):
+                raise IVEStageEditTrainingCorpusError(
+                    "existing native-cut frame index is invalid"
+                )
+            source_seconds = _finite(
+                raw_change.get("source_seconds"),
+                "existing native-cut source seconds",
+            )
+            scores = tuple(
+                _finite(raw_change.get(name), f"existing native-cut {name}")
+                for name in (
+                    "score",
+                    "frame_difference",
+                    "histogram_distance",
+                )
+            )
+            if (
+                not math.isclose(
+                    source_seconds,
+                    frame_index / float(source["frame_rate"]),
+                    rel_tol=0.0,
+                    abs_tol=_FLOAT_TOLERANCE,
+                )
+                or any(not 0.0 <= value <= 1.0 for value in scores)
+            ):
+                raise IVEStageEditTrainingCorpusError(
+                    "existing native-cut change evidence differs"
+                )
+            frame_indices.append(frame_index)
+        if frame_indices != sorted(set(frame_indices)):
+            raise IVEStageEditTrainingCorpusError(
+                "existing native-cut frame indices are not strict"
+            )
+        if (
+            not isinstance(evidence_sha256, str)
+            or _SHA256.fullmatch(evidence_sha256) is None
+            or _canonical_sha256(unsigned_record) != evidence_sha256
+        ):
+            raise IVEStageEditTrainingCorpusError(
+                "existing native-cut source evidence hash differs"
+            )
+        records.append(dict(raw_record))
+
+    return (
+        TrainingCorpusArtifactIdentity(
+            path=resolved,
+            content_sha256=artifact_content_sha256,
+            file_sha256=hashlib.sha256(encoded).hexdigest(),
+        ),
+        tuple(records),
+    )
+
+
 def _verify_feature_job(
     *,
     preflight: TrainingCorpusPreflightResult,
@@ -2130,6 +2370,23 @@ def _verify_feature_job(
         )
     grid = request["decision_grid"]
     statistics = manifest.get("statistics")
+    expected_supervision_inputs = [
+        {
+            "reference_id": str(item["reference_id"]),
+            "path": str(Path(item["path"]).resolve(strict=True)),
+            "sha256": str(item["file_sha256"]),
+        }
+        for item in sorted(
+            request["supervisions"],
+            key=lambda value: str(value["reference_id"]),
+        )
+    ]
+    expected_reference_ids = {
+        item["reference_id"] for item in expected_supervision_inputs
+    }
+    expected_source_catalog_sha256 = request["upstream_evidence"][
+        "alignment_catalog"
+    ]["source_catalog_sha256"]
     if (
         manifest.get("song_id") != preflight.song_id
         or manifest.get("source_count") != preflight.source_count
@@ -2137,11 +2394,16 @@ def _verify_feature_job(
         or statistics.get("reference_count") != preflight.reference_count
         or statistics.get("union_decision_time_count")
         != preflight.union_decision_time_count
+        or manifest.get("sampling") != request["sampling"]
+        or manifest.get("source_catalog_sha256")
+        != expected_source_catalog_sha256
+        or manifest.get("supervision_inputs")
+        != expected_supervision_inputs
         or manifest.get("causal_sensing_binding")
         != media_job.stage_edit_artifacts.binding.to_dict()
     ):
         raise IVEStageEditTrainingCorpusError(
-            "schema4 feature manifest changed source/grid/triple authority"
+            "schema4 feature manifest changed request/source/grid/triple authority"
         )
     gate = manifest.get("production_causal_sensing_gate")
     expected_gate = _expected_feature_snapshot_production_gate(
@@ -2151,6 +2413,56 @@ def _verify_feature_job(
     if gate != expected_gate:
         raise IVEStageEditTrainingCorpusError(
             "schema4 feature manifest production causal gate differs"
+        )
+    snapshot_manifest_by_reference: dict[str, Mapping[str, Any]] = {}
+    raw_snapshot_manifest = manifest.get("snapshots")
+    if not isinstance(raw_snapshot_manifest, list):
+        raise IVEStageEditTrainingCorpusError(
+            "schema4 feature manifest snapshots must be a list"
+        )
+    if raw_snapshot_manifest is not None:
+        for item in raw_snapshot_manifest:
+            if not isinstance(item, Mapping):
+                raise IVEStageEditTrainingCorpusError(
+                    "schema4 feature manifest snapshot entry is invalid"
+                )
+            reference_id = item.get("reference_id")
+            token_count = item.get("token_count")
+            manifest_source_count = item.get("source_count")
+            snapshot_path = item.get("path")
+            snapshot_sha256 = item.get("snapshot_sha256")
+            if (
+                not isinstance(reference_id, str)
+                or not reference_id
+                or reference_id in snapshot_manifest_by_reference
+                or isinstance(token_count, bool)
+                or not isinstance(token_count, int)
+                or token_count <= 0
+                or manifest_source_count != preflight.source_count
+                or not isinstance(snapshot_path, str)
+                or not Path(snapshot_path).is_absolute()
+                or not isinstance(snapshot_sha256, str)
+                or _SHA256.fullmatch(snapshot_sha256) is None
+            ):
+                raise IVEStageEditTrainingCorpusError(
+                    "schema4 feature manifest snapshot dimensions are invalid"
+                )
+            _schema4_feature_snapshot_maximum_bytes(
+                token_count=token_count,
+                source_count=preflight.source_count,
+            )
+            snapshot_manifest_by_reference[reference_id] = item
+        if set(snapshot_manifest_by_reference) != set(feature_job.snapshots):
+            raise IVEStageEditTrainingCorpusError(
+                "schema4 feature manifest snapshot reference set differs"
+            )
+        if set(snapshot_manifest_by_reference) != expected_reference_ids:
+            raise IVEStageEditTrainingCorpusError(
+                "schema4 feature manifest reference set differs from request"
+            )
+    if set(feature_job.snapshot_sha256) != set(feature_job.snapshots):
+        raise IVEStageEditTrainingCorpusError(
+            "feature job snapshot SHA-256 reference set differs"
         )
     union_times: set[float] = set()
     snapshot_receipts: list[Mapping[str, Any]] = []
@@ -2162,13 +2474,22 @@ def _verify_feature_job(
             "feature job did not produce exactly five snapshots"
         )
     for reference_id, path in sorted(feature_job.snapshots.items()):
+        snapshot_manifest_entry = snapshot_manifest_by_reference.get(reference_id)
+        declared_token_count = (
+            int(snapshot_manifest_entry["token_count"])
+            if snapshot_manifest_entry is not None
+            else int(preflight.union_decision_time_count)
+        )
+        snapshot_maximum_bytes = _schema4_feature_snapshot_maximum_bytes(
+            token_count=declared_token_count,
+            source_count=preflight.source_count,
+        )
         _resolved, _bytes, payload = _stable_json(
             path,
-            # Schema4 carries the complete 396-dimensional source tokens for
-            # every union-grid cell and legitimately exceeds the compact
-            # request/receipt envelope.  Keep the bounded upstream-artifact
-            # limit while still rejecting oversized or unstable files.
-            maximum_bytes=_MAXIMUM_UPSTREAM_JSON_BYTES,
+            # Schema4 carries the complete schema-bound source token for every
+            # reference-time x source cell.  Use the hash-bound manifest count
+            # rather than the compact request/receipt envelope.
+            maximum_bytes=snapshot_maximum_bytes,
             name=f"schema4 feature snapshot {reference_id}",
         )
         try:
@@ -2177,8 +2498,25 @@ def _verify_feature_job(
             raise IVEStageEditTrainingCorpusError(
                 f"schema4 feature snapshot {reference_id} failed strict replay: {exc}"
             ) from exc
+        if snapshot_manifest_entry is not None:
+            manifest_snapshot_path = _absolute_lexical_path(
+                snapshot_manifest_entry.get("path"),
+                f"schema4 feature manifest snapshot path {reference_id}",
+            )
+            if (
+                manifest_snapshot_path.resolve(strict=True) != _resolved
+                or snapshot_manifest_entry.get("snapshot_sha256")
+                != snapshot.snapshot_sha256
+                or feature_job.snapshot_sha256.get(reference_id)
+                != snapshot.snapshot_sha256
+            ):
+                raise IVEStageEditTrainingCorpusError(
+                    f"schema4 feature manifest snapshot identity differs: "
+                    f"{reference_id}"
+                )
         if (
             snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION
+            or len(snapshot.sequence.tokens) != declared_token_count
             or snapshot.causal_sensing_binding.to_dict()
             != media_job.stage_edit_artifacts.binding.to_dict()
             or snapshot.require_production_causal_sensing(
@@ -2225,6 +2563,8 @@ def _verify_feature_job(
                 "path": str(Path(path).resolve(strict=True)),
                 "snapshot_sha256": snapshot.snapshot_sha256,
                 "token_count": len(snapshot.sequence.tokens),
+                "file_size_bytes": len(_bytes),
+                "schema_derived_maximum_bytes": snapshot_maximum_bytes,
             }
         )
     if tuple(sorted(union_times)) != tuple(grid["master_times"]):
@@ -2447,11 +2787,149 @@ def _strictly_reload_existing_causal_media_job(
     )
 
 
+def _strictly_reload_existing_feature_snapshot_job(
+    manifest_path: Path,
+    *,
+    expected_output_directory: Path,
+    expected_reference_count: int,
+    expected_source_count: int,
+) -> StageEditFeatureSnapshotJobResult:
+    """Reconstruct one immutable feature job without decoding media again.
+
+    This is only a bounded resume adapter.  The caller must still pass the
+    returned object through ``_verify_feature_job``, which strictly replays
+    every schema4 snapshot against the live request and causal triple.
+    """
+
+    output_directory = _absolute_lexical_path(
+        expected_output_directory,
+        "schema4 feature snapshot output directory",
+    ).resolve(strict=True)
+    if not output_directory.is_dir():
+        raise IVEStageEditTrainingCorpusError(
+            "schema4 feature snapshot output path is not a directory"
+        )
+    resolved_manifest, _encoded, manifest = _stable_json(
+        manifest_path,
+        maximum_bytes=_MAXIMUM_REQUEST_BYTES,
+        name="existing schema4 feature job manifest",
+    )
+    unsigned = dict(manifest)
+    manifest_sha256 = unsigned.pop("manifest_sha256", None)
+    if (
+        manifest.get("schema_version") != FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION
+        or not isinstance(manifest_sha256, str)
+        or _SHA256.fullmatch(manifest_sha256) is None
+        or _canonical_sha256(unsigned) != manifest_sha256
+        or resolved_manifest.name
+        != (
+            "stageedit-feature-snapshot-job-manifest-"
+            f"{manifest_sha256[:16]}.json"
+        )
+        or resolved_manifest.parent.resolve(strict=True) != output_directory
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "existing schema4 feature manifest is not immutable/current"
+        )
+    if (
+        isinstance(expected_reference_count, bool)
+        or not isinstance(expected_reference_count, int)
+        or expected_reference_count <= 0
+        or isinstance(expected_source_count, bool)
+        or not isinstance(expected_source_count, int)
+        or expected_source_count <= 0
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "existing feature resume dimensions must be positive integers"
+        )
+    statistics = manifest.get("statistics")
+    raw_snapshots = manifest.get("snapshots")
+    if (
+        manifest.get("source_count") != expected_source_count
+        or not isinstance(statistics, Mapping)
+        or statistics.get("reference_count") != expected_reference_count
+        or statistics.get("source_count") != expected_source_count
+        or not isinstance(raw_snapshots, list)
+        or len(raw_snapshots) != expected_reference_count
+    ):
+        raise IVEStageEditTrainingCorpusError(
+            "existing schema4 feature manifest dimensions differ"
+        )
+
+    snapshots: dict[str, Path] = {}
+    snapshot_sha256: dict[str, str] = {}
+    for raw in raw_snapshots:
+        if not isinstance(raw, Mapping):
+            raise IVEStageEditTrainingCorpusError(
+                "existing schema4 feature manifest snapshot entry is invalid"
+            )
+        reference_id = _source_id(raw.get("reference_id"))
+        token_count = _positive_int(
+            raw.get("token_count"),
+            f"schema4 feature snapshot token count {reference_id}",
+        )
+        if (
+            reference_id in snapshots
+            or raw.get("source_count") != expected_source_count
+        ):
+            raise IVEStageEditTrainingCorpusError(
+                "existing schema4 feature snapshot dimensions differ"
+            )
+        _schema4_feature_snapshot_maximum_bytes(
+            token_count=token_count,
+            source_count=expected_source_count,
+        )
+        digest = _sha256(
+            raw.get("snapshot_sha256"),
+            f"schema4 feature snapshot SHA-256 {reference_id}",
+        )
+        path = _absolute_lexical_path(
+            raw.get("path"),
+            f"schema4 feature snapshot path {reference_id}",
+        )
+        try:
+            resolved_parent = path.parent.resolve(strict=True)
+            path_stat = path.lstat()
+        except OSError as exc:
+            raise IVEStageEditTrainingCorpusError(
+                "existing schema4 feature snapshot is missing or unsafe: "
+                f"{reference_id}"
+            ) from exc
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(path_stat.st_mode)
+            or resolved_parent != output_directory
+            or path.name
+            != (
+                f"{reference_id}-stageedit-feature-snapshot-"
+                f"{digest[:16]}.json"
+            )
+        ):
+            raise IVEStageEditTrainingCorpusError(
+                "existing schema4 feature snapshot left its immutable output "
+                f"directory: {reference_id}"
+            )
+        # Preserve the lexical leaf for _verify_feature_job's O_NOFOLLOW
+        # stable read.  Resolving it here would erase symlink evidence.
+        snapshots[reference_id] = path
+        snapshot_sha256[reference_id] = digest
+
+    return StageEditFeatureSnapshotJobResult(
+        output_directory=output_directory,
+        manifest_path=resolved_manifest,
+        snapshots=snapshots,
+        snapshot_sha256=snapshot_sha256,
+        statistics=dict(statistics),
+    )
+
+
 def launch_ive_stage_edit_training_corpus_request(
     *,
     song_id: str,
     request_path: Path,
+    existing_native_cut_manifest_path: Path | None = None,
     existing_causal_sensing_paths: tuple[Path, Path, Path] | None = None,
+    existing_feature_snapshot_manifest_path: Path | None = None,
     detector: Callable[..., tuple[SceneChange, ...]] = detect_scene_changes_in_video,
     media_materializer: Callable[..., IVECausalSensingMediaJobResult] = (
         materialize_ive_causal_sensing_from_media
@@ -2466,7 +2944,17 @@ def launch_ive_stage_edit_training_corpus_request(
         song=song_id,
         source_paths=(
             request_path,
+            *(
+                (existing_native_cut_manifest_path,)
+                if existing_native_cut_manifest_path is not None
+                else ()
+            ),
             *(existing_causal_sensing_paths or ()),
+            *(
+                (existing_feature_snapshot_manifest_path,)
+                if existing_feature_snapshot_manifest_path is not None
+                else ()
+            ),
         ),
     )
     preflight = preflight_ive_stage_edit_training_corpus_request(
@@ -2474,9 +2962,16 @@ def launch_ive_stage_edit_training_corpus_request(
         request_path=request_path,
     )
     request = preflight.request_payload
-    native_manifest, native_records = _materialize_native_cut_manifest(
-        preflight=preflight,
-        detector=detector,
+    native_manifest, native_records = (
+        _strictly_reload_existing_native_cut_manifest(
+            preflight=preflight,
+            manifest_path=existing_native_cut_manifest_path,
+        )
+        if existing_native_cut_manifest_path is not None
+        else _materialize_native_cut_manifest(
+            preflight=preflight,
+            detector=detector,
+        )
     )
     cut_by_source = {str(item["source_id"]): item for item in native_records}
     sources = tuple(
@@ -2549,21 +3044,32 @@ def launch_ive_stage_edit_training_corpus_request(
             "causal triple does not exactly cover the request union grid"
         )
     sampling = request["sampling"]
-    feature_job = feature_builder(
-        tuple(Path(item["path"]) for item in request["supervisions"]),
-        song_id=preflight.song_id,
-        output_directory=Path(
-            request["outputs"]["feature_snapshot_output_directory"]
-        ),
-        expected_source_count=preflight.source_count,
-        negative_samples_per_hold=sampling["negative_samples_per_hold"],
-        boundary_guard_seconds=sampling["boundary_guard_seconds"],
-        max_sources=sampling["max_sources"],
-        working_width=sampling["visual_working_width"],
-        causal_sensing=media_job.stage_edit_artifacts,
-        edit_mode=preflight.edit_mode,
-        target_member=preflight.target_member,
-        inspection_only_without_causal_sensing=False,
+    feature_job = (
+        _strictly_reload_existing_feature_snapshot_job(
+            existing_feature_snapshot_manifest_path,
+            expected_output_directory=Path(
+                request["outputs"]["feature_snapshot_output_directory"]
+            ),
+            expected_reference_count=preflight.reference_count,
+            expected_source_count=preflight.source_count,
+        )
+        if existing_feature_snapshot_manifest_path is not None
+        else feature_builder(
+            tuple(Path(item["path"]) for item in request["supervisions"]),
+            song_id=preflight.song_id,
+            output_directory=Path(
+                request["outputs"]["feature_snapshot_output_directory"]
+            ),
+            expected_source_count=preflight.source_count,
+            negative_samples_per_hold=sampling["negative_samples_per_hold"],
+            boundary_guard_seconds=sampling["boundary_guard_seconds"],
+            max_sources=sampling["max_sources"],
+            working_width=sampling["visual_working_width"],
+            causal_sensing=media_job.stage_edit_artifacts,
+            edit_mode=preflight.edit_mode,
+            target_member=preflight.target_member,
+            inspection_only_without_causal_sensing=False,
+        )
     )
     if not isinstance(feature_job, StageEditFeatureSnapshotJobResult):
         raise IVEStageEditTrainingCorpusError(
@@ -2584,6 +3090,19 @@ def launch_ive_stage_edit_training_corpus_request(
         "source_count": preflight.source_count,
         "reference_count": preflight.reference_count,
         "native_cut_manifest": native_manifest.to_dict(),
+        "native_cut_execution": {
+            "contract": "strict_native_cut_manifest_resume_v1",
+            "existing_manifest_strictly_reloaded": (
+                existing_native_cut_manifest_path is not None
+            ),
+            "detector_invoked": (
+                existing_native_cut_manifest_path is None
+            ),
+            "all_source_records_strictly_validated": True,
+            "persisted_manifest_strictly_replayed": (
+                existing_native_cut_manifest_path is not None
+            ),
+        },
         "causal_sensing": {
             "shooting_grammar_path": str(media_job.shooting_grammar_path),
             "shooting_grammar_content_sha256": (
@@ -2603,7 +3122,27 @@ def launch_ive_stage_edit_training_corpus_request(
                 media_job.unavailable_source_time_count
             ),
         },
+        "causal_sensing_execution": {
+            "contract": "strict_causal_sensing_triple_resume_v1",
+            "existing_triple_strictly_reloaded": (
+                existing_causal_sensing_paths is not None
+            ),
+            "media_materializer_invoked": (
+                existing_causal_sensing_paths is None
+            ),
+            "all_artifacts_bound_to_exact_request": True,
+        },
         "feature_job": feature_receipt,
+        "feature_job_execution": {
+            "contract": "strict_schema4_feature_manifest_resume_v1",
+            "existing_manifest_strictly_reloaded": (
+                existing_feature_snapshot_manifest_path is not None
+            ),
+            "feature_builder_invoked": (
+                existing_feature_snapshot_manifest_path is None
+            ),
+            "all_snapshots_strictly_replayed": True,
+        },
         "same_exact_triple_bound_to_all_five_snapshots": True,
         "raw_frames_persisted_by_coordinator": False,
     }
@@ -2666,9 +3205,11 @@ def build_parser() -> argparse.ArgumentParser:
     launch = subparsers.add_parser("launch")
     launch.add_argument("--song-id", required=True)
     launch.add_argument("--request", required=True, type=Path)
+    launch.add_argument("--reuse-native-cut-manifest", type=Path)
     launch.add_argument("--reuse-shooting-grammar", type=Path)
     launch.add_argument("--reuse-member-state-graph", type=Path)
     launch.add_argument("--reuse-ive-performer-state", type=Path)
+    launch.add_argument("--reuse-feature-manifest", type=Path)
     return parser
 
 
@@ -2721,8 +3262,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = launch_ive_stage_edit_training_corpus_request(
             song_id=args.song_id,
             request_path=args.request,
+            existing_native_cut_manifest_path=(
+                args.reuse_native_cut_manifest
+            ),
             existing_causal_sensing_paths=(
                 tuple(reuse_values) if all(value is not None for value in reuse_values) else None
+            ),
+            existing_feature_snapshot_manifest_path=(
+                args.reuse_feature_manifest
             ),
         )
         print(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True))
