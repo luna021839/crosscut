@@ -41,6 +41,38 @@ from .ive_product_quality_floor import (
 from .professional_montage_grammar import (
     PROFILE_ANALYSIS_BASIS as MONTAGE_PROFILE_ANALYSIS_BASIS,
     PROFILE_SCHEMA_VERSION as MONTAGE_PROFILE_SCHEMA_VERSION,
+    ProfessionalBoundaryGrammarEvidence,
+    assess_professional_boundary_grammar,
+)
+from .group_boundary_grammar_adapter import (
+    adapt_group_boundary_grammar_evidence,
+)
+from .ive import AspectRatio
+from .render import (
+    BoundaryLookKeyframe,
+    BoundaryLookTrack,
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    NormalizedCrop,
+    PanCropKeyframe,
+    PanCropTrack,
+    RenderPlan,
+    RenderSegment,
+    RenderTransition,
+    SourceLookAdjustment,
+)
+from .stage_edit_dynamic_crop_motion_authority_v3 import (
+    DynamicCropMotionAuthorityV3Error,
+    DynamicCropMotionTimelineEvidenceV3,
+    apply_dynamic_crop_motion_authority_to_render_plan_v3,
+    corroborate_dynamic_crop_motion_timeline_v3,
+    load_dynamic_crop_motion_authority_from_registered_identity_v3,
+)
+from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
+)
+from .stage_edit_production_registry import (
+    RegisteredStageEditMotionAuthorityIdentityV3,
 )
 from .rendered_montage_grammar_review import (
     RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS,
@@ -62,6 +94,10 @@ ANALYSIS_BASIS = (
 )
 INPUT_ARTIFACT_FINGERPRINT_CONTRACT = (
     "post_render_qa_input_artifact_content_sha256_v1"
+)
+DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT = (
+    "final_render_plan_registered_release_freeze_decode_and_motion_evidence_"
+    "independent_replay_v1"
 )
 
 _ANALYSIS_SUFFIX = "-analysis.json"
@@ -112,6 +148,10 @@ class PostRenderQAVerdict(str, Enum):
     PASS = "PASS"
     CONDITIONAL = "CONDITIONAL"
     FAIL = "FAIL"
+
+
+class DynamicCropV3PostRenderEvidenceReplayError(ValueError):
+    """Final v3 renderer motion evidence could not be independently replayed."""
 
 
 class QAIssueSeverity(str, Enum):
@@ -834,6 +874,628 @@ def _integer(value: Any) -> int | None:
     return value
 
 
+def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
+    """Rebuild the typed boundary authority from the persisted final plan.
+
+    The professional boundary gate only consumes source/timeline clocks,
+    transitions, and editorial camera tracks.  Reconstruct those fields here
+    instead of trusting the already-derived evidence embedded in the analysis
+    JSON.  Redundant serialized clock fields are checked before construction so
+    a self-consistent re-hash cannot hide drift in the final RenderPlan.
+    """
+
+    payload = _mapping(value)
+    if payload is None:
+        raise ValueError("render plan must be an object")
+
+    raw_sources = _sequence(payload.get("sources"))
+    if not raw_sources or any(
+        not isinstance(item, str) or not item for item in raw_sources
+    ):
+        raise ValueError("render plan sources are missing or malformed")
+    sources = tuple(Path(item) for item in raw_sources)
+
+    fps = _number(payload.get("fps"))
+    if fps is None or fps <= 0.0:
+        raise ValueError("render plan fps is invalid")
+    raw_segments = _sequence(payload.get("segments"))
+    if not raw_segments:
+        raise ValueError("render plan segments are missing")
+    segments: list[RenderSegment] = []
+    for index, raw_segment in enumerate(raw_segments):
+        segment = _mapping(raw_segment)
+        if segment is None:
+            raise ValueError(f"render plan segment {index} is malformed")
+        source_index = _integer(segment.get("source_index"))
+        source_start = _number(segment.get("source_start"))
+        duration = _number(segment.get("duration"))
+        master_start = _number(segment.get("master_start"))
+        if (
+            source_index is None
+            or source_start is None
+            or duration is None
+            or master_start is None
+        ):
+            raise ValueError(f"render plan segment {index} clock is malformed")
+        raw_source_duration = segment.get("source_duration")
+        source_duration = (
+            None if raw_source_duration is None else _number(raw_source_duration)
+        )
+        if raw_source_duration is not None and source_duration is None:
+            raise ValueError(
+                f"render plan segment {index} source_duration is malformed"
+            )
+
+        transform: EditorialTransformTrack | None = None
+        raw_transform = segment.get("editorial_transform")
+        if raw_transform is not None:
+            transform_payload = _mapping(raw_transform)
+            if transform_payload is None:
+                raise ValueError(
+                    f"render plan segment {index} editorial transform is malformed"
+                )
+            raw_keyframes = _sequence(transform_payload.get("keyframes"))
+            reason = transform_payload.get("reason")
+            if not raw_keyframes or not isinstance(reason, str) or not reason:
+                raise ValueError(
+                    f"render plan segment {index} editorial transform is incomplete"
+                )
+            keyframes: list[EditorialTransformKeyframe] = []
+            for keyframe_index, raw_keyframe in enumerate(raw_keyframes):
+                keyframe = _mapping(raw_keyframe)
+                if keyframe is None:
+                    raise ValueError(
+                        "render plan editorial transform keyframe is malformed"
+                    )
+                values = {
+                    key: _number(keyframe.get(key))
+                    for key in (
+                        "time_seconds",
+                        "zoom",
+                        "center_x",
+                        "center_y",
+                        "roll_degrees",
+                    )
+                }
+                if any(item is None for item in values.values()):
+                    raise ValueError(
+                        "render plan segment "
+                        f"{index} transform keyframe {keyframe_index} is incomplete"
+                    )
+                keyframes.append(
+                    EditorialTransformKeyframe(
+                        time_seconds=float(values["time_seconds"]),
+                        zoom=float(values["zoom"]),
+                        center_x=float(values["center_x"]),
+                        center_y=float(values["center_y"]),
+                        roll_degrees=float(values["roll_degrees"]),
+                    )
+                )
+            transform = EditorialTransformTrack(
+                keyframes=tuple(keyframes),
+                reason=reason,
+            )
+
+        rebuilt = RenderSegment(
+            source_index=source_index,
+            source_start=source_start,
+            duration=duration,
+            master_start=master_start,
+            source_duration=source_duration,
+            editorial_transform=transform,
+        )
+        redundant_numbers = {
+            "source_local_start": rebuilt.source_start,
+            "source_local_end": rebuilt.source_end,
+            "effective_source_duration": rebuilt.effective_source_duration,
+            "source_playback_rate": rebuilt.source_playback_rate,
+        }
+        for key, expected in redundant_numbers.items():
+            observed = _number(segment.get(key))
+            if observed is None or not math.isclose(
+                observed,
+                expected,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    f"render plan segment {index} redundant {key} disagrees"
+                )
+        segments.append(rebuilt)
+
+    raw_transitions = _sequence(payload.get("transitions"))
+    if raw_transitions is None:
+        raise ValueError("render plan transitions are missing")
+    transitions: list[RenderTransition] = []
+    for index, raw_transition in enumerate(raw_transitions):
+        transition = _mapping(raw_transition)
+        if transition is None:
+            raise ValueError(f"render plan transition {index} is malformed")
+        frame_count = _integer(transition.get("frame_count"))
+        reason = transition.get("reason")
+        kind = transition.get("kind")
+        if (
+            frame_count is None
+            or not isinstance(reason, str)
+            or not reason
+            or not isinstance(kind, str)
+        ):
+            raise ValueError(f"render plan transition {index} is incomplete")
+
+        optional_numbers: dict[str, float | None] = {}
+        for key in (
+            "face_mismatch",
+            "appearance_min_cosine_similarity",
+            "future_pose_max_mismatch",
+            "future_silhouette_max_mismatch",
+        ):
+            raw_number = transition.get(key)
+            optional_numbers[key] = (
+                None if raw_number is None else _number(raw_number)
+            )
+            if raw_number is not None and optional_numbers[key] is None:
+                raise ValueError(
+                    f"render plan transition {index} {key} is malformed"
+                )
+        rebuilt_transition = RenderTransition(
+            kind=kind,
+            frame_count=frame_count,
+            reason=reason,
+            face_mismatch=optional_numbers["face_mismatch"],
+            tier=transition.get("tier"),
+            appearance_min_cosine_similarity=optional_numbers[
+                "appearance_min_cosine_similarity"
+            ],
+            future_pose_max_mismatch=optional_numbers[
+                "future_pose_max_mismatch"
+            ],
+            future_silhouette_max_mismatch=optional_numbers[
+                "future_silhouette_max_mismatch"
+            ],
+        )
+        serialized_duration = _number(transition.get("duration_seconds"))
+        if serialized_duration is None or not math.isclose(
+            serialized_duration,
+            rebuilt_transition.duration_seconds(fps),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"render plan transition {index} duration disagrees"
+            )
+        transitions.append(rebuilt_transition)
+
+    reference_source = _integer(payload.get("reference_source"))
+    width = _integer(payload.get("width"))
+    height = _integer(payload.get("height"))
+    master_audio_start = _number(payload.get("master_audio_start"))
+    aspect_ratio = payload.get("aspect_ratio")
+    output = payload.get("output")
+    if (
+        reference_source is None
+        or width is None
+        or height is None
+        or master_audio_start is None
+        or not isinstance(aspect_ratio, str)
+        or not isinstance(output, str)
+        or not output
+    ):
+        raise ValueError("render plan header is malformed")
+    rebuilt_plan = RenderPlan(
+        sources=sources,
+        segments=tuple(segments),
+        reference_source=reference_source,
+        aspect_ratio=AspectRatio(aspect_ratio),
+        output=Path(output),
+        master_audio_start=master_audio_start,
+        width=width,
+        height=height,
+        fps=fps,
+        transitions=tuple(transitions),
+        member_pose_dissolve_requested=payload.get(
+            "member_pose_dissolve_requested"
+        ),
+        member_pose_dissolve_effective=payload.get(
+            "member_pose_dissolve_effective"
+        ),
+        member_pose_dissolve_count=payload.get("member_pose_dissolve_count"),
+    )
+    for key, expected in (
+        ("duration", rebuilt_plan.duration),
+        ("render_duration", rebuilt_plan.render_duration),
+    ):
+        observed = _number(payload.get(key))
+        if observed is None or not math.isclose(
+            observed,
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(f"render plan {key} disagrees with typed reconstruction")
+    if _integer(payload.get("output_frame_count")) != rebuilt_plan.output_frame_count:
+        raise ValueError("render plan output_frame_count disagrees")
+    return rebuilt_plan
+
+
+def _dynamic_crop_canonical_sha256(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "Dynamic Crop v3 post-render input is not canonical JSON"
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _exact_numeric_mapping(
+    value: object,
+    *,
+    keys: frozenset[str],
+    label: str,
+) -> dict[str, float]:
+    payload = _mapping(value)
+    if payload is None or set(payload) != keys:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} keys are not exact"
+        )
+    result: dict[str, float] = {}
+    for key in keys:
+        number = _number(payload[key])
+        if number is None:
+            raise DynamicCropV3PostRenderEvidenceReplayError(
+                f"{label}.{key} is not finite"
+            )
+        result[key] = number
+    return result
+
+
+def _normalized_crop_from_serialized(
+    value: object,
+    *,
+    label: str,
+) -> NormalizedCrop | None:
+    if value is None:
+        return None
+    values = _exact_numeric_mapping(
+        value,
+        keys=frozenset({"x", "y", "width", "height"}),
+        label=label,
+    )
+    return NormalizedCrop(**values)
+
+
+def _pan_crop_from_serialized(
+    value: object,
+    *,
+    label: str,
+) -> PanCropTrack | None:
+    if value is None:
+        return None
+    payload = _mapping(value)
+    if payload is None or set(payload) != {"keyframes"}:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} keys are not exact"
+        )
+    raw_keyframes = _sequence(payload["keyframes"])
+    if not raw_keyframes:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} keyframes are missing"
+        )
+    keyframes: list[PanCropKeyframe] = []
+    for index, raw_keyframe in enumerate(raw_keyframes):
+        keyframe = _mapping(raw_keyframe)
+        if keyframe is None or set(keyframe) != {"time_seconds", "crop"}:
+            raise DynamicCropV3PostRenderEvidenceReplayError(
+                f"{label} keyframe {index} keys are not exact"
+            )
+        time_seconds = _number(keyframe["time_seconds"])
+        crop = _normalized_crop_from_serialized(
+            keyframe["crop"],
+            label=f"{label}.keyframes[{index}].crop",
+        )
+        if time_seconds is None or crop is None:
+            raise DynamicCropV3PostRenderEvidenceReplayError(
+                f"{label} keyframe {index} is malformed"
+            )
+        keyframes.append(PanCropKeyframe(time_seconds=time_seconds, crop=crop))
+    return PanCropTrack(tuple(keyframes))
+
+
+def _source_look_from_serialized(
+    value: object,
+    *,
+    label: str,
+) -> SourceLookAdjustment | None:
+    if value is None:
+        return None
+    values = _exact_numeric_mapping(
+        value,
+        keys=frozenset(
+            {"brightness", "contrast", "saturation", "temperature_balance"}
+        ),
+        label=label,
+    )
+    return SourceLookAdjustment(**values)
+
+
+def _boundary_look_from_serialized(
+    value: object,
+    *,
+    label: str,
+) -> BoundaryLookTrack | None:
+    if value is None:
+        return None
+    payload = _mapping(value)
+    if payload is None or set(payload) != {"keyframes", "reason"}:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} keys are not exact"
+        )
+    reason = payload["reason"]
+    raw_keyframes = _sequence(payload["keyframes"])
+    if not isinstance(reason, str) or not reason or not raw_keyframes:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"{label} is malformed"
+        )
+    keyframes: list[BoundaryLookKeyframe] = []
+    keys = frozenset(
+        {
+            "time_seconds",
+            "brightness",
+            "contrast",
+            "saturation",
+            "temperature_balance",
+        }
+    )
+    for index, raw_keyframe in enumerate(raw_keyframes):
+        values = _exact_numeric_mapping(
+            raw_keyframe,
+            keys=keys,
+            label=f"{label}.keyframes[{index}]",
+        )
+        keyframes.append(BoundaryLookKeyframe(**values))
+    return BoundaryLookTrack(tuple(keyframes), reason=reason)
+
+
+def _dynamic_crop_render_plan_from_serialized(value: object) -> RenderPlan:
+    """Strictly restore every final RenderPlan field used by its content hash."""
+
+    payload = _mapping(value)
+    if payload is None:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "final serialized RenderPlan must be an object"
+        )
+    try:
+        partial = _boundary_render_plan_from_serialized(payload)
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"final serialized RenderPlan is invalid: {exc}"
+        ) from exc
+    raw_segments = _sequence(payload.get("segments"))
+    if raw_segments is None or len(raw_segments) != len(partial.segments):
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "final serialized RenderPlan segment count changed"
+        )
+    segments: list[RenderSegment] = []
+    for index, (base_segment, raw_segment) in enumerate(
+        zip(partial.segments, raw_segments, strict=True)
+    ):
+        segment = _mapping(raw_segment)
+        if segment is None:
+            raise DynamicCropV3PostRenderEvidenceReplayError(
+                f"final RenderPlan segment {index} is malformed"
+            )
+        try:
+            segments.append(
+                replace(
+                    base_segment,
+                    crop=_normalized_crop_from_serialized(
+                        segment.get("crop"),
+                        label=f"segments[{index}].crop",
+                    ),
+                    pan_crop=_pan_crop_from_serialized(
+                        segment.get("pan_crop"),
+                        label=f"segments[{index}].pan_crop",
+                    ),
+                    look_adjustment=_source_look_from_serialized(
+                        segment.get("look_adjustment"),
+                        label=f"segments[{index}].look_adjustment",
+                    ),
+                    boundary_look_track=_boundary_look_from_serialized(
+                        segment.get("boundary_look_track"),
+                        label=f"segments[{index}].boundary_look_track",
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, DynamicCropV3PostRenderEvidenceReplayError):
+                raise
+            raise DynamicCropV3PostRenderEvidenceReplayError(
+                f"final RenderPlan segment {index} cannot be reconstructed: {exc}"
+            ) from exc
+    try:
+        rebuilt = replace(partial, segments=tuple(segments))
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"final RenderPlan typed reconstruction failed: {exc}"
+        ) from exc
+    if _dynamic_crop_canonical_sha256(
+        payload
+    ) != _dynamic_crop_canonical_sha256(rebuilt.to_json()):
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "final serialized RenderPlan differs from its exact typed reconstruction"
+        )
+    return rebuilt
+
+
+def replay_dynamic_crop_v3_post_render_evidence(
+    *,
+    serialized_render_plan: object,
+    registered_motion_authority_identity: object,
+    serialized_decodes: object,
+    persisted_timeline_evidence: object,
+) -> DynamicCropMotionTimelineEvidenceV3:
+    """Independently replay final Dynamic Crop v3 renderer-motion evidence.
+
+    The final plan must already contain the exact authority-sanitized tracks.
+    Runtime then replays the live registered release freeze, restores every
+    selected decode, corroborates renderer-frame physical motion, and requires
+    byte-semantic equality with the persisted content-addressed evidence.
+    """
+
+    plan = _dynamic_crop_render_plan_from_serialized(serialized_render_plan)
+    identity_payload = _mapping(registered_motion_authority_identity)
+    if identity_payload is None:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "registered Dynamic Crop v3 motion authority identity is missing"
+        )
+    try:
+        identity = RegisteredStageEditMotionAuthorityIdentityV3.from_dict(
+            identity_payload
+        )
+        authority = load_dynamic_crop_motion_authority_from_registered_identity_v3(
+            identity
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"registered Dynamic Crop v3 motion authority replay failed: {exc}"
+        ) from exc
+
+    raw_decodes = _sequence(serialized_decodes)
+    if raw_decodes is None:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "serialized Dynamic Crop v3 decode list is missing"
+        )
+    try:
+        decodes = tuple(
+            DynamicCropTrackDecodeV3.from_dict(raw_decode)
+            if isinstance(raw_decode, Mapping)
+            else (_ for _ in ()).throw(
+                ValueError("Dynamic Crop v3 decode must be an object")
+            )
+            for raw_decode in raw_decodes
+        )
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"serialized Dynamic Crop v3 decode is invalid: {exc}"
+        ) from exc
+
+    persisted_payload = _mapping(persisted_timeline_evidence)
+    if persisted_payload is None:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "persisted Dynamic Crop v3 motion evidence is missing"
+        )
+    try:
+        persisted = DynamicCropMotionTimelineEvidenceV3.from_dict(
+            persisted_payload
+        )
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"persisted Dynamic Crop v3 motion evidence is invalid: {exc}"
+        ) from exc
+    if persisted.authority != authority:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "persisted motion evidence authority differs from the live registry"
+        )
+
+    try:
+        sanitized = apply_dynamic_crop_motion_authority_to_render_plan_v3(
+            render_plan=plan,
+            decodes=decodes,
+            authority=authority,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"final RenderPlan motion-authority application failed: {exc}"
+        ) from exc
+    if _dynamic_crop_canonical_sha256(
+        sanitized.to_json()
+    ) != _dynamic_crop_canonical_sha256(plan.to_json()):
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "final RenderPlan was not motion-authority sanitized before rendering"
+        )
+    try:
+        reconstructed = corroborate_dynamic_crop_motion_timeline_v3(
+            render_plan=sanitized,
+            decodes=decodes,
+            authority=authority,
+        )
+    except (DynamicCropMotionAuthorityV3Error, TypeError, ValueError) as exc:
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            f"final Dynamic Crop v3 motion evidence reconstruction failed: {exc}"
+        ) from exc
+    if persisted.to_dict() != reconstructed.to_dict():
+        raise DynamicCropV3PostRenderEvidenceReplayError(
+            "persisted Dynamic Crop v3 motion evidence differs from reconstruction"
+        )
+    return reconstructed
+
+
+def _boundary_scene_cut_times_from_analysis(
+    analysis: Mapping[str, Any],
+    *,
+    plan: RenderPlan,
+) -> tuple[tuple[float, ...], ...]:
+    """Recover every source-local hard-cut clock from its detector authority."""
+
+    raw_records = _sequence(analysis.get("scene_analysis"))
+    if raw_records is None or len(raw_records) != len(plan.sources):
+        raise ValueError(
+            "scene_analysis must contain one detector record per RenderPlan source"
+        )
+    clocks: list[tuple[float, ...]] = []
+    for source_index, raw_record in enumerate(raw_records):
+        record = _mapping(raw_record)
+        if (
+            record is None
+            or record.get("index_domain") != "request_source_index"
+            or _integer(record.get("source_index")) != source_index
+            or record.get("source") != str(plan.sources[source_index])
+        ):
+            raise ValueError(
+                f"scene_analysis source record {source_index} is not domain-bound"
+            )
+        frame_rate = _number(record.get("frame_rate"))
+        raw_changes = _sequence(record.get("changes"))
+        if frame_rate is None or frame_rate <= 0.0 or raw_changes is None:
+            raise ValueError(
+                f"scene_analysis source record {source_index} is incomplete"
+            )
+        source_clocks: list[float] = []
+        previous_frame = -1
+        for change_index, raw_change in enumerate(raw_changes):
+            change = _mapping(raw_change)
+            if change is None:
+                raise ValueError("scene_analysis change is malformed")
+            frame_index = _integer(change.get("frame_index"))
+            timestamp = _number(change.get("timestamp_seconds"))
+            if (
+                frame_index is None
+                or frame_index < 0
+                or frame_index <= previous_frame
+                or timestamp is None
+                or not math.isclose(
+                    timestamp,
+                    frame_index / frame_rate,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "scene_analysis source "
+                    f"{source_index} change {change_index} clock is malformed"
+                )
+            previous_frame = frame_index
+            source_clocks.append(timestamp)
+        clocks.append(tuple(source_clocks))
+    return tuple(clocks)
+
+
 def _probe_number(value: Any) -> float | None:
     result = _number(value)
     if result is not None:
@@ -1234,6 +1896,12 @@ def _domain_aware_boundary_contract_valid(
         issue_fraction = _number(payload.get("issue_fraction"))
         score = _mapping(payload.get("score")) or {}
         distribution = _mapping(score.get("distribution")) or {}
+        score_p10 = _number(score.get("p10"))
+        expected_pass_policy = (
+            "editorial_boundary_p10_and_issue_fraction_gate"
+            if domain == _INTRODUCED_CROSS_SOURCE_DOMAIN
+            else "zero_technical_integrity_issues"
+        )
         if not (
             payload.get("domain") == domain
             and payload.get("count_basis") == domain
@@ -1256,11 +1924,17 @@ def _domain_aware_boundary_contract_valid(
                 abs_tol=1e-12,
             )
             and _integer(distribution.get("count")) == count
+            and score_p10 is not None
             and (
-                (_number(score.get("p10")) is not None)
-                if count
-                else score.get("p10") is None
+                count > 0
+                or math.isclose(
+                    score_p10,
+                    100.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
             )
+            and payload.get("pass_policy") == expected_pass_policy
             and isinstance(payload.get("passed"), bool)
         ):
             return False
@@ -2185,6 +2859,109 @@ def _validate_plan_invariants(
         and duration is not None
         and math.isclose(usage_duration, duration, rel_tol=0.0, abs_tol=1e-6)
     )
+    request_payload = _mapping(analysis.get("request")) or {}
+    render_payload = _mapping(analysis.get("render")) or {}
+    automatic_member_direct_required = bool(
+        str(request_payload.get("group", "")).strip().upper() == "IVE"
+        and str(request_payload.get("source_mode", "")).strip().lower()
+        == "automatic"
+        and str(request_payload.get("edit_mode", "")).strip().lower()
+        == "member"
+        and render_payload.get("direct_full_frame") is True
+    )
+    member_direct = _mapping(analysis.get("member_direct_full_frame"))
+    if member_direct is not None and member_direct.get("enabled") is True:
+        raw_alignment_eligibility = _sequence(
+            analysis.get("alignment_eligibility")
+        )
+        source_index_mapping = _mapping(analysis.get("source_index_mapping"))
+        canonical_eligible_member_source_indices: list[int] = []
+        canonical_alignment_eligibility_well_formed = bool(
+            raw_alignment_eligibility is not None
+            and len(raw_alignment_eligibility) == len(sources)
+        )
+        if raw_alignment_eligibility is not None:
+            for position, raw_eligibility in enumerate(
+                raw_alignment_eligibility
+            ):
+                eligibility = _mapping(raw_eligibility)
+                if not (
+                    eligibility is not None
+                    and eligibility.get("index_domain")
+                    == "request_source_index"
+                    and eligibility.get("source_index") == position
+                    and isinstance(eligibility.get("render_eligible"), bool)
+                ):
+                    canonical_alignment_eligibility_well_formed = False
+                    continue
+                if eligibility["render_eligible"] is True:
+                    canonical_eligible_member_source_indices.append(position)
+        expected_request_to_eligible: list[int | None] = [None] * len(sources)
+        for eligible_position, request_source_index in enumerate(
+            canonical_eligible_member_source_indices
+        ):
+            expected_request_to_eligible[request_source_index] = (
+                eligible_position
+            )
+        canonical_source_mapping_matches = bool(
+            source_index_mapping is not None
+            and source_index_mapping.get("request_index_domain")
+            == "request_source_index"
+            and source_index_mapping.get("eligible_index_domain")
+            == "eligible_source_index"
+            and source_index_mapping.get("render_plan_index_domain")
+            == "render_plan_sources_array_index"
+            and source_index_mapping.get("eligible_to_request")
+            == canonical_eligible_member_source_indices
+            and source_index_mapping.get("request_to_eligible")
+            == expected_request_to_eligible
+        )
+        eligible_member_sources = _sequence(
+            member_direct.get("eligible_request_source_indices")
+        )
+        required_member_sources = _sequence(
+            member_direct.get("required_used_request_source_indices")
+        )
+        direct_final_usage = _mapping(member_direct.get("final_source_usage")) or {}
+        direct_used_sources = _sequence(
+            direct_final_usage.get("used_source_indices")
+        )
+        eligible_member_source_indices = (
+            [
+                value
+                for value in eligible_member_sources
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+            if eligible_member_sources is not None
+            else []
+        )
+        member_source_contract_well_formed = bool(
+            canonical_alignment_eligibility_well_formed
+            and canonical_source_mapping_matches
+            and eligible_member_sources is not None
+            and eligible_member_source_indices == eligible_member_sources
+            and len(set(eligible_member_source_indices))
+            == len(eligible_member_source_indices)
+            and eligible_member_source_indices
+            == sorted(eligible_member_source_indices)
+            and eligible_member_source_indices
+            == canonical_eligible_member_source_indices
+            and required_member_sources == eligible_member_source_indices
+            and member_direct.get("minimum_required_distinct_source_count")
+            == len(eligible_member_source_indices)
+        )
+        checks["member_direct_all_eligible_sources_used"] = bool(
+            member_source_contract_well_formed
+            and actual_used_source_indices == eligible_member_source_indices
+            and direct_final_usage.get("distinct_source_count")
+            == len(eligible_member_source_indices)
+            and direct_used_sources == eligible_member_source_indices
+            and dict(direct_final_usage) == dict(source_usage)
+        )
+    elif automatic_member_direct_required:
+        checks["member_direct_all_eligible_sources_used"] = False
+    else:
+        checks["member_direct_all_eligible_sources_used"] = True
     checks["timeline_unique_sources_matches_plan"] = (
         timeline.get("unique_source_count") == len(actual_used_source_indices)
     )
@@ -5909,6 +6686,220 @@ def _automatic_ive_group_product_scope(analysis: Mapping[str, Any]) -> bool:
     return automatic_ive_group_product_floor_required(analysis)
 
 
+def _dynamic_crop_v3_motion_evidence_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    collector: _IssueCollector,
+) -> tuple[dict[str, Any], DynamicCropMotionTimelineEvidenceV3 | None]:
+    """Replay the release-bound v3 evidence before any montage recomputation."""
+
+    version = analysis.get("dynamic_crop_version")
+    serialized_decodes = analysis.get("dynamic_crop_v3_decodes")
+    persisted_evidence = analysis.get("dynamic_crop_motion_v3")
+    generation = _mapping(analysis.get("stage_edit_generation"))
+    activation = _mapping(generation.get("activation")) if generation else None
+    authority_record = (
+        _mapping(activation.get("dynamic_crop_v3_motion_authority"))
+        if activation is not None
+        else None
+    )
+    selection_policy = (
+        _mapping(generation.get("selection_policy"))
+        if generation is not None
+        else None
+    )
+    generation_version = (
+        selection_policy.get("dynamic_crop_version")
+        if selection_policy is not None
+        else None
+    )
+    activation_version = (
+        activation.get("dynamic_crop_version")
+        if activation is not None
+        else None
+    )
+    registered_v3_claimed = bool(
+        generation_version == 3
+        or activation_version == 3
+        or (
+            authority_record is not None
+            and (
+                authority_record.get("qualified") is True
+                or authority_record.get("identity") is not None
+            )
+        )
+    )
+    for marker, marker_path in (
+        (version, "dynamic_crop_version"),
+        (
+            generation_version,
+            "stage_edit_generation.selection_policy.dynamic_crop_version",
+        ),
+        (
+            activation_version,
+            "stage_edit_generation.activation.dynamic_crop_version",
+        ),
+    ):
+        if marker is None:
+            continue
+        if (
+            isinstance(marker, bool)
+            or not isinstance(marker, int)
+            or marker not in (2, 3)
+        ):
+            collector.add(
+                "dynamic_crop_version_invalid",
+                QAIssueSeverity.FAIL,
+                "The final analysis has an invalid Dynamic Crop version marker.",
+                path=marker_path,
+                value=marker,
+                threshold={"allowed": [2, 3]},
+            )
+            return {
+                "required": registered_v3_claimed,
+                "available": False,
+                "passed": False,
+                "failure": "dynamic_crop_version_invalid",
+            }, None
+    if registered_v3_claimed and version != 3:
+        collector.add(
+            "dynamic_crop_v3_activation_version_mismatch",
+            QAIssueSeverity.FAIL,
+            "Registered Dynamic Crop v3 authority was downgraded or removed from the final analysis marker.",
+            path=(
+                "stage_edit_generation.activation.dynamic_crop_version,"
+                "stage_edit_generation.activation.dynamic_crop_v3_motion_authority,"
+                "dynamic_crop_version"
+            ),
+            value={
+                "activation_dynamic_crop_version": activation_version,
+                "generation_dynamic_crop_version": generation_version,
+                "analysis_dynamic_crop_version": version,
+                "registered_v3_authority_claimed": registered_v3_claimed,
+            },
+            threshold={
+                "activation_dynamic_crop_version": 3,
+                "generation_dynamic_crop_version": 3,
+                "analysis_dynamic_crop_version": 3,
+            },
+        )
+        return {
+            "required": True,
+            "available": False,
+            "passed": False,
+            "dynamic_crop_version": version,
+            "failure": "dynamic_crop_v3_activation_version_mismatch",
+        }, None
+    if version != 3:
+        unexpected = bool(
+            serialized_decodes is not None or persisted_evidence is not None
+        )
+        if unexpected:
+            collector.add(
+                "dynamic_crop_v3_evidence_without_version",
+                QAIssueSeverity.FAIL,
+                "Dynamic Crop v3 replay evidence exists without a v3 version marker.",
+                path="dynamic_crop_v3_decodes,dynamic_crop_motion_v3",
+            )
+        return {
+            "required": False,
+            "available": unexpected,
+            "passed": not unexpected,
+            "dynamic_crop_version": version,
+        }, None
+
+    if activation_version != 3 or generation_version != 3:
+        collector.add(
+            "dynamic_crop_v3_activation_version_mismatch",
+            QAIssueSeverity.FAIL,
+            "Final Dynamic Crop v3 evidence lacks a matching registered activation version.",
+            path=(
+                "stage_edit_generation.activation.dynamic_crop_version,"
+                "dynamic_crop_version"
+            ),
+            value={
+                "activation_dynamic_crop_version": activation_version,
+                "generation_dynamic_crop_version": generation_version,
+                "analysis_dynamic_crop_version": version,
+            },
+            threshold={
+                "activation_dynamic_crop_version": 3,
+                "generation_dynamic_crop_version": 3,
+                "analysis_dynamic_crop_version": 3,
+            },
+        )
+        return {
+            "required": True,
+            "available": False,
+            "passed": False,
+            "dynamic_crop_version": 3,
+            "failure": "dynamic_crop_v3_activation_version_mismatch",
+        }, None
+    identity = (
+        authority_record.get("identity")
+        if authority_record is not None
+        and authority_record.get("qualified") is True
+        else None
+    )
+    try:
+        replayed = replay_dynamic_crop_v3_post_render_evidence(
+            serialized_render_plan=plan,
+            registered_motion_authority_identity=identity,
+            serialized_decodes=serialized_decodes,
+            persisted_timeline_evidence=persisted_evidence,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        collector.add(
+            "dynamic_crop_v3_post_render_evidence_replay_failed",
+            QAIssueSeverity.FAIL,
+            "The final Dynamic Crop v3 motion evidence could not be independently replayed.",
+            path=(
+                "stage_edit_generation.activation.dynamic_crop_v3_motion_authority,"
+                "dynamic_crop_v3_decodes,dynamic_crop_motion_v3"
+            ),
+            value=f"{type(exc).__name__}: {exc}",
+            threshold={
+                "contract": DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT,
+                "passed": True,
+            },
+        )
+        return {
+            "required": True,
+            "available": False,
+            "passed": False,
+            "dynamic_crop_version": 3,
+            "contract": DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT,
+            "error": f"{type(exc).__name__}: {exc}",
+        }, None
+    return {
+        "required": True,
+        "available": True,
+        "passed": True,
+        "dynamic_crop_version": 3,
+        "contract": DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT,
+        "render_plan_content_sha256": replayed.render_plan_content_sha256,
+        "authority_content_sha256": (
+            replayed.authority.authority_content_sha256
+        ),
+        "timeline_evidence_content_sha256": (
+            replayed.timeline_evidence_content_sha256
+        ),
+        "segment_count": replayed.segment_count,
+        "framing_track_applied_count": (
+            replayed.framing_track_applied_count
+        ),
+        "motion_event_applied_count": replayed.motion_event_applied_count,
+        "motion_event_applied_fraction": replayed.motion_event_applied_fraction,
+        "static_or_cut_time_reframe_excluded_count": (
+            replayed.static_or_cut_time_reframe_excluded_count
+        ),
+        "renderer_motion_without_loso_authority_count": (
+            replayed.renderer_motion_without_loso_authority_count
+        ),
+        "motion_budget_within_range": replayed.motion_budget_within_range,
+    }, replayed
+
+
 def _rendered_montage_grammar_metrics(
     analysis: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -5917,6 +6908,9 @@ def _rendered_montage_grammar_metrics(
     collector: _IssueCollector,
     *,
     trusted_registered_stage_edit: bool | None = None,
+    replayed_dynamic_crop_motion_v3: (
+        DynamicCropMotionTimelineEvidenceV3 | None
+    ) = None,
 ) -> dict[str, Any]:
     """Recompute the final montage grammar for every IVE product delivery."""
 
@@ -5947,7 +6941,13 @@ def _rendered_montage_grammar_metrics(
     configuration_matches = False
     serialized_review_matches = False
     profile_identity_matches = False
+    professional_boundary_evidence_valid = False
+    professional_boundary_assessment_matches = False
+    professional_boundary_render_plan_binding_matches = False
+    professional_boundary_authority_reconstruction_matches = False
+    professional_boundary_legacy_pass_binding_matches = False
     recomputed: dict[str, Any] | None = None
+    recomputed_boundary_assessment: dict[str, Any] | None = None
     generation_profile: dict[str, Any] | None = None
     persisted_profile: dict[str, Any] | None = None
     failure_details: list[str] = []
@@ -6010,9 +7010,16 @@ def _rendered_montage_grammar_metrics(
                 threshold=generation_identity,
             )
 
+    recompute_analysis = deepcopy(dict(analysis))
+    if analysis.get("dynamic_crop_version") == 3:
+        recompute_analysis["dynamic_crop_motion_v3"] = (
+            replayed_dynamic_crop_motion_v3.to_dict()
+            if replayed_dynamic_crop_motion_v3 is not None
+            else None
+        )
     try:
         recomputed = review_rendered_montage_grammar(
-            analysis,
+            recompute_analysis,
             render_plan=plan,
             config=config.rendered_montage_grammar,
         )
@@ -6026,6 +7033,192 @@ def _rendered_montage_grammar_metrics(
             path="rendered_montage_grammar_review",
             value=f"{type(exc).__name__}: {exc}",
         )
+
+    boundary_evidence: ProfessionalBoundaryGrammarEvidence | None = None
+    if persisted is not None and recomputed is not None:
+        try:
+            serialized_boundary_evidence = _mapping(
+                persisted.get("professional_boundary_grammar_evidence")
+            )
+            serialized_boundary_assessment = _mapping(
+                persisted.get("professional_boundary_grammar_assessment")
+            )
+            legacy_pass = persisted.get(
+                "passed_before_professional_boundary_grammar"
+            )
+            if serialized_boundary_evidence is None:
+                raise ValueError(
+                    "professional boundary grammar evidence must be an object"
+                )
+            if serialized_boundary_assessment is None:
+                raise ValueError(
+                    "professional boundary grammar assessment must be an object"
+                )
+            if not isinstance(legacy_pass, bool):
+                raise ValueError(
+                    "passed_before_professional_boundary_grammar must be boolean"
+                )
+
+            boundary_evidence = ProfessionalBoundaryGrammarEvidence.from_mapping(
+                serialized_boundary_evidence
+            )
+            professional_boundary_evidence_valid = True
+            canonical_plan_sha256 = hashlib.sha256(
+                json.dumps(
+                    plan,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_performance_id = (
+                f"ive-group-{canonical_plan_sha256[:20]}"
+            )
+            typed_boundary_plan = (
+                _dynamic_crop_render_plan_from_serialized(plan)
+                if analysis.get("dynamic_crop_version") == 3
+                else _boundary_render_plan_from_serialized(plan)
+            )
+            source_scene_cut_times = _boundary_scene_cut_times_from_analysis(
+                analysis,
+                plan=typed_boundary_plan,
+            )
+            reconstructed_boundary_evidence = (
+                adapt_group_boundary_grammar_evidence(
+                    performance_id=expected_performance_id,
+                    render_plan=typed_boundary_plan,
+                    source_index_mapping=analysis.get("source_index_mapping"),
+                    selected_timeline=analysis.get("visual_timeline"),
+                    source_scene_cut_times=source_scene_cut_times,
+                    timeline_review=analysis.get("timeline_review"),
+                    section_plan=analysis.get("section_plan"),
+                    rendered_proxy_review=analysis.get(
+                        "rendered_proxy_review"
+                    ),
+                    editorial_motion=analysis.get("editorial_motion"),
+                    dynamic_crop_version=analysis.get(
+                        "dynamic_crop_version"
+                    ),
+                    dynamic_crop_motion_v3=(
+                        replayed_dynamic_crop_motion_v3
+                    ),
+                )
+            )
+            professional_boundary_authority_reconstruction_matches = bool(
+                boundary_evidence.to_dict()
+                == reconstructed_boundary_evidence.to_dict()
+            )
+            professional_boundary_render_plan_binding_matches = bool(
+                professional_boundary_authority_reconstruction_matches
+                and reconstructed_boundary_evidence.performance_id
+                == expected_performance_id
+            )
+            if not professional_boundary_authority_reconstruction_matches:
+                failure_details.append(
+                    "professional_boundary_authority_reconstruction_mismatch"
+                )
+                collector.add(
+                    "production_professional_boundary_grammar_authority_reconstruction_mismatch",
+                    QAIssueSeverity.FAIL,
+                    "Professional boundary evidence disagrees with an independent reconstruction from final plan, scene, section, proxy, timeline, and transform authorities.",
+                    path=(
+                        "rendered_montage_grammar_review."
+                        "professional_boundary_grammar_evidence"
+                    ),
+                    value=boundary_evidence.to_dict(),
+                    threshold=reconstructed_boundary_evidence.to_dict(),
+                )
+
+            recomputed_boundary_assessment = (
+                assess_professional_boundary_grammar(
+                    reconstructed_boundary_evidence
+                ).to_dict()
+            )
+            professional_boundary_assessment_matches = bool(
+                dict(serialized_boundary_assessment)
+                == recomputed_boundary_assessment
+            )
+            if not professional_boundary_assessment_matches:
+                failure_details.append(
+                    "professional_boundary_assessment_recompute_mismatch"
+                )
+                collector.add(
+                    "production_professional_boundary_grammar_assessment_mismatch",
+                    QAIssueSeverity.FAIL,
+                    "The serialized professional boundary assessment does not match an independent recomputation.",
+                    path=(
+                        "rendered_montage_grammar_review."
+                        "professional_boundary_grammar_assessment"
+                    ),
+                )
+
+            professional_boundary_legacy_pass_binding_matches = bool(
+                legacy_pass is (recomputed.get("passed") is True)
+            )
+            if not professional_boundary_legacy_pass_binding_matches:
+                failure_details.append(
+                    "professional_boundary_legacy_pass_binding_mismatch"
+                )
+                collector.add(
+                    "production_professional_boundary_grammar_legacy_pass_binding_mismatch",
+                    QAIssueSeverity.FAIL,
+                    "The professional boundary gate is not bound to the independently recomputed legacy montage verdict.",
+                    path=(
+                        "rendered_montage_grammar_review."
+                        "passed_before_professional_boundary_grammar"
+                    ),
+                    value=legacy_pass,
+                    threshold=recomputed.get("passed") is True,
+                )
+
+            if not professional_boundary_render_plan_binding_matches:
+                failure_details.append(
+                    "professional_boundary_render_plan_binding_mismatch"
+                )
+                collector.add(
+                    "production_professional_boundary_grammar_render_plan_binding_mismatch",
+                    QAIssueSeverity.FAIL,
+                    "Professional source-switch clocks or identity disagree with the exact final RenderPlan.",
+                    path=(
+                        "rendered_montage_grammar_review."
+                        "professional_boundary_grammar_evidence"
+                    ),
+                    value=boundary_evidence.to_dict(),
+                    threshold=reconstructed_boundary_evidence.to_dict(),
+                )
+
+            recomputed[
+                "professional_boundary_grammar_evidence"
+            ] = reconstructed_boundary_evidence.to_dict()
+            recomputed[
+                "professional_boundary_grammar_assessment"
+            ] = recomputed_boundary_assessment
+            recomputed[
+                "passed_before_professional_boundary_grammar"
+            ] = recomputed.get("passed") is True
+            recomputed["passed"] = bool(
+                recomputed[
+                    "passed_before_professional_boundary_grammar"
+                ]
+                and recomputed_boundary_assessment.get("passed") is True
+            )
+        except Exception as exc:
+            professional_boundary_evidence_valid = False
+            evidence_valid = False
+            failure_details.append(
+                "professional_boundary_evidence_missing_or_invalid"
+            )
+            collector.add(
+                "production_professional_boundary_grammar_evidence_missing_or_invalid",
+                QAIssueSeverity.FAIL,
+                "Professional boundary evidence is missing, malformed, or cannot be independently assessed.",
+                path=(
+                    "rendered_montage_grammar_review."
+                    "professional_boundary_grammar_evidence"
+                ),
+                value=f"{type(exc).__name__}: {exc}",
+            )
 
     if persisted is not None and recomputed is not None:
         configuration_matches = (
@@ -6064,6 +7257,11 @@ def _rendered_montage_grammar_metrics(
         and profile_identity_matches
         and configuration_matches
         and serialized_review_matches
+        and professional_boundary_evidence_valid
+        and professional_boundary_assessment_matches
+        and professional_boundary_render_plan_binding_matches
+        and professional_boundary_authority_reconstruction_matches
+        and professional_boundary_legacy_pass_binding_matches
         and persisted_passed
         and recomputed_passed
     )
@@ -6098,6 +7296,21 @@ def _rendered_montage_grammar_metrics(
         "configuration_matches": configuration_matches,
         "serialized_review_matches_recomputation": serialized_review_matches,
         "reference_profile_identity_matches": profile_identity_matches,
+        "professional_boundary_evidence_valid": (
+            professional_boundary_evidence_valid
+        ),
+        "professional_boundary_assessment_matches_recomputation": (
+            professional_boundary_assessment_matches
+        ),
+        "professional_boundary_render_plan_binding_matches": (
+            professional_boundary_render_plan_binding_matches
+        ),
+        "professional_boundary_authority_reconstruction_matches": (
+            professional_boundary_authority_reconstruction_matches
+        ),
+        "professional_boundary_legacy_pass_binding_matches": (
+            professional_boundary_legacy_pass_binding_matches
+        ),
         "generation_reference_profile": generation_profile,
         "persisted_reference_profile": persisted_profile,
         "persisted_review": persisted,
@@ -6231,6 +7444,17 @@ def evaluate_post_render_qa(
         selection=selection,
         trusted_registered_stage_edit=trusted_registered_stage_edit,
     )
+    (
+        dynamic_crop_v3_motion_metrics,
+        replayed_dynamic_crop_motion_v3,
+    ) = _dynamic_crop_v3_motion_evidence_metrics(
+        analysis,
+        plan,
+        collector,
+    )
+    metrics["dynamic_crop_v3_motion_evidence"] = (
+        dynamic_crop_v3_motion_metrics
+    )
     metrics["rendered_montage_grammar"] = _rendered_montage_grammar_metrics(
         analysis,
         plan,
@@ -6238,6 +7462,9 @@ def evaluate_post_render_qa(
         settings,
         collector,
         trusted_registered_stage_edit=trusted_registered_stage_edit,
+        replayed_dynamic_crop_motion_v3=(
+            replayed_dynamic_crop_motion_v3
+        ),
     )
     metrics["ive_product_quality_floor"] = _ive_product_quality_floor_metrics(
         analysis,
@@ -6351,7 +7578,9 @@ def evaluate_and_write_post_render_qa(
 
 __all__ = [
     "ANALYSIS_BASIS",
+    "DYNAMIC_CROP_V3_POST_RENDER_EVIDENCE_REPLAY_CONTRACT",
     "INPUT_ARTIFACT_FINGERPRINT_CONTRACT",
+    "DynamicCropV3PostRenderEvidenceReplayError",
     "PostRenderArtifactSet",
     "PostRenderQAEvaluationSnapshot",
     "PostRenderQAConfig",
@@ -6367,4 +7596,5 @@ __all__ = [
     "fingerprint_post_render_artifacts",
     "materialize_post_render_qa_snapshot",
     "normalize_post_render_artifact_fingerprints",
+    "replay_dynamic_crop_v3_post_render_evidence",
 ]

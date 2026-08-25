@@ -55,14 +55,27 @@ from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
     DynamicCropTrackDecodeV3,
 )
 from .stage_edit_continuity_authority import (
+    CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2,
     CONTINUITY_AUTHORITY_CONTRACT,
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     STAGE_EDIT_CONTINUITY_AUTHORITIES as _CONTINUITY_AUTHORITIES,
+)
+from .stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+    StageEditContextualBoundaryScoreV2,
+    StageEditContextualRuntimeFrameV2,
+    StageEditContextualSourcePairScorerV2,
+    StageEditContextualSourcePairV2Error,
 )
 from .stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
     StageEditSourcePairScorer,
+)
+from .stage_edit_source_pair_contextual_v2_production import (
+    StageEditContextualSourcePairEvaluationBundleV2,
+    require_stage_edit_contextual_source_pair_evaluation_bundle_v2,
 )
 from .stage_edit_temporal_pose_motion import (
     TemporalPoseMotionThresholds,
@@ -74,6 +87,7 @@ from .stage_edit_transformer import (
     STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
     StageEditTemporalPoseSidecar,
     StageEditTokenSchema,
+    stage_edit_recent_history_mask_contract,
     stage_edit_readiness_report,
 )
 from .stage_edit_transition_authority import (
@@ -84,8 +98,19 @@ from .stage_edit_transition_authority import (
 )
 
 
-DECODER_SCHEMA_VERSION = 14
-DECODER_CONTRACT = "stage_edit_semimarkov_beam_v11"
+_CONTEXTUAL_V2_DECODER_AUTHORITIES = frozenset(
+    {
+        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
+        CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2,
+    }
+)
+_DECODER_CONTINUITY_AUTHORITIES = frozenset(_CONTINUITY_AUTHORITIES) | {
+    CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2
+}
+
+
+DECODER_SCHEMA_VERSION = 15
+DECODER_CONTRACT = "stage_edit_semimarkov_beam_v12"
 _TIME_EPSILON = 1e-6
 _SHOT_SIZES = frozenset(
     {"unknown", "wide", "full", "medium", "closeup", "extreme_closeup"}
@@ -855,6 +880,13 @@ class StageEditHeadFrame:
     dynamic_crop_v3_by_source: tuple[
         DynamicCropHeadPredictionV3 | None, ...
     ] = ()
+    # Production contextual continuity consumes a redacted, current-token
+    # causal sidecar.  It is appended so all legacy positional constructors
+    # and their serialized hashes remain unchanged when the authority is not
+    # active.
+    contextual_source_pair_runtime_v2: (
+        StageEditContextualRuntimeFrameV2 | None
+    ) = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -966,6 +998,22 @@ class StageEditHeadFrame:
             if role not in allowed_roles:
                 raise StageEditDecodeInputError("section_role is outside SectionRole")
             object.__setattr__(self, "section_role", role)
+        contextual_runtime = self.contextual_source_pair_runtime_v2
+        if contextual_runtime is not None:
+            if not isinstance(
+                contextual_runtime, StageEditContextualRuntimeFrameV2
+            ):
+                raise StageEditDecodeInputError(
+                    "contextual_source_pair_runtime_v2 must use the typed "
+                    "StageEdit contextual runtime contract"
+                )
+            if (
+                contextual_runtime.master_time_seconds
+                != self.master_time_seconds
+            ):
+                raise StageEditDecodeInputError(
+                    "contextual source-pair runtime time differs from its head frame"
+                )
 
     @property
     def effective_source_mask(self) -> tuple[bool, ...]:
@@ -979,7 +1027,7 @@ class StageEditHeadFrame:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _public_scalar_pose_payload({
+        payload = {
             "master_time_seconds": self.master_time_seconds,
             "cut_logit": self.cut_logit,
             "source_logits": list(self.source_logits),
@@ -1005,7 +1053,18 @@ class StageEditHeadFrame:
             "section_progress": self.section_progress,
             "phrase_progress": self.phrase_progress,
             "section_role": self.section_role,
-        }, context="StageEdit head frame")
+        }
+        if self.contextual_source_pair_runtime_v2 is not None:
+            # Never serialize raw current-token values or source embeddings
+            # through a decoder/head audit.  The content-bound identity is all
+            # downstream scoring needs to prove exact evidence lineage.
+            payload["contextual_source_pair_runtime_v2"] = (
+                self.contextual_source_pair_runtime_v2.audit_identity_dict()
+            )
+        return _public_scalar_pose_payload(
+            payload,
+            context="StageEdit head frame",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1210,10 +1269,10 @@ class StageEditSemiMarkovConfig:
                 "enforce_montage_grammar must be boolean"
             )
         authority = str(self.continuity_authority).strip()
-        if authority not in _CONTINUITY_AUTHORITIES:
+        if authority not in _DECODER_CONTINUITY_AUTHORITIES:
             raise StageEditDecodeInputError(
-                "continuity_authority must select handcrafted or production "
-                "learned-checkpoint scoring"
+                "continuity_authority must select a supported production or "
+                "Beam-QA evaluation scoring authority"
             )
         object.__setattr__(self, "continuity_authority", authority)
         if self.continuity_authority_contract != CONTINUITY_AUTHORITY_CONTRACT:
@@ -1227,11 +1286,14 @@ class StageEditSemiMarkovConfig:
                 raise StageEditDecodeInputError(
                     "continuity_scorer_contract cannot be blank"
                 )
-            allowed_contract = (
-                HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-                if authority == HANDCRAFTED_CONTINUITY_AUTHORITY
-                else STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
-            )
+            if authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
+                allowed_contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+            elif authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+                allowed_contract = STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT
+            else:
+                allowed_contract = (
+                    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+                )
             if expected_contract != allowed_contract:
                 raise StageEditDecodeInputError(
                     "continuity scorer contract conflicts with its authority"
@@ -1862,6 +1924,11 @@ class StageEditBeamDecision:
     # Appended so positional construction of the pre-v11 decision remains
     # compatible. The primary boundary score above is preserved separately.
     boundary_handcrafted_motion_continuity_qualifier_score: float | None = None
+    # Scalar-only per-boundary scorer lineage.  Omitted from legacy decision
+    # serialization when absent so existing audit hashes remain stable.
+    boundary_continuity_score_lineage: (
+        StageEditBoundaryContinuityResolution | None
+    ) = None
 
     @property
     def duration_seconds(self) -> float:
@@ -1899,7 +1966,7 @@ class StageEditBeamDecision:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _public_scalar_pose_payload({
+        payload = {
             "shot_index": self.shot_index,
             "start_candidate_index": self.start_candidate_index,
             "end_candidate_index": self.end_candidate_index,
@@ -2121,6 +2188,13 @@ class StageEditBeamDecision:
                     "minimum_safe_zoom_projection_count": (
                         self.dynamic_crop_decode_v3.minimum_safe_zoom_projection_count
                     ),
+                    "motion_logit": self.dynamic_crop_decode_v3.motion_logit,
+                    "decoded_shot_duration_seconds": (
+                        self.dynamic_crop_decode_v3.shot_duration_seconds
+                    ),
+                    "motion_logit_role": (
+                        "renderer_motion_authority_input_not_track_presence_gate"
+                    ),
                     "rejection_reasons": list(
                         self.dynamic_crop_decode_v3.rejection_reasons
                     ),
@@ -2146,7 +2220,22 @@ class StageEditBeamDecision:
                 ),
                 "section_switch_counts": list(self.section_switch_counts_after),
             },
-        }, context="StageEdit beam decision")
+        }
+        if self.boundary_continuity_score_lineage is not None:
+            if not isinstance(
+                self.boundary_continuity_score_lineage,
+                StageEditBoundaryContinuityResolution,
+            ):
+                raise StageEditDecodeInputError(
+                    "boundary continuity decision lineage must use its typed contract"
+                )
+            payload["boundary_continuity_score_lineage"] = (
+                self.boundary_continuity_score_lineage.to_dict()
+            )
+        return _public_scalar_pose_payload(
+            payload,
+            context="StageEdit beam decision",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4964,9 +5053,140 @@ def _bounded_continuity_delta(left: float, right: float, scale: float) -> float:
     return min(1.0, abs(left - right) / scale)
 
 
+@dataclass(frozen=True, slots=True)
+class StageEditBoundaryContinuityResolution:
+    """One authority-resolved boundary value plus public scalar lineage."""
+
+    authority: str
+    decoder_score: float
+    applied: bool
+    neutral_reason: str | None
+    outgoing_source_id: str | None
+    incoming_source_id: str
+    scorer_contract: str
+    scorer_fingerprint: str
+    contextual_score_v2: StageEditContextualBoundaryScoreV2 | None = None
+
+    def __post_init__(self) -> None:
+        if self.authority not in _DECODER_CONTINUITY_AUTHORITIES:
+            raise StageEditDecodeInputError(
+                "boundary continuity resolution authority is unsupported"
+            )
+        score = _finite(self.decoder_score, "boundary continuity decoder score")
+        if not -1.0 <= score <= 0.0:
+            raise StageEditDecodeInputError(
+                "boundary continuity resolution violated [-1, 0]"
+            )
+        object.__setattr__(self, "decoder_score", score)
+        if not isinstance(self.applied, bool):
+            raise StageEditDecodeInputError(
+                "boundary continuity resolution applied flag must be boolean"
+            )
+        if not self.incoming_source_id.strip():
+            raise StageEditDecodeInputError(
+                "boundary continuity resolution needs an incoming source id"
+            )
+        if self.outgoing_source_id is not None and not (
+            self.outgoing_source_id.strip()
+        ):
+            raise StageEditDecodeInputError(
+                "boundary continuity outgoing source id cannot be blank"
+            )
+        if not self.scorer_contract.strip():
+            raise StageEditDecodeInputError(
+                "boundary continuity scorer contract cannot be blank"
+            )
+        if (
+            len(self.scorer_fingerprint) != 64
+            or any(
+                value not in "0123456789abcdef"
+                for value in self.scorer_fingerprint
+            )
+        ):
+            raise StageEditDecodeInputError(
+                "boundary continuity scorer fingerprint must be SHA-256"
+            )
+        contextual = self.contextual_score_v2
+        if self.authority in _CONTEXTUAL_V2_DECODER_AUTHORITIES:
+            if self.neutral_reason == "opening_boundary":
+                if contextual is not None or self.applied or score != 0.0:
+                    raise StageEditDecodeInputError(
+                        "contextual opening boundary must be an exact neutral bypass"
+                    )
+            else:
+                if not isinstance(contextual, StageEditContextualBoundaryScoreV2):
+                    raise StageEditDecodeInputError(
+                        "contextual boundary resolution lacks typed score lineage"
+                    )
+                if (
+                    contextual.decoder_score != score
+                    or contextual.applied != self.applied
+                    or contextual.neutral_reason != self.neutral_reason
+                    or contextual.scorer_fingerprint != self.scorer_fingerprint
+                    or contextual.outgoing_source_id != self.outgoing_source_id
+                    or contextual.incoming_source_id != self.incoming_source_id
+                ):
+                    raise StageEditDecodeInputError(
+                        "contextual boundary resolution lineage is inconsistent"
+                    )
+        elif contextual is not None:
+            raise StageEditDecodeInputError(
+                "non-contextual boundary cannot carry contextual lineage"
+            )
+        if self.applied:
+            if self.neutral_reason is not None or self.outgoing_source_id is None:
+                raise StageEditDecodeInputError(
+                    "applied boundary continuity resolution is inconsistent"
+                )
+        elif self.neutral_reason not in {
+            "opening_boundary",
+            "same_exact_source",
+            "same_derivative_family",
+            "missing_handcrafted_observations",
+        }:
+            raise StageEditDecodeInputError(
+                "neutral boundary continuity reason is unsupported"
+            )
+        elif score != 0.0:
+            raise StageEditDecodeInputError(
+                "neutral boundary continuity resolution must score exactly zero"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "authority": self.authority,
+            "decoder_score": self.decoder_score,
+            "applied": self.applied,
+            "neutral_reason": self.neutral_reason,
+            "outgoing_source_id": self.outgoing_source_id,
+            "incoming_source_id": self.incoming_source_id,
+            "scorer_contract": self.scorer_contract,
+            "scorer_fingerprint": self.scorer_fingerprint,
+        }
+        if self.contextual_score_v2 is not None:
+            payload["contextual_score_v2"] = self.contextual_score_v2.to_dict()
+        return payload
+
+
+def _contextual_runtime_content_sha256(
+    runtime: StageEditContextualRuntimeFrameV2,
+) -> str:
+    encoded = json.dumps(
+        runtime.unsigned_dict(),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _continuity_score_provenance(
     config: StageEditSemiMarkovConfig,
     source_pair_scorer: StageEditSourcePairScorer | None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ),
 ) -> dict[str, Any]:
     """Resolve one unambiguous scorer authority without exposing weights."""
 
@@ -4976,9 +5196,19 @@ def _continuity_score_provenance(
                 "handcrafted continuity authority rejects an unexpected "
                 "learned source-pair scorer"
             )
+        if contextual_source_pair_scorer_v2 is not None:
+            raise StageEditDecodeInputError(
+                "handcrafted continuity authority rejects an unexpected "
+                "contextual-v2 source-pair scorer"
+            )
         scorer_contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
         scorer_fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
-    else:
+    elif config.continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if contextual_source_pair_scorer_v2 is not None:
+            raise StageEditDecodeInputError(
+                "production learned-v1 continuity authority rejects a "
+                "contextual-v2 scorer"
+            )
         if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
             raise StageEditDecodeInputError(
                 "production learned continuity authority requires a typed "
@@ -4989,6 +5219,29 @@ def _continuity_score_provenance(
         if scorer_contract != STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT:
             raise StageEditDecodeInputError(
                 "learned source-pair scorer contract mismatch"
+            )
+    else:
+        if source_pair_scorer is not None:
+            raise StageEditDecodeInputError(
+                "production contextual-v2 continuity authority rejects a "
+                "learned-v1 scorer"
+            )
+        if not isinstance(
+            contextual_source_pair_scorer_v2,
+            StageEditContextualSourcePairScorerV2,
+        ):
+            raise StageEditDecodeInputError(
+                "production contextual-v2 continuity authority requires a "
+                "typed StageEditContextualSourcePairScorerV2"
+            )
+        scorer_contract = contextual_source_pair_scorer_v2.contract
+        scorer_fingerprint = contextual_source_pair_scorer_v2.fingerprint
+        if (
+            scorer_contract
+            != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 source-pair scorer contract mismatch"
             )
     if (
         config.continuity_scorer_contract is not None
@@ -5013,6 +5266,7 @@ def _continuity_score_provenance(
         "score_range": [-1.0, 0.0],
         "applies_to": "actual_derivative_family_boundaries_only",
         "opening_and_same_family_raw_score": 0.0,
+        "contextual_runtime_raw_values_embedded": False,
     }
 
 
@@ -5164,48 +5418,235 @@ def stage_edit_boundary_continuity_score(
     return -min(1.0, max(0.0, penalty))
 
 
-def _boundary_continuity_raw(
+def resolve_stage_edit_boundary_continuity(
     frame: StageEditHeadFrame,
     outgoing_source_index: int | None,
     incoming_source_index: int,
+    canonical_source_ids: Sequence[str],
     derivative_family_ids: Sequence[int],
     *,
     continuity_authority: str,
     source_pair_scorer: StageEditSourcePairScorer | None,
-) -> float:
-    if outgoing_source_index is None:
-        return 0.0
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None,
+) -> StageEditBoundaryContinuityResolution:
+    """Resolve one exact boundary under the selected scorer authority.
+
+    The contextual path consumes only the content-bound current-token sidecar
+    attached to ``frame``.  Model logits, reference labels, and Transformer
+    edit-history features are not accepted by this API.
+    """
+
+    if not isinstance(frame, StageEditHeadFrame):
+        raise StageEditDecodeInputError(
+            "boundary continuity resolution requires a StageEditHeadFrame"
+        )
+    source_ids = tuple(str(value).strip() for value in canonical_source_ids)
     if (
-        derivative_family_ids[outgoing_source_index]
-        == derivative_family_ids[incoming_source_index]
+        not source_ids
+        or any(not value for value in source_ids)
+        or len(source_ids) != len(set(source_ids))
     ):
-        return 0.0
+        raise StageEditDecodeInputError(
+            "boundary continuity canonical source ids are invalid"
+        )
+    families = tuple(derivative_family_ids)
+    if len(families) != len(source_ids) or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in families
+    ):
+        raise StageEditDecodeInputError(
+            "boundary continuity derivative families do not match sources"
+        )
+    if (
+        isinstance(incoming_source_index, bool)
+        or not isinstance(incoming_source_index, int)
+        or not 0 <= incoming_source_index < len(source_ids)
+    ):
+        raise StageEditDecodeInputError(
+            "boundary continuity incoming source index is invalid"
+        )
+    if outgoing_source_index is not None and (
+        isinstance(outgoing_source_index, bool)
+        or not isinstance(outgoing_source_index, int)
+        or not 0 <= outgoing_source_index < len(source_ids)
+    ):
+        raise StageEditDecodeInputError(
+            "boundary continuity outgoing source index is invalid"
+        )
+    incoming_id = source_ids[incoming_source_index]
+    outgoing_id = (
+        None
+        if outgoing_source_index is None
+        else source_ids[outgoing_source_index]
+    )
+
+    if continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
+        if (
+            source_pair_scorer is not None
+            or contextual_source_pair_scorer_v2 is not None
+        ):
+            raise StageEditDecodeInputError(
+                "handcrafted boundary scoring rejects source-pair scorers"
+            )
+        scorer_contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+        scorer_fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+    elif continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if contextual_source_pair_scorer_v2 is not None or not isinstance(
+            source_pair_scorer, StageEditSourcePairScorer
+        ):
+            raise StageEditDecodeInputError(
+                "learned-v1 boundary scoring requires only its typed scorer"
+            )
+        scorer_contract = source_pair_scorer.contract
+        scorer_fingerprint = source_pair_scorer.fingerprint
+    elif continuity_authority in _CONTEXTUAL_V2_DECODER_AUTHORITIES:
+        if source_pair_scorer is not None or not isinstance(
+            contextual_source_pair_scorer_v2,
+            StageEditContextualSourcePairScorerV2,
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 boundary scoring requires only its typed scorer"
+            )
+        scorer_contract = contextual_source_pair_scorer_v2.contract
+        scorer_fingerprint = contextual_source_pair_scorer_v2.fingerprint
+        runtime = frame.contextual_source_pair_runtime_v2
+        if not isinstance(runtime, StageEditContextualRuntimeFrameV2):
+            raise StageEditDecodeInputError(
+                "contextual-v2 boundary scoring is missing its runtime sidecar"
+            )
+        if runtime.master_time_seconds != frame.master_time_seconds:
+            raise StageEditDecodeInputError(
+                "contextual-v2 runtime time differs from its head frame"
+            )
+        if (
+            runtime.token_schema_fingerprint
+            != contextual_source_pair_scorer_v2.token_schema_fingerprint
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 runtime/scorer token schema mismatch"
+            )
+        if (
+            _contextual_runtime_content_sha256(runtime)
+            != runtime.runtime_evidence_sha256
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 runtime evidence digest mismatch"
+            )
+        runtime_sources = runtime.source_by_id
+        if set(runtime_sources) != set(source_ids):
+            raise StageEditDecodeInputError(
+                "contextual-v2 runtime sources differ from canonical sources"
+            )
+        if any(
+            runtime_sources[source_id].derivative_family_id != families[index]
+            for index, source_id in enumerate(source_ids)
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 runtime derivative families differ from verified metadata"
+            )
+    else:
+        raise StageEditDecodeInputError(
+            "boundary continuity authority is unsupported"
+        )
+
+    if outgoing_source_index is None:
+        return StageEditBoundaryContinuityResolution(
+            authority=continuity_authority,
+            decoder_score=0.0,
+            applied=False,
+            neutral_reason="opening_boundary",
+            outgoing_source_id=None,
+            incoming_source_id=incoming_id,
+            scorer_contract=scorer_contract,
+            scorer_fingerprint=scorer_fingerprint,
+        )
+
+    assert outgoing_id is not None
+    neutral_reason = None
+    if outgoing_source_index == incoming_source_index:
+        neutral_reason = "same_exact_source"
+    elif families[outgoing_source_index] == families[incoming_source_index]:
+        neutral_reason = "same_derivative_family"
+
+    if continuity_authority in _CONTEXTUAL_V2_DECODER_AUTHORITIES:
+        assert contextual_source_pair_scorer_v2 is not None
+        assert frame.contextual_source_pair_runtime_v2 is not None
+        try:
+            contextual_score = contextual_source_pair_scorer_v2.score_boundary(
+                frame.contextual_source_pair_runtime_v2,
+                outgoing_id,
+                incoming_id,
+            )
+        except StageEditContextualSourcePairV2Error as exc:
+            raise StageEditDecodeInputError(
+                f"contextual-v2 boundary scoring failed: {exc}"
+            ) from exc
+        if contextual_score.neutral_reason != neutral_reason:
+            raise StageEditDecodeInputError(
+                "contextual-v2 scorer neutrality differs from verified families"
+            )
+        return StageEditBoundaryContinuityResolution(
+            authority=continuity_authority,
+            decoder_score=contextual_score.decoder_score,
+            applied=contextual_score.applied,
+            neutral_reason=contextual_score.neutral_reason,
+            outgoing_source_id=outgoing_id,
+            incoming_source_id=incoming_id,
+            scorer_contract=scorer_contract,
+            scorer_fingerprint=scorer_fingerprint,
+            contextual_score_v2=contextual_score,
+        )
+
+    if neutral_reason is not None:
+        return StageEditBoundaryContinuityResolution(
+            authority=continuity_authority,
+            decoder_score=0.0,
+            applied=False,
+            neutral_reason=neutral_reason,
+            outgoing_source_id=outgoing_id,
+            incoming_source_id=incoming_id,
+            scorer_contract=scorer_contract,
+            scorer_fingerprint=scorer_fingerprint,
+        )
     if not frame.source_continuity:
         if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
             raise StageEditDecodeInputError(
                 "learned boundary scoring is missing exact source continuity"
             )
-        return 0.0
+        return StageEditBoundaryContinuityResolution(
+            authority=continuity_authority,
+            decoder_score=0.0,
+            applied=False,
+            neutral_reason="missing_handcrafted_observations",
+            outgoing_source_id=outgoing_id,
+            incoming_source_id=incoming_id,
+            scorer_contract=scorer_contract,
+            scorer_fingerprint=scorer_fingerprint,
+        )
     outgoing = frame.source_continuity[outgoing_source_index]
     incoming = frame.source_continuity[incoming_source_index]
-    if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
-        if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
-            raise StageEditDecodeInputError(
-                "learned boundary scoring is missing its source-pair scorer"
-            )
-        raw = source_pair_scorer.score(outgoing, incoming)
-    elif continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
-        raw = stage_edit_boundary_continuity_score(outgoing, incoming)
-    else:  # Config validation should make this unreachable.
-        raise StageEditDecodeInputError(
-            "boundary continuity authority is unsupported"
-        )
+    raw = (
+        source_pair_scorer.score(outgoing, incoming)
+        if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+        else stage_edit_boundary_continuity_score(outgoing, incoming)
+    )
     result = _finite(raw, "boundary_continuity_raw")
     if not -1.0 <= result <= 0.0:
         raise StageEditDecodeInputError(
             "boundary continuity scorer violated its bounded [-1, 0] contract"
         )
-    return result
+    return StageEditBoundaryContinuityResolution(
+        authority=continuity_authority,
+        decoder_score=result,
+        applied=True,
+        neutral_reason=None,
+        outgoing_source_id=outgoing_id,
+        incoming_source_id=incoming_id,
+        scorer_contract=scorer_contract,
+        scorer_fingerprint=scorer_fingerprint,
+    )
 
 
 def _temporal_pose_sidecar_pair_audit(
@@ -5756,6 +6197,7 @@ def _build_stage_edit(
                 section_role=decision.section_role,
                 section_progress=decision.section_progress,
                 phrase_progress=decision.phrase_progress,
+                dynamic_crop_decode_v3=decision.dynamic_crop_decode_v3,
             )
         )
     boundaries = tuple(
@@ -5818,6 +6260,70 @@ def _build_stage_edit(
     )
 
 
+def _validate_contextual_runtime_frame_v2(
+    *,
+    frame: StageEditHeadFrame,
+    frame_index: int,
+    canonical_source_ids: tuple[str, ...],
+    derivative_family_ids: tuple[int, ...],
+    schema: StageEditTokenSchema,
+    scorer: StageEditContextualSourcePairScorerV2,
+) -> None:
+    runtime = frame.contextual_source_pair_runtime_v2
+    if not isinstance(runtime, StageEditContextualRuntimeFrameV2):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual-v2 authority requires a runtime sidecar"
+        )
+    if runtime.master_time_seconds != frame.master_time_seconds:
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime time mismatch"
+        )
+    if (
+        runtime.token_schema_fingerprint != schema.fingerprint
+        or scorer.token_schema_fingerprint != schema.fingerprint
+    ):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime/scorer schema mismatch"
+        )
+    expected_mask_sha256 = stage_edit_recent_history_mask_contract(schema)[
+        "contract_sha256"
+    ]
+    if runtime.recent_history_mask_contract_sha256 != expected_mask_sha256:
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime mask contract mismatch"
+        )
+    runtime_sources = runtime.source_by_id
+    if set(runtime_sources) != set(canonical_source_ids):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime source identity mismatch"
+        )
+    if tuple(value.source_id for value in runtime.sources) != tuple(
+        sorted(canonical_source_ids)
+    ):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime source order is not canonical"
+        )
+    if runtime.source_feature_names != tuple(schema.source_feature_names):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime source schema mismatch"
+        )
+    if any(
+        runtime_sources[source_id].derivative_family_id
+        != derivative_family_ids[source_index]
+        for source_index, source_id in enumerate(canonical_source_ids)
+    ):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime derivative family mismatch"
+        )
+    if (
+        _contextual_runtime_content_sha256(runtime)
+        != runtime.runtime_evidence_sha256
+    ):
+        raise StageEditDecodeInputError(
+            f"frame {frame_index} contextual runtime digest mismatch"
+        )
+
+
 def _validate_decode_inputs(
     *,
     sources: tuple[Path, ...],
@@ -5832,6 +6338,9 @@ def _validate_decode_inputs(
     height: int,
     fps: float,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ),
 ) -> None:
     source_count = len(sources)
     if source_count < 2:
@@ -5861,6 +6370,22 @@ def _validate_decode_inputs(
         if source_derivative_metadata.family_count < config.minimum_unique_sources:
             raise StageEditDecodeInputError(
                 "minimum_unique_sources exceeds verified derivative-family count"
+            )
+    if config.continuity_authority in _CONTEXTUAL_V2_DECODER_AUTHORITIES:
+        if not isinstance(
+            source_derivative_metadata,
+            SourceDerivativeFamilyMetadata,
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 continuity authority requires verified "
+                "SourceDerivativeFamilyMetadata"
+            )
+        if not isinstance(
+            contextual_source_pair_scorer_v2,
+            StageEditContextualSourcePairScorerV2,
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 continuity authority requires its typed scorer"
             )
     if (
         isinstance(reference_source, bool)
@@ -5930,6 +6455,26 @@ def _validate_decode_inputs(
                 f"frame {index} learned continuity authority requires exact "
                 "canonical source observations"
             )
+        if (
+            config.continuity_authority
+            in _CONTEXTUAL_V2_DECODER_AUTHORITIES
+        ):
+            if len(frame.source_continuity) != source_count:
+                raise StageEditDecodeInputError(
+                    f"frame {index} contextual-v2 continuity authority requires "
+                    "exact canonical source observations for the independent "
+                    "handcrafted motion qualifier"
+                )
+            assert source_derivative_metadata is not None
+            assert contextual_source_pair_scorer_v2 is not None
+            _validate_contextual_runtime_frame_v2(
+                frame=frame,
+                frame_index=index,
+                canonical_source_ids=source_ids,
+                derivative_family_ids=source_derivative_metadata.family_ids,
+                schema=schema,
+                scorer=contextual_source_pair_scorer_v2,
+            )
         if frame.dynamic_crop_v3_by_source:
             if len(frame.dynamic_crop_v3_by_source) != source_count:
                 raise StageEditDecodeInputError(
@@ -5982,7 +6527,7 @@ def _validate_decode_inputs(
         raise StageEditDecodeInputError("fps must be positive")
 
 
-def decode_stage_edit_semimarkov_beam(
+def _decode_stage_edit_semimarkov_beam(
     *,
     checkpoint_directory: Path,
     sources: Sequence[Path],
@@ -6000,6 +6545,12 @@ def decode_stage_edit_semimarkov_beam(
     fps: float = 29.97,
     source_derivative_metadata: SourceDerivativeFamilyMetadata | None = None,
     source_pair_scorer: StageEditSourcePairScorer | None = None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None,
+    contextual_evaluation_bundle_v2: (
+        StageEditContextualSourcePairEvaluationBundleV2 | None
+    ) = None,
 ) -> StageEditSemiMarkovResult:
     """Decode StageEdit heads into ranked, renderer-valid StageEdit timelines.
 
@@ -6007,6 +6558,38 @@ def decode_stage_edit_semimarkov_beam(
     this function cannot be repurposed as an implicit random-checkpoint
     decoder.  It performs no rendering, media probing, or pipeline mutation.
     """
+
+    if config.continuity_authority == (
+        CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2
+    ):
+        try:
+            evaluation_bundle = (
+                require_stage_edit_contextual_source_pair_evaluation_bundle_v2(
+                    contextual_evaluation_bundle_v2
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise StageEditDecodeInputError(
+                "contextual-v2 Beam-QA evaluation authority requires its "
+                "loader-issued offline bundle"
+            ) from exc
+        if (
+            source_pair_scorer is not None
+            or contextual_source_pair_scorer_v2 is not evaluation_bundle.scorer
+            or config.continuity_scorer_contract
+            not in (None, evaluation_bundle.scorer.contract)
+            or config.continuity_scorer_fingerprint
+            not in (None, evaluation_bundle.scorer.fingerprint)
+        ):
+            raise StageEditDecodeInputError(
+                "contextual-v2 Beam-QA evaluation scorer differs from its sealed bundle"
+            )
+    elif contextual_evaluation_bundle_v2 is not None:
+        raise StageEditDecodeInputError(
+            "a contextual-v2 evaluation bundle cannot authorize a production decode"
+        )
 
     if checkpoint_directory is None:
         raise StageEditCheckpointNotReadyError(
@@ -6026,7 +6609,9 @@ def decode_stage_edit_semimarkov_beam(
         )
 
     boundary_continuity_score_provenance = _continuity_score_provenance(
-        config, source_pair_scorer
+        config,
+        source_pair_scorer,
+        contextual_source_pair_scorer_v2,
     )
     audit_config = _audit_config_payload(
         config, boundary_continuity_score_provenance
@@ -6054,12 +6639,18 @@ def decode_stage_edit_semimarkov_beam(
         height=height,
         fps=fps,
         source_derivative_metadata=source_derivative_metadata,
+        contextual_source_pair_scorer_v2=(
+            contextual_source_pair_scorer_v2
+        ),
     )
     resolved = _resolved_constraints(
         section_plan, constraints, schema, config
     )
 
     source_count = len(normalized_sources)
+    canonical_source_ids = tuple(
+        value.source_id for value in normalized_metadata
+    )
     derivative_family_ids = (
         source_derivative_metadata.family_ids
         if source_derivative_metadata is not None
@@ -6534,13 +7125,24 @@ def decode_stage_edit_semimarkov_beam(
                             crop_contract = "legacy_static_crop_head_v1"
                             editorial_transform = _editorial_track(applied_crop)
                         source_raw = source_log_probabilities[start_index][source_index]
-                        boundary_continuity_raw = _boundary_continuity_raw(
-                            frame,
-                            state.current_source,
-                            source_index,
-                            derivative_family_ids,
-                            continuity_authority=config.continuity_authority,
-                            source_pair_scorer=source_pair_scorer,
+                        boundary_continuity_resolution = (
+                            resolve_stage_edit_boundary_continuity(
+                                frame,
+                                state.current_source,
+                                source_index,
+                                canonical_source_ids,
+                                derivative_family_ids,
+                                continuity_authority=(
+                                    config.continuity_authority
+                                ),
+                                source_pair_scorer=source_pair_scorer,
+                                contextual_source_pair_scorer_v2=(
+                                    contextual_source_pair_scorer_v2
+                                ),
+                            )
+                        )
+                        boundary_continuity_raw = (
+                            boundary_continuity_resolution.decoder_score
                         )
                         boundary_motion_evidence = (
                             _boundary_motion_amount_plus_continuity_evidence(
@@ -6798,6 +7400,12 @@ def decode_stage_edit_semimarkov_beam(
                             ),
                             boundary_continuity_score=(
                                 boundary_motion_evidence["continuity_score"]
+                            ),
+                            boundary_continuity_score_lineage=(
+                                boundary_continuity_resolution
+                                if config.continuity_authority
+                                in _CONTEXTUAL_V2_DECODER_AUTHORITIES
+                                else None
                             ),
                             boundary_handcrafted_motion_continuity_qualifier_score=(
                                 boundary_motion_evidence[
@@ -7363,7 +7971,113 @@ def decode_stage_edit_semimarkov_beam(
     return StageEditSemiMarkovResult(tuple(timelines), audit)
 
 
+def decode_stage_edit_semimarkov_beam(
+    *,
+    checkpoint_directory: Path,
+    sources: Sequence[Path],
+    source_metadata: Sequence[StageEditSourceMetadata],
+    head_frames: Sequence[StageEditHeadFrame],
+    section_plan: SectionPlan,
+    output: Path,
+    section_constraints: Sequence[StageEditSectionConstraint] = (),
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    config: StageEditSemiMarkovConfig = StageEditSemiMarkovConfig(),
+    reference_source: int = 0,
+    aspect_ratio: AspectRatio = AspectRatio.LANDSCAPE,
+    width: int = 1920,
+    height: int = 1080,
+    fps: float = 29.97,
+    source_derivative_metadata: SourceDerivativeFamilyMetadata | None = None,
+    source_pair_scorer: StageEditSourcePairScorer | None = None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None,
+) -> StageEditSemiMarkovResult:
+    """Run the normal decoder; evaluation-only authority is never injectable."""
+
+    if config.continuity_authority == (
+        CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2
+    ):
+        raise StageEditDecodeInputError(
+            "Beam-QA evaluation authority is restricted to its dedicated decoder"
+        )
+    return _decode_stage_edit_semimarkov_beam(
+        checkpoint_directory=checkpoint_directory,
+        sources=sources,
+        source_metadata=source_metadata,
+        head_frames=head_frames,
+        section_plan=section_plan,
+        output=output,
+        section_constraints=section_constraints,
+        schema=schema,
+        config=config,
+        reference_source=reference_source,
+        aspect_ratio=aspect_ratio,
+        width=width,
+        height=height,
+        fps=fps,
+        source_derivative_metadata=source_derivative_metadata,
+        source_pair_scorer=source_pair_scorer,
+        contextual_source_pair_scorer_v2=contextual_source_pair_scorer_v2,
+    )
+
+
+def decode_stage_edit_semimarkov_beam_contextual_evaluation_v2(
+    *,
+    evaluation_bundle_v2: StageEditContextualSourcePairEvaluationBundleV2,
+    checkpoint_directory: Path,
+    sources: Sequence[Path],
+    source_metadata: Sequence[StageEditSourceMetadata],
+    head_frames: Sequence[StageEditHeadFrame],
+    section_plan: SectionPlan,
+    output: Path,
+    section_constraints: Sequence[StageEditSectionConstraint] = (),
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    config: StageEditSemiMarkovConfig,
+    reference_source: int = 0,
+    aspect_ratio: AspectRatio = AspectRatio.LANDSCAPE,
+    width: int = 1920,
+    height: int = 1080,
+    fps: float = 29.97,
+    source_derivative_metadata: SourceDerivativeFamilyMetadata | None = None,
+) -> StageEditSemiMarkovResult:
+    """Run one report-free, artifact-pinned contextual Beam-QA decode."""
+
+    evaluation_bundle = (
+        require_stage_edit_contextual_source_pair_evaluation_bundle_v2(
+            evaluation_bundle_v2
+        )
+    )
+    if config.continuity_authority != (
+        CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2
+    ):
+        raise StageEditDecodeInputError(
+            "the contextual-v2 evaluation decoder requires evaluation authority"
+        )
+    return _decode_stage_edit_semimarkov_beam(
+        checkpoint_directory=checkpoint_directory,
+        sources=sources,
+        source_metadata=source_metadata,
+        head_frames=head_frames,
+        section_plan=section_plan,
+        output=output,
+        section_constraints=section_constraints,
+        schema=schema,
+        config=config,
+        reference_source=reference_source,
+        aspect_ratio=aspect_ratio,
+        width=width,
+        height=height,
+        fps=fps,
+        source_derivative_metadata=source_derivative_metadata,
+        source_pair_scorer=None,
+        contextual_source_pair_scorer_v2=evaluation_bundle.scorer,
+        contextual_evaluation_bundle_v2=evaluation_bundle,
+    )
+
+
 __all__ = [
+    "CONTEXTUAL_BEAM_QA_EVALUATION_CONTINUITY_AUTHORITY_V2",
     "CONTINUITY_AUTHORITY_CONTRACT",
     "DECODER_CONTRACT",
     "DECODER_SCHEMA_VERSION",
@@ -7373,7 +8087,9 @@ __all__ = [
     "HIGHLIGHT_MOTION_CALIBRATION_CONTRACT",
     "HIGHLIGHT_MOTION_CALIBRATION_QUANTILES",
     "MONTAGE_GRAMMAR_CONTRACT",
+    "PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2",
     "PRODUCTION_LEARNED_CONTINUITY_AUTHORITY",
+    "StageEditBoundaryContinuityResolution",
     "StageEditBeamDecision",
     "StageEditBeamTimeline",
     "StageEditCheckpointNotReadyError",
@@ -7393,5 +8109,7 @@ __all__ = [
     "TEMPORAL_POSE_MOTION_CALIBRATION_ACTIVATION_AVAILABLE",
     "TEMPORAL_POSE_MOTION_CALIBRATION_CONTRACT",
     "decode_stage_edit_semimarkov_beam",
+    "decode_stage_edit_semimarkov_beam_contextual_evaluation_v2",
+    "resolve_stage_edit_boundary_continuity",
     "stage_edit_boundary_continuity_score",
 ]

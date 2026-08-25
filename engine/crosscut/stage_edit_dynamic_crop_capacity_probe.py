@@ -63,13 +63,13 @@ DATASET_ANALYSIS_BASIS = "ive_fixed_capacity_selection_dataset_v1"
 FOLD_EVIDENCE_ANALYSIS_BASIS = "verified_stageedit_fold_run_evidence_v1"
 SMOKE_EVIDENCE_ANALYSIS_BASIS = "real_mlx_training_memory_smoke_v2"
 SMOKE_EVIDENCE_SCHEMA_VERSION = 2
-MEMORY_ESTIMATE_CONTRACT = "non_authoritative_float32_source720_bound_v2"
+MEMORY_ESTIMATE_CONTRACT = "non_authoritative_float32_schema_v3_source792_bound_v3"
 SELECTION_ARTIFACT_PREFIX = "dynamic-crop-v2-capacity-selection-"
 DATASET_ARTIFACT_PREFIX = "dynamic-crop-v2-selection-dataset-"
 FOLD_EVIDENCE_PREFIX = "dynamic-crop-v2-fold-run-"
 SMOKE_EVIDENCE_PREFIX = "dynamic-crop-v2-mlx-smoke-"
 SMOKE_INPUT_PACKING_CONTRACT = (
-    "fifteen_bbr_reference_feature_snapshots_fixed_lane_ab_2x2048x32x720_v1"
+    "fifteen_bbr_reference_feature_snapshots_fixed_lane_ab_2x2048x32x792_v2"
 )
 SMOKE_TILING_CONTRACT = (
     "repeat_exact_original_lane_cycle_then_prefix_truncate_to_2048_v1"
@@ -2809,10 +2809,17 @@ def _validate_mlx_smoke_evidence_root(
         or candidate.model_config.max_sources != 32
         or tensor["context_feature_dimension"]
         != candidate.model_config.context_input_dimension
-        or tensor["source_feature_dimension"] != 720
+        or tensor["source_feature_dimension"]
+        != DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension
         or tensor["source_feature_dimension"]
         != candidate.model_config.source_input_dimension
-        or tensor["source_tensor_shape"] != [2, 2048, 32, 720]
+        or tensor["source_tensor_shape"]
+        != [
+            2,
+            2048,
+            32,
+            DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+        ]
         or tensor["context_tensor_shape"]
         != [2, 2048, candidate.model_config.context_input_dimension]
         or tensor["dynamic_values_shape"] != [2, 2048, 8, 4]

@@ -16,10 +16,20 @@ from crosscut.professional_montage_policy import (
     close_burst_policy_binding_sha256,
 )
 from crosscut.render import (
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
     RenderPlan,
     RenderSegment,
     RenderTransition,
     segment_frame_counts,
+)
+from crosscut.stage_edit_dynamic_crop_motion_authority_v3 import (
+    DynamicCropMotionAuthorityV3,
+    apply_dynamic_crop_motion_authority_to_render_plan_v3,
+    corroborate_dynamic_crop_motion_timeline_v3,
+)
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
 )
 from crosscut.rendered_montage_grammar_review import (
     RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS,
@@ -436,6 +446,105 @@ def _review(
             ),
             config=config or RenderedMontageGrammarConfig(),
         )
+
+
+def _attach_v3_motion_evidence(
+    fixture: dict[str, object],
+    *,
+    authorized_motion_indices: tuple[int, ...] = (2,),
+    suppressed_motion_indices: tuple[int, ...] = (),
+) -> dict[str, object]:
+    choices = fixture["visual_timeline"]["choices"]
+    source_count = fixture["source_derivative_diversity"]["source_count"]
+    authority = DynamicCropMotionAuthorityV3.create(
+        release_freeze_content_sha256="a" * 64,
+        release_freeze_file_sha256="b" * 64,
+        source_commit_oid="c" * 40,
+        candidate_id="rendered-montage-v3-test",
+    )
+    decodes: list[DynamicCropTrackDecodeV3] = []
+    segments: list[RenderSegment] = []
+    dynamic_indices = set(authorized_motion_indices) | set(
+        suppressed_motion_indices
+    )
+    for index, choice in enumerate(choices):
+        if index in dynamic_indices:
+            keyframes = (
+                EditorialTransformKeyframe(0.0, 1.02, 0.5, 0.5, 0.0),
+                EditorialTransformKeyframe(0.8, 1.05, 0.52, 0.5, 0.0),
+            )
+        else:
+            # Deliberately vary static framing across cuts.  Those cut-time
+            # changes remain excluded by typed v3 authority.
+            keyframes = (
+                EditorialTransformKeyframe(
+                    0.0,
+                    1.02 + index * 0.001,
+                    0.5,
+                    0.5,
+                    0.0,
+                ),
+            )
+        original = EditorialTransformTrack(
+            keyframes,
+            reason="stage_edit_dynamic_crop_head_v3",
+        )
+        decodes.append(
+            DynamicCropTrackDecodeV3(
+                source_id=f"source-{choice['source_index']}",
+                source_index=choice["source_index"],
+                eligible=True,
+                loss_masked=False,
+                track=original,
+                predicted_keyframe_count=len(keyframes),
+                applied_keyframe_count=len(keyframes),
+                minimum_safe_zoom_projection_count=0,
+                rejection_reasons=(),
+                motion_logit=(
+                    -20.0 if index in suppressed_motion_indices else 20.0
+                ),
+                shot_duration_seconds=choice["duration_seconds"],
+            )
+        )
+        segments.append(
+            RenderSegment(
+                source_index=choice["source_index"],
+                source_start=choice["source_local_start"],
+                duration=choice["duration_seconds"],
+                master_start=choice["canonical_master_start"],
+                editorial_transform=EditorialTransformTrack(
+                    keyframes,
+                    reason=(
+                        "stage_edit_dynamic_crop_head_v3_"
+                        "stage_edit_preserved"
+                    ),
+                ),
+            )
+        )
+    provisional = RenderPlan(
+        sources=tuple(Path(f"source-{index}.mp4") for index in range(source_count)),
+        segments=tuple(segments),
+        reference_source=0,
+        aspect_ratio=AspectRatio.LANDSCAPE,
+        output=Path("synthetic-v3-final.mp4"),
+        fps=30.0,
+        transitions=tuple(
+            RenderTransition() for _ in range(max(0, len(segments) - 1))
+        ),
+    )
+    final_plan = apply_dynamic_crop_motion_authority_to_render_plan_v3(
+        render_plan=provisional,
+        decodes=tuple(decodes),
+        authority=authority,
+    )
+    evidence = corroborate_dynamic_crop_motion_timeline_v3(
+        render_plan=final_plan,
+        decodes=tuple(decodes),
+        authority=authority,
+    )
+    fixture["dynamic_crop_version"] = 3
+    fixture["dynamic_crop_motion_v3"] = evidence.to_dict()
+    return final_plan.to_json()
 
 
 def _split_into_two_highlights(fixture: dict[str, object]) -> None:
@@ -1301,6 +1410,88 @@ class RenderedMontageGrammarReviewTests(unittest.TestCase):
             "section_0:highlight_motion_accent_missing",
             result["failure_codes"],
         )
+
+    def test_v3_motion_accent_uses_only_typed_authorized_segments(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+            motion_indices=(0, 1, 2, 3, 4, 5),
+        )
+        plan = _attach_v3_motion_evidence(
+            fixture,
+            authorized_motion_indices=(4,),
+            suppressed_motion_indices=(2,),
+        )
+
+        result = _review(fixture, render_plan=plan)
+
+        self.assertEqual(result["sections"][0]["motion_accent_run_count"], 1)
+
+    def test_v3_missing_evidence_and_full_plan_hash_tamper_fail_closed(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        plan = _attach_v3_motion_evidence(fixture)
+        del fixture["dynamic_crop_motion_v3"]
+        with self.assertRaises(ValueError):
+            _review(fixture, render_plan=plan)
+
+        plan = _attach_v3_motion_evidence(fixture)
+        plan["output"] = "another-final-output.mp4"
+        with self.assertRaises(ValueError):
+            _review(fixture, render_plan=plan)
+
+    def test_v3_timeline_self_hash_tamper_fails_closed(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+        )
+        plan = _attach_v3_motion_evidence(fixture)
+        fixture["dynamic_crop_motion_v3"]["motion_event_applied_count"] = 0
+
+        with self.assertRaises(ValueError):
+            _review(fixture, render_plan=plan)
+
+    def test_v2_marker_preserves_ordinary_editorial_motion_review(self) -> None:
+        fixture = _analysis(
+            (
+                "group_wide",
+                "medium",
+                "close_up",
+                "full_shot",
+                "medium",
+                "close_up",
+            ),
+            (0, 1, 2, 3, 1, 2),
+            motion_indices=(2,),
+        )
+        fixture["dynamic_crop_version"] = 2
+
+        result = _review(fixture)
+
+        self.assertEqual(result["sections"][0]["motion_accent_run_count"], 1)
 
     def test_same_derivative_camera_family_does_not_create_a_multicam_burst(self) -> None:
         fixture = _analysis(

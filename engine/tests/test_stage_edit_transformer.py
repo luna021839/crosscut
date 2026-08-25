@@ -33,6 +33,7 @@ from crosscut.stage_edit_production_training import (
 from crosscut.stage_edit_reference_adapter import (
     ReferenceTrainingCorpus,
     ReferenceTrainingExample,
+    verify_reference_training_feature_snapshot,
 )
 
 from crosscut.stage_edit_transformer import (
@@ -79,6 +80,11 @@ from crosscut.stage_edit_transformer import (
 from crosscut.stage_edit_transition_authority import (
     RENDERER_OWNED_TRANSITION_AUTHORITY,
     StageEditTransitionAuthority,
+)
+from tests.stage_edit_causal_sensing_test_support import (
+    production_gate_statistics,
+    synthetic_production_gate,
+    synthetic_production_snapshot,
 )
 
 try:
@@ -201,8 +207,24 @@ def _v3_production_corpora() -> tuple[
     for song in ("BANG", "BLACKHOLE", "XOXZ"):
         for index in range(2):
             reference_id = f"{song}-v3-readiness-{index}"
-            sequence = _sequence(reference_id)
+            # Immutable production snapshots persist finite replacement values
+            # plus the missing mask; the generic tensorization fixture above
+            # deliberately carries a NaN sentinel and is therefore not a
+            # serializable snapshot input.
+            snapshot = synthetic_production_snapshot(
+                StageEditSequence(
+                    reference_id,
+                    (_token(0.0), _token(0.5), _token(1.0)),
+                )
+            )
+            sequence = snapshot.sequence
             targets = _targets(reference_id)
+            verified_evidence = verify_reference_training_feature_snapshot(
+                reference_id=reference_id,
+                sequence=sequence,
+                feature_snapshot=snapshot,
+                production_edit_mode="group",
+            )
             examples.append(
                 ReferenceTrainingExample(
                     reference_id=reference_id,
@@ -218,10 +240,12 @@ def _v3_production_corpora() -> tuple[
                         "native_source_camera_cut_editorial_positive_count": 0,
                         "materialized_feature_snapshot_used": True,
                         "shared_feature_materializer_used": True,
+                        "production_causal_sensing_gate": (
+                            production_gate_statistics(snapshot)
+                        ),
                     },
-                    feature_snapshot_sha256=hashlib.sha256(
-                        reference_id.encode("utf-8")
-                    ).hexdigest(),
+                    feature_snapshot_sha256=snapshot.snapshot_sha256,
+                    verified_feature_snapshot_evidence=verified_evidence,
                 )
             )
             dynamic_targets = [None] * len(sequence.tokens)
@@ -332,10 +356,14 @@ class StageEditSchemaTests(unittest.TestCase):
         restored = StageEditTokenSchema.from_dict(SCHEMA.to_dict())
         self.assertEqual(restored, SCHEMA)
         self.assertEqual(restored.fingerprint, SCHEMA.fingerprint)
-        legacy_schema = SCHEMA.to_dict()
-        legacy_schema["schema_version"] = 1
-        with self.assertRaisesRegex(ValueError, "unsupported StageEdit token schema"):
-            StageEditTokenSchema.from_dict(legacy_schema)
+        for legacy_version in (1, 2):
+            legacy_schema = SCHEMA.to_dict()
+            legacy_schema["schema_version"] = legacy_version
+            with self.assertRaisesRegex(
+                ValueError,
+                "unsupported StageEdit token schema",
+            ):
+                StageEditTokenSchema.from_dict(legacy_schema)
         parameter_count = stage_edit_parameter_count(
             production_stage_edit_config(SCHEMA)
         )
@@ -482,9 +510,9 @@ class StageEditMLXTests(unittest.TestCase):
         )
         self.assertEqual(
             SCHEMA.fingerprint,
-            "41f6e234f4522c5e99edb0879d18479ba56cf1d59b50896e8b8c123b070f88af",
+            "301ddc566f97cd368bac30abb3afd0a3c61b7af77a74e3591c084b7728205b81",
         )
-        self.assertEqual(SCHEMA.raw_source_dimension, 360)
+        self.assertEqual(SCHEMA.raw_source_dimension, 396)
         with mx.stream(mx.cpu):
             original_batch = tensorize_stage_edit_batch(
                 (original,), SCHEMA, self.config, device=mx.cpu
@@ -1383,6 +1411,15 @@ class StageEditMLXTests(unittest.TestCase):
                         allow_nan=False,
                     ).encode("utf-8")
                 ).hexdigest()
+                sensing_gate = synthetic_production_gate()
+                sensing_reference_ids = (
+                    "a-train",
+                    "b-train",
+                    "a-validation",
+                    "b-validation",
+                    "c-heldout-1",
+                    "c-heldout-2",
+                )
                 production_report = {
                     "schema_version": PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION,
                     "run_kind": PRODUCTION_TRAINING_RUN_KIND,
@@ -1448,6 +1485,20 @@ class StageEditMLXTests(unittest.TestCase):
                             "b-validation": "d" * 64,
                             "c-heldout-1": "e" * 64,
                             "c-heldout-2": "f" * 64,
+                        },
+                        "production_causal_sensing_gate_by_reference": {
+                            reference_id: sensing_gate
+                            for reference_id in sensing_reference_ids
+                        },
+                        "production_causal_sensing_scope": {
+                            key: sensing_gate[key]
+                            for key in (
+                                "edit_mode",
+                                "target_member",
+                                "member_feature_mode",
+                                "feature_snapshot_schema_version",
+                                "token_schema_fingerprint",
+                            )
                         },
                         "reference_match_or_current_choice_features_present": False,
                         "missing_reference_ids": [],
@@ -1618,6 +1669,24 @@ class StageEditMLXTests(unittest.TestCase):
 
             report_path = checkpoint / PRODUCTION_TRAINING_REPORT_FILENAME
             original_report = json.loads(report_path.read_text(encoding="utf-8"))
+            tampered_sensing = copy.deepcopy(original_report)
+            first_reference = next(
+                iter(
+                    tampered_sensing["production_feature_snapshot_gate"][
+                        "production_causal_sensing_gate_by_reference"
+                    ]
+                )
+            )
+            del tampered_sensing["production_feature_snapshot_gate"][
+                "production_causal_sensing_gate_by_reference"
+            ][first_reference]["ive_performer_state_content_sha256"]
+            report_path.write_text(
+                json.dumps(tampered_sensing), encoding="utf-8"
+            )
+            rejected_sensing = stage_edit_readiness_report(checkpoint)
+            self.assertFalse(rejected_sensing.learned_inference_ready)
+            self.assertIn("causal-sensing triple", rejected_sensing.reason)
+
             tampered_model = copy.deepcopy(original_report)
             tampered_model["model"]["dynamic_crop_version"] = 2
             report_path.write_text(

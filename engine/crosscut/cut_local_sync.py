@@ -40,6 +40,7 @@ from .visual_score import FrameVisualDescriptor, describe_frame
 SCHEMA_VERSION = 2
 ANALYSIS_BASIS = "actual_pts_renderer_bound_retained_cut_pose_body_motion_phase_v2"
 ACTIVATION = "automatic_registered_stage_edit_group"
+MEMBER_ACTIVATION = "automatic_ive_member_direct_full_frame"
 PTS_BASIS = "ffprobe_best_effort_timestamp_time"
 RENDERER_SELECTION_BASIS = (
     "trim_lower_bound_setpts_first_pts_fps_round_near_tpad_clone_v1"
@@ -1156,6 +1157,7 @@ def analyze_cut_local_sync(
     *,
     source_timewarps: Sequence[TimeWarpMap | None],
     timewarp_payloads: Sequence[Mapping[str, Any]],
+    activation: str = ACTIVATION,
     config: CutLocalSyncConfig | None = None,
     pts_provider: PTSProvider = _probe_actual_video_pts,
     decode_provider: DecodeProvider = _decode_provider,
@@ -1165,6 +1167,8 @@ def analyze_cut_local_sync(
 
     if not isinstance(plan, RenderPlan):
         raise TypeError("cut-local sync requires a RenderPlan")
+    if activation not in {ACTIVATION, MEMBER_ACTIVATION}:
+        raise ValueError("cut-local sync activation is unsupported")
     settings = config or CutLocalSyncConfig()
     plan_payload = plan.to_json()
     boundaries = _boundary_contracts(plan_payload)
@@ -1485,7 +1489,7 @@ def analyze_cut_local_sync(
     result = {
         "schema_version": SCHEMA_VERSION,
         "analysis": ANALYSIS_BASIS,
-        "activation": ACTIVATION,
+        "activation": activation,
         "required": True,
         "plan_sha256": plan_sha,
         "timewarp_contract_sha256": timewarp_sha,
@@ -2179,6 +2183,7 @@ def validate_cut_local_sync_evidence(
     *,
     plan: Mapping[str, Any],
     timewarp_payloads: Sequence[Mapping[str, Any]],
+    expected_activation: str = ACTIVATION,
     maximum_residual_p95_frames: float = 0.5,
 ) -> dict[str, Any]:
     """Independently verify serialized scalar evidence against final artifacts."""
@@ -2205,6 +2210,8 @@ def validate_cut_local_sync_evidence(
         )
         if threshold <= 0.0:
             raise ValueError("threshold invalid")
+        if expected_activation not in {ACTIVATION, MEMBER_ACTIVATION}:
+            raise ValueError("activation invalid")
         trusted_policy = CutLocalSyncConfig(
             maximum_residual_p95_frames=threshold
         )
@@ -2237,7 +2244,10 @@ def validate_cut_local_sync_evidence(
         errors.append("unsupported_schema_version")
     if payload.get("analysis") != ANALYSIS_BASIS:
         errors.append("unsupported_analysis_basis")
-    if payload.get("activation") != ACTIVATION or payload.get("required") is not True:
+    if (
+        payload.get("activation") != expected_activation
+        or payload.get("required") is not True
+    ):
         errors.append("activation_contract_invalid")
     if not _numbers_equal(payload.get("fps"), plan_fps):
         errors.append("fps_mismatch")
@@ -2658,6 +2668,7 @@ __all__ = [
     "ANALYSIS_BASIS",
     "CutLocalMotionSample",
     "CutLocalSyncConfig",
+    "MEMBER_ACTIVATION",
     "analyze_cut_local_sync",
     "estimate_motion_phase",
     "renderer_selected_frame_ordinals",

@@ -847,6 +847,18 @@ def _strict_release_freeze(path: Path) -> dict[str, Any]:
     return payload
 
 
+def load_dynamic_crop_v3_release_freeze(path: Path) -> dict[str, Any]:
+    """Strictly replay a content-addressed v3 LOSO release freeze.
+
+    This public read-only entry point lets downstream release coordinators bind
+    the selected v3 model/loss contract without importing a private validator.
+    It grants no activation authority and performs the same complete LOSO,
+    source-provenance, montage-profile, and candidate replay as the creator.
+    """
+
+    return _strict_release_freeze(path)
+
+
 def create_dynamic_crop_v3_final_fit_plan(
     *,
     release_freeze_path: Path,
@@ -1069,6 +1081,17 @@ def _strict_final_fit_plan(path: Path) -> dict[str, Any]:
     return payload
 
 
+def load_dynamic_crop_v3_final_fit_plan(path: Path) -> dict[str, Any]:
+    """Strictly replay the manifest graph used by the inactive v3 final fit.
+
+    Downstream release coordinators use this public loader to prove that the
+    three training-song manifest tuples they are about to consume are exactly
+    the tuples that survived LOSO selection and the all-reference final fit.
+    """
+
+    return _strict_final_fit_plan(path)
+
+
 def preflight_dynamic_crop_v3_final_fit(
     plan_path: Path,
 ) -> DynamicCropV3FinalFitPreflight:
@@ -1199,6 +1222,8 @@ def _execute_final_fit(
         max_sources=capacity.v2_launcher.legacy.PRODUCTION_SAMPLING_CONTRACT[
             "max_sources"
         ],
+        production_edit_mode="group",
+        production_target_member=None,
     )
     v2_corpus = build_stage_edit_dynamic_crop_training_corpus_v2(
         corpus.examples,
@@ -1704,6 +1729,8 @@ __all__ = [
     "create_dynamic_crop_v3_final_fit_plan",
     "create_dynamic_crop_v3_release_freeze",
     "launch_dynamic_crop_v3_final_fit",
+    "load_dynamic_crop_v3_final_fit_plan",
+    "load_dynamic_crop_v3_release_freeze",
     "load_dynamic_crop_v3_final_fit_receipt",
     "main",
     "preflight_dynamic_crop_v3_final_fit",

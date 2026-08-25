@@ -4,11 +4,19 @@ from dataclasses import replace
 from pathlib import Path
 import unittest
 
-from crosscut.render import RenderSegment, RenderTransition
+from crosscut.render import (
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    RenderSegment,
+    RenderTransition,
+)
 from crosscut.request import AspectRatio
 from crosscut.rhythm import Beat, OnsetEnvelope, RhythmAnalysis, TempoEstimate
 from crosscut.section_director import build_section_plan
 from crosscut.stage_edit import StageBoundary, StageEdit, StageShot
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
+)
 
 
 def _sections():
@@ -87,6 +95,78 @@ class StageEditTests(unittest.TestCase):
         self.assertEqual(len(patched.lineage), 1)
         self.assertEqual(patched.to_render_plan().output_frame_count, 270)
 
+    def test_partial_patch_preserves_exact_v3_decode_provenance(self) -> None:
+        edit = _edit()
+
+        def decoded(source_index: int) -> DynamicCropTrackDecodeV3:
+            track = EditorialTransformTrack(
+                (
+                    EditorialTransformKeyframe(0.0, 1.02),
+                    EditorialTransformKeyframe(2.0, 1.04),
+                ),
+                reason="stage_edit_dynamic_crop_head_v3",
+            )
+            return DynamicCropTrackDecodeV3(
+                source_id=f"source-{source_index}",
+                source_index=source_index,
+                eligible=True,
+                loss_masked=False,
+                track=track,
+                predicted_keyframe_count=2,
+                applied_keyframe_count=2,
+                minimum_safe_zoom_projection_count=0,
+                rejection_reasons=(),
+                motion_logit=0.75,
+                shot_duration_seconds=3.0,
+            )
+
+        shots = tuple(
+            replace(
+                shot,
+                segment=replace(
+                    shot.segment,
+                    editorial_transform=(value := decoded(shot.segment.source_index)).track,
+                ),
+                dynamic_crop_decode_v3=value,
+            )
+            for shot in edit.shots
+        )
+        edit = replace(edit, shots=shots)
+        replacement = replace(
+            edit.shots[1],
+            decision_id="v3-repaired-decision",
+        )
+        patched = edit.replace_window(
+            start_shot=1,
+            end_shot_exclusive=2,
+            replacement_shots=(replacement,),
+            replacement_boundaries=(
+                StageBoundary(0, RenderTransition(reason="new-left"), "passed"),
+                StageBoundary(1, RenderTransition(reason="new-right"), "passed"),
+            ),
+            reason="v3_provenance_repair",
+            score_before=70.0,
+            score_after=80.0,
+        )
+
+        self.assertIs(
+            patched.shots[0].dynamic_crop_decode_v3,
+            edit.shots[0].dynamic_crop_decode_v3,
+        )
+        self.assertIs(
+            patched.shots[2].dynamic_crop_decode_v3,
+            edit.shots[2].dynamic_crop_decode_v3,
+        )
+        self.assertEqual(
+            replacement.dynamic_crop_decode_v3,
+            patched.shots[1].dynamic_crop_decode_v3,
+        )
+        assert patched.shots[1].dynamic_crop_decode_v3 is not None
+        self.assertEqual(
+            patched.shots[1].dynamic_crop_decode_v3.to_dict(),
+            patched.shots[1].to_dict()["dynamic_crop_v3"],
+        )
+
     def test_partial_patch_rejects_non_improvement(self) -> None:
         edit = _edit()
         with self.assertRaisesRegex(ValueError, "improve"):
@@ -106,6 +186,7 @@ class StageEditTests(unittest.TestCase):
         self.assertEqual(len(edit.reviewer_history), 0)
         self.assertEqual(reviewed.reviewer_history[0]["score"], 91.2)
         self.assertEqual(reviewed.to_dict()["schema_version"], 2)
+        self.assertNotIn("dynamic_crop_v3", edit.shots[0].to_dict())
 
 
 if __name__ == "__main__":

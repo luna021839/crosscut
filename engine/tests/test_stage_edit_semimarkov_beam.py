@@ -3250,13 +3250,20 @@ class StageEditSemiMarkovBeamTests(unittest.TestCase):
             result.audit.input_summary["selected_dynamic_crop_v3_attempt_count"],
         )
         for timeline in result.timelines:
-            for decision in timeline.decisions:
+            for decision, shot in zip(
+                timeline.decisions, timeline.edit.shots, strict=True
+            ):
                 expected_zoom = 1.02 + 0.04 * decision.source_index
                 self.assertAlmostEqual(expected_zoom, decision.crop_requested[0])
                 self.assertAlmostEqual(expected_zoom, decision.crop_applied[0])
                 self.assertIsNone(decision.dynamic_crop_decode)
                 decoded = decision.dynamic_crop_decode_v3
                 assert decoded is not None
+                self.assertIs(decoded, shot.dynamic_crop_decode_v3)
+                self.assertEqual(
+                    decoded.to_dict(),
+                    shot.to_dict()["dynamic_crop_v3"],
+                )
                 self.assertEqual(decision.source_index, decoded.source_index)
                 self.assertEqual(decision.source_id, decoded.source_id)
                 self.assertEqual(

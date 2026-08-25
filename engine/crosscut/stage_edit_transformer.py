@@ -34,6 +34,12 @@ from .reference_dataset import (
     NATIVE_SOURCE_CAMERA_CUT_EVENT,
     REFERENCE_START_EVENT,
 )
+from .causal_shooting_grammar import (
+    STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES,
+)
+from .ive_performer_state import (
+    STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES,
+)
 from .stage_edit_transition_authority import (
     LEARNED_TRANSITION_AUTHORITY,
     RENDERER_OWNED_TRANSITION_AUTHORITY,
@@ -52,7 +58,7 @@ else:
     _MLX_IMPORT_ERROR = None
 
 
-TOKEN_SCHEMA_VERSION = 2
+TOKEN_SCHEMA_VERSION = 3
 CHECKPOINT_FORMAT_VERSION = 3
 MASKED_SOURCE_LOGIT = -1.0e9
 PRODUCTION_TRAINING_REPORT_FILENAME = "training-report.json"
@@ -76,6 +82,9 @@ _DYNAMIC_CROP_V3_ACTIVATION_CHECKPOINTING_KEYS = frozenset(
 )
 PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT = (
     "shared_media_feature_snapshot_with_postload_history_scrub_v2"
+)
+STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT = (
+    "production_requires_hash_bound_shooting_member_performer_triple_v1"
 )
 STAGE_EDIT_RECENT_HISTORY_MASK_CONTRACT = (
     "transformer_recent_edit_slice_fully_unknown_train_and_serve_v1"
@@ -154,6 +163,55 @@ STAGE_EDIT_ACTION_FORMATION_SOURCE_FEATURE_NAMES = (
     *STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
     *STAGE_EDIT_FORMATION_LAYOUT_FEATURE_NAMES,
     *STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES,
+)
+
+# Exact-timestamp member-state values are source-local.  The explicit
+# observation and uncertainty columns distinguish a genuinely absent member
+# observation from a known numeric zero.
+STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES = (
+    "target_member_probability",
+    "target_visibility_probability",
+    "target_center_x",
+    "target_center_y",
+    "target_prominence_probability",
+    "target_member_uncertainty_probability",
+    "target_member_state_observed",
+)
+
+STAGE_EDIT_CORE_SOURCE_FEATURE_NAMES = (
+    "sync_confidence",
+    "sync_residual_normalized",
+    "shot_scale",
+    "face_scale",
+    "face_center_x",
+    "face_center_y",
+    "body_center_x",
+    "body_center_y",
+    "pose_motion",
+    "camera_motion_x",
+    "camera_motion_y",
+    "camera_zoom_velocity",
+    "camera_roll_degrees_normalized",
+    "sharpness",
+    "exposure",
+    "color_temperature_normalized",
+    "occlusion_probability",
+    "visual_match_confidence",
+    *STAGE_EDIT_ACTION_FORMATION_SOURCE_FEATURE_NAMES,
+)
+
+# Three reviewed shooting-grammar adapter columns already exist in the core
+# schema.  They are corroborated at materialization time rather than silently
+# duplicated under another tensor index.
+STAGE_EDIT_SHOOTING_GRAMMAR_ADDITIONAL_SOURCE_FEATURE_NAMES = tuple(
+    name
+    for name in STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES
+    if name not in STAGE_EDIT_CORE_SOURCE_FEATURE_NAMES
+)
+STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES = (
+    *STAGE_EDIT_SHOOTING_GRAMMAR_ADDITIONAL_SOURCE_FEATURE_NAMES,
+    *STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES,
+    *STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES,
 )
 
 STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT = (
@@ -316,25 +374,10 @@ DEFAULT_STAGE_EDIT_SCHEMA = StageEditTokenSchema(
         "section_energy_delta",
     ),
     source_feature_names=(
-        "sync_confidence",
-        "sync_residual_normalized",
-        "shot_scale",
-        "face_scale",
-        "face_center_x",
-        "face_center_y",
-        "body_center_x",
-        "body_center_y",
-        "pose_motion",
-        "camera_motion_x",
-        "camera_motion_y",
-        "camera_zoom_velocity",
-        "camera_roll_degrees_normalized",
-        "sharpness",
-        "exposure",
-        "color_temperature_normalized",
-        "occlusion_probability",
-        "visual_match_confidence",
-        *STAGE_EDIT_ACTION_FORMATION_SOURCE_FEATURE_NAMES,
+        *STAGE_EDIT_CORE_SOURCE_FEATURE_NAMES,
+        *STAGE_EDIT_SHOOTING_GRAMMAR_ADDITIONAL_SOURCE_FEATURE_NAMES,
+        *STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES,
+        *STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES,
     ),
     recent_edit_feature_names=(
         "seconds_since_cut_normalized",
@@ -2555,6 +2598,112 @@ def _production_training_report_errors(
             )
         ):
             errors.append("production feature-snapshot hash evidence is invalid")
+        sensing_gates = feature_gate.get(
+            "production_causal_sensing_gate_by_reference"
+        )
+        sensing_scope = feature_gate.get("production_causal_sensing_scope")
+        sensing_gate_keys = {
+            "passed",
+            "contract",
+            "edit_mode",
+            "target_member",
+            "member_feature_mode",
+            "shooting_grammar_content_sha256",
+            "member_state_graph_content_sha256",
+            "ive_performer_state_content_sha256",
+            "exact_master_timestamp_lookup",
+            "missing_masks_are_one_to_one",
+            "unknown_is_explicit",
+            "feature_snapshot_schema_version",
+            "token_schema_fingerprint",
+            "feature_materializer_contract",
+        }
+        valid_ive_members = {"안유진", "가을", "레이", "장원영", "리즈", "이서"}
+        valid_sensing_gates = bool(
+            isinstance(sensing_gates, Mapping)
+            and isinstance(hashes, Mapping)
+            and set(sensing_gates) == set(hashes)
+        )
+        scope_identities: set[tuple[object, ...]] = set()
+        if valid_sensing_gates:
+            assert isinstance(sensing_gates, Mapping)
+            for raw_gate in sensing_gates.values():
+                if not isinstance(raw_gate, Mapping) or set(raw_gate) != sensing_gate_keys:
+                    valid_sensing_gates = False
+                    break
+                mode = raw_gate.get("edit_mode")
+                target = raw_gate.get("target_member")
+                member_mode = raw_gate.get("member_feature_mode")
+                if not (
+                    raw_gate.get("passed") is True
+                    and raw_gate.get("contract")
+                    == STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT
+                    and raw_gate.get("exact_master_timestamp_lookup") is True
+                    and raw_gate.get("missing_masks_are_one_to_one") is True
+                    and raw_gate.get("unknown_is_explicit") is True
+                    and raw_gate.get("feature_snapshot_schema_version") == 4
+                    and raw_gate.get("token_schema_fingerprint")
+                    == DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+                    and raw_gate.get("feature_materializer_contract")
+                    == "stage_edit_inference_available_feature_materializer_v4"
+                    and all(
+                        isinstance(raw_gate.get(name), str)
+                        and len(str(raw_gate[name])) == 64
+                        and all(
+                            character in "0123456789abcdef"
+                            for character in str(raw_gate[name])
+                        )
+                        for name in (
+                            "shooting_grammar_content_sha256",
+                            "member_state_graph_content_sha256",
+                            "ive_performer_state_content_sha256",
+                        )
+                    )
+                    and (
+                        (
+                            mode == "group"
+                            and target is None
+                            and member_mode == "group_no_target"
+                        )
+                        or (
+                            mode == "member"
+                            and target in valid_ive_members
+                            and member_mode == "target_member"
+                        )
+                    )
+                ):
+                    valid_sensing_gates = False
+                    break
+                scope_identities.add(
+                    (
+                        mode,
+                        target,
+                        member_mode,
+                        raw_gate.get("feature_snapshot_schema_version"),
+                        raw_gate.get("token_schema_fingerprint"),
+                    )
+                )
+        expected_scope = (
+            {
+                "edit_mode": next(iter(scope_identities))[0],
+                "target_member": next(iter(scope_identities))[1],
+                "member_feature_mode": next(iter(scope_identities))[2],
+                "feature_snapshot_schema_version": next(iter(scope_identities))[3],
+                "token_schema_fingerprint": next(iter(scope_identities))[4],
+            }
+            if len(scope_identities) == 1
+            else None
+        )
+        if (
+            not valid_sensing_gates
+            or expected_scope is None
+            or not isinstance(sensing_scope, Mapping)
+            or dict(sensing_scope) != expected_scope
+        ):
+            errors.append(
+                "production feature snapshots lack an exact hash-bound "
+                "causal-sensing triple and edit scope"
+            )
         if feature_gate.get(
             "reference_match_or_current_choice_features_present"
         ) is not False:
@@ -3094,6 +3243,7 @@ __all__ = [
     "MASKED_SOURCE_LOGIT",
     "PRODUCTION_CHECKPOINT_SCOPE",
     "PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT",
+    "STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT",
     "PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION",
     "PRODUCTION_TRAINING_REPORT_FILENAME",
     "PRODUCTION_TRAINING_RUN_KIND",
@@ -3102,17 +3252,22 @@ __all__ = [
     "STAGE_EDIT_CUT_SCORING_CONTRACT",
     "STAGE_EDIT_CUT_THRESHOLD_SELECTION_CONTRACT",
     "STAGE_EDIT_ACTION_FORMATION_SOURCE_FEATURE_NAMES",
+    "STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES",
+    "STAGE_EDIT_CORE_SOURCE_FEATURE_NAMES",
     "STAGE_EDIT_DECISION_HISTORY_OWNER",
     "STAGE_EDIT_RECENT_HISTORY_MASK_CONTRACT",
     "STAGE_EDIT_FORMATION_LAYOUT_FEATURE_NAMES",
     "STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES",
     "STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES",
+    "STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES",
     "STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND",
     "STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS",
     "STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT",
     "STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT",
     "STAGE_EDIT_SOURCE_RELATION_MODE",
     "STAGE_EDIT_SOURCE_SCORING_CONTRACT",
+    "STAGE_EDIT_SHOOTING_GRAMMAR_ADDITIONAL_SOURCE_FEATURE_NAMES",
+    "STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES",
     "STAGE_EDIT_VALIDATION_SELECTION_CONTRACT",
     "LEARNED_TRANSITION_AUTHORITY",
     "RENDERER_OWNED_TRANSITION_AUTHORITY",

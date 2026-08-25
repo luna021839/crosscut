@@ -3,7 +3,7 @@
 This module deliberately has a narrower authority than the Dynamic Crop v2
 capacity selector.  It proves that one pinned v3 model can execute a real
 forward pass, backward pass, global-gradient clip, and AdamW update at the
-release tensor shape ``[2, 2048, 32, 720]``.  It never computes semantic
+schema-v3 release tensor shape ``[2, 2048, 32, 792]``.  It never computes semantic
 quality metrics and its artifacts can never authorize model selection.
 
 The input lanes are tiled only from the immutable BANG BANG, BLACKHOLE, and
@@ -116,7 +116,7 @@ V3_CAPACITY_SMOKE_RUNNER_CONTRACT = (
     "dynamic_crop_v3_rematerialized_forward_backward_clip_adamw_fresh_process_v2"
 )
 V3_CAPACITY_SMOKE_PACKING_CONTRACT = (
-    "immutable_bbr15_source_exact_v3_fixed_lane_2x2048x32x720_v1"
+    "immutable_bbr15_source_exact_v3_fixed_lane_2x2048x32x792_v2"
 )
 V3_CAPACITY_SMOKE_PROCESS_CONTRACT = (
     "one_supervisor_one_fresh_worker_one_pinned_rematerialized_v3_candidate_v2"
@@ -661,7 +661,12 @@ def _pack_fixed_lane_training_arrays_v3(
         "legacy_v2_model_or_loss_used": False,
         "semantic_metrics_authorized": False,
     }
-    if provenance["source_tensor_shape"] != [2, 2048, 32, 720] and (
+    if provenance["source_tensor_shape"] != [
+        FIXED_BATCH_SIZE,
+        FIXED_SEQUENCE_LENGTH,
+        FIXED_MAX_SOURCES,
+        FIXED_SOURCE_DIMENSION,
+    ] and (
         sequence_length == FIXED_SEQUENCE_LENGTH and max_sources == FIXED_MAX_SOURCES
     ):
         raise DynamicCropV3CapacitySmokeError(
@@ -877,7 +882,12 @@ def _worker_main(args: argparse.Namespace) -> int:
                 candidate=candidate,
             )
         )
-        if tensor["source_tensor_shape"] != [2, 2048, 32, 720]:
+        if tensor["source_tensor_shape"] != [
+            FIXED_BATCH_SIZE,
+            FIXED_SEQUENCE_LENGTH,
+            FIXED_MAX_SOURCES,
+            FIXED_SOURCE_DIMENSION,
+        ]:
             raise DynamicCropV3CapacitySmokeError(
                 "worker did not materialize the release tensor shape"
             )
@@ -1195,7 +1205,13 @@ def _normalize_execution(
     tensor = result.get("tensor_provenance")
     tensor_ok = (
         isinstance(tensor, Mapping)
-        and tensor.get("source_tensor_shape") == [2, 2048, 32, 720]
+        and tensor.get("source_tensor_shape")
+        == [
+            FIXED_BATCH_SIZE,
+            FIXED_SEQUENCE_LENGTH,
+            FIXED_MAX_SOURCES,
+            FIXED_SOURCE_DIMENSION,
+        ]
         and tensor.get("dynamic_crop_version") == 3
         and tensor.get("model_contract") == DYNAMIC_CROP_V3_MODEL_CONTRACT
         and tensor.get("loss_contract") == DYNAMIC_CROP_V3_LOSS_CONTRACT
@@ -1792,7 +1808,13 @@ def load_dynamic_crop_v3_capacity_smoke(path: Path) -> dict[str, Any]:
                 execution.get("activation_checkpointing")
             )
             or not isinstance(tensor, Mapping)
-            or tensor.get("source_tensor_shape") != [2, 2048, 32, 720]
+            or tensor.get("source_tensor_shape")
+            != [
+                FIXED_BATCH_SIZE,
+                FIXED_SEQUENCE_LENGTH,
+                FIXED_MAX_SOURCES,
+                FIXED_SOURCE_DIMENSION,
+            ]
             or tensor.get("dynamic_crop_version") != 3
             or tensor.get("legacy_v2_model_or_loss_used") is not False
         ):
@@ -1817,7 +1839,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one pinned Dynamic Crop v3 capacity candidate in a fresh MLX "
-            "process at [2,2048,32,720]."
+            f"process at [2,2048,32,{FIXED_SOURCE_DIMENSION}]."
         )
     )
     parser.add_argument(

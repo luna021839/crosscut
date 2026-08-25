@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,7 @@ from crosscut.acquisition import (
     _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
     _IVE_STAGE_PLAYLIST_URL,
     _CATALOG_MINIMUM_PLAUSIBLE_ENTRY_COUNT,
+    _build_acquisition_artifact,
     _load_official_ive_stage_catalog,
     _merge_discovery,
     _metadata_candidate,
@@ -119,10 +121,11 @@ class _FakeClient:
     def __init__(self, entries: list[dict[str, object]], failed_ids: set[str] | None = None) -> None:
         self.entries = entries
         self.failed_ids = failed_ids or set()
+        self.search_calls: list[tuple[str, int]] = []
         self.download_attempts: list[str] = []
 
     def search(self, query: str, limit: int) -> list[dict[str, object]]:
-        del query, limit
+        self.search_calls.append((query, limit))
         return list(self.entries)
 
     def playlist_catalog(self, playlist_id: str) -> dict[str, object]:
@@ -562,13 +565,197 @@ class AcquisitionTests(unittest.TestCase):
                 member_anchors=artifact.member_anchors,
             )
             manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+            manifest_file_sha256 = hashlib.sha256(
+                artifact.manifest_path.read_bytes()
+            ).hexdigest()
         self.assertEqual(artifact.member_anchors, ())
+        self.assertIsNotNone(artifact.member_identity_authority)
+        assert artifact.member_identity_authority is not None
+        self.assertEqual(
+            len(artifact.member_identity_authority.sources),
+            len(artifact.source_paths),
+        )
+        self.assertEqual(
+            artifact.member_identity_authority.manifest_sha256,
+            manifest_file_sha256,
+        )
         self.assertEqual(materialized.member_anchors, ())
         self.assertEqual(len(manifest["selected"]), 10)
         self.assertTrue(
             all("automatic_member_anchor" not in item for item in manifest["selected"])
         )
         self.assertNotIn("auto_anchor_rejected_count", manifest["summary"])
+
+    def test_member_upload_date_fresh_identity_and_cache_reauthentication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, member=True, desired=10)
+            entries = [
+                {
+                    "id": f"upload{index:05d}",
+                    "title": (
+                        "IVE Gaeul I AM Fancam Music Bank Camera "
+                        f"{chr(ord('A') + index)}"
+                    ),
+                    "channel": "KBS Kpop",
+                    "channel_id": "UCeLPm9yH_a_QH8n6445G-Ow",
+                    "duration": 184 + index % 4,
+                    "upload_date": f"202304{10 + index:02d}",
+                    "webpage_url": (
+                        "https://www.youtube.com/watch?v="
+                        f"upload{index:05d}"
+                    ),
+                }
+                for index in range(10)
+            ]
+            first_reporter = _MemoryReporter()
+            first = acquire_sources(
+                request,
+                reporter=first_reporter,
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_portrait_media,
+            )
+            self.assertIsNotNone(first.member_identity_authority)
+            self.assertTrue(
+                all(
+                    item["broadcast_date_basis"] == "upload_date"
+                    for item in first.manifest["selected"]
+                )
+            )
+            self.assertFalse(
+                any(
+                    payload.get("level") == "warning"
+                    for _event_type, payload in first_reporter.events
+                )
+            )
+
+            cache_only_client = _FakeClient([])
+            cache_only_reporter = _MemoryReporter()
+            cache_only = acquire_sources(
+                request,
+                reporter=cache_only_reporter,
+                client=cache_only_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_portrait_media,
+            )
+            self.assertIsNone(cache_only.member_identity_authority)
+            self.assertEqual(len(cache_only_client.search_calls), 8)
+            self.assertEqual(cache_only_client.download_attempts, [])
+            self.assertEqual(
+                cache_only.manifest["official_ive_stage_playlist_catalog"][
+                    "result"
+                ],
+                "fresh_hash_valid_cache",
+            )
+            self.assertTrue(
+                any(
+                    payload.get("level") == "warning"
+                    and "다시 인증" in str(payload.get("message", ""))
+                    for _event_type, payload in cache_only_reporter.events
+                )
+            )
+
+            refreshed_client = _FakeClient(entries)
+            refreshed = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=refreshed_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_portrait_media,
+            )
+            self.assertIsNotNone(refreshed.member_identity_authority)
+            self.assertEqual(refreshed_client.download_attempts, [])
+
+    def test_member_upload_date_raw_stale_and_forged_provenance_rejected(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _request(root, member=True, desired=10)
+            entries = [
+                {
+                    "id": f"proof{index:06d}",
+                    "title": (
+                        "IVE Gaeul I AM Fancam Music Bank Camera "
+                        f"{chr(ord('A') + index)}"
+                    ),
+                    "channel": "KBS Kpop",
+                    "channel_id": "UCeLPm9yH_a_QH8n6445G-Ow",
+                    "duration": 184 + index % 4,
+                    "upload_date": f"202304{10 + index:02d}",
+                    "webpage_url": (
+                        "https://www.youtube.com/watch?v="
+                        f"proof{index:06d}"
+                    ),
+                }
+                for index in range(10)
+            ]
+            artifact = acquire_sources(
+                request,
+                reporter=_MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=_portrait_media,
+            )
+            raw_replay = _build_acquisition_artifact(
+                source_paths=artifact.source_paths,
+                manifest_path=artifact.manifest_path,
+                manifest=artifact.manifest,
+            )
+            self.assertIsNone(raw_replay.member_identity_authority)
+
+            candidates = [
+                _metadata_candidate(
+                    entry,
+                    request=request,
+                    query="fresh-query",
+                    verified_fresh_metadata_origin="query_search",
+                )
+                for entry in entries
+            ]
+            self.assertTrue(all(candidate is not None for candidate in candidates))
+            identities = {
+                candidate.video_id: candidate._fresh_metadata_identities
+                for candidate in candidates
+                if candidate is not None
+            }
+            exact = _build_acquisition_artifact(
+                source_paths=artifact.source_paths,
+                manifest_path=artifact.manifest_path,
+                manifest=artifact.manifest,
+                fresh_metadata_identities_by_video_id=identities,
+            )
+            self.assertIsNotNone(exact.member_identity_authority)
+
+            victim = str(artifact.manifest["selected"][0]["video_id"])
+            other = next(video_id for video_id in identities if video_id != victim)
+            stale_identities = dict(identities)
+            stale_identities[victim] = identities[other]
+            stale = _build_acquisition_artifact(
+                source_paths=artifact.source_paths,
+                manifest_path=artifact.manifest_path,
+                manifest=artifact.manifest,
+                fresh_metadata_identities_by_video_id=stale_identities,
+            )
+            self.assertIsNone(stale.member_identity_authority)
+
+            raw_claims: dict[str, object] = dict(identities)
+            raw_claims[victim] = (
+                {
+                    "video_id": victim,
+                    "broadcast_date_basis": "upload_date",
+                },
+            )
+            forged = _build_acquisition_artifact(
+                source_paths=artifact.source_paths,
+                manifest_path=artifact.manifest_path,
+                manifest=artifact.manifest,
+                fresh_metadata_identities_by_video_id=raw_claims,  # type: ignore[arg-type]
+            )
+            self.assertIsNone(forged.member_identity_authority)
 
     def test_member_closeup_title_classifier(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1723,6 +1910,71 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(merged.rejection_reasons, trusted.rejection_reasons)
         self.assertEqual(merged.broadcast_date, "2023-04-14")
         self.assertEqual(merged.broadcast_program, "music_bank")
+
+    def test_exact_id_merge_preserves_each_fresh_metadata_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            request = _request(Path(temp), desired=8)
+            common = {
+                "id": "mergeproof01",
+                "channel": "KBS Kpop",
+                "channel_id": "UCeLPm9yH_a_QH8n6445G-Ow",
+                "duration": 180,
+                "upload_date": "20230414",
+            }
+            query_candidate = _metadata_candidate(
+                {
+                    **common,
+                    "title": "IVE I AM Music Bank Stage Camera A",
+                },
+                request=request,
+                query="query-search",
+                verified_fresh_metadata_origin="query_search",
+            )
+            catalog_candidate = _metadata_candidate(
+                {
+                    **common,
+                    "title": "IVE I AM Music Bank Stage Camera B",
+                },
+                request=request,
+                query=f"playlist:{_IVE_STAGE_PLAYLIST_ID}",
+                discovery_source="official_ive_stage_playlist",
+                verified_fresh_metadata_origin="validated_network_catalog",
+            )
+            raw_candidate = _metadata_candidate(
+                {
+                    **common,
+                    "title": "IVE I AM Music Bank Stage Camera C",
+                },
+                request=request,
+                query="unsealed-cache",
+                discovery_source="verified_cache",
+            )
+            assert query_candidate is not None and catalog_candidate is not None
+            assert raw_candidate is not None
+            merged = _merge_discovery(query_candidate, catalog_candidate)
+
+        self.assertEqual(raw_candidate._fresh_metadata_identities, ())
+        self.assertEqual(
+            set(merged._fresh_metadata_identities),
+            {
+                *query_candidate._fresh_metadata_identities,
+                *catalog_candidate._fresh_metadata_identities,
+            },
+        )
+        self.assertEqual(
+            {identity.origin for identity in merged._fresh_metadata_identities},
+            {"query_search", "validated_network_catalog"},
+        )
+        self.assertEqual(
+            {
+                (identity.title, identity.broadcast_date_basis)
+                for identity in merged._fresh_metadata_identities
+            },
+            {
+                ("IVE I AM Music Bank Stage Camera A", "upload_date"),
+                ("IVE I AM Music Bank Stage Camera B", "upload_date"),
+            },
+        )
 
     def test_playlist_candidate_wrong_media_is_quarantined_and_next_is_used(
         self,

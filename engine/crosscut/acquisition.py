@@ -20,7 +20,7 @@ import re
 import statistics
 import subprocess
 from datetime import UTC, datetime
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 from .events import EventReporter
@@ -46,6 +46,90 @@ class AcquisitionError(RuntimeError):
     """A clear user-facing source discovery or download failure."""
 
 
+class _MemberAcquisitionIdentityReauthenticationRequired(AcquisitionError):
+    """Cached broadcast metadata needs a fresh authoritative lookup."""
+
+
+_ACQUISITION_IDENTITY_AUTHORITY_SEAL = object()
+_FRESH_METADATA_IDENTITY_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedFreshMetadataIdentity:
+    """Process-local proof for one live metadata observation.
+
+    Serialized acquisition manifests deliberately cannot recreate this value.
+    It is issued only while consuming a direct query response or a playlist
+    response that passed the pinned-owner network validation in this process.
+    """
+
+    video_id: str
+    title: str
+    channel_id: str | None
+    broadcast_program: str
+    broadcast_date: str
+    broadcast_date_basis: str
+    origin: str
+    _seal: object
+
+    def __post_init__(self) -> None:
+        if self._seal is not _FRESH_METADATA_IDENTITY_SEAL:
+            raise TypeError("fresh metadata identity must be issued by acquisition")
+        if self.origin not in {
+            "query_search",
+            "validated_network_catalog",
+        }:
+            raise ValueError("fresh metadata identity origin is invalid")
+        if self.broadcast_date_basis not in {
+            "title",
+            "upload_date",
+            "timestamp",
+        }:
+            raise ValueError("fresh metadata broadcast date basis is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedAcquisitionSourceIdentity:
+    source_index: int
+    source_path: str
+    video_id: str
+    broadcast_date: str
+    broadcast_program: str
+    source_size_bytes: int
+    source_sha256: str
+
+    @property
+    def broadcast_slot(self) -> str:
+        return f"{self.broadcast_date}:{self.broadcast_program}"
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedMemberAcquisitionIdentityAuthority:
+    group: str
+    song: str
+    target_member: str
+    manifest_path: str
+    manifest_size_bytes: int
+    manifest_sha256: str
+    sources: tuple[VerifiedAcquisitionSourceIdentity, ...]
+    _seal: object
+
+    def __post_init__(self) -> None:
+        if self._seal is not _ACQUISITION_IDENTITY_AUTHORITY_SEAL:
+            raise TypeError(
+                "member acquisition identity authority must be issued by acquisition"
+            )
+
+
+def is_verified_member_acquisition_identity_authority(
+    value: object,
+) -> bool:
+    return bool(
+        isinstance(value, VerifiedMemberAcquisitionIdentityAuthority)
+        and value._seal is _ACQUISITION_IDENTITY_AUTHORITY_SEAL
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionCandidate:
     video_id: str
@@ -59,10 +143,16 @@ class AcquisitionCandidate:
     trust_score: int
     broadcast_date: str | None = None
     broadcast_program: str | None = None
+    broadcast_date_basis: str | None = None
     official_channel_signal: str = "none"
     rejection_reasons: tuple[str, ...] = ()
     fallback_reason: str | None = None
     discovery_sources: tuple[str, ...] = ("query_search",)
+    _fresh_metadata_identities: tuple[_VerifiedFreshMetadataIdentity, ...] = ()
+    # Exact current metadata observations are deliberately process-local.
+    # Cache-derived candidates leave this empty, so a serialized manifest
+    # alone can never mint a download-suppression decision.
+    _metadata_observation_sha256: tuple[str, ...] = ()
 
     @property
     def query(self) -> str:
@@ -79,6 +169,10 @@ class AcquisitionArtifact:
     member_anchors: tuple[MemberAnchorRequest, ...]
     manifest_path: Path
     manifest: dict[str, Any]
+    member_identity_authority: (
+        VerifiedMemberAcquisitionIdentityAuthority | None
+    ) = None
+    member_identity_authority_error: str | None = None
 
 
 class _MediaContractError(AcquisitionError):
@@ -94,6 +188,25 @@ class _MediaContractError(AcquisitionError):
         super().__init__(message)
         self.hard_rejection_reason = hard_rejection_reason
         self.diagnostics = diagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedPersistentMediaContractRejection:
+    evidence: dict[str, Any]
+    quarantine_path: Path
+    quarantine_file_identity: tuple[int, int, int, int, int]
+
+
+class _PersistentMediaContractRejectionSkip(AcquisitionError):
+    """Internal control flow for a fully revalidated persisted rejection."""
+
+    def __init__(self, evidence: dict[str, Any]) -> None:
+        self.evidence = evidence
+        reason = evidence["hard_rejection_reason"]
+        video_id = evidence["video_id"]
+        super().__init__(
+            f"{video_id}: unchanged persistent media-contract rejection ({reason})"
+        )
 
 
 class _CatalogCompletenessError(AcquisitionError):
@@ -118,6 +231,20 @@ _CURRENT_HARD_TITLE_AUDIT_POLICY = (
 _MEMBER_PORTRAIT_ASPECT_CONTRACT_VERSION = 1
 _AUTOMATIC_MEDIA_QUALITY_CONTRACT_VERSION = 1
 _CONTENT_INTEGRITY_CONTRACT_VERSION = 1
+_PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION = 1
+_PERSISTENT_MEDIA_CONTRACT_REJECTION_REASONS = frozenset(
+    {
+        "automatic_member_portrait_first_video_stream_missing",
+        "automatic_member_portrait_dimensions_unavailable",
+        "automatic_member_portrait_aspect_ratio_mismatch",
+        "automatic_group_landscape_first_video_stream_missing",
+        "automatic_group_landscape_dimensions_unavailable",
+        "automatic_group_landscape_aspect_ratio_mismatch",
+        "automatic_video_resolution_below_minimum",
+        "automatic_video_frame_rate_unavailable",
+        "automatic_video_frame_rate_below_minimum",
+    }
+)
 _AUTOMATIC_MEMBER_PORTRAIT_RATIO = 9.0 / 16.0
 _AUTOMATIC_MEMBER_PORTRAIT_RATIO_TOLERANCE = 0.01
 _AUTOMATIC_GROUP_LANDSCAPE_RATIO = 16.0 / 9.0
@@ -402,6 +529,14 @@ def _music_show_program(title: str) -> str | None:
     return None
 
 
+def canonical_music_show_program(title: str) -> str | None:
+    """Expose the acquisition policy's canonical programme identity."""
+
+    if not isinstance(title, str):
+        raise TypeError("title must be a string")
+    return _music_show_program(title)
+
+
 def _has_ive_title_signal(title: str) -> bool:
     folded = _fold(title)
     return "아이브" in folded or re.search(
@@ -451,23 +586,36 @@ def _broadcast_date(title: str) -> str | None:
     return None
 
 
-def _metadata_broadcast_date(entry: dict[str, Any], title: str) -> str | None:
+def _metadata_broadcast_date_with_basis(
+    entry: Mapping[str, Any],
+    title: str,
+) -> tuple[str | None, str | None]:
     title_date = _broadcast_date(title)
     if title_date is not None:
-        return title_date
+        return (title_date, "title")
     upload_date = entry.get("upload_date")
     if isinstance(upload_date, str):
         try:
-            return datetime.strptime(upload_date, "%Y%m%d").date().isoformat()
+            return (
+                datetime.strptime(upload_date, "%Y%m%d").date().isoformat(),
+                "upload_date",
+            )
         except ValueError:
             pass
     timestamp = entry.get("timestamp")
     if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
         try:
-            return datetime.fromtimestamp(float(timestamp), tz=UTC).date().isoformat()
+            return (
+                datetime.fromtimestamp(float(timestamp), tz=UTC).date().isoformat(),
+                "timestamp",
+            )
         except (OverflowError, OSError, ValueError):
             pass
-    return None
+    return (None, None)
+
+
+def _metadata_broadcast_date(entry: dict[str, Any], title: str) -> str | None:
+    return _metadata_broadcast_date_with_basis(entry, title)[0]
 
 
 def _metadata_queries(request: AnalysisRequest) -> tuple[str, ...]:
@@ -1126,13 +1274,52 @@ def _cached_video_paths(directory: Path, video_id: str) -> tuple[Path, ...]:
     return tuple(matches)
 
 
+def _metadata_observation_digest(
+    *,
+    video_id: str,
+    title: str,
+    channel: str,
+    channel_id: str | None,
+    duration_seconds: float,
+    webpage_url: str,
+    broadcast_date: str | None,
+    broadcast_program: str | None,
+    broadcast_date_basis: str | None,
+) -> str:
+    """Fingerprint stable media-relevant fields from one discovery result."""
+
+    payload = {
+        "schema_version": 1,
+        "video_id": video_id,
+        "title": title,
+        "channel": channel,
+        "channel_id": channel_id,
+        "duration_seconds": duration_seconds,
+        "webpage_url": webpage_url,
+        "broadcast_date": broadcast_date,
+        "broadcast_program": broadcast_program,
+        "broadcast_date_basis": broadcast_date_basis,
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
 def _metadata_candidate(
     entry: dict[str, Any],
     *,
     request: AnalysisRequest,
     query: str,
     discovery_source: str = "query_search",
+    verified_fresh_metadata_origin: str | None = None,
 ) -> AcquisitionCandidate | None:
+    expected_discovery_source = {
+        "query_search": "query_search",
+        "validated_network_catalog": "official_ive_stage_playlist",
+    }.get(verified_fresh_metadata_origin)
+    if verified_fresh_metadata_origin is not None and (
+        expected_discovery_source is None
+        or discovery_source != expected_discovery_source
+    ):
+        raise ValueError("fresh metadata origin/discovery source mismatch")
     video_id = entry.get("id")
     if not isinstance(video_id, str) or not _VIDEO_ID.fullmatch(video_id):
         return None
@@ -1263,9 +1450,44 @@ def _metadata_candidate(
         + (15 if request.edit_mode is EditMode.MEMBER and has_fancam_signal else 0)
         + (3 if "4k" in folded_title or "2160" in folded_title else 0)
     )
+    normalized_title = title.strip()
+    broadcast_date, broadcast_date_basis = _metadata_broadcast_date_with_basis(
+        entry,
+        normalized_title,
+    )
+    fresh_metadata_identities: tuple[_VerifiedFreshMetadataIdentity, ...] = ()
+    if (
+        verified_fresh_metadata_origin is not None
+        and broadcast_program is not None
+        and broadcast_date is not None
+        and broadcast_date_basis is not None
+    ):
+        fresh_metadata_identities = (
+            _VerifiedFreshMetadataIdentity(
+                video_id=video_id,
+                title=normalized_title,
+                channel_id=channel_id,
+                broadcast_program=broadcast_program,
+                broadcast_date=broadcast_date,
+                broadcast_date_basis=broadcast_date_basis,
+                origin=verified_fresh_metadata_origin,
+                _seal=_FRESH_METADATA_IDENTITY_SEAL,
+            ),
+        )
+    metadata_observation_sha256 = _metadata_observation_digest(
+        video_id=video_id,
+        title=normalized_title,
+        channel=channel,
+        channel_id=channel_id,
+        duration_seconds=duration,
+        webpage_url=webpage_url,
+        broadcast_date=broadcast_date,
+        broadcast_program=broadcast_program,
+        broadcast_date_basis=broadcast_date_basis,
+    )
     return AcquisitionCandidate(
         video_id=video_id,
-        title=title.strip(),
+        title=normalized_title,
         channel=channel,
         channel_id=channel_id,
         duration_seconds=duration,
@@ -1273,12 +1495,15 @@ def _metadata_candidate(
         queries=(query,),
         selection_tier=selection_tier,
         trust_score=trust_score,
-        broadcast_date=_metadata_broadcast_date(entry, title),
+        broadcast_date=broadcast_date,
         broadcast_program=broadcast_program,
+        broadcast_date_basis=broadcast_date_basis,
         official_channel_signal=official_channel_signal,
         rejection_reasons=tuple(dict.fromkeys(rejection_reasons)),
         fallback_reason=fallback_reason,
         discovery_sources=(discovery_source,),
+        _fresh_metadata_identities=fresh_metadata_identities,
+        _metadata_observation_sha256=(metadata_observation_sha256,),
     )
 
 
@@ -1325,6 +1550,7 @@ def _merge_discovery(
     # passes stricter existing filters. Never merge individual trust fields.
     better = min((existing, discovered), key=merge_order)
     alternate = discovered if better is existing else existing
+    use_better_date = better.broadcast_date is not None
     return AcquisitionCandidate(
         video_id=better.video_id,
         title=better.title,
@@ -1342,12 +1568,31 @@ def _merge_discovery(
         broadcast_program=(
             better.broadcast_program or alternate.broadcast_program
         ),
+        broadcast_date_basis=(
+            better.broadcast_date_basis
+            if use_better_date
+            else alternate.broadcast_date_basis
+        ),
         official_channel_signal=better.official_channel_signal,
         rejection_reasons=better.rejection_reasons,
         fallback_reason=better.fallback_reason,
         discovery_sources=tuple(
             dict.fromkeys(
                 (*existing.discovery_sources, *discovered.discovery_sources)
+            )
+        ),
+        _fresh_metadata_identities=tuple(
+            dict.fromkeys(
+                (
+                    *existing._fresh_metadata_identities,
+                    *discovered._fresh_metadata_identities,
+                )
+            )
+        ),
+        _metadata_observation_sha256=tuple(
+            sorted(
+                set(existing._metadata_observation_sha256)
+                | set(discovered._metadata_observation_sha256)
             )
         ),
     )
@@ -1368,6 +1613,7 @@ def _record(candidate: AcquisitionCandidate) -> dict[str, Any]:
         "trust_score": candidate.trust_score,
         "broadcast_date": candidate.broadcast_date,
         "broadcast_program": candidate.broadcast_program,
+        "broadcast_date_basis": candidate.broadcast_date_basis,
         "official_channel_signal": candidate.official_channel_signal,
         "fallback_reason": candidate.fallback_reason,
         "rejection_reasons": list(candidate.rejection_reasons),
@@ -1385,6 +1631,7 @@ def _record(candidate: AcquisitionCandidate) -> dict[str, Any]:
         "group_quality_relative_rank": None,
         "group_quality_exclusion_reasons": [],
         "preexisting_cache_quarantined_paths": [],
+        "persistent_media_contract_rejection": None,
     }
 
 
@@ -1680,6 +1927,807 @@ def _content_integrity_matches(path: Path, binding: object) -> bool:
     except (AcquisitionError, OSError):
         return False
     return hmac.compare_digest(actual_digest, expected_digest)
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _candidate_media_metadata_identity(
+    candidate: AcquisitionCandidate,
+) -> dict[str, Any] | None:
+    observations = sorted(set(candidate._metadata_observation_sha256))
+    if not observations or any(
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in observations
+    ):
+        return None
+    payload = {
+        "schema_version": 1,
+        "video_id": candidate.video_id,
+        "title": candidate.title,
+        "channel": candidate.channel,
+        "channel_id": candidate.channel_id,
+        "duration_seconds": candidate.duration_seconds,
+        "webpage_url": candidate.webpage_url,
+        "broadcast_date": candidate.broadcast_date,
+        "broadcast_program": candidate.broadcast_program,
+        "broadcast_date_basis": candidate.broadcast_date_basis,
+        "official_channel_signal": candidate.official_channel_signal,
+        "current_metadata_observation_sha256": observations,
+    }
+    return {
+        "algorithm": "sha256",
+        "sha256": _canonical_sha256(payload),
+        "payload": payload,
+    }
+
+
+def _client_download_contract(client: object) -> tuple[str, str | None]:
+    raw_profile = getattr(client, "download_profile", None)
+    profile = (
+        raw_profile.strip()
+        if isinstance(raw_profile, str) and raw_profile.strip()
+        else "injected_client_unspecified_profile"
+    )
+    raw_format = getattr(client, "download_format", None)
+    download_format = (
+        raw_format.strip()
+        if isinstance(raw_format, str) and raw_format.strip()
+        else None
+    )
+    return (profile, download_format)
+
+
+def _persistent_media_contract_request_identity(
+    *,
+    request: AnalysisRequest,
+    client: object,
+) -> dict[str, Any]:
+    member_portrait = _requires_automatic_member_portrait_contract(request)
+    profile, download_format = _client_download_contract(client)
+    payload = {
+        "schema_version": 1,
+        "group": "IVE",
+        "song": request.song,
+        "source_mode": request.source_mode.value,
+        "edit_mode": request.edit_mode.value,
+        "aspect_ratio": request.aspect_ratio.value,
+        "target_member": (
+            request.target_member.value if request.target_member else None
+        ),
+        "automatic_media_quality_contract_version": (
+            _AUTOMATIC_MEDIA_QUALITY_CONTRACT_VERSION
+            if _requires_automatic_media_quality_contract(request)
+            else None
+        ),
+        "member_portrait_aspect_contract_version": (
+            _MEMBER_PORTRAIT_ASPECT_CONTRACT_VERSION
+            if member_portrait
+            else None
+        ),
+        "expected_width_over_height": (
+            _AUTOMATIC_MEMBER_PORTRAIT_RATIO
+            if member_portrait
+            else _AUTOMATIC_GROUP_LANDSCAPE_RATIO
+        ),
+        "aspect_ratio_tolerance": (
+            _AUTOMATIC_MEMBER_PORTRAIT_RATIO_TOLERANCE
+            if member_portrait
+            else _AUTOMATIC_GROUP_LANDSCAPE_RATIO_TOLERANCE
+        ),
+        "minimum_short_edge": _AUTOMATIC_MINIMUM_SHORT_EDGE,
+        "minimum_long_edge": _AUTOMATIC_MINIMUM_LONG_EDGE,
+        "minimum_frame_rate": _AUTOMATIC_MINIMUM_FRAME_RATE,
+        "download_profile": profile,
+        "download_format": download_format,
+    }
+    return {
+        "algorithm": "sha256",
+        "sha256": _canonical_sha256(payload),
+        "payload": payload,
+    }
+
+
+def _persistent_rejection_quarantine_path(
+    *,
+    manifest_path: Path,
+    video_id: str,
+    artifact: object,
+) -> Path | None:
+    if not isinstance(artifact, dict):
+        return None
+    raw_relative_path = artifact.get("relative_path")
+    if not isinstance(raw_relative_path, str):
+        return None
+    relative_path = Path(raw_relative_path)
+    if relative_path.is_absolute() or len(relative_path.parts) != 2:
+        return None
+    if relative_path.parts[0] != "videos":
+        return None
+    filename = relative_path.parts[1]
+    if re.fullmatch(
+        rf"{re.escape(video_id)}\.(?:mp4|mkv|mov|webm|m4v)"
+        r"\.invalid(?:\.[1-9][0-9]*)?",
+        filename,
+    ) is None:
+        return None
+    videos_directory = manifest_path.parent / "videos"
+    if videos_directory.is_symlink():
+        return None
+    quarantine_path = manifest_path.parent / relative_path
+    try:
+        if quarantine_path.is_symlink() or not quarantine_path.is_file():
+            return None
+        if quarantine_path.parent.resolve() != videos_directory.resolve():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return quarantine_path
+
+
+def _quarantine_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.lstat()
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _build_persistent_media_contract_rejection(
+    *,
+    candidate: AcquisitionCandidate,
+    request: AnalysisRequest,
+    client: object,
+    cache_directory: Path,
+    quarantine_path: Path | None,
+    hard_rejection_reason: str,
+    diagnostics: dict[str, Any],
+    evidence_origin: str = "downloaded_media_contract_failure",
+) -> dict[str, Any] | None:
+    if (
+        quarantine_path is None
+        or evidence_origin
+        not in {
+            "downloaded_media_contract_failure",
+            "legacy_candidate_rejection_revalidated",
+        }
+        or hard_rejection_reason
+        not in _PERSISTENT_MEDIA_CONTRACT_REJECTION_REASONS
+        or diagnostics.get("passed") is not False
+        or diagnostics.get("hard_rejection_reason") != hard_rejection_reason
+    ):
+        return None
+    candidate_identity = _candidate_media_metadata_identity(candidate)
+    if candidate_identity is None:
+        return None
+    try:
+        if quarantine_path.is_symlink() or not quarantine_path.is_file():
+            return None
+        cache_root = cache_directory.resolve()
+        resolved_quarantine = quarantine_path.resolve(strict=True)
+        relative_path = resolved_quarantine.relative_to(cache_root)
+        if relative_path.parent != Path("videos"):
+            return None
+        expected_path = _persistent_rejection_quarantine_path(
+            manifest_path=cache_root / "acquisition-manifest.json",
+            video_id=candidate.video_id,
+            artifact={"relative_path": str(relative_path)},
+        )
+        if expected_path is None or expected_path.resolve() != resolved_quarantine:
+            return None
+        rejected_content_integrity = _content_integrity(resolved_quarantine)
+    except (AcquisitionError, OSError, RuntimeError, ValueError):
+        return None
+    diagnostics_copy = deepcopy(diagnostics)
+    return {
+        "schema_version": _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION,
+        "evidence_origin": evidence_origin,
+        "video_id": candidate.video_id,
+        "candidate_media_metadata_identity": candidate_identity,
+        "request_media_contract_identity": (
+            _persistent_media_contract_request_identity(
+                request=request,
+                client=client,
+            )
+        ),
+        "hard_rejection_reason": hard_rejection_reason,
+        "diagnostics": diagnostics_copy,
+        "diagnostics_sha256": _canonical_sha256(diagnostics_copy),
+        "quarantine_artifact": {
+            "relative_path": str(relative_path),
+            "content_integrity": rejected_content_integrity,
+        },
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _migrate_legacy_persistent_media_contract_rejection(
+    *,
+    prior_manifest: dict[str, Any] | None,
+    manifest_path: Path,
+    candidate: AcquisitionCandidate,
+    request: AnalysisRequest,
+    client: object,
+    media_validator: Callable[[Path], object | None],
+    media_probe: Callable[[Path], MediaInfo],
+) -> dict[str, Any] | None:
+    """Bind an older failed candidate record to its still-present artifact.
+
+    Policy-v5 manifests already persisted the exact candidate fields, typed
+    media diagnostics, hard reason, and quarantine path, but did not hash the
+    rejected bytes.  This migration never trusts that record alone: every
+    field must match current discovery metadata, the request/download profile
+    must match, and the quarantined bytes must reproduce the identical typed
+    contract failure before a new content-bound v1 envelope is issued.
+    """
+
+    if (
+        prior_manifest is None
+        or not _manifest_matches_cache_binding_contract(prior_manifest, request)
+        or "persistent_media_contract_rejection_contract_version"
+        in prior_manifest
+        or "persistent_media_contract_rejections" in prior_manifest
+    ):
+        return None
+    current_profile, _current_format = _client_download_contract(client)
+    if prior_manifest.get("download_profile") != current_profile:
+        return None
+    raw_records = prior_manifest.get("candidates")
+    if (
+        not isinstance(raw_records, list)
+        or len(raw_records) > 512
+        or any(not isinstance(record, dict) for record in raw_records)
+    ):
+        return None
+    matches = [
+        record
+        for record in raw_records
+        if record.get("video_id") == candidate.video_id
+    ]
+    if len(matches) != 1:
+        return None
+    record = matches[0]
+    exact_metadata = {
+        "video_id": candidate.video_id,
+        "title": candidate.title,
+        "channel": candidate.channel,
+        "channel_id": candidate.channel_id,
+        "duration_seconds": candidate.duration_seconds,
+        "webpage_url": candidate.webpage_url,
+        "broadcast_date": candidate.broadcast_date,
+        "broadcast_program": candidate.broadcast_program,
+        "broadcast_date_basis": candidate.broadcast_date_basis,
+        "official_channel_signal": candidate.official_channel_signal,
+        "fallback_reason": candidate.fallback_reason,
+    }
+    if any(record.get(key) != value for key, value in exact_metadata.items()):
+        return None
+    hard_reasons = record.get("download_hard_rejection_reasons")
+    diagnostics = record.get("aspect_validation")
+    raw_quarantine_path = record.get("quarantined_path")
+    if (
+        record.get("selected") is not False
+        or record.get("download_status") != "failed"
+        or record.get("local_path") is not None
+        or not isinstance(hard_reasons, list)
+        or len(hard_reasons) != 1
+        or hard_reasons[0]
+        not in _PERSISTENT_MEDIA_CONTRACT_REJECTION_REASONS
+        or not isinstance(diagnostics, dict)
+        or diagnostics.get("passed") is not False
+        or diagnostics.get("hard_rejection_reason") != hard_reasons[0]
+        or not isinstance(raw_quarantine_path, str)
+        or not isinstance(record.get("download_error"), str)
+        or not record["download_error"]
+    ):
+        return None
+    try:
+        cache_root = manifest_path.parent.resolve()
+        raw_path = Path(raw_quarantine_path)
+        if not raw_path.is_absolute():
+            return None
+        resolved_path = raw_path.resolve(strict=True)
+        relative_path = resolved_path.relative_to(cache_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    quarantine_path = _persistent_rejection_quarantine_path(
+        manifest_path=manifest_path,
+        video_id=candidate.video_id,
+        artifact={"relative_path": str(relative_path)},
+    )
+    if quarantine_path is None:
+        return None
+    try:
+        before_identity = _quarantine_file_identity(quarantine_path)
+        _validate_media_for_request(
+            quarantine_path,
+            request=request,
+            media_validator=media_validator,
+            media_probe=media_probe,
+        )
+    except _MediaContractError as exc:
+        if (
+            exc.hard_rejection_reason != hard_reasons[0]
+            or exc.diagnostics != diagnostics
+        ):
+            return None
+    except (AcquisitionError, MediaProbeError, OSError, ValueError):
+        return None
+    else:
+        return None
+    try:
+        if _quarantine_file_identity(quarantine_path) != before_identity:
+            return None
+    except OSError:
+        return None
+    evidence = _build_persistent_media_contract_rejection(
+        candidate=candidate,
+        request=request,
+        client=client,
+        cache_directory=manifest_path.parent,
+        quarantine_path=quarantine_path,
+        hard_rejection_reason=hard_reasons[0],
+        diagnostics=diagnostics,
+        evidence_origin="legacy_candidate_rejection_revalidated",
+    )
+    if evidence is None:
+        return None
+    try:
+        if _quarantine_file_identity(quarantine_path) != before_identity:
+            return None
+    except OSError:
+        return None
+    return evidence
+
+
+def _validated_persistent_media_contract_rejections(
+    *,
+    prior_manifest: dict[str, Any] | None,
+    manifest_path: Path,
+    request: AnalysisRequest,
+    client: object,
+) -> tuple[_ValidatedPersistentMediaContractRejection, ...]:
+    if (
+        prior_manifest is None
+        or not _manifest_matches_cache_binding_contract(prior_manifest, request)
+        or prior_manifest.get(
+            "persistent_media_contract_rejection_contract_version"
+        )
+        != _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+    ):
+        return ()
+    raw_entries = prior_manifest.get("persistent_media_contract_rejections")
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) > 512
+        or any(not isinstance(entry, dict) for entry in raw_entries)
+    ):
+        return ()
+    expected_request_identity = _persistent_media_contract_request_identity(
+        request=request,
+        client=client,
+    )
+    validated: list[_ValidatedPersistentMediaContractRejection] = []
+    for raw_entry in raw_entries:
+        video_id = raw_entry.get("video_id")
+        reason = raw_entry.get("hard_rejection_reason")
+        metadata_identity = raw_entry.get("candidate_media_metadata_identity")
+        request_identity = raw_entry.get("request_media_contract_identity")
+        diagnostics = raw_entry.get("diagnostics")
+        diagnostics_sha256 = raw_entry.get("diagnostics_sha256")
+        if (
+            raw_entry.get("schema_version")
+            != _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+            or raw_entry.get("evidence_origin")
+            not in {
+                "downloaded_media_contract_failure",
+                "legacy_candidate_rejection_revalidated",
+            }
+            or not isinstance(video_id, str)
+            or _VIDEO_ID.fullmatch(video_id) is None
+            or reason not in _PERSISTENT_MEDIA_CONTRACT_REJECTION_REASONS
+            or not isinstance(metadata_identity, dict)
+            or metadata_identity.get("algorithm") != "sha256"
+            or not isinstance(metadata_identity.get("payload"), dict)
+            or metadata_identity["payload"].get("video_id") != video_id
+            or not isinstance(metadata_identity.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", metadata_identity["sha256"])
+            is None
+            or not hmac.compare_digest(
+                metadata_identity["sha256"],
+                _canonical_sha256(metadata_identity["payload"]),
+            )
+            or not isinstance(
+                metadata_identity["payload"].get(
+                    "current_metadata_observation_sha256"
+                ),
+                list,
+            )
+            or not metadata_identity["payload"][
+                "current_metadata_observation_sha256"
+            ]
+            or any(
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                for digest in metadata_identity["payload"][
+                    "current_metadata_observation_sha256"
+                ]
+            )
+            or request_identity != expected_request_identity
+            or not isinstance(diagnostics, dict)
+            or diagnostics.get("passed") is not False
+            or diagnostics.get("hard_rejection_reason") != reason
+            or not isinstance(diagnostics_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", diagnostics_sha256) is None
+            or not hmac.compare_digest(
+                diagnostics_sha256,
+                _canonical_sha256(diagnostics),
+            )
+        ):
+            continue
+        quarantine_artifact = raw_entry.get("quarantine_artifact")
+        quarantine_path = _persistent_rejection_quarantine_path(
+            manifest_path=manifest_path,
+            video_id=video_id,
+            artifact=quarantine_artifact,
+        )
+        if quarantine_path is None or not isinstance(quarantine_artifact, dict):
+            continue
+        content_integrity = quarantine_artifact.get("content_integrity")
+        try:
+            if not _content_integrity_matches(
+                quarantine_path,
+                content_integrity,
+            ):
+                continue
+            file_identity = _quarantine_file_identity(quarantine_path)
+        except (AcquisitionError, OSError):
+            continue
+        validated.append(
+            _ValidatedPersistentMediaContractRejection(
+                evidence=deepcopy(raw_entry),
+                quarantine_path=quarantine_path,
+                quarantine_file_identity=file_identity,
+            )
+        )
+    return tuple(validated)
+
+
+def _matching_persistent_media_contract_rejection(
+    *,
+    candidate: AcquisitionCandidate,
+    validated_rejections: Sequence[
+        _ValidatedPersistentMediaContractRejection
+    ],
+    request: AnalysisRequest,
+    media_validator: Callable[[Path], object | None],
+    media_probe: Callable[[Path], MediaInfo],
+) -> dict[str, Any] | None:
+    candidate_identity = _candidate_media_metadata_identity(candidate)
+    if candidate_identity is None:
+        return None
+    matches = [
+        entry
+        for entry in validated_rejections
+        if entry.evidence.get("video_id") == candidate.video_id
+        and entry.evidence.get("candidate_media_metadata_identity")
+        == candidate_identity
+    ]
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    try:
+        _validate_media_for_request(
+            match.quarantine_path,
+            request=request,
+            media_validator=media_validator,
+            media_probe=media_probe,
+        )
+    except _MediaContractError as exc:
+        evidence = match.evidence
+        if (
+            exc.hard_rejection_reason
+            != evidence.get("hard_rejection_reason")
+            or exc.diagnostics != evidence.get("diagnostics")
+        ):
+            return None
+        try:
+            if (
+                _quarantine_file_identity(match.quarantine_path)
+                != match.quarantine_file_identity
+            ):
+                return None
+        except OSError:
+            return None
+        return deepcopy(evidence)
+    except (AcquisitionError, MediaProbeError, OSError, ValueError):
+        return None
+    return None
+
+
+def _upsert_persistent_media_contract_rejection(
+    manifest: dict[str, Any],
+    evidence: dict[str, Any],
+) -> None:
+    raw_entries = manifest.get("persistent_media_contract_rejections")
+    entries = (
+        [deepcopy(entry) for entry in raw_entries if isinstance(entry, dict)]
+        if isinstance(raw_entries, list)
+        else []
+    )
+    video_id = evidence["video_id"]
+    scope_sha256 = evidence["request_media_contract_identity"]["sha256"]
+    entries = [
+        entry
+        for entry in entries
+        if not (
+            entry.get("video_id") == video_id
+            and isinstance(entry.get("request_media_contract_identity"), dict)
+            and entry["request_media_contract_identity"].get("sha256")
+            == scope_sha256
+        )
+    ]
+    entries.append(deepcopy(evidence))
+    entries.sort(
+        key=lambda entry: (
+            str(entry.get("video_id", "")),
+            str(
+                entry.get("candidate_media_metadata_identity", {}).get(
+                    "sha256", ""
+                )
+                if isinstance(
+                    entry.get("candidate_media_metadata_identity"), dict
+                )
+                else ""
+            ),
+        )
+    )
+    manifest["persistent_media_contract_rejections"] = entries
+
+
+def _copy_persistent_media_contract_rejection_state(
+    *,
+    destination: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    destination["persistent_media_contract_rejection_contract_version"] = (
+        _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+    )
+    destination["persistent_media_contract_rejections"] = deepcopy(
+        source.get("persistent_media_contract_rejections", [])
+    )
+    destination["persistent_media_contract_rejection_refresh"] = deepcopy(
+        source.get("persistent_media_contract_rejection_refresh")
+    )
+    destination_summary = destination.get("summary")
+    source_summary = source.get("summary")
+    if isinstance(destination_summary, dict) and isinstance(source_summary, dict):
+        for key in (
+            "persistent_media_contract_rejection_count",
+            "persistent_media_contract_new_rejection_count",
+            "persistent_media_contract_skip_count",
+            "persistent_media_contract_migrated_legacy_count",
+        ):
+            destination_summary[key] = source_summary.get(key, 0)
+
+
+def _stable_manifest_identity(
+    manifest_path: Path,
+    expected_manifest: dict[str, Any],
+) -> tuple[int, str]:
+    before = manifest_path.lstat()
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise AcquisitionError("수집 매니페스트가 일반 파일이 아닙니다.")
+    encoded = manifest_path.read_bytes()
+    after = manifest_path.lstat()
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or len(encoded) != after.st_size
+    ):
+        raise AcquisitionError("수집 매니페스트를 읽는 동안 변경되었습니다.")
+    try:
+        current_manifest = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AcquisitionError("수집 매니페스트 JSON이 손상되었습니다.") from exc
+    if current_manifest != expected_manifest:
+        raise AcquisitionError("수집 결과와 저장 매니페스트가 다릅니다.")
+    return (len(encoded), hashlib.sha256(encoded).hexdigest())
+
+
+def _issue_member_acquisition_identity_authority(
+    *,
+    source_paths: Sequence[Path],
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    fresh_metadata_identities_by_video_id: Mapping[
+        str,
+        Sequence[_VerifiedFreshMetadataIdentity],
+    ] | None = None,
+) -> VerifiedMemberAcquisitionIdentityAuthority | None:
+    if str(manifest.get("edit_mode", "")).strip().lower() != "member":
+        return None
+    summary = manifest.get("summary")
+    selected = manifest.get("selected")
+    if not (
+        manifest.get("schema_version") == 1
+        and manifest.get("content_integrity_contract_version")
+        == _CONTENT_INTEGRITY_CONTRACT_VERSION
+        and manifest.get("automatic_media_quality_contract_version") == 1
+        and manifest.get("member_portrait_aspect_contract_version") == 1
+        and isinstance(summary, dict)
+        and summary.get("status") == "complete"
+        and isinstance(selected, list)
+        and len(selected) == len(source_paths)
+    ):
+        raise AcquisitionError(
+            "완료·무결성·세로 직캠 계약이 검증된 멤버 수집만 사용할 수 있습니다."
+        )
+    manifest_size, manifest_sha256 = _stable_manifest_identity(
+        manifest_path,
+        manifest,
+    )
+    identities: list[VerifiedAcquisitionSourceIdentity] = []
+    seen_video_ids: set[str] = set()
+    for source_index, (source, raw_entry) in enumerate(
+        zip(source_paths, selected, strict=True)
+    ):
+        if not isinstance(raw_entry, dict):
+            raise AcquisitionError("멤버 수집 항목 형식이 잘못되었습니다.")
+        video_id = raw_entry.get("video_id")
+        broadcast_date = raw_entry.get("broadcast_date")
+        broadcast_date_basis = raw_entry.get("broadcast_date_basis")
+        title = raw_entry.get("title")
+        channel_id = raw_entry.get("channel_id")
+        programme = raw_entry.get("broadcast_program")
+        canonical_programme = (
+            _music_show_program(title) if isinstance(title, str) else None
+        )
+        canonical_date = _broadcast_date(title) if isinstance(title, str) else None
+        integrity = raw_entry.get("content_integrity")
+        media_validation = raw_entry.get("media_validation")
+        aspect_validation = raw_entry.get("aspect_validation")
+        unresolved_source = Path(source).expanduser()
+        source_is_symlink = unresolved_source.is_symlink()
+        resolved_source = unresolved_source.resolve(strict=True)
+        raw_local_path = raw_entry.get("local_path")
+        if not (
+            raw_entry.get("source_index") == source_index
+            and isinstance(video_id, str)
+            and re.fullmatch(r"[0-9A-Za-z_-]{6,32}", video_id)
+            and video_id not in seen_video_ids
+            and isinstance(raw_local_path, str)
+            and Path(raw_local_path).expanduser().resolve(strict=True)
+            == resolved_source
+            and isinstance(broadcast_date, str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", broadcast_date)
+            and isinstance(programme, str)
+            and bool(programme.strip())
+            and isinstance(media_validation, dict)
+            and media_validation.get("passed") is True
+            and isinstance(aspect_validation, dict)
+            and aspect_validation.get("passed") is True
+            and isinstance(integrity, dict)
+            and integrity.get("contract_version")
+            == _CONTENT_INTEGRITY_CONTRACT_VERSION
+            and integrity.get("algorithm") == "sha256"
+            and isinstance(integrity.get("size_bytes"), int)
+            and not isinstance(integrity.get("size_bytes"), bool)
+            and isinstance(integrity.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", integrity["sha256"])
+            and not source_is_symlink
+            and _content_integrity_matches(resolved_source, integrity)
+        ):
+            raise AcquisitionError(
+                "멤버 수집 방송 슬롯·파일 무결성 계약이 일치하지 않습니다."
+            )
+        if canonical_programme is None or programme.strip() != canonical_programme:
+            raise _MemberAcquisitionIdentityReauthenticationRequired(
+                "캐시된 멤버 직캠의 방송일·음방 프로그램을 공식 "
+                "메타데이터로 다시 인증해야 합니다."
+            )
+        if canonical_date is not None:
+            metadata_identity_verified = broadcast_date == canonical_date
+        else:
+            raw_fresh_identities = (
+                fresh_metadata_identities_by_video_id.get(video_id, ())
+                if fresh_metadata_identities_by_video_id is not None
+                and isinstance(video_id, str)
+                else ()
+            )
+            metadata_identity_verified = any(
+                isinstance(identity, _VerifiedFreshMetadataIdentity)
+                and identity._seal is _FRESH_METADATA_IDENTITY_SEAL
+                and identity.video_id == video_id
+                and identity.title == title
+                and identity.channel_id == channel_id
+                and identity.broadcast_program == programme.strip()
+                and identity.broadcast_date == broadcast_date
+                and identity.broadcast_date_basis == broadcast_date_basis
+                and identity.broadcast_date_basis in {"upload_date", "timestamp"}
+                for identity in raw_fresh_identities
+            )
+        if not metadata_identity_verified:
+            raise _MemberAcquisitionIdentityReauthenticationRequired(
+                "캐시된 멤버 직캠의 방송일·음방 프로그램을 공식 "
+                "메타데이터로 다시 인증해야 합니다."
+            )
+        seen_video_ids.add(video_id)
+        identities.append(
+            VerifiedAcquisitionSourceIdentity(
+                source_index=source_index,
+                source_path=str(resolved_source),
+                video_id=video_id,
+                broadcast_date=broadcast_date,
+                broadcast_program=programme.strip(),
+                source_size_bytes=integrity["size_bytes"],
+                source_sha256=integrity["sha256"],
+            )
+        )
+    group = str(manifest.get("group", "")).strip().upper()
+    song = manifest.get("song")
+    target_member = manifest.get("target_member")
+    if not (
+        group == "IVE"
+        and isinstance(song, str)
+        and bool(song.strip())
+        and isinstance(target_member, str)
+        and bool(target_member.strip())
+    ):
+        raise AcquisitionError("멤버 수집 요청 범위가 올바르지 않습니다.")
+    return VerifiedMemberAcquisitionIdentityAuthority(
+        group=group,
+        song=song,
+        target_member=target_member,
+        manifest_path=str(manifest_path.resolve(strict=True)),
+        manifest_size_bytes=manifest_size,
+        manifest_sha256=manifest_sha256,
+        sources=tuple(identities),
+        _seal=_ACQUISITION_IDENTITY_AUTHORITY_SEAL,
+    )
+
+
+def _build_acquisition_artifact(
+    *,
+    source_paths: Sequence[Path],
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    fresh_metadata_identities_by_video_id: Mapping[
+        str,
+        Sequence[_VerifiedFreshMetadataIdentity],
+    ] | None = None,
+) -> AcquisitionArtifact:
+    raw_sources = tuple(Path(path).expanduser() for path in source_paths)
+    if any(path.is_symlink() for path in raw_sources):
+        raise AcquisitionError("수집 소스 파일은 심볼릭 링크일 수 없습니다.")
+    normalized_sources = tuple(path.resolve(strict=True) for path in raw_sources)
+    authority: VerifiedMemberAcquisitionIdentityAuthority | None = None
+    authority_error: str | None = None
+    try:
+        authority = _issue_member_acquisition_identity_authority(
+            source_paths=normalized_sources,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            fresh_metadata_identities_by_video_id=(
+                fresh_metadata_identities_by_video_id
+            ),
+        )
+    except _MemberAcquisitionIdentityReauthenticationRequired as exc:
+        if str(manifest.get("edit_mode", "")).strip().lower() != "member":
+            raise
+        authority_error = str(exc)
+    return AcquisitionArtifact(
+        source_paths=normalized_sources,
+        member_anchors=(),
+        manifest_path=manifest_path,
+        manifest=manifest,
+        member_identity_authority=authority,
+        member_identity_authority_error=authority_error,
+    )
 
 
 def _is_capture_variant(candidate: AcquisitionCandidate) -> bool:
@@ -2242,6 +3290,7 @@ def _manifest_refresh_candidates(
             continue
         stored_date = item.get("broadcast_date")
         stored_program = item.get("broadcast_program")
+        stored_date_basis = item.get("broadcast_date_basis")
         candidates.append(
             AcquisitionCandidate(
                 video_id=candidate.video_id,
@@ -2260,6 +3309,11 @@ def _manifest_refresh_candidates(
                     stored_program
                     if isinstance(stored_program, str)
                     else candidate.broadcast_program
+                ),
+                broadcast_date_basis=(
+                    stored_date_basis
+                    if isinstance(stored_date_basis, str)
+                    else candidate.broadcast_date_basis
                 ),
                 official_channel_signal=candidate.official_channel_signal,
                 rejection_reasons=candidate.rejection_reasons,
@@ -2775,9 +3829,8 @@ def _reusable_completed_manifest(
             "cache_files_reused_only_after_exact_path_video_id_size_sha256": True,
         }
     _write_manifest(manifest_path, manifest)
-    return AcquisitionArtifact(
+    return _build_acquisition_artifact(
         source_paths=paths,
-        member_anchors=(),
         manifest_path=manifest_path,
         manifest=manifest,
     )
@@ -3020,9 +4073,8 @@ def _upgrade_completed_manifest_missing_group_quality_gate(
         f"{materialized_count}개 평가, {eligible_count}개 사용"
     )
     reporter.progress(0.20, "IVE 교차편집 소스 확인 완료")
-    return AcquisitionArtifact(
+    return _build_acquisition_artifact(
         source_paths=eligible_paths,
-        member_anchors=(),
         manifest_path=manifest_path,
         manifest=staged,
     )
@@ -3205,6 +4257,33 @@ def acquire_sources(
             artifact=reusable,
             request=request,
         )
+        member_identity_reauthentication_required = bool(
+            request.edit_mode is EditMode.MEMBER
+            and reusable.member_identity_authority is None
+        )
+        if member_identity_reauthentication_required:
+            cache_refresh_upgrade.update(
+                {
+                    "decision": (
+                        "refresh_metadata_to_reauthenticate_member_"
+                        "broadcast_identities"
+                    ),
+                    "refresh_required": True,
+                    "member_identity_reauthentication_required": True,
+                    "member_identity_authority_error": (
+                        reusable.member_identity_authority_error
+                    ),
+                }
+            )
+            reporter.emit(
+                "log",
+                level="warning",
+                message=(
+                    "캐시된 멤버 직캠의 방송일·프로그램 근거를 다시 "
+                    "인증해야 경계 오디오 소스를 복구할 수 있어 "
+                    "공식 메타데이터를 갱신합니다."
+                ),
+            )
         reusable.manifest["cache_refresh_upgrade"] = cache_refresh_upgrade
         _write_manifest(manifest_path, reusable.manifest)
         if not cache_refresh_upgrade["refresh_required"]:
@@ -3215,11 +4294,19 @@ def acquire_sources(
                 f"완료된 소스 구성 재사용: {len(reusable.source_paths)}개"
             )
             reporter.progress(0.20, "IVE 교차편집 소스 확인 완료")
-            return reusable
+            return _build_acquisition_artifact(
+                source_paths=reusable.source_paths,
+                manifest_path=manifest_path,
+                manifest=reusable.manifest,
+            )
         prior_manifest = reusable.manifest
-        verified_cache_candidates = _manifest_refresh_candidates(
-            artifact=reusable,
-            request=request,
+        verified_cache_candidates = (
+            []
+            if member_identity_reauthentication_required
+            else _manifest_refresh_candidates(
+                artifact=reusable,
+                request=request,
+            )
         )
         cache_refresh_upgrade["metadata_refresh_attempted"] = True
         reporter.status(
@@ -3276,7 +4363,19 @@ def acquire_sources(
                 "검증된 fallback 캐시를 그대로 사용합니다."
             ),
         )
-        return reusable
+        return _build_acquisition_artifact(
+            source_paths=reusable.source_paths,
+            manifest_path=manifest_path,
+            manifest=reusable.manifest,
+        )
+    validated_persistent_rejections = (
+        _validated_persistent_media_contract_rejections(
+            prior_manifest=prior_manifest,
+            manifest_path=manifest_path,
+            request=request,
+            client=client,
+        )
+    )
     queries = _metadata_queries(request)
     search_limit = min(40, max(18, request.desired_source_count * 2))
     reporter.status("IVE 음방 영상 후보를 검색하는 중…")
@@ -3295,7 +4394,12 @@ def acquire_sources(
             reporter.emit("log", level="warning", message=str(exc))
             continue
         for entry in entries:
-            candidate = _metadata_candidate(entry, request=request, query=query)
+            candidate = _metadata_candidate(
+                entry,
+                request=request,
+                query=query,
+                verified_fresh_metadata_origin="query_search",
+            )
             if candidate is None:
                 continue
             previous = by_id.get(candidate.video_id)
@@ -3313,6 +4417,17 @@ def acquire_sources(
         client=client,
     )
     catalog_query = f"playlist:{_IVE_STAGE_PLAYLIST_ID}"
+    catalog_fresh_metadata_origin = (
+        "validated_network_catalog"
+        if catalog_provenance.get("network_status")
+        == "validated_pinned_playlist"
+        and catalog_provenance.get("result")
+        in {
+            "validated_network_catalog_cached",
+            "validated_network_catalog_cache_write_failed",
+        }
+        else None
+    )
     catalog_candidate_count = 0
     catalog_selectable_count = 0
     catalog_duplicate_video_id_count = 0
@@ -3323,6 +4438,7 @@ def acquire_sources(
             request=request,
             query=catalog_query,
             discovery_source="official_ive_stage_playlist",
+            verified_fresh_metadata_origin=catalog_fresh_metadata_origin,
         )
         if candidate is None:
             continue
@@ -3430,6 +4546,11 @@ def acquire_sources(
         ]
     else:
         ordered = [*_ordered_for_download(primary), *_ordered_for_download(fallback)]
+    fresh_metadata_identities_by_video_id = {
+        candidate.video_id: candidate._fresh_metadata_identities
+        for candidate in ordered
+        if candidate._fresh_metadata_identities
+    }
     # The primary/fallback and standard/close-up lanes are ranked separately.
     # Their internal ordering has already placed all canonical programme slots
     # before alternate cameras; retaining those alternates is necessary when a
@@ -3455,6 +4576,24 @@ def acquire_sources(
         "content_integrity_contract_version": (
             _CONTENT_INTEGRITY_CONTRACT_VERSION
         ),
+        "persistent_media_contract_rejection_contract_version": (
+            _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+        ),
+        "persistent_media_contract_rejections": [
+            deepcopy(entry.evidence)
+            for entry in validated_persistent_rejections
+        ],
+        "persistent_media_contract_rejection_refresh": {
+            "contract_version": (
+                _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+            ),
+            "carried_forward_count": len(validated_persistent_rejections),
+            "migrated_legacy_rejection_count": 0,
+            "new_rejection_count": 0,
+            "skipped_download_count": 0,
+            "new_rejections": [],
+            "skipped_downloads": [],
+        },
         "automatic_media_quality_contract_version": (
             _AUTOMATIC_MEDIA_QUALITY_CONTRACT_VERSION
             if automatic_quality_contract_required
@@ -3474,6 +4613,7 @@ def acquire_sources(
         "group": "IVE",
         "song": request.song,
         "edit_mode": request.edit_mode.value,
+        "aspect_ratio": request.aspect_ratio.value,
         "target_member": request.target_member.value if request.target_member else None,
         "desired_source_count": request.desired_source_count,
         "minimum_acceptable_source_count": (
@@ -3620,6 +4760,20 @@ def acquire_sources(
                 "ordinary_weekly_music_bank_title": "allowed",
             },
             "cache_content_binding": "exact_path_sha256_and_size_required_before_any_preexisting_file_reuse",
+            "persistent_media_contract_rejection": {
+                "contract_version": (
+                    _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION
+                ),
+                "skip_requires": (
+                    "exact_current_metadata_observations_plus_request_media_"
+                    "contract_plus_quarantined_content_sha256_plus_same_"
+                    "failure_revalidated"
+                ),
+                "metadata_or_content_or_mode_or_aspect_change": (
+                    "revalidate_by_download"
+                ),
+                "raw_boolean_or_partial_manifest_evidence": "never_skip",
+            },
             "member_camera_preference": (
                 "standard_fancam_before_facecam_or_closeup_fallback"
                 if request.edit_mode is EditMode.MEMBER
@@ -3703,6 +4857,12 @@ def acquire_sources(
             "media_contract_hard_rejection_count": 0,
             "aspect_hard_rejection_count": 0,
             "fallback_selected_count": 0,
+            "persistent_media_contract_rejection_count": len(
+                validated_persistent_rejections
+            ),
+            "persistent_media_contract_new_rejection_count": 0,
+            "persistent_media_contract_skip_count": 0,
+            "persistent_media_contract_migrated_legacy_count": 0,
             "status": "metadata_complete",
             "cache_reuse_count": (
                 int(
@@ -3736,6 +4896,10 @@ def acquire_sources(
                 "official_ive_stage_playlist_catalog"
             ] = catalog_provenance
             reusable.manifest["search_failures"] = search_failures
+            _copy_persistent_media_contract_rejection_state(
+                destination=reusable.manifest,
+                source=manifest,
+            )
             _write_manifest(manifest_path, reusable.manifest)
             reporter.emit(
                 "log",
@@ -3746,7 +4910,11 @@ def acquire_sources(
                     "fallback 캐시를 사용합니다."
                 ),
             )
-            return reusable
+            return _build_acquisition_artifact(
+                source_paths=reusable.source_paths,
+                manifest_path=manifest_path,
+                manifest=reusable.manifest,
+            )
         manifest["summary"]["status"] = "insufficient_metadata_candidates"
         _write_manifest(manifest_path, manifest)
         raise AcquisitionError(
@@ -3760,6 +4928,9 @@ def acquire_sources(
     download_failures = 0
     fallback_selected_count = 0
     aspect_hard_rejection_count = 0
+    persistent_media_contract_new_rejection_count = 0
+    persistent_media_contract_skip_count = 0
+    persistent_media_contract_migrated_legacy_count = 0
     authenticated_cache_reuse_ids: set[str] = set()
     new_download_ids: set[str] = set()
     for candidate_index, candidate in enumerate(ordered):
@@ -3777,11 +4948,47 @@ def acquire_sources(
                 ),
             )
         reporter.status(
-            f"소스 {len(source_paths) + 1}/{request.desired_source_count} 다운로드 중: "
+            f"소스 {len(source_paths) + 1}/{request.desired_source_count} 확인 중: "
             f"{candidate.title}"
         )
         try:
             videos_directory = cache_directory / "videos"
+            persistent_rejection = (
+                _matching_persistent_media_contract_rejection(
+                    candidate=candidate,
+                    validated_rejections=validated_persistent_rejections,
+                    request=request,
+                    media_validator=media_validator,
+                    media_probe=scoped_media_probe,
+                )
+            )
+            if persistent_rejection is None:
+                persistent_rejection = (
+                    _migrate_legacy_persistent_media_contract_rejection(
+                        prior_manifest=prior_manifest,
+                        manifest_path=manifest_path,
+                        candidate=candidate,
+                        request=request,
+                        client=client,
+                        media_validator=media_validator,
+                        media_probe=scoped_media_probe,
+                    )
+                )
+                if persistent_rejection is not None:
+                    _upsert_persistent_media_contract_rejection(
+                        manifest,
+                        persistent_rejection,
+                    )
+                    persistent_media_contract_migrated_legacy_count += 1
+                    manifest[
+                        "persistent_media_contract_rejection_refresh"
+                    ]["migrated_legacy_rejection_count"] = (
+                        persistent_media_contract_migrated_legacy_count
+                    )
+            if persistent_rejection is not None:
+                raise _PersistentMediaContractRejectionSkip(
+                    persistent_rejection
+                )
             preexisting_paths = _cached_video_paths(
                 videos_directory,
                 candidate.video_id,
@@ -3825,6 +5032,64 @@ def acquire_sources(
                 record["quarantined_path"] = (
                     str(quarantined) if quarantined is not None else None
                 )
+                persistent_evidence = (
+                    _build_persistent_media_contract_rejection(
+                        candidate=candidate,
+                        request=request,
+                        client=client,
+                        cache_directory=cache_directory,
+                        quarantine_path=quarantined,
+                        hard_rejection_reason=exc.hard_rejection_reason,
+                        diagnostics=exc.diagnostics,
+                    )
+                )
+                if persistent_evidence is not None:
+                    record["persistent_media_contract_rejection"] = (
+                        deepcopy(persistent_evidence)
+                    )
+                    _upsert_persistent_media_contract_rejection(
+                        manifest,
+                        persistent_evidence,
+                    )
+                    persistent_media_contract_new_rejection_count += 1
+                    refresh_audit = manifest[
+                        "persistent_media_contract_rejection_refresh"
+                    ]
+                    refresh_audit["new_rejection_count"] = (
+                        persistent_media_contract_new_rejection_count
+                    )
+                    refresh_audit["new_rejections"].append(
+                        {
+                            "video_id": candidate.video_id,
+                            "title": candidate.title,
+                            "decision": (
+                                "downloaded_rejected_and_content_bound"
+                            ),
+                            "hard_rejection_reason": (
+                                exc.hard_rejection_reason
+                            ),
+                            "candidate_media_metadata_sha256": (
+                                persistent_evidence[
+                                    "candidate_media_metadata_identity"
+                                ]["sha256"]
+                            ),
+                            "request_media_contract_sha256": (
+                                persistent_evidence[
+                                    "request_media_contract_identity"
+                                ]["sha256"]
+                            ),
+                            "quarantine_relative_path": (
+                                persistent_evidence["quarantine_artifact"][
+                                    "relative_path"
+                                ]
+                            ),
+                            "quarantined_content_sha256": (
+                                persistent_evidence["quarantine_artifact"][
+                                    "content_integrity"
+                                ]["sha256"]
+                            ),
+                        }
+                    )
                 aspect_hard_rejection_count += 1
                 raise AcquisitionError(
                     f"{candidate.title}: 자동 소스 미디어 계약 검증 실패 ({exc})"
@@ -3869,6 +5134,7 @@ def acquire_sources(
                     "discovery_sources": list(candidate.discovery_sources),
                     "broadcast_date": candidate.broadcast_date,
                     "broadcast_program": candidate.broadcast_program,
+                    "broadcast_date_basis": candidate.broadcast_date_basis,
                     "official_channel_signal": candidate.official_channel_signal,
                     "fallback_reason": candidate.fallback_reason,
                     "download_status": record["download_status"],
@@ -3879,6 +5145,67 @@ def acquire_sources(
                 }
             )
             reporter.log(f"소스 확보: {candidate.title} · {candidate.channel}")
+        except _PersistentMediaContractRejectionSkip as exc:
+            evidence = exc.evidence
+            reason = str(evidence["hard_rejection_reason"])
+            persistent_media_contract_skip_count += 1
+            record["selected"] = False
+            record["download_status"] = (
+                "skipped_persistent_media_contract_rejection"
+            )
+            record["download_error"] = (
+                "동일 메타데이터·요청 계약·격리 콘텐츠에서 이미 "
+                f"확정된 미디어 계약 실패: {reason}"
+            )
+            record["aspect_validation"] = deepcopy(evidence["diagnostics"])
+            record["download_hard_rejection_reasons"] = [reason]
+            if reason not in record["rejection_reasons"]:
+                record["rejection_reasons"].append(reason)
+            record["quarantined_path"] = str(
+                manifest_path.parent
+                / evidence["quarantine_artifact"]["relative_path"]
+            )
+            record["persistent_media_contract_rejection"] = deepcopy(
+                evidence
+            )
+            refresh_audit = manifest[
+                "persistent_media_contract_rejection_refresh"
+            ]
+            refresh_audit["skipped_download_count"] = (
+                persistent_media_contract_skip_count
+            )
+            refresh_audit["skipped_downloads"].append(
+                {
+                    "video_id": candidate.video_id,
+                    "title": candidate.title,
+                    "decision": (
+                        "download_skipped_after_exact_evidence_revalidation"
+                    ),
+                    "evidence_origin": evidence["evidence_origin"],
+                    "hard_rejection_reason": reason,
+                    "candidate_media_metadata_sha256": evidence[
+                        "candidate_media_metadata_identity"
+                    ]["sha256"],
+                    "request_media_contract_sha256": evidence[
+                        "request_media_contract_identity"
+                    ]["sha256"],
+                    "quarantine_relative_path": evidence[
+                        "quarantine_artifact"
+                    ]["relative_path"],
+                    "quarantined_content_sha256": evidence[
+                        "quarantine_artifact"
+                    ]["content_integrity"]["sha256"],
+                }
+            )
+            reporter.emit(
+                "log",
+                level="warning",
+                message=(
+                    f"재다운로드 생략: {candidate.video_id} · {reason} "
+                    "(현재 메타데이터·요청 계약·격리 파일 SHA와 "
+                    "실패 재검증 일치)"
+                ),
+            )
         except AcquisitionError as exc:
             download_failures += 1
             record["selected"] = False
@@ -3896,6 +5223,18 @@ def acquire_sources(
                 ),
                 "aspect_hard_rejection_count": aspect_hard_rejection_count,
                 "fallback_selected_count": fallback_selected_count,
+                "persistent_media_contract_rejection_count": len(
+                    manifest["persistent_media_contract_rejections"]
+                ),
+                "persistent_media_contract_new_rejection_count": (
+                    persistent_media_contract_new_rejection_count
+                ),
+                "persistent_media_contract_skip_count": (
+                    persistent_media_contract_skip_count
+                ),
+                "persistent_media_contract_migrated_legacy_count": (
+                    persistent_media_contract_migrated_legacy_count
+                ),
                 "status": "downloading",
             }
         )
@@ -3921,6 +5260,10 @@ def acquire_sources(
                 "official_ive_stage_playlist_catalog"
             ] = catalog_provenance
             reusable.manifest["search_failures"] = search_failures
+            _copy_persistent_media_contract_rejection_state(
+                destination=reusable.manifest,
+                source=manifest,
+            )
             _write_manifest(manifest_path, reusable.manifest)
             reporter.emit(
                 "log",
@@ -3930,7 +5273,11 @@ def acquire_sources(
                     "기존 검증 fallback 캐시를 유지합니다."
                 ),
             )
-            return reusable
+            return _build_acquisition_artifact(
+                source_paths=reusable.source_paths,
+                manifest_path=manifest_path,
+                manifest=reusable.manifest,
+            )
         manifest["summary"]["status"] = "insufficient_downloaded_sources"
         _write_manifest(manifest_path, manifest)
         raise AcquisitionError(
@@ -4097,18 +5444,38 @@ def acquire_sources(
             }
         )
     _write_manifest(manifest_path, manifest)
-    return AcquisitionArtifact(
+    artifact = _build_acquisition_artifact(
         source_paths=tuple(source_paths),
-        member_anchors=(),
         manifest_path=manifest_path,
         manifest=manifest,
+        fresh_metadata_identities_by_video_id=(
+            fresh_metadata_identities_by_video_id
+        ),
     )
+    if (
+        request.edit_mode is EditMode.MEMBER
+        and artifact.member_identity_authority is None
+    ):
+        reporter.emit(
+            "log",
+            level="warning",
+            message=(
+                "이번 수집에서 멤버 직캠 방송일 근거를 권한으로 확정하지 "
+                "못해 경계 오디오 소스의 다중 직캠 복구는 비활성화됩니다. "
+                "다음 실행에서 공식 메타데이터 재인증을 시도합니다."
+            ),
+        )
+    return artifact
 
 
 __all__ = [
     "AcquisitionArtifact",
     "AcquisitionCandidate",
     "AcquisitionError",
+    "VerifiedAcquisitionSourceIdentity",
+    "VerifiedMemberAcquisitionIdentityAuthority",
     "YTDLPClient",
     "acquire_sources",
+    "canonical_music_show_program",
+    "is_verified_member_acquisition_identity_authority",
 ]

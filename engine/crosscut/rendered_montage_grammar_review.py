@@ -44,6 +44,12 @@ from .rendered_proxy_review import (
     SEGMENT_INTERIOR_SAMPLE_FRACTIONS,
     verified_file_content_sha256,
 )
+from .stage_edit_dynamic_crop_motion_authority_v3 import (
+    DEFAULT_MAXIMUM_MOTION_APPLIED_FRACTION,
+    DEFAULT_MINIMUM_MOTION_APPLIED_FRACTION,
+    DynamicCropMotionAuthorityV3Error,
+    DynamicCropMotionTimelineEvidenceV3,
+)
 
 
 RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS = (
@@ -859,7 +865,86 @@ def _transform_has_within_segment_motion(value: Any, name: str) -> bool:
     )
 
 
-def _motion_accent_segment_indices(analysis: Mapping[str, Any]) -> set[int]:
+def _validated_dynamic_crop_v3_motion_segments(
+    *,
+    value: object,
+    render_plan: Mapping[str, Any],
+) -> set[int]:
+    """Restore exact v3 evidence and bind it to the complete final plan."""
+
+    try:
+        if isinstance(value, DynamicCropMotionTimelineEvidenceV3):
+            # Reparse typed inputs as well as serialized inputs so nested
+            # self-hashes and the frozen 8--35% budget are checked here.
+            evidence = DynamicCropMotionTimelineEvidenceV3.from_dict(
+                value.to_dict()
+            )
+        elif isinstance(value, Mapping):
+            evidence = DynamicCropMotionTimelineEvidenceV3.from_dict(value)
+        else:
+            raise DynamicCropMotionAuthorityV3Error(
+                "Dynamic Crop v3 motion evidence must be typed or serialized"
+            )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Dynamic Crop v3 motion evidence is invalid: {exc}"
+        ) from exc
+
+    segments = _sequence(render_plan.get("segments"), "render_plan.segments")
+    if evidence.render_plan_content_sha256 != _canonical_sha256(render_plan):
+        raise ValueError(
+            "Dynamic Crop v3 motion evidence belongs to another RenderPlan"
+        )
+    if evidence.segment_count != len(segments):
+        raise ValueError(
+            "Dynamic Crop v3 motion evidence segment count differs from RenderPlan"
+        )
+    if (
+        evidence.motion_authority_consistent is not True
+        or evidence.renderer_motion_without_loso_authority_count != 0
+        or evidence.motion_budget_within_range is not True
+        or evidence.minimum_motion_applied_fraction
+        != DEFAULT_MINIMUM_MOTION_APPLIED_FRACTION
+        or evidence.maximum_motion_applied_fraction
+        != DEFAULT_MAXIMUM_MOTION_APPLIED_FRACTION
+    ):
+        raise ValueError(
+            "Dynamic Crop v3 motion authority is not production-consistent"
+        )
+    return {
+        item.segment_index
+        for item in evidence.segment_evidence
+        if item.motion_event_applied
+    }
+
+
+def _motion_accent_segment_indices(
+    analysis: Mapping[str, Any],
+    *,
+    render_plan: Mapping[str, Any],
+) -> set[int]:
+    dynamic_crop_version = analysis.get("dynamic_crop_version")
+    if dynamic_crop_version is not None and (
+        isinstance(dynamic_crop_version, bool)
+        or not isinstance(dynamic_crop_version, int)
+        or dynamic_crop_version not in {2, 3}
+    ):
+        raise ValueError("dynamic_crop_version must be absent, 2, or 3")
+    dynamic_crop_motion_v3 = analysis.get("dynamic_crop_motion_v3")
+    if dynamic_crop_version == 3:
+        if dynamic_crop_motion_v3 is None:
+            raise ValueError(
+                "Dynamic Crop v3 requires typed motion timeline evidence"
+            )
+        return _validated_dynamic_crop_v3_motion_segments(
+            value=dynamic_crop_motion_v3,
+            render_plan=render_plan,
+        )
+    if dynamic_crop_motion_v3 is not None:
+        raise ValueError(
+            "Dynamic Crop v3 motion evidence lacks its version marker"
+        )
+
     result: set[int] = set()
     editorial = analysis.get("editorial_motion")
     if isinstance(editorial, Mapping):
@@ -2924,7 +3009,10 @@ def review_rendered_montage_grammar(
         if rendered_geometry_duration_runs
         else runs
     )
-    motion_segments = _motion_accent_segment_indices(root)
+    motion_segments = _motion_accent_segment_indices(
+        root,
+        render_plan=bound_render_plan,
+    )
 
     timeline_start = float(runs[0]["start_seconds"])
     timeline_end = float(runs[-1]["end_seconds"])

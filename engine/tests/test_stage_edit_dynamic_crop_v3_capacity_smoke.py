@@ -40,6 +40,7 @@ from crosscut.stage_edit_dynamic_crop_v3_capacity_smoke import (
 from crosscut.stage_edit_reference_adapter import ReferenceTrainingExample
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     SourceCandidateToken,
     StageEditSequence,
     StageEditTarget,
@@ -57,11 +58,18 @@ BUDGET = DeviceMemoryBudget(
 
 def _token(value: float) -> StageEditToken:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     sources = tuple(
         SourceCandidateToken(
             source_id=f"source-{index}",
-            features=(value + index,) * schema.raw_source_dimension,
-            missing_mask=(False,) * schema.raw_source_dimension,
+            features=tuple(
+                0.0 if missing else value + index
+                for missing in missing_mask
+            ),
+            missing_mask=missing_mask,
         )
         for index in range(2)
     )
@@ -214,7 +222,15 @@ class DynamicCropV3CapacitySmokeTests(unittest.TestCase):
             sequence_length=4,
             max_sources=2,
         )
-        self.assertEqual((2, 4, 2, 720), inputs["source_features"].shape)
+        self.assertEqual(
+            (
+                2,
+                4,
+                2,
+                DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+            ),
+            inputs["source_features"].shape,
+        )
         np.testing.assert_array_equal(base["source_targets"], 0)
         self.assertEqual((2, 4, 2, 8, 4), dynamic["values"].shape)
         self.assertTrue(np.all(dynamic["track_mask"][:, :, 1]))
@@ -354,7 +370,12 @@ class DynamicCropV3CapacitySmokeTests(unittest.TestCase):
             "semantic_metrics_authorized": False,
             "model_selection_authorized": False,
             "tensor_provenance": {
-                "source_tensor_shape": [2, 2048, 32, 720],
+                "source_tensor_shape": [
+                    2,
+                    2048,
+                    32,
+                    DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+                ],
                 "dynamic_crop_version": 3,
                 "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
                 "loss_contract": DYNAMIC_CROP_V3_LOSS_CONTRACT,
@@ -405,6 +426,27 @@ class DynamicCropV3CapacitySmokeTests(unittest.TestCase):
             dict(V3_CAPACITY_ACTIVATION_CHECKPOINTING_EVIDENCE),
             result["activation_checkpointing"],
         )
+
+        legacy_source_720 = {
+            **event,
+            "tensor_provenance": {
+                **event["tensor_provenance"],
+                "source_tensor_shape": [2, 2048, 32, 720],
+            },
+        }
+        rejected = _normalize_execution(
+            event=legacy_source_720,
+            returncode=0,
+            candidate=candidate,
+            budget=BUDGET,
+            supervisor_pid=100,
+            worker_pid=200,
+            suite_id=suite,
+            run_nonce_sha256=nonce,
+            expected_hashes=hashes,
+        )
+        self.assertFalse(rejected["runtime_execution_passed"])
+        self.assertFalse(rejected["capacity_smoke_passed"])
 
         mixed_event = {**event, "model_class": "StageEditTransformerDynamicCropV2"}
         rejected = _normalize_execution(
@@ -473,7 +515,12 @@ class DynamicCropV3CapacitySmokeTests(unittest.TestCase):
             "semantic_metrics_authorized": False,
             "model_selection_authorized": False,
             "tensor_provenance": {
-                "source_tensor_shape": [2, 2048, 32, 720],
+                "source_tensor_shape": [
+                    2,
+                    2048,
+                    32,
+                    DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+                ],
                 "dynamic_crop_version": 3,
                 "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
                 "loss_contract": DYNAMIC_CROP_V3_LOSS_CONTRACT,
@@ -544,7 +591,12 @@ class DynamicCropV3CapacitySmokeTests(unittest.TestCase):
             "semantic_metrics_authorized": False,
             "model_selection_authorized": False,
             "tensor_provenance": {
-                "source_tensor_shape": [2, 2048, 32, 720],
+                "source_tensor_shape": [
+                    2,
+                    2048,
+                    32,
+                    DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
+                ],
                 "dynamic_crop_version": 3,
                 "model_contract": DYNAMIC_CROP_V3_MODEL_CONTRACT,
                 "loss_contract": DYNAMIC_CROP_V3_LOSS_CONTRACT,

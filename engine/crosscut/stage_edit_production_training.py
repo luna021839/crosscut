@@ -68,9 +68,13 @@ from .stage_edit_dynamic_crop_training import (
 from .stage_edit_dynamic_crop_training_v3 import (
     StageEditDynamicCropTrainingCorpusV3,
 )
+from .stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+)
 from .stage_edit_reference_adapter import (
     ReferenceTrainingCorpus,
     ReferenceTrainingExample,
+    VerifiedReferenceFeatureSnapshotEvidence,
 )
 from .stage_edit_training import (
     ProductionSupervisionGate,
@@ -393,44 +397,103 @@ def _require_unambiguous_checkpoint_namespace(
         )
 
 
-def _require_production_feature_snapshots(
-    corpus: ReferenceTrainingCorpus,
+def _production_feature_snapshot_gate_for_examples(
+    examples: Sequence[ReferenceTrainingExample],
+    *,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
 ) -> dict[str, Any]:
-    """Require the exact train/serve feature materializer for every reference."""
+    """Validate exact snapshot and causal-sensing evidence before preprocessing."""
 
+    if not examples:
+        raise ValueError("production StageEdit requires feature snapshot examples")
     hashes: dict[str, str] = {}
+    sensing_gates: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
-    for example in corpus.examples:
-        digest = str(example.feature_snapshot_sha256 or "").strip()
+    for example in examples:
+        evidence = example.verified_feature_snapshot_evidence
+        digest = ""
         try:
-            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
-        except ValueError:
-            valid_digest = False
+            if not isinstance(
+                evidence,
+                VerifiedReferenceFeatureSnapshotEvidence,
+            ):
+                raise ValueError("loader-issued feature evidence is absent")
+            sensing_gate = evidence.revalidate(
+                example,
+                schema=schema,
+            )
+            digest = evidence.feature_snapshot_sha256
+        except (TypeError, ValueError):
+            sensing_gate = None
         if (
-            not valid_digest
-            or example.statistics.get("materialized_feature_snapshot_used")
-            is not True
-            or example.statistics.get("shared_feature_materializer_used")
-            is not True
+            sensing_gate is None
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
         ):
             missing.append(example.reference_id)
             continue
         hashes[example.reference_id] = digest
-    if missing or len(hashes) != len(corpus.examples):
+        sensing_gates[example.reference_id] = sensing_gate
+    if missing or len(hashes) != len(examples):
         raise ValueError(
             "production StageEdit requires a verified causal feature snapshot "
             "for every reference; missing=" + ", ".join(sorted(missing))
         )
     if len(hashes) != len(set(hashes)):
         raise ValueError("production feature snapshot reference ids are not unique")
+    scope_identities = {
+        (
+            gate["edit_mode"],
+            gate["target_member"],
+            gate["member_feature_mode"],
+            gate["feature_snapshot_schema_version"],
+            gate["token_schema_fingerprint"],
+            gate["feature_materializer_contract"],
+        )
+        for gate in sensing_gates.values()
+    }
+    if len(scope_identities) != 1:
+        raise ValueError(
+            "production feature snapshots mix causal-sensing edit scope or schema"
+        )
     return {
         "passed": True,
         "contract": PRODUCTION_FEATURE_SNAPSHOT_GATE_CONTRACT,
         "reference_count": len(hashes),
         "feature_snapshot_sha256_by_reference": dict(sorted(hashes.items())),
+        "production_causal_sensing_gate_by_reference": {
+            reference_id: sensing_gates[reference_id]
+            for reference_id in sorted(sensing_gates)
+        },
+        "production_causal_sensing_scope": {
+            "edit_mode": next(iter(sensing_gates.values()))["edit_mode"],
+            "target_member": next(iter(sensing_gates.values()))["target_member"],
+            "member_feature_mode": next(iter(sensing_gates.values()))[
+                "member_feature_mode"
+            ],
+            "feature_snapshot_schema_version": (
+                FEATURE_MATERIALIZER_SCHEMA_VERSION
+            ),
+            "token_schema_fingerprint": schema.fingerprint,
+        },
         "reference_match_or_current_choice_features_present": False,
         "missing_reference_ids": [],
     }
+
+
+def _require_production_feature_snapshots(
+    corpus: ReferenceTrainingCorpus,
+    *,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+) -> dict[str, Any]:
+    """Require the exact train/serve feature materializer for every reference."""
+
+    if not isinstance(corpus, ReferenceTrainingCorpus):
+        raise TypeError("production feature gate requires ReferenceTrainingCorpus")
+    return _production_feature_snapshot_gate_for_examples(
+        corpus.examples,
+        schema=schema,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2033,9 +2096,15 @@ def prepare_stage_edit_production_input_sequences(
     unknown before any tensorization.
     """
 
+    example_tuple = tuple(examples)
+    _production_feature_snapshot_gate_for_examples(
+        example_tuple,
+        schema=schema,
+    )
+
     return tuple(
         mask_stage_edit_recent_history_for_semimarkov(example.sequence, schema)
-        for example in examples
+        for example in example_tuple
     )
 
 
@@ -2252,7 +2321,10 @@ def train_production_stage_edit(
             ),
         ),
     )
-    feature_snapshot_gate = _require_production_feature_snapshots(corpus)
+    feature_snapshot_gate = _require_production_feature_snapshots(
+        corpus,
+        schema=schema,
+    )
     supervision_gate_corpus = ReferenceTrainingCorpus(
         examples=split.train + split.validation,
         data_id=f"{corpus.data_id}:training-songs-only",

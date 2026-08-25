@@ -17,6 +17,9 @@ from typing import Any, Mapping, Sequence
 from .render import RenderPlan, RenderSegment, RenderTransition
 from .request import AspectRatio
 from .section_director import SectionPlan
+from .stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
+)
 
 
 SCHEMA_VERSION = 2
@@ -37,6 +40,11 @@ class StageShot:
     section_role: str | None = None
     section_progress: float | None = None
     phrase_progress: float | None = None
+    # Exact typed v3 inference provenance.  This remains separate from the
+    # renderer-facing segment because later visual overlays may rename,
+    # reparameterize, or suppress the track while runtime motion authority must
+    # still replay the original decode/logit/duration/source contract.
+    dynamic_crop_decode_v3: DynamicCropTrackDecodeV3 | None = None
 
     def __post_init__(self) -> None:
         if self.shot_index < 0 or self.section_index < 0:
@@ -73,9 +81,36 @@ class StageShot:
                 not math.isfinite(value) or not 0.0 <= value <= 1.0
             ):
                 raise ValueError(f"{name} must lie in 0...1")
+        if self.dynamic_crop_decode_v3 is not None:
+            if not isinstance(
+                self.dynamic_crop_decode_v3, DynamicCropTrackDecodeV3
+            ):
+                raise TypeError(
+                    "StageShot Dynamic Crop v3 provenance must be typed"
+                )
+            if (
+                self.dynamic_crop_decode_v3.source_index
+                != self.segment.source_index
+            ):
+                raise ValueError(
+                    "StageShot Dynamic Crop v3 source differs from its segment"
+                )
+            try:
+                replayed = DynamicCropTrackDecodeV3.from_dict(
+                    self.dynamic_crop_decode_v3.to_dict()
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "StageShot Dynamic Crop v3 provenance is not independently "
+                    "replayable"
+                ) from exc
+            if replayed != self.dynamic_crop_decode_v3:
+                raise ValueError(
+                    "StageShot Dynamic Crop v3 provenance changed on strict replay"
+                )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "shot_index": self.shot_index,
             "section_index": self.section_index,
             "decision_id": self.decision_id,
@@ -93,6 +128,12 @@ class StageShot:
             "section_progress": self.section_progress,
             "phrase_progress": self.phrase_progress,
         }
+        # Omit this key for legacy/v2 shots so their serialized payload remains
+        # byte-for-byte compatible.  When present, retain the complete strict
+        # decode needed for independent post-render reconstruction.
+        if self.dynamic_crop_decode_v3 is not None:
+            payload["dynamic_crop_v3"] = self.dynamic_crop_decode_v3.to_dict()
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

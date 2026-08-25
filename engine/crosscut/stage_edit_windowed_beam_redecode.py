@@ -16,12 +16,22 @@ from typing import Any, Mapping, Sequence
 
 from .render import RenderTransition, aligned_render_segment
 from .section_director import SectionPlan
+from .source_derivative_diversity import SourceDerivativeFamilyMetadata
 from .stage_edit import StageBoundary, StageShot
 from .stage_edit_continuity_authority import (
+    CONTINUITY_AUTHORITY_CONTRACT,
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
-from .stage_edit_pipeline_bridge import StageEditPipelineBridgeResult
+from .stage_edit_head_materializer import (
+    _canonical_sha256 as _head_materializer_canonical_sha256,
+    _sequence_payload as _head_materializer_sequence_payload,
+)
+from .stage_edit_pipeline_bridge import (
+    StageEditContextualSourcePairBridgeIdentityV2,
+    StageEditPipelineBridgeResult,
+)
 from .stage_edit_repair_loop import (
     StageEditRepairProposal,
     StageEditRepairRequest,
@@ -34,11 +44,22 @@ from .stage_edit_semimarkov_beam import (
     StageEditSemiMarkovConfig,
     StageEditSourceMetadata,
     decode_stage_edit_semimarkov_beam,
+    resolve_stage_edit_boundary_continuity,
     stage_edit_boundary_continuity_score,
+)
+from .stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+    StageEditContextualSourcePairScorerV2,
+    materialize_stage_edit_contextual_runtime_frame_v2,
 )
 from .stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
     StageEditSourcePairScorer,
+)
+from .stage_edit_transformer import (
+    DEFAULT_STAGE_EDIT_SCHEMA,
+    mask_stage_edit_recent_history_for_semimarkov,
+    stage_edit_recent_history_mask_contract,
 )
 from .timewarp import TimeWarpMap
 
@@ -93,6 +114,9 @@ def _maximum_switch_count(rate: float, duration: float) -> int:
 def _resolved_continuity_identity(
     config: StageEditSemiMarkovConfig,
     source_pair_scorer: StageEditSourcePairScorer | None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None,
 ) -> dict[str, Any]:
     """Resolve the exact scorer used by both local and exterior boundaries."""
 
@@ -102,9 +126,17 @@ def _resolved_continuity_identity(
             raise StageEditWindowedBeamError(
                 "handcrafted exterior continuity rejects a learned scorer"
             )
+        if contextual_source_pair_scorer_v2 is not None:
+            raise StageEditWindowedBeamError(
+                "handcrafted exterior continuity rejects a contextual-v2 scorer"
+            )
         contract = HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
         fingerprint = HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
     elif authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if contextual_source_pair_scorer_v2 is not None:
+            raise StageEditWindowedBeamError(
+                "learned-v1 exterior continuity rejects a contextual-v2 scorer"
+            )
         if not isinstance(source_pair_scorer, StageEditSourcePairScorer):
             raise StageEditWindowedBeamError(
                 "learned exterior continuity requires the production source-pair scorer"
@@ -114,6 +146,24 @@ def _resolved_continuity_identity(
         if contract != STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT:
             raise StageEditWindowedBeamError(
                 "learned exterior continuity scorer contract changed"
+            )
+    elif authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        if source_pair_scorer is not None:
+            raise StageEditWindowedBeamError(
+                "contextual-v2 exterior continuity rejects a learned-v1 scorer"
+            )
+        if not isinstance(
+            contextual_source_pair_scorer_v2,
+            StageEditContextualSourcePairScorerV2,
+        ):
+            raise StageEditWindowedBeamError(
+                "contextual-v2 exterior continuity requires its typed scorer"
+            )
+        contract = contextual_source_pair_scorer_v2.contract
+        fingerprint = contextual_source_pair_scorer_v2.fingerprint
+        if contract != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT:
+            raise StageEditWindowedBeamError(
+                "contextual-v2 exterior continuity scorer contract changed"
             )
     else:
         raise StageEditWindowedBeamError(
@@ -133,12 +183,16 @@ def _resolved_continuity_identity(
         raise StageEditWindowedBeamError(
             "windowed continuity scorer fingerprint differs from production"
         )
-    return {
+    payload = {
         "continuity_authority": authority,
         "continuity_scorer_contract": contract,
         "continuity_scorer_fingerprint": fingerprint,
         "learned_source_pair_scorer_bound": source_pair_scorer is not None,
     }
+    if authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        payload["contextual_source_pair_scorer_v2_bound"] = True
+        payload["contextual_runtime_raw_values_embedded"] = False
+    return payload
 
 
 def _validate_decoder_continuity_provenance(
@@ -154,6 +208,22 @@ def _validate_decoder_continuity_provenance(
         raise StageEditWindowedBeamError(
             "local decoder continuity provenance differs from its resolved scorer"
         )
+    if identity["continuity_authority"] == (
+        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+    ):
+        exact_contextual_provenance = {
+            "authority_contract": CONTINUITY_AUTHORITY_CONTRACT,
+            **expected,
+            "scorer_weights_embedded": False,
+            "score_range": [-1.0, 0.0],
+            "applies_to": "actual_derivative_family_boundaries_only",
+            "opening_and_same_family_raw_score": 0.0,
+            "contextual_runtime_raw_values_embedded": False,
+        }
+        if dict(provenance) != exact_contextual_provenance:
+            raise StageEditWindowedBeamError(
+                "local contextual-v2 decoder continuity provenance is not exact"
+            )
 
 
 def _exact_head_frame(
@@ -177,14 +247,27 @@ def _exterior_splice_continuity_evidence(
     replacement_shots: Sequence[StageShot],
     *,
     config: StageEditSemiMarkovConfig,
+    canonical_source_ids: Sequence[str],
     derivative_family_ids: Sequence[int],
     all_frames: Sequence[StageEditHeadFrame],
     source_pair_scorer: StageEditSourcePairScorer | None,
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ),
     identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Score every newly created fixed-context edge on the exact master clock."""
 
     source_count = len(request.base_edit.sources)
+    source_ids = tuple(str(value).strip() for value in canonical_source_ids)
+    if (
+        len(source_ids) != source_count
+        or any(not value for value in source_ids)
+        or len(source_ids) != len(set(source_ids))
+    ):
+        raise StageEditWindowedBeamError(
+            "exterior continuity canonical source ids do not align with sources"
+        )
     if len(derivative_family_ids) != source_count:
         raise StageEditWindowedBeamError(
             "exterior continuity derivative families do not align with sources"
@@ -223,40 +306,86 @@ def _exterior_splice_continuity_evidence(
         outgoing_family = derivative_family_ids[outgoing_source]
         incoming_family = derivative_family_ids[incoming_source]
         cross_family = outgoing_family != incoming_family
-        scorer_invoked = False
-        neutral_reason: str | None = None
-        if not cross_family:
-            raw_score = 0.0
-            neutral_reason = "same_derivative_family_neutral"
-        elif not frame.source_continuity:
-            if (
-                identity["continuity_authority"]
-                == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
-            ):
-                raise StageEditWindowedBeamError(
-                    "learned exterior continuity is missing exact observations"
-                )
-            raw_score = 0.0
-            neutral_reason = "handcrafted_missing_observation_neutral"
-        else:
+        if (
+            identity["continuity_authority"]
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            and len(frame.source_continuity) != source_count
+        ):
+            raise StageEditWindowedBeamError(
+                "contextual-v2 exterior continuity requires exact source "
+                "observations for the independent handcrafted motion qualifier"
+            )
+        if (
+            identity["continuity_authority"]
+            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+            and cross_family
+            and not frame.source_continuity
+        ):
+            raise StageEditWindowedBeamError(
+                "learned exterior continuity is missing exact observations"
+            )
+        if (
+            identity["continuity_authority"]
+            != PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            and cross_family
+            and frame.source_continuity
+            and len(frame.source_continuity) != source_count
+        ):
+            raise StageEditWindowedBeamError(
+                "exterior continuity observations do not align with sources"
+            )
+        try:
+            resolution = resolve_stage_edit_boundary_continuity(
+                frame,
+                outgoing_source,
+                incoming_source,
+                source_ids,
+                derivative_family_ids,
+                continuity_authority=identity["continuity_authority"],
+                source_pair_scorer=source_pair_scorer,
+                contextual_source_pair_scorer_v2=(
+                    contextual_source_pair_scorer_v2
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise StageEditWindowedBeamError(
+                f"exterior continuity resolution failed: {exc}"
+            ) from exc
+        raw_score = resolution.decoder_score
+        scorer_invoked = resolution.applied
+        neutral_reason = resolution.neutral_reason
+        # Preserve the exact legacy audit vocabulary and key set. Contextual
+        # v2 instead carries the typed resolver's scalar lineage below.
+        if identity["continuity_authority"] != (
+            PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            neutral_reason = {
+                "same_exact_source": "same_derivative_family_neutral",
+                "same_derivative_family": "same_derivative_family_neutral",
+                "missing_handcrafted_observations": (
+                    "handcrafted_missing_observation_neutral"
+                ),
+            }.get(neutral_reason, neutral_reason)
+        if (
+            identity["continuity_authority"]
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
             if len(frame.source_continuity) != source_count:
                 raise StageEditWindowedBeamError(
-                    "exterior continuity observations do not align with sources"
+                    "contextual-v2 exterior continuity observations do not align with sources"
                 )
             outgoing = frame.source_continuity[outgoing_source]
             incoming = frame.source_continuity[incoming_source]
-            if (
-                identity["continuity_authority"]
-                == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
-            ):
-                assert isinstance(source_pair_scorer, StageEditSourcePairScorer)
-                raw_score = source_pair_scorer.score(outgoing, incoming)
-            else:
-                raw_score = stage_edit_boundary_continuity_score(
+            handcrafted_motion_qualifier = (
+                None
+                if not cross_family
+                else stage_edit_boundary_continuity_score(
                     outgoing,
                     incoming,
                 )
-            scorer_invoked = True
+            )
+        else:
+            handcrafted_motion_qualifier = None
         raw_score = float(raw_score)
         if not math.isfinite(raw_score) or not -1.0 <= raw_score <= 0.0:
             raise StageEditWindowedBeamError(
@@ -272,26 +401,33 @@ def _exterior_splice_continuity_evidence(
             raise StageEditWindowedBeamError(
                 "weighted exterior continuity score is outside its bounded range"
             )
-        edges.append(
-            {
-                "side": side,
-                "boundary_time_seconds": boundary_time,
-                "head_frame_time_seconds": frame.master_time_seconds,
-                "outgoing_source_index": outgoing_source,
-                "incoming_source_index": incoming_source,
-                "outgoing_derivative_family_id": outgoing_family,
-                "incoming_derivative_family_id": incoming_family,
-                "cross_derivative_family": cross_family,
-                "authority_rule_evaluated": True,
-                "scorer_evaluated": scorer_invoked,
-                "scorer_invoked": scorer_invoked,
-                "neutral_reason": neutral_reason,
-                "raw_score": raw_score,
-                "weight": weight,
-                "weighted_score": weighted_score,
-                **dict(identity),
-            }
-        )
+        edge = {
+            "side": side,
+            "boundary_time_seconds": boundary_time,
+            "head_frame_time_seconds": frame.master_time_seconds,
+            "outgoing_source_index": outgoing_source,
+            "incoming_source_index": incoming_source,
+            "outgoing_derivative_family_id": outgoing_family,
+            "incoming_derivative_family_id": incoming_family,
+            "cross_derivative_family": cross_family,
+            "authority_rule_evaluated": True,
+            "scorer_evaluated": scorer_invoked,
+            "scorer_invoked": scorer_invoked,
+            "neutral_reason": neutral_reason,
+            "raw_score": raw_score,
+            "weight": weight,
+            "weighted_score": weighted_score,
+            **dict(identity),
+        }
+        if identity["continuity_authority"] == (
+            PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            edge["typed_boundary_resolution"] = resolution.to_dict()
+            edge["independent_handcrafted_motion_qualifier_score"] = (
+                handcrafted_motion_qualifier
+            )
+            edge["contextual_primary_reused_for_motion_qualifier"] = False
+        edges.append(edge)
     expected_edge_count = len(edge_inputs)
     return {
         "expected_edge_count": expected_edge_count,
@@ -399,6 +535,141 @@ def _full_edit_constraint_rejections(
     return tuple(sorted(reasons))
 
 
+def _revalidate_contextual_runtime_binding(
+    bridge_result: StageEditPipelineBridgeResult,
+    *,
+    scorer: StageEditContextualSourcePairScorerV2,
+    derivative_metadata: SourceDerivativeFamilyMetadata,
+) -> None:
+    """Rebuild every runtime sidecar from the sealed preflight snapshot.
+
+    A typed runtime object proves internal consistency, but not that it came
+    from this bridge's exact masked snapshot.  Re-materializing here binds all
+    context/source values, masks, schemas, clipping counts, source families,
+    timestamps, and digests to the persisted preflight snapshot before any
+    local or exterior boundary can be rescored.
+    """
+
+    preflight = bridge_result.preflight
+    try:
+        snapshot = preflight.revalidate_snapshot_identity(
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+        masked_sequence = mask_stage_edit_recent_history_for_semimarkov(
+            snapshot.sequence,
+            DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        raise StageEditWindowedBeamError(
+            f"contextual-v2 windowed snapshot binding is invalid: {exc}"
+        ) from exc
+
+    source_ids = tuple(preflight.source_ids)
+    family_mapping = {
+        source_id: derivative_metadata.family_ids[index]
+        for index, source_id in enumerate(source_ids)
+    }
+    try:
+        expected_runtimes = tuple(
+            materialize_stage_edit_contextual_runtime_frame_v2(
+                token,
+                canonical_source_ids=source_ids,
+                derivative_family_id_by_source=family_mapping,
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+            for token in masked_sequence.tokens
+        )
+    except (TypeError, ValueError) as exc:
+        raise StageEditWindowedBeamError(
+            f"contextual-v2 windowed runtime reconstruction failed: {exc}"
+        ) from exc
+
+    heads = bridge_result.head_materialization
+    expected_history_contract = stage_edit_recent_history_mask_contract(
+        DEFAULT_STAGE_EDIT_SCHEMA
+    )
+    try:
+        expected_supplied_sha256 = _head_materializer_canonical_sha256(
+            _head_materializer_sequence_payload(snapshot.sequence)
+        )
+        expected_input_sha256 = _head_materializer_canonical_sha256(
+            _head_materializer_sequence_payload(masked_sequence)
+        )
+    except (TypeError, ValueError) as exc:
+        raise StageEditWindowedBeamError(
+            f"contextual-v2 windowed sequence binding failed: {exc}"
+        ) from exc
+    if (
+        heads.sequence_id != snapshot.sequence.sequence_id
+        or heads.canonical_source_ids != source_ids
+        or heads.supplied_sequence_sha256 != expected_supplied_sha256
+        or heads.input_sequence_sha256 != expected_input_sha256
+        or dict(heads.decision_history_input_contract)
+        != expected_history_contract
+    ):
+        raise StageEditWindowedBeamError(
+            "contextual-v2 windowed head/snapshot binding changed"
+        )
+    frames = tuple(heads.frames)
+    if len(frames) != len(expected_runtimes):
+        raise StageEditWindowedBeamError(
+            "contextual-v2 windowed head/runtime counts differ from snapshot"
+        )
+    expected_mask_sha256 = expected_history_contract["contract_sha256"]
+    for frame_index, (frame, expected_runtime) in enumerate(
+        zip(frames, expected_runtimes, strict=True)
+    ):
+        runtime = frame.contextual_source_pair_runtime_v2
+        if runtime is None:
+            raise StageEditWindowedBeamError(
+                f"contextual-v2 windowed frame {frame_index} lacks its runtime sidecar"
+            )
+        if len(frame.source_continuity) != len(source_ids):
+            raise StageEditWindowedBeamError(
+                f"contextual-v2 windowed frame {frame_index} lacks exact "
+                "source continuity for the independent handcrafted motion qualifier"
+            )
+        if runtime.recent_history_mask_contract_sha256 != expected_mask_sha256:
+            raise StageEditWindowedBeamError(
+                f"contextual-v2 windowed frame {frame_index} mask contract changed"
+            )
+        if runtime.to_dict() != expected_runtime.to_dict():
+            raise StageEditWindowedBeamError(
+                f"contextual-v2 windowed frame {frame_index} runtime differs "
+                "from the verified masked preflight snapshot"
+            )
+        try:
+            resolve_stage_edit_boundary_continuity(
+                frame,
+                None,
+                0,
+                source_ids,
+                derivative_metadata.family_ids,
+                continuity_authority=(
+                    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                ),
+                source_pair_scorer=None,
+                contextual_source_pair_scorer_v2=scorer,
+            )
+        except (TypeError, ValueError) as exc:
+            raise StageEditWindowedBeamError(
+                f"contextual-v2 windowed frame {frame_index} is invalid: {exc}"
+            ) from exc
+
+    try:
+        expected_output_sha256 = _head_materializer_canonical_sha256(
+            [frame.to_dict() for frame in frames]
+        )
+    except (TypeError, ValueError) as exc:
+        raise StageEditWindowedBeamError(
+            f"contextual-v2 windowed head output binding failed: {exc}"
+        ) from exc
+    if heads.output_frames_sha256 != expected_output_sha256:
+        raise StageEditWindowedBeamError(
+            "contextual-v2 windowed head output hash changed"
+        )
+
+
 @dataclass(slots=True)
 class StageEditWindowedBeamRedecoder:
     """Callable actual-beam adapter consumed by ``repair_stage_edit_candidates``."""
@@ -411,12 +682,95 @@ class StageEditWindowedBeamRedecoder:
     source_timewarps: tuple[TimeWarpMap | None, ...]
     source_quality_log_priors: tuple[float, ...]
     output: Path
+    # Optional compatibility injection. Contextual production still requires
+    # a sealed preflight-bound scorer; an equivalent injection is normalized
+    # back to that exact bound instance and can never activate the authority.
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None
     call_audits: list[dict[str, Any]] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.bridge_result, StageEditPipelineBridgeResult):
             raise TypeError("bridge_result must be a StageEditPipelineBridgeResult")
-        source_count = len(self.bridge_result.preflight.source_ids)
+        preflight = self.bridge_result.preflight
+        try:
+            preflight.revalidate_snapshot_identity(
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise StageEditWindowedBeamError(
+                f"windowed production snapshot identity is invalid: {exc}"
+            ) from exc
+        source_count = len(preflight.source_ids)
+        declared_authority = preflight.continuity_authority
+        preflight_contextual_scorer = (
+            preflight.contextual_source_pair_scorer_v2
+        )
+        preflight_contextual_identity = (
+            preflight.contextual_source_pair_identity_v2
+        )
+        if (
+            self.contextual_source_pair_scorer_v2 is not None
+            and not isinstance(
+                self.contextual_source_pair_scorer_v2,
+                StageEditContextualSourcePairScorerV2,
+            )
+        ):
+            raise StageEditWindowedBeamError(
+                "windowed contextual-v2 injected scorer is not typed"
+            )
+        if declared_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+            if not isinstance(
+                preflight_contextual_scorer,
+                StageEditContextualSourcePairScorerV2,
+            ) or not isinstance(
+                preflight_contextual_identity,
+                StageEditContextualSourcePairBridgeIdentityV2,
+            ):
+                raise StageEditWindowedBeamError(
+                    "contextual-v2 windowed decode requires a sealed "
+                    "preflight-bound scorer identity"
+                )
+            try:
+                preflight._validate_contextual_scorer_identity(
+                    reload_artifacts=True
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                raise StageEditWindowedBeamError(
+                    f"contextual-v2 windowed preflight identity is invalid: {exc}"
+                ) from exc
+            unified_fingerprint = preflight.continuity_scorer_fingerprint
+            alias_fingerprint = (
+                preflight.contextual_source_pair_scorer_fingerprint_v2
+            )
+            if (
+                unified_fingerprint != alias_fingerprint
+                or unified_fingerprint
+                != preflight_contextual_identity.scorer_fingerprint
+                or unified_fingerprint
+                != preflight_contextual_scorer.fingerprint
+            ):
+                raise StageEditWindowedBeamError(
+                    "contextual-v2 windowed unified and alias scorer "
+                    "fingerprints differ from the sealed identity"
+                )
+            injected = self.contextual_source_pair_scorer_v2
+            if injected is not None and (
+                injected.contract != preflight_contextual_scorer.contract
+                or injected.fingerprint != unified_fingerprint
+                or injected.token_schema_fingerprint
+                != preflight_contextual_scorer.token_schema_fingerprint
+                or injected.to_dict()
+                != preflight_contextual_scorer.to_dict()
+            ):
+                raise StageEditWindowedBeamError(
+                    "windowed contextual-v2 injected scorer differs from "
+                    "the sealed preflight-bound scorer"
+                )
+            self.contextual_source_pair_scorer_v2 = (
+                preflight_contextual_scorer
+            )
         self.sources = tuple(Path(value).expanduser().resolve() for value in self.sources)
         self.source_durations_seconds = tuple(
             float(value) for value in self.source_durations_seconds
@@ -475,6 +829,56 @@ class StageEditWindowedBeamRedecoder:
                 "windowed beam clocks must be checked TimeWarpMap values"
             )
         self.output = Path(self.output).expanduser().resolve()
+        config = self.production_config
+        v1_scorer = preflight.source_pair_scorer
+        identity = _resolved_continuity_identity(
+            config,
+            v1_scorer,
+            self.contextual_source_pair_scorer_v2,
+        )
+        if declared_authority != identity["continuity_authority"]:
+            raise StageEditWindowedBeamError(
+                "windowed continuity authority differs from production preflight"
+            )
+        if config.continuity_authority == (
+            PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            declared_fingerprint = preflight.continuity_scorer_fingerprint
+            if declared_fingerprint != identity[
+                "continuity_scorer_fingerprint"
+            ]:
+                raise StageEditWindowedBeamError(
+                    "contextual-v2 windowed preflight lacks the exact scorer fingerprint"
+                )
+            derivative_metadata = (
+                self.bridge_result.source_derivative_diversity
+            )
+            if (
+                not isinstance(
+                    derivative_metadata,
+                    SourceDerivativeFamilyMetadata,
+                )
+                or not derivative_metadata.production_ready
+                or derivative_metadata.source_count != source_count
+            ):
+                raise StageEditWindowedBeamError(
+                    "contextual-v2 windowed decode requires verified derivative families"
+                )
+            if (
+                self.bridge_result.head_materialization.token_schema_fingerprint
+                != DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+                or preflight.snapshot.token_schema_fingerprint
+                != DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+            ):
+                raise StageEditWindowedBeamError(
+                    "contextual-v2 windowed token schema differs from production"
+                )
+            assert self.contextual_source_pair_scorer_v2 is not None
+            _revalidate_contextual_runtime_binding(
+                self.bridge_result,
+                scorer=self.contextual_source_pair_scorer_v2,
+                derivative_metadata=derivative_metadata,
+            )
 
     @property
     def canonical_boundaries_seconds(self) -> tuple[float, ...]:
@@ -562,6 +966,9 @@ class StageEditWindowedBeamRedecoder:
                     section_role=decision.section_role,
                     section_progress=decision.section_progress,
                     phrase_progress=decision.phrase_progress,
+                    dynamic_crop_decode_v3=getattr(
+                        decision, "dynamic_crop_decode_v3", None
+                    ),
                 )
             )
         return tuple(shots)
@@ -604,6 +1011,14 @@ class StageEditWindowedBeamRedecoder:
     ) -> tuple[StageEditRepairProposal, ...]:
         if not isinstance(request, StageEditRepairRequest):
             raise TypeError("windowed beam callback needs StageEditRepairRequest")
+        try:
+            self.bridge_result.preflight.revalidate_snapshot_identity(
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise StageEditWindowedBeamError(
+                f"windowed production snapshot identity is invalid: {exc}"
+            ) from exc
         start = request.window.actual_start_seconds
         end = request.window.actual_end_seconds
         all_frames = self.bridge_result.head_materialization.frames
@@ -639,7 +1054,27 @@ class StageEditWindowedBeamRedecoder:
         continuity_identity = _resolved_continuity_identity(
             local_config,
             source_pair_scorer,
+            self.contextual_source_pair_scorer_v2,
         )
+        if continuity_identity["continuity_authority"] == (
+            PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            contextual_bridge_identity = (
+                self.bridge_result.preflight.contextual_source_pair_identity_v2
+            )
+            if not isinstance(
+                contextual_bridge_identity,
+                StageEditContextualSourcePairBridgeIdentityV2,
+            ):
+                raise StageEditWindowedBeamError(
+                    "windowed contextual-v2 call lost its sealed bridge identity"
+                )
+            continuity_identity = {
+                **continuity_identity,
+                "contextual_source_pair_identity_v2": (
+                    contextual_bridge_identity.to_dict()
+                ),
+            }
         declared_authority = getattr(
             self.bridge_result.preflight,
             "continuity_authority",
@@ -649,19 +1084,10 @@ class StageEditWindowedBeamRedecoder:
             raise StageEditWindowedBeamError(
                 "windowed continuity authority differs from production preflight"
             )
-        declared_fingerprint = getattr(
-            self.bridge_result.preflight,
-            "source_pair_scorer_fingerprint",
-            None,
+        declared_fingerprint = (
+            self.bridge_result.preflight.continuity_scorer_fingerprint
         )
-        if declared_fingerprint is None and (
-            continuity_identity["continuity_authority"]
-            == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
-        ):
-            raise StageEditWindowedBeamError(
-                "learned windowed continuity preflight lacks its scorer fingerprint"
-            )
-        if declared_fingerprint is not None and declared_fingerprint != (
+        if declared_fingerprint != (
             continuity_identity["continuity_scorer_fingerprint"]
         ):
             raise StageEditWindowedBeamError(
@@ -715,6 +1141,9 @@ class StageEditWindowedBeamRedecoder:
                     self.bridge_result.source_derivative_diversity
                 ),
                 source_pair_scorer=source_pair_scorer,
+                contextual_source_pair_scorer_v2=(
+                    self.contextual_source_pair_scorer_v2
+                ),
             )
         except StageEditNoValidTimelineError as exc:
             call_audit["decoder_no_valid_timeline"] = str(exc)
@@ -776,9 +1205,15 @@ class StageEditWindowedBeamRedecoder:
                     request,
                     shots,
                     config=production_config,
+                    canonical_source_ids=(
+                        self.bridge_result.preflight.source_ids
+                    ),
                     derivative_family_ids=derivative_family_ids,
                     all_frames=all_frames,
                     source_pair_scorer=source_pair_scorer,
+                    contextual_source_pair_scorer_v2=(
+                        self.contextual_source_pair_scorer_v2
+                    ),
                     identity=continuity_identity,
                 )
                 if not exterior_evidence["full_edit_validation_passed"]:

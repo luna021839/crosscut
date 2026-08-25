@@ -17,6 +17,10 @@ from crosscut.stage_edit_training import (
     require_stage_edit_production_supervision,
     validate_stage_edit_production_supervision,
 )
+from tests.stage_edit_causal_sensing_test_support import (
+    production_gate_statistics,
+    synthetic_production_snapshot,
+)
 
 
 def _candidate(source_id: str, selected: bool, score: float) -> dict:
@@ -646,6 +650,66 @@ class StageEditReferenceAdapterTests(unittest.TestCase):
             validation_songs = {item.song_id for item in split.validation}
             self.assertTrue(train_songs.isdisjoint(validation_songs))
             self.assertEqual(split, deterministic_reference_split(corpus, seed=7))
+
+    def test_production_causal_gate_is_immutable_and_data_id_manifest_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "ref-a.json"
+            payload = _payload("ref-a")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            base = build_reference_training_example(payload)
+            group_snapshot = synthetic_production_snapshot(base.sequence)
+            member_snapshot = synthetic_production_snapshot(
+                base.sequence,
+                edit_mode="member",
+                target_member="가을",
+            )
+            group = load_reference_training_corpus(
+                (path,),
+                feature_snapshot_by_reference={"ref-a": group_snapshot},
+                production_edit_mode="group",
+            )
+            member = load_reference_training_corpus(
+                (path,),
+                feature_snapshot_by_reference={"ref-a": member_snapshot},
+                production_edit_mode="member",
+                production_target_member="가을",
+            )
+            expected_gate = production_gate_statistics(group_snapshot)
+            stored_gate = group.examples[0].statistics[
+                "production_causal_sensing_gate"
+            ]
+            self.assertEqual(expected_gate, dict(stored_gate))
+            with self.assertRaises(TypeError):
+                stored_gate["edit_mode"] = "member"
+            self.assertNotEqual(group.data_id, member.data_id)
+
+            manifest = group.manifest()
+            self.assertEqual(
+                expected_gate,
+                manifest["production_causal_sensing_gate_by_reference"][
+                    "ref-a"
+                ],
+            )
+            self.assertEqual(
+                expected_gate,
+                manifest["examples"][0]["statistics"][
+                    "production_causal_sensing_gate"
+                ],
+            )
+            manifest["production_causal_sensing_gate_by_reference"]["ref-a"][
+                "edit_mode"
+            ] = "member"
+            self.assertEqual("group", stored_gate["edit_mode"])
+            destination = group.write_manifest(root / "production-manifest.json")
+            restored = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(group.data_id, restored["data_id"])
+            self.assertEqual(
+                expected_gate,
+                restored["production_causal_sensing_gate_by_reference"][
+                    "ref-a"
+                ],
+            )
 
     def test_single_song_corpus_falls_back_to_whole_reference_split(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

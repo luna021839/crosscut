@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import stat as stat_module
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .professional_montage_policy import (
     ProfessionalMontagePolicyError,
@@ -38,6 +38,7 @@ from .professional_montage_policy import (
 )
 from .stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     STAGE_EDIT_CONTINUITY_AUTHORITIES,
 )
@@ -67,6 +68,17 @@ from .stage_edit_source_pair_scorer import (
 from .stage_edit_source_pair_training import (
     STAGE_EDIT_SOURCE_PAIR_ACTIVATION_GATE_CONTRACT,
 )
+from .stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CHECKPOINT_FILENAME,
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CORPUS_FILENAME,
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_REPORT_FILENAME,
+    StageEditContextualTrainingCorpusV2,
+)
+from .stage_edit_source_pair_contextual_v2_production import (
+    StageEditContextualSourcePairCheckpointV2,
+    StageEditContextualSourcePairProductionReportV2,
+    load_stage_edit_contextual_source_pair_production_bundle_v2,
+)
 from .stage_edit_transformer import (
     DYNAMIC_CROP_V3_TRAINING_CORPUS_CONTRACT,
     DYNAMIC_CROP_V3_VALIDATION_SELECTION_GATE_CONTRACT,
@@ -89,9 +101,25 @@ STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION = 4
 STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND = (
     "ive_stage_edit_dynamic_crop_v3_active_production_bundle"
 )
+STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_SCHEMA_VERSION = 5
+STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_KIND = (
+    "ive_stage_edit_dynamic_crop_v3_contextual_v2_active_production_bundle"
+)
+STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_SCHEMA_VERSION = 6
+STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_KIND = (
+    "ive_stage_edit_dynamic_crop_v3_release_freeze_motion_authority_bundle"
+)
+STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_LOGIT_THRESHOLD_V3 = 0.0
+STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_THRESHOLD_FREEZE_CONTRACT_V3 = (
+    "zero_logit_predeclared_before_loso_heldout_evaluation_v1"
+)
+STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT = (
+    "adapter_replayable_contextual_beam_qa_registry_manifest_v1"
+)
 STAGE_EDIT_PRODUCTION_REGISTRY_ENV = "CROSSCUT_STAGE_EDIT_PRODUCTION_REGISTRY"
 STAGE_EDIT_PRODUCTION_REGISTRY_FILENAME = "active-production-bundle.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_COMMIT_OID = re.compile(r"[0-9a-f]{40}")
 
 
 class StageEditProductionRegistryError(RuntimeError):
@@ -164,6 +192,150 @@ def preferred_stage_edit_production_registry_path() -> Path:
 
 
 @dataclass(frozen=True, slots=True)
+class RegisteredStageEditMotionAuthorityIdentityV3:
+    """Exact LOSO release-freeze identity that may authorize v3 motion.
+
+    This is deliberately separate from the checkpoint identity.  A v3
+    checkpoint name, weight, or legacy registry record cannot manufacture
+    motion authority; only the strictly replayed production-promotion lineage
+    can populate this value.
+    """
+
+    release_freeze_path: Path
+    release_freeze_file_sha256: str
+    release_freeze_content_sha256: str
+    source_commit_oid: str
+    candidate_id: str
+    motion_logit_threshold: float
+    threshold_freeze_contract: str
+
+    def __post_init__(self) -> None:
+        path = Path(self.release_freeze_path)
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError(
+                "registered v3 motion release-freeze path must be absolute "
+                "and non-symlink"
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(
+                "registered v3 motion release-freeze path is missing"
+            ) from exc
+        if resolved != path or not path.is_file():
+            raise ValueError(
+                "registered v3 motion release-freeze path must be normalized "
+                "and regular"
+            )
+        for value in (
+            self.release_freeze_file_sha256,
+            self.release_freeze_content_sha256,
+        ):
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise ValueError(
+                    "registered v3 motion release-freeze identity must be SHA-256"
+                )
+        if (
+            not isinstance(self.source_commit_oid, str)
+            or _COMMIT_OID.fullmatch(self.source_commit_oid) is None
+        ):
+            raise ValueError(
+                "registered v3 motion source commit must be a full commit OID"
+            )
+        if not isinstance(self.candidate_id, str) or not self.candidate_id.strip():
+            raise ValueError("registered v3 motion candidate id cannot be blank")
+        if (
+            isinstance(self.motion_logit_threshold, bool)
+            or not isinstance(self.motion_logit_threshold, float)
+            or not math.isfinite(self.motion_logit_threshold)
+            or self.motion_logit_threshold
+            != STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_LOGIT_THRESHOLD_V3
+            or math.copysign(1.0, self.motion_logit_threshold) < 0.0
+        ):
+            raise ValueError(
+                "registered v3 motion logit threshold is not the frozen value"
+            )
+        if (
+            self.threshold_freeze_contract
+            != STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_THRESHOLD_FREEZE_CONTRACT_V3
+        ):
+            raise ValueError(
+                "registered v3 motion threshold freeze contract is unsupported"
+            )
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "RegisteredStageEditMotionAuthorityIdentityV3":
+        expected = {
+            "release_freeze_path",
+            "release_freeze_file_sha256",
+            "release_freeze_content_sha256",
+            "source_commit_oid",
+            "candidate_id",
+            "motion_logit_threshold",
+            "threshold_freeze_contract",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ValueError(
+                "registered v3 motion authority identity schema is invalid"
+            )
+        raw_path = value.get("release_freeze_path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError(
+                "registered v3 motion release-freeze path is invalid"
+            )
+        file_sha256 = value.get("release_freeze_file_sha256")
+        content_sha256 = value.get("release_freeze_content_sha256")
+        source_commit_oid = value.get("source_commit_oid")
+        candidate_id = value.get("candidate_id")
+        motion_logit_threshold = value.get("motion_logit_threshold")
+        threshold_freeze_contract = value.get("threshold_freeze_contract")
+        if not all(
+            isinstance(item, str)
+            for item in (
+                file_sha256,
+                content_sha256,
+                source_commit_oid,
+                candidate_id,
+                threshold_freeze_contract,
+            )
+        ) or not isinstance(motion_logit_threshold, float):
+            raise ValueError(
+                "registered v3 motion authority identity types are invalid"
+            )
+        assert isinstance(file_sha256, str)
+        assert isinstance(content_sha256, str)
+        assert isinstance(source_commit_oid, str)
+        assert isinstance(candidate_id, str)
+        assert isinstance(motion_logit_threshold, float)
+        assert isinstance(threshold_freeze_contract, str)
+        return cls(
+            release_freeze_path=Path(raw_path),
+            release_freeze_file_sha256=file_sha256,
+            release_freeze_content_sha256=content_sha256,
+            source_commit_oid=source_commit_oid,
+            candidate_id=candidate_id,
+            motion_logit_threshold=motion_logit_threshold,
+            threshold_freeze_contract=threshold_freeze_contract,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "release_freeze_path": str(self.release_freeze_path),
+            "release_freeze_file_sha256": self.release_freeze_file_sha256,
+            "release_freeze_content_sha256": (
+                self.release_freeze_content_sha256
+            ),
+            "source_commit_oid": self.source_commit_oid,
+            "candidate_id": self.candidate_id,
+            "motion_logit_threshold": self.motion_logit_threshold,
+            "threshold_freeze_contract": self.threshold_freeze_contract,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RegisteredStageEditProductionBundle:
     registry_path: Path
     checkpoint_directory: Path
@@ -190,6 +362,20 @@ class RegisteredStageEditProductionBundle:
     source_pair_scorer_fingerprint: str | None
     source_pair_checkpoint_sha256: str | None
     source_pair_corpus_sha256: str | None
+    contextual_source_pair_bundle_directory: Path | None
+    contextual_source_pair_checkpoint_sha256: str | None
+    contextual_source_pair_checkpoint_file_sha256: str | None
+    contextual_source_pair_report_sha256: str | None
+    contextual_source_pair_report_file_sha256: str | None
+    contextual_source_pair_beam_qa_report_sha256: str | None
+    contextual_source_pair_corpus_sha256: str | None
+    contextual_source_pair_corpus_file_sha256: str | None
+    contextual_source_pair_token_schema_fingerprint: str | None
+    contextual_source_pair_scorer_fingerprint: str | None
+    contextual_source_pair_verified_beam_qa_cases: tuple[object, ...]
+    motion_authority_identity_v3: (
+        RegisteredStageEditMotionAuthorityIdentityV3 | None
+    )
     registry_sha256: str
     readiness: StageEditReadinessReport
 
@@ -234,12 +420,39 @@ class RegisteredStageEditProductionBundle:
             self.source_pair_scorer_path,
             self.source_pair_production_report_path,
         )
+        contextual_values = (
+            self.contextual_source_pair_checkpoint_sha256,
+            self.contextual_source_pair_checkpoint_file_sha256,
+            self.contextual_source_pair_report_sha256,
+            self.contextual_source_pair_report_file_sha256,
+            self.contextual_source_pair_beam_qa_report_sha256,
+            self.contextual_source_pair_corpus_sha256,
+            self.contextual_source_pair_corpus_file_sha256,
+            self.contextual_source_pair_token_schema_fingerprint,
+            self.contextual_source_pair_scorer_fingerprint,
+        )
+        contextual_paths = (self.contextual_source_pair_bundle_directory,)
+        contextual_cases = tuple(
+            self.contextual_source_pair_verified_beam_qa_cases
+        )
         if self.dynamic_crop_version == 2:
             if self.continuity_authority is not None:
                 raise ValueError(
                     "Dynamic Crop v2 cannot bind a continuity authority"
                 )
-            if any(value is not None for value in (*pair_paths, *pair_values)):
+            if self.motion_authority_identity_v3 is not None:
+                raise ValueError(
+                    "Dynamic Crop v2 cannot bind v3 motion authority"
+                )
+            if any(
+                value is not None
+                for value in (
+                    *pair_paths,
+                    *pair_values,
+                    *contextual_paths,
+                    *contextual_values,
+                )
+            ) or contextual_cases:
                 raise ValueError(
                     "Dynamic Crop v2 cannot bind source-pair v3 evidence"
                 )
@@ -263,7 +476,63 @@ class RegisteredStageEditProductionBundle:
                 for value in pair_values
             ):
                 raise ValueError("registered source-pair identity must be SHA-256")
-        elif any(value is not None for value in (*pair_paths, *pair_values)):
+            if any(
+                value is not None
+                for value in (*contextual_paths, *contextual_values)
+            ) or contextual_cases:
+                raise ValueError(
+                    "learned-v1 Dynamic Crop v3 continuity cannot bind "
+                    "contextual-v2 evidence"
+                )
+        elif (
+            self.continuity_authority
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            if any(value is not None for value in (*pair_paths, *pair_values)):
+                raise ValueError(
+                    "contextual-v2 Dynamic Crop v3 continuity cannot bind "
+                    "learned-v1 evidence"
+                )
+            if any(
+                value is None
+                for value in (*contextual_paths, *contextual_values)
+            ) or not contextual_cases:
+                raise ValueError(
+                    "contextual-v2 Dynamic Crop v3 continuity requires its "
+                    "complete production bundle and verified Beam-QA evidence"
+                )
+            if not Path(self.contextual_source_pair_bundle_directory).is_absolute():
+                raise ValueError(
+                    "registered contextual-v2 bundle path must be absolute"
+                )
+            if any(
+                not isinstance(value, str) or _SHA256.fullmatch(value) is None
+                for value in contextual_values
+            ):
+                raise ValueError(
+                    "registered contextual-v2 identity must be SHA-256"
+                )
+            from .stage_edit_contextual_beam_qa_adapter_v2 import (
+                is_verified_stage_edit_contextual_beam_qa_case_v2,
+            )
+
+            if any(
+                not is_verified_stage_edit_contextual_beam_qa_case_v2(value)
+                for value in contextual_cases
+            ):
+                raise ValueError(
+                    "registered contextual-v2 Beam-QA cases must be "
+                    "adapter-issued envelopes"
+                )
+        elif any(
+            value is not None
+            for value in (
+                *pair_paths,
+                *pair_values,
+                *contextual_paths,
+                *contextual_values,
+            )
+        ) or contextual_cases:
             raise ValueError(
                 "handcrafted Dynamic Crop v3 continuity cannot bind "
                 "source-pair evidence"
@@ -330,6 +599,15 @@ class RegisteredStageEditProductionBundle:
             ),
         }
 
+    @property
+    def dynamic_crop_v3_motion_authority_qualified(self) -> bool:
+        """Whether this registry carries replayed v3 release-freeze authority."""
+
+        return bool(
+            self.dynamic_crop_version == 3
+            and self.motion_authority_identity_v3 is not None
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "activation": "automatic_registered_production_bundle",
@@ -348,6 +626,17 @@ class RegisteredStageEditProductionBundle:
             "weights_sha256": self.weights_sha256,
             "training_report_sha256": self.training_report_sha256,
             "readiness": self.readiness.to_dict(),
+            "dynamic_crop_v3_motion_authority": {
+                "qualified": self.dynamic_crop_v3_motion_authority_qualified,
+                "legacy_without_motion_authority": (
+                    self.motion_authority_identity_v3 is None
+                ),
+                "identity": (
+                    self.motion_authority_identity_v3.to_dict()
+                    if self.motion_authority_identity_v3 is not None
+                    else None
+                ),
+            },
             "silent_fallback_allowed": False,
         }
         if self.dynamic_crop_version == 3:
@@ -374,6 +663,52 @@ class RegisteredStageEditProductionBundle:
                 "scorer_fingerprint": self.source_pair_scorer_fingerprint,
                 "checkpoint_sha256": self.source_pair_checkpoint_sha256,
                 "corpus_sha256": self.source_pair_corpus_sha256,
+            }
+        elif (
+            self.continuity_authority
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        ):
+            payload["contextual_source_pair_v2"] = {
+                "bundle_directory": str(
+                    self.contextual_source_pair_bundle_directory
+                ),
+                "checkpoint_sha256": (
+                    self.contextual_source_pair_checkpoint_sha256
+                ),
+                "checkpoint_file_sha256": (
+                    self.contextual_source_pair_checkpoint_file_sha256
+                ),
+                "report_sha256": self.contextual_source_pair_report_sha256,
+                "report_file_sha256": (
+                    self.contextual_source_pair_report_file_sha256
+                ),
+                "beam_qa_report_sha256": (
+                    self.contextual_source_pair_beam_qa_report_sha256
+                ),
+                "corpus_sha256": self.contextual_source_pair_corpus_sha256,
+                "corpus_file_sha256": (
+                    self.contextual_source_pair_corpus_file_sha256
+                ),
+                "token_schema_fingerprint": (
+                    self.contextual_source_pair_token_schema_fingerprint
+                ),
+                "scorer_fingerprint": (
+                    self.contextual_source_pair_scorer_fingerprint
+                ),
+                "verified_beam_qa_case_count": len(
+                    self.contextual_source_pair_verified_beam_qa_cases
+                ),
+                "verified_beam_qa_cases": [
+                    {
+                        "case_id": value.case.case_id,
+                        "song_id": value.case.song_id,
+                        "case_sha256": value.case.case_sha256,
+                        "derivation_sha256": (
+                            value.derivation.derivation_sha256
+                        ),
+                    }
+                    for value in self.contextual_source_pair_verified_beam_qa_cases
+                ],
             }
         return payload
 
@@ -426,26 +761,70 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
         schema_version == STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION
         and dynamic_crop_version == 3
     )
-    if not is_v2 and not is_v3:
+    is_contextual_v2 = (
+        schema_version
+        == STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_SCHEMA_VERSION
+        and dynamic_crop_version == 3
+    )
+    is_motion_authority_v3 = (
+        schema_version
+        == STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_SCHEMA_VERSION
+        and dynamic_crop_version == 3
+    )
+    if not any((is_v2, is_v3, is_contextual_v2, is_motion_authority_v3)):
         raise StageEditProductionRegistryError(
             "production registry schema does not match"
         )
     continuity_authority = (
-        payload.get("continuity_authority") if is_v3 else None
+        payload.get("continuity_authority")
+        if is_v3 or is_contextual_v2 or is_motion_authority_v3
+        else None
     )
-    if is_v3 and (
+    if (is_v3 or is_contextual_v2 or is_motion_authority_v3) and (
         not isinstance(continuity_authority, str)
         or continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES
     ):
         raise StageEditProductionRegistryError(
             "production registry continuity authority is unsupported"
         )
+    if is_v3 and continuity_authority == (
+        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+    ):
+        raise StageEditProductionRegistryError(
+            "contextual-v2 continuity requires its strict registry schema"
+        )
+    if is_contextual_v2 and continuity_authority != (
+        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+    ):
+        raise StageEditProductionRegistryError(
+            "contextual-v2 registry continuity authority is unsupported"
+        )
     if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
         v3_expected |= {
             "source_pair_scorer",
             "source_pair_production_report",
         }
-    expected = v2_expected if is_v2 else v3_expected if is_v3 else set()
+    contextual_expected = v3_expected | {
+        "contextual_source_pair_v2",
+        "contextual_beam_qa_cases",
+    }
+    motion_authority_expected = (
+        contextual_expected
+        if continuity_authority
+        == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        else v3_expected
+    ) | {"dynamic_crop_v3_motion_authority"}
+    expected = (
+        v2_expected
+        if is_v2
+        else contextual_expected
+        if is_contextual_v2
+        else motion_authority_expected
+        if is_motion_authority_v3
+        else v3_expected
+        if is_v3
+        else set()
+    )
     if set(payload) != expected:
         raise StageEditProductionRegistryError(
             "production registry schema does not match"
@@ -463,10 +842,23 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
             and payload.get("model_contract")
             == DYNAMIC_CROP_V2_MODEL_CONTRACT
         )
+    elif is_contextual_v2:
+        supported_contract = bool(
+            payload.get("registry_kind")
+            == STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_KIND
+            and payload.get("model_contract") == DYNAMIC_CROP_V3_MODEL_CONTRACT
+        )
     elif is_v3:
         supported_contract = bool(
             payload.get("registry_kind")
             == STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND
+            and payload.get("model_contract")
+            == DYNAMIC_CROP_V3_MODEL_CONTRACT
+        )
+    elif is_motion_authority_v3:
+        supported_contract = bool(
+            payload.get("registry_kind")
+            == STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_KIND
             and payload.get("model_contract")
             == DYNAMIC_CROP_V3_MODEL_CONTRACT
         )
@@ -491,6 +883,17 @@ def _strict_registry_payload(path: Path) -> Mapping[str, Any]:
     }
     if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
         expected_storage_policy["source_pair_absolute_paths_required"] = True
+    elif continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        expected_storage_policy[
+            "contextual_source_pair_bundle_absolute_path_required"
+        ] = True
+        expected_storage_policy[
+            "contextual_beam_qa_artifact_absolute_paths_required"
+        ] = True
+    if is_motion_authority_v3:
+        expected_storage_policy[
+            "dynamic_crop_v3_release_freeze_absolute_path_required"
+        ] = True
     if payload.get("storage_policy") != expected_storage_policy:
         raise StageEditProductionRegistryError(
             "production registry storage policy is unsupported"
@@ -752,6 +1155,149 @@ def _validate_v3_training_report_declarations(
         raise StageEditProductionRegistryNotReadyError(
             "production training report v3 held-out evidence is invalid"
         )
+
+
+def _motion_authority_identity_from_verified_v3_training_report(
+    report: Mapping[str, Any],
+) -> RegisteredStageEditMotionAuthorityIdentityV3 | None:
+    """Replay and derive motion identity after strict report validation.
+
+    The caller must first pass ``report`` through
+    ``_validate_v3_training_report_declarations``.  That validates the complete
+    production-promotion lineage against the exact installed checkpoint.  We
+    then independently replay the release freeze here and bind the small
+    runtime-facing identity; no checkpoint filename or id participates in the
+    authority decision.
+    """
+
+    from .stage_edit_dynamic_crop_v3_production_promotion import (
+        PRODUCTION_PROMOTION_RUN_KIND,
+    )
+
+    if report.get("run_kind") != PRODUCTION_PROMOTION_RUN_KIND:
+        return None
+    from .stage_edit_dynamic_crop_v3_final_release_launcher import (
+        load_dynamic_crop_v3_release_freeze,
+    )
+
+    lineage = report.get("lineage")
+    if not isinstance(lineage, Mapping):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion report lacks release-freeze lineage"
+        )
+    pointer = lineage.get("release_freeze")
+    if not isinstance(pointer, Mapping) or set(pointer) != {
+        "path",
+        "file_sha256",
+    }:
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze pointer is invalid"
+        )
+    raw_path_value = pointer.get("path")
+    pointer_file_sha256 = pointer.get("file_sha256")
+    if (
+        not isinstance(raw_path_value, str)
+        or not raw_path_value.strip()
+        or not isinstance(pointer_file_sha256, str)
+        or _SHA256.fullmatch(pointer_file_sha256) is None
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze identity is invalid"
+        )
+    raw_path = Path(raw_path_value)
+    if not raw_path.is_absolute() or raw_path.is_symlink():
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze path must be absolute and "
+            "non-symlink"
+        )
+    try:
+        release_freeze_path = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            f"production-promotion release freeze is missing: {exc}"
+        ) from exc
+    if release_freeze_path != raw_path or not release_freeze_path.is_file():
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze path is not normalized or safe"
+        )
+    before = release_freeze_path.lstat()
+    if not stat_module.S_ISREG(before.st_mode):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release freeze must be a regular file"
+        )
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    actual_file_sha256 = _file_sha256(release_freeze_path)
+    if not hmac_compare_digest(pointer_file_sha256, actual_file_sha256):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze file identity changed"
+        )
+    try:
+        freeze = load_dynamic_crop_v3_release_freeze(release_freeze_path)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            f"production-promotion release-freeze replay failed: {exc}"
+        ) from exc
+    try:
+        after = release_freeze_path.lstat()
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        after_file_sha256 = _file_sha256(release_freeze_path)
+    except OSError as exc:
+        raise StageEditProductionRegistryNotReadyError(
+            f"production-promotion release freeze changed during replay: {exc}"
+        ) from exc
+    if (
+        not stat_module.S_ISREG(after.st_mode)
+        or after_identity != before_identity
+        or not hmac_compare_digest(actual_file_sha256, after_file_sha256)
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release freeze changed during replay"
+        )
+    source = freeze.get("source_provenance")
+    source_commit_oid = (
+        source.get("head_commit_oid")
+        if isinstance(source, Mapping)
+        else None
+    )
+    release_freeze_content_sha256 = freeze.get("freeze_content_sha256")
+    candidate_id = freeze.get("candidate_id")
+    if (
+        not isinstance(release_freeze_content_sha256, str)
+        or _SHA256.fullmatch(release_freeze_content_sha256) is None
+        or lineage.get("release_freeze_content_sha256")
+        != release_freeze_content_sha256
+        or not isinstance(source_commit_oid, str)
+        or _COMMIT_OID.fullmatch(source_commit_oid) is None
+        or report.get("source_commit") != source_commit_oid
+        or not isinstance(candidate_id, str)
+        or not candidate_id.strip()
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "production-promotion release-freeze lineage identity differs"
+        )
+    return RegisteredStageEditMotionAuthorityIdentityV3(
+        release_freeze_path=release_freeze_path,
+        release_freeze_file_sha256=actual_file_sha256,
+        release_freeze_content_sha256=release_freeze_content_sha256,
+        source_commit_oid=source_commit_oid,
+        candidate_id=candidate_id,
+        motion_logit_threshold=(
+            STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_LOGIT_THRESHOLD_V3
+        ),
+        threshold_freeze_contract=(
+            STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_THRESHOLD_FREEZE_CONTRACT_V3
+        ),
+    )
 
 
 def _validate_source_pair_production_report(
@@ -1062,6 +1608,318 @@ def _registered_source_pair_identity(
     return actual
 
 
+def _contextual_beam_qa_manifest_from_verified_cases(
+    verified_cases: Sequence[object],
+) -> dict[str, Any]:
+    """Serialize only adapter-issued evidence needed for restart replay."""
+
+    from .stage_edit_contextual_beam_qa_adapter_v2 import (
+        require_verified_stage_edit_contextual_beam_qa_case_v2,
+    )
+
+    if isinstance(verified_cases, (str, bytes)) or not isinstance(
+        verified_cases, Sequence
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "contextual-v2 Beam-QA evidence must be a sequence of verified envelopes"
+        )
+    ordered = tuple(
+        sorted(
+            tuple(verified_cases),
+            key=lambda value: (
+                getattr(getattr(value, "case", None), "song_id", ""),
+                getattr(getattr(value, "case", None), "case_id", ""),
+            ),
+        )
+    )
+    if not ordered:
+        raise StageEditProductionRegistryNotReadyError(
+            "contextual-v2 Beam-QA evidence cannot be empty"
+        )
+    entries: list[dict[str, Any]] = []
+    case_sha256s: list[str] = []
+    for value in ordered:
+        try:
+            case = require_verified_stage_edit_contextual_beam_qa_case_v2(value)
+        except Exception as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise StageEditProductionRegistryNotReadyError(
+                "contextual-v2 registration rejects raw or stale Beam-QA DTOs: "
+                f"{exc}"
+            ) from exc
+        derivation = getattr(value, "derivation", None)
+        if derivation is None or not callable(getattr(derivation, "to_dict", None)):
+            raise StageEditProductionRegistryNotReadyError(
+                "contextual-v2 verified Beam-QA envelope lacks derivation evidence"
+            )
+        if not isinstance(case.case_sha256, str):
+            raise StageEditProductionRegistryNotReadyError(
+                "contextual-v2 verified Beam-QA case lacks its digest"
+            )
+        case_sha256s.append(case.case_sha256)
+        entries.append(
+            {
+                "case": case.to_dict(),
+                "derivation": derivation.to_dict(),
+            }
+        )
+    if len(case_sha256s) != len(set(case_sha256s)):
+        raise StageEditProductionRegistryNotReadyError(
+            "contextual-v2 Beam-QA case identities must be unique"
+        )
+    return {
+        "contract": (
+            STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT
+        ),
+        "cases": entries,
+    }
+
+
+def _validated_contextual_source_pair_identity(
+    bundle_directory: Path,
+    verified_beam_qa_cases: Sequence[object],
+) -> dict[str, Any]:
+    """Replay one complete contextual-v2 bundle from fixed sibling artifacts."""
+
+    if isinstance(verified_beam_qa_cases, (str, bytes)) or not isinstance(
+        verified_beam_qa_cases, Sequence
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "contextual-v2 Beam-QA evidence must be a sequence of verified envelopes"
+        )
+    ordered_cases = tuple(
+        sorted(
+            tuple(verified_beam_qa_cases),
+            key=lambda value: (
+                getattr(getattr(value, "case", None), "song_id", ""),
+                getattr(getattr(value, "case", None), "case_id", ""),
+            ),
+        )
+    )
+    raw_directory = Path(bundle_directory)
+    raw_spelling = os.fspath(raw_directory)
+    if (
+        not raw_directory.is_absolute()
+        or os.path.normpath(raw_spelling) != raw_spelling
+        or raw_directory.is_symlink()
+        or not raw_directory.is_dir()
+    ):
+        raise StageEditProductionRegistryNotReadyError(
+            "contextual-v2 bundle directory must be one absolute, normalized, "
+            "non-symlink directory"
+        )
+    artifact_paths = {
+        "corpus": raw_directory
+        / STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CORPUS_FILENAME,
+        "checkpoint": raw_directory
+        / STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CHECKPOINT_FILENAME,
+        "report": raw_directory
+        / STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_REPORT_FILENAME,
+    }
+    for name, path in artifact_paths.items():
+        if path.is_symlink() or not path.is_file():
+            raise StageEditProductionRegistryNotReadyError(
+                f"contextual-v2 {name} artifact is missing or unsafe: {path}"
+            )
+    try:
+        corpus = StageEditContextualTrainingCorpusV2.from_dict(
+            _strict_json_mapping(
+                artifact_paths["corpus"], "contextual-v2 training corpus"
+            )
+        )
+        checkpoint = StageEditContextualSourcePairCheckpointV2.from_dict(
+            _strict_json_mapping(
+                artifact_paths["checkpoint"], "contextual-v2 checkpoint"
+            )
+        )
+        report = StageEditContextualSourcePairProductionReportV2.from_dict(
+            _strict_json_mapping(
+                artifact_paths["report"], "contextual-v2 production report"
+            )
+        )
+        file_sha256s = {
+            name: _file_sha256(path) for name, path in artifact_paths.items()
+        }
+        bundle = load_stage_edit_contextual_source_pair_production_bundle_v2(
+            raw_directory,
+            expected_checkpoint_sha256=checkpoint.checkpoint_sha256,
+            expected_checkpoint_file_sha256=file_sha256s["checkpoint"],
+            expected_report_sha256=report.report_sha256,
+            expected_report_file_sha256=file_sha256s["report"],
+            expected_beam_qa_report_sha256=(
+                report.beam_level_qa.qa_report_sha256
+            ),
+            expected_corpus_sha256=corpus.content_sha256,
+            expected_corpus_file_sha256=file_sha256s["corpus"],
+            expected_token_schema_fingerprint=(
+                checkpoint.token_schema_fingerprint
+            ),
+            verified_beam_qa_cases=ordered_cases,
+        )
+    except Exception as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise StageEditProductionRegistryNotReadyError(
+            f"contextual-v2 production bundle is invalid: {exc}"
+        ) from exc
+    manifest = _contextual_beam_qa_manifest_from_verified_cases(
+        ordered_cases
+    )
+    return {
+        "bundle_directory": str(bundle.directory),
+        "checkpoint_sha256": bundle.checkpoint.checkpoint_sha256,
+        "checkpoint_file_sha256": bundle.checkpoint_file_sha256,
+        "report_sha256": bundle.report.report_sha256,
+        "report_file_sha256": bundle.report_file_sha256,
+        "beam_qa_report_sha256": (
+            bundle.report.beam_level_qa.qa_report_sha256
+        ),
+        "corpus_sha256": bundle.corpus.content_sha256,
+        "corpus_file_sha256": bundle.corpus_file_sha256,
+        "token_schema_fingerprint": (
+            bundle.checkpoint.token_schema_fingerprint
+        ),
+        "scorer_fingerprint": bundle.scorer.fingerprint,
+        "verified_beam_qa_cases": ordered_cases,
+        "beam_qa_manifest": manifest,
+    }
+
+
+def _registered_contextual_source_pair_identity(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reissue QA envelopes and reverify every contextual-v2 artifact."""
+
+    raw_identity = payload.get("contextual_source_pair_v2")
+    raw_manifest = payload.get("contextual_beam_qa_cases")
+    identity_keys = {
+        "bundle_directory",
+        "checkpoint",
+        "production_report",
+        "training_corpus",
+        "token_schema_fingerprint",
+        "scorer_fingerprint",
+    }
+    checkpoint_keys = {"filename", "content_sha256", "file_sha256"}
+    report_keys = {
+        "filename",
+        "content_sha256",
+        "file_sha256",
+        "beam_qa_report_sha256",
+    }
+    corpus_keys = {"filename", "content_sha256", "file_sha256"}
+    if (
+        not isinstance(raw_identity, Mapping)
+        or set(raw_identity) != identity_keys
+        or not isinstance(raw_identity.get("checkpoint"), Mapping)
+        or set(raw_identity["checkpoint"]) != checkpoint_keys
+        or not isinstance(raw_identity.get("production_report"), Mapping)
+        or set(raw_identity["production_report"]) != report_keys
+        or not isinstance(raw_identity.get("training_corpus"), Mapping)
+        or set(raw_identity["training_corpus"]) != corpus_keys
+        or not isinstance(raw_manifest, Mapping)
+        or set(raw_manifest) != {"contract", "cases"}
+        or raw_manifest.get("contract")
+        != STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT
+        or not isinstance(raw_manifest.get("cases"), list)
+        or not raw_manifest["cases"]
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry contextual-v2 evidence is invalid"
+        )
+    directory = raw_identity.get("bundle_directory")
+    if (
+        not isinstance(directory, str)
+        or not directory
+        or not os.path.isabs(directory)
+        or os.path.normpath(directory) != directory
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry contextual-v2 bundle path must be absolute and normalized"
+        )
+    checkpoint_record = raw_identity["checkpoint"]
+    report_record = raw_identity["production_report"]
+    corpus_record = raw_identity["training_corpus"]
+    if (
+        checkpoint_record.get("filename")
+        != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CHECKPOINT_FILENAME
+        or report_record.get("filename")
+        != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_REPORT_FILENAME
+        or corpus_record.get("filename")
+        != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CORPUS_FILENAME
+    ):
+        raise StageEditProductionRegistryError(
+            "production registry contextual-v2 artifact filenames are unsupported"
+        )
+    for value in (
+        checkpoint_record.get("content_sha256"),
+        checkpoint_record.get("file_sha256"),
+        report_record.get("content_sha256"),
+        report_record.get("file_sha256"),
+        report_record.get("beam_qa_report_sha256"),
+        corpus_record.get("content_sha256"),
+        corpus_record.get("file_sha256"),
+        raw_identity.get("token_schema_fingerprint"),
+        raw_identity.get("scorer_fingerprint"),
+    ):
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+            raise StageEditProductionRegistryError(
+                "production registry contextual-v2 SHA-256 identity is invalid"
+            )
+    from .stage_edit_contextual_beam_qa_adapter_v2 import (
+        rehydrate_stage_edit_contextual_beam_qa_case_v2,
+    )
+
+    verified_cases: list[object] = []
+    for entry in raw_manifest["cases"]:
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"case", "derivation"}
+            or not isinstance(entry.get("case"), Mapping)
+            or not isinstance(entry.get("derivation"), Mapping)
+        ):
+            raise StageEditProductionRegistryError(
+                "production registry contextual-v2 Beam-QA case manifest is invalid"
+            )
+        try:
+            verified_cases.append(
+                rehydrate_stage_edit_contextual_beam_qa_case_v2(
+                    case_payload=entry["case"],
+                    derivation_payload=entry["derivation"],
+                )
+            )
+        except Exception as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise StageEditProductionRegistryNotReadyError(
+                f"registered contextual-v2 Beam-QA replay failed: {exc}"
+            ) from exc
+    actual = _validated_contextual_source_pair_identity(
+        Path(directory), tuple(verified_cases)
+    )
+    expected = {
+        "bundle_directory": directory,
+        "checkpoint_sha256": checkpoint_record.get("content_sha256"),
+        "checkpoint_file_sha256": checkpoint_record.get("file_sha256"),
+        "report_sha256": report_record.get("content_sha256"),
+        "report_file_sha256": report_record.get("file_sha256"),
+        "beam_qa_report_sha256": report_record.get("beam_qa_report_sha256"),
+        "corpus_sha256": corpus_record.get("content_sha256"),
+        "corpus_file_sha256": corpus_record.get("file_sha256"),
+        "token_schema_fingerprint": raw_identity.get(
+            "token_schema_fingerprint"
+        ),
+        "scorer_fingerprint": raw_identity.get("scorer_fingerprint"),
+    }
+    observed = {key: actual[key] for key in expected}
+    if observed != expected or actual["beam_qa_manifest"] != dict(raw_manifest):
+        raise StageEditProductionRegistryNotReadyError(
+            "registered contextual-v2 artifact identity changed"
+        )
+    return actual
+
+
 def _registered_montage_profile_identity(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1186,6 +2044,12 @@ def load_registered_stage_edit_production_bundle(
         if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
         else None
     )
+    contextual_identity = (
+        _registered_contextual_source_pair_identity(payload)
+        if continuity_authority
+        == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        else None
+    )
 
     metadata_filename = (
         DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME
@@ -1277,6 +2141,9 @@ def load_registered_stage_edit_production_bundle(
             f"v{dynamic_crop_version} metadata"
         )
 
+    motion_authority_identity_v3: (
+        RegisteredStageEditMotionAuthorityIdentityV3 | None
+    ) = None
     if dynamic_crop_version == 3:
         training_report = _strict_json_mapping(
             evidence["training_report"][0],
@@ -1289,6 +2156,34 @@ def load_registered_stage_edit_production_bundle(
             weight_sha256=evidence["weights"][1],
             checkpoint_directory=checkpoint,
         )
+        if (
+            payload.get("schema_version")
+            == STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_SCHEMA_VERSION
+        ):
+            observed_motion_identity = (
+                _motion_authority_identity_from_verified_v3_training_report(
+                    training_report
+                )
+            )
+            try:
+                registered_motion_identity = (
+                    RegisteredStageEditMotionAuthorityIdentityV3.from_dict(
+                        payload.get("dynamic_crop_v3_motion_authority")
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise StageEditProductionRegistryError(
+                    "production registry v3 motion authority identity is invalid"
+                ) from exc
+            if (
+                observed_motion_identity is None
+                or registered_motion_identity != observed_motion_identity
+            ):
+                raise StageEditProductionRegistryNotReadyError(
+                    "registered v3 motion authority no longer matches the "
+                    "strictly replayed production-promotion release freeze"
+                )
+            motion_authority_identity_v3 = observed_motion_identity
 
     readiness = stage_edit_readiness_report(checkpoint)
     if not (
@@ -1382,6 +2277,62 @@ def load_registered_stage_edit_production_bundle(
             if pair_identity is not None
             else None
         ),
+        contextual_source_pair_bundle_directory=(
+            Path(contextual_identity["bundle_directory"])
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_checkpoint_sha256=(
+            contextual_identity["checkpoint_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_checkpoint_file_sha256=(
+            contextual_identity["checkpoint_file_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_report_sha256=(
+            contextual_identity["report_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_report_file_sha256=(
+            contextual_identity["report_file_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_beam_qa_report_sha256=(
+            contextual_identity["beam_qa_report_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_corpus_sha256=(
+            contextual_identity["corpus_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_corpus_file_sha256=(
+            contextual_identity["corpus_file_sha256"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_token_schema_fingerprint=(
+            contextual_identity["token_schema_fingerprint"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_scorer_fingerprint=(
+            contextual_identity["scorer_fingerprint"]
+            if contextual_identity is not None
+            else None
+        ),
+        contextual_source_pair_verified_beam_qa_cases=(
+            tuple(contextual_identity["verified_beam_qa_cases"])
+            if contextual_identity is not None
+            else ()
+        ),
+        motion_authority_identity_v3=motion_authority_identity_v3,
         registry_sha256=str(payload["registry_sha256"]),
         readiness=readiness,
     )
@@ -1429,6 +2380,8 @@ def register_stage_edit_production_bundle(
     continuity_authority: str | None = None,
     source_pair_scorer_path: Path | None = None,
     source_pair_production_report_path: Path | None = None,
+    contextual_source_pair_bundle_directory: Path | None = None,
+    contextual_source_pair_verified_beam_qa_cases: Sequence[object] | None = None,
 ) -> Path:
     """Install one verified bundle without replacing another active record."""
 
@@ -1462,11 +2415,14 @@ def register_stage_edit_production_bundle(
         if (
             source_pair_scorer_path is not None
             or source_pair_production_report_path is not None
+            or contextual_source_pair_bundle_directory is not None
+            or contextual_source_pair_verified_beam_qa_cases is not None
         ):
             raise StageEditProductionRegistryNotReadyError(
                 "Dynamic Crop v2 cannot register source-pair v3 artifacts"
             )
         pair_identity: dict[str, Any] | None = None
+        contextual_identity: dict[str, Any] | None = None
     elif (
         not isinstance(continuity_authority, str)
         or continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES
@@ -1475,6 +2431,14 @@ def register_stage_edit_production_bundle(
             "Dynamic Crop v3 requires an explicit supported continuity authority"
         )
     elif continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if (
+            contextual_source_pair_bundle_directory is not None
+            or contextual_source_pair_verified_beam_qa_cases is not None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "learned-v1 Dynamic Crop v3 continuity cannot register "
+                "contextual-v2 artifacts"
+            )
         if (
             source_pair_scorer_path is None
             or source_pair_production_report_path is None
@@ -1487,16 +2451,42 @@ def register_stage_edit_production_bundle(
             Path(source_pair_scorer_path),
             Path(source_pair_production_report_path),
         )
+        contextual_identity: dict[str, Any] | None = None
+    elif continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        if (
+            source_pair_scorer_path is not None
+            or source_pair_production_report_path is not None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "contextual-v2 Dynamic Crop v3 continuity cannot register "
+                "learned-v1 artifacts"
+            )
+        if (
+            contextual_source_pair_bundle_directory is None
+            or contextual_source_pair_verified_beam_qa_cases is None
+        ):
+            raise StageEditProductionRegistryNotReadyError(
+                "contextual-v2 Dynamic Crop v3 continuity requires its bundle "
+                "directory and adapter-issued Beam-QA envelopes"
+            )
+        pair_identity = None
+        contextual_identity = _validated_contextual_source_pair_identity(
+            Path(contextual_source_pair_bundle_directory),
+            contextual_source_pair_verified_beam_qa_cases,
+        )
     else:
         if (
             source_pair_scorer_path is not None
             or source_pair_production_report_path is not None
+            or contextual_source_pair_bundle_directory is not None
+            or contextual_source_pair_verified_beam_qa_cases is not None
         ):
             raise StageEditProductionRegistryNotReadyError(
                 "handcrafted Dynamic Crop v3 continuity cannot register "
                 "source-pair artifacts"
             )
         pair_identity = None
+        contextual_identity = None
     raw_montage_profile = Path(professional_montage_grammar_profile_path)
     if not raw_montage_profile.is_absolute():
         raise StageEditProductionRegistryNotReadyError(
@@ -1573,6 +2563,9 @@ def register_stage_edit_production_bundle(
         raise StageEditProductionRegistryNotReadyError(
             "checkpoint metadata weight hash differs from installed weights"
         )
+    motion_authority_identity_v3: (
+        RegisteredStageEditMotionAuthorityIdentityV3 | None
+    ) = None
     if dynamic_crop_version == 3:
         assert isinstance(metadata, StageEditDynamicCropCheckpointMetadataV3)
         training_report = _strict_json_mapping(
@@ -1584,6 +2577,11 @@ def register_stage_edit_production_bundle(
             metadata=metadata,
             weight_sha256=weights_sha,
             checkpoint_directory=checkpoint,
+        )
+        motion_authority_identity_v3 = (
+            _motion_authority_identity_from_verified_v3_training_report(
+                training_report
+            )
         )
         if not (
             readiness.dynamic_crop_version == 3
@@ -1612,6 +2610,8 @@ def register_stage_edit_production_bundle(
             and installed.metadata_sha256 == metadata_sha
             and installed.weights_sha256 == weights_sha
             and installed.training_report_sha256 == report_sha
+            and installed.motion_authority_identity_v3
+            == motion_authority_identity_v3
             and installed.professional_montage_grammar_profile_identity
             == montage_profile
             and (
@@ -1632,7 +2632,48 @@ def register_stage_edit_production_bundle(
                     and installed.source_pair_checkpoint_sha256
                     == pair_identity["checkpoint_sha256"]
                     and installed.source_pair_corpus_sha256
-                    == pair_identity["corpus_sha256"]
+                        == pair_identity["corpus_sha256"]
+                )
+            )
+            and (
+                contextual_identity is None
+                or (
+                    installed.contextual_source_pair_bundle_directory
+                    == Path(contextual_identity["bundle_directory"])
+                    and installed.contextual_source_pair_checkpoint_sha256
+                    == contextual_identity["checkpoint_sha256"]
+                    and installed.contextual_source_pair_checkpoint_file_sha256
+                    == contextual_identity["checkpoint_file_sha256"]
+                    and installed.contextual_source_pair_report_sha256
+                    == contextual_identity["report_sha256"]
+                    and installed.contextual_source_pair_report_file_sha256
+                    == contextual_identity["report_file_sha256"]
+                    and installed.contextual_source_pair_beam_qa_report_sha256
+                    == contextual_identity["beam_qa_report_sha256"]
+                    and installed.contextual_source_pair_corpus_sha256
+                    == contextual_identity["corpus_sha256"]
+                    and installed.contextual_source_pair_corpus_file_sha256
+                    == contextual_identity["corpus_file_sha256"]
+                    and installed.contextual_source_pair_token_schema_fingerprint
+                    == contextual_identity["token_schema_fingerprint"]
+                    and installed.contextual_source_pair_scorer_fingerprint
+                    == contextual_identity["scorer_fingerprint"]
+                    and [
+                        {
+                            "case": value.case.to_dict(),
+                            "derivation": value.derivation.to_dict(),
+                        }
+                        for value in installed.contextual_source_pair_verified_beam_qa_cases
+                    ]
+                    == [
+                        {
+                            "case": value.case.to_dict(),
+                            "derivation": value.derivation.to_dict(),
+                        }
+                        for value in contextual_identity[
+                            "verified_beam_qa_cases"
+                        ]
+                    ]
                 )
             )
         ):
@@ -1643,12 +2684,22 @@ def register_stage_edit_production_bundle(
 
     unsigned: dict[str, Any] = {
         "schema_version": (
-            STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION
+            STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_SCHEMA_VERSION
+            if motion_authority_identity_v3 is not None
+            else STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_SCHEMA_VERSION
+            if continuity_authority
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            else STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION
             if dynamic_crop_version == 3
             else STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION
         ),
         "registry_kind": (
-            STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND
+            STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_KIND
+            if motion_authority_identity_v3 is not None
+            else STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_KIND
+            if continuity_authority
+            == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            else STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND
             if dynamic_crop_version == 3
             else STAGE_EDIT_PRODUCTION_REGISTRY_KIND
         ),
@@ -1687,6 +2738,13 @@ def register_stage_edit_production_bundle(
     if dynamic_crop_version == 3:
         unsigned["dynamic_crop_version"] = 3
         unsigned["continuity_authority"] = continuity_authority
+    if motion_authority_identity_v3 is not None:
+        unsigned["dynamic_crop_v3_motion_authority"] = (
+            motion_authority_identity_v3.to_dict()
+        )
+        unsigned["storage_policy"][
+            "dynamic_crop_v3_release_freeze_absolute_path_required"
+        ] = True
     if continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
         assert pair_identity is not None
         unsigned["source_pair_scorer"] = {
@@ -1706,6 +2764,48 @@ def register_stage_edit_production_bundle(
         }
         unsigned["storage_policy"][
             "source_pair_absolute_paths_required"
+        ] = True
+    elif continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        assert contextual_identity is not None
+        unsigned["contextual_source_pair_v2"] = {
+            "bundle_directory": contextual_identity["bundle_directory"],
+            "checkpoint": {
+                "filename": (
+                    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CHECKPOINT_FILENAME
+                ),
+                "content_sha256": contextual_identity["checkpoint_sha256"],
+                "file_sha256": contextual_identity[
+                    "checkpoint_file_sha256"
+                ],
+            },
+            "production_report": {
+                "filename": STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_REPORT_FILENAME,
+                "content_sha256": contextual_identity["report_sha256"],
+                "file_sha256": contextual_identity["report_file_sha256"],
+                "beam_qa_report_sha256": contextual_identity[
+                    "beam_qa_report_sha256"
+                ],
+            },
+            "training_corpus": {
+                "filename": STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_CORPUS_FILENAME,
+                "content_sha256": contextual_identity["corpus_sha256"],
+                "file_sha256": contextual_identity["corpus_file_sha256"],
+            },
+            "token_schema_fingerprint": contextual_identity[
+                "token_schema_fingerprint"
+            ],
+            "scorer_fingerprint": contextual_identity[
+                "scorer_fingerprint"
+            ],
+        }
+        unsigned["contextual_beam_qa_cases"] = contextual_identity[
+            "beam_qa_manifest"
+        ]
+        unsigned["storage_policy"][
+            "contextual_source_pair_bundle_absolute_path_required"
+        ] = True
+        unsigned["storage_policy"][
+            "contextual_beam_qa_artifact_absolute_paths_required"
         ] = True
     payload = {**unsigned, "registry_sha256": _canonical_sha256(unsigned)}
     encoded = json.dumps(
@@ -1796,10 +2896,18 @@ def register_stage_edit_production_bundle(
 
 
 __all__ = [
+    "RegisteredStageEditMotionAuthorityIdentityV3",
     "RegisteredStageEditProductionBundle",
     "STAGE_EDIT_PRODUCTION_REGISTRY_ENV",
     "STAGE_EDIT_PRODUCTION_REGISTRY_FILENAME",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_KIND",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_V2_SCHEMA_VERSION",
     "STAGE_EDIT_PRODUCTION_REGISTRY_KIND",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_KIND",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_AUTHORITY_V3_SCHEMA_VERSION",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_LOGIT_THRESHOLD_V3",
+    "STAGE_EDIT_PRODUCTION_REGISTRY_MOTION_THRESHOLD_FREEZE_CONTRACT_V3",
     "STAGE_EDIT_PRODUCTION_REGISTRY_SCHEMA_VERSION",
     "STAGE_EDIT_PRODUCTION_REGISTRY_V3_KIND",
     "STAGE_EDIT_PRODUCTION_REGISTRY_V3_SCHEMA_VERSION",

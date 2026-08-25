@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 from crosscut.ive import AspectRatio, EditMode, SourceMode
 from crosscut.pipeline import (
@@ -18,9 +18,14 @@ from crosscut.pipeline import (
     _stage_edit_semimarkov_config_from_montage_policy,
     analyze,
 )
-from crosscut.render import RenderSegment
+from crosscut.render import (
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    RenderSegment,
+)
 from crosscut.request import AnalysisRequest
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
+from crosscut.source_derivative_diversity import SourceDerivativeFamilyMetadata
 from crosscut.stage_edit import StageEdit, StageShot
 from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
 from crosscut.stage_edit_head_materializer import (
@@ -39,12 +44,24 @@ from crosscut.stage_edit_pipeline_bridge import (
     StageEditPipelineBridgeNotReadyError,
     StageEditPipelineBridgePreflight,
     StageEditPipelineBridgeResult,
+    StageEditContextualSourcePairBridgeIdentityV2,
+    _exact_clock_candidate,
+    load_stage_edit_production_snapshot_identity,
     preflight_stage_edit_pipeline_bridge,
     run_stage_edit_pipeline_bridge,
 )
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropTrackDecodeV3,
+)
 from crosscut.stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
+)
+from crosscut.stage_edit_contextual_beam_qa_adapter_v2 import (
+    VerifiedStageEditContextualBeamQACaseV2,
+    derive_stage_edit_contextual_beam_qa_case_v2,
+    is_verified_stage_edit_contextual_beam_qa_case_v2,
 )
 from crosscut.stage_edit_semimarkov_beam import (
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
@@ -64,6 +81,15 @@ from crosscut.stage_edit_source_pair_scorer import (
     new_stage_edit_source_pair_checkpoint,
     save_stage_edit_source_pair_checkpoint,
 )
+from crosscut.stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_FEATURE_NAMES,
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+    StageEditContextualSourcePairScorerV2,
+)
+from crosscut.stage_edit_source_pair_contextual_v2_production import (
+    StageEditContextualBeamQACaseV2,
+    StageEditContextualSourcePairProductionBundleV2,
+)
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     SourceCandidateToken,
@@ -71,7 +97,11 @@ from crosscut.stage_edit_transformer import (
     StageEditSequence,
     StageEditTemporalPoseSidecar,
     StageEditToken,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
+)
+from engine.tests.stage_edit_causal_sensing_test_support import (
+    synthetic_production_snapshot,
 )
 
 
@@ -108,18 +138,22 @@ def _assert_no_raw_pose_vectors(
 
 def _candidate(source_id: str, value: float) -> SourceCandidateToken:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing = tuple(name in causal_names for name in schema.source_feature_names)
     return SourceCandidateToken(
         source_id=source_id,
-        features=(value,) * schema.raw_source_dimension,
-        missing_mask=(False,) * schema.raw_source_dimension,
+        features=tuple(
+            0.0 if is_missing else value for is_missing in missing
+        ),
+        missing_mask=missing,
         available=True,
         hard_gate_passed=True,
     )
 
 
-def _snapshot() -> StageEditFeatureSnapshot:
+def _snapshot_sequence() -> StageEditSequence:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
-    sequence = StageEditSequence(
+    return StageEditSequence(
         "ive:bridge",
         (
             StageEditToken(
@@ -137,7 +171,34 @@ def _snapshot() -> StageEditFeatureSnapshot:
             ),
         ),
     )
-    return StageEditFeatureSnapshot.build(sequence)
+
+
+def _snapshot() -> StageEditFeatureSnapshot:
+    return synthetic_production_snapshot(_snapshot_sequence())
+
+
+def _inspection_snapshot() -> StageEditFeatureSnapshot:
+    return StageEditFeatureSnapshot.build(
+        _snapshot_sequence(),
+        inspection_only_without_causal_sensing=True,
+    )
+
+
+def _snapshot_identity(
+    snapshot: StageEditFeatureSnapshot,
+    path: Path,
+):
+    canonical = Path(path).resolve()
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(
+        json.dumps(snapshot.to_dict(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return load_stage_edit_production_snapshot_identity(
+        canonical,
+        edit_mode="group",
+        target_member=None,
+    )
 
 
 def _ready(checkpoint: Path, *, dynamic_crop_version: int = 2) -> StageEditReadinessReport:
@@ -203,6 +264,79 @@ def _saved_uniform_source_pair_scorer(
         checkpoint.checkpoint_sha256,
         corpus_sha256,
     )
+
+
+def _real_verified_contextual_beam_qa_envelope(
+    root: Path,
+) -> VerifiedStageEditContextualBeamQACaseV2:
+    # Reuse the adapter's filesystem-complete fixture so this bridge test gets
+    # a genuinely adapter-sealed envelope, not a hand-built DTO or mutated
+    # dataclass.  The production bundle loader remains the mocked unit boundary.
+    from engine.tests.test_stage_edit_contextual_beam_qa_adapter_v2 import (
+        _Fixture,
+    )
+
+    fixture = _Fixture(root)
+    with patch(
+        "crosscut.stage_edit_contextual_beam_qa_adapter_v2.evaluate_post_render_qa",
+        return_value=fixture.report,
+    ):
+        verified = derive_stage_edit_contextual_beam_qa_case_v2(
+            semimarkov=fixture.semimarkov,
+            selected_timeline_rank=1,
+            post_render_report=fixture.report,
+            decode_report_path=fixture.decode_path,
+            post_render_report_path=fixture.report_path,
+        )
+    if not is_verified_stage_edit_contextual_beam_qa_case_v2(verified):
+        raise AssertionError("adapter did not issue a verified Beam-QA envelope")
+    return verified
+
+
+def _typed_contextual_bundle_v2(
+    directory: Path,
+    verified: VerifiedStageEditContextualBeamQACaseV2,
+) -> tuple[
+    StageEditContextualSourcePairProductionBundleV2,
+    StageEditContextualSourcePairScorerV2,
+    dict[str, str],
+]:
+    scorer = StageEditContextualSourcePairScorerV2(
+        token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+        weights=(0.0,) * len(STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_FEATURE_NAMES),
+    )
+    pins = {
+        "checkpoint_sha256": "1" * 64,
+        "checkpoint_file_sha256": "2" * 64,
+        "report_sha256": "3" * 64,
+        "report_file_sha256": "4" * 64,
+        "beam_qa_report_sha256": "5" * 64,
+        "corpus_sha256": "6" * 64,
+        "corpus_file_sha256": "7" * 64,
+        "token_schema_fingerprint": DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+    }
+    bundle = create_autospec(
+        StageEditContextualSourcePairProductionBundleV2,
+        instance=True,
+    )
+    bundle.directory = directory
+    bundle.scorer = scorer
+    bundle.checkpoint = SimpleNamespace(
+        checkpoint_sha256=pins["checkpoint_sha256"],
+        token_schema_fingerprint=pins["token_schema_fingerprint"],
+    )
+    bundle.checkpoint_file_sha256 = pins["checkpoint_file_sha256"]
+    bundle.report = SimpleNamespace(
+        report_sha256=pins["report_sha256"],
+        beam_level_qa=SimpleNamespace(
+            qa_report_sha256=pins["beam_qa_report_sha256"],
+            cases=(verified.case,),
+        ),
+    )
+    bundle.report_file_sha256 = pins["report_file_sha256"]
+    bundle.corpus = SimpleNamespace(content_sha256=pins["corpus_sha256"])
+    bundle.corpus_file_sha256 = pins["corpus_file_sha256"]
+    return bundle, scorer, pins
 
 
 def _section_plan() -> SectionPlan:
@@ -459,16 +593,8 @@ def _typed_direct_bridge_result(
     decode_scorer_contract: str | None = None,
     decode_scorer_fingerprint: str | None = None,
 ) -> StageEditPipelineBridgeResult:
-    expected_contract = (
-        preflight.source_pair_scorer.contract
-        if preflight.source_pair_scorer is not None
-        else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-    )
-    expected_fingerprint = (
-        preflight.source_pair_scorer_fingerprint
-        if preflight.source_pair_scorer_fingerprint is not None
-        else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
-    )
+    expected_contract = preflight.continuity_scorer_contract
+    expected_fingerprint = preflight.continuity_scorer_fingerprint
     authority = decode_authority or preflight.continuity_authority
     scorer_contract = decode_scorer_contract or expected_contract
     scorer_fingerprint = decode_scorer_fingerprint or expected_fingerprint
@@ -535,6 +661,11 @@ def _typed_direct_bridge_result(
             "continuity_authority": preflight.continuity_authority,
             "continuity_scorer_contract": expected_contract,
             "continuity_scorer_fingerprint": expected_fingerprint,
+            "contextual_source_pair_identity_v2": (
+                preflight.contextual_source_pair_identity_v2.to_dict()
+                if preflight.contextual_source_pair_identity_v2 is not None
+                else None
+            ),
             "temporal_pose_sidecar": (
                 preflight.snapshot.temporal_pose_sidecar_audit()
             ),
@@ -543,6 +674,168 @@ def _typed_direct_bridge_result(
 
 
 class StageEditPipelineBridgeTests(unittest.TestCase):
+    def test_exact_clock_projection_preserves_typed_v3_decode_or_fails(self) -> None:
+        sources = (
+            Path("/tmp/stageedit-v3-provenance-a.mp4"),
+            Path("/tmp/stageedit-v3-provenance-b.mp4"),
+        )
+        timeline = _typed_timelines(
+            sources,
+            count=1,
+            authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
+            scorer_contract=HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
+            scorer_fingerprint=HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+        )[0]
+        track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.02),
+                EditorialTransformKeyframe(1.5, 1.05),
+            ),
+            reason="stage_edit_dynamic_crop_head_v3",
+        )
+        decoded = DynamicCropTrackDecodeV3(
+            source_id="source-0",
+            source_index=0,
+            eligible=True,
+            loss_masked=False,
+            track=track,
+            predicted_keyframe_count=2,
+            applied_keyframe_count=2,
+            minimum_safe_zoom_projection_count=0,
+            rejection_reasons=(),
+            motion_logit=0.5,
+            shot_duration_seconds=2.0,
+        )
+        decision = SimpleNamespace(
+            **{
+                **vars(timeline.decisions[0]),
+                "editorial_transform": track,
+                "dynamic_crop_decode_v3": decoded,
+            }
+        )
+        shot = replace(
+            timeline.edit.shots[0],
+            segment=replace(
+                timeline.edit.shots[0].segment,
+                editorial_transform=track,
+            ),
+            dynamic_crop_decode_v3=decoded,
+        )
+        exact_timeline = replace(
+            timeline,
+            decisions=(decision,),
+            edit=replace(timeline.edit, shots=(shot,)),
+        )
+        common = {
+            "sources": sources,
+            "source_offsets": (0.0, 0.0),
+            "source_durations": (10.0, 10.0),
+            "internal_cuts": ((), ()),
+            "timewarps": (None, None),
+            "section_plan": _section_plan(),
+            "config": StageEditSemiMarkovConfig(minimum_unique_sources=1),
+            "dynamic_crop_version": 3,
+            "continuity_authority": HANDCRAFTED_CONTINUITY_AUTHORITY,
+        }
+
+        retained = _exact_clock_candidate(timeline=exact_timeline, **common)
+        self.assertIs(
+            decoded,
+            retained.edit.shots[0].dynamic_crop_decode_v3,
+        )
+        self.assertEqual(
+            decoded.to_dict(),
+            retained.edit.shots[0].to_dict()["dynamic_crop_v3"],
+        )
+
+        lost = replace(
+            exact_timeline,
+            edit=replace(
+                exact_timeline.edit,
+                shots=(replace(shot, dynamic_crop_decode_v3=None),),
+            ),
+        )
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeInputError,
+            "lost Dynamic Crop v3 decode provenance",
+        ):
+            _exact_clock_candidate(timeline=lost, **common)
+
+    def test_direct_preflight_replace_scope_and_disk_swap_fail_closed(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        snapshot_path = root / "feature-snapshot.json"
+        checkpoint = root / "checkpoint"
+        snapshot = _snapshot()
+        identity = _snapshot_identity(snapshot, snapshot_path)
+        preflight = StageEditPipelineBridgePreflight(
+            snapshot_path=snapshot_path,
+            checkpoint_directory=checkpoint,
+            source_ids=("source-a", "source-b"),
+            snapshot=snapshot,
+            readiness=_ready(checkpoint),
+            snapshot_identity=identity,
+            edit_mode="group",
+            target_member=None,
+        )
+
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeNotReadyError,
+            "identity or causal scope",
+        ):
+            StageEditPipelineBridgePreflight(
+                snapshot_path=snapshot_path,
+                checkpoint_directory=checkpoint,
+                source_ids=("source-a", "source-b"),
+                snapshot=_inspection_snapshot(),
+                readiness=_ready(checkpoint),
+                snapshot_identity=identity,
+                edit_mode="group",
+                target_member=None,
+            )
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeNotReadyError,
+            "identity or causal scope",
+        ):
+            replace(
+                preflight,
+                edit_mode="member",
+                target_member="가을",
+            )
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeNotReadyError,
+            "identity or causal scope",
+        ):
+            replace(preflight, snapshot=_inspection_snapshot())
+
+        snapshot_path.write_text(
+            json.dumps(_inspection_snapshot().to_dict(), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "crosscut.stage_edit_pipeline_bridge."
+                "materialize_stage_edit_head_frames_v2"
+            ) as materialize_heads,
+            self.assertRaisesRegex(
+                StageEditPipelineBridgeNotReadyError,
+                "disk identity",
+            ),
+        ):
+            run_stage_edit_pipeline_bridge(
+                preflight=preflight,
+                sources=(root / "a.mp4", root / "b.mp4"),
+                source_durations_seconds=(10.0, 10.0),
+                source_start_offsets_seconds=(0.0, 0.0),
+                internal_cut_times_seconds=((), ()),
+                source_timewarps=(None, None),
+                source_quality_log_priors=(0.0, 0.0),
+                section_plan=_section_plan(),
+                output=root / "out.mp4",
+                reference_source=0,
+                config=StageEditSemiMarkovConfig(minimum_unique_sources=1),
+            )
+        materialize_heads.assert_not_called()
+
     def test_bridge_result_recursively_redacts_all_raw_pose_vectors(self) -> None:
         checkpoint = Path("/tmp/stageedit-vector-redaction").resolve()
         preflight = StageEditPipelineBridgePreflight(
@@ -551,6 +844,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=_snapshot(),
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                _snapshot(), Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         result = _typed_direct_bridge_result(preflight)
         sidecar = StageEditTemporalPoseSidecar(
@@ -642,6 +940,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=_snapshot(),
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                _snapshot(), Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         valid = _typed_direct_bridge_result(preflight)
         cases = (
@@ -700,6 +1003,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=_snapshot(),
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                _snapshot(), Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         valid = _typed_direct_bridge_result(preflight)
         wrong = {
@@ -772,6 +1080,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=_snapshot(),
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                _snapshot(), Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         valid = _typed_direct_bridge_result(preflight)
         mismatched_head = replace(
@@ -804,6 +1117,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                 source_ids=("source-a", "source-b"),
                 snapshot=_snapshot(),
                 readiness=readiness,
+                snapshot_identity=_snapshot_identity(
+                    _snapshot(), root / "stageedit-feature.json"
+                ),
+                edit_mode="group",
+                target_member=None,
                 dynamic_crop_version=3,
                 continuity_authority=(
                     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
@@ -836,6 +1154,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=snapshot,
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                snapshot, Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         with self.assertRaisesRegex(
             StageEditPipelineBridgeInputError,
@@ -888,6 +1211,17 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                         feature_snapshot_path=snapshot_path,
                         checkpoint_directory=checkpoint,
                         source_ids=("source-a", "source-c"),
+                    )
+                with self.assertRaisesRegex(
+                    StageEditPipelineBridgeNotReadyError,
+                    "does not match MEMBER",
+                ):
+                    preflight_stage_edit_pipeline_bridge(
+                        feature_snapshot_path=snapshot_path,
+                        checkpoint_directory=checkpoint,
+                        source_ids=("source-a", "source-b"),
+                        edit_mode=EditMode.MEMBER,
+                        target_member="가을",
                     )
             with patch(
                 "crosscut.stage_edit_pipeline_bridge.stage_edit_readiness_report",
@@ -1011,6 +1345,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                 source_ids=("source-a", "source-b"),
                 snapshot=_snapshot(),
                 readiness=_ready(checkpoint, dynamic_crop_version=3),
+                snapshot_identity=_snapshot_identity(
+                    _snapshot(), Path("/tmp/stageedit-direct-v3.json")
+                ),
+                edit_mode="group",
+                target_member=None,
                 dynamic_crop_version=3,
                 continuity_authority=(
                     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
@@ -1101,6 +1440,351 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                     source_pair_corpus_sha256=corpus_digest,
                 )
 
+    def test_contextual_v2_preflight_and_generation_use_verified_bundle_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as raw:
+            root = Path(raw)
+            envelope_root = root / "verified-beam-qa"
+            envelope_root.mkdir()
+            verified = _real_verified_contextual_beam_qa_envelope(envelope_root)
+            bundle_directory = root / "contextual-bundle"
+            bundle_directory.mkdir()
+            bundle, scorer, pins = _typed_contextual_bundle_v2(
+                bundle_directory,
+                verified,
+            )
+            snapshot = _snapshot()
+            snapshot_path = snapshot.write_json(root / "snapshot.json")
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "dynamic-crop-v3-metadata.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            config = StageEditSemiMarkovConfig(
+                minimum_unique_sources=1,
+                continuity_authority=(
+                    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                ),
+                continuity_scorer_contract=(
+                    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+                ),
+                continuity_scorer_fingerprint=scorer.fingerprint,
+            )
+            sources = (
+                Path("/tmp/contextual-stageedit-a.mp4"),
+                Path("/tmp/contextual-stageedit-b.mp4"),
+            )
+            timelines = _typed_timelines(
+                sources,
+                count=config.timeline_count,
+                authority=PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
+                scorer_contract=(
+                    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+                ),
+                scorer_fingerprint=scorer.fingerprint,
+            )
+            decoded = _typed_decode_result(
+                timelines,
+                config=config,
+                scorer_contract=(
+                    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+                ),
+                scorer_fingerprint=scorer.fingerprint,
+                request_fulfilled=True,
+            )
+            derivative_metadata = SourceDerivativeFamilyMetadata(
+                source_count=2,
+                family_ids=(0, 1),
+                audit_sha256="8" * 64,
+                production_ready=True,
+                uncertain_pair_count=0,
+                clock_contract_complete=True,
+            )
+            with (
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge.stage_edit_readiness_report",
+                    return_value=_ready(checkpoint, dynamic_crop_version=3),
+                ),
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "load_stage_edit_contextual_source_pair_production_bundle_v2",
+                    return_value=bundle,
+                ) as load_bundle,
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "materialize_stage_edit_head_frames_v3",
+                    return_value=_typed_head_result(
+                        checkpoint,
+                        dynamic_crop_version=3,
+                    ),
+                ) as materialize_v3,
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "materialize_stage_edit_head_frames_v2"
+                ) as materialize_v2,
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "decode_stage_edit_semimarkov_beam",
+                    return_value=decoded,
+                ) as decode,
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "build_learned_section_plan_from_checkpoint",
+                    return_value=_typed_section_director(
+                        dynamic_crop_version=3
+                    ),
+                ),
+            ):
+                preflight = preflight_stage_edit_pipeline_bridge(
+                    feature_snapshot_path=snapshot_path,
+                    checkpoint_directory=checkpoint,
+                    source_ids=("source-a", "source-b"),
+                    dynamic_crop_version=3,
+                    continuity_authority=(
+                        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                    ),
+                    contextual_source_pair_bundle_directory=bundle_directory,
+                    contextual_source_pair_checkpoint_sha256=(
+                        pins["checkpoint_sha256"]
+                    ),
+                    contextual_source_pair_checkpoint_file_sha256=(
+                        pins["checkpoint_file_sha256"]
+                    ),
+                    contextual_source_pair_report_sha256=pins["report_sha256"],
+                    contextual_source_pair_report_file_sha256=(
+                        pins["report_file_sha256"]
+                    ),
+                    contextual_source_pair_beam_qa_report_sha256=(
+                        pins["beam_qa_report_sha256"]
+                    ),
+                    contextual_source_pair_corpus_sha256=pins["corpus_sha256"],
+                    contextual_source_pair_corpus_file_sha256=(
+                        pins["corpus_file_sha256"]
+                    ),
+                    contextual_source_pair_token_schema_fingerprint=(
+                        pins["token_schema_fingerprint"]
+                    ),
+                    contextual_source_pair_verified_beam_qa_cases=(verified,),
+                )
+                result = run_stage_edit_pipeline_bridge(
+                    preflight=preflight,
+                    sources=sources,
+                    source_durations_seconds=(10.0, 10.0),
+                    source_start_offsets_seconds=(0.0, 0.0),
+                    internal_cut_times_seconds=((), ()),
+                    source_timewarps=(None, None),
+                    source_quality_log_priors=(0.0, 0.0),
+                    source_derivative_metadata=derivative_metadata,
+                    section_plan=_section_plan(),
+                    output=Path("/tmp/contextual-stageedit-result.mp4"),
+                    reference_source=0,
+                    fps=30.0,
+                    config=config,
+                )
+
+            self.assertIsInstance(
+                preflight.contextual_source_pair_identity_v2,
+                StageEditContextualSourcePairBridgeIdentityV2,
+            )
+            self.assertIs(preflight.contextual_source_pair_scorer_v2, scorer)
+            self.assertEqual(
+                preflight.contextual_source_pair_scorer_fingerprint_v2,
+                scorer.fingerprint,
+            )
+            self.assertEqual(load_bundle.call_count, 2)
+            expected_loader_kwargs = {
+                "expected_checkpoint_sha256": pins["checkpoint_sha256"],
+                "expected_checkpoint_file_sha256": pins[
+                    "checkpoint_file_sha256"
+                ],
+                "expected_report_sha256": pins["report_sha256"],
+                "expected_report_file_sha256": pins["report_file_sha256"],
+                "expected_beam_qa_report_sha256": pins[
+                    "beam_qa_report_sha256"
+                ],
+                "expected_corpus_sha256": pins["corpus_sha256"],
+                "expected_corpus_file_sha256": pins["corpus_file_sha256"],
+                "expected_token_schema_fingerprint": pins[
+                    "token_schema_fingerprint"
+                ],
+                "verified_beam_qa_cases": (verified,),
+            }
+            for call in load_bundle.call_args_list:
+                self.assertEqual(call.args, (bundle_directory,))
+                self.assertEqual(call.kwargs, expected_loader_kwargs)
+            materialize_v3.assert_called_once()
+            materialize_v2.assert_not_called()
+            self.assertEqual(
+                materialize_v3.call_args.kwargs[
+                    "derivative_family_id_by_source"
+                ],
+                {"source-a": 0, "source-b": 1},
+            )
+            self.assertIsNone(decode.call_args.kwargs["source_pair_scorer"])
+            self.assertIs(
+                decode.call_args.kwargs["contextual_source_pair_scorer_v2"],
+                scorer,
+            )
+            self.assertIs(
+                decode.call_args.kwargs["source_derivative_metadata"],
+                derivative_metadata,
+            )
+            contextual_identity = preflight.contextual_source_pair_identity_v2
+            assert contextual_identity is not None
+            expected_identity_payload = contextual_identity.to_dict()
+            self.assertEqual(
+                result.selection_policy[
+                    "contextual_source_pair_identity_v2"
+                ],
+                expected_identity_payload,
+            )
+            self.assertEqual(
+                result.semimarkov.audit.config["continuity_authority"],
+                PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
+            )
+            self.assertEqual(
+                result.semimarkov.audit.score_provenance[
+                    "boundary_continuity"
+                ]["scorer_fingerprint"],
+                scorer.fingerprint,
+            )
+            self.assertEqual(
+                result.selection_policy["source_derivative_policy"],
+                "verified_actual_pts_families_required",
+            )
+            serialized = result.to_dict()
+            self.assertEqual(
+                serialized["activation"]["continuity"]
+                ["contextual_source_pair_identity_v2"],
+                expected_identity_payload,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "contextual-v2 selection identity differs",
+            ):
+                replace(
+                    result,
+                    selection_policy={
+                        **result.selection_policy,
+                        "contextual_source_pair_identity_v2": {},
+                    },
+                )
+            tampered_audit = replace(
+                result.semimarkov.audit,
+                config={
+                    **result.semimarkov.audit.config,
+                    "continuity_scorer_fingerprint": "f" * 64,
+                },
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "audit config continuity identity differs",
+            ):
+                replace(
+                    result,
+                    semimarkov=replace(
+                        result.semimarkov,
+                        audit=tampered_audit,
+                    ),
+                )
+
+    def test_contextual_v2_raw_or_partial_activation_evidence_fails_closed(
+        self,
+    ) -> None:
+        from engine.tests.test_stage_edit_contextual_beam_qa_adapter_v2 import (
+            _raw_passing_case,
+        )
+
+        raw_case: StageEditContextualBeamQACaseV2 = _raw_passing_case()
+        common = {
+            "feature_snapshot_path": Path("/tmp/missing-contextual-snapshot.json"),
+            "checkpoint_directory": Path("/tmp/missing-contextual-checkpoint"),
+            "source_ids": ("source-a", "source-b"),
+            "dynamic_crop_version": 3,
+            "continuity_authority": (
+                PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            ),
+            "contextual_source_pair_bundle_directory": Path(
+                "/tmp/missing-contextual-bundle"
+            ),
+            "contextual_source_pair_checkpoint_sha256": "1" * 64,
+            "contextual_source_pair_checkpoint_file_sha256": "2" * 64,
+            "contextual_source_pair_report_sha256": "3" * 64,
+            "contextual_source_pair_report_file_sha256": "4" * 64,
+            "contextual_source_pair_beam_qa_report_sha256": "5" * 64,
+            "contextual_source_pair_corpus_sha256": "6" * 64,
+            "contextual_source_pair_corpus_file_sha256": "7" * 64,
+            "contextual_source_pair_token_schema_fingerprint": (
+                DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+            ),
+            "contextual_source_pair_verified_beam_qa_cases": (raw_case,),
+        }
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeInputError,
+            "raw case DTOs are inspection-only",
+        ):
+            preflight_stage_edit_pipeline_bridge(**common)
+
+        partial = dict(common)
+        partial["contextual_source_pair_verified_beam_qa_cases"] = (object(),)
+        partial.pop("contextual_source_pair_report_file_sha256")
+        with self.assertRaisesRegex(
+            StageEditPipelineBridgeInputError,
+            "requires complete corpus/checkpoint/report",
+        ):
+            preflight_stage_edit_pipeline_bridge(**partial)
+
+        fake_bundle = create_autospec(
+            StageEditContextualSourcePairProductionBundleV2,
+            instance=True,
+        )
+        with self.assertRaisesRegex(ValueError, "issued by production preflight"):
+            StageEditContextualSourcePairBridgeIdentityV2(
+                directory=Path("/tmp/missing-contextual-bundle"),
+                checkpoint_sha256="1" * 64,
+                checkpoint_file_sha256="2" * 64,
+                report_sha256="3" * 64,
+                report_file_sha256="4" * 64,
+                beam_qa_report_sha256="5" * 64,
+                corpus_sha256="6" * 64,
+                corpus_file_sha256="7" * 64,
+                token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+                scorer_fingerprint="8" * 64,
+                verified_beam_qa_cases=(),
+                _bundle=fake_bundle,
+                _seal=object(),
+            )
+        contextual_scorer = StageEditContextualSourcePairScorerV2(
+            token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+            weights=(0.0,)
+            * len(STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_FEATURE_NAMES),
+        )
+        with self.assertRaisesRegex(ValueError, "complete sealed identity"):
+            StageEditPipelineBridgePreflight(
+                snapshot_path=Path(
+                    "/tmp/contextual-partial-snapshot.json"
+                ).resolve(),
+                checkpoint_directory=Path("/tmp/contextual-partial-checkpoint"),
+                source_ids=("source-a", "source-b"),
+                snapshot=_snapshot(),
+                readiness=_ready(
+                    Path("/tmp/contextual-partial-checkpoint"),
+                    dynamic_crop_version=3,
+                ),
+                snapshot_identity=_snapshot_identity(
+                    _snapshot(), Path("/tmp/contextual-partial-snapshot.json")
+                ),
+                edit_mode="group",
+                target_member=None,
+                dynamic_crop_version=3,
+                continuity_authority=(
+                    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                ),
+                contextual_source_pair_scorer_v2=contextual_scorer,
+            )
+
     def test_generation_retains_parallel_candidates_and_never_selects_baseline(self):
         snapshot = _snapshot()
         checkpoint = Path("/tmp/stageedit-bridge-ready").resolve()
@@ -1110,6 +1794,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=snapshot,
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                snapshot, Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         sources = (
             Path("/tmp/stageedit-a.mp4"),
@@ -1174,9 +1863,9 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             direct_sections.call_args.kwargs["checkpoint_directory"],
             preflight.checkpoint_directory,
         )
-        self.assertEqual(STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION, 4)
-        self.assertTrue(STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT.endswith("_v4"))
-        self.assertEqual(result.schema_version, 4)
+        self.assertEqual(STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION, 5)
+        self.assertTrue(STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT.endswith("_v5"))
+        self.assertEqual(result.schema_version, 5)
         self.assertEqual(result.contract, STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT)
         self.assertEqual(8, len(result.retained_candidates))
         self.assertFalse(result.selection_policy["selected_for_render"])
@@ -1214,6 +1903,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
                 source_ids=("source-a", "source-b"),
                 snapshot=snapshot,
                 readiness=_ready(checkpoint, dynamic_crop_version=3),
+                snapshot_identity=_snapshot_identity(
+                    snapshot, root / "stageedit-v3-feature.json"
+                ),
+                edit_mode="group",
+                target_member=None,
                 dynamic_crop_version=3,
                 continuity_authority=PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
                 source_pair_scorer=scorer,
@@ -1282,6 +1976,9 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
         materialize_v3.assert_called_once()
         materialize_v2.assert_not_called()
         self.assertIs(decode.call_args.kwargs["source_pair_scorer"], scorer)
+        self.assertIsNone(
+            decode.call_args.kwargs["contextual_source_pair_scorer_v2"]
+        )
         self.assertIs(decode.call_args.kwargs["config"], config)
         self.assertEqual(result.preflight.dynamic_crop_version, 3)
         self.assertEqual(
@@ -1353,6 +2050,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=snapshot,
             readiness=_ready(checkpoint, dynamic_crop_version=3),
+            snapshot_identity=_snapshot_identity(
+                snapshot, Path("/tmp/stageedit-v3-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
             dynamic_crop_version=3,
             continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
         )
@@ -1409,6 +2111,9 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
         materialize_v3.assert_called_once()
         materialize_v2.assert_not_called()
         self.assertIsNone(decode.call_args.kwargs["source_pair_scorer"])
+        self.assertIsNone(
+            decode.call_args.kwargs["contextual_source_pair_scorer_v2"]
+        )
 
     def test_requested_decode_shortfall_fails_without_visual_fallback(self):
         snapshot = _snapshot()
@@ -1419,6 +2124,11 @@ class StageEditPipelineBridgeTests(unittest.TestCase):
             source_ids=("source-a", "source-b"),
             snapshot=snapshot,
             readiness=_ready(checkpoint),
+            snapshot_identity=_snapshot_identity(
+                snapshot, Path("/tmp/stageedit-feature.json")
+            ),
+            edit_mode="group",
+            target_member=None,
         )
         config = StageEditSemiMarkovConfig(minimum_unique_sources=1)
         decoded = _typed_decode_result(
@@ -1537,6 +2247,8 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                     request.stage_edit_generation_checkpoint_directory
                 ),
                 source_ids=request.stage_edit_generation_source_ids,
+                edit_mode=EditMode.GROUP,
+                target_member=None,
                 dynamic_crop_version=2,
                 continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
             )
@@ -1575,6 +2287,8 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 feature_snapshot_path=request.stage_edit_generation_feature_snapshot,
                 checkpoint_directory=checkpoint,
                 source_ids=request.stage_edit_generation_source_ids,
+                edit_mode=EditMode.GROUP,
+                target_member=None,
                 dynamic_crop_version=3,
                 continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
             )
@@ -1722,6 +2436,22 @@ class StageEditGenerationRequestTests(unittest.TestCase):
             snapshot = SimpleNamespace(
                 snapshot_path=(root / "snapshot.json").resolve(),
                 source_ids=tuple(f"source-{index}" for index in range(8)),
+                statistics={},
+            )
+            causal_artifacts = object()
+            causal = SimpleNamespace(
+                stage_edit_artifacts=causal_artifacts,
+                require_exact_inference_snapshot_binding=(
+                    lambda observed: {
+                        "exact_inference_snapshot_binding_verified": (
+                            observed is snapshot
+                        )
+                    }
+                ),
+            )
+            persisted_audit = SimpleNamespace(
+                path=(root / "causal-sensing-audit.json").resolve(),
+                to_dict=lambda: {"content_sha256": "f" * 64},
             )
             preflight = SimpleNamespace(
                 readiness=SimpleNamespace(checkpoint_path=str(checkpoint))
@@ -1739,17 +2469,27 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                     return_value=snapshot,
                 ) as materialize,
                 patch(
+                    "crosscut.pipeline."
+                    "materialize_ive_causal_sensing_for_stage_edit_pipeline",
+                    return_value=causal,
+                ) as causal_materialize,
+                patch(
+                    "crosscut.pipeline.write_ive_causal_sensing_pipeline_audit",
+                    return_value=persisted_audit,
+                ) as write_causal_audit,
+                patch(
                     "crosscut.pipeline.preflight_stage_edit_pipeline_bridge",
                     return_value=preflight,
                 ) as preflight_call,
             ):
-                observed_snapshot, observed_preflight = (
+                observed_snapshot, observed_preflight, observed_audit = (
                     _materialize_registered_stage_edit_preflight(
                         bundle=bundle,
                         request=request,
                         alignment=alignment,
                         alignment_eligibility=eligibility,
                         source_timewarps=(None,) * 8,
+                        source_scene_cut_times=((),) * 8,
                         timing_draft=timing,
                         rhythm=rhythm,
                         section_plan=sections,
@@ -1758,6 +2498,7 @@ class StageEditGenerationRequestTests(unittest.TestCase):
 
             self.assertIs(observed_snapshot, snapshot)
             self.assertIs(observed_preflight, preflight)
+            self.assertIs(observed_audit, persisted_audit)
             materialize.assert_called_once_with(
                 song_id=request.song,
                 sources=request.sources,
@@ -1775,11 +2516,27 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 feature_cache_directory=request.source_cache_directory,
                 maximum_sequence_length=2048,
                 maximum_sources=32,
+                causal_sensing=causal_artifacts,
+                edit_mode=EditMode.GROUP,
+                target_member=None,
+            )
+            causal_materialize.assert_called_once()
+            write_causal_audit.assert_called_once_with(
+                pipeline_result=causal,
+                inference_snapshot=snapshot,
+                artifact_directory=(
+                    request.source_cache_directory
+                    / "derived"
+                    / "stage-edit-inference-v1"
+                    / "causal-sensing-audit"
+                ),
             )
             preflight_call.assert_called_once_with(
                 feature_snapshot_path=snapshot.snapshot_path,
                 checkpoint_directory=checkpoint,
                 source_ids=snapshot.source_ids,
+                edit_mode=EditMode.GROUP,
+                target_member=None,
                 dynamic_crop_version=2,
                 continuity_authority=HANDCRAFTED_CONTINUITY_AUTHORITY,
             )
@@ -1819,6 +2576,22 @@ class StageEditGenerationRequestTests(unittest.TestCase):
             snapshot = SimpleNamespace(
                 snapshot_path=(root / "current-snapshot.json").resolve(),
                 source_ids=tuple(f"source-{index}" for index in range(8)),
+                statistics={},
+            )
+            causal_artifacts = object()
+            causal = SimpleNamespace(
+                stage_edit_artifacts=causal_artifacts,
+                require_exact_inference_snapshot_binding=(
+                    lambda observed: {
+                        "exact_inference_snapshot_binding_verified": (
+                            observed is snapshot
+                        )
+                    }
+                ),
+            )
+            persisted_audit = SimpleNamespace(
+                path=(root / "causal-sensing-audit.json").resolve(),
+                to_dict=lambda: {"content_sha256": "f" * 64},
             )
             preflight = SimpleNamespace(
                 readiness=SimpleNamespace(checkpoint_path=str(checkpoint))
@@ -1827,6 +2600,15 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 patch(
                     "crosscut.pipeline.materialize_stage_edit_inference_snapshot",
                     return_value=snapshot,
+                ),
+                patch(
+                    "crosscut.pipeline."
+                    "materialize_ive_causal_sensing_for_stage_edit_pipeline",
+                    return_value=causal,
+                ),
+                patch(
+                    "crosscut.pipeline.write_ive_causal_sensing_pipeline_audit",
+                    return_value=persisted_audit,
                 ),
                 patch(
                     "crosscut.pipeline.preflight_stage_edit_pipeline_bridge",
@@ -1841,6 +2623,7 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                         {"render_eligible": True} for _ in range(8)
                     ),
                     source_timewarps=(None,) * 8,
+                    source_scene_cut_times=((),) * 8,
                     timing_draft=object(),
                     rhythm=object(),
                     section_plan=object(),
@@ -1849,6 +2632,8 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 feature_snapshot_path=snapshot.snapshot_path,
                 checkpoint_directory=checkpoint,
                 source_ids=snapshot.source_ids,
+                edit_mode=EditMode.GROUP,
+                target_member=None,
                 dynamic_crop_version=3,
                 continuity_authority=(
                     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY

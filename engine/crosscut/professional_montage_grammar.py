@@ -29,7 +29,11 @@ from typing import Any, Mapping, Sequence
 from .stage_edit_feature_materializer import (
     FEATURE_MATERIALIZER_CONTRACT,
     FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+    STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+    StageEditCausalSensingBinding,
     StageEditFeatureSnapshot,
+    validate_production_causal_sensing_gate_payload,
 )
 from .stage_edit_feature_snapshot_job import (
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
@@ -53,6 +57,14 @@ ROLE_SEMANTICS = "acoustic_editing_roles_not_ground_truth_lyrical_sections"
 SHOT_SCALE_FEATURE_NAME = "shot_scale"
 WIDE_MAX_EXCLUSIVE = 0.22
 MEDIUM_MAX_EXCLUSIVE = 0.52
+BOUNDARY_GRAMMAR_SCHEMA_VERSION = 1
+BOUNDARY_GRAMMAR_ANALYSIS_BASIS = (
+    "ive_professional_cross_source_boundary_grammar_v1"
+)
+HIGHLIGHT_BURST_EXEMPLAR_CUTS_PER_MINUTE = 60.0
+APPLIED_TRANSFORM_SEGMENT_COUNT_BASIS = (
+    "segment_with_exact_zoom_pan_or_roll_onset_or_active_value_change_v1"
+)
 
 ROLE_NAMES = (
     "intro",
@@ -81,6 +93,8 @@ _FEATURE_MANIFEST_KEYS = {
     "source_content",
     "supervision_inputs",
     "feature_provenance",
+    "causal_sensing_binding",
+    "production_causal_sensing_gate",
     "snapshots",
     "statistics",
     "manifest_sha256",
@@ -363,6 +377,866 @@ class MontageGrammarConfig:
                 "reference_floor_quantile",
             ),
         )
+
+
+_SECTION_KINDS = ("general", "chorus", "highlight")
+
+
+def _strict_seconds(
+    values: Sequence[float],
+    *,
+    duration_seconds: float,
+    name: str,
+) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise MontageGrammarEvidenceError(f"{name} must be an array")
+    seconds = tuple(_finite(item, f"{name} value") for item in values)
+    if tuple(sorted(seconds)) != seconds or len(set(seconds)) != len(seconds):
+        raise MontageGrammarEvidenceError(
+            f"{name} must be strictly increasing and unique"
+        )
+    if any(not 0.0 < item < duration_seconds for item in seconds):
+        raise MontageGrammarEvidenceError(
+            f"{name} values must lie strictly inside the performance span"
+        )
+    return seconds
+
+
+def _strict_transform_event_seconds(
+    values: Sequence[float],
+    *,
+    duration_seconds: float,
+    name: str,
+) -> tuple[float, ...]:
+    """Validate exact transform-onset clocks on the output timeline.
+
+    Unlike cut clocks, an editorial transform may already be active on the
+    first rendered frame.  The performance endpoint is still excluded because
+    no output frame exists after it.  Multiple onsets may belong to one
+    Dynamic Crop trajectory, so this validator intentionally does not collapse
+    or cap events by transformed-segment count; the typed professional policy
+    applies the bounded whole-plan density limits later.
+    """
+
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise MontageGrammarEvidenceError(f"{name} must be an array")
+    seconds = tuple(_finite(item, f"{name} value") for item in values)
+    if tuple(sorted(seconds)) != seconds or len(set(seconds)) != len(seconds):
+        raise MontageGrammarEvidenceError(
+            f"{name} must be strictly increasing and unique"
+        )
+    if any(not 0.0 <= item < duration_seconds for item in seconds):
+        raise MontageGrammarEvidenceError(
+            f"{name} values must lie in [0, performance duration)"
+        )
+    return seconds
+
+
+@dataclass(frozen=True, slots=True)
+class MontageSectionWindow:
+    """One non-overlapping acoustic/editing section on the output clock."""
+
+    section_id: str
+    kind: str
+    start_seconds: float
+    end_seconds: float
+
+    def __post_init__(self) -> None:
+        section_id = str(self.section_id).strip()
+        if not section_id or any(character.isspace() for character in section_id):
+            raise MontageGrammarEvidenceError(
+                "section_id must be non-blank and contain no whitespace"
+            )
+        kind = str(self.kind).strip()
+        if kind not in _SECTION_KINDS:
+            raise MontageGrammarEvidenceError(
+                f"section kind must be one of {_SECTION_KINDS}"
+            )
+        start = _finite(self.start_seconds, "section start_seconds")
+        end = _finite(self.end_seconds, "section end_seconds")
+        if start < 0.0 or end <= start:
+            raise MontageGrammarEvidenceError("section span must be positive")
+        object.__setattr__(self, "section_id", section_id)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "start_seconds", start)
+        object.__setattr__(self, "end_seconds", end)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "section_id": self.section_id,
+            "kind": self.kind,
+            "start_seconds": self.start_seconds,
+            "end_seconds": self.end_seconds,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "MontageSectionWindow":
+        _exact_keys(
+            value,
+            {"section_id", "kind", "start_seconds", "end_seconds"},
+            "montage section window",
+        )
+        return cls(
+            section_id=str(value["section_id"]),
+            kind=str(value["kind"]),
+            start_seconds=_finite(value["start_seconds"], "section start_seconds"),
+            end_seconds=_finite(value["end_seconds"], "section end_seconds"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IntroducedBoundaryContinuityEvidence:
+    """Decoded review evidence for newly introduced cross-source boundaries."""
+
+    boundary_count: int
+    issue_count: int
+    issue_fraction: float
+    score_p10: float | None
+
+    def __post_init__(self) -> None:
+        boundary_count = _integer(self.boundary_count, "introduced boundary_count")
+        issue_count = _integer(self.issue_count, "introduced issue_count")
+        issue_fraction = _finite(
+            self.issue_fraction,
+            "introduced issue_fraction",
+        )
+        if boundary_count < 0 or not 0 <= issue_count <= boundary_count:
+            raise MontageGrammarEvidenceError(
+                "introduced boundary issue counts are inconsistent"
+            )
+        expected_fraction = (
+            issue_count / boundary_count if boundary_count else 0.0
+        )
+        if not math.isclose(
+            issue_fraction,
+            expected_fraction,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise MontageGrammarEvidenceError(
+                "introduced issue_fraction does not match the exact counts"
+            )
+        if boundary_count:
+            if self.score_p10 is None:
+                raise MontageGrammarEvidenceError(
+                    "introduced score_p10 is required when boundaries exist"
+                )
+            score_p10 = _finite(self.score_p10, "introduced score_p10")
+            if not 0.0 <= score_p10 <= 100.0:
+                raise MontageGrammarEvidenceError(
+                    "introduced score_p10 must lie in [0, 100]"
+                )
+        else:
+            if self.score_p10 is not None:
+                raise MontageGrammarEvidenceError(
+                    "introduced score_p10 must be null when no boundaries exist"
+                )
+            score_p10 = None
+        object.__setattr__(self, "boundary_count", boundary_count)
+        object.__setattr__(self, "issue_count", issue_count)
+        object.__setattr__(self, "issue_fraction", issue_fraction)
+        object.__setattr__(self, "score_p10", score_p10)
+
+    @classmethod
+    def from_counts(
+        cls,
+        *,
+        boundary_count: int,
+        issue_count: int,
+        score_p10: float | None,
+    ) -> "IntroducedBoundaryContinuityEvidence":
+        fraction = issue_count / boundary_count if boundary_count else 0.0
+        return cls(boundary_count, issue_count, fraction, score_p10)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "boundary_count": self.boundary_count,
+            "issue_count": self.issue_count,
+            "issue_fraction": self.issue_fraction,
+            "score_p10": self.score_p10,
+        }
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "IntroducedBoundaryContinuityEvidence":
+        _exact_keys(
+            value,
+            {"boundary_count", "issue_count", "issue_fraction", "score_p10"},
+            "introduced-boundary continuity evidence",
+        )
+        return cls(
+            boundary_count=_integer(value["boundary_count"], "boundary_count"),
+            issue_count=_integer(value["issue_count"], "issue_count"),
+            issue_fraction=_finite(value["issue_fraction"], "issue_fraction"),
+            score_p10=(
+                None
+                if value["score_p10"] is None
+                else _finite(value["score_p10"], "score_p10")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialTransformEvidence:
+    """Finite render-plan transform evidence with exact visible event clocks.
+
+    ``applied_segment_count`` counts segments containing at least one visible
+    zoom, pan, or roll onset/value change.  Merely attaching a constant learned
+    framing track to every segment does not turn every shot into an editorial
+    motion event.
+    """
+
+    segment_count: int
+    applied_segment_count: int
+    zoom_event_times_seconds: tuple[float, ...] = ()
+    pan_event_times_seconds: tuple[float, ...] = ()
+    roll_event_times_seconds: tuple[float, ...] = ()
+
+    def validated(self, *, duration_seconds: float) -> "EditorialTransformEvidence":
+        segment_count = _integer(self.segment_count, "transform segment_count")
+        applied = _integer(
+            self.applied_segment_count,
+            "transform applied_segment_count",
+        )
+        if segment_count < 1 or not 0 <= applied <= segment_count:
+            raise MontageGrammarEvidenceError(
+                "transform segment counts are inconsistent"
+            )
+        zoom = _strict_transform_event_seconds(
+            self.zoom_event_times_seconds,
+            duration_seconds=duration_seconds,
+            name="zoom event times",
+        )
+        pan = _strict_transform_event_seconds(
+            self.pan_event_times_seconds,
+            duration_seconds=duration_seconds,
+            name="pan event times",
+        )
+        roll = _strict_transform_event_seconds(
+            self.roll_event_times_seconds,
+            duration_seconds=duration_seconds,
+            name="roll event times",
+        )
+        if not applied and any((zoom, pan, roll)):
+            raise MontageGrammarEvidenceError(
+                "transform events require an applied transform segment"
+            )
+        if applied > len(zoom) + len(pan) + len(roll):
+            raise MontageGrammarEvidenceError(
+                "each applied transform segment requires at least one exact event"
+            )
+        return EditorialTransformEvidence(
+            segment_count=segment_count,
+            applied_segment_count=applied,
+            zoom_event_times_seconds=zoom,
+            pan_event_times_seconds=pan,
+            roll_event_times_seconds=roll,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_count": self.segment_count,
+            "applied_segment_count": self.applied_segment_count,
+            "applied_segment_count_basis": (
+                APPLIED_TRANSFORM_SEGMENT_COUNT_BASIS
+            ),
+            "zoom_event_times_seconds": list(self.zoom_event_times_seconds),
+            "pan_event_times_seconds": list(self.pan_event_times_seconds),
+            "roll_event_times_seconds": list(self.roll_event_times_seconds),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "EditorialTransformEvidence":
+        _exact_keys(
+            value,
+            {
+                "segment_count",
+                "applied_segment_count",
+                "applied_segment_count_basis",
+                "zoom_event_times_seconds",
+                "pan_event_times_seconds",
+                "roll_event_times_seconds",
+            },
+            "editorial transform evidence",
+        )
+        if value["applied_segment_count_basis"] != (
+            APPLIED_TRANSFORM_SEGMENT_COUNT_BASIS
+        ):
+            raise MontageGrammarEvidenceError(
+                "editorial transform applied-segment count basis mismatch"
+            )
+        return cls(
+            segment_count=_integer(value["segment_count"], "segment_count"),
+            applied_segment_count=_integer(
+                value["applied_segment_count"],
+                "applied_segment_count",
+            ),
+            zoom_event_times_seconds=tuple(
+                _finite(item, "zoom event time")
+                for item in _array(
+                    value["zoom_event_times_seconds"],
+                    "zoom event times",
+                )
+            ),
+            pan_event_times_seconds=tuple(
+                _finite(item, "pan event time")
+                for item in _array(
+                    value["pan_event_times_seconds"],
+                    "pan event times",
+                )
+            ),
+            roll_event_times_seconds=tuple(
+                _finite(item, "roll event time")
+                for item in _array(
+                    value["roll_event_times_seconds"],
+                    "roll event times",
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalBoundaryGrammarEvidence:
+    """Identity-free clocks and decoded QA needed for boundary assessment."""
+
+    performance_id: str
+    duration_seconds: float
+    source_switch_times_seconds: tuple[float, ...]
+    native_internal_cut_times_seconds: tuple[float, ...]
+    sections: tuple[MontageSectionWindow, ...]
+    introduced_boundary_continuity: IntroducedBoundaryContinuityEvidence
+    editorial_transforms: EditorialTransformEvidence
+
+    def __post_init__(self) -> None:
+        performance_id = str(self.performance_id).strip()
+        if not performance_id or any(
+            character.isspace() for character in performance_id
+        ):
+            raise MontageGrammarEvidenceError(
+                "performance_id must be non-blank and contain no whitespace"
+            )
+        duration = _finite(self.duration_seconds, "performance duration_seconds")
+        if duration <= 0.0:
+            raise MontageGrammarEvidenceError(
+                "performance duration_seconds must be positive"
+            )
+        switches = _strict_seconds(
+            self.source_switch_times_seconds,
+            duration_seconds=duration,
+            name="source-switch times",
+        )
+        native = _strict_seconds(
+            self.native_internal_cut_times_seconds,
+            duration_seconds=duration,
+            name="native/internal cut times",
+        )
+        if set(switches).intersection(native):
+            raise MontageGrammarEvidenceError(
+                "source switches and native/internal cuts must be disjoint"
+            )
+        sections = tuple(self.sections)
+        if not all(isinstance(item, MontageSectionWindow) for item in sections):
+            raise MontageGrammarEvidenceError(
+                "sections must contain MontageSectionWindow values"
+            )
+        if tuple(sorted(sections, key=lambda item: item.start_seconds)) != sections:
+            raise MontageGrammarEvidenceError("sections must be ordered by start")
+        if not sections:
+            raise MontageGrammarEvidenceError(
+                "sections must partition the complete performance span"
+            )
+        if len({item.section_id for item in sections}) != len(sections):
+            raise MontageGrammarEvidenceError("section_id values must be unique")
+        if not math.isclose(
+            sections[0].start_seconds,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise MontageGrammarEvidenceError(
+                "sections must begin at the performance start"
+            )
+        for index, section in enumerate(sections):
+            if section.end_seconds > duration + 1e-12:
+                raise MontageGrammarEvidenceError(
+                    "section extends beyond the performance span"
+                )
+            if index and not math.isclose(
+                sections[index - 1].end_seconds,
+                section.start_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise MontageGrammarEvidenceError(
+                    "sections must be contiguous and non-overlapping"
+                )
+        if not math.isclose(
+            sections[-1].end_seconds,
+            duration,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise MontageGrammarEvidenceError(
+                "sections must end at the performance end"
+            )
+        continuity = self.introduced_boundary_continuity
+        if not isinstance(continuity, IntroducedBoundaryContinuityEvidence):
+            raise MontageGrammarEvidenceError(
+                "introduced_boundary_continuity has the wrong type"
+            )
+        if continuity.boundary_count != len(switches):
+            raise MontageGrammarEvidenceError(
+                "introduced boundary_count must equal the source-switch count"
+            )
+        transforms = self.editorial_transforms
+        if not isinstance(transforms, EditorialTransformEvidence):
+            raise MontageGrammarEvidenceError(
+                "editorial_transforms has the wrong type"
+            )
+        transforms = transforms.validated(duration_seconds=duration)
+        object.__setattr__(self, "performance_id", performance_id)
+        object.__setattr__(self, "duration_seconds", duration)
+        object.__setattr__(self, "source_switch_times_seconds", switches)
+        object.__setattr__(self, "native_internal_cut_times_seconds", native)
+        object.__setattr__(self, "sections", sections)
+        object.__setattr__(self, "editorial_transforms", transforms)
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": BOUNDARY_GRAMMAR_SCHEMA_VERSION,
+            "analysis_basis": BOUNDARY_GRAMMAR_ANALYSIS_BASIS,
+            "performance_id": self.performance_id,
+            "duration_seconds": self.duration_seconds,
+            "source_switch_times_seconds": list(self.source_switch_times_seconds),
+            "native_internal_cut_times_seconds": list(
+                self.native_internal_cut_times_seconds
+            ),
+            "sections": [item.to_dict() for item in self.sections],
+            "introduced_boundary_continuity": (
+                self.introduced_boundary_continuity.to_dict()
+            ),
+            "editorial_transforms": self.editorial_transforms.to_dict(),
+        }
+
+    @property
+    def evidence_sha256(self) -> str:
+        return _canonical_sha256(self._unsigned_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self._unsigned_dict()
+        payload["evidence_sha256"] = self.evidence_sha256
+        return payload
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "ProfessionalBoundaryGrammarEvidence":
+        expected = {
+            "schema_version",
+            "analysis_basis",
+            "performance_id",
+            "duration_seconds",
+            "source_switch_times_seconds",
+            "native_internal_cut_times_seconds",
+            "sections",
+            "introduced_boundary_continuity",
+            "editorial_transforms",
+            "evidence_sha256",
+        }
+        _exact_keys(value, expected, "professional boundary grammar evidence")
+        if value["schema_version"] != BOUNDARY_GRAMMAR_SCHEMA_VERSION:
+            raise MontageGrammarEvidenceError(
+                "boundary grammar evidence schema version mismatch"
+            )
+        if value["analysis_basis"] != BOUNDARY_GRAMMAR_ANALYSIS_BASIS:
+            raise MontageGrammarEvidenceError(
+                "boundary grammar evidence analysis basis mismatch"
+            )
+        claimed_hash = value["evidence_sha256"]
+        if not _is_sha256(claimed_hash):
+            raise MontageGrammarEvidenceError(
+                "boundary grammar evidence SHA-256 is invalid"
+            )
+        unsigned = dict(value)
+        unsigned.pop("evidence_sha256")
+        if _canonical_sha256(unsigned) != claimed_hash:
+            raise MontageGrammarEvidenceError(
+                "boundary grammar evidence content hash mismatch"
+            )
+        evidence = cls(
+            performance_id=str(value["performance_id"]),
+            duration_seconds=_finite(value["duration_seconds"], "duration_seconds"),
+            source_switch_times_seconds=tuple(
+                _finite(item, "source-switch time")
+                for item in _array(
+                    value["source_switch_times_seconds"],
+                    "source-switch times",
+                )
+            ),
+            native_internal_cut_times_seconds=tuple(
+                _finite(item, "native/internal cut time")
+                for item in _array(
+                    value["native_internal_cut_times_seconds"],
+                    "native/internal cut times",
+                )
+            ),
+            sections=tuple(
+                MontageSectionWindow.from_mapping(
+                    _mapping(item, "montage section window")
+                )
+                for item in _array(value["sections"], "sections")
+            ),
+            introduced_boundary_continuity=(
+                IntroducedBoundaryContinuityEvidence.from_mapping(
+                    _mapping(
+                        value["introduced_boundary_continuity"],
+                        "introduced-boundary continuity evidence",
+                    )
+                )
+            ),
+            editorial_transforms=EditorialTransformEvidence.from_mapping(
+                _mapping(value["editorial_transforms"], "editorial transforms")
+            ),
+        )
+        if evidence.evidence_sha256 != claimed_hash:
+            raise MontageGrammarEvidenceError(
+                "boundary grammar evidence failed strict round-trip"
+            )
+        return evidence
+
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalBoundaryGrammarPolicy:
+    """Finite professional floors; the 60/min exemplar is not a general floor."""
+
+    minimum_whole_song_source_switches_per_minute: float = 12.0
+    minimum_chorus_source_switches_per_minute: float = 18.0
+    minimum_highlight_source_switches_per_minute: float = 24.0
+    maximum_chorus_no_switch_gap_seconds: float = 4.0
+    maximum_highlight_no_switch_gap_seconds: float = 2.75
+    maximum_introduced_boundary_issue_fraction: float = 0.25
+    minimum_introduced_boundary_score_p10: float = 70.0
+    minimum_editorial_transform_segment_fraction: float = 0.08
+    maximum_editorial_transform_segment_fraction: float = 0.35
+    minimum_zoom_pan_events_per_segment: float = 0.05
+    maximum_zoom_pan_events_per_segment: float = 0.50
+    maximum_roll_events_per_applied_segment: float = 0.20
+
+    def __post_init__(self) -> None:
+        positive = (
+            "minimum_whole_song_source_switches_per_minute",
+            "minimum_chorus_source_switches_per_minute",
+            "minimum_highlight_source_switches_per_minute",
+            "maximum_chorus_no_switch_gap_seconds",
+            "maximum_highlight_no_switch_gap_seconds",
+            "minimum_introduced_boundary_score_p10",
+        )
+        for name in positive:
+            if _finite(getattr(self, name), name) <= 0.0:
+                raise MontageGrammarEvidenceError(f"{name} must be positive")
+        unit = (
+            "maximum_introduced_boundary_issue_fraction",
+            "minimum_editorial_transform_segment_fraction",
+            "maximum_editorial_transform_segment_fraction",
+            "minimum_zoom_pan_events_per_segment",
+            "maximum_zoom_pan_events_per_segment",
+            "maximum_roll_events_per_applied_segment",
+        )
+        for name in unit:
+            value = _finite(getattr(self, name), name)
+            if not 0.0 <= value <= 1.0:
+                raise MontageGrammarEvidenceError(f"{name} must lie in [0, 1]")
+        if self.minimum_introduced_boundary_score_p10 > 100.0:
+            raise MontageGrammarEvidenceError(
+                "minimum_introduced_boundary_score_p10 must lie in (0, 100]"
+            )
+        if (
+            self.minimum_editorial_transform_segment_fraction
+            > self.maximum_editorial_transform_segment_fraction
+            or self.minimum_zoom_pan_events_per_segment
+            > self.maximum_zoom_pan_events_per_segment
+        ):
+            raise MontageGrammarEvidenceError(
+                "minimum transform coverage cannot exceed its maximum"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        } | {
+            "roll_allowed_section_kinds": ["chorus", "highlight"],
+            "highlight_burst_exemplar": {
+                "reference": "I_AM_51_to_57_seconds",
+                "cuts_per_minute": HIGHLIGHT_BURST_EXEMPLAR_CUTS_PER_MINUTE,
+                "used_as_general_section_minimum": False,
+                "used_as_whole_song_minimum": False,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SectionBoundaryAssessment:
+    section_id: str
+    kind: str
+    duration_seconds: float
+    source_switch_count: int
+    source_switches_per_minute: float
+    maximum_no_switch_gap_seconds: float
+    minimum_required_source_switches_per_minute: float | None
+    maximum_allowed_no_switch_gap_seconds: float | None
+    passed: bool
+    failure_reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: (
+                list(value) if name == "failure_reasons" else value
+            )
+            for name, value in (
+                (field, getattr(self, field))
+                for field in self.__dataclass_fields__
+            )
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ProfessionalBoundaryGrammarAssessment:
+    passed: bool
+    failure_reasons: tuple[str, ...]
+    source_switch_count: int
+    source_switches_per_minute: float
+    native_internal_cut_count: int
+    native_internal_cuts_per_minute: float
+    total_visible_cut_count: int
+    total_visible_cuts_per_minute: float
+    introduced_boundary_issue_fraction: float
+    introduced_boundary_score_p10: float | None
+    editorial_transform_segment_fraction: float
+    zoom_pan_events_per_segment: float
+    roll_events_per_applied_segment: float
+    section_assessments: tuple[SectionBoundaryAssessment, ...]
+    evidence_sha256: str
+    policy: ProfessionalBoundaryGrammarPolicy
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": BOUNDARY_GRAMMAR_SCHEMA_VERSION,
+            "analysis_basis": BOUNDARY_GRAMMAR_ANALYSIS_BASIS,
+            "passed": self.passed,
+            "failure_reasons": list(self.failure_reasons),
+            "cadence": {
+                "source_switch_count": self.source_switch_count,
+                "source_switches_per_minute": self.source_switches_per_minute,
+                "native_internal_cut_count": self.native_internal_cut_count,
+                "native_internal_cuts_per_minute": (
+                    self.native_internal_cuts_per_minute
+                ),
+                "total_visible_cut_count": self.total_visible_cut_count,
+                "total_visible_cuts_per_minute": self.total_visible_cuts_per_minute,
+                "native_cuts_satisfy_source_switch_policy": False,
+            },
+            "introduced_boundary_continuity": {
+                "issue_fraction": self.introduced_boundary_issue_fraction,
+                "score_p10": self.introduced_boundary_score_p10,
+            },
+            "editorial_transforms": {
+                "applied_segment_fraction": (
+                    self.editorial_transform_segment_fraction
+                ),
+                "applied_segment_fraction_basis": (
+                    APPLIED_TRANSFORM_SEGMENT_COUNT_BASIS
+                ),
+                "zoom_pan_events_per_segment": self.zoom_pan_events_per_segment,
+                "roll_events_per_applied_segment": (
+                    self.roll_events_per_applied_segment
+                ),
+                "roll_allowed_section_kinds": ["chorus", "highlight"],
+            },
+            "sections": [item.to_dict() for item in self.section_assessments],
+            "evidence_sha256": self.evidence_sha256,
+            "policy": self.policy.to_dict(),
+        }
+
+
+def _section_switch_times(
+    switch_times: Sequence[float],
+    section: MontageSectionWindow,
+) -> tuple[float, ...]:
+    return tuple(
+        item
+        for item in switch_times
+        if section.start_seconds <= item < section.end_seconds
+    )
+
+
+def _maximum_section_gap(
+    switch_times: Sequence[float],
+    section: MontageSectionWindow,
+) -> float:
+    clocks = (section.start_seconds, *switch_times, section.end_seconds)
+    return max(right - left for left, right in zip(clocks, clocks[1:]))
+
+
+def _section_kind_at(
+    seconds: float,
+    sections: Sequence[MontageSectionWindow],
+) -> str:
+    for section in sections:
+        if section.start_seconds <= seconds < section.end_seconds:
+            return section.kind
+    return "general"
+
+
+def assess_professional_boundary_grammar(
+    evidence: ProfessionalBoundaryGrammarEvidence,
+    *,
+    policy: ProfessionalBoundaryGrammarPolicy | None = None,
+) -> ProfessionalBoundaryGrammarAssessment:
+    """Fail closed on sparse/rough source changes without counting native cuts.
+
+    The I AM 51--57 second 60 cuts/min observation calibrates the existence of
+    a highlight burst. It is intentionally neither the whole-song nor the
+    ordinary-section floor.
+    """
+
+    if not isinstance(evidence, ProfessionalBoundaryGrammarEvidence):
+        raise MontageGrammarEvidenceError(
+            "boundary grammar evidence must be typed and validated"
+        )
+    settings = policy or ProfessionalBoundaryGrammarPolicy()
+    if not isinstance(settings, ProfessionalBoundaryGrammarPolicy):
+        raise MontageGrammarEvidenceError(
+            "boundary grammar policy must be typed and validated"
+        )
+    duration = evidence.duration_seconds
+    source_count = len(evidence.source_switch_times_seconds)
+    native_count = len(evidence.native_internal_cut_times_seconds)
+    source_rate = source_count / duration * 60.0
+    native_rate = native_count / duration * 60.0
+    total_count = source_count + native_count
+    total_rate = total_count / duration * 60.0
+    failures: list[str] = []
+    if source_rate + 1e-12 < (
+        settings.minimum_whole_song_source_switches_per_minute
+    ):
+        failures.append("whole_song_source_switch_density_below_minimum")
+
+    section_results: list[SectionBoundaryAssessment] = []
+    for section in evidence.sections:
+        switch_times = _section_switch_times(
+            evidence.source_switch_times_seconds,
+            section,
+        )
+        section_duration = section.end_seconds - section.start_seconds
+        section_rate = len(switch_times) / section_duration * 60.0
+        maximum_gap = _maximum_section_gap(switch_times, section)
+        minimum_rate: float | None = None
+        maximum_gap_allowed: float | None = None
+        section_failures: list[str] = []
+        if section.kind == "chorus":
+            minimum_rate = settings.minimum_chorus_source_switches_per_minute
+            maximum_gap_allowed = settings.maximum_chorus_no_switch_gap_seconds
+        elif section.kind == "highlight":
+            minimum_rate = settings.minimum_highlight_source_switches_per_minute
+            maximum_gap_allowed = settings.maximum_highlight_no_switch_gap_seconds
+        if minimum_rate is not None and section_rate + 1e-12 < minimum_rate:
+            section_failures.append(
+                f"{section.kind}_source_switch_density_below_minimum"
+            )
+        if (
+            maximum_gap_allowed is not None
+            and maximum_gap > maximum_gap_allowed + 1e-12
+        ):
+            section_failures.append(
+                f"{section.kind}_no_switch_gap_above_maximum"
+            )
+        failures.extend(section_failures)
+        section_results.append(
+            SectionBoundaryAssessment(
+                section_id=section.section_id,
+                kind=section.kind,
+                duration_seconds=section_duration,
+                source_switch_count=len(switch_times),
+                source_switches_per_minute=section_rate,
+                maximum_no_switch_gap_seconds=maximum_gap,
+                minimum_required_source_switches_per_minute=minimum_rate,
+                maximum_allowed_no_switch_gap_seconds=maximum_gap_allowed,
+                passed=not section_failures,
+                failure_reasons=tuple(section_failures),
+            )
+        )
+
+    continuity = evidence.introduced_boundary_continuity
+    if continuity.issue_fraction > (
+        settings.maximum_introduced_boundary_issue_fraction + 1e-12
+    ):
+        failures.append("introduced_boundary_issue_fraction_above_maximum")
+    if (
+        continuity.boundary_count
+        and continuity.score_p10 is not None
+        and continuity.score_p10 + 1e-12
+        < settings.minimum_introduced_boundary_score_p10
+    ):
+        failures.append("introduced_boundary_score_p10_below_minimum")
+
+    transforms = evidence.editorial_transforms
+    applied_fraction = (
+        transforms.applied_segment_count / transforms.segment_count
+    )
+    zoom_pan_rate = (
+        len(transforms.zoom_event_times_seconds)
+        + len(transforms.pan_event_times_seconds)
+    ) / transforms.segment_count
+    roll_rate = (
+        len(transforms.roll_event_times_seconds)
+        / transforms.applied_segment_count
+        if transforms.applied_segment_count
+        else 0.0
+    )
+    if applied_fraction + 1e-12 < (
+        settings.minimum_editorial_transform_segment_fraction
+    ):
+        failures.append("editorial_transform_coverage_below_minimum")
+    if applied_fraction > (
+        settings.maximum_editorial_transform_segment_fraction + 1e-12
+    ):
+        failures.append("editorial_transform_coverage_above_maximum")
+    if zoom_pan_rate + 1e-12 < settings.minimum_zoom_pan_events_per_segment:
+        failures.append("zoom_pan_coverage_below_minimum")
+    if zoom_pan_rate > settings.maximum_zoom_pan_events_per_segment + 1e-12:
+        failures.append("zoom_pan_coverage_above_maximum")
+    if roll_rate > settings.maximum_roll_events_per_applied_segment + 1e-12:
+        failures.append("roll_fraction_above_maximum")
+    if any(
+        _section_kind_at(seconds, evidence.sections)
+        not in {"chorus", "highlight"}
+        for seconds in transforms.roll_event_times_seconds
+    ):
+        failures.append("roll_outside_allowed_section")
+
+    unique_failures = tuple(dict.fromkeys(failures))
+    return ProfessionalBoundaryGrammarAssessment(
+        passed=not unique_failures,
+        failure_reasons=unique_failures,
+        source_switch_count=source_count,
+        source_switches_per_minute=source_rate,
+        native_internal_cut_count=native_count,
+        native_internal_cuts_per_minute=native_rate,
+        total_visible_cut_count=total_count,
+        total_visible_cuts_per_minute=total_rate,
+        introduced_boundary_issue_fraction=continuity.issue_fraction,
+        introduced_boundary_score_p10=continuity.score_p10,
+        editorial_transform_segment_fraction=applied_fraction,
+        zoom_pan_events_per_segment=zoom_pan_rate,
+        roll_events_per_applied_segment=roll_rate,
+        section_assessments=tuple(section_results),
+        evidence_sha256=evidence.evidence_sha256,
+        policy=settings,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1632,9 +2506,56 @@ def _load_feature_manifest(
     if (
         provenance.get("producer") != FEATURE_MATERIALIZER_CONTRACT
         or set(_array(provenance.get("contracts"), "feature contracts"))
-        != set(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS)
+        != {
+            *FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+            STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+            STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+        }
     ):
         raise MontageGrammarEvidenceError("feature provenance contract mismatch")
+    try:
+        sensing_gate = validate_production_causal_sensing_gate_payload(
+            _mapping(
+                payload.get("production_causal_sensing_gate"),
+                "production causal-sensing gate",
+            ),
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MontageGrammarEvidenceError(
+            f"feature production causal-sensing gate is invalid: {exc}"
+        ) from exc
+    if not (
+        sensing_gate["edit_mode"] == "group"
+        and sensing_gate["target_member"] is None
+        and sensing_gate["member_feature_mode"] == "group_no_target"
+    ):
+        raise MontageGrammarEvidenceError(
+            "professional montage grammar requires group_no_target sensing"
+        )
+    try:
+        manifest_binding = StageEditCausalSensingBinding.from_dict(
+            _mapping(
+                payload.get("causal_sensing_binding"),
+                "causal-sensing binding",
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise MontageGrammarEvidenceError(
+            f"feature causal-sensing binding is invalid: {exc}"
+        ) from exc
+    if not (
+        manifest_binding.shooting_grammar_content_sha256
+        == sensing_gate["shooting_grammar_content_sha256"]
+        and manifest_binding.member_state_graph_content_sha256
+        == sensing_gate["member_state_graph_content_sha256"]
+        and manifest_binding.ive_performer_state_content_sha256
+        == sensing_gate["ive_performer_state_content_sha256"]
+        and manifest_binding.target_member is None
+    ):
+        raise MontageGrammarEvidenceError(
+            "feature causal-sensing binding/gate mismatch"
+        )
     source_count = _integer(payload.get("source_count"), "source_count")
     if source_count < config.minimum_sources_per_song:
         raise MontageGrammarEvidenceError("feature manifest source count is too small")
@@ -1724,6 +2645,13 @@ def _build_song(
         config,
         outputs,
     )
+    sensing_gate = validate_production_causal_sensing_gate_payload(
+        _mapping(
+            feature_manifest.get("production_causal_sensing_gate"),
+            "production causal-sensing gate",
+        ),
+        schema=DEFAULT_STAGE_EDIT_SCHEMA,
+    )
     contract = _mapping(materialization["input_contract"], "input contract")
     if feature_manifest.get("source_count") != contract.get(
         "expected_source_count"
@@ -1794,7 +2722,21 @@ def _build_song(
         if snapshot.snapshot_sha256 != record.get("snapshot_sha256"):
             raise MontageGrammarEvidenceError("snapshot internal hash mismatch")
         if snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
-            raise MontageGrammarEvidenceError("snapshot schema is not v3")
+            raise MontageGrammarEvidenceError("snapshot schema is not current")
+        try:
+            snapshot_gate = snapshot.require_production_causal_sensing(
+                edit_mode="group",
+                target_member=None,
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+        except (TypeError, ValueError) as exc:
+            raise MontageGrammarEvidenceError(
+                f"snapshot production causal sensing is invalid: {exc}"
+            ) from exc
+        if snapshot_gate != sensing_gate:
+            raise MontageGrammarEvidenceError(
+                "snapshot/manifest causal-sensing binding mismatch"
+            )
         if len(snapshot.sequence.tokens) != record.get("token_count"):
             raise MontageGrammarEvidenceError("snapshot token count mismatch")
         expected_sequence = f"stageedit-features:{item.song_id}:{reference_id}"
@@ -2931,15 +3873,27 @@ class ProfessionalMontageGrammarProfile:
 
 
 __all__ = [
+    "APPLIED_TRANSFORM_SEGMENT_COUNT_BASIS",
+    "BOUNDARY_GRAMMAR_ANALYSIS_BASIS",
+    "BOUNDARY_GRAMMAR_SCHEMA_VERSION",
+    "EditorialTransformEvidence",
+    "HIGHLIGHT_BURST_EXEMPLAR_CUTS_PER_MINUTE",
+    "IntroducedBoundaryContinuityEvidence",
     "MEDIUM_MAX_EXCLUSIVE",
+    "MontageSectionWindow",
     "MontageGrammarConfig",
     "MontageGrammarEvidenceError",
     "MontageSongInput",
     "PROFILE_ANALYSIS_BASIS",
     "PROFILE_SCHEMA_VERSION",
+    "ProfessionalBoundaryGrammarAssessment",
+    "ProfessionalBoundaryGrammarEvidence",
+    "ProfessionalBoundaryGrammarPolicy",
     "ProfessionalMontageGrammarProfile",
     "ROLE_NAMES",
+    "SectionBoundaryAssessment",
     "SHOT_SIZE_NAMES",
     "WIDE_MAX_EXCLUSIVE",
+    "assess_professional_boundary_grammar",
     "build_professional_montage_grammar_profile",
 ]

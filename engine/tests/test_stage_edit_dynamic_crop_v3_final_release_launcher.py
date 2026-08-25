@@ -45,6 +45,76 @@ class DynamicCropV3FinalReleaseLauncherTests(unittest.TestCase):
             if candidate.candidate_name == release.SELECTED_CANDIDATE_NAME
         )
 
+    def test_final_fit_corpus_loader_is_explicitly_group_scoped(self) -> None:
+        candidate = self._candidate()
+        reference_ids_by_song = {
+            song: (f"{song}-ref",) for song in SELECTION_SONG_IDS
+        }
+        supervision_paths_by_song = {
+            song: {f"{song}-ref": Path(f"/tmp/{song}-reference.json")}
+            for song in SELECTION_SONG_IDS
+        }
+        snapshot_paths_by_song = {
+            song: {f"{song}-ref": Path(f"/tmp/{song}-snapshot.json")}
+            for song in SELECTION_SONG_IDS
+        }
+        preflight = SimpleNamespace(
+            candidate_id=candidate.candidate_id,
+            reference_ids_by_song=reference_ids_by_song,
+            supervision_paths_by_song=supervision_paths_by_song,
+            snapshot_paths_by_song=snapshot_paths_by_song,
+            dynamic_manifest_paths_by_song={
+                song: Path(f"/tmp/{song}-dynamic.json")
+                for song in SELECTION_SONG_IDS
+            },
+            checkpoint_directory=Path("/tmp/final-fit-checkpoint"),
+            frozen_dynamic_crop_v3_prior_candidate_step=200,
+            frozen_cut_probability_threshold=0.5,
+            quality_thresholds={},
+            release_freeze_path=Path("/tmp/release-freeze.json"),
+            release_freeze_file_sha256="f" * 64,
+            source_commit="test-commit",
+        )
+        corpus = SimpleNamespace(examples=())
+        expected = object()
+        with (
+            patch.object(release, "_snapshot_map", return_value={}),
+            patch.object(
+                release,
+                "load_reference_training_corpus",
+                return_value=corpus,
+            ) as load_corpus,
+            patch.object(
+                release,
+                "_dynamic_artifact_map",
+                return_value={},
+            ),
+            patch.object(
+                release,
+                "build_stage_edit_dynamic_crop_training_corpus_v2",
+                return_value=object(),
+            ),
+            patch.object(
+                release,
+                "build_stage_edit_dynamic_crop_training_corpus_v3",
+                return_value=object(),
+            ),
+            patch.object(
+                release,
+                "train_dynamic_crop_v3_final_fit",
+                return_value=expected,
+            ),
+        ):
+            result = release._execute_final_fit(preflight)
+        self.assertIs(expected, result)
+        self.assertEqual(
+            "group",
+            load_corpus.call_args.kwargs["production_edit_mode"],
+        )
+        self.assertIsNone(
+            load_corpus.call_args.kwargs["production_target_member"]
+        )
+
     def _loso_fixture(self, root: Path):
         candidate = self._candidate()
         plan_path = root / "capacity-plan.json"

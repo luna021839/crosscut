@@ -415,6 +415,7 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                     boundary_guard_seconds=0.2,
                     max_sources=8,
                     working_width=320,
+                    inspection_only_without_causal_sensing=True,
                 )
                 poisoned_result = build_stage_edit_feature_snapshots(
                     (poisoned_supervision,),
@@ -425,6 +426,7 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                     boundary_guard_seconds=0.2,
                     max_sources=8,
                     working_width=320,
+                    inspection_only_without_causal_sensing=True,
                 )
 
             self.assertEqual(extract.call_count, 2)
@@ -474,9 +476,29 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                 manifest_payload["analysis_basis"],
                 FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
             )
+            inspection_policy = dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY)
+            inspection_policy.update(
+                {
+                    "causal_sensing_exact_timestamp_and_content_hash_bound": False,
+                    "member_state_unknown_preserved": False,
+                    "ive_performer_distribution_unknown_preserved": False,
+                    "inspection_only_without_causal_sensing": True,
+                }
+            )
+            self.assertEqual(manifest_payload["input_policy"], inspection_policy)
             self.assertEqual(
-                manifest_payload["input_policy"],
-                dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY),
+                manifest_payload["production_causal_sensing_gate"],
+                {
+                    "passed": False,
+                    "contract": (
+                        "production_requires_hash_bound_shooting_member_"
+                        "performer_triple_v1"
+                    ),
+                    "inspection_only_without_causal_sensing": True,
+                    "edit_mode": None,
+                    "target_member": None,
+                    "member_feature_mode": "not_bound",
+                },
             )
             self.assertEqual(
                 manifest_payload["feature_provenance"]["producer"],
@@ -502,7 +524,7 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
             )
             self.assertTrue(
                 manifest_payload["input_policy"][
-                    "temporal_pose_sidecars_hash_bound_in_snapshot_v3"
+                    "temporal_pose_sidecars_hash_bound_in_snapshot_v4"
                 ]
             )
             snapshot = StageEditFeatureSnapshot.from_dict(snapshot_payload)
@@ -584,6 +606,7 @@ class StageEditFeatureSnapshotJobTests(unittest.TestCase):
                     (unsafe_path,),
                     song_id="IVE-TEST",
                     output_directory=root / "unsafe-out",
+                    inspection_only_without_causal_sensing=True,
                 )
             self.assertFalse((root / "escape").exists())
 

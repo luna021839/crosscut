@@ -18,11 +18,12 @@ boundary.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from .reference_attribution import (
@@ -61,9 +62,13 @@ from .stage_edit_transformer import (
 )
 
 
-ADAPTER_SCHEMA_VERSION = 5
+ADAPTER_SCHEMA_VERSION = 7
 EXPECTED_DATASET_KIND = "reference_stage_mix_pairwise_listwise_supervision"
 HOLD_NEGATIVE_EVENT = "known_source_hold_negative"
+VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_CONTRACT = (
+    "loader_replayed_snapshot_scope_and_exact_adapted_sequence_v1"
+)
+_VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_SEAL = object()
 
 _BOUNDARY_EVENT_TYPES = frozenset(
     {
@@ -109,6 +114,175 @@ def _normalized_id(value: Any) -> str | None:
     return normalized or None
 
 
+def _plain_statistics(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy immutable statistics into JSON-ready manifest values."""
+
+    result = dict(value)
+    gate = result.get("production_causal_sensing_gate")
+    if isinstance(gate, Mapping):
+        result["production_causal_sensing_gate"] = dict(gate)
+    return result
+
+
+def _require_snapshot_derived_reference_sequence(
+    sequence: StageEditSequence,
+    snapshot: StageEditFeatureSnapshot,
+) -> None:
+    if not isinstance(sequence, StageEditSequence) or not sequence.tokens:
+        raise ValueError("verified reference sequence must contain tokens")
+    for token_index, token in enumerate(sequence.tokens):
+        source_ids = tuple(
+            candidate.source_id for candidate in token.source_candidates
+        )
+        try:
+            expected = subset_stage_edit_token_sources(
+                snapshot.token_at(token.master_time_seconds),
+                source_ids,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"reference token {token_index} is absent from its feature snapshot"
+            ) from exc
+        if token != expected:
+            raise ValueError(
+                f"reference token {token_index} was not derived exactly from "
+                "the verified feature snapshot"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedReferenceFeatureSnapshotEvidence:
+    """Non-serializable authority issued after replaying one adapted sequence."""
+
+    reference_id: str
+    feature_snapshot_sha256: str
+    token_schema_fingerprint: str
+    edit_mode: str
+    target_member: str | None
+    production_causal_sensing_gate: Mapping[str, Any]
+    _snapshot: StageEditFeatureSnapshot = field(repr=False, compare=False)
+    _sequence: StageEditSequence = field(repr=False, compare=False)
+    _schema: StageEditTokenSchema = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+    contract: str = VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_CONTRACT
+
+    def __post_init__(self) -> None:
+        if self._seal is not _VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_SEAL:
+            raise ValueError(
+                "reference feature evidence must be issued by the strict adapter"
+            )
+        if self.contract != VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_CONTRACT:
+            raise ValueError("reference feature evidence contract changed")
+        if not isinstance(self._snapshot, StageEditFeatureSnapshot):
+            raise TypeError("reference feature evidence needs a typed snapshot")
+        if not isinstance(self._sequence, StageEditSequence):
+            raise TypeError("reference feature evidence needs a typed sequence")
+        if not isinstance(self._schema, StageEditTokenSchema):
+            raise TypeError("reference feature evidence needs a typed schema")
+        if (
+            self.feature_snapshot_sha256 != self._snapshot.snapshot_sha256
+            or self.token_schema_fingerprint
+            != self._snapshot.token_schema_fingerprint
+            or self.token_schema_fingerprint != self._schema.fingerprint
+        ):
+            raise ValueError("reference feature evidence snapshot identity changed")
+        gate = self._snapshot.require_production_causal_sensing(
+            edit_mode=self.edit_mode,
+            target_member=self.target_member,
+            schema=self._schema,
+        )
+        if dict(self.production_causal_sensing_gate) != gate:
+            raise ValueError("reference feature evidence sensing gate changed")
+        _require_snapshot_derived_reference_sequence(
+            self._sequence,
+            self._snapshot,
+        )
+        object.__setattr__(
+            self,
+            "production_causal_sensing_gate",
+            MappingProxyType(dict(gate)),
+        )
+
+    def revalidate(
+        self,
+        example: ReferenceTrainingExample,
+        *,
+        schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    ) -> dict[str, Any]:
+        if self._seal is not _VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_SEAL:
+            raise ValueError("reference feature evidence is not adapter-sealed")
+        if not isinstance(example, ReferenceTrainingExample):
+            raise TypeError("reference feature evidence needs a typed example")
+        if schema.to_dict() != self._schema.to_dict():
+            raise ValueError("reference feature evidence token schema changed")
+        if (
+            example.reference_id != self.reference_id
+            or example.feature_snapshot_sha256 != self.feature_snapshot_sha256
+            or example.sequence != self._sequence
+        ):
+            raise ValueError("reference feature evidence/example binding changed")
+        gate = self._snapshot.require_production_causal_sensing(
+            edit_mode=self.edit_mode,
+            target_member=self.target_member,
+            schema=schema,
+        )
+        if gate != dict(self.production_causal_sensing_gate):
+            raise ValueError("reference feature evidence causal scope changed")
+        _require_snapshot_derived_reference_sequence(
+            example.sequence,
+            self._snapshot,
+        )
+        raw_gate = example.statistics.get("production_causal_sensing_gate")
+        if not isinstance(raw_gate, Mapping) or dict(raw_gate) != gate:
+            raise ValueError(
+                "reference feature audit statistics differ from sealed evidence"
+            )
+        if (
+            example.statistics.get("materialized_feature_snapshot_used") is not True
+            or example.statistics.get("shared_feature_materializer_used") is not True
+        ):
+            raise ValueError(
+                "reference feature audit statistics omit materializer use"
+            )
+        return gate
+
+
+def verify_reference_training_feature_snapshot(
+    *,
+    reference_id: str,
+    sequence: StageEditSequence,
+    feature_snapshot: StageEditFeatureSnapshot,
+    production_edit_mode: object,
+    production_target_member: object | None = None,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+) -> VerifiedReferenceFeatureSnapshotEvidence:
+    """Replay and seal one exact snapshot-derived reference input sequence."""
+
+    normalized_reference = _normalized_id(reference_id)
+    if normalized_reference is None:
+        raise ValueError("verified reference feature evidence needs reference_id")
+    if not isinstance(feature_snapshot, StageEditFeatureSnapshot):
+        raise TypeError("feature_snapshot must use StageEditFeatureSnapshot")
+    gate = feature_snapshot.require_production_causal_sensing(
+        edit_mode=production_edit_mode,
+        target_member=production_target_member,
+        schema=schema,
+    )
+    _require_snapshot_derived_reference_sequence(sequence, feature_snapshot)
+    return VerifiedReferenceFeatureSnapshotEvidence(
+        reference_id=normalized_reference,
+        feature_snapshot_sha256=feature_snapshot.snapshot_sha256,
+        token_schema_fingerprint=feature_snapshot.token_schema_fingerprint,
+        edit_mode=gate["edit_mode"],
+        target_member=gate["target_member"],
+        production_causal_sensing_gate=gate,
+        _snapshot=feature_snapshot,
+        _sequence=sequence,
+        _schema=schema,
+        _seal=_VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_SEAL,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ReferenceTrainingExample:
     reference_id: str
@@ -118,6 +292,9 @@ class ReferenceTrainingExample:
     targets: StageEditTargetSequence
     statistics: Mapping[str, Any]
     feature_snapshot_sha256: str | None = None
+    verified_feature_snapshot_evidence: (
+        VerifiedReferenceFeatureSnapshotEvidence | None
+    ) = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,8 +327,22 @@ class ReferenceTrainingCorpus:
                     FEATURE_MATERIALIZER_CONTRACT
                 ),
                 "optional_feature_snapshots_are_schema_and_content_hashed": True,
+                "production_causal_sensing_gate_is_snapshot_derived_and_data_id_bound": True,
                 "canonical_detector_boundaries_override_known_shot_edges": True,
                 "loss_masked_detector_boundaries_remain_tokens": True,
+            },
+            "production_causal_sensing_gate_by_reference": {
+                example.reference_id: (
+                    dict(gate)
+                    if isinstance(
+                        gate := example.statistics.get(
+                            "production_causal_sensing_gate"
+                        ),
+                        Mapping,
+                    )
+                    else None
+                )
+                for example in self.examples
             },
             "examples": [
                 {
@@ -163,7 +354,7 @@ class ReferenceTrainingCorpus:
                     "feature_snapshot_sha256": (
                         example.feature_snapshot_sha256
                     ),
-                    "statistics": dict(example.statistics),
+                    "statistics": _plain_statistics(example.statistics),
                 }
                 for example in self.examples
             ],
@@ -1018,6 +1209,8 @@ def build_reference_training_example(
     negative_samples_per_hold: int = 1,
     boundary_guard_seconds: float = 0.18,
     max_sources: int = 8,
+    production_edit_mode: object | None = None,
+    production_target_member: object | None = None,
 ) -> ReferenceTrainingExample:
     """Convert one reference-supervision payload without feature leakage."""
 
@@ -1029,10 +1222,21 @@ def build_reference_training_example(
         raise ValueError("boundary_guard_seconds must be finite and non-negative")
     if max_sources < 2:
         raise ValueError("max_sources must allow a positive and a negative")
+    production_causal_sensing_gate: Mapping[str, Any] | None = None
     if feature_snapshot is not None:
         if not isinstance(feature_snapshot, StageEditFeatureSnapshot):
             raise TypeError("feature_snapshot must use StageEditFeatureSnapshot")
         feature_snapshot.require_schema(schema)
+        if production_edit_mode is not None:
+            production_causal_sensing_gate = (
+                feature_snapshot.require_production_causal_sensing(
+                    edit_mode=production_edit_mode,
+                    target_member=production_target_member,
+                    schema=schema,
+                )
+            )
+    if production_target_member is not None and production_edit_mode is None:
+        raise ValueError("production_target_member requires production_edit_mode")
 
     reference_id = _normalized_id(payload.get("reference_id"))
     style_id = _normalized_id(payload.get("style_id"))
@@ -1403,6 +1607,11 @@ def build_reference_training_example(
         "reference_match_features_in_model_input": 0,
         "shared_feature_materializer_used": True,
         "materialized_feature_snapshot_used": feature_snapshot is not None,
+        "production_causal_sensing_gate": (
+            MappingProxyType(dict(production_causal_sensing_gate))
+            if production_causal_sensing_gate is not None
+            else None
+        ),
         "canonical_detected_boundary_partition_used": (
             canonical_boundaries is not None
         ),
@@ -1417,18 +1626,32 @@ def build_reference_training_example(
             canonical_prefix_boundary_excluded_count
         ),
     }
+    sequence = StageEditSequence(sequence_id, tuple(tokens))
+    verified_evidence = (
+        verify_reference_training_feature_snapshot(
+            reference_id=reference_id,
+            sequence=sequence,
+            feature_snapshot=feature_snapshot,
+            production_edit_mode=production_edit_mode,
+            production_target_member=production_target_member,
+            schema=schema,
+        )
+        if feature_snapshot is not None and production_edit_mode is not None
+        else None
+    )
     return ReferenceTrainingExample(
         reference_id=reference_id,
         song_id=normalized_song,
         style_id=style_id,
-        sequence=StageEditSequence(sequence_id, tuple(tokens)),
+        sequence=sequence,
         targets=StageEditTargetSequence(sequence_id, tuple(targets)),
-        statistics=statistics,
+        statistics=MappingProxyType(statistics),
         feature_snapshot_sha256=(
             feature_snapshot.snapshot_sha256
             if feature_snapshot is not None
             else None
         ),
+        verified_feature_snapshot_evidence=verified_evidence,
     )
 
 
@@ -1443,6 +1666,8 @@ def load_reference_training_corpus(
     negative_samples_per_hold: int = 1,
     boundary_guard_seconds: float = 0.18,
     max_sources: int = 8,
+    production_edit_mode: object | None = None,
+    production_target_member: object | None = None,
 ) -> ReferenceTrainingCorpus:
     """Load caller-supplied JSON files; no output is written implicitly."""
 
@@ -1487,6 +1712,8 @@ def load_reference_training_corpus(
             negative_samples_per_hold=negative_samples_per_hold,
             boundary_guard_seconds=boundary_guard_seconds,
             max_sources=max_sources,
+            production_edit_mode=production_edit_mode,
+            production_target_member=production_target_member,
         )
         examples.append(example)
         resolved = str(path.resolve())
@@ -1495,6 +1722,24 @@ def load_reference_training_corpus(
         digest.update(hashlib.sha256(content).digest())
         digest.update(str(example.song_id).encode())
         digest.update(str(example.feature_snapshot_sha256).encode())
+        digest.update(
+            json.dumps(
+                (
+                    dict(raw_gate)
+                    if isinstance(
+                        raw_gate := example.statistics.get(
+                            "production_causal_sensing_gate"
+                        ),
+                        Mapping,
+                    )
+                    else None
+                ),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
     examples.sort(key=lambda example: example.reference_id)
     total: dict[str, int] = {}
     for key in (
@@ -1559,6 +1804,9 @@ __all__ = [
     "PROHIBITED_REFERENCE_MATCH_INPUT_FIELDS",
     "ReferenceTrainingCorpus",
     "ReferenceTrainingExample",
+    "VERIFIED_REFERENCE_FEATURE_SNAPSHOT_EVIDENCE_CONTRACT",
+    "VerifiedReferenceFeatureSnapshotEvidence",
     "build_reference_training_example",
     "load_reference_training_corpus",
+    "verify_reference_training_feature_snapshot",
 ]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
-import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -65,6 +64,7 @@ from crosscut.stage_edit_production_training import (
 from crosscut.stage_edit_reference_adapter import (
     ReferenceTrainingCorpus,
     ReferenceTrainingExample,
+    verify_reference_training_feature_snapshot,
 )
 from crosscut.stage_edit_semimarkov_beam import (
     StageEditSemiMarkovConfig,
@@ -88,6 +88,10 @@ from crosscut.stage_edit_transformer import (
 from crosscut.stage_edit_transition_authority import (
     RENDERER_OWNED_LEARNED_EVALUATION_SKIP_REASON,
     RENDERER_OWNED_TRANSITION_AUTHORITY,
+)
+from tests.stage_edit_causal_sensing_test_support import (
+    production_gate_statistics,
+    synthetic_production_snapshot,
 )
 
 try:
@@ -336,6 +340,36 @@ class StageEditProductionQualityTests(unittest.TestCase):
     def test_production_preprocessing_scrubs_human_history_snapshot_slice(self) -> None:
         schema = DEFAULT_STAGE_EDIT_SCHEMA
         example = _training_example("BANG", "BANG-human-history")
+        valid_gate = dict(
+            example.statistics["production_causal_sensing_gate"]
+        )
+        partial_gate = dict(valid_gate)
+        partial_gate.pop("ive_performer_state_content_sha256")
+        wrong_mode_gate = dict(valid_gate)
+        wrong_mode_gate["edit_mode"] = "member"
+        old_schema_gate = dict(valid_gate)
+        old_schema_gate["feature_snapshot_schema_version"] = 3
+        for label, invalid_gate in (
+            ("empty", None),
+            ("partial", partial_gate),
+            ("wrong-mode", wrong_mode_gate),
+            ("old", old_schema_gate),
+        ):
+            with self.subTest(invalid_gate=label), self.assertRaisesRegex(
+                ValueError,
+                "verified causal feature snapshot",
+            ):
+                prepare_stage_edit_production_input_sequences(
+                    (
+                        replace(
+                            example,
+                            statistics={
+                                **example.statistics,
+                                "production_causal_sensing_gate": invalid_gate,
+                            },
+                        ),
+                    )
+                )
         prepared = prepare_stage_edit_production_input_sequences((example,))[0]
         recent_start = len(schema.music_feature_names) + len(
             schema.section_feature_names
@@ -353,6 +387,49 @@ class StageEditProductionQualityTests(unittest.TestCase):
                 (True,) * len(schema.recent_edit_feature_names),
                 token.missing_mask[recent_start:recent_stop],
             )
+
+    def test_production_preprocessing_rejects_forged_statistics_and_reused_evidence(
+        self,
+    ) -> None:
+        example = _training_example("BANG", "BANG-forged-snapshot")
+        forged = replace(
+            example,
+            feature_snapshot_sha256="f" * 64,
+            verified_feature_snapshot_evidence=None,
+            statistics={
+                **example.statistics,
+                "materialized_feature_snapshot_used": True,
+                "shared_feature_materializer_used": True,
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "verified causal feature snapshot",
+        ):
+            prepare_stage_edit_production_input_sequences((forged,))
+
+        first = example.sequence.tokens[0]
+        tampered = replace(
+            example,
+            sequence=replace(
+                example.sequence,
+                tokens=(
+                    replace(
+                        first,
+                        music_features=(
+                            first.music_features[0] + 0.01,
+                            *first.music_features[1:],
+                        ),
+                    ),
+                    *example.sequence.tokens[1:],
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "verified causal feature snapshot",
+        ):
+            prepare_stage_edit_production_input_sequences((tampered,))
 
     def test_every_renderer_active_head_must_pass_fixed_unseen_song_gate(
         self,
@@ -532,11 +609,21 @@ def _training_example(song: str, reference: str) -> ReferenceTrainingExample:
             crop=(1.08, 0.48, 0.50, -0.2),
         ),
     )
+    snapshot = synthetic_production_snapshot(
+        StageEditSequence(reference, tokens)
+    )
+    sequence = snapshot.sequence
+    verified_evidence = verify_reference_training_feature_snapshot(
+        reference_id=reference,
+        sequence=sequence,
+        feature_snapshot=snapshot,
+        production_edit_mode="group",
+    )
     return ReferenceTrainingExample(
         reference_id=reference,
         song_id=song,
         style_id="human-stage-mix",
-        sequence=StageEditSequence(reference, tokens),
+        sequence=sequence,
         targets=StageEditTargetSequence(reference, targets),
         statistics={
             "dense_editorial_source_switch_positive_count": 2,
@@ -546,8 +633,10 @@ def _training_example(song: str, reference: str) -> ReferenceTrainingExample:
             "native_source_camera_cut_editorial_positive_count": 0,
             "materialized_feature_snapshot_used": True,
             "shared_feature_materializer_used": True,
+            "production_causal_sensing_gate": production_gate_statistics(snapshot),
         },
-        feature_snapshot_sha256=hashlib.sha256(reference.encode()).hexdigest(),
+        feature_snapshot_sha256=snapshot.snapshot_sha256,
+        verified_feature_snapshot_evidence=verified_evidence,
     )
 
 
@@ -622,10 +711,24 @@ def _source_balance_example(
         )
         for index in range(1, event_count + 1)
     )
+    sequence = StageEditSequence(reference, tokens)
+    snapshot = synthetic_production_snapshot(sequence)
+    verified_evidence = verify_reference_training_feature_snapshot(
+        reference_id=reference,
+        sequence=snapshot.sequence,
+        feature_snapshot=snapshot,
+        production_edit_mode="group",
+    )
     return replace(
         base,
-        sequence=StageEditSequence(reference, tokens),
+        sequence=snapshot.sequence,
         targets=StageEditTargetSequence(reference, tuple(targets)),
+        statistics={
+            **base.statistics,
+            "production_causal_sensing_gate": production_gate_statistics(snapshot),
+        },
+        feature_snapshot_sha256=snapshot.snapshot_sha256,
+        verified_feature_snapshot_evidence=verified_evidence,
     )
 
 

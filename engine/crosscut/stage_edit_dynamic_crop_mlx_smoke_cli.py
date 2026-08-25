@@ -5,7 +5,7 @@ candidate in a fresh Python process, captures a content-addressed runner log,
 and publishes a schema-v2 smoke evidence artifact even when the worker is
 killed or runs out of memory.  The worker consumes only the fifteen immutable
 BANG BANG / BLACKHOLE / REBEL HEART feature snapshots and packs them into the
-fixed release tensor shape ``[2, 2048, 32, 720]``.
+schema-bound release tensor shape ``[2, 2048, 32, 792]``.
 
 This is a capacity/runtime probe, not an evaluator.  It tiles the immutable
 real BBR feature and supervision cycles; the resulting loss never authorizes
@@ -88,7 +88,10 @@ from .stage_edit_dynamic_crop_training import (
 from .stage_edit_feature_materializer import (
     FEATURE_MATERIALIZER_CONTRACT,
     FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+    STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
     StageEditFeatureSnapshot,
+    validate_production_causal_sensing_gate_payload,
 )
 from .stage_edit_feature_snapshot_job import (
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
@@ -134,7 +137,7 @@ EXTERNAL_VOLUME_ROOT = Path("/Volumes/CrossCutMedia")
 FIXED_BATCH_SIZE = 2
 FIXED_SEQUENCE_LENGTH = 2048
 FIXED_MAX_SOURCES = 32
-FIXED_SOURCE_DIMENSION = 720
+FIXED_SOURCE_DIMENSION = DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension
 SMOKE_TARGET_CONTRACT = (
     "actual_bbr_supervision_repeated_for_capacity_only_semantic_metrics_forbidden_v1"
 )
@@ -290,6 +293,24 @@ def _load_bbr_feature_dataset(
         statistics = manifest.get("statistics")
         input_policy = manifest.get("input_policy")
         feature_provenance = manifest.get("feature_provenance")
+        raw_sensing_gate = manifest.get("production_causal_sensing_gate")
+        try:
+            sensing_gate = validate_production_causal_sensing_gate_payload(
+                raw_sensing_gate,
+                schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            )
+        except (TypeError, ValueError) as exc:
+            raise StageEditMlxSmokeRunnerError(
+                f"{song} production causal-sensing gate is invalid: {exc}"
+            ) from exc
+        if (
+            sensing_gate["edit_mode"] != "group"
+            or sensing_gate["target_member"] is not None
+            or sensing_gate["member_feature_mode"] != "group_no_target"
+        ):
+            raise StageEditMlxSmokeRunnerError(
+                f"{song} BBR capacity dataset requires group_no_target sensing"
+            )
         if (
             manifest.get("schema_version") != FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION
             or manifest.get("analysis_basis") != FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS
@@ -308,7 +329,11 @@ def _load_bbr_feature_dataset(
             or feature_provenance.get("producer")
             != FEATURE_MATERIALIZER_CONTRACT
             or set(feature_provenance.get("contracts") or ())
-            != set(FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS)
+            != {
+                *FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+                STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+                STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+            }
         ):
             raise StageEditMlxSmokeRunnerError(
                 f"{song} feature manifest contract differs"
@@ -341,6 +366,21 @@ def _load_bbr_feature_dataset(
                 raise StageEditMlxSmokeRunnerError(
                     f"{song}/{reference} feature snapshot is invalid: {exc}"
                 ) from exc
+            try:
+                snapshot_gate = snapshot.require_production_causal_sensing(
+                    edit_mode=sensing_gate["edit_mode"],
+                    target_member=sensing_gate["target_member"],
+                    schema=DEFAULT_STAGE_EDIT_SCHEMA,
+                )
+            except (TypeError, ValueError) as exc:
+                raise StageEditMlxSmokeRunnerError(
+                    f"{song}/{reference} production causal sensing is invalid: "
+                    f"{exc}"
+                ) from exc
+            if snapshot_gate != sensing_gate:
+                raise StageEditMlxSmokeRunnerError(
+                    f"{song}/{reference} causal-sensing manifest binding differs"
+                )
             token_count = len(snapshot.sequence.tokens)
             candidate_counts = {
                 len(token.source_candidates) for token in snapshot.sequence.tokens
@@ -611,6 +651,8 @@ def _load_bbr_target_bindings(
         negative_samples_per_hold=2,
         boundary_guard_seconds=0.18,
         max_sources=32,
+        production_edit_mode="group",
+        production_target_member=None,
     )
     prepared_sequences = {
         example.reference_id: sequence
@@ -1006,7 +1048,12 @@ def _tensor_provenance_template(
         ),
         "context_feature_dimension": DEFAULT_STAGE_EDIT_SCHEMA.encoded_context_dimension,
         "source_feature_dimension": DEFAULT_STAGE_EDIT_SCHEMA.encoded_source_dimension,
-        "source_tensor_shape": [2, 2048, 32, 720],
+        "source_tensor_shape": [
+            FIXED_BATCH_SIZE,
+            FIXED_SEQUENCE_LENGTH,
+            FIXED_MAX_SOURCES,
+            FIXED_SOURCE_DIMENSION,
+        ],
         "context_tensor_shape": [
             2,
             2048,

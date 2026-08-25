@@ -17,12 +17,13 @@ baseline; promotion remains a later rendered-proxy review decision.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .ive import AspectRatio
 from .render import aligned_render_segment
@@ -37,7 +38,10 @@ from .stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
 )
-from .stage_edit_feature_materializer import StageEditFeatureSnapshot
+from .stage_edit_feature_materializer import (
+    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureSnapshot,
+)
 from .stage_edit_head_materializer import (
     StageEditHeadMaterializationResult,
     materialize_stage_edit_head_frames_v2,
@@ -59,8 +63,18 @@ from .stage_edit_semimarkov_beam import (
 )
 from .stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     STAGE_EDIT_CONTINUITY_AUTHORITIES,
+)
+from .stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+    StageEditContextualSourcePairScorerV2,
+    StageEditContextualSourcePairV2ArtifactError,
+)
+from .stage_edit_source_pair_contextual_v2_production import (
+    StageEditContextualSourcePairProductionBundleV2,
+    load_stage_edit_contextual_source_pair_production_bundle_v2,
 )
 from .stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_CHECKPOINT_FILENAME,
@@ -81,11 +95,26 @@ from .stage_edit_temporal_pose_motion import (
 from .timewarp import TimeWarpMap
 
 
-STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 4
+if TYPE_CHECKING:
+    from .stage_edit_contextual_beam_qa_adapter_v2 import (
+        VerifiedStageEditContextualBeamQACaseV2,
+    )
+
+
+STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION = 5
 STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT = (
     "explicit_snapshot_dynamic_crop_v2_v3_profile_chorus_anchor_"
-    "continuity_authority_temporal_pose_sidecar_semimarkov_retention_v4"
+    "continuity_authority_contextual_v2_verified_bundle_"
+    "temporal_pose_sidecar_semimarkov_retention_v5"
 )
+STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_CONTRACT = (
+    "contextual_v2_corpus_checkpoint_report_file_and_verified_beam_qa_identity_v1"
+)
+STAGE_EDIT_PRODUCTION_SNAPSHOT_IDENTITY_CONTRACT = (
+    "canonical_file_internal_snapshot_schema_and_causal_scope_identity_v1"
+)
+_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_SEAL = object()
+_PRODUCTION_SNAPSHOT_IDENTITY_SEAL = object()
 
 
 class StageEditPipelineBridgeError(RuntimeError):
@@ -151,6 +180,432 @@ def _sha256_identity(value: str | None, name: str) -> str:
     return value
 
 
+def _read_canonical_stage_edit_snapshot(
+    path: Path,
+    *,
+    schema: StageEditTokenSchema,
+) -> tuple[StageEditFeatureSnapshot, str]:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or path.is_symlink()
+        or path.resolve() != path
+        or not path.is_file()
+    ):
+        raise StageEditPipelineBridgeNotReadyError(
+            "StageEdit feature snapshot must be one canonical regular file"
+        )
+    try:
+        content = path.read_bytes()
+        payload = json.loads(content.decode("utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("snapshot root must be an object")
+        snapshot = StageEditFeatureSnapshot.from_dict(payload, schema=schema)
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise StageEditPipelineBridgeNotReadyError(
+            f"configured StageEdit feature snapshot is invalid: {exc}"
+        ) from exc
+    return snapshot, hashlib.sha256(content).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditProductionSnapshotIdentity:
+    """Loader-issued identity for the exact production sensing snapshot."""
+
+    snapshot_path: Path
+    snapshot_file_sha256: str
+    snapshot_sha256: str
+    token_schema_fingerprint: str
+    edit_mode: str
+    target_member: str | None
+    production_causal_sensing_gate: Mapping[str, Any]
+    _snapshot: StageEditFeatureSnapshot = field(repr=False, compare=False)
+    _schema: StageEditTokenSchema = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+    contract: str = STAGE_EDIT_PRODUCTION_SNAPSHOT_IDENTITY_CONTRACT
+
+    def __post_init__(self) -> None:
+        if self._seal is not _PRODUCTION_SNAPSHOT_IDENTITY_SEAL:
+            raise ValueError(
+                "production snapshot identity must be issued by the strict loader"
+            )
+        if self.contract != STAGE_EDIT_PRODUCTION_SNAPSHOT_IDENTITY_CONTRACT:
+            raise ValueError("production snapshot identity contract changed")
+        if not isinstance(self._snapshot, StageEditFeatureSnapshot):
+            raise TypeError("production snapshot identity needs a typed snapshot")
+        if not isinstance(self._schema, StageEditTokenSchema):
+            raise TypeError("production snapshot identity needs a typed token schema")
+        _sha256_identity(self.snapshot_file_sha256, "snapshot_file_sha256")
+        _sha256_identity(self.snapshot_sha256, "snapshot_sha256")
+        _sha256_identity(
+            self.token_schema_fingerprint,
+            "token_schema_fingerprint",
+        )
+        if (
+            self.snapshot_sha256 != self._snapshot.snapshot_sha256
+            or self.token_schema_fingerprint
+            != self._snapshot.token_schema_fingerprint
+            or self.token_schema_fingerprint != self._schema.fingerprint
+        ):
+            raise ValueError("production snapshot identity fields changed")
+        try:
+            canonical_gate = self._snapshot.require_production_causal_sensing(
+                edit_mode=self.edit_mode,
+                target_member=self.target_member,
+                schema=self._schema,
+            )
+        except (TypeError, ValueError) as exc:
+            raise StageEditPipelineBridgeNotReadyError(
+                f"production snapshot scope is invalid: {exc}"
+            ) from exc
+        if dict(self.production_causal_sensing_gate) != canonical_gate:
+            raise ValueError("production snapshot sensing gate changed")
+        object.__setattr__(
+            self,
+            "production_causal_sensing_gate",
+            MappingProxyType(dict(canonical_gate)),
+        )
+        self.revalidate(
+            snapshot=self._snapshot,
+            snapshot_path=self.snapshot_path,
+            edit_mode=self.edit_mode,
+            target_member=self.target_member,
+            schema=self._schema,
+        )
+
+    @property
+    def snapshot(self) -> StageEditFeatureSnapshot:
+        return self._snapshot
+
+    @property
+    def schema(self) -> StageEditTokenSchema:
+        return self._schema
+
+    def revalidate(
+        self,
+        *,
+        snapshot: StageEditFeatureSnapshot,
+        snapshot_path: Path,
+        edit_mode: object,
+        target_member: object | None,
+        schema: StageEditTokenSchema,
+    ) -> StageEditFeatureSnapshot:
+        if self._seal is not _PRODUCTION_SNAPSHOT_IDENTITY_SEAL:
+            raise StageEditPipelineBridgeNotReadyError(
+                "production snapshot identity is not loader-sealed"
+            )
+        if not isinstance(snapshot, StageEditFeatureSnapshot):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight snapshot is not typed"
+            )
+        if not isinstance(schema, StageEditTokenSchema):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight token schema is not typed"
+            )
+        if (
+            snapshot_path != self.snapshot_path
+            or schema.to_dict() != self._schema.to_dict()
+            or snapshot.snapshot_sha256 != self.snapshot_sha256
+            or snapshot.token_schema_fingerprint != self.token_schema_fingerprint
+            or snapshot.to_dict() != self._snapshot.to_dict()
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight snapshot memory identity changed"
+            )
+        persisted, file_sha256 = _read_canonical_stage_edit_snapshot(
+            self.snapshot_path,
+            schema=schema,
+        )
+        if (
+            file_sha256 != self.snapshot_file_sha256
+            or persisted.snapshot_sha256 != self.snapshot_sha256
+            or persisted.token_schema_fingerprint
+            != self.token_schema_fingerprint
+            or persisted.to_dict() != snapshot.to_dict()
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production feature snapshot disk identity changed"
+            )
+        try:
+            gate = persisted.require_production_causal_sensing(
+                edit_mode=edit_mode,
+                target_member=target_member,
+                schema=schema,
+            )
+        except (TypeError, ValueError) as exc:
+            raise StageEditPipelineBridgeNotReadyError(
+                f"production feature snapshot scope is invalid: {exc}"
+            ) from exc
+        if (
+            gate != dict(self.production_causal_sensing_gate)
+            or gate["edit_mode"] != self.edit_mode
+            or gate["target_member"] != self.target_member
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production feature snapshot causal scope changed"
+            )
+        return persisted
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": self.contract,
+            "snapshot_path": str(self.snapshot_path),
+            "snapshot_file_sha256": self.snapshot_file_sha256,
+            "snapshot_sha256": self.snapshot_sha256,
+            "token_schema_fingerprint": self.token_schema_fingerprint,
+            "edit_mode": self.edit_mode,
+            "target_member": self.target_member,
+            "production_causal_sensing_gate": dict(
+                self.production_causal_sensing_gate
+            ),
+        }
+
+
+def load_stage_edit_production_snapshot_identity(
+    snapshot_path: Path,
+    *,
+    edit_mode: object,
+    target_member: object | None = None,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+) -> StageEditProductionSnapshotIdentity:
+    """Strict-load a snapshot and seal its bytes, schema, and edit scope."""
+
+    raw_path = Path(snapshot_path).expanduser()
+    if raw_path.is_symlink():
+        raise StageEditPipelineBridgeNotReadyError(
+            "StageEdit feature snapshot cannot be a symlink"
+        )
+    canonical_path = raw_path.resolve()
+    snapshot, file_sha256 = _read_canonical_stage_edit_snapshot(
+        canonical_path,
+        schema=schema,
+    )
+    if snapshot.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+        raise StageEditPipelineBridgeNotReadyError(
+            "configured StageEdit feature snapshot uses an obsolete schema"
+        )
+    try:
+        gate = snapshot.require_production_causal_sensing(
+            edit_mode=edit_mode,
+            target_member=target_member,
+            schema=schema,
+        )
+    except (TypeError, ValueError) as exc:
+        raise StageEditPipelineBridgeNotReadyError(
+            "configured StageEdit feature snapshot lacks valid production "
+            f"causal sensing: {exc}"
+        ) from exc
+    return StageEditProductionSnapshotIdentity(
+        snapshot_path=canonical_path,
+        snapshot_file_sha256=file_sha256,
+        snapshot_sha256=snapshot.snapshot_sha256,
+        token_schema_fingerprint=snapshot.token_schema_fingerprint,
+        edit_mode=gate["edit_mode"],
+        target_member=gate["target_member"],
+        production_causal_sensing_gate=gate,
+        _snapshot=snapshot,
+        _schema=schema,
+        _seal=_PRODUCTION_SNAPSHOT_IDENTITY_SEAL,
+    )
+
+
+def _is_verified_contextual_beam_qa_case_v2(value: Any) -> bool:
+    # Function-local by design: the adapter imports post-render QA, whose
+    # windowed re-decoder imports this bridge.  Importing it at module load time
+    # would create a pipeline -> QA -> bridge -> QA cycle.
+    from .stage_edit_contextual_beam_qa_adapter_v2 import (
+        is_verified_stage_edit_contextual_beam_qa_case_v2,
+    )
+
+    return is_verified_stage_edit_contextual_beam_qa_case_v2(value)
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditContextualSourcePairBridgeIdentityV2:
+    """Sealed activation identity for one contextual-v2 production bundle.
+
+    Callers provide the immutable hashes and adapter-issued Beam-QA envelopes
+    to :func:`preflight_stage_edit_pipeline_bridge`; only the production loader
+    may turn them into this identity.  Keeping the activation seal and the
+    loader-issued bundle here prevents a raw DTO or a partially pinned path
+    from being smuggled into a directly constructed bridge preflight.
+    """
+
+    directory: Path
+    checkpoint_sha256: str
+    checkpoint_file_sha256: str
+    report_sha256: str
+    report_file_sha256: str
+    beam_qa_report_sha256: str
+    corpus_sha256: str
+    corpus_file_sha256: str
+    token_schema_fingerprint: str
+    scorer_fingerprint: str
+    verified_beam_qa_cases: tuple[
+        VerifiedStageEditContextualBeamQACaseV2, ...
+    ] = field(repr=False, compare=False)
+    _bundle: StageEditContextualSourcePairProductionBundleV2 = field(
+        repr=False,
+        compare=False,
+    )
+    _seal: object = field(repr=False, compare=False)
+    contract: str = STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_CONTRACT
+
+    def __post_init__(self) -> None:
+        if self._seal is not _CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_SEAL:
+            raise ValueError(
+                "contextual-v2 bridge identity must be issued by production preflight"
+            )
+        if self.contract != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_CONTRACT:
+            raise ValueError("contextual-v2 bridge identity contract changed")
+        if not isinstance(self.directory, Path) or not self.directory.is_absolute():
+            raise ValueError("contextual-v2 bundle directory must be absolute")
+        if not isinstance(
+            self._bundle,
+            StageEditContextualSourcePairProductionBundleV2,
+        ):
+            raise TypeError("contextual-v2 identity needs a typed production bundle")
+        for name in (
+            "checkpoint_sha256",
+            "checkpoint_file_sha256",
+            "report_sha256",
+            "report_file_sha256",
+            "beam_qa_report_sha256",
+            "corpus_sha256",
+            "corpus_file_sha256",
+            "token_schema_fingerprint",
+            "scorer_fingerprint",
+        ):
+            _sha256_identity(getattr(self, name), name)
+        cases = tuple(self.verified_beam_qa_cases)
+        if not cases or any(
+            not _is_verified_contextual_beam_qa_case_v2(value)
+            for value in cases
+        ):
+            raise ValueError(
+                "contextual-v2 identity requires adapter-issued verified Beam-QA envelopes"
+            )
+        ordered_cases = tuple(
+            sorted(cases, key=lambda value: (value.case.song_id, value.case.case_id))
+        )
+        case_sha256s = tuple(value.case.case_sha256 for value in ordered_cases)
+        if (
+            any(value is None for value in case_sha256s)
+            or len(case_sha256s) != len(set(case_sha256s))
+        ):
+            raise ValueError(
+                "contextual-v2 verified Beam-QA case identities must be unique"
+            )
+        object.__setattr__(self, "verified_beam_qa_cases", ordered_cases)
+        self._validate_bundle(self._bundle)
+
+    def _validate_bundle(
+        self,
+        bundle: StageEditContextualSourcePairProductionBundleV2,
+    ) -> None:
+        if not isinstance(bundle, StageEditContextualSourcePairProductionBundleV2):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 production loader returned an untyped bundle"
+            )
+        report_case_sha256s = tuple(
+            value.case_sha256 for value in bundle.report.beam_level_qa.cases
+        )
+        verified_case_sha256s = tuple(
+            value.case.case_sha256 for value in self.verified_beam_qa_cases
+        )
+        if (
+            bundle.directory != self.directory
+            or bundle.checkpoint.checkpoint_sha256 != self.checkpoint_sha256
+            or bundle.checkpoint_file_sha256 != self.checkpoint_file_sha256
+            or bundle.report.report_sha256 != self.report_sha256
+            or bundle.report_file_sha256 != self.report_file_sha256
+            or bundle.report.beam_level_qa.qa_report_sha256
+            != self.beam_qa_report_sha256
+            or bundle.corpus.content_sha256 != self.corpus_sha256
+            or bundle.corpus_file_sha256 != self.corpus_file_sha256
+            or bundle.checkpoint.token_schema_fingerprint
+            != self.token_schema_fingerprint
+            or bundle.scorer.token_schema_fingerprint
+            != self.token_schema_fingerprint
+            or bundle.scorer.contract
+            != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+            or bundle.scorer.fingerprint != self.scorer_fingerprint
+            or report_case_sha256s != verified_case_sha256s
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 production bundle identity changed"
+            )
+
+    def loader_kwargs(self) -> dict[str, Any]:
+        return {
+            "expected_checkpoint_sha256": self.checkpoint_sha256,
+            "expected_checkpoint_file_sha256": self.checkpoint_file_sha256,
+            "expected_report_sha256": self.report_sha256,
+            "expected_report_file_sha256": self.report_file_sha256,
+            "expected_beam_qa_report_sha256": self.beam_qa_report_sha256,
+            "expected_corpus_sha256": self.corpus_sha256,
+            "expected_corpus_file_sha256": self.corpus_file_sha256,
+            "expected_token_schema_fingerprint": self.token_schema_fingerprint,
+            "verified_beam_qa_cases": self.verified_beam_qa_cases,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": self.contract,
+            "directory": str(self.directory),
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "checkpoint_file_sha256": self.checkpoint_file_sha256,
+            "report_sha256": self.report_sha256,
+            "report_file_sha256": self.report_file_sha256,
+            "beam_qa_report_sha256": self.beam_qa_report_sha256,
+            "corpus_sha256": self.corpus_sha256,
+            "corpus_file_sha256": self.corpus_file_sha256,
+            "token_schema_fingerprint": self.token_schema_fingerprint,
+            "scorer_contract": STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+            "scorer_fingerprint": self.scorer_fingerprint,
+            "verified_beam_qa_case_count": len(self.verified_beam_qa_cases),
+            "verified_beam_qa_cases": [
+                {
+                    "case_id": value.case.case_id,
+                    "song_id": value.case.song_id,
+                    "case_sha256": value.case.case_sha256,
+                    "derivation": value.derivation.to_dict(),
+                }
+                for value in self.verified_beam_qa_cases
+            ],
+        }
+
+
+def _new_contextual_source_pair_bridge_identity_v2(
+    *,
+    bundle: StageEditContextualSourcePairProductionBundleV2,
+    verified_beam_qa_cases: tuple[VerifiedStageEditContextualBeamQACaseV2, ...],
+    checkpoint_sha256: str,
+    checkpoint_file_sha256: str,
+    report_sha256: str,
+    report_file_sha256: str,
+    beam_qa_report_sha256: str,
+    corpus_sha256: str,
+    corpus_file_sha256: str,
+    token_schema_fingerprint: str,
+) -> StageEditContextualSourcePairBridgeIdentityV2:
+    return StageEditContextualSourcePairBridgeIdentityV2(
+        directory=bundle.directory,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_file_sha256=checkpoint_file_sha256,
+        report_sha256=report_sha256,
+        report_file_sha256=report_file_sha256,
+        beam_qa_report_sha256=beam_qa_report_sha256,
+        corpus_sha256=corpus_sha256,
+        corpus_file_sha256=corpus_file_sha256,
+        token_schema_fingerprint=token_schema_fingerprint,
+        scorer_fingerprint=bundle.scorer.fingerprint,
+        verified_beam_qa_cases=verified_beam_qa_cases,
+        _bundle=bundle,
+        _seal=_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_SEAL,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StageEditPipelineBridgePreflight:
     snapshot_path: Path
@@ -158,6 +613,9 @@ class StageEditPipelineBridgePreflight:
     source_ids: tuple[str, ...]
     snapshot: StageEditFeatureSnapshot
     readiness: StageEditReadinessReport
+    snapshot_identity: StageEditProductionSnapshotIdentity
+    edit_mode: str
+    target_member: str | None
     dynamic_crop_version: int = 2
     continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY
     source_pair_scorer: StageEditSourcePairScorer | None = None
@@ -166,6 +624,67 @@ class StageEditPipelineBridgePreflight:
     source_pair_scorer_fingerprint: str | None = None
     source_pair_checkpoint_sha256: str | None = None
     source_pair_corpus_sha256: str | None = None
+    contextual_source_pair_scorer_v2: (
+        StageEditContextualSourcePairScorerV2 | None
+    ) = None
+    contextual_source_pair_identity_v2: (
+        StageEditContextualSourcePairBridgeIdentityV2 | None
+    ) = None
+
+    @property
+    def continuity_scorer_contract(self) -> str:
+        if self.contextual_source_pair_scorer_v2 is not None:
+            return self.contextual_source_pair_scorer_v2.contract
+        if self.source_pair_scorer is not None:
+            return self.source_pair_scorer.contract
+        return HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
+
+    @property
+    def continuity_scorer_fingerprint(self) -> str:
+        if self.contextual_source_pair_scorer_v2 is not None:
+            return self.contextual_source_pair_scorer_v2.fingerprint
+        if self.source_pair_scorer_fingerprint is not None:
+            return self.source_pair_scorer_fingerprint
+        return HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
+
+    @property
+    def contextual_source_pair_scorer_fingerprint_v2(self) -> str | None:
+        """Compatibility view used by the windowed re-decoder identity check."""
+
+        scorer = self.contextual_source_pair_scorer_v2
+        return scorer.fingerprint if scorer is not None else None
+
+    def revalidate_snapshot_identity(
+        self,
+        *,
+        schema: StageEditTokenSchema | None = None,
+    ) -> StageEditFeatureSnapshot:
+        identity = self.snapshot_identity
+        if not isinstance(identity, StageEditProductionSnapshotIdentity):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight snapshot identity is not typed"
+            )
+        if identity._seal is not _PRODUCTION_SNAPSHOT_IDENTITY_SEAL:
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight snapshot identity is not loader-sealed"
+            )
+        effective_schema = identity.schema if schema is None else schema
+        if (
+            identity.snapshot_path != self.snapshot_path
+            or identity.snapshot_sha256 != self.snapshot.snapshot_sha256
+            or identity.edit_mode != self.edit_mode
+            or identity.target_member != self.target_member
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "production preflight snapshot identity or causal scope changed"
+            )
+        return identity.revalidate(
+            snapshot=self.snapshot,
+            snapshot_path=self.snapshot_path,
+            edit_mode=self.edit_mode,
+            target_member=self.target_member,
+            schema=effective_schema,
+        )
 
     def _validate_learned_scorer_identity(self) -> None:
         if self.continuity_authority != PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
@@ -234,9 +753,61 @@ class StageEditPipelineBridgePreflight:
                 "learned preflight source-pair scorer identity changed"
             )
 
+    def _validate_contextual_scorer_identity(
+        self,
+        *,
+        reload_artifacts: bool = False,
+    ) -> None:
+        if self.continuity_authority != PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+            return
+        scorer = self.contextual_source_pair_scorer_v2
+        identity = self.contextual_source_pair_identity_v2
+        if not isinstance(scorer, StageEditContextualSourcePairScorerV2):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 preflight source-pair scorer is not typed"
+            )
+        if not isinstance(identity, StageEditContextualSourcePairBridgeIdentityV2):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 preflight production identity is not typed"
+            )
+        if identity._seal is not _CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_SEAL:
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 preflight production identity is not sealed"
+            )
+        identity._validate_bundle(identity._bundle)
+        if (
+            scorer.contract
+            != STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+            or scorer.fingerprint != identity.scorer_fingerprint
+            or scorer.token_schema_fingerprint != identity.token_schema_fingerprint
+            or scorer.to_dict() != identity._bundle.scorer.to_dict()
+            or identity.token_schema_fingerprint
+            != self.snapshot.token_schema_fingerprint
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 preflight scorer or token-schema identity changed"
+            )
+        if not reload_artifacts:
+            return
+        try:
+            loaded = load_stage_edit_contextual_source_pair_production_bundle_v2(
+                identity.directory,
+                **identity.loader_kwargs(),
+            )
+        except (OSError, StageEditContextualSourcePairV2ArtifactError) as exc:
+            raise StageEditPipelineBridgeNotReadyError(
+                f"contextual-v2 production bundle is invalid: {exc}"
+            ) from exc
+        identity._validate_bundle(loaded)
+        if loaded.scorer.to_dict() != scorer.to_dict():
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 production scorer changed after preflight"
+            )
+
     def __post_init__(self) -> None:
         if not self.snapshot_path.is_absolute() or not self.checkpoint_directory.is_absolute():
             raise ValueError("StageEdit preflight paths must be absolute")
+        self.revalidate_snapshot_identity()
         if _snapshot_source_ids(self.snapshot) != frozenset(self.source_ids):
             raise ValueError("StageEdit preflight source identity changed")
         if not (
@@ -264,7 +835,7 @@ class StageEditPipelineBridgePreflight:
             raise ValueError("StageEdit preflight readiness version changed")
         if self.continuity_authority not in STAGE_EDIT_CONTINUITY_AUTHORITIES:
             raise ValueError("StageEdit preflight continuity authority is invalid")
-        pair_values = (
+        learned_v1_values = (
             self.source_pair_scorer,
             self.source_pair_scorer_path,
             self.source_pair_scorer_file_sha256,
@@ -272,19 +843,30 @@ class StageEditPipelineBridgePreflight:
             self.source_pair_checkpoint_sha256,
             self.source_pair_corpus_sha256,
         )
+        contextual_v2_values = (
+            self.contextual_source_pair_scorer_v2,
+            self.contextual_source_pair_identity_v2,
+        )
         if self.continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
-            if any(value is not None for value in pair_values):
+            if any(
+                value is not None
+                for value in (*learned_v1_values, *contextual_v2_values)
+            ):
                 raise ValueError(
                     "handcrafted continuity authority cannot bind a learned scorer"
                 )
-        else:
+        elif self.continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
             if self.dynamic_crop_version != 3:
                 raise ValueError(
                     "learned source-pair continuity requires Dynamic Crop v3"
                 )
-            if any(value is None for value in pair_values):
+            if any(value is None for value in learned_v1_values):
                 raise ValueError(
                     "learned continuity authority requires a complete scorer identity"
+                )
+            if any(value is not None for value in contextual_v2_values):
+                raise ValueError(
+                    "learned-v1 continuity cannot bind contextual-v2 evidence"
                 )
             if not isinstance(self.source_pair_scorer, StageEditSourcePairScorer):
                 raise ValueError("StageEdit preflight source-pair scorer is invalid")
@@ -296,6 +878,30 @@ class StageEditPipelineBridgePreflight:
                 raise ValueError("StageEdit preflight scorer contract changed")
             if self.source_pair_scorer.fingerprint != self.source_pair_scorer_fingerprint:
                 raise ValueError("StageEdit preflight scorer fingerprint changed")
+        else:
+            if self.dynamic_crop_version != 3:
+                raise ValueError(
+                    "contextual-v2 source-pair continuity requires Dynamic Crop v3"
+                )
+            if any(value is not None for value in learned_v1_values):
+                raise ValueError(
+                    "contextual-v2 continuity cannot bind learned-v1 evidence"
+                )
+            if any(value is None for value in contextual_v2_values):
+                raise ValueError(
+                    "contextual-v2 continuity requires a complete sealed identity"
+                )
+            if not isinstance(
+                self.contextual_source_pair_scorer_v2,
+                StageEditContextualSourcePairScorerV2,
+            ):
+                raise ValueError("StageEdit contextual-v2 scorer is invalid")
+            if not isinstance(
+                self.contextual_source_pair_identity_v2,
+                StageEditContextualSourcePairBridgeIdentityV2,
+            ):
+                raise ValueError("StageEdit contextual-v2 identity is invalid")
+        if self.continuity_authority != HANDCRAFTED_CONTINUITY_AUTHORITY:
             actual_readiness = stage_edit_readiness_report(
                 self.checkpoint_directory
             )
@@ -315,15 +921,23 @@ class StageEditPipelineBridgePreflight:
                 raise StageEditPipelineBridgeNotReadyError(
                     "learned preflight readiness identity changed"
                 )
+        if self.continuity_authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
             self._validate_learned_scorer_identity()
+        elif self.continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+            self._validate_contextual_scorer_identity()
 
     def to_dict(self) -> dict[str, Any]:
+        self.revalidate_snapshot_identity()
         self._validate_learned_scorer_identity()
+        self._validate_contextual_scorer_identity()
         payload = {
             "snapshot_path": str(self.snapshot_path),
             "snapshot_sha256": self.snapshot.snapshot_sha256,
             "snapshot_sequence_id": self.snapshot.sequence.sequence_id,
             "snapshot_token_count": len(self.snapshot.sequence.tokens),
+            "snapshot_identity": self.snapshot_identity.to_dict(),
+            "edit_mode": self.edit_mode,
+            "target_member": self.target_member,
             "temporal_pose_sidecar": (
                 self.snapshot.temporal_pose_sidecar_audit()
             ),
@@ -333,16 +947,8 @@ class StageEditPipelineBridgePreflight:
             "source_ids": list(self.source_ids),
             "continuity": {
                 "authority": self.continuity_authority,
-                "scorer_contract": (
-                    self.source_pair_scorer.contract
-                    if self.source_pair_scorer is not None
-                    else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-                ),
-                "scorer_fingerprint": (
-                    self.source_pair_scorer_fingerprint
-                    if self.source_pair_scorer_fingerprint is not None
-                    else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
-                ),
+                "scorer_contract": self.continuity_scorer_contract,
+                "scorer_fingerprint": self.continuity_scorer_fingerprint,
                 "source_pair_scorer_path": (
                     str(self.source_pair_scorer_path)
                     if self.source_pair_scorer_path is not None
@@ -355,6 +961,11 @@ class StageEditPipelineBridgePreflight:
                     self.source_pair_checkpoint_sha256
                 ),
                 "source_pair_corpus_sha256": self.source_pair_corpus_sha256,
+                "contextual_source_pair_identity_v2": (
+                    self.contextual_source_pair_identity_v2.to_dict()
+                    if self.contextual_source_pair_identity_v2 is not None
+                    else None
+                ),
             },
             "readiness": self.readiness.to_dict(),
         }
@@ -407,6 +1018,7 @@ class StageEditPipelineBridgeResult:
                 "StageEdit bridge result requires a typed production preflight"
             )
         self.preflight._validate_learned_scorer_identity()
+        self.preflight._validate_contextual_scorer_identity()
         if not isinstance(
             self.head_materialization, StageEditHeadMaterializationResult
         ):
@@ -455,16 +1067,8 @@ class StageEditPipelineBridgeResult:
             )
         version = self.preflight.dynamic_crop_version
         authority = self.preflight.continuity_authority
-        scorer_contract = (
-            self.preflight.source_pair_scorer.contract
-            if self.preflight.source_pair_scorer is not None
-            else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-        )
-        scorer_fingerprint = (
-            self.preflight.source_pair_scorer_fingerprint
-            if self.preflight.source_pair_scorer_fingerprint is not None
-            else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
-        )
+        scorer_contract = self.preflight.continuity_scorer_contract
+        scorer_fingerprint = self.preflight.continuity_scorer_fingerprint
         if self.head_materialization.dynamic_crop_version != version:
             raise ValueError(
                 "StageEdit bridge head materialization version differs"
@@ -584,6 +1188,17 @@ class StageEditPipelineBridgeResult:
             raise ValueError(
                 "StageEdit bridge selection identity differs from preflight"
             )
+        expected_contextual_identity = (
+            self.preflight.contextual_source_pair_identity_v2.to_dict()
+            if self.preflight.contextual_source_pair_identity_v2 is not None
+            else None
+        )
+        if self.selection_policy.get(
+            "contextual_source_pair_identity_v2"
+        ) != expected_contextual_identity:
+            raise ValueError(
+                "StageEdit bridge contextual-v2 selection identity differs from preflight"
+            )
         for retained in self.retained_candidates:
             history = tuple(retained.edit.candidate_history)
             explicit_versions = {
@@ -668,6 +1283,8 @@ def preflight_stage_edit_pipeline_bridge(
     feature_snapshot_path: Path,
     checkpoint_directory: Path,
     source_ids: Sequence[str],
+    edit_mode: object = "group",
+    target_member: object | None = None,
     schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
     dynamic_crop_version: int = 2,
     continuity_authority: str = HANDCRAFTED_CONTINUITY_AUTHORITY,
@@ -676,10 +1293,27 @@ def preflight_stage_edit_pipeline_bridge(
     source_pair_scorer_fingerprint: str | None = None,
     source_pair_checkpoint_sha256: str | None = None,
     source_pair_corpus_sha256: str | None = None,
+    contextual_source_pair_bundle_directory: Path | None = None,
+    contextual_source_pair_checkpoint_sha256: str | None = None,
+    contextual_source_pair_checkpoint_file_sha256: str | None = None,
+    contextual_source_pair_report_sha256: str | None = None,
+    contextual_source_pair_report_file_sha256: str | None = None,
+    contextual_source_pair_beam_qa_report_sha256: str | None = None,
+    contextual_source_pair_corpus_sha256: str | None = None,
+    contextual_source_pair_corpus_file_sha256: str | None = None,
+    contextual_source_pair_token_schema_fingerprint: str | None = None,
+    contextual_source_pair_verified_beam_qa_cases: (
+        Sequence[VerifiedStageEditContextualBeamQACaseV2] | None
+    ) = None,
 ) -> StageEditPipelineBridgePreflight:
     """Strict-load all explicit activation identities before expensive work."""
 
-    snapshot_path = Path(feature_snapshot_path).expanduser().resolve()
+    raw_snapshot_path = Path(feature_snapshot_path).expanduser()
+    if raw_snapshot_path.is_symlink():
+        raise StageEditPipelineBridgeNotReadyError(
+            "configured StageEdit feature snapshot cannot be a symlink"
+        )
+    snapshot_path = raw_snapshot_path.resolve()
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
     canonical_source_ids = _strict_source_ids(source_ids)
     if (
@@ -695,27 +1329,82 @@ def preflight_stage_edit_pipeline_bridge(
         raise StageEditPipelineBridgeInputError(
             "continuity_authority is unsupported"
         )
-    pair_arguments = (
+    learned_v1_arguments = (
         source_pair_scorer_path,
         source_pair_scorer_file_sha256,
         source_pair_scorer_fingerprint,
         source_pair_checkpoint_sha256,
         source_pair_corpus_sha256,
     )
+    contextual_v2_arguments = (
+        contextual_source_pair_bundle_directory,
+        contextual_source_pair_checkpoint_sha256,
+        contextual_source_pair_checkpoint_file_sha256,
+        contextual_source_pair_report_sha256,
+        contextual_source_pair_report_file_sha256,
+        contextual_source_pair_beam_qa_report_sha256,
+        contextual_source_pair_corpus_sha256,
+        contextual_source_pair_corpus_file_sha256,
+        contextual_source_pair_token_schema_fingerprint,
+        contextual_source_pair_verified_beam_qa_cases,
+    )
+    contextual_cases: tuple[VerifiedStageEditContextualBeamQACaseV2, ...] = ()
     if authority == HANDCRAFTED_CONTINUITY_AUTHORITY:
-        if any(value is not None for value in pair_arguments):
+        if any(
+            value is not None
+            for value in (*learned_v1_arguments, *contextual_v2_arguments)
+        ):
             raise StageEditPipelineBridgeInputError(
                 "handcrafted continuity authority rejects source-pair scorer evidence"
             )
-    elif dynamic_crop_version != 3:
-        raise StageEditPipelineBridgeInputError(
-            "learned source-pair continuity is only valid for Dynamic Crop v3"
-        )
-    elif any(value is None for value in pair_arguments):
-        raise StageEditPipelineBridgeInputError(
-            "learned continuity authority requires the exact registered scorer "
-            "path, file hash, fingerprint, checkpoint hash, and corpus hash"
-        )
+    elif authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
+        if dynamic_crop_version != 3:
+            raise StageEditPipelineBridgeInputError(
+                "learned source-pair continuity is only valid for Dynamic Crop v3"
+            )
+        if any(value is None for value in learned_v1_arguments):
+            raise StageEditPipelineBridgeInputError(
+                "learned continuity authority requires the exact registered scorer "
+                "path, file hash, fingerprint, checkpoint hash, and corpus hash"
+            )
+        if any(value is not None for value in contextual_v2_arguments):
+            raise StageEditPipelineBridgeInputError(
+                "learned-v1 continuity rejects contextual-v2 bundle evidence"
+            )
+    else:
+        if dynamic_crop_version != 3:
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 continuity is only valid for Dynamic Crop v3"
+            )
+        if any(value is not None for value in learned_v1_arguments):
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 continuity rejects learned-v1 scorer evidence"
+            )
+        if any(value is None for value in contextual_v2_arguments):
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 continuity requires complete corpus/checkpoint/"
+                "report byte hashes, content hashes, schema identity, and "
+                "verified Beam-QA envelopes"
+            )
+        cases_value = contextual_source_pair_verified_beam_qa_cases
+        if isinstance(cases_value, (str, bytes, bytearray)):
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 Beam-QA evidence must be verified envelopes"
+            )
+        try:
+            contextual_cases = tuple(cases_value)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 Beam-QA evidence must be a sequence"
+            ) from exc
+        if not contextual_cases or any(
+            not _is_verified_contextual_beam_qa_case_v2(value)
+            for value in contextual_cases
+        ):
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 production activation requires adapter-issued "
+                "verified Beam-QA envelopes; raw case DTOs are inspection-only"
+            )
     if not snapshot_path.is_file():
         raise StageEditPipelineBridgeNotReadyError(
             "configured StageEdit feature snapshot does not exist"
@@ -751,15 +1440,13 @@ def preflight_stage_edit_pipeline_bridge(
             "configured checkpoint must contain one unambiguous "
             f"Dynamic Crop v{dynamic_crop_version} namespace"
         )
-    try:
-        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, Mapping):
-            raise ValueError("snapshot root must be an object")
-        snapshot = StageEditFeatureSnapshot.from_dict(payload, schema=schema)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise StageEditPipelineBridgeNotReadyError(
-            f"configured StageEdit feature snapshot is invalid: {exc}"
-        ) from exc
+    snapshot_identity = load_stage_edit_production_snapshot_identity(
+        snapshot_path,
+        edit_mode=edit_mode,
+        target_member=target_member,
+        schema=schema,
+    )
+    snapshot = snapshot_identity.snapshot
     observed_source_ids = _snapshot_source_ids(snapshot)
     configured_source_ids = frozenset(canonical_source_ids)
     if observed_source_ids != configured_source_ids:
@@ -793,6 +1480,8 @@ def preflight_stage_edit_pipeline_bridge(
     scorer_fingerprint: str | None = None
     scorer_checkpoint_sha256: str | None = None
     scorer_corpus_sha256: str | None = None
+    contextual_scorer: StageEditContextualSourcePairScorerV2 | None = None
+    contextual_identity: StageEditContextualSourcePairBridgeIdentityV2 | None = None
     if authority == PRODUCTION_LEARNED_CONTINUITY_AUTHORITY:
         raw_scorer_path = Path(source_pair_scorer_path).expanduser()  # type: ignore[arg-type]
         if raw_scorer_path.is_symlink():
@@ -852,12 +1541,111 @@ def preflight_stage_edit_pipeline_bridge(
             raise StageEditPipelineBridgeNotReadyError(
                 "registered source-pair scorer identity changed"
             )
+    elif authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        bundle_directory = Path(
+            contextual_source_pair_bundle_directory  # type: ignore[arg-type]
+        ).expanduser()
+        if not bundle_directory.is_absolute():
+            raise StageEditPipelineBridgeInputError(
+                "contextual-v2 production bundle directory must be absolute"
+            )
+        contextual_checkpoint_sha256 = _sha256_identity(
+            contextual_source_pair_checkpoint_sha256,
+            "contextual_source_pair_checkpoint_sha256",
+        )
+        contextual_checkpoint_file_sha256 = _sha256_identity(
+            contextual_source_pair_checkpoint_file_sha256,
+            "contextual_source_pair_checkpoint_file_sha256",
+        )
+        contextual_report_sha256 = _sha256_identity(
+            contextual_source_pair_report_sha256,
+            "contextual_source_pair_report_sha256",
+        )
+        contextual_report_file_sha256 = _sha256_identity(
+            contextual_source_pair_report_file_sha256,
+            "contextual_source_pair_report_file_sha256",
+        )
+        contextual_beam_qa_report_sha256 = _sha256_identity(
+            contextual_source_pair_beam_qa_report_sha256,
+            "contextual_source_pair_beam_qa_report_sha256",
+        )
+        contextual_corpus_sha256 = _sha256_identity(
+            contextual_source_pair_corpus_sha256,
+            "contextual_source_pair_corpus_sha256",
+        )
+        contextual_corpus_file_sha256 = _sha256_identity(
+            contextual_source_pair_corpus_file_sha256,
+            "contextual_source_pair_corpus_file_sha256",
+        )
+        contextual_token_schema_fingerprint = _sha256_identity(
+            contextual_source_pair_token_schema_fingerprint,
+            "contextual_source_pair_token_schema_fingerprint",
+        )
+        if contextual_token_schema_fingerprint != snapshot.token_schema_fingerprint:
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 bundle token schema differs from the feature snapshot"
+            )
+        try:
+            contextual_bundle = (
+                load_stage_edit_contextual_source_pair_production_bundle_v2(
+                    bundle_directory,
+                    expected_checkpoint_sha256=contextual_checkpoint_sha256,
+                    expected_checkpoint_file_sha256=(
+                        contextual_checkpoint_file_sha256
+                    ),
+                    expected_report_sha256=contextual_report_sha256,
+                    expected_report_file_sha256=contextual_report_file_sha256,
+                    expected_beam_qa_report_sha256=(
+                        contextual_beam_qa_report_sha256
+                    ),
+                    expected_corpus_sha256=contextual_corpus_sha256,
+                    expected_corpus_file_sha256=contextual_corpus_file_sha256,
+                    expected_token_schema_fingerprint=(
+                        contextual_token_schema_fingerprint
+                    ),
+                    verified_beam_qa_cases=contextual_cases,
+                )
+            )
+        except (OSError, StageEditContextualSourcePairV2ArtifactError) as exc:
+            raise StageEditPipelineBridgeNotReadyError(
+                f"contextual-v2 production bundle is invalid: {exc}"
+            ) from exc
+        if not isinstance(
+            contextual_bundle,
+            StageEditContextualSourcePairProductionBundleV2,
+        ) or not isinstance(
+            contextual_bundle.scorer,
+            StageEditContextualSourcePairScorerV2,
+        ):
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 production loader returned an untyped bundle"
+            )
+        if contextual_bundle.directory != bundle_directory:
+            raise StageEditPipelineBridgeNotReadyError(
+                "contextual-v2 production loader returned another bundle directory"
+            )
+        contextual_scorer = contextual_bundle.scorer
+        contextual_identity = _new_contextual_source_pair_bridge_identity_v2(
+            bundle=contextual_bundle,
+            verified_beam_qa_cases=contextual_cases,
+            checkpoint_sha256=contextual_checkpoint_sha256,
+            checkpoint_file_sha256=contextual_checkpoint_file_sha256,
+            report_sha256=contextual_report_sha256,
+            report_file_sha256=contextual_report_file_sha256,
+            beam_qa_report_sha256=contextual_beam_qa_report_sha256,
+            corpus_sha256=contextual_corpus_sha256,
+            corpus_file_sha256=contextual_corpus_file_sha256,
+            token_schema_fingerprint=contextual_token_schema_fingerprint,
+        )
     return StageEditPipelineBridgePreflight(
         snapshot_path=snapshot_path,
         checkpoint_directory=checkpoint,
         source_ids=canonical_source_ids,
         snapshot=snapshot,
         readiness=readiness,
+        snapshot_identity=snapshot_identity,
+        edit_mode=snapshot_identity.edit_mode,
+        target_member=snapshot_identity.target_member,
         dynamic_crop_version=dynamic_crop_version,
         continuity_authority=authority,
         source_pair_scorer=scorer,
@@ -866,6 +1654,8 @@ def preflight_stage_edit_pipeline_bridge(
         source_pair_scorer_fingerprint=scorer_fingerprint,
         source_pair_checkpoint_sha256=scorer_checkpoint_sha256,
         source_pair_corpus_sha256=scorer_corpus_sha256,
+        contextual_source_pair_scorer_v2=contextual_scorer,
+        contextual_source_pair_identity_v2=contextual_identity,
     )
 
 
@@ -903,6 +1693,11 @@ def _exact_clock_candidate(
     for decision, shot in zip(
         timeline.decisions, timeline.edit.shots, strict=True
     ):
+        decision_decode_v3 = getattr(decision, "dynamic_crop_decode_v3", None)
+        if shot.dynamic_crop_decode_v3 != decision_decode_v3:
+            raise StageEditPipelineBridgeInputError(
+                "exact-clock projection lost Dynamic Crop v3 decode provenance"
+            )
         source_index = decision.source_index
         timewarp = timewarps[source_index]
         if timewarp is not None and not math.isclose(
@@ -994,7 +1789,9 @@ def run_stage_edit_pipeline_bridge(
 ) -> StageEditPipelineBridgeResult:
     """Materialize, decode, and retain learned candidates without selecting them."""
 
+    preflight.revalidate_snapshot_identity(schema=schema)
     preflight._validate_learned_scorer_identity()
+    preflight._validate_contextual_scorer_identity(reload_artifacts=True)
     normalized_sources = tuple(Path(value).expanduser().resolve() for value in sources)
     source_count = len(preflight.source_ids)
     if len(normalized_sources) != source_count or len(set(normalized_sources)) != source_count:
@@ -1066,16 +1863,8 @@ def run_stage_edit_pipeline_bridge(
         raise StageEditPipelineBridgeInputError(
             "semi-Markov continuity authority differs from the preflight bundle"
         )
-    expected_scorer_contract = (
-        preflight.source_pair_scorer.contract
-        if preflight.source_pair_scorer is not None
-        else HANDCRAFTED_CONTINUITY_SCORER_CONTRACT
-    )
-    expected_scorer_fingerprint = (
-        preflight.source_pair_scorer_fingerprint
-        if preflight.source_pair_scorer_fingerprint is not None
-        else HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT
-    )
+    expected_scorer_contract = preflight.continuity_scorer_contract
+    expected_scorer_fingerprint = preflight.continuity_scorer_fingerprint
     if (
         config.continuity_scorer_contract is not None
         and config.continuity_scorer_contract != expected_scorer_contract
@@ -1098,6 +1887,14 @@ def run_stage_edit_pipeline_bridge(
         raise StageEditPipelineBridgeInputError(
             "automatic GROUP StageEdit bridge requires verified source derivative metadata"
         )
+    if (
+        preflight.continuity_authority
+        == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+        and source_derivative_metadata is None
+    ):
+        raise StageEditPipelineBridgeInputError(
+            "contextual-v2 continuity requires verified source derivative metadata"
+        )
     if source_derivative_metadata is not None and not isinstance(
         source_derivative_metadata, SourceDerivativeFamilyMetadata
     ):
@@ -1119,17 +1916,33 @@ def run_stage_edit_pipeline_bridge(
             "source derivative classification is uncertain or clock-incomplete"
         )
 
-    materializer = (
-        materialize_stage_edit_head_frames_v3
-        if preflight.dynamic_crop_version == 3
-        else materialize_stage_edit_head_frames_v2
-    )
-    heads = materializer(
-        checkpoint_directory=preflight.checkpoint_directory,
-        sequence=preflight.snapshot.sequence,
-        canonical_source_ids=preflight.source_ids,
-        schema=schema,
-    )
+    if preflight.dynamic_crop_version == 3:
+        family_mapping = (
+            {
+                source_id: source_derivative_metadata.family_ids[index]
+                for index, source_id in enumerate(preflight.source_ids)
+            }
+            if source_derivative_metadata is not None
+            else None
+        )
+        heads = materialize_stage_edit_head_frames_v3(
+            checkpoint_directory=preflight.checkpoint_directory,
+            sequence=preflight.snapshot.sequence,
+            canonical_source_ids=preflight.source_ids,
+            schema=schema,
+            **(
+                {"derivative_family_id_by_source": family_mapping}
+                if family_mapping is not None
+                else {}
+            ),
+        )
+    else:
+        heads = materialize_stage_edit_head_frames_v2(
+            checkpoint_directory=preflight.checkpoint_directory,
+            sequence=preflight.snapshot.sequence,
+            canonical_source_ids=preflight.source_ids,
+            schema=schema,
+        )
     if getattr(heads, "dynamic_crop_version", None) != (
         preflight.dynamic_crop_version
     ):
@@ -1179,6 +1992,9 @@ def run_stage_edit_pipeline_bridge(
         fps=fps,
         source_derivative_metadata=source_derivative_metadata,
         source_pair_scorer=preflight.source_pair_scorer,
+        contextual_source_pair_scorer_v2=(
+            preflight.contextual_source_pair_scorer_v2
+        ),
     )
     if not decoded.audit.request_fulfilled:
         raise StageEditPipelineBridgeError(
@@ -1221,12 +2037,21 @@ def run_stage_edit_pipeline_bridge(
             "continuity_authority": preflight.continuity_authority,
             "continuity_scorer_contract": expected_scorer_contract,
             "continuity_scorer_fingerprint": expected_scorer_fingerprint,
+            "contextual_source_pair_identity_v2": (
+                preflight.contextual_source_pair_identity_v2.to_dict()
+                if preflight.contextual_source_pair_identity_v2 is not None
+                else None
+            ),
             "temporal_pose_sidecar": (
                 preflight.snapshot.temporal_pose_sidecar_audit()
             ),
             "source_derivative_policy": (
                 "verified_actual_pts_families_required"
-                if require_verified_source_derivative_metadata
+                if (
+                    require_verified_source_derivative_metadata
+                    or preflight.continuity_authority
+                    == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                )
                 else "legacy_identity_default_not_automatic_group_safe"
             ),
             "section_director": (
@@ -1237,14 +2062,19 @@ def run_stage_edit_pipeline_bridge(
 
 
 __all__ = [
+    "STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_BRIDGE_IDENTITY_V2_CONTRACT",
     "STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT",
     "STAGE_EDIT_PIPELINE_BRIDGE_SCHEMA_VERSION",
+    "STAGE_EDIT_PRODUCTION_SNAPSHOT_IDENTITY_CONTRACT",
     "RetainedStageEditCandidate",
     "StageEditPipelineBridgeError",
     "StageEditPipelineBridgeInputError",
     "StageEditPipelineBridgeNotReadyError",
     "StageEditPipelineBridgePreflight",
     "StageEditPipelineBridgeResult",
+    "StageEditContextualSourcePairBridgeIdentityV2",
+    "StageEditProductionSnapshotIdentity",
+    "load_stage_edit_production_snapshot_identity",
     "preflight_stage_edit_pipeline_bridge",
     "run_stage_edit_pipeline_bridge",
 ]

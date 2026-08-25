@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
-from .render import EditorialTransformTrack
+from .render import EditorialTransformKeyframe, EditorialTransformTrack
 from .stage_edit_dynamic_crop_head_v2 import DynamicCropHeadV2Config
 from .stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_MAX_KEYFRAMES,
@@ -39,6 +39,29 @@ DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT = (
 DYNAMIC_CROP_V3_PREDICTION_CONTRACT = (
     "source_slot_count_conditional_dynamic_crop_prediction_v3"
 )
+
+_DYNAMIC_CROP_V3_DECODE_KEYS = {
+    "adapter_contract",
+    "source_id",
+    "source_index",
+    "eligible",
+    "loss_masked",
+    "track",
+    "predicted_keyframe_count",
+    "applied_keyframe_count",
+    "minimum_safe_zoom_projection_count",
+    "rejection_reasons",
+    "motion_logit",
+    "shot_duration_seconds",
+}
+_DYNAMIC_CROP_V3_TRACK_KEYS = {"reason", "keyframes"}
+_DYNAMIC_CROP_V3_KEYFRAME_KEYS = {
+    "time_seconds",
+    "zoom",
+    "center_x",
+    "center_y",
+    "roll_degrees",
+}
 
 
 def _finite_float(value: object, name: str) -> float:
@@ -113,6 +136,15 @@ class DynamicCropTrackDecodeV3:
     applied_keyframe_count: int
     minimum_safe_zoom_projection_count: int
     rejection_reasons: tuple[str, ...]
+    # Retained independently from track presence.  The renderer-side motion
+    # authority combines this exact logit with its LOSO-bound threshold and
+    # sampled physical range; a framing track alone never means "motion".
+    motion_logit: float | None = None
+    # Exact semi-Markov duration used to scale the normalized keyframe clock.
+    # Final visual repair may reparameterize that clock; renderer provenance
+    # must prove the target/original duration ratio rather than loosely accept
+    # a track that merely looks similar.
+    shot_duration_seconds: float | None = None
     adapter_contract: str = DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT
 
     def __post_init__(self) -> None:
@@ -127,6 +159,19 @@ class DynamicCropTrackDecodeV3:
             raise ValueError("dynamic crop v3 predicted count is invalid")
         if self.adapter_contract != DYNAMIC_CROP_V3_SEMIMARKOV_ADAPTER_CONTRACT:
             raise ValueError("dynamic crop v3 adapter contract mismatch")
+        if self.motion_logit is not None:
+            object.__setattr__(
+                self,
+                "motion_logit",
+                _finite_float(self.motion_logit, "motion logit"),
+            )
+        if self.shot_duration_seconds is not None:
+            duration = _finite_float(
+                self.shot_duration_seconds, "shot duration seconds"
+            )
+            if duration <= 0.0:
+                raise ValueError("dynamic crop v3 shot duration must be positive")
+            object.__setattr__(self, "shot_duration_seconds", duration)
         if self.eligible:
             if self.loss_masked or self.track is None or source_id is None:
                 raise ValueError("eligible dynamic crop v3 decode needs a source track")
@@ -144,6 +189,143 @@ class DynamicCropTrackDecodeV3:
             if not self.rejection_reasons:
                 raise ValueError("rejected dynamic crop v3 decode needs a reason")
         object.__setattr__(self, "source_id", source_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize every field needed to replay renderer motion authority."""
+
+        track = self.track
+        return {
+            "adapter_contract": self.adapter_contract,
+            "source_id": self.source_id,
+            "source_index": self.source_index,
+            "eligible": self.eligible,
+            "loss_masked": self.loss_masked,
+            "track": (
+                None
+                if track is None
+                else {
+                    "reason": track.reason,
+                    "keyframes": [
+                        {
+                            "time_seconds": item.time_seconds,
+                            "zoom": item.zoom,
+                            "center_x": item.center_x,
+                            "center_y": item.center_y,
+                            "roll_degrees": item.roll_degrees,
+                        }
+                        for item in track.keyframes
+                    ],
+                }
+            ),
+            "predicted_keyframe_count": self.predicted_keyframe_count,
+            "applied_keyframe_count": self.applied_keyframe_count,
+            "minimum_safe_zoom_projection_count": (
+                self.minimum_safe_zoom_projection_count
+            ),
+            "rejection_reasons": list(self.rejection_reasons),
+            "motion_logit": self.motion_logit,
+            "shot_duration_seconds": self.shot_duration_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DynamicCropTrackDecodeV3":
+        """Strictly restore one exact v3 decode; partial legacy payloads fail."""
+
+        if not isinstance(payload, Mapping) or set(payload) != _DYNAMIC_CROP_V3_DECODE_KEYS:
+            raise ValueError("dynamic crop v3 decode keys are not exact")
+        material = dict(payload)
+        for name in ("eligible", "loss_masked"):
+            if not isinstance(material[name], bool):
+                raise ValueError(f"dynamic crop v3 decode {name} must be boolean")
+        for name in (
+            "source_index",
+            "predicted_keyframe_count",
+            "applied_keyframe_count",
+            "minimum_safe_zoom_projection_count",
+        ):
+            if isinstance(material[name], bool) or not isinstance(material[name], int):
+                raise ValueError(f"dynamic crop v3 decode {name} must be an integer")
+        source_id = material["source_id"]
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError(
+                "strict dynamic crop v3 decode needs an exact source identity"
+            )
+        if not isinstance(material["adapter_contract"], str):
+            raise ValueError("dynamic crop v3 decode adapter contract must be a string")
+        rejection_reasons = material["rejection_reasons"]
+        if not isinstance(rejection_reasons, list) or any(
+            not isinstance(reason, str) or not reason.strip()
+            for reason in rejection_reasons
+        ):
+            raise ValueError("dynamic crop v3 decode rejection reasons are invalid")
+        raw_track = material["track"]
+        track: EditorialTransformTrack | None
+        if raw_track is None:
+            track = None
+        else:
+            if not isinstance(raw_track, Mapping) or set(raw_track) != _DYNAMIC_CROP_V3_TRACK_KEYS:
+                raise ValueError("dynamic crop v3 decode track keys are not exact")
+            reason = raw_track["reason"]
+            raw_keyframes = raw_track["keyframes"]
+            if not isinstance(reason, str) or not isinstance(raw_keyframes, list):
+                raise ValueError("dynamic crop v3 decode track is malformed")
+            keyframes: list[EditorialTransformKeyframe] = []
+            for index, raw_keyframe in enumerate(raw_keyframes):
+                if (
+                    not isinstance(raw_keyframe, Mapping)
+                    or set(raw_keyframe) != _DYNAMIC_CROP_V3_KEYFRAME_KEYS
+                ):
+                    raise ValueError(
+                        f"dynamic crop v3 keyframe {index} keys are not exact"
+                    )
+                keyframes.append(
+                    EditorialTransformKeyframe(
+                        time_seconds=_finite_float(
+                            raw_keyframe["time_seconds"],
+                            f"keyframe {index} time_seconds",
+                        ),
+                        zoom=_finite_float(
+                            raw_keyframe["zoom"], f"keyframe {index} zoom"
+                        ),
+                        center_x=_finite_float(
+                            raw_keyframe["center_x"],
+                            f"keyframe {index} center_x",
+                        ),
+                        center_y=_finite_float(
+                            raw_keyframe["center_y"],
+                            f"keyframe {index} center_y",
+                        ),
+                        roll_degrees=_finite_float(
+                            raw_keyframe["roll_degrees"],
+                            f"keyframe {index} roll_degrees",
+                        ),
+                    )
+                )
+            track = EditorialTransformTrack(tuple(keyframes), reason=reason)
+        motion_logit = material["motion_logit"]
+        shot_duration = material["shot_duration_seconds"]
+        if motion_logit is None or shot_duration is None:
+            raise ValueError(
+                "strict dynamic crop v3 decode needs motion logit and shot duration"
+            )
+        return cls(
+            source_id=source_id,
+            source_index=material["source_index"],
+            eligible=material["eligible"],
+            loss_masked=material["loss_masked"],
+            track=track,
+            predicted_keyframe_count=material["predicted_keyframe_count"],
+            applied_keyframe_count=material["applied_keyframe_count"],
+            minimum_safe_zoom_projection_count=material[
+                "minimum_safe_zoom_projection_count"
+            ],
+            rejection_reasons=tuple(rejection_reasons),
+            motion_logit=_finite_float(motion_logit, "motion logit"),
+            shot_duration_seconds=_finite_float(
+                shot_duration, "shot duration seconds"
+            ),
+            adapter_contract=material["adapter_contract"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +418,8 @@ class DynamicCropHeadPredictionV3:
                 applied_keyframe_count=0,
                 minimum_safe_zoom_projection_count=0,
                 rejection_reasons=legacy.rejection_reasons,
+                motion_logit=self.motion_logit,
+                shot_duration_seconds=shot_duration_seconds,
             )
         assert legacy.track is not None
         track = EditorialTransformTrack(
@@ -253,6 +437,8 @@ class DynamicCropHeadPredictionV3:
                 legacy.minimum_safe_zoom_projection_count
             ),
             rejection_reasons=(),
+            motion_logit=self.motion_logit,
+            shot_duration_seconds=shot_duration_seconds,
         )
 
     def to_dict(self) -> dict[str, Any]:

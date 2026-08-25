@@ -8,17 +8,24 @@ import tempfile
 import unittest
 
 from crosscut.professional_montage_grammar import (
+    EditorialTransformEvidence,
+    IntroducedBoundaryContinuityEvidence,
     MontageGrammarConfig,
     MontageGrammarEvidenceError,
+    MontageSectionWindow,
     MontageSongInput,
     PROFILE_ANALYSIS_BASIS,
     PROFILE_SCHEMA_VERSION,
+    ProfessionalBoundaryGrammarEvidence,
+    ProfessionalBoundaryGrammarPolicy,
     ProfessionalMontageGrammarProfile,
+    assess_professional_boundary_grammar,
     build_professional_montage_grammar_profile,
 )
 from crosscut.stage_edit_feature_materializer import (
     FEATURE_MATERIALIZER_CONTRACT,
     FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    StageEditFeatureProvenance,
     StageEditFeatureSnapshot,
 )
 from crosscut.stage_edit_feature_snapshot_job import (
@@ -31,6 +38,9 @@ from crosscut.stage_edit_transformer import (
     SourceCandidateToken,
     StageEditSequence,
     StageEditToken,
+)
+from engine.tests.stage_edit_causal_sensing_test_support import (
+    synthetic_production_snapshot,
 )
 
 
@@ -209,10 +219,14 @@ class _SyntheticSong:
             "supervision_inputs": supervision_records,
             "feature_provenance": {
                 "producer": FEATURE_MATERIALIZER_CONTRACT,
-                "contracts": list(
-                    FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS
-                ),
+                "contracts": list(snapshot.provenance.contracts),
             },
+            "causal_sensing_binding": (
+                snapshot.causal_sensing_binding.to_dict()
+            ),
+            "production_causal_sensing_gate": (
+                snapshot.require_production_causal_sensing(edit_mode="group")
+            ),
             "snapshots": snapshot_records,
             "statistics": {
                 "reference_count": 2,
@@ -314,11 +328,14 @@ class _SyntheticSong:
                     * DEFAULT_STAGE_EDIT_SCHEMA.raw_context_dimension,
                 )
             )
-        return StageEditFeatureSnapshot.build(
+        return synthetic_production_snapshot(
             StageEditSequence(
                 f"stageedit-features:{self.song_id}:{reference_id}",
                 tuple(tokens),
-            )
+            ),
+            provenance=StageEditFeatureProvenance(
+                contracts=FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS,
+            ),
         )
 
     def _supervision(
@@ -725,6 +742,320 @@ class ProfessionalMontageGrammarTest(unittest.TestCase):
                 artist="OTHER",
                 config=self.config,
             )
+
+
+class ProfessionalBoundaryGrammarAssessmentTests(unittest.TestCase):
+    _SECTIONS = (
+        MontageSectionWindow("general-a", "general", 0.0, 20.0),
+        MontageSectionWindow("chorus-a", "chorus", 20.0, 40.0),
+        MontageSectionWindow("highlight-a", "highlight", 40.0, 46.0),
+        MontageSectionWindow("general-b", "general", 46.0, 60.0),
+    )
+    _SWITCHES = (
+        2.0,
+        6.0,
+        10.0,
+        14.0,
+        18.0,
+        20.5,
+        23.5,
+        26.5,
+        29.5,
+        32.5,
+        35.5,
+        38.5,
+        40.5,
+        42.5,
+        44.5,
+        48.0,
+        52.0,
+        56.0,
+    )
+    _NATIVE_CUTS = (
+        1.0,
+        3.0,
+        5.0,
+        7.0,
+        9.0,
+        11.0,
+        13.0,
+        15.0,
+        17.0,
+        19.0,
+        21.0,
+        22.0,
+        24.0,
+        25.0,
+        27.0,
+        28.0,
+        30.0,
+        31.0,
+        33.0,
+        34.0,
+        36.0,
+        37.0,
+        39.0,
+        41.0,
+        43.0,
+        45.0,
+        47.0,
+        49.0,
+        50.0,
+        51.0,
+        53.0,
+        54.0,
+        55.0,
+        57.0,
+        58.0,
+        59.0,
+    )
+
+    def _transforms(
+        self,
+        *,
+        roll: tuple[float, ...] = (42.0,),
+    ) -> EditorialTransformEvidence:
+        return EditorialTransformEvidence(
+            segment_count=100,
+            applied_segment_count=8,
+            zoom_event_times_seconds=(3.0, 23.0, 32.0, 42.0, 52.0),
+            pan_event_times_seconds=(6.0, 26.0, 44.0),
+            roll_event_times_seconds=roll,
+        )
+
+    def _evidence(
+        self,
+        *,
+        switches: tuple[float, ...] | None = None,
+        native_cuts: tuple[float, ...] | None = None,
+        sections: tuple[MontageSectionWindow, ...] | None = None,
+        issue_count: int = 2,
+        score_p10: float | None = 82.0,
+        transforms: EditorialTransformEvidence | None = None,
+    ) -> ProfessionalBoundaryGrammarEvidence:
+        selected_switches = self._SWITCHES if switches is None else switches
+        if not selected_switches:
+            issue_count = 0
+            score_p10 = None
+        return ProfessionalBoundaryGrammarEvidence(
+            performance_id="IVE-SYNTHETIC-BOUNDARY",
+            duration_seconds=60.0,
+            source_switch_times_seconds=selected_switches,
+            native_internal_cut_times_seconds=(
+                self._NATIVE_CUTS if native_cuts is None else native_cuts
+            ),
+            sections=self._SECTIONS if sections is None else sections,
+            introduced_boundary_continuity=(
+                IntroducedBoundaryContinuityEvidence.from_counts(
+                    boundary_count=len(selected_switches),
+                    issue_count=issue_count,
+                    score_p10=score_p10,
+                )
+            ),
+            editorial_transforms=transforms or self._transforms(),
+        )
+
+    def test_native_cuts_do_not_mask_cross_source_cadence_failure(self) -> None:
+        native_only = tuple(float(index) for index in range(1, 60))
+        assessment = assess_professional_boundary_grammar(
+            self._evidence(
+                switches=(),
+                native_cuts=native_only,
+                sections=(
+                    MontageSectionWindow("ordinary", "general", 0.0, 60.0),
+                ),
+                transforms=self._transforms(roll=()),
+            )
+        )
+        self.assertFalse(assessment.passed)
+        self.assertIn(
+            "whole_song_source_switch_density_below_minimum",
+            assessment.failure_reasons,
+        )
+        self.assertEqual(0, assessment.source_switch_count)
+        self.assertEqual(59, assessment.native_internal_cut_count)
+        self.assertEqual(59, assessment.total_visible_cut_count)
+        self.assertFalse(
+            assessment.to_dict()["cadence"][
+                "native_cuts_satisfy_source_switch_policy"
+            ]
+        )
+
+    def test_highlight_burst_passes_and_sparse_highlight_fails(self) -> None:
+        passing = assess_professional_boundary_grammar(self._evidence())
+        self.assertTrue(passing.passed, passing.failure_reasons)
+        highlight = next(
+            item
+            for item in passing.section_assessments
+            if item.kind == "highlight"
+        )
+        self.assertEqual(30.0, highlight.source_switches_per_minute)
+        self.assertEqual(2.0, highlight.maximum_no_switch_gap_seconds)
+
+        sparse_switches = tuple(
+            item for item in self._SWITCHES if not 40.0 <= item < 46.0
+        )
+        sparse = assess_professional_boundary_grammar(
+            self._evidence(
+                switches=sparse_switches,
+                issue_count=1,
+            )
+        )
+        self.assertFalse(sparse.passed)
+        self.assertIn(
+            "highlight_source_switch_density_below_minimum",
+            sparse.failure_reasons,
+        )
+        self.assertIn(
+            "highlight_no_switch_gap_above_maximum",
+            sparse.failure_reasons,
+        )
+
+    def test_introduced_boundary_continuity_failure_is_independent(self) -> None:
+        assessment = assess_professional_boundary_grammar(
+            self._evidence(issue_count=9, score_p10=60.0)
+        )
+        self.assertFalse(assessment.passed)
+        self.assertIn(
+            "introduced_boundary_issue_fraction_above_maximum",
+            assessment.failure_reasons,
+        )
+        self.assertIn(
+            "introduced_boundary_score_p10_below_minimum",
+            assessment.failure_reasons,
+        )
+        self.assertEqual(0.5, assessment.introduced_boundary_issue_fraction)
+
+    def test_roll_abuse_and_roll_outside_highlight_or_chorus_fail(self) -> None:
+        assessment = assess_professional_boundary_grammar(
+            self._evidence(
+                transforms=self._transforms(roll=(5.0, 10.0, 15.0, 42.0))
+            )
+        )
+        self.assertFalse(assessment.passed)
+        self.assertIn("roll_fraction_above_maximum", assessment.failure_reasons)
+        self.assertIn("roll_outside_allowed_section", assessment.failure_reasons)
+
+    def test_ordinary_sections_do_not_inherit_the_60_per_minute_exemplar(self) -> None:
+        ordinary_switches = tuple(2.5 + 5.0 * index for index in range(12))
+        assessment = assess_professional_boundary_grammar(
+            self._evidence(
+                switches=ordinary_switches,
+                native_cuts=(),
+                sections=(
+                    MontageSectionWindow("ordinary", "general", 0.0, 60.0),
+                ),
+                issue_count=0,
+                transforms=self._transforms(roll=()),
+            )
+        )
+        self.assertTrue(assessment.passed, assessment.failure_reasons)
+        ordinary = assessment.section_assessments[0]
+        self.assertIsNone(ordinary.minimum_required_source_switches_per_minute)
+        self.assertIsNone(ordinary.maximum_allowed_no_switch_gap_seconds)
+        exemplar = assessment.to_dict()["policy"][
+            "highlight_burst_exemplar"
+        ]
+        self.assertEqual(60.0, exemplar["cuts_per_minute"])
+        self.assertFalse(exemplar["used_as_general_section_minimum"])
+        self.assertFalse(exemplar["used_as_whole_song_minimum"])
+
+    def test_transform_coverage_is_bounded(self) -> None:
+        too_sparse = EditorialTransformEvidence(
+            segment_count=100,
+            applied_segment_count=1,
+            zoom_event_times_seconds=(42.0,),
+            pan_event_times_seconds=(),
+            roll_event_times_seconds=(),
+        )
+        sparse = assess_professional_boundary_grammar(
+            self._evidence(transforms=too_sparse)
+        )
+        self.assertIn(
+            "editorial_transform_coverage_below_minimum",
+            sparse.failure_reasons,
+        )
+        self.assertIn("zoom_pan_coverage_below_minimum", sparse.failure_reasons)
+
+        too_dense = EditorialTransformEvidence(
+            segment_count=100,
+            applied_segment_count=50,
+            zoom_event_times_seconds=tuple(float(index) for index in range(1, 51)),
+            pan_event_times_seconds=(),
+            roll_event_times_seconds=(),
+        )
+        dense = assess_professional_boundary_grammar(
+            self._evidence(transforms=too_dense)
+        )
+        self.assertIn(
+            "editorial_transform_coverage_above_maximum",
+            dense.failure_reasons,
+        )
+
+    def test_transform_events_preserve_zero_clock_and_multiple_pulses(self) -> None:
+        transforms = EditorialTransformEvidence(
+            segment_count=100,
+            applied_segment_count=8,
+            # A learned trajectory may start transformed at output frame zero
+            # and return to neutral before beginning another pulse in the same
+            # segment.  Neither exact event may be discarded or merged.
+            zoom_event_times_seconds=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0),
+            pan_event_times_seconds=(),
+            roll_event_times_seconds=(),
+        )
+        assessment = assess_professional_boundary_grammar(
+            self._evidence(transforms=transforms)
+        )
+        self.assertTrue(assessment.passed, assessment.failure_reasons)
+        self.assertEqual(
+            transforms.zoom_event_times_seconds,
+            ProfessionalBoundaryGrammarEvidence.from_mapping(
+                self._evidence(transforms=transforms).to_dict()
+            ).editorial_transforms.zoom_event_times_seconds,
+        )
+
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            r"\[0, performance duration\)",
+        ):
+            self._evidence(
+                transforms=EditorialTransformEvidence(
+                    segment_count=100,
+                    applied_segment_count=8,
+                    zoom_event_times_seconds=(60.0,),
+                )
+            )
+
+    def test_nonfinite_and_serialized_tampering_are_rejected(self) -> None:
+        with self.assertRaisesRegex(MontageGrammarEvidenceError, "finite"):
+            ProfessionalBoundaryGrammarPolicy(
+                minimum_highlight_source_switches_per_minute=float("nan")
+            )
+
+        evidence = self._evidence()
+        restored = ProfessionalBoundaryGrammarEvidence.from_mapping(
+            evidence.to_dict()
+        )
+        self.assertEqual(evidence.evidence_sha256, restored.evidence_sha256)
+
+        payload = evidence.to_dict()
+        payload["duration_seconds"] = 61.0
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "content hash mismatch",
+        ):
+            ProfessionalBoundaryGrammarEvidence.from_mapping(payload)
+
+        payload = evidence.to_dict()
+        payload["introduced_boundary_continuity"]["issue_fraction"] = 0.99
+        unsigned = deepcopy(payload)
+        unsigned.pop("evidence_sha256")
+        payload["evidence_sha256"] = _canonical_sha256(unsigned)
+        with self.assertRaisesRegex(
+            MontageGrammarEvidenceError,
+            "issue_fraction does not match",
+        ):
+            ProfessionalBoundaryGrammarEvidence.from_mapping(payload)
 
 
 if __name__ == "__main__":

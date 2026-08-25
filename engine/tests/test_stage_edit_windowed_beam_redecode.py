@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 from crosscut.group_transition import GroupTransitionPlan
 from crosscut.pipeline import (
@@ -26,21 +28,32 @@ from crosscut.rendered_proxy_review import (
 from crosscut.rendered_montage_grammar_review import (
     _exact_stage_edit_anchor_metrics,
 )
+from crosscut.source_derivative_diversity import SourceDerivativeFamilyMetadata
 from crosscut.stage_edit_dynamic_crop_semimarkov_adapter import (
     DynamicCropHeadPredictionV2,
+)
+from crosscut.stage_edit_dynamic_crop_semimarkov_adapter_v3 import (
+    DynamicCropHeadPredictionV3,
 )
 from crosscut.stage_edit_feature_materializer import StageEditFeatureSnapshot
 from crosscut.stage_edit_head_materializer import (
     StageEditHeadMaterializationResult,
+    _canonical_sha256 as _head_materializer_canonical_sha256,
+    _sequence_payload as _head_materializer_sequence_payload,
 )
 from crosscut.stage_edit_pipeline_bridge import (
     STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
     RetainedStageEditCandidate,
+    StageEditContextualSourcePairBridgeIdentityV2,
     StageEditPipelineBridgePreflight,
     StageEditPipelineBridgeResult,
+    load_stage_edit_production_snapshot_identity,
+    preflight_stage_edit_pipeline_bridge,
 )
 from crosscut.stage_edit_continuity_authority import (
+    CONTINUITY_AUTHORITY_CONTRACT,
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
 from crosscut.stage_edit_repair_loop import (
@@ -52,10 +65,20 @@ from crosscut.stage_edit_repair_loop import (
 from crosscut.stage_edit_semimarkov_beam import (
     HANDCRAFTED_CONTINUITY_SCORER_CONTRACT,
     HANDCRAFTED_CONTINUITY_SCORER_FINGERPRINT,
+    StageEditHeadFrame,
     StageEditSemiMarkovConfig,
     StageEditSemiMarkovResult,
     StageEditSourceContinuity,
     decode_stage_edit_semimarkov_beam,
+    stage_edit_boundary_continuity_score,
+)
+from crosscut.stage_edit_source_pair_contextual_v2 import (
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_FEATURE_NAMES,
+    STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT,
+    StageEditContextualRuntimeFrameV2,
+    StageEditContextualSourcePairScorerV2,
+    materialize_stage_edit_contextual_runtime_frame_v2,
+    stage_edit_contextual_raw_to_decoder_score_v2,
 )
 from crosscut.stage_edit_source_pair_scorer import (
     STAGE_EDIT_SOURCE_PAIR_SCORER_CONTRACT,
@@ -66,20 +89,31 @@ from crosscut.stage_edit_source_pair_scorer import (
 )
 from crosscut.stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
+    STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES,
     SourceCandidateToken,
     StageEditReadinessReport,
     StageEditSequence,
     StageEditToken,
+    mask_stage_edit_recent_history_for_semimarkov,
+    stage_edit_recent_history_mask_contract,
 )
 from crosscut.stage_edit_windowed_beam_redecode import (
     STAGE_EDIT_WINDOWED_BEAM_CONTRACT,
+    StageEditWindowedBeamError,
     StageEditWindowedBeamRedecoder,
+    _exterior_splice_continuity_evidence,
+    _resolved_continuity_identity,
+    _validate_decoder_continuity_provenance,
 )
 from crosscut.stage_edit_visual_candidate_adapter import (
     StageEditMaterializedVisualCandidate,
 )
-from crosscut.visual_score import VisualTimelinePlan
-from engine.tests.test_pipeline import _visual_choice
+from crosscut.timeline import ShotType
+from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
+from engine.tests.test_stage_edit_pipeline_bridge import (
+    _real_verified_contextual_beam_qa_envelope,
+    _typed_contextual_bundle_v2,
+)
 from engine.tests.test_stage_edit_semimarkov_beam import (
     _frames,
     _metadata,
@@ -88,6 +122,37 @@ from engine.tests.test_stage_edit_semimarkov_beam import (
     _single_feature_scorer,
     _sources,
 )
+from engine.tests.stage_edit_causal_sensing_test_support import (
+    synthetic_production_snapshot,
+)
+
+
+def _visual_choice(
+    segment_index: int,
+    source_index: int,
+    start_seconds: float,
+    end_seconds: float,
+) -> VisualTimelineChoice:
+    """Build the narrow visual record needed by windowed-redecode tests.
+
+    This helper intentionally lives with its consumer so the safe focused test
+    never imports the large end-to-end pipeline test module during collection.
+    """
+
+    return VisualTimelineChoice(
+        segment_index=segment_index,
+        source_index=source_index,
+        canonical_master_start=start_seconds,
+        canonical_master_end=end_seconds,
+        source_local_start=start_seconds,
+        source_local_end=end_seconds,
+        quality_score=0.92,
+        composition_score=0.91,
+        boundary_score=0.90,
+        shot_scale=0.50,
+        shot_type=ShotType.MEDIUM,
+        shot_id=f"windowed-safe-{segment_index}-{source_index}",
+    )
 
 
 def _dynamic_prediction() -> DynamicCropHeadPredictionV2:
@@ -114,6 +179,24 @@ def _dynamic_prediction() -> DynamicCropHeadPredictionV2:
             -20.0,
         ),
         motion_logit=20.0,
+    )
+
+
+def _dynamic_predictions_v3(source_count: int) -> tuple[DynamicCropHeadPredictionV3, ...]:
+    return tuple(
+        DynamicCropHeadPredictionV3(
+            source_id=f"source-{source_index}",
+            source_index=source_index,
+            values=(
+                (1.02 + source_index * 0.01, 0.5, 0.5, 0.0),
+                (1.04 + source_index * 0.01, 0.5, 0.5, 0.0),
+            )
+            + ((1.02, 0.5, 0.5, 0.0),) * 6,
+            count_logits=(-20.0, 20.0) + (-20.0,) * 6,
+            time_interval_logits=(0.0,) * 35,
+            motion_logit=0.25 + source_index * 0.1,
+        )
+        for source_index in range(source_count)
     )
 
 
@@ -180,11 +263,18 @@ def _typed_snapshot(
     master_times_seconds: tuple[float, ...] = (0.0,),
 ) -> StageEditFeatureSnapshot:
     schema = DEFAULT_STAGE_EDIT_SCHEMA
+    causal_sensing_names = set(STAGE_EDIT_CAUSAL_SENSING_SOURCE_FEATURE_NAMES)
+    missing_mask = tuple(
+        name in causal_sensing_names for name in schema.source_feature_names
+    )
     candidates = tuple(
         SourceCandidateToken(
             source_id=source_id,
-            features=(0.1 + index * 0.01,) * schema.raw_source_dimension,
-            missing_mask=(False,) * schema.raw_source_dimension,
+            features=tuple(
+                0.0 if missing else 0.1 + index * 0.01
+                for missing in missing_mask
+            ),
+            missing_mask=missing_mask,
             available=True,
             hard_gate_passed=True,
         )
@@ -206,7 +296,137 @@ def _typed_snapshot(
             for master_time_seconds in master_times_seconds
         ),
     )
-    return StageEditFeatureSnapshot.build(sequence)
+    return synthetic_production_snapshot(sequence)
+
+
+def _contextual_windowed_scorer() -> StageEditContextualSourcePairScorerV2:
+    return StageEditContextualSourcePairScorerV2(
+        token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+        weights=(0.0,) * len(
+            STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_FEATURE_NAMES
+        ),
+    )
+
+
+def _contextual_windowed_frames(
+    duration: int,
+    source_count: int,
+    *,
+    family_ids: tuple[int, ...] | None = None,
+    runtime_source_ids: tuple[str, ...] | None = None,
+):
+    source_ids = tuple(f"source-{index}" for index in range(source_count))
+    runtime_ids = runtime_source_ids or source_ids
+    families = family_ids or tuple(range(source_count))
+    if len(runtime_ids) != source_count or len(families) != source_count:
+        raise ValueError("contextual windowed fixture identity mismatch")
+    snapshot = _typed_snapshot(
+        runtime_ids,
+        tuple(float(index) for index in range(duration)),
+    )
+    masked = mask_stage_edit_recent_history_for_semimarkov(
+        snapshot.sequence,
+        DEFAULT_STAGE_EDIT_SCHEMA,
+    )
+    family_map = dict(zip(runtime_ids, families, strict=True))
+    runtimes = tuple(
+        materialize_stage_edit_contextual_runtime_frame_v2(
+            token,
+            canonical_source_ids=runtime_ids,
+            derivative_family_id_by_source=family_map,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+        )
+        for token in masked.tokens
+    )
+    return tuple(
+        replace(
+            frame,
+            contextual_source_pair_runtime_v2=runtime,
+        )
+        for frame, runtime in zip(
+            _frames(duration, source_count),
+            runtimes,
+            strict=True,
+        )
+    )
+
+
+def _contextual_derivative_metadata(
+    source_count: int,
+    family_ids: tuple[int, ...] | None = None,
+) -> SourceDerivativeFamilyMetadata:
+    return SourceDerivativeFamilyMetadata(
+        source_count=source_count,
+        family_ids=family_ids or tuple(range(source_count)),
+        audit_sha256="e" * 64,
+        production_ready=True,
+        uncertain_pair_count=0,
+        clock_contract_complete=True,
+    )
+
+
+def _contextual_head_result(
+    *,
+    checkpoint_directory: Path,
+    readiness: StageEditReadinessReport,
+    snapshot: StageEditFeatureSnapshot,
+    source_ids: tuple[str, ...],
+    frames: tuple[StageEditHeadFrame, ...],
+) -> StageEditHeadMaterializationResult:
+    masked = mask_stage_edit_recent_history_for_semimarkov(
+        snapshot.sequence,
+        DEFAULT_STAGE_EDIT_SCHEMA,
+    )
+    digest = "a" * 64
+    return StageEditHeadMaterializationResult(
+        frames=frames,
+        sequence_id=snapshot.sequence.sequence_id,
+        canonical_source_ids=source_ids,
+        checkpoint_directory=str(checkpoint_directory.resolve()),
+        checkpoint_id="typed-contextual-windowed-checkpoint",
+        training_steps=readiness.training_steps,
+        metadata_sha256=digest,
+        weights_sha256=digest,
+        supplied_sequence_sha256=_head_materializer_canonical_sha256(
+            _head_materializer_sequence_payload(snapshot.sequence)
+        ),
+        input_sequence_sha256=_head_materializer_canonical_sha256(
+            _head_materializer_sequence_payload(masked)
+        ),
+        output_frames_sha256=_head_materializer_canonical_sha256(
+            [frame.to_dict() for frame in frames]
+        ),
+        token_schema_fingerprint=DEFAULT_STAGE_EDIT_SCHEMA.fingerprint,
+        dynamic_crop_config_fingerprint=digest,
+        readiness=readiness,
+        decision_history_input_contract=(
+            stage_edit_recent_history_mask_contract(
+                DEFAULT_STAGE_EDIT_SCHEMA
+            )
+        ),
+        checkpoint_format="dynamic_crop_v3",
+        dynamic_crop_version=3,
+        checkpoint_metadata_filename="dynamic-crop-v3-metadata.json",
+    )
+
+
+def _contextual_runtime_with_updates(
+    runtime: StageEditContextualRuntimeFrameV2,
+    **updates,
+) -> StageEditContextualRuntimeFrameV2:
+    payload = runtime.to_dict()
+    payload.update(updates)
+    payload.pop("runtime_evidence_sha256", None)
+    payload["runtime_evidence_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return StageEditContextualRuntimeFrameV2.from_dict(payload)
 
 
 def _typed_readiness(
@@ -277,20 +497,36 @@ def _typed_bridge_result(
         checkpoint_directory,
         dynamic_crop_version,
     )
+    snapshot = _typed_snapshot(
+        source_ids,
+        tuple(frame.master_time_seconds for frame in frames),
+    )
+    snapshot_path = Path(
+        f"/tmp/stageedit-windowed-{snapshot.snapshot_sha256}.json"
+    ).resolve()
+    snapshot_path.write_text(
+        json.dumps(snapshot.to_dict(), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    snapshot_identity = load_stage_edit_production_snapshot_identity(
+        snapshot_path,
+        edit_mode="group",
+        target_member=None,
+    )
     pair_kwargs = source_pair_evidence or {}
     with patch(
         "crosscut.stage_edit_pipeline_bridge.stage_edit_readiness_report",
         return_value=readiness,
     ):
         preflight = StageEditPipelineBridgePreflight(
-            snapshot_path=Path("/tmp/stageedit-windowed-snapshot.json"),
+            snapshot_path=snapshot_path,
             checkpoint_directory=checkpoint_directory.resolve(),
             source_ids=source_ids,
-            snapshot=_typed_snapshot(
-                source_ids,
-                tuple(frame.master_time_seconds for frame in frames),
-            ),
+            snapshot=snapshot,
             readiness=readiness,
+            snapshot_identity=snapshot_identity,
+            edit_mode="group",
+            target_member=None,
             dynamic_crop_version=dynamic_crop_version,
             continuity_authority=continuity_authority,
             **pair_kwargs,
@@ -364,6 +600,85 @@ def _typed_bridge_result(
 
 
 class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
+    def test_legacy_identity_sha_and_constructor_prefix_are_unchanged(
+        self,
+    ) -> None:
+        constructor_parameters = tuple(
+            inspect.signature(StageEditWindowedBeamRedecoder).parameters
+        )
+        self.assertEqual(
+            (
+                "bridge_result",
+                "sources",
+                "source_durations_seconds",
+                "source_start_offsets_seconds",
+                "internal_cut_times_seconds",
+                "source_timewarps",
+                "source_quality_log_priors",
+                "output",
+            ),
+            constructor_parameters[:8],
+        )
+        self.assertEqual(
+            "contextual_source_pair_scorer_v2",
+            constructor_parameters[8],
+        )
+
+        handcrafted = _resolved_continuity_identity(
+            StageEditSemiMarkovConfig(),
+            None,
+        )
+        self.assertNotIn(
+            "contextual_source_pair_scorer_v2_bound",
+            handcrafted,
+        )
+        self.assertNotIn(
+            "contextual_runtime_raw_values_embedded",
+            handcrafted,
+        )
+        handcrafted_sha256 = hashlib.sha256(
+            json.dumps(
+                handcrafted,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            "a4c5656f489904602f5832e21042e1d40ff56eb18b377e679ed0a725d0b839a1",
+            handcrafted_sha256,
+        )
+
+        scorer = StageEditSourcePairScorer.uniform()
+        learned = _resolved_continuity_identity(
+            StageEditSemiMarkovConfig(
+                continuity_authority=(
+                    PRODUCTION_LEARNED_CONTINUITY_AUTHORITY
+                ),
+                continuity_scorer_contract=scorer.contract,
+                continuity_scorer_fingerprint=scorer.fingerprint,
+            ),
+            scorer,
+        )
+        self.assertNotIn(
+            "contextual_source_pair_scorer_v2_bound",
+            learned,
+        )
+        learned_sha256 = hashlib.sha256(
+            json.dumps(
+                learned,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            "c506761e78f653cfb311c02e1eb8a298e208dd395611a255134ceb914083ca41",
+            learned_sha256,
+        )
+
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
         return_value=_ready_report(),
@@ -747,6 +1062,992 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
                 for edge in learned_exterior["edges"]
             )
         )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_v3_decode_provenance_survives_windowed_exact_shots_and_splice(
+        self,
+        _readiness,
+    ) -> None:
+        duration = 8
+        source_count = 4
+        sources = _sources(source_count, float(duration))
+        predictions = _dynamic_predictions_v3(source_count)
+        frames = tuple(
+            replace(
+                frame,
+                crop=(99.0, 99.0, -99.0, 99.0),
+                dynamic_crop_v3_by_source=predictions,
+            )
+            for frame in _frames(duration, source_count)
+        )
+        config = StageEditSemiMarkovConfig(
+            beam_width=16,
+            timeline_count=8,
+            minimum_unique_sources=3,
+            maximum_source_occupancy_fraction=0.75,
+            montage_grammar_score_weight=0.0,
+            enforce_montage_grammar=False,
+        )
+        decoded = decode_stage_edit_semimarkov_beam(
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            sources=sources,
+            source_metadata=_metadata(source_count, float(duration)),
+            head_frames=frames,
+            section_plan=_plan(duration),
+            output=Path("/tmp/stageedit-window-v3-base.mp4"),
+            config=config,
+            fps=30.0,
+        )
+        raw_retained = tuple(
+            RetainedStageEditCandidate(
+                rank=timeline.rank,
+                score=timeline.score,
+                edit=timeline.edit,
+                exact_clock_reprojected=True,
+                timewarped_segment_count=0,
+            )
+            for timeline in decoded.timelines
+        )
+        bridge = _typed_bridge_result(
+            source_ids=tuple(
+                f"source-{index}" for index in range(source_count)
+            ),
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
+            semimarkov=decoded,
+            retained_candidates=raw_retained,
+            dynamic_crop_version=3,
+        )
+        base = bridge.retained_candidates[0].edit
+        self.assertTrue(
+            all(shot.dynamic_crop_decode_v3 is not None for shot in base.shots)
+        )
+        start_shot = 1
+        end_shot = 2
+        selected = base.shots[start_shot].segment
+        start = base.master_audio_start + selected.master_start
+        end = start + selected.duration
+        request = StageEditRepairRequest(
+            iteration=1,
+            base_edit=base,
+            current_review=StageEditRepairReview(50.0, 50.0, -1.0),
+            window=StageEditRepairWindow(
+                issue_ids=("v3-provenance-window",),
+                causes=("learned_editorial_discontinuity",),
+                requested_start_seconds=start,
+                requested_end_seconds=end,
+                context_start_seconds=start,
+                context_end_seconds=end,
+                canonical_start_seconds=start,
+                canonical_end_seconds=end,
+                actual_start_seconds=start,
+                actual_end_seconds=end,
+                start_shot=start_shot,
+                end_shot_exclusive=end_shot,
+            ),
+            canonical_boundaries_seconds=tuple(
+                frame.master_time_seconds for frame in frames
+            )
+            + (float(duration),),
+            exclusions=StageEditRepairExclusions(),
+            forbidden_edit_sha256s=(),
+        )
+        redecoder = StageEditWindowedBeamRedecoder(
+            bridge_result=bridge,
+            sources=sources,
+            source_durations_seconds=(float(duration),) * source_count,
+            source_start_offsets_seconds=(0.0,) * source_count,
+            internal_cut_times_seconds=((),) * source_count,
+            source_timewarps=(None,) * source_count,
+            source_quality_log_priors=(0.0,) * source_count,
+            output=Path("/tmp/stageedit-window-v3-redecode.mp4"),
+        )
+
+        proposals = redecoder(request)
+
+        self.assertGreater(len(proposals), 0, redecoder.audit_payload())
+        proposal = proposals[0]
+        self.assertTrue(
+            all(
+                shot.dynamic_crop_decode_v3 is not None
+                for shot in proposal.replacement_shots
+            )
+        )
+        for shot in proposal.replacement_shots:
+            decoded_v3 = shot.dynamic_crop_decode_v3
+            assert decoded_v3 is not None
+            self.assertEqual(
+                decoded_v3.to_dict(), shot.to_dict()["dynamic_crop_v3"]
+            )
+        spliced = base.replace_window(
+            start_shot=start_shot,
+            end_shot_exclusive=end_shot,
+            replacement_shots=proposal.replacement_shots,
+            replacement_boundaries=proposal.replacement_boundaries,
+            reason="v3 typed provenance splice",
+            score_before=None,
+            score_after=None,
+        )
+        self.assertIs(spliced.shots[0], base.shots[0])
+        self.assertEqual(
+            tuple(
+                shot.dynamic_crop_decode_v3
+                for shot in proposal.replacement_shots
+            ),
+            tuple(
+                shot.dynamic_crop_decode_v3
+                for shot in spliced.shots[start_shot:end_shot]
+            ),
+        )
+        self.assertEqual(
+            base.shots[end_shot:],
+            spliced.shots[-len(base.shots[end_shot:]):],
+        )
+
+    @patch(
+        "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
+        return_value=_ready_report(),
+    )
+    def test_contextual_v2_windowed_decode_and_exterior_splice_fail_closed(
+        self,
+        _readiness,
+    ) -> None:
+        duration = 8
+        source_count = 4
+        source_ids = tuple(f"source-{index}" for index in range(source_count))
+        sources = _sources(source_count, float(duration))
+        snapshot = _typed_snapshot(
+            source_ids,
+            tuple(float(index) for index in range(duration)),
+        )
+        frames = _contextual_windowed_frames(duration, source_count)
+        scorer = _contextual_windowed_scorer()
+        derivative_metadata = _contextual_derivative_metadata(source_count)
+        base_config = StageEditSemiMarkovConfig(
+            beam_width=16,
+            timeline_count=8,
+            minimum_unique_sources=3,
+            maximum_source_occupancy_fraction=0.75,
+            enforce_montage_grammar=False,
+        )
+        contextual_config = replace(
+            base_config,
+            continuity_authority=(
+                PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+            ),
+            continuity_scorer_contract=(
+                STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+            ),
+            continuity_scorer_fingerprint=scorer.fingerprint,
+        )
+        contextual_decoded = decode_stage_edit_semimarkov_beam(
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            sources=sources,
+            source_metadata=_metadata(source_count, float(duration)),
+            head_frames=frames,
+            section_plan=_plan(duration),
+            output=Path("/tmp/stageedit-window-contextual-base.mp4"),
+            config=contextual_config,
+            fps=30.0,
+            source_derivative_metadata=derivative_metadata,
+            contextual_source_pair_scorer_v2=scorer,
+        )
+        handcrafted_decoded = decode_stage_edit_semimarkov_beam(
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            sources=sources,
+            source_metadata=_metadata(source_count, float(duration)),
+            head_frames=frames,
+            section_plan=_plan(duration),
+            output=Path("/tmp/stageedit-window-handcrafted-fixture.mp4"),
+            config=base_config,
+            fps=30.0,
+            source_derivative_metadata=derivative_metadata,
+        )
+        contextual_retained = tuple(
+            RetainedStageEditCandidate(
+                rank=timeline.rank,
+                score=timeline.score,
+                edit=timeline.edit,
+                exact_clock_reprojected=True,
+                timewarped_segment_count=0,
+            )
+            for timeline in contextual_decoded.timelines
+        )
+        handcrafted_retained = tuple(
+            RetainedStageEditCandidate(
+                rank=timeline.rank,
+                score=timeline.score,
+                edit=timeline.edit,
+                exact_clock_reprojected=True,
+                timewarped_segment_count=0,
+            )
+            for timeline in handcrafted_decoded.timelines
+        )
+        base = contextual_retained[0].edit
+        self.assertGreaterEqual(len(base.shots), 3)
+        start_shot = 1
+        end_shot = 2
+        selected = base.shots[start_shot].segment
+        start = base.master_audio_start + selected.master_start
+        end = start + selected.duration
+        request = StageEditRepairRequest(
+            iteration=1,
+            base_edit=base,
+            current_review=StageEditRepairReview(50.0, 50.0, -1.0),
+            window=StageEditRepairWindow(
+                issue_ids=("contextual-window",),
+                causes=("learned_editorial_discontinuity",),
+                requested_start_seconds=start,
+                requested_end_seconds=end,
+                context_start_seconds=start,
+                context_end_seconds=end,
+                canonical_start_seconds=start,
+                canonical_end_seconds=end,
+                actual_start_seconds=start,
+                actual_end_seconds=end,
+                start_shot=start_shot,
+                end_shot_exclusive=end_shot,
+            ),
+            canonical_boundaries_seconds=tuple(
+                float(index) for index in range(duration + 1)
+            ),
+            exclusions=StageEditRepairExclusions(),
+            forbidden_edit_sha256s=(),
+        )
+        handcrafted_bridge = _typed_bridge_result(
+            source_ids=source_ids,
+            checkpoint_directory=Path("/tmp/stageedit-production"),
+            frames=frames,
+            semimarkov=handcrafted_decoded,
+            retained_candidates=handcrafted_retained,
+            dynamic_crop_version=3,
+        )
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as raw:
+            root = Path(raw)
+            envelope_root = root / "verified-beam-qa"
+            envelope_root.mkdir()
+            verified = _real_verified_contextual_beam_qa_envelope(
+                envelope_root
+            )
+            bundle_directory = root / "contextual-bundle"
+            bundle_directory.mkdir()
+            bundle, bound_scorer, pins = _typed_contextual_bundle_v2(
+                bundle_directory,
+                verified,
+            )
+            self.assertEqual(bound_scorer.to_dict(), scorer.to_dict())
+            snapshot_path = snapshot.write_json(root / "snapshot.json")
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            (checkpoint / "dynamic-crop-v3-metadata.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            readiness = _typed_readiness(checkpoint, 3)
+            with (
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "stage_edit_readiness_report",
+                    return_value=readiness,
+                ),
+                patch(
+                    "crosscut.stage_edit_pipeline_bridge."
+                    "load_stage_edit_contextual_source_pair_production_bundle_v2",
+                    return_value=bundle,
+                ) as load_bundle,
+            ):
+                preflight = preflight_stage_edit_pipeline_bridge(
+                    feature_snapshot_path=snapshot_path,
+                    checkpoint_directory=checkpoint,
+                    source_ids=source_ids,
+                    dynamic_crop_version=3,
+                    continuity_authority=(
+                        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                    ),
+                    contextual_source_pair_bundle_directory=bundle_directory,
+                    contextual_source_pair_checkpoint_sha256=(
+                        pins["checkpoint_sha256"]
+                    ),
+                    contextual_source_pair_checkpoint_file_sha256=(
+                        pins["checkpoint_file_sha256"]
+                    ),
+                    contextual_source_pair_report_sha256=(
+                        pins["report_sha256"]
+                    ),
+                    contextual_source_pair_report_file_sha256=(
+                        pins["report_file_sha256"]
+                    ),
+                    contextual_source_pair_beam_qa_report_sha256=(
+                        pins["beam_qa_report_sha256"]
+                    ),
+                    contextual_source_pair_corpus_sha256=(
+                        pins["corpus_sha256"]
+                    ),
+                    contextual_source_pair_corpus_file_sha256=(
+                        pins["corpus_file_sha256"]
+                    ),
+                    contextual_source_pair_token_schema_fingerprint=(
+                        pins["token_schema_fingerprint"]
+                    ),
+                    contextual_source_pair_verified_beam_qa_cases=(
+                        verified,
+                    ),
+                )
+                self.assertIsInstance(
+                    preflight.contextual_source_pair_identity_v2,
+                    StageEditContextualSourcePairBridgeIdentityV2,
+                )
+                self.assertIs(
+                    preflight.contextual_source_pair_scorer_v2,
+                    bound_scorer,
+                )
+                self.assertEqual(
+                    preflight.continuity_scorer_fingerprint,
+                    preflight.contextual_source_pair_scorer_fingerprint_v2,
+                )
+
+                retained = tuple(
+                    replace(
+                        item,
+                        edit=replace(
+                            item.edit,
+                            candidate_history=(
+                                *item.edit.candidate_history,
+                                {
+                                    "bridge": STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+                                    "dynamic_crop_version": 3,
+                                    "continuity_authority": (
+                                        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                                    ),
+                                },
+                            ),
+                        ),
+                    )
+                    for item in contextual_retained
+                )
+                head_result = _contextual_head_result(
+                    checkpoint_directory=checkpoint,
+                    readiness=readiness,
+                    snapshot=preflight.snapshot,
+                    source_ids=source_ids,
+                    frames=frames,
+                )
+                contextual_identity = (
+                    preflight.contextual_source_pair_identity_v2
+                )
+                assert contextual_identity is not None
+                bridge = StageEditPipelineBridgeResult(
+                    preflight=preflight,
+                    head_materialization=head_result,
+                    semimarkov=contextual_decoded,
+                    retained_candidates=retained,
+                    source_derivative_diversity=derivative_metadata,
+                    selection_policy={
+                        "visual_baseline_replaced": False,
+                        "selected_for_render": False,
+                        "dynamic_crop_version": 3,
+                        "continuity_authority": (
+                            PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                        ),
+                        "continuity_scorer_contract": (
+                            preflight.continuity_scorer_contract
+                        ),
+                        "continuity_scorer_fingerprint": (
+                            preflight.continuity_scorer_fingerprint
+                        ),
+                        "contextual_source_pair_identity_v2": (
+                            contextual_identity.to_dict()
+                        ),
+                        "temporal_pose_sidecar": (
+                            preflight.snapshot.temporal_pose_sidecar_audit()
+                        ),
+                    },
+                )
+
+                def bridge_for(
+                    candidate_frames=frames,
+                    *,
+                    derivative=derivative_metadata,
+                    head_overrides: dict[str, object] | None = None,
+                ) -> StageEditPipelineBridgeResult:
+                    candidate_head = _contextual_head_result(
+                        checkpoint_directory=checkpoint,
+                        readiness=readiness,
+                        snapshot=preflight.snapshot,
+                        source_ids=source_ids,
+                        frames=tuple(candidate_frames),
+                    )
+                    if head_overrides:
+                        candidate_head = replace(
+                            candidate_head,
+                            **head_overrides,
+                        )
+                    return replace(
+                        bridge,
+                        head_materialization=candidate_head,
+                        source_derivative_diversity=derivative,
+                    )
+
+                def redecoder_for(
+                    value: StageEditPipelineBridgeResult,
+                    *,
+                    injected_scorer=None,
+                ) -> StageEditWindowedBeamRedecoder:
+                    return StageEditWindowedBeamRedecoder(
+                        bridge_result=value,
+                        sources=sources,
+                        source_durations_seconds=(float(duration),)
+                        * source_count,
+                        source_start_offsets_seconds=(0.0,) * source_count,
+                        internal_cut_times_seconds=((),) * source_count,
+                        source_timewarps=(None,) * source_count,
+                        source_quality_log_priors=(0.0,) * source_count,
+                        output=Path(
+                            "/tmp/stageedit-window-contextual-local.mp4"
+                        ),
+                        contextual_source_pair_scorer_v2=(
+                            injected_scorer
+                        ),
+                    )
+
+                redecoder = redecoder_for(bridge)
+                self.assertIs(
+                    redecoder.contextual_source_pair_scorer_v2,
+                    bound_scorer,
+                )
+                with patch(
+                    "crosscut.stage_edit_windowed_beam_redecode."
+                    "decode_stage_edit_semimarkov_beam",
+                    wraps=decode_stage_edit_semimarkov_beam,
+                ) as actual_decoder:
+                    proposals = redecoder(request)
+                self.assertGreater(
+                    len(proposals),
+                    0,
+                    redecoder.audit_payload(),
+                )
+                self.assertIsNone(
+                    actual_decoder.call_args.kwargs["source_pair_scorer"]
+                )
+                self.assertIs(
+                    bound_scorer,
+                    actual_decoder.call_args.kwargs[
+                        "contextual_source_pair_scorer_v2"
+                    ],
+                )
+                call = redecoder.audit_payload()["calls"][0]
+                self.assertEqual(
+                    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
+                    call["continuity_authority"],
+                )
+                self.assertEqual(
+                    bound_scorer.fingerprint,
+                    call["continuity_scorer_fingerprint"],
+                )
+                self.assertEqual(
+                    contextual_identity.to_dict(),
+                    call["contextual_source_pair_identity_v2"],
+                )
+                self.assertEqual(
+                    contextual_identity.to_dict(),
+                    proposals[0].audit[
+                        "contextual_source_pair_identity_v2"
+                    ],
+                )
+                expected_decoder_provenance = {
+                    "authority_contract": CONTINUITY_AUTHORITY_CONTRACT,
+                    "authority": (
+                        PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2
+                    ),
+                    "scorer_contract": (
+                        STAGE_EDIT_CONTEXTUAL_SOURCE_PAIR_V2_SCORER_CONTRACT
+                    ),
+                    "scorer_fingerprint": bound_scorer.fingerprint,
+                    "scorer_weights_embedded": False,
+                    "score_range": [-1.0, 0.0],
+                    "applies_to": (
+                        "actual_derivative_family_boundaries_only"
+                    ),
+                    "opening_and_same_family_raw_score": 0.0,
+                    "contextual_runtime_raw_values_embedded": False,
+                }
+                self.assertEqual(
+                    expected_decoder_provenance,
+                    call["decoder_audit"]["score_provenance"][
+                        "boundary_continuity"
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "provenance is not exact",
+                ):
+                    _validate_decoder_continuity_provenance(
+                        {
+                            **expected_decoder_provenance,
+                            "context_values": [0.0],
+                        },
+                        call,
+                    )
+
+                exterior = proposals[0].audit[
+                    "exterior_splice_continuity"
+                ]
+                self.assertTrue(exterior["full_edit_validation_passed"])
+                self.assertEqual(
+                    contextual_identity.to_dict(),
+                    exterior["contextual_source_pair_identity_v2"],
+                )
+                self.assertGreater(exterior["evaluated_edge_count"], 0)
+                for edge in exterior["edges"]:
+                    resolution = edge["typed_boundary_resolution"]
+                    contextual_score = resolution["contextual_score_v2"]
+                    self.assertTrue(contextual_score["applied"])
+                    self.assertAlmostEqual(
+                        contextual_score["raw_logit"],
+                        contextual_score["blended_baseline"]
+                        + contextual_score["signed_residual"],
+                    )
+                    self.assertAlmostEqual(
+                        contextual_score["decoder_score"],
+                        stage_edit_contextual_raw_to_decoder_score_v2(
+                            contextual_score["raw_logit"]
+                        ),
+                    )
+                    exact_frame = next(
+                        frame
+                        for frame in frames
+                        if frame.master_time_seconds
+                        == edge["boundary_time_seconds"]
+                    )
+                    self.assertAlmostEqual(
+                        stage_edit_boundary_continuity_score(
+                            exact_frame.source_continuity[
+                                edge["outgoing_source_index"]
+                            ],
+                            exact_frame.source_continuity[
+                                edge["incoming_source_index"]
+                            ],
+                        ),
+                        edge[
+                            "independent_handcrafted_motion_qualifier_score"
+                        ],
+                    )
+                    encoded = str(resolution)
+                    self.assertNotIn("context_values", encoded)
+                    self.assertNotIn("feature_names", encoded)
+                    self.assertNotIn("weights", encoded)
+
+                neutral_family_ids = (0,) * source_count
+                neutral_exterior = _exterior_splice_continuity_evidence(
+                    request,
+                    proposals[0].replacement_shots,
+                    config=contextual_config,
+                    canonical_source_ids=source_ids,
+                    derivative_family_ids=neutral_family_ids,
+                    all_frames=_contextual_windowed_frames(
+                        duration,
+                        source_count,
+                        family_ids=neutral_family_ids,
+                    ),
+                    source_pair_scorer=None,
+                    contextual_source_pair_scorer_v2=bound_scorer,
+                    identity=_resolved_continuity_identity(
+                        contextual_config,
+                        None,
+                        bound_scorer,
+                    ),
+                )
+                for edge in neutral_exterior["edges"]:
+                    resolution = edge["typed_boundary_resolution"]
+                    self.assertFalse(resolution["applied"])
+                    self.assertEqual(0.0, resolution["decoder_score"])
+                    self.assertIsNone(
+                        edge[
+                            "independent_handcrafted_motion_qualifier_score"
+                        ]
+                    )
+
+                equivalent_scorer = StageEditContextualSourcePairScorerV2(
+                    token_schema_fingerprint=(
+                        DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+                    ),
+                    weights=bound_scorer.weights,
+                )
+                equivalent_redecoder = redecoder_for(
+                    bridge,
+                    injected_scorer=equivalent_scorer,
+                )
+                self.assertIs(
+                    equivalent_redecoder.contextual_source_pair_scorer_v2,
+                    bound_scorer,
+                )
+                different_weights = list(bound_scorer.weights)
+                different_weights[0] = 0.01
+                different_scorer = StageEditContextualSourcePairScorerV2(
+                    token_schema_fingerprint=(
+                        DEFAULT_STAGE_EDIT_SCHEMA.fingerprint
+                    ),
+                    weights=tuple(different_weights),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "sealed preflight-bound scorer",
+                ):
+                    redecoder_for(
+                        bridge,
+                        injected_scorer=different_scorer,
+                    )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "handcrafted exterior continuity rejects a contextual-v2 scorer",
+                ):
+                    redecoder_for(
+                        handcrafted_bridge,
+                        injected_scorer=bound_scorer,
+                    )
+                with (
+                    patch.object(
+                        StageEditPipelineBridgePreflight,
+                        "contextual_source_pair_scorer_fingerprint_v2",
+                        new_callable=PropertyMock,
+                        return_value="0" * 64,
+                    ),
+                    self.assertRaisesRegex(
+                        StageEditWindowedBeamError,
+                        "unified and alias scorer fingerprints differ",
+                    ),
+                ):
+                    redecoder_for(bridge)
+
+                missing_runtime = list(frames)
+                missing_runtime[0] = replace(
+                    missing_runtime[0],
+                    contextual_source_pair_runtime_v2=None,
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "lacks its runtime sidecar",
+                ):
+                    redecoder_for(bridge_for(missing_runtime))
+
+                for continuity in (
+                    (),
+                    frames[0].source_continuity[:-1],
+                ):
+                    bad_continuity = list(frames)
+                    bad_continuity[0] = replace(
+                        bad_continuity[0],
+                        source_continuity=continuity,
+                    )
+                    with self.assertRaisesRegex(
+                        StageEditWindowedBeamError,
+                        "independent handcrafted motion qualifier",
+                    ):
+                        redecoder_for(bridge_for(bad_continuity))
+
+                wrong_families = _contextual_windowed_frames(
+                    duration,
+                    source_count,
+                    family_ids=(0, 0, 2, 3),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_families))
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "verified derivative families",
+                ):
+                    redecoder_for(bridge_for(derivative=None))
+
+                wrong_runtime_sources = _contextual_windowed_frames(
+                    duration,
+                    source_count,
+                    runtime_source_ids=(
+                        "source-0",
+                        "source-1",
+                        "source-2",
+                        "source-X",
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_runtime_sources))
+
+                original_runtime = frames[0].contextual_source_pair_runtime_v2
+                assert original_runtime is not None
+                wrong_mask_runtime = _contextual_runtime_with_updates(
+                    original_runtime,
+                    recent_history_mask_contract_sha256="0" * 64,
+                )
+                wrong_mask = list(frames)
+                wrong_mask[0] = replace(
+                    wrong_mask[0],
+                    contextual_source_pair_runtime_v2=wrong_mask_runtime,
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "mask contract changed",
+                ):
+                    redecoder_for(bridge_for(wrong_mask))
+
+                changed_context = list(original_runtime.context_values)
+                changed_context[0] += 0.01
+                wrong_context_runtime = _contextual_runtime_with_updates(
+                    original_runtime,
+                    context_values=changed_context,
+                )
+                self.assertNotEqual(
+                    original_runtime.runtime_evidence_sha256,
+                    wrong_context_runtime.runtime_evidence_sha256,
+                )
+                wrong_context = list(frames)
+                wrong_context[0] = replace(
+                    wrong_context[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_context_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_context))
+
+                changed_context_mask = list(
+                    original_runtime.context_missing_mask
+                )
+                changed_context_mask[0] = True
+                masked_context_values = list(
+                    original_runtime.context_values
+                )
+                masked_context_values[0] = 0.0
+                wrong_context_mask_runtime = (
+                    _contextual_runtime_with_updates(
+                        original_runtime,
+                        context_values=masked_context_values,
+                        context_missing_mask=changed_context_mask,
+                    )
+                )
+                wrong_context_mask = list(frames)
+                wrong_context_mask[0] = replace(
+                    wrong_context_mask[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_context_mask_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_context_mask))
+
+                clipped_context_values = list(
+                    original_runtime.context_values
+                )
+                clipped_context_values[0] = 1.2
+                wrong_clipped_runtime = _contextual_runtime_with_updates(
+                    original_runtime,
+                    context_values=clipped_context_values,
+                    clipped_observed_value_count=(
+                        original_runtime.clipped_observed_value_count + 1
+                    ),
+                )
+                wrong_clipped = list(frames)
+                wrong_clipped[0] = replace(
+                    wrong_clipped[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_clipped_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_clipped))
+
+                changed_source = replace(
+                    original_runtime.sources[0],
+                    values=(
+                        original_runtime.sources[0].values[0] + 0.01,
+                        *original_runtime.sources[0].values[1:],
+                    ),
+                )
+                wrong_sources_payload = [
+                    (
+                        changed_source.to_dict()
+                        if index == 0
+                        else source.to_dict()
+                    )
+                    for index, source in enumerate(original_runtime.sources)
+                ]
+                wrong_source_runtime = _contextual_runtime_with_updates(
+                    original_runtime,
+                    sources=wrong_sources_payload,
+                )
+                wrong_source_values = list(frames)
+                wrong_source_values[0] = replace(
+                    wrong_source_values[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_source_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_source_values))
+
+                changed_source_schema = [
+                    "tampered_source_feature",
+                    *original_runtime.source_feature_names[1:],
+                ]
+                wrong_source_schema_runtime = (
+                    _contextual_runtime_with_updates(
+                        original_runtime,
+                        source_feature_names=changed_source_schema,
+                    )
+                )
+                wrong_source_schema = list(frames)
+                wrong_source_schema[0] = replace(
+                    wrong_source_schema[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_source_schema_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_source_schema))
+
+                wrong_token_schema_runtime = (
+                    _contextual_runtime_with_updates(
+                        original_runtime,
+                        token_schema_fingerprint="0" * 64,
+                    )
+                )
+                wrong_token_schema = list(frames)
+                wrong_token_schema[0] = replace(
+                    wrong_token_schema[0],
+                    contextual_source_pair_runtime_v2=(
+                        wrong_token_schema_runtime
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "runtime differs from the verified masked preflight snapshot",
+                ):
+                    redecoder_for(bridge_for(wrong_token_schema))
+
+                invalid_digest_payload = original_runtime.to_dict()
+                invalid_digest_payload["runtime_evidence_sha256"] = "0" * 64
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "digest does not match contents",
+                ):
+                    StageEditContextualRuntimeFrameV2.from_dict(
+                        invalid_digest_payload
+                    )
+                invalid_context_names = original_runtime.to_dict()
+                invalid_context_names["context_feature_names"][0] = (
+                    "tampered.context.feature"
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "context feature schema is not frozen",
+                ):
+                    StageEditContextualRuntimeFrameV2.from_dict(
+                        invalid_context_names
+                    )
+                invalid_context_dimensions = original_runtime.to_dict()
+                invalid_context_dimensions["context_values"].pop()
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "context dimensions differ",
+                ):
+                    StageEditContextualRuntimeFrameV2.from_dict(
+                        invalid_context_dimensions
+                    )
+
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "head/snapshot binding changed",
+                ):
+                    redecoder_for(
+                        bridge_for(
+                            head_overrides={
+                                "supplied_sequence_sha256": "0" * 64
+                            }
+                        )
+                    )
+                with self.assertRaisesRegex(
+                    StageEditWindowedBeamError,
+                    "head output hash changed",
+                ):
+                    redecoder_for(
+                        bridge_for(
+                            head_overrides={
+                                "output_frames_sha256": "0" * 64
+                            }
+                        )
+                    )
+
+                original_snapshot_bytes = snapshot_path.read_bytes()
+                changed_token = replace(
+                    snapshot.sequence.tokens[0],
+                    music_features=(
+                        snapshot.sequence.tokens[0].music_features[0] + 0.01,
+                        *snapshot.sequence.tokens[0].music_features[1:],
+                    ),
+                )
+                changed_snapshot = StageEditFeatureSnapshot.build(
+                    replace(
+                        snapshot.sequence,
+                        tokens=(
+                            changed_token,
+                            *snapshot.sequence.tokens[1:],
+                        ),
+                    ),
+                    provenance=snapshot.provenance,
+                    causal_sensing_binding=snapshot.causal_sensing_binding,
+                )
+                snapshot_path.write_text(
+                    json.dumps(
+                        changed_snapshot.to_dict(),
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                try:
+                    with (
+                        patch.object(
+                            StageEditContextualSourcePairScorerV2,
+                            "score_boundary",
+                        ) as score_boundary,
+                        self.assertRaisesRegex(
+                            StageEditWindowedBeamError,
+                            "snapshot identity.*disk identity changed",
+                        ),
+                    ):
+                        redecoder(request)
+                    score_boundary.assert_not_called()
+                    with self.assertRaisesRegex(
+                        StageEditWindowedBeamError,
+                        "snapshot identity.*disk identity changed",
+                    ):
+                        redecoder_for(bridge)
+                finally:
+                    snapshot_path.write_bytes(original_snapshot_bytes)
+
+                self.assertGreaterEqual(load_bundle.call_count, 1)
 
     @patch(
         "crosscut.stage_edit_semimarkov_beam.stage_edit_readiness_report",
@@ -1611,9 +2912,16 @@ class StageEditWindowedBeamRedecodeTests(unittest.TestCase):
                 )
             )
 
-        def apply_repaired_render_contract(bundle, _materialized):
+        def apply_repaired_render_contract(
+            bundle,
+            _materialized,
+            *,
+            motion_authority_v3=None,
+        ):
+            self.assertIsNone(motion_authority_v3)
             return replace(
                 bundle,
+                stage_edit_dynamic_crop_version=2,
                 candidate_lineage=bundle.candidate_lineage
                 + (
                     {

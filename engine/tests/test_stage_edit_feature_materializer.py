@@ -9,7 +9,7 @@ import unittest
 
 from crosscut.stage_edit_feature_materializer import (
     CausalEditDecision,
-    FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+    FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3,
     FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
     SourceFeatureObservation,
     StageEditFeatureFrame,
@@ -557,6 +557,7 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
                 upstream_sha256=(("timeline_candidate", "a" * 64),),
                 contracts=("ive_source_local_visual_features_v1",),
             ),
+            inspection_only_without_causal_sensing=True,
         )
         restored = StageEditFeatureSnapshot.from_dict(snapshot.to_dict())
         self.assertEqual(restored, snapshot)
@@ -569,7 +570,7 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported.*version"):
             StageEditFeatureSnapshot.from_dict(legacy)
 
-    def test_v3_sidecar_is_hash_bound_and_v2_loads_as_explicit_missing(self) -> None:
+    def test_v4_sidecar_is_hash_bound_and_v3_is_inspection_only(self) -> None:
         first = tuple(0.10 + index * 0.001 for index in range(60))
         second = tuple(0.12 + index * 0.001 for index in range(60))
         observation = source_observation_from_visual_cache_payload(
@@ -588,10 +589,14 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
             "ive:temporal-snapshot",
             (StageEditFeatureFrame(0.5, (observation,)),),
             performance_end_seconds=1.0,
+            inspection_only_without_causal_sensing=True,
         )
         payload = snapshot.to_dict()
         audit = snapshot.temporal_pose_sidecar_audit()
-        self.assertEqual(audit["status"], "v3_hash_bound_temporal_sidecar")
+        self.assertEqual(
+            audit["status"],
+            "v4_hash_bound_temporal_sidecar_and_causal_sensing",
+        )
         self.assertEqual(audit["observed_sidecar_count"], 1)
         self.assertTrue(audit["sidecar_hash_bound"])
         self.assertFalse(audit["enters_transformer_tensors"])
@@ -624,22 +629,28 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
         legacy = deepcopy(payload)
         legacy["schema_version"] = FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
         legacy["provenance"]["producer"] = (
-            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3
         )
-        for token in legacy["tokens"]:
-            for candidate in token["source_candidates"]:
-                candidate.pop("temporal_pose_sidecar")
+        legacy.pop("causal_sensing_binding")
         legacy["input_policy"] = {
             "training_inference_materializer_shared": True,
             "reference_attribution_match_inputs_present": False,
             "selected_labels_present": False,
             "missing_values_are_explicitly_masked": True,
             "source_availability_and_hard_gate_are_distinct": True,
+            "temporal_pose_sidecar_hash_bound": True,
+            "temporal_pose_sidecar_enters_transformer_tensors": False,
+            "legacy_snapshots_cannot_claim_pose_direction": True,
         }
         unsigned = deepcopy(legacy)
         unsigned.pop("snapshot_sha256")
         legacy["snapshot_sha256"] = _snapshot_payload_sha256(unsigned)
-        restored = StageEditFeatureSnapshot.from_dict(legacy)
+        with self.assertRaisesRegex(ValueError, "inspection-only"):
+            StageEditFeatureSnapshot.from_dict(legacy)
+        restored = StageEditFeatureSnapshot.from_dict(
+            legacy,
+            allow_legacy=True,
+        )
         legacy_audit = restored.temporal_pose_sidecar_audit()
         self.assertEqual(
             restored.schema_version,
@@ -647,24 +658,13 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
         )
         self.assertEqual(
             legacy_audit["status"],
-            "legacy_v2_explicit_temporal_sidecar_missing",
+            "legacy_v3_hash_bound_temporal_sidecar",
         )
-        self.assertEqual(legacy_audit["observed_sidecar_count"], 0)
-        self.assertFalse(legacy_audit["sidecar_hash_bound"])
+        self.assertEqual(legacy_audit["observed_sidecar_count"], 1)
+        self.assertTrue(legacy_audit["sidecar_hash_bound"])
         self.assertFalse(
             legacy_audit["pose_direction_or_velocity_proven_by_snapshot_alone"]
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "snapshot v2 cannot carry a temporal pose sidecar",
-        ):
-            StageEditFeatureSnapshot(
-                sequence=snapshot.sequence,
-                token_schema_fingerprint=restored.token_schema_fingerprint,
-                provenance=restored.provenance,
-                snapshot_sha256=restored.snapshot_sha256,
-                schema_version=FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
-            )
 
     def test_reference_training_and_inference_consume_identical_snapshot(self) -> None:
         times = (0.0, 0.5, 1.0, 1.75, 2.5, 3.25)
@@ -684,6 +684,7 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
             "stageedit-reference:test:ref-a",
             frames,
             performance_end_seconds=4.0,
+            inspection_only_without_causal_sensing=True,
         )
         payload = _payload("ref-a")
         example = build_reference_training_example(
@@ -731,6 +732,7 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
             "stageedit-reference:test:ref-a:canonical",
             frames,
             performance_end_seconds=4.0,
+            inspection_only_without_causal_sensing=True,
         )
         example = build_reference_training_example(
             _canonical_payload(),
@@ -755,6 +757,7 @@ class StageEditFeatureMaterializerTests(unittest.TestCase):
             "stageedit-reference:test:ref-a",
             tuple(StageEditFeatureFrame(timestamp, _sources()) for timestamp in times),
             performance_end_seconds=4.0,
+            inspection_only_without_causal_sensing=True,
         )
         original = _payload("ref-a")
         poisoned = deepcopy(original)
