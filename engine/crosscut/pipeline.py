@@ -134,6 +134,7 @@ from .professional_motion_cut_profile import (
     load_professional_motion_cut_profile,
 )
 from .render import (
+    NormalizedCrop,
     RENDER_PLAN_SOURCE_INDEX_DOMAIN,
     RenderPlan,
     RenderSegment,
@@ -285,6 +286,11 @@ ELIGIBLE_SOURCE_INDEX_DOMAIN = "eligible_source_index"
 OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY = (
     "official_target_fancam_direct_full_frame"
 )
+AUTOMATIC_MEMBER_PORTRAIT_FILL_CONTRACT = (
+    "automatic_official_member_lossless_portrait_fill_v1"
+)
+_MEMBER_PRODUCTION_WIDTH = 1080
+_MEMBER_PRODUCTION_HEIGHT = 1920
 AUTOMATIC_MEMBER_ALIGNMENT_PEER_CONSENSUS_CONTRACT = (
     "automatic_member_borderline_multi_peer_alignment_consensus_v1"
 )
@@ -2906,12 +2912,14 @@ def _automatic_member_portrait_source_ratios(
     request: AnalysisRequest,
     media: Sequence[MediaInfo],
 ) -> tuple[float, ...] | None:
-    """Fail closed on the materialized automatic portrait-source contract.
+    """Fail closed on the materialized automatic portrait-output contract.
 
     Automatic acquisition is the provenance boundary: it admits only official
-    target-member fancams.  The product path promises to retain those portrait
-    frames uncropped, so missing dimensions or a non-9:16 source is a contract
-    failure rather than permission to enter anchor/tracking fallback.
+    target-member fancams. Native portrait sources can be retained unchanged;
+    wider or taller official FaceCams are also valid when their decoded pixels
+    can cover a 1080x1920 portrait output without upscaling. Missing dimensions
+    or insufficient crop headroom remains a contract failure rather than
+    permission to enter anchor/tracking fallback.
     """
 
     if (
@@ -2940,7 +2948,6 @@ def _automatic_member_portrait_source_ratios(
             "automatic MEMBER+PORTRAIT direct-full-frame aspect contract "
             "cannot validate every materialized source"
         )
-    expected_ratio = 9.0 / 16.0
     ratios: list[float] = []
     for source_index, info in enumerate(media):
         if not info.video_streams:
@@ -2955,11 +2962,16 @@ def _automatic_member_portrait_source_ratios(
                 f"failed for source {source_index}: dimensions unavailable"
             )
         ratio = stream.width / stream.height
-        if abs(ratio - expected_ratio) > 0.01:
+        lossless_zoom = min(
+            stream.width / _MEMBER_PRODUCTION_WIDTH,
+            stream.height / _MEMBER_PRODUCTION_HEIGHT,
+        )
+        if lossless_zoom < 1.0 - 1e-6:
             raise ValueError(
-                "automatic MEMBER+PORTRAIT direct-full-frame aspect contract "
-                f"failed for source {source_index}: width/height {ratio:.6f} "
-                "is outside 9:16±0.01"
+                "automatic MEMBER+PORTRAIT lossless-fill contract failed for "
+                f"source {source_index}: {stream.width}x{stream.height} cannot "
+                f"cover {_MEMBER_PRODUCTION_WIDTH}x{_MEMBER_PRODUCTION_HEIGHT} "
+                "without upscaling"
             )
         ratios.append(ratio)
     return tuple(ratios)
@@ -2970,7 +2982,11 @@ def _automatic_member_direct_full_frame_ratios(
     media: Sequence[MediaInfo],
     eligible_indices: Sequence[int],
 ) -> tuple[float, ...] | None:
-    """Gate the provenance-scoped portrait direct-full-frame member path."""
+    """Gate the provenance-scoped portrait member path.
+
+    The historical function name remains stable for analysis compatibility;
+    returned ratios may now include lossless-croppable 4K landscape FaceCams.
+    """
 
     ratios = _automatic_member_portrait_source_ratios(request, media)
     if ratios is None:
@@ -2997,6 +3013,46 @@ def _automatic_member_direct_full_frame_ratios(
             "index is outside the materialized portrait source list"
         )
     return tuple(ratios[index] for index in eligible)
+
+
+def _lossless_member_portrait_fill_crop(
+    source_aspect_ratio: float,
+) -> NormalizedCrop | None:
+    """Return the centered source crop needed to fill a 9:16 output.
+
+    ``None`` preserves an already-exact portrait source. The acquisition and
+    materialization gates independently guarantee enough decoded pixels; this
+    helper only expresses the geometry and never authorizes upscaling.
+    """
+
+    if (
+        not math.isfinite(source_aspect_ratio)
+        or source_aspect_ratio <= 0.0
+    ):
+        raise ValueError("member portrait-fill source aspect ratio is invalid")
+    target_ratio = 9.0 / 16.0
+    if math.isclose(
+        source_aspect_ratio,
+        target_ratio,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        return None
+    if source_aspect_ratio > target_ratio:
+        width = target_ratio / source_aspect_ratio
+        return NormalizedCrop(
+            x=(1.0 - width) / 2.0,
+            y=0.0,
+            width=width,
+            height=1.0,
+        )
+    height = source_aspect_ratio / target_ratio
+    return NormalizedCrop(
+        x=0.0,
+        y=(1.0 - height) / 2.0,
+        width=1.0,
+        height=height,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -7234,6 +7290,7 @@ def _official_target_fancam_direct_full_frame_segments(
     common_master_start: float,
     source_timewarps: Sequence[TimeWarpMap | None] | None,
     scene_cut_times: Sequence[Sequence[float]],
+    eligible_source_aspect_ratios: Sequence[float] | None = None,
     descriptor_provider: DescriptorProvider | None = None,
     eligible_source_durations_seconds: Sequence[float] | None = None,
     source_metadata_contract: str | None = None,
@@ -7248,7 +7305,7 @@ def _official_target_fancam_direct_full_frame_segments(
     dict[str, Any],
     DirectMemberVisualSelection,
 ]:
-    """Build a visually selected, all-source, uncropped portrait render."""
+    """Build a visually selected, all-source portrait render."""
 
     eligible = tuple(int(index) for index in eligible_indices)
     if len(eligible) < MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT:
@@ -7258,6 +7315,17 @@ def _official_target_fancam_direct_full_frame_segments(
         )
     if len(eligible_sources) != len(eligible):
         raise ValueError("direct eligible_sources must match eligible indices")
+    source_aspect_ratios = (
+        tuple(9.0 / 16.0 for _ in eligible)
+        if eligible_source_aspect_ratios is None
+        else tuple(float(value) for value in eligible_source_aspect_ratios)
+    )
+    if len(source_aspect_ratios) != len(eligible):
+        raise ValueError("direct source aspect ratios must match eligible indices")
+    portrait_fill_crops = tuple(
+        _lossless_member_portrait_fill_crop(value)
+        for value in source_aspect_ratios
+    )
     if len(timing_draft.audio_offsets) != len(eligible):
         raise ValueError("direct timing offsets must match eligible sources")
     if source_timewarps is not None and max(eligible) >= len(source_timewarps):
@@ -7336,7 +7404,24 @@ def _official_target_fancam_direct_full_frame_segments(
                     if segment.source_duration is not None
                     else "global_scalar_offset"
                 ),
-                "crop_applied": False,
+                "crop_applied": portrait_fill_crops[eligible_source_index]
+                is not None,
+                "portrait_fill_contract": (
+                    AUTOMATIC_MEMBER_PORTRAIT_FILL_CONTRACT
+                ),
+                "source_aspect_ratio": source_aspect_ratios[
+                    eligible_source_index
+                ],
+                "portrait_fill_crop": (
+                    {
+                        "x": portrait_fill_crops[eligible_source_index].x,
+                        "y": portrait_fill_crops[eligible_source_index].y,
+                        "width": portrait_fill_crops[eligible_source_index].width,
+                        "height": portrait_fill_crops[eligible_source_index].height,
+                    }
+                    if portrait_fill_crops[eligible_source_index] is not None
+                    else None
+                ),
                 "timing_segment_count": span.timing_segment_count,
                 "estimated_beat_count": span.estimated_beat_count,
                 "start_boundary_reasons": list(span.start_boundary_reasons),
@@ -7344,10 +7429,40 @@ def _official_target_fancam_direct_full_frame_segments(
             }
         )
 
-    transitions = tuple(
-        RenderTransition(reason=OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY)
-        for _ in range(len(resolved) - 1)
-    )
+    boundary_diagnostics = tuple(visual_selection.boundaries)
+    if len(boundary_diagnostics) != len(resolved) - 1:
+        raise RuntimeError(
+            "direct member visual selection boundary count disagrees with render"
+        )
+    hold_boundary_indices: set[int] = set()
+    transitions_list: list[RenderTransition] = []
+    for boundary_index, (left, right, diagnostic) in enumerate(
+        zip(resolved, resolved[1:], boundary_diagnostics, strict=True)
+    ):
+        cut_applied = getattr(diagnostic, "cut_applied", True)
+        if not isinstance(cut_applied, bool):
+            raise RuntimeError("direct member cut-applied diagnostic is invalid")
+        same_source = left.source_index == right.source_index
+        if same_source != (not cut_applied):
+            raise RuntimeError(
+                "direct member same-source continuation disagrees with "
+                "the audited cut decision"
+            )
+        if same_source:
+            hold_boundary_indices.add(boundary_index)
+            transitions_list.append(
+                RenderTransition(
+                    tier="D",
+                    reason="same_source_hold_no_visible_switch",
+                )
+            )
+        else:
+            transitions_list.append(
+                RenderTransition(
+                    reason=OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY
+                )
+            )
+    transitions = tuple(transitions_list)
     counts = {source: 0 for source in eligible}
     for segment in resolved:
         counts[segment.source_index] += 1
@@ -7410,12 +7525,6 @@ def _official_target_fancam_direct_full_frame_segments(
         raise RuntimeError(
             "direct full-frame selector duration diagnostics disagree with render segments"
         )
-    if any(
-        left.source_index == right.source_index
-        for left, right in zip(resolved, resolved[1:])
-    ):
-        raise RuntimeError("direct full-frame render repeated an adjacent source")
-
     cadence = _render_cadence_payload(resolved)
     switches_per_minute = float(cadence["source_switches_per_minute"])
     median_run = float(cadence["source_run_median_seconds"])
@@ -7489,6 +7598,15 @@ def _official_target_fancam_direct_full_frame_segments(
             fps=output_fps,
         )
     transitions = dissolve_plan.transitions
+    transitions = tuple(
+        RenderTransition(
+            tier="D",
+            reason="same_source_hold_no_visible_switch",
+        )
+        if boundary_index in hold_boundary_indices
+        else transition
+        for boundary_index, transition in enumerate(transitions)
+    )
     dissolve_payload = dissolve_plan.to_dict()
     dissolve_payload["planner_completed"] = dissolve_planner_error is None
     dissolve_payload["planner_error"] = dissolve_planner_error
@@ -7796,6 +7914,66 @@ def _attach_direct_member_editorial_motion_tracks(
             render_item
             if plan_item.track is None
             else replace(render_item, editorial_transform=plan_item.track)
+        )
+    return tuple(attached)
+
+
+def _attach_direct_member_portrait_fill_geometry(
+    *,
+    visual_selection: DirectMemberVisualSelection,
+    eligible_indices: Sequence[int],
+    eligible_source_aspect_ratios: Sequence[float],
+    render_segments: Sequence[RenderSegment],
+) -> tuple[RenderSegment, ...]:
+    """Apply a lossless 9:16 fill to spans without an authored camera track.
+
+    Authored editorial transforms already begin with aspect-fill scaling in the
+    renderer. Untouched spans instead receive one deterministic centered crop.
+    This is attached only after dense motion planning so face coordinates stay
+    in the original decoded-frame domain during review.
+    """
+
+    source_path = tuple(int(value) for value in visual_selection.source_indices)
+    eligible = tuple(int(value) for value in eligible_indices)
+    source_aspect_ratios = tuple(
+        float(value) for value in eligible_source_aspect_ratios
+    )
+    renders = tuple(render_segments)
+    if len(source_path) != len(renders):
+        raise ValueError(
+            "direct member portrait fill requires one source per render segment"
+        )
+    if len(source_aspect_ratios) != len(eligible):
+        raise ValueError(
+            "direct member portrait fill aspect ratios must match eligible sources"
+        )
+
+    attached: list[RenderSegment] = []
+    for eligible_source_index, render_item in zip(
+        source_path,
+        renders,
+        strict=True,
+    ):
+        if not 0 <= eligible_source_index < len(eligible):
+            raise ValueError(
+                "direct member portrait fill references an unknown eligible source"
+            )
+        if render_item.source_index != eligible[eligible_source_index]:
+            raise ValueError(
+                "direct member portrait fill source path disagrees with render"
+            )
+        if render_item.crop is not None or render_item.pan_crop is not None:
+            raise ValueError(
+                "direct member portrait fill requires an unclaimed base crop"
+            )
+        if render_item.editorial_transform is not None:
+            attached.append(render_item)
+            continue
+        crop = _lossless_member_portrait_fill_crop(
+            source_aspect_ratios[eligible_source_index]
+        )
+        attached.append(
+            render_item if crop is None else replace(render_item, crop=crop)
         )
     return tuple(attached)
 
@@ -12483,8 +12661,9 @@ def analyze(
         reporter.progress(0.05 + 0.15 * (index + 1) / len(request.sources), "영상 확인 중…")
 
     # An automatic portrait-member request is already materialized at this
-    # point.  Enforce its uncropped 9:16 source promise before alignment or
-    # scene work so a bad cache can never fall through into anchor/tracking.
+    # point. Enforce its native-or-lossless-croppable 9:16 output promise before
+    # alignment or scene work so a bad cache can never fall through into
+    # anchor/tracking.
     _automatic_member_portrait_source_ratios(request, media)
 
     alignment, reference_pcm = _align_sequentially(request, reporter)
@@ -14886,7 +15065,13 @@ def analyze(
                 raise ValueError("멤버 크롭을 위한 원본 영상 해상도를 확인할 수 없습니다.")
             aspect_ratios.append(video_stream.width / video_stream.height)
         source_aspect_ratio = aspect_ratios[0]
-        if any(abs(value - source_aspect_ratio) > 0.03 for value in aspect_ratios[1:]):
+        if (
+            not use_direct_member_full_frame
+            and any(
+                abs(value - source_aspect_ratio) > 0.03
+                for value in aspect_ratios[1:]
+            )
+        ):
             raise ValueError("멤버 모드 원본 영상들의 화면 비율이 서로 다릅니다.")
         direct_segment_details: tuple[dict[str, Any], ...] = ()
         direct_cadence: dict[str, Any] | None = None
@@ -14971,6 +15156,9 @@ def analyze(
                     eligible_indices=eligible_indices,
                     eligible_sources=tuple(
                         request.sources[index] for index in eligible_indices
+                    ),
+                    eligible_source_aspect_ratios=(
+                        direct_full_frame_ratios
                     ),
                     common_master_start=member_common_start,
                     source_timewarps=source_timewarps,
@@ -15152,6 +15340,22 @@ def analyze(
                 }
                 if dense_face_provider is not None:
                     dense_face_provider.close()
+            assert direct_full_frame_ratios is not None
+            segments = _attach_direct_member_portrait_fill_geometry(
+                visual_selection=direct_visual_selection,
+                eligible_indices=eligible_indices,
+                eligible_source_aspect_ratios=direct_full_frame_ratios,
+                render_segments=segments,
+            )
+            for detail, segment in zip(
+                direct_segment_details,
+                segments,
+                strict=True,
+            ):
+                detail["crop_applied"] = segment.crop is not None
+                detail["editorial_transform_applied"] = (
+                    segment.editorial_transform is not None
+                )
             selection_basis = OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY
         else:
             member_draft = build_member_draft(
@@ -15367,7 +15571,11 @@ def analyze(
                         "automatic_acquisition_official_target_member_fancam"
                     ),
                     "identity_policy": (
-                        "no_geometry_identity_claim_no_tracking_no_crop"
+                        "official_target_member_provenance_no_identity_inference_"
+                        "with_lossless_portrait_fill"
+                    ),
+                    "portrait_fill_contract": (
+                        AUTOMATIC_MEMBER_PORTRAIT_FILL_CONTRACT
                     ),
                     "output_aspect": request.aspect_ratio.value,
                     "output_pixel_aspect_ratio": 9.0 / 16.0,

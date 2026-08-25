@@ -710,6 +710,11 @@ def _safe_candidate(
         reasons.append("boundary_source_metadata_disagrees_with_render")
     outgoing_segment = render_segments[boundary_index]
     incoming_segment = render_segments[boundary_index + 1]
+    cut_applied = getattr(diagnostic, "cut_applied", True)
+    if not isinstance(cut_applied, bool):
+        reasons.append("cut_applied_diagnostic_invalid")
+    elif not cut_applied:
+        reasons.append("same_source_continuation_has_no_visible_cut")
 
     mismatch = getattr(diagnostic, "mismatch", None)
     warning_flags = tuple(getattr(mismatch, "warning_flags", ()))

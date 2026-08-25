@@ -542,7 +542,10 @@ def build_direct_member_editorial_motion_plan(
 
     blocked: set[int] = set()
     for index, transition in enumerate(transition_items):
-        if transition.kind is TransitionKind.FACE_DISSOLVE:
+        if (
+            transition.kind is TransitionKind.FACE_DISSOLVE
+            or transition.tier == "D"
+        ):
             blocked.update((index, index + 1))
     skipped: dict[str, int] = {}
 
