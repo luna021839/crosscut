@@ -61,6 +61,9 @@ PORTRAIT_ACQUISITION_AUTHORITY_BASIS = (
 FACECAM_REJECTION_AUTHORITY_BASIS = (
     "exact_persistent_portrait_aspect_rejection_current_metadata_and_media_v1"
 )
+DEDICATED_FACECAM_ACQUISITION_AUTHORITY_BASIS = (
+    "sealed_dedicated_ive_facecam_acquisition_v1"
+)
 PUBLIC_AUDIT_CONTRACT = "ive_face_gallery_materializer_scalar_audit_v1"
 
 _GALLERY_SOURCE_AUTHORITY_SEAL = object()
@@ -365,6 +368,7 @@ class SealedGallerySourceMediaAuthority:
         if self.acquisition_authority_basis not in {
             PORTRAIT_ACQUISITION_AUTHORITY_BASIS,
             FACECAM_REJECTION_AUTHORITY_BASIS,
+            DEDICATED_FACECAM_ACQUISITION_AUTHORITY_BASIS,
         }:
             raise IVEFaceGalleryMaterializerError(
                 "acquisition authority basis is invalid"
@@ -409,6 +413,26 @@ def is_sealed_gallery_source_media_authority(value: object) -> bool:
         isinstance(value, SealedGallerySourceMediaAuthority)
         and value._seal is _GALLERY_SOURCE_AUTHORITY_SEAL
     )
+
+
+def revalidate_sealed_gallery_source_media_authority(
+    authority: SealedGallerySourceMediaAuthority,
+) -> SealedGallerySourceMediaAuthority:
+    """Reproduce a gallery-source seal against its current local files."""
+
+    if not is_sealed_gallery_source_media_authority(authority):
+        raise IVEFaceGalleryMaterializerError(
+            "gallery source lacks a process-local materializer seal"
+        )
+    SealedGallerySourceMediaAuthority(
+        **{
+            field: getattr(authority, field)
+            for field in authority.__dataclass_fields__
+            if field != "_seal"
+        },
+        _seal=_GALLERY_SOURCE_AUTHORITY_SEAL,
+    )
+    return authority
 
 
 def _issue_gallery_authority(
@@ -828,6 +852,100 @@ def seal_closeup_facecam_sources_from_rejection_manifest(
     )
 
 
+def seal_closeup_facecam_sources_from_dedicated_acquisition(
+    authorities: Sequence[object],
+    *,
+    media_probe: Callable[[Path], MediaInfo] = probe_media,
+) -> tuple[SealedGallerySourceMediaAuthority, ...]:
+    """Consume only process-sealed dedicated FaceCam acquisition outputs."""
+
+    from .ive_face_identity_gallery_acquisition import (
+        DedicatedFaceCamAcquisitionAuthority,
+        IVEFaceGalleryAcquisitionError,
+        is_dedicated_facecam_acquisition_authority,
+        revalidate_dedicated_facecam_acquisition_authority,
+    )
+
+    values = tuple(authorities)
+    if not values or any(
+        not is_dedicated_facecam_acquisition_authority(item) for item in values
+    ):
+        raise IVEFaceGalleryMaterializerError(
+            "dedicated FaceCam sources require process-sealed acquisition authorities"
+        )
+    issued: list[SealedGallerySourceMediaAuthority] = []
+    for raw in values:
+        assert isinstance(raw, DedicatedFaceCamAcquisitionAuthority)
+        try:
+            authority = revalidate_dedicated_facecam_acquisition_authority(
+                raw, media_probe=media_probe
+            )
+        except IVEFaceGalleryAcquisitionError as exc:
+            raise IVEFaceGalleryMaterializerError(str(exc)) from exc
+        media_identity = _stable_regular_file(authority.media_path)
+        manifest_identity = _stable_regular_file(
+            authority.manifest_path, maximum_bytes=_MAXIMUM_MANIFEST_BYTES
+        )
+        if not (
+            media_identity.size_bytes == authority.media_size_bytes
+            and hmac.compare_digest(
+                media_identity.sha256, authority.media_sha256
+            )
+            and hmac.compare_digest(
+                manifest_identity.sha256, authority.manifest_file_sha256
+            )
+        ):
+            raise IVEFaceGalleryMaterializerError(
+                "dedicated FaceCam current file rebinding failed"
+            )
+        try:
+            provenance = OfficialTargetMemberFancamProvenance(
+                song=authority.song,
+                target_member=authority.member,
+                video_id=authority.video_id,
+                title=authority.title,
+                broadcast_date=authority.broadcast_date,
+                broadcast_program=authority.broadcast_program,
+                channel_id=authority.channel_id,
+                metadata_authority_sha256=(
+                    authority.metadata_observation_sha256
+                ),
+                acquisition_manifest_sha256=(
+                    authority.manifest_file_sha256
+                ),
+                media_content_sha256=authority.media_sha256,
+                media_size_bytes=authority.media_size_bytes,
+                media_width=authority.media_width,
+                media_height=authority.media_height,
+                source_authority=(
+                    IVEFaceGallerySourceAuthority.OFFICIAL_TARGET_MEMBER_CLOSEUP_FACECAM
+                ),
+                source_media_contract=CLOSEUP_FACECAM_MEDIA_CONTRACT,
+                title_member_authorization_contract=(
+                    FACECAM_TITLE_MEMBER_AUTHORIZATION_CONTRACT
+                ),
+            )
+        except IVEFaceGalleryError as exc:
+            raise IVEFaceGalleryMaterializerError(str(exc)) from exc
+        issued.append(
+            _issue_gallery_authority(
+                provenance=provenance,
+                media_identity=media_identity,
+                manifest_identity=manifest_identity,
+                duration_seconds=authority.media_duration_seconds,
+                acquisition_authority_basis=(
+                    DEDICATED_FACECAM_ACQUISITION_AUTHORITY_BASIS
+                ),
+                acquisition_evidence_sha256=(
+                    authority.authority_content_sha256
+                ),
+            )
+        )
+    return tuple(
+        sorted(issued, key=lambda item: item.authority_content_sha256)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class IVEFaceGalleryMaterializerConfig:
     start_margin_seconds: float = 4.0
@@ -1040,6 +1158,10 @@ def materialize_ive_face_identity_gallery_job(
     ):
         raise IVEFaceGalleryMaterializerError(
             "job requires typed sealed source authorities"
+        )
+    if len({item.provenance.video_id for item in provided}) != len(provided):
+        raise IVEFaceGalleryMaterializerError(
+            "one provenance video_id cannot seed multiple gallery sources"
         )
     if len({item.authority_content_sha256 for item in provided}) != len(provided):
         raise IVEFaceGalleryMaterializerError("source authority is duplicated")
