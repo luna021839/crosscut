@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import math
 from pathlib import Path
@@ -86,6 +87,9 @@ IVE_CAUSAL_SENSING_IDENTITY_CONTRACT = (
 )
 IVE_CAUSAL_SENSING_MEMBER_FRAME_CONTRACT = (
     "member_graph_source_local_decision_ordinal_with_native_decode_manifest_v1"
+)
+IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT = (
+    "hash_bound_source_clock_media_edge_unavailability_exact_grid_v1"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -191,6 +195,10 @@ class IVECausalSensingSource:
     clock: ReferenceSourceClock
     native_cut_source_seconds: tuple[float, ...]
     native_cut_evidence_sha256: str
+    unavailable_master_times: tuple[float, ...] = ()
+    availability_frame_rate: float | None = None
+    availability_declared_frame_count: int | None = None
+    unavailable_master_time_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_id", _source_id(self.source_id))
@@ -228,6 +236,50 @@ class IVECausalSensingSource:
                 "native_cut_evidence_sha256",
             ),
         )
+        unavailable = tuple(
+            _finite(value, "unavailable master time")
+            for value in self.unavailable_master_times
+        )
+        if any(value < 0.0 for value in unavailable) or unavailable != tuple(
+            sorted(set(unavailable))
+        ):
+            raise IVECausalSensingMediaJobError(
+                "unavailable master times must be non-negative, strict, and canonical"
+            )
+        object.__setattr__(self, "unavailable_master_times", unavailable)
+        rate = self.availability_frame_rate
+        count = self.availability_declared_frame_count
+        evidence = self.unavailable_master_time_evidence_sha256
+        bound_values = (rate is not None, count is not None, evidence is not None)
+        if any(bound_values) and not all(bound_values):
+            raise IVECausalSensingMediaJobError(
+                "availability frame rate, frame count, and evidence SHA are all required"
+            )
+        if all(bound_values):
+            checked_rate = _finite(rate, "availability frame rate")
+            if checked_rate <= 0.0:
+                raise IVECausalSensingMediaJobError(
+                    "availability frame rate must be positive"
+                )
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count <= 1
+            ):
+                raise IVECausalSensingMediaJobError(
+                    "availability declared frame count must exceed one"
+                )
+            object.__setattr__(self, "availability_frame_rate", checked_rate)
+            object.__setattr__(self, "availability_declared_frame_count", count)
+            object.__setattr__(
+                self,
+                "unavailable_master_time_evidence_sha256",
+                _sha256(evidence, "unavailable master-time evidence SHA-256"),
+            )
+        elif unavailable:
+            raise IVECausalSensingMediaJobError(
+                "non-empty unavailable master times require hash-bound media bounds"
+            )
 
     @property
     def clock_sha256(self) -> str:
@@ -241,6 +293,67 @@ class IVECausalSensingSource:
                 "source_seconds": list(self.native_cut_source_seconds),
             }
         )
+
+    @property
+    def availability_bound(self) -> bool:
+        return self.availability_frame_rate is not None
+
+
+def ive_causal_sensing_source_availability_evidence_sha256(
+    *,
+    source_id: str,
+    media_content_sha256: str,
+    source_clock_sha256: str,
+    decision_grid_sha256: str,
+    frame_rate: float,
+    declared_frame_count: int,
+    unavailable_master_times: Sequence[float],
+) -> str:
+    """Hash one exact media-edge availability mask without filesystem access."""
+
+    checked_source_id = _source_id(source_id)
+    checked_media = _sha256(media_content_sha256, "media_content_sha256")
+    checked_clock = _sha256(source_clock_sha256, "source_clock_sha256")
+    checked_grid = _sha256(decision_grid_sha256, "decision_grid_sha256")
+    checked_rate = _finite(frame_rate, "availability frame rate")
+    if checked_rate <= 0.0:
+        raise IVECausalSensingMediaJobError(
+            "availability frame rate must be positive"
+        )
+    if (
+        isinstance(declared_frame_count, bool)
+        or not isinstance(declared_frame_count, int)
+        or declared_frame_count <= 1
+    ):
+        raise IVECausalSensingMediaJobError(
+            "availability declared frame count must exceed one"
+        )
+    unavailable = tuple(
+        _finite(value, "unavailable master time")
+        for value in unavailable_master_times
+    )
+    if any(value < 0.0 for value in unavailable) or unavailable != tuple(
+        sorted(set(unavailable))
+    ):
+        raise IVECausalSensingMediaJobError(
+            "unavailable master times must be non-negative, strict, and canonical"
+        )
+    return _canonical_sha256(
+        {
+            "contract": IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT,
+            "source_id": checked_source_id,
+            "media_content_sha256": checked_media,
+            "source_clock_sha256": checked_clock,
+            "decision_grid_sha256": checked_grid,
+            "frame_rate": checked_rate,
+            "declared_frame_count": declared_frame_count,
+            "unavailable_master_times": list(unavailable),
+            "unavailable_reason": (
+                "mapped_native_current_plus_following_frame_outside_media_edges"
+            ),
+            "interior_gaps_allowed": False,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +443,79 @@ class IVECausalSensingMediaRequest:
             raise IVECausalSensingMediaJobError(
                 "source/time grid exceeds the bounded M4-memory contract"
             )
+        availability_modes = {source.availability_bound for source in sources}
+        if len(availability_modes) != 1:
+            raise IVECausalSensingMediaJobError(
+                "source availability bindings must be complete or uniformly absent"
+            )
+        if availability_modes == {True}:
+            decision_grid_sha256 = _canonical_sha256(list(times))
+            for source in sources:
+                assert source.availability_frame_rate is not None
+                assert source.availability_declared_frame_count is not None
+                mapped = tuple(
+                    _finite(
+                        source.clock.master_to_source(master_seconds),
+                        "mapped source time",
+                    )
+                    for master_seconds in times
+                )
+                if any(
+                    right <= left
+                    for left, right in zip(mapped, mapped[1:], strict=False)
+                ):
+                    raise IVECausalSensingMediaJobError(
+                        "source clock must be strictly monotonic on the decision grid"
+                    )
+                expected_unavailable = tuple(
+                    master_seconds
+                    for master_seconds, source_seconds in zip(
+                        times, mapped, strict=True
+                    )
+                    if source_seconds < 0.0
+                    or int(round(source_seconds * source.availability_frame_rate))
+                    + 1
+                    >= source.availability_declared_frame_count
+                )
+                if source.unavailable_master_times != expected_unavailable:
+                    raise IVECausalSensingMediaJobError(
+                        "source unavailable mask differs from clock and media bounds"
+                    )
+                available_indices = tuple(
+                    index
+                    for index, master_seconds in enumerate(times)
+                    if master_seconds not in set(expected_unavailable)
+                )
+                if not available_indices:
+                    raise IVECausalSensingMediaJobError(
+                        "source has no decodable decision time"
+                    )
+                if available_indices != tuple(
+                    range(available_indices[0], available_indices[-1] + 1)
+                ):
+                    raise IVECausalSensingMediaJobError(
+                        "source unavailable mask contains an interior clock gap"
+                    )
+                expected_evidence = (
+                    ive_causal_sensing_source_availability_evidence_sha256(
+                        source_id=source.source_id,
+                        media_content_sha256=source.media_content_sha256,
+                        source_clock_sha256=source.clock_sha256,
+                        decision_grid_sha256=decision_grid_sha256,
+                        frame_rate=source.availability_frame_rate,
+                        declared_frame_count=(
+                            source.availability_declared_frame_count
+                        ),
+                        unavailable_master_times=expected_unavailable,
+                    )
+                )
+                if not hmac.compare_digest(
+                    expected_evidence,
+                    str(source.unavailable_master_time_evidence_sha256),
+                ):
+                    raise IVECausalSensingMediaJobError(
+                        "source unavailable mask evidence SHA-256 mismatch"
+                    )
         gallery_path = Path(self.gallery_artifact_path).expanduser()
         artifact_directory = Path(self.artifact_directory).expanduser()
         if not gallery_path.is_absolute() or not artifact_directory.is_absolute():
@@ -1072,6 +1258,15 @@ def _observation_manifest_sha256(
             "source_content_sha256": source.media_content_sha256,
             "source_clock_sha256": source.clock_sha256,
             "native_cut_manifest_sha256": source.native_cut_manifest_sha256,
+            "availability_contract": (
+                IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT
+                if source.availability_bound
+                else None
+            ),
+            "unavailable_master_time_evidence_sha256": (
+                source.unavailable_master_time_evidence_sha256
+            ),
+            "unavailable_master_times": list(source.unavailable_master_times),
             "decision_grid_sha256": request.decision_grid_sha256,
             "song_scope_sha256": request.song_scope_sha256,
             "gallery_content_sha256": request.gallery_content_sha256,
@@ -1109,6 +1304,7 @@ class IVECausalSensingMediaJobResult:
     decision_count: int
     member_observation_count: int
     accepted_identity_observation_count: int
+    unavailable_source_time_count: int = 0
 
 
 def reject_attitude_before_ive_causal_sensing_access(
@@ -1174,7 +1370,15 @@ def materialize_ive_causal_sensing_from_media(
             )
             for master_seconds in request.master_decision_times
         )
-        if any(value < 0.0 for value in mapped_times) or any(
+        unavailable = set(source.unavailable_master_times)
+        available_grid = tuple(
+            (grid_index, master_seconds, source_seconds)
+            for grid_index, (master_seconds, source_seconds) in enumerate(
+                zip(request.master_decision_times, mapped_times, strict=True)
+            )
+            if master_seconds not in unavailable
+        )
+        if any(value < 0.0 for _index, _master, value in available_grid) or any(
             right <= left
             for left, right in zip(mapped_times, mapped_times[1:], strict=False)
         ):
@@ -1183,7 +1387,10 @@ def materialize_ive_causal_sensing_from_media(
             )
         media_identity = _verify_source_media(source)
         iterator = iter(
-            active_runtime.frame_provider.iter_source_samples(source, mapped_times)
+            active_runtime.frame_provider.iter_source_samples(
+                source,
+                tuple(value for _index, _master, value in available_grid),
+            )
         )
         previous_source_seconds: float | None = None
         previous_scale: float | None = None
@@ -1203,6 +1410,15 @@ def materialize_ive_causal_sensing_from_media(
                 "source_content_sha256": source.media_content_sha256,
                 "source_clock_sha256": source.clock_sha256,
                 "decision_grid_sha256": request.decision_grid_sha256,
+                "availability_contract": (
+                    IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT
+                    if source.availability_bound
+                    else None
+                ),
+                "unavailable_master_time_evidence_sha256": (
+                    source.unavailable_master_time_evidence_sha256
+                ),
+                "unavailable_master_time_count": len(unavailable),
             },
         )
         causal_order = 0
@@ -1210,13 +1426,33 @@ def materialize_ive_causal_sensing_from_media(
             for graph_frame_index, (
                 master_seconds,
                 expected_source_seconds,
-            ) in enumerate(
-                zip(
-                    request.master_decision_times,
-                    mapped_times,
-                    strict=True,
-                )
-            ):
+            ) in enumerate(zip(request.master_decision_times, mapped_times, strict=True)):
+                if master_seconds in unavailable:
+                    _update_manifest_digest(
+                        decoded_frame_manifest,
+                        {
+                            "record": "skipped",
+                            "source_local_decision_ordinal": graph_frame_index,
+                            "master_seconds": master_seconds,
+                            "mapped_source_seconds": expected_source_seconds,
+                            "reason": (
+                                "mapped_native_current_plus_following_frame_"
+                                "outside_media_edges"
+                            ),
+                            "availability_evidence_sha256": (
+                                source.unavailable_master_time_evidence_sha256
+                            ),
+                        },
+                    )
+                    shooting_observations.append(
+                        ShootingGrammarObservation(
+                            source_id=source.source_id,
+                            master_time_seconds=master_seconds,
+                            internal_native_cut_since_previous=None,
+                            shooting_grammar_confidence=0.0,
+                        )
+                    )
+                    continue
                 try:
                     sample = next(iterator)
                 except StopIteration as exc:
@@ -1245,6 +1481,15 @@ def materialize_ive_causal_sensing_from_media(
                     )
                 if observed_frame_rate is None:
                     observed_frame_rate = sample.frame_rate
+                    if source.availability_frame_rate is not None and not math.isclose(
+                        observed_frame_rate,
+                        source.availability_frame_rate,
+                        rel_tol=2.0e-3,
+                        abs_tol=2.0e-3,
+                    ):
+                        raise IVECausalSensingMediaJobError(
+                            "decoded source frame rate differs from availability evidence"
+                        )
                 elif not math.isclose(
                     observed_frame_rate,
                     sample.frame_rate,
@@ -1347,6 +1592,12 @@ def materialize_ive_causal_sensing_from_media(
         for master_seconds in request.master_decision_times
         for source in request.sources
     }
+    expected_member_keys = {
+        (master_seconds, source.source_id)
+        for source in request.sources
+        for master_seconds in request.master_decision_times
+        if master_seconds not in set(source.unavailable_master_times)
+    }
     actual_shooting_keys = {
         (item.master_time_seconds, item.source_id)
         for item in shooting_observations
@@ -1354,9 +1605,12 @@ def materialize_ive_causal_sensing_from_media(
     actual_member_keys = {
         (item.timestamp_seconds, item.source_id) for item in member_observations
     }
-    if actual_shooting_keys != expected_keys or actual_member_keys != expected_keys:
+    if (
+        actual_shooting_keys != expected_keys
+        or actual_member_keys != expected_member_keys
+    ):
         raise IVECausalSensingMediaJobError(
-            "derived sensing does not exactly cover every source/time"
+            "derived sensing does not match exact available/missing source-time keys"
         )
 
     ordered_shooting = tuple(
@@ -1381,6 +1635,21 @@ def materialize_ive_causal_sensing_from_media(
                     source.native_cut_manifest_sha256,
                 ),
                 (
+                    f"source_{index:03d}_availability",
+                    _canonical_sha256(
+                        {
+                            "contract": IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT,
+                            "bound": source.availability_bound,
+                            "evidence_sha256": (
+                                source.unavailable_master_time_evidence_sha256
+                            ),
+                            "unavailable_master_times": list(
+                                source.unavailable_master_times
+                            ),
+                        }
+                    ),
+                ),
+                (
                     f"source_{index:03d}_decoded_frames",
                     decoded_frame_manifest_by_source[source.source_id],
                 ),
@@ -1397,6 +1666,7 @@ def materialize_ive_causal_sensing_from_media(
                 IVE_CAUSAL_SENSING_MEDIA_JOB_CONTRACT,
                 IVE_CAUSAL_SENSING_FRAME_CONTRACT,
                 IVE_CAUSAL_SENSING_MEMBER_FRAME_CONTRACT,
+                IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT,
                 "paths_frames_descriptors_and_query_embeddings_not_persisted_v1",
             ),
         ),
@@ -1439,6 +1709,7 @@ def materialize_ive_causal_sensing_from_media(
                 sorted(
                     (
                         IVE_CAUSAL_SENSING_IDENTITY_CONTRACT,
+                        IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT,
                         IVE_CAUSAL_SENSING_MEMBER_FRAME_CONTRACT,
                         IVE_CAUSAL_SENSING_MEDIA_JOB_CONTRACT,
                     )
@@ -1506,12 +1777,16 @@ def materialize_ive_causal_sensing_from_media(
         stage_edit_artifacts=stage_edit_artifacts,
         source_count=len(request.sources),
         decision_count=len(request.master_decision_times),
+        unavailable_source_time_count=sum(
+            len(source.unavailable_master_times) for source in request.sources
+        ),
         member_observation_count=len(member_graph.observations),
         accepted_identity_observation_count=accepted_count,
     )
 
 
 __all__ = [
+    "IVE_CAUSAL_SENSING_AVAILABILITY_CONTRACT",
     "IVE_CAUSAL_SENSING_FRAME_CONTRACT",
     "IVE_CAUSAL_SENSING_IDENTITY_CONTRACT",
     "IVE_CAUSAL_SENSING_MEMBER_FRAME_CONTRACT",
@@ -1526,5 +1801,6 @@ __all__ = [
     "IVECausalSensingSource",
     "OpenCVSequentialCausalFrameProvider",
     "materialize_ive_causal_sensing_from_media",
+    "ive_causal_sensing_source_availability_evidence_sha256",
     "reject_attitude_before_ive_causal_sensing_access",
 ]

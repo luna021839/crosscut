@@ -31,9 +31,11 @@ from .section_director import build_section_plan
 from .stage_edit_feature_materializer import (
     CausalEditDecision,
     SourceFeatureObservation,
+    StageEditCausalSensingArtifacts,
     StageEditFeatureFrame,
     StageEditFeatureProvenance,
     StageEditFeatureSnapshot,
+    STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT,
     materialize_stage_edit_feature_snapshot,
     source_observation_from_visual_cache_payload,
 )
@@ -46,9 +48,9 @@ from .visual_score import (
 )
 
 
-FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION = 3
+FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION = 4
 FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS = (
-    "synchronized_source_causal_stage_edit_feature_snapshot_v3"
+    "synchronized_source_causal_stage_edit_feature_snapshot_v4"
 )
 ACTION_FORMATION_EXTRACTION_CONTRACT = (
     "identity_free_pose60_layout134_formation6x8x3_with_hash_bound_"
@@ -62,8 +64,13 @@ FEATURE_SNAPSHOT_JOB_INPUT_POLICY: Mapping[str, bool] = {
     "raw_frames_persisted": False,
     "identity_embeddings_persisted": False,
     "identity_free_temporal_pose_sidecars_persisted": True,
-    "temporal_pose_sidecars_hash_bound_in_snapshot_v3": True,
+    "temporal_pose_sidecars_hash_bound_in_snapshot_v4": True,
     "temporal_pose_sidecars_enter_transformer_tensors": False,
+    "causal_sensing_exact_timestamp_and_content_hash_bound": True,
+    "member_state_unknown_preserved": True,
+    "ive_performer_distribution_unknown_preserved": True,
+    "causal_sensing_triple_required_for_production": True,
+    "inspection_only_without_causal_sensing": False,
 }
 FEATURE_SNAPSHOT_JOB_PROVENANCE_CONTRACTS = (
     FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
@@ -425,13 +432,16 @@ def _source_observations(
             # crop supervision exactly.  A second half-up convention here can
             # disagree at N + 0.5 and pair a feature with the adjacent label.
             index = int(round(source_time * source.frame_rate))
-            if index < 0 or index >= source.declared_frame_count:
+            # Production causal sensing requires the exact decision frame and
+            # its immediate follower.  Keep candidate availability identical
+            # to that media contract: a catalog's final native frame is not a
+            # usable decision cell even though the current frame alone exists.
+            if index < 0 or index + 1 >= source.declared_frame_count:
                 index_by_time[timestamp] = None
                 continue
             index_by_time[timestamp] = index
             requested.add(index)
-            if index + 1 < source.declared_frame_count:
-                requested.add(index + 1)
+            requested.add(index + 1)
 
         decoded = decode_target_frames_sequential(
             source.path,
@@ -446,11 +456,9 @@ def _source_observations(
         ):
             raise ValueError(f"source frame rate changed: {source.path}")
         missing = set(requested) - set(decoded.frames)
-        # A final +1 lookahead may be unavailable on a malformed frame-count
-        # declaration, but every decision frame itself is mandatory.
-        mandatory = {
-            index for index in index_by_time.values() if index is not None
-        }
+        # Both current and immediate-following frames are part of the causal
+        # availability contract and are therefore mandatory.
+        mandatory = set(requested)
         missing_mandatory = tuple(sorted(missing & mandatory))
         if missing_mandatory:
             raise ValueError(
@@ -612,6 +620,10 @@ def build_stage_edit_feature_snapshots(
     max_sources: int = DEFAULT_MAX_SOURCES,
     working_width: int = DEFAULT_VISUAL_WORKING_WIDTH,
     style_features: Mapping[str, Any] | None = None,
+    causal_sensing: StageEditCausalSensingArtifacts | None = None,
+    edit_mode: object = "group",
+    target_member: object | None = None,
+    inspection_only_without_causal_sensing: bool = False,
 ) -> StageEditFeatureSnapshotJobResult:
     """Build immutable feature-only snapshots for one complete song corpus."""
 
@@ -624,6 +636,23 @@ def build_stage_edit_feature_snapshots(
         raise ValueError("feature snapshot sampling configuration is invalid")
     if max_sources < 2 or working_width < 320:
         raise ValueError("feature snapshot model/decode configuration is invalid")
+    if not isinstance(inspection_only_without_causal_sensing, bool):
+        raise TypeError("inspection_only_without_causal_sensing must be a boolean")
+    if inspection_only_without_causal_sensing:
+        if causal_sensing is not None:
+            raise ValueError(
+                "inspection-only feature job cannot bind causal sensing"
+            )
+    else:
+        if not isinstance(causal_sensing, StageEditCausalSensingArtifacts):
+            raise ValueError(
+                "production feature snapshot job requires the complete causal-"
+                "sensing artifact triple"
+            )
+        causal_sensing.binding.require_production_scope(
+            edit_mode=edit_mode,
+            target_member=target_member,
+        )
 
     loaded = tuple((path, *_load_supervision(path)) for path in paths)
     reference_ids = tuple(
@@ -773,6 +802,16 @@ def build_stage_edit_feature_snapshots(
             performance_start_seconds=scaffold.performance_start_seconds,
             performance_end_seconds=scaffold.performance_end_seconds,
             provenance=provenance,
+            causal_sensing=causal_sensing,
+            production_edit_mode=(
+                None if inspection_only_without_causal_sensing else edit_mode
+            ),
+            production_target_member=(
+                None if inspection_only_without_causal_sensing else target_member
+            ),
+            inspection_only_without_causal_sensing=(
+                inspection_only_without_causal_sensing
+            ),
         )
         name = (
             f"{scaffold.reference_id}-stageedit-feature-snapshot-"
@@ -804,11 +843,38 @@ def build_stage_edit_feature_snapshots(
             loaded, key=lambda item: str(item[2].get("reference_id"))
         )
     ]
+    production_causal_sensing_gate = (
+        snapshot.require_production_causal_sensing(
+            edit_mode=edit_mode,
+            target_member=target_member,
+        )
+        if not inspection_only_without_causal_sensing
+        else {
+            "passed": False,
+            "contract": STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT,
+            "inspection_only_without_causal_sensing": True,
+            "edit_mode": None,
+            "target_member": None,
+            "member_feature_mode": (
+                snapshot.causal_sensing_binding.member_feature_mode
+            ),
+        }
+    )
+    manifest_input_policy = dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY)
+    if inspection_only_without_causal_sensing:
+        manifest_input_policy.update(
+            {
+                "causal_sensing_exact_timestamp_and_content_hash_bound": False,
+                "member_state_unknown_preserved": False,
+                "ive_performer_distribution_unknown_preserved": False,
+                "inspection_only_without_causal_sensing": True,
+            }
+        )
     manifest_unsigned: dict[str, Any] = {
         "schema_version": FEATURE_SNAPSHOT_JOB_SCHEMA_VERSION,
         "analysis_basis": FEATURE_SNAPSHOT_JOB_ANALYSIS_BASIS,
         "song_id": normalized_song,
-        "input_policy": dict(FEATURE_SNAPSHOT_JOB_INPUT_POLICY),
+        "input_policy": manifest_input_policy,
         "sampling": {
             "negative_samples_per_hold": negative_samples_per_hold,
             "boundary_guard_seconds": boundary_guard_seconds,
@@ -819,7 +885,9 @@ def build_stage_edit_feature_snapshots(
         "source_count": len(sources),
         "source_content": source_identity_payload,
         "supervision_inputs": supervision_inputs,
-        "feature_provenance": provenance.to_dict(),
+        "feature_provenance": snapshot.provenance.to_dict(),
+        "causal_sensing_binding": snapshot.causal_sensing_binding.to_dict(),
+        "production_causal_sensing_gate": production_causal_sensing_gate,
         "snapshots": [
             {
                 "reference_id": reference_id,
@@ -879,6 +947,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional JSON object matching the StageEdit style-feature schema",
     )
+    parser.add_argument("--edit-mode", choices=("group", "member"), default="group")
+    parser.add_argument("--target-member")
+    parser.add_argument("--shooting-grammar", type=Path)
+    parser.add_argument("--shooting-grammar-content-sha256")
+    parser.add_argument("--member-state-graph", type=Path)
+    parser.add_argument("--member-state-graph-content-sha256")
+    parser.add_argument("--ive-performer-state", type=Path)
+    parser.add_argument("--ive-performer-state-content-sha256")
+    parser.add_argument(
+        "--inspection-only-without-causal-sensing",
+        action="store_true",
+        help=(
+            "Allow an explicitly non-production snapshot with every causal-"
+            "sensing column missing. Production validators always reject it."
+        ),
+    )
     return parser
 
 
@@ -895,6 +979,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "style feature JSON has unknown keys: " + ", ".join(sorted(unknown))
             )
         style = raw_style
+    sensing_values = (
+        args.shooting_grammar,
+        args.shooting_grammar_content_sha256,
+        args.member_state_graph,
+        args.member_state_graph_content_sha256,
+        args.ive_performer_state,
+        args.ive_performer_state_content_sha256,
+    )
+    if args.inspection_only_without_causal_sensing:
+        if any(value is not None for value in sensing_values):
+            raise ValueError(
+                "inspection-only feature job cannot accept causal-sensing inputs"
+            )
+        causal_sensing = None
+    else:
+        if any(value is None for value in sensing_values):
+            raise ValueError(
+                "production feature job requires all three causal-sensing paths "
+                "and content SHA-256 values"
+            )
+        causal_sensing = StageEditCausalSensingArtifacts(
+            shooting_grammar_path=args.shooting_grammar,
+            shooting_grammar_content_sha256=(
+                args.shooting_grammar_content_sha256
+            ),
+            member_state_graph_path=args.member_state_graph,
+            member_state_graph_content_sha256=(
+                args.member_state_graph_content_sha256
+            ),
+            target_member=(
+                args.target_member if args.edit_mode == "member" else None
+            ),
+            ive_performer_state_path=args.ive_performer_state,
+            ive_performer_state_content_sha256=(
+                args.ive_performer_state_content_sha256
+            ),
+        )
     result = build_stage_edit_feature_snapshots(
         args.input,
         song_id=args.song_id,
@@ -905,6 +1026,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_sources=args.max_sources,
         working_width=args.working_width,
         style_features=style,
+        causal_sensing=causal_sensing,
+        edit_mode=args.edit_mode,
+        target_member=args.target_member,
+        inspection_only_without_causal_sensing=(
+            args.inspection_only_without_causal_sensing
+        ),
     )
     print(
         json.dumps(

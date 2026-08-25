@@ -23,6 +23,7 @@ from crosscut.ive_causal_sensing_media_job import (
     IVECausalSensingRuntime,
     IVECausalSensingSource,
     OpenCVSequentialCausalFrameProvider,
+    ive_causal_sensing_source_availability_evidence_sha256,
     materialize_ive_causal_sensing_from_media,
     reject_attitude_before_ive_causal_sensing_access,
 )
@@ -301,6 +302,169 @@ class IVECausalSensingMediaJobTests(unittest.TestCase):
             artifact_directory=output,
             created_at_utc="2026-08-25T00:00:00Z",
         )
+
+    def _availability_bound_sources(
+        self,
+        *,
+        unavailable_a: tuple[float, ...] = (1.0,),
+        evidence_a: str | None = None,
+    ) -> tuple[IVECausalSensingSource, ...]:
+        grid_sha256 = media_job._canonical_sha256([0.5, 1.0])
+        counts = {"A": 11, "B": 13}
+        unavailable = {"A": unavailable_a, "B": ()}
+        sources: list[IVECausalSensingSource] = []
+        for source in self._sources():
+            evidence = ive_causal_sensing_source_availability_evidence_sha256(
+                source_id=source.source_id,
+                media_content_sha256=source.media_content_sha256,
+                source_clock_sha256=source.clock_sha256,
+                decision_grid_sha256=grid_sha256,
+                frame_rate=10.0,
+                declared_frame_count=counts[source.source_id],
+                unavailable_master_times=unavailable[source.source_id],
+            )
+            if source.source_id == "A" and evidence_a is not None:
+                evidence = evidence_a
+            sources.append(
+                replace(
+                    source,
+                    unavailable_master_times=unavailable[source.source_id],
+                    availability_frame_rate=10.0,
+                    availability_declared_frame_count=counts[source.source_id],
+                    unavailable_master_time_evidence_sha256=evidence,
+                )
+            )
+        return tuple(sources)
+
+    def test_hash_bound_media_edge_is_explicit_missing_observation(self) -> None:
+        provider = _FakeFrameProvider()
+        request = self._request(
+            self.root / "out-availability-edge",
+            sources=self._availability_bound_sources(),
+        )
+        result = materialize_ive_causal_sensing_from_media(
+            request,
+            runtime=_runtime(provider),
+        )
+
+        self.assertEqual(provider.requested_by_source["A"], (0.5,))
+        self.assertEqual(provider.requested_by_source["B"], (0.6, 1.1))
+        self.assertEqual(result.unavailable_source_time_count, 1)
+        grammar = load_causal_shooting_grammar_artifact(
+            result.shooting_grammar_path,
+            expected_content_sha256=result.shooting_grammar_content_sha256,
+        )
+        missing = next(
+            item
+            for item in grammar.records
+            if item.source_id == "A" and item.master_time_seconds == 1.0
+        )
+        serialized_mask = missing.to_dict()["missing_mask"]
+        self.assertEqual(missing.shooting_grammar_confidence, 0.0)
+        self.assertFalse(serialized_mask["shooting_grammar_confidence"])
+        self.assertTrue(
+            all(
+                value
+                for name, value in serialized_mask.items()
+                if name != "shooting_grammar_confidence"
+            )
+        )
+        member = load_member_state_graph_artifact(
+            result.member_state_graph_path,
+            expected_content_sha256=result.member_state_graph_content_sha256,
+        )
+        self.assertNotIn(
+            ("A", 1.0),
+            {
+                (item.source_id, item.timestamp_seconds)
+                for item in member.graph.observations
+            },
+        )
+        performer = load_ive_performer_state_artifact(
+            result.ive_performer_state_path,
+            expected_content_sha256=result.ive_performer_state_content_sha256,
+            expected_source_content_sha256={
+                source.source_id: source.media_content_sha256
+                for source in request.sources
+            },
+        )
+        unknown = next(
+            item
+            for item in performer.records
+            if item.source_id == "A" and item.master_time_seconds == 1.0
+        )
+        self.assertEqual(unknown.center_member.unknown_mass, 1.0)
+        self.assertEqual(unknown.active_performer.unknown_mass, 1.0)
+        self.assertEqual(unknown.member_observation_ids, ())
+
+    def test_availability_mask_or_hash_tamper_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            IVECausalSensingMediaJobError,
+            "unavailable mask evidence SHA-256 mismatch",
+        ):
+            self._request(
+                self.root / "out-availability-hash-tamper",
+                sources=self._availability_bound_sources(evidence_a="f" * 64),
+            )
+        with self.assertRaisesRegex(
+            IVECausalSensingMediaJobError,
+            "unavailable mask differs",
+        ):
+            self._request(
+                self.root / "out-availability-mask-tamper",
+                sources=self._availability_bound_sources(
+                    unavailable_a=(0.5,),
+                ),
+            )
+
+    def test_interior_unavailability_declaration_is_rejected(self) -> None:
+        grid_sha256 = media_job._canonical_sha256([0.5, 1.0, 1.5])
+        sources: list[IVECausalSensingSource] = []
+        for source in self._sources():
+            declared = (1.0,) if source.source_id == "A" else ()
+            evidence = ive_causal_sensing_source_availability_evidence_sha256(
+                source_id=source.source_id,
+                media_content_sha256=source.media_content_sha256,
+                source_clock_sha256=source.clock_sha256,
+                decision_grid_sha256=grid_sha256,
+                frame_rate=10.0,
+                declared_frame_count=100,
+                unavailable_master_times=declared,
+            )
+            sources.append(
+                replace(
+                    source,
+                    unavailable_master_times=declared,
+                    availability_frame_rate=10.0,
+                    availability_declared_frame_count=100,
+                    unavailable_master_time_evidence_sha256=evidence,
+                )
+            )
+        with self.assertRaisesRegex(
+            IVECausalSensingMediaJobError,
+            "unavailable mask differs",
+        ):
+            IVECausalSensingMediaRequest(
+                song="TEST SONG",
+                edit_mode=EditMode.MEMBER,
+                target_member=IVEMember.GAEUL,
+                sources=tuple(sources),
+                master_decision_times=(0.5, 1.0, 1.5),
+                gallery_artifact_path=self.gallery_artifact.path,
+                gallery_content_sha256=self.gallery_artifact.content_sha256,
+                artifact_directory=self.root / "out-interior-mask",
+                created_at_utc="2026-08-25T00:00:00Z",
+            )
+
+    def test_legacy_default_empty_availability_mask_remains_supported(self) -> None:
+        provider = _FakeFrameProvider()
+        result = materialize_ive_causal_sensing_from_media(
+            self._request(self.root / "out-legacy-empty-availability"),
+            runtime=_runtime(provider),
+        )
+        self.assertEqual(result.unavailable_source_time_count, 0)
+        self.assertEqual(provider.requested_by_source["A"], (0.5, 1.0))
+        self.assertEqual(provider.requested_by_source["B"], (0.6, 1.1))
 
     def test_materializes_hash_bound_member_triple_with_unknown_on_ambiguity(self) -> None:
         provider = _FakeFrameProvider()

@@ -14,7 +14,7 @@ are schema-bound, content-hashed and contain features only -- never targets.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -22,12 +22,39 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence, TYPE_CHECKING
 
+from .causal_shooting_grammar import (
+    STAGE_EDIT_SHOOTING_GRAMMAR_ADAPTER,
+    STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES,
+    CausalShootingGrammarArtifact,
+    StageEditNamedShootingGrammarFeatures,
+    adapt_causal_shooting_grammar_for_stage_edit,
+    load_causal_shooting_grammar_artifact,
+)
+from .ive import IVEMember
+from .ive_performer_state import (
+    IVE_PERFORMER_STATE_CONTRACT,
+    STAGE_EDIT_IVE_PERFORMER_STATE_ADAPTER,
+    STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES,
+    IVEPerformerStateArtifact,
+    StageEditNamedIVEPerformerStateFeatures,
+    adapt_ive_performer_state_for_stage_edit,
+    load_ive_performer_state_artifact,
+)
+from .member_state_graph import (
+    MEMBER_STATE_GRAPH_CONTRACT,
+    MemberStateFeatureAdapter,
+    MemberStateGraphArtifact,
+    TargetMemberTimestampFeatures,
+    load_member_state_graph_artifact,
+)
 from .section_director import SectionPlan, SectionRole
 from .stage_edit_transformer import (
     DEFAULT_STAGE_EDIT_SCHEMA,
     STAGE_EDIT_FORMATION_LAYOUT_FEATURE_NAMES,
     STAGE_EDIT_FORMATION_POSE_FEATURE_NAMES,
     STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES,
+    STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT,
+    STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES,
     STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND,
     STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT,
     STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
@@ -44,15 +71,43 @@ if TYPE_CHECKING:  # Avoid importing OpenCV-backed visual analysis at runtime.
     from .visual_score import FrameVisualDescriptor
 
 
-FEATURE_MATERIALIZER_SCHEMA_VERSION = 3
+FEATURE_MATERIALIZER_SCHEMA_VERSION = 4
 FEATURE_MATERIALIZER_CONTRACT = (
+    "stage_edit_inference_available_feature_materializer_v4"
+)
+FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3 = (
     "stage_edit_inference_available_feature_materializer_v3"
 )
-FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2 = (
-    "stage_edit_inference_available_feature_materializer_v2"
-)
 FEATURE_SNAPSHOT_KIND = "stage_edit_inference_safe_feature_snapshot"
-FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION = 2
+FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION = 3
+STAGE_EDIT_CAUSAL_SENSING_BINDING_SCHEMA_VERSION = 3
+STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT = (
+    "content_addressed_exact_timestamp_member_and_shooting_grammar_v3"
+)
+STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT = (
+    "typed_source_authority_no_homonym_corroboration_v3"
+)
+# These columns already have inference-time source-observation semantics in the
+# StageEdit token schema.  The shooting-grammar adapter exposes homonymous
+# diagnostics with different semantics: camera roll can be temporally smoothed,
+# while its ``formation_pose_coverage`` is formation-person/detected-person
+# coverage rather than upper-body pose-slot coverage.  They are therefore not
+# corroborating measurements and must never overwrite, fill, average, or veto
+# the source-observation columns.  In particular, the shooting-grammar person
+# count is ``max(detector_count, face_count, formation_count)`` while the base
+# token column is the detector count itself; equality on a frame is incidental.
+STAGE_EDIT_SOURCE_OBSERVATION_AUTHORITATIVE_OVERLAPS = frozenset(
+    {
+        "camera_roll_degrees_normalized",
+        "detected_person_count_normalized",
+        "formation_pose_coverage",
+    }
+)
+# No current shooting-grammar homonym has exactly the base token semantics.
+STAGE_EDIT_EXACT_CORROBORATION_OVERLAPS = frozenset()
+STAGE_EDIT_MEMBER_FEATURE_MODE_NOT_BOUND = "not_bound"
+STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET = "group_no_target"
+STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER = "target_member"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _UPSTREAM_COMPONENTS = frozenset(
@@ -64,8 +119,36 @@ _UPSTREAM_COMPONENTS = frozenset(
         "section_plan",
         "source_alignment",
         "style_profile",
+        "member_state_graph",
+        "causal_shooting_grammar",
+        "ive_performer_state",
     }
 )
+
+
+def _normalized_production_edit_scope(
+    edit_mode: object,
+    target_member: IVEMember | str | None,
+) -> tuple[str, IVEMember | None]:
+    raw_mode = getattr(edit_mode, "value", edit_mode)
+    mode = str(raw_mode or "").strip().lower()
+    if mode not in {"group", "member"}:
+        raise ValueError("production StageEdit edit_mode must be group or member")
+    if mode == "group":
+        if target_member is not None:
+            raise ValueError("GROUP production StageEdit cannot bind target_member")
+        return mode, None
+    if target_member is None:
+        raise ValueError("MEMBER production StageEdit requires target_member")
+    try:
+        member = (
+            target_member
+            if isinstance(target_member, IVEMember)
+            else IVEMember.parse(str(target_member))
+        )
+    except ValueError as exc:
+        raise ValueError("production StageEdit target_member is not an IVE member") from exc
+    return mode, member
 
 
 def _finite_or_none(value: Any) -> float | None:
@@ -76,6 +159,18 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _canonical_unicode_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _unit_or_none(value: Any) -> float | None:
@@ -149,7 +244,7 @@ class StageEditFeatureProvenance:
         producer = str(self.producer).strip()
         if producer not in {
             FEATURE_MATERIALIZER_CONTRACT,
-            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3,
         }:
             raise ValueError("StageEdit feature producer is unsupported")
         object.__setattr__(self, "producer", producer)
@@ -178,7 +273,7 @@ class StageEditFeatureProvenance:
             raise ValueError("StageEdit feature provenance schema does not match")
         if payload.get("producer") not in {
             FEATURE_MATERIALIZER_CONTRACT,
-            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2,
+            FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3,
         }:
             raise ValueError("StageEdit feature producer is unsupported")
         if payload.get("input_availability") != (
@@ -203,6 +298,725 @@ class StageEditFeatureProvenance:
             contracts=tuple(str(value) for value in contracts),
             producer=str(payload["producer"]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditCausalSensingBinding:
+    """Hash-only identity for optional exact-timestamp sensing artifacts."""
+
+    shooting_grammar_content_sha256: str | None = None
+    member_state_graph_content_sha256: str | None = None
+    ive_performer_state_content_sha256: str | None = None
+    target_member: str | None = None
+    schema_version: int = STAGE_EDIT_CAUSAL_SENSING_BINDING_SCHEMA_VERSION
+    contract: str = STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version
+            != STAGE_EDIT_CAUSAL_SENSING_BINDING_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported StageEdit causal-sensing binding version")
+        if self.contract != STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT:
+            raise ValueError("StageEdit causal-sensing binding contract changed")
+        for name in (
+            "shooting_grammar_content_sha256",
+            "member_state_graph_content_sha256",
+            "ive_performer_state_content_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or _SHA256.fullmatch(value) is None
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 or None")
+        target = self.target_member
+        member_digest = self.member_state_graph_content_sha256
+        if self.ive_performer_state_content_sha256 is not None and (
+            self.shooting_grammar_content_sha256 is None or member_digest is None
+        ):
+            raise ValueError(
+                "IVE performer-state binding requires member and shooting grammar"
+            )
+        if member_digest is None:
+            if target is not None:
+                raise ValueError("target_member requires a member-state artifact")
+        elif target is not None:
+            if not isinstance(target, str):
+                raise ValueError("member-state target must be a string or None")
+            try:
+                target = IVEMember.parse(target).value
+            except ValueError as exc:
+                raise ValueError("member-state binding target is not an IVE member") from exc
+            object.__setattr__(self, "target_member", target)
+
+    @property
+    def active(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.shooting_grammar_content_sha256,
+                self.member_state_graph_content_sha256,
+                self.ive_performer_state_content_sha256,
+            )
+        )
+
+    @property
+    def production_complete(self) -> bool:
+        """Return whether all three production sensing identities are bound."""
+
+        return all(
+            value is not None
+            for value in (
+                self.shooting_grammar_content_sha256,
+                self.member_state_graph_content_sha256,
+                self.ive_performer_state_content_sha256,
+            )
+        )
+
+    @property
+    def member_feature_mode(self) -> str:
+        if self.member_state_graph_content_sha256 is None:
+            return STAGE_EDIT_MEMBER_FEATURE_MODE_NOT_BOUND
+        if self.target_member is None:
+            return STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET
+        return STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER
+
+    def require_production_scope(
+        self,
+        *,
+        edit_mode: object,
+        target_member: IVEMember | str | None = None,
+    ) -> dict[str, Any]:
+        """Fail closed unless the complete sensing triple matches edit scope."""
+
+        mode, member = _normalized_production_edit_scope(edit_mode, target_member)
+        if not self.production_complete:
+            raise ValueError(
+                "production StageEdit requires the hash-bound shooting grammar, "
+                "member-state graph, and IVE performer-state triple"
+            )
+        expected_member_mode = (
+            STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET
+            if mode == "group"
+            else STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER
+        )
+        if self.member_feature_mode != expected_member_mode:
+            raise ValueError(
+                "production StageEdit causal-sensing member mode does not match "
+                f"{mode.upper()}"
+            )
+        expected_target = member.value if member is not None else None
+        if self.target_member != expected_target:
+            raise ValueError(
+                "production StageEdit causal-sensing target_member does not match "
+                "the request"
+            )
+        assert self.shooting_grammar_content_sha256 is not None
+        assert self.member_state_graph_content_sha256 is not None
+        assert self.ive_performer_state_content_sha256 is not None
+        return {
+            "passed": True,
+            "contract": STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT,
+            "edit_mode": mode,
+            "target_member": expected_target,
+            "member_feature_mode": expected_member_mode,
+            "shooting_grammar_content_sha256": (
+                self.shooting_grammar_content_sha256
+            ),
+            "member_state_graph_content_sha256": (
+                self.member_state_graph_content_sha256
+            ),
+            "ive_performer_state_content_sha256": (
+                self.ive_performer_state_content_sha256
+            ),
+            "exact_master_timestamp_lookup": True,
+            "missing_masks_are_one_to_one": True,
+            "unknown_is_explicit": True,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "contract": self.contract,
+            "exact_master_timestamp_lookup": True,
+            "missing_mask_semantics": "true_means_unavailable",
+            "known_overlap_merge_contract": (
+                STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT
+            ),
+            "known_overlap_policy": {
+                "source_observation_authoritative": sorted(
+                    STAGE_EDIT_SOURCE_OBSERVATION_AUTHORITATIVE_OVERLAPS
+                ),
+                "exact_same_snapshot_corroboration": sorted(
+                    STAGE_EDIT_EXACT_CORROBORATION_OVERLAPS
+                ),
+                "source_observation_authoritative_semantics": {
+                    "camera_roll_degrees_normalized": "raw_source_observation",
+                    "detected_person_count_normalized": (
+                        "detector_person_count_capped_at_six_divided_by_six"
+                    ),
+                    "formation_pose_coverage": (
+                        "upper_body_pose_people_divided_by_formation_people"
+                    ),
+                },
+                "causal_homonyms_do_not_fill_missing_base_values": True,
+            },
+            "shooting_grammar": (
+                {
+                    "artifact_content_sha256": (
+                        self.shooting_grammar_content_sha256
+                    ),
+                    "artifact_adapter": STAGE_EDIT_SHOOTING_GRAMMAR_ADAPTER,
+                    "feature_names": list(
+                        STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES
+                    ),
+                }
+                if self.shooting_grammar_content_sha256 is not None
+                else None
+            ),
+            "member_state_graph": (
+                {
+                    "artifact_content_sha256": (
+                        self.member_state_graph_content_sha256
+                    ),
+                    "artifact_contract": MEMBER_STATE_GRAPH_CONTRACT,
+                    "target_member": self.target_member,
+                    "member_feature_mode": self.member_feature_mode,
+                    "feature_names": list(
+                        STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES
+                    ),
+                    "all_target_member_features_missing": (
+                        self.member_feature_mode
+                        == STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET
+                    ),
+                    "unobserved_state": {
+                        "target_member_probability": 0.0,
+                        "target_visibility_probability": 0.0,
+                        "target_prominence_probability": 0.0,
+                        "target_member_uncertainty_probability": 1.0,
+                        "target_member_state_observed": 0.0,
+                        "target_center_is_missing": True,
+                    },
+                }
+                if self.member_state_graph_content_sha256 is not None
+                else None
+            ),
+            "ive_performer_state": (
+                {
+                    "artifact_content_sha256": (
+                        self.ive_performer_state_content_sha256
+                    ),
+                    "artifact_contract": IVE_PERFORMER_STATE_CONTRACT,
+                    "artifact_adapter": STAGE_EDIT_IVE_PERFORMER_STATE_ADAPTER,
+                    "feature_names": list(
+                        STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES
+                    ),
+                    "distribution_unknown_is_explicit_not_missing": True,
+                    "only_optional_vocal_may_be_missing": True,
+                }
+                if self.ive_performer_state_content_sha256 is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "StageEditCausalSensingBinding":
+        expected = {
+            "schema_version",
+            "contract",
+            "exact_master_timestamp_lookup",
+            "missing_mask_semantics",
+            "known_overlap_merge_contract",
+            "known_overlap_policy",
+            "shooting_grammar",
+            "member_state_graph",
+            "ive_performer_state",
+        }
+        if set(payload) != expected:
+            raise ValueError("StageEdit causal-sensing binding schema changed")
+        if payload.get("exact_master_timestamp_lookup") is not True:
+            raise ValueError("StageEdit causal sensing is not exact-timestamp")
+        if payload.get("missing_mask_semantics") != "true_means_unavailable":
+            raise ValueError("StageEdit causal-sensing missing semantics changed")
+        if (
+            payload.get("known_overlap_merge_contract")
+            != STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT
+        ):
+            raise ValueError("StageEdit causal-sensing merge contract changed")
+        expected_overlap_policy = {
+            "source_observation_authoritative": sorted(
+                STAGE_EDIT_SOURCE_OBSERVATION_AUTHORITATIVE_OVERLAPS
+            ),
+            "exact_same_snapshot_corroboration": sorted(
+                STAGE_EDIT_EXACT_CORROBORATION_OVERLAPS
+            ),
+            "source_observation_authoritative_semantics": {
+                "camera_roll_degrees_normalized": "raw_source_observation",
+                "detected_person_count_normalized": (
+                    "detector_person_count_capped_at_six_divided_by_six"
+                ),
+                "formation_pose_coverage": (
+                    "upper_body_pose_people_divided_by_formation_people"
+                ),
+            },
+            "causal_homonyms_do_not_fill_missing_base_values": True,
+        }
+        if payload.get("known_overlap_policy") != expected_overlap_policy:
+            raise ValueError("StageEdit causal-sensing overlap policy changed")
+        grammar = payload.get("shooting_grammar")
+        member = payload.get("member_state_graph")
+        performer = payload.get("ive_performer_state")
+        if grammar is not None:
+            if not isinstance(grammar, Mapping) or set(grammar) != {
+                "artifact_content_sha256",
+                "artifact_adapter",
+                "feature_names",
+            }:
+                raise ValueError("shooting-grammar binding schema changed")
+            if (
+                grammar.get("artifact_adapter")
+                != STAGE_EDIT_SHOOTING_GRAMMAR_ADAPTER
+                or grammar.get("feature_names")
+                != list(STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES)
+            ):
+                raise ValueError("shooting-grammar adapter binding changed")
+        if member is not None:
+            if not isinstance(member, Mapping) or set(member) != {
+                "artifact_content_sha256",
+                "artifact_contract",
+                "target_member",
+                "member_feature_mode",
+                "feature_names",
+                "all_target_member_features_missing",
+                "unobserved_state",
+            }:
+                raise ValueError("member-state binding schema changed")
+            if (
+                member.get("artifact_contract") != MEMBER_STATE_GRAPH_CONTRACT
+                or member.get("feature_names")
+                != list(STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES)
+                or member.get("member_feature_mode")
+                not in {
+                    STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET,
+                    STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER,
+                }
+                or not isinstance(
+                    member.get("all_target_member_features_missing"),
+                    bool,
+                )
+            ):
+                raise ValueError("member-state adapter binding changed")
+        if performer is not None:
+            if not isinstance(performer, Mapping) or set(performer) != {
+                "artifact_content_sha256",
+                "artifact_contract",
+                "artifact_adapter",
+                "feature_names",
+                "distribution_unknown_is_explicit_not_missing",
+                "only_optional_vocal_may_be_missing",
+            }:
+                raise ValueError("IVE performer-state binding schema changed")
+            if (
+                performer.get("artifact_contract")
+                != IVE_PERFORMER_STATE_CONTRACT
+                or performer.get("artifact_adapter")
+                != STAGE_EDIT_IVE_PERFORMER_STATE_ADAPTER
+                or performer.get("feature_names")
+                != list(STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES)
+                or performer.get("distribution_unknown_is_explicit_not_missing")
+                is not True
+                or performer.get("only_optional_vocal_may_be_missing") is not True
+            ):
+                raise ValueError("IVE performer-state adapter binding changed")
+        result = cls(
+            shooting_grammar_content_sha256=(
+                grammar.get("artifact_content_sha256")
+                if isinstance(grammar, Mapping)
+                else None
+            ),
+            member_state_graph_content_sha256=(
+                member.get("artifact_content_sha256")
+                if isinstance(member, Mapping)
+                else None
+            ),
+            ive_performer_state_content_sha256=(
+                performer.get("artifact_content_sha256")
+                if isinstance(performer, Mapping)
+                else None
+            ),
+            target_member=(
+                member.get("target_member")
+                if isinstance(member, Mapping)
+                else None
+            ),
+            schema_version=payload.get("schema_version"),
+            contract=payload.get("contract"),
+        )
+        if result.to_dict() != dict(payload):
+            raise ValueError(
+                "StageEdit causal-sensing derived contract or member feature "
+                "mode changed"
+            )
+        return result
+
+
+def validate_production_causal_sensing_gate_payload(
+    payload: Mapping[str, Any],
+    *,
+    schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+) -> dict[str, Any]:
+    """Strictly reconstruct and canonicalize a serialized production gate."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("production causal-sensing gate must be an object")
+    binding = StageEditCausalSensingBinding(
+        shooting_grammar_content_sha256=payload.get(
+            "shooting_grammar_content_sha256"
+        ),
+        member_state_graph_content_sha256=payload.get(
+            "member_state_graph_content_sha256"
+        ),
+        ive_performer_state_content_sha256=payload.get(
+            "ive_performer_state_content_sha256"
+        ),
+        target_member=payload.get("target_member"),
+    )
+    canonical = {
+        **binding.require_production_scope(
+            edit_mode=payload.get("edit_mode"),
+            target_member=payload.get("target_member"),
+        ),
+        "feature_snapshot_schema_version": FEATURE_MATERIALIZER_SCHEMA_VERSION,
+        "token_schema_fingerprint": schema.fingerprint,
+        "feature_materializer_contract": FEATURE_MATERIALIZER_CONTRACT,
+    }
+    if dict(payload) != canonical:
+        raise ValueError("production causal-sensing gate payload is not canonical")
+    return canonical
+
+
+@dataclass(frozen=True, slots=True)
+class StageEditCausalSensingArtifacts:
+    """Strictly loaded artifacts used identically by train and inference."""
+
+    shooting_grammar_path: Path | None = None
+    shooting_grammar_content_sha256: str | None = None
+    member_state_graph_path: Path | None = None
+    member_state_graph_content_sha256: str | None = None
+    target_member: IVEMember | str | None = None
+    ive_performer_state_path: Path | None = None
+    ive_performer_state_content_sha256: str | None = None
+    _shooting_grammar: CausalShootingGrammarArtifact | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _shooting_by_key: Mapping[
+        tuple[str, float], StageEditNamedShootingGrammarFeatures
+    ] = field(init=False, repr=False, compare=False, default_factory=dict)
+    _member_state: MemberStateGraphArtifact | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _member_adapter: MemberStateFeatureAdapter | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _ive_performer_state: IVEPerformerStateArtifact | None = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default=None,
+    )
+    _performer_by_key: Mapping[
+        tuple[str, float], StageEditNamedIVEPerformerStateFeatures
+    ] = field(init=False, repr=False, compare=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        grammar_path = self.shooting_grammar_path
+        grammar_digest = self.shooting_grammar_content_sha256
+        member_path = self.member_state_graph_path
+        member_digest = self.member_state_graph_content_sha256
+        performer_path = self.ive_performer_state_path
+        performer_digest = self.ive_performer_state_content_sha256
+        if (grammar_path is None) != (grammar_digest is None):
+            raise ValueError(
+                "shooting-grammar path and expected content hash are both required"
+            )
+        if (member_path is None) != (member_digest is None):
+            raise ValueError(
+                "member-state path and expected content hash are both required"
+            )
+        if (performer_path is None) != (performer_digest is None):
+            raise ValueError(
+                "IVE performer-state path and expected content hash are both required"
+            )
+        if performer_path is not None and (
+            grammar_path is None or member_path is None
+        ):
+            raise ValueError(
+                "IVE performer state requires its member-state and "
+                "shooting-grammar input artifacts"
+            )
+        if member_path is None and self.target_member is not None:
+            raise ValueError("target_member requires a member-state artifact")
+        if grammar_path is None and member_path is None and performer_path is None:
+            raise ValueError("causal sensing needs at least one artifact")
+
+        if grammar_path is not None:
+            grammar = load_causal_shooting_grammar_artifact(
+                Path(grammar_path),
+                expected_content_sha256=grammar_digest,
+            )
+            indexed: dict[
+                tuple[str, float], StageEditNamedShootingGrammarFeatures
+            ] = {}
+            for record in grammar.records:
+                adapted = adapt_causal_shooting_grammar_for_stage_edit(record)
+                key = (adapted.source_id, adapted.master_time_seconds)
+                if key in indexed:
+                    raise ValueError(
+                        "shooting-grammar artifact has a duplicate source/timestamp"
+                    )
+                indexed[key] = adapted
+            object.__setattr__(self, "shooting_grammar_path", Path(grammar_path))
+            object.__setattr__(self, "_shooting_grammar", grammar)
+            object.__setattr__(self, "_shooting_by_key", indexed)
+
+        if member_path is not None:
+            member = load_member_state_graph_artifact(
+                Path(member_path),
+                expected_content_sha256=member_digest,
+            )
+            target = None
+            if self.target_member is not None:
+                target = (
+                    self.target_member
+                    if isinstance(self.target_member, IVEMember)
+                    else IVEMember.parse(str(self.target_member))
+                )
+            object.__setattr__(self, "member_state_graph_path", Path(member_path))
+            object.__setattr__(self, "target_member", target)
+            object.__setattr__(self, "_member_state", member)
+            if target is not None:
+                object.__setattr__(
+                    self,
+                    "_member_adapter",
+                    MemberStateFeatureAdapter(member.graph),
+                )
+
+        if performer_path is not None:
+            assert self._member_state is not None
+            assert self._shooting_grammar is not None
+            expected_source_content = {
+                item.source_id: item.source_content_sha256
+                for item in self._member_state.provenance.sources
+            }
+            performer = load_ive_performer_state_artifact(
+                Path(performer_path),
+                expected_content_sha256=performer_digest,
+                expected_source_content_sha256=expected_source_content,
+            )
+            expected_member_graph_sha256 = _canonical_unicode_sha256(
+                self._member_state.graph.to_dict()
+            )
+            expected_grammar_sha256 = _canonical_unicode_sha256(
+                [record.to_dict() for record in self._shooting_grammar.records]
+            )
+            if (
+                performer.input_binding.member_state_graph_sha256
+                != expected_member_graph_sha256
+                or performer.input_binding.causal_shooting_grammar_records_sha256
+                != expected_grammar_sha256
+            ):
+                raise ValueError(
+                    "IVE performer-state artifact replay/input binding differs "
+                    "from the supplied member and shooting-grammar artifacts"
+                )
+            performer_index: dict[
+                tuple[str, float], StageEditNamedIVEPerformerStateFeatures
+            ] = {}
+            for record in performer.records:
+                adapted = adapt_ive_performer_state_for_stage_edit(record)
+                key = (adapted.source_id, adapted.master_time_seconds)
+                if key in performer_index:
+                    raise ValueError(
+                        "IVE performer-state artifact has a duplicate source/timestamp"
+                    )
+                performer_index[key] = adapted
+            object.__setattr__(
+                self,
+                "ive_performer_state_path",
+                Path(performer_path),
+            )
+            object.__setattr__(self, "_ive_performer_state", performer)
+            object.__setattr__(self, "_performer_by_key", performer_index)
+
+    @property
+    def binding(self) -> StageEditCausalSensingBinding:
+        return StageEditCausalSensingBinding(
+            shooting_grammar_content_sha256=(
+                self._shooting_grammar.artifact_content_sha256
+                if self._shooting_grammar is not None
+                else None
+            ),
+            member_state_graph_content_sha256=(
+                self._member_state.content_sha256
+                if self._member_state is not None
+                else None
+            ),
+            ive_performer_state_content_sha256=(
+                self._ive_performer_state.content_sha256
+                if self._ive_performer_state is not None
+                else None
+            ),
+            target_member=(
+                self.target_member.value
+                if isinstance(self.target_member, IVEMember)
+                else None
+            ),
+        )
+
+    def bind_provenance(
+        self,
+        provenance: StageEditFeatureProvenance,
+    ) -> StageEditFeatureProvenance:
+        identities = dict(provenance.upstream_sha256)
+        additions = {
+            name: digest
+            for name, digest in (
+                (
+                    "causal_shooting_grammar",
+                    self.binding.shooting_grammar_content_sha256,
+                ),
+                (
+                    "member_state_graph",
+                    self.binding.member_state_graph_content_sha256,
+                ),
+                (
+                    "ive_performer_state",
+                    self.binding.ive_performer_state_content_sha256,
+                ),
+            )
+            if digest is not None
+        }
+        for name, digest in additions.items():
+            if name in identities and identities[name] != digest:
+                raise ValueError(
+                    f"StageEdit causal-sensing provenance for {name} conflicts"
+                )
+            identities[name] = digest
+        return replace(
+            provenance,
+            upstream_sha256=tuple(identities.items()),
+            contracts=tuple(
+                sorted(
+                    {
+                        *provenance.contracts,
+                        STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+                        STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+                    }
+                )
+            ),
+        )
+
+    def validate_source_pool(self, source_ids: Sequence[str]) -> None:
+        expected = frozenset(str(value).strip() for value in source_ids)
+        if not expected or any(not value for value in expected):
+            raise ValueError("StageEdit causal-sensing source ids are invalid")
+        if self._shooting_grammar is not None:
+            observed = frozenset(
+                record.source_id for record in self._shooting_grammar.records
+            )
+            if observed != expected:
+                raise ValueError(
+                    "shooting-grammar artifact does not exactly cover StageEdit sources"
+                )
+        if self._member_state is not None:
+            observed = frozenset(self._member_state.graph.source_ids)
+            if observed != expected:
+                raise ValueError(
+                    "member-state artifact does not exactly cover StageEdit sources"
+                )
+        if self._ive_performer_state is not None:
+            observed = frozenset(self._ive_performer_state.provenance.source_ids)
+            if observed != expected:
+                raise ValueError(
+                    "IVE performer-state artifact does not exactly cover StageEdit sources"
+                )
+
+    def named_features_at(
+        self,
+        *,
+        source_id: str,
+        master_time_seconds: float,
+    ) -> tuple[dict[str, float], frozenset[str]]:
+        observed: dict[str, float] = {}
+        explicitly_missing: set[str] = set()
+        if self._shooting_grammar is not None:
+            key = (source_id, master_time_seconds)
+            adapted = self._shooting_by_key.get(key)
+            if adapted is None:
+                raise ValueError(
+                    "shooting-grammar artifact lacks an exact StageEdit source/timestamp"
+                )
+            for name, (value, missing) in adapted.named_values().items():
+                if missing:
+                    explicitly_missing.add(name)
+                else:
+                    observed[name] = value
+        if self._member_adapter is not None:
+            assert isinstance(self.target_member, IVEMember)
+            adapted_member: TargetMemberTimestampFeatures = (
+                self._member_adapter.at_timestamp(
+                    source_id=source_id,
+                    timestamp_seconds=master_time_seconds,
+                    target_member=self.target_member,
+                )
+            )
+            member_values = adapted_member.to_stage_edit_features()
+            if set(member_values) != set(
+                STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES
+            ):
+                raise ValueError("member-state StageEdit adapter columns changed")
+            for name in STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES:
+                value = member_values[name]
+                if value is None:
+                    explicitly_missing.add(name)
+                elif isinstance(value, bool):
+                    observed[name] = 1.0 if value else 0.0
+                else:
+                    number = _unit_or_none(value)
+                    if number is None:
+                        raise ValueError(
+                            f"member-state StageEdit feature {name} is invalid"
+                        )
+                    observed[name] = number
+        if self._ive_performer_state is not None:
+            performer = self._performer_by_key.get(
+                (source_id, master_time_seconds)
+            )
+            if performer is None:
+                raise ValueError(
+                    "IVE performer-state artifact lacks an exact StageEdit "
+                    "source/timestamp"
+                )
+            for name, (value, missing) in performer.named_values().items():
+                if missing:
+                    explicitly_missing.add(name)
+                else:
+                    observed[name] = value
+        return observed, frozenset(explicitly_missing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1019,10 +1833,45 @@ def materialize_stage_edit_source_candidate(
     observation: SourceFeatureObservation,
     *,
     schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    additional_named_features: Mapping[str, Any] | None = None,
 ) -> SourceCandidateToken:
+    observed = observation.observed_features
+    for name, raw_value in dict(additional_named_features or {}).items():
+        if name not in schema.source_feature_names:
+            raise ValueError(
+                f"causal sensing emitted unknown StageEdit source feature {name}"
+            )
+        value = _finite_or_none(raw_value)
+        if value is None:
+            raise ValueError(
+                f"causal sensing emitted non-finite StageEdit source feature {name}"
+            )
+        if name in STAGE_EDIT_SOURCE_OBSERVATION_AUTHORITATIVE_OVERLAPS:
+            # The causal adapter's homonymous diagnostics have different
+            # reviewed semantics.  They cannot fill a missing base value and
+            # cannot veto or replace an observed one.
+            continue
+        previous = observed.get(name)
+        if previous is not None:
+            if name not in STAGE_EDIT_EXACT_CORROBORATION_OVERLAPS:
+                raise ValueError(
+                    "unclassified overlapping StageEdit source feature cannot "
+                    f"be merged: {name}"
+                )
+            if not math.isclose(
+                previous,
+                value,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError(
+                    "exact-corroboration StageEdit source features disagree at "
+                    f"the same causal snapshot: {name}"
+                )
+        observed[name] = value
     values, missing = _feature_vector(
         schema.source_feature_names,
-        observation.observed_features,
+        observed,
     )
     return SourceCandidateToken(
         source_id=observation.source_id,
@@ -1221,6 +2070,7 @@ def materialize_stage_edit_token(
     style_features: Mapping[str, Any] | None = None,
     performance_start_seconds: float = 0.0,
     performance_end_seconds: float | None = None,
+    causal_sensing: StageEditCausalSensingArtifacts | None = None,
 ) -> StageEditToken:
     """Materialize exactly one train/serve token with explicit missing bits."""
 
@@ -1275,15 +2125,26 @@ def materialize_stage_edit_token(
         schema.style_feature_names,
         dict(style_features or {}),
     )
-    candidates = tuple(
-        materialize_stage_edit_source_candidate(item, schema=schema)
-        for item in sorted(observations, key=lambda item: item.source_id)
-    )
+    candidates: list[SourceCandidateToken] = []
+    for item in sorted(observations, key=lambda item: item.source_id):
+        additional: Mapping[str, Any] | None = None
+        if causal_sensing is not None:
+            additional, _explicitly_missing = causal_sensing.named_features_at(
+                source_id=item.source_id,
+                master_time_seconds=timestamp,
+            )
+        candidates.append(
+            materialize_stage_edit_source_candidate(
+                item,
+                schema=schema,
+                additional_named_features=additional,
+            )
+        )
     return StageEditToken(
         master_time_seconds=timestamp,
         music_features=music,
         section_features=section,
-        source_candidates=candidates,
+        source_candidates=tuple(candidates),
         recent_edit_features=recent,
         style_features=style,
         missing_mask=music_missing + section_missing + recent_missing + style_missing,
@@ -1302,13 +2163,16 @@ def _candidate_to_dict(
         "available": candidate.available,
         "hard_gate_passed": candidate.hard_gate_passed,
     }
-    if snapshot_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+    if snapshot_schema_version in {
+        FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+        FEATURE_MATERIALIZER_SCHEMA_VERSION,
+    }:
         payload["temporal_pose_sidecar"] = (
             candidate.temporal_pose_sidecar.to_dict()
             if candidate.temporal_pose_sidecar is not None
             else None
         )
-    elif snapshot_schema_version != FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION:
+    else:
         raise ValueError("unsupported StageEdit feature snapshot version")
     return payload
 
@@ -1340,6 +2204,9 @@ def _snapshot_unsigned_payload(
     sequence: StageEditSequence,
     token_schema_fingerprint: str,
     provenance: StageEditFeatureProvenance,
+    causal_sensing_binding: StageEditCausalSensingBinding = (
+        StageEditCausalSensingBinding()
+    ),
     snapshot_schema_version: int = FEATURE_MATERIALIZER_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     if snapshot_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
@@ -1352,6 +2219,13 @@ def _snapshot_unsigned_payload(
             "temporal_pose_sidecar_hash_bound": True,
             "temporal_pose_sidecar_enters_transformer_tensors": False,
             "legacy_snapshots_cannot_claim_pose_direction": True,
+            "causal_sensing_artifacts_content_hash_bound": True,
+            "causal_sensing_exact_master_timestamp_only": True,
+            "causal_sensing_missing_masks_are_one_to_one": True,
+            "member_state_unknown_is_explicit_not_zero_imputed": True,
+            "ive_performer_distribution_unknown_is_explicit": True,
+            "ive_performer_only_optional_vocal_may_be_missing": True,
+            "overlapping_known_source_features_require_corroboration": True,
         }
     elif snapshot_schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION:
         input_policy = {
@@ -1360,10 +2234,13 @@ def _snapshot_unsigned_payload(
             "selected_labels_present": False,
             "missing_values_are_explicitly_masked": True,
             "source_availability_and_hard_gate_are_distinct": True,
+            "temporal_pose_sidecar_hash_bound": True,
+            "temporal_pose_sidecar_enters_transformer_tensors": False,
+            "legacy_snapshots_cannot_claim_pose_direction": True,
         }
     else:
         raise ValueError("unsupported StageEdit feature snapshot version")
-    return {
+    payload = {
         "schema_version": snapshot_schema_version,
         "snapshot_kind": FEATURE_SNAPSHOT_KIND,
         "token_schema_fingerprint": token_schema_fingerprint,
@@ -1378,6 +2255,11 @@ def _snapshot_unsigned_payload(
         ],
         "input_policy": input_policy,
     }
+    if snapshot_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+        payload["causal_sensing_binding"] = causal_sensing_binding.to_dict()
+    elif causal_sensing_binding.active:
+        raise ValueError("legacy StageEdit snapshot cannot bind causal sensing")
+    return payload
 
 
 def _payload_sha256(payload: Mapping[str, Any]) -> str:
@@ -1477,6 +2359,9 @@ class StageEditFeatureSnapshot:
     token_schema_fingerprint: str
     provenance: StageEditFeatureProvenance
     snapshot_sha256: str
+    causal_sensing_binding: StageEditCausalSensingBinding = (
+        StageEditCausalSensingBinding()
+    )
     schema_version: int = FEATURE_MATERIALIZER_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -1494,19 +2379,55 @@ class StageEditFeatureSnapshot:
         expected_producer = (
             FEATURE_MATERIALIZER_CONTRACT
             if self.schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION
-            else FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2
+            else FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3
         )
         if self.provenance.producer != expected_producer:
             raise ValueError(
                 "StageEdit feature snapshot producer does not match its version"
             )
-        if (
-            self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
-            and _temporal_pose_sidecar_count(self.sequence) != 0
+        if not isinstance(
+            self.causal_sensing_binding,
+            StageEditCausalSensingBinding,
         ):
             raise ValueError(
-                "legacy StageEdit feature snapshot v2 cannot carry a temporal "
-                "pose sidecar"
+                "StageEdit snapshot causal-sensing binding must be typed"
+            )
+        if (
+            self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            and self.causal_sensing_binding.active
+        ):
+            raise ValueError("legacy StageEdit snapshot cannot bind causal sensing")
+        upstream = dict(self.provenance.upstream_sha256)
+        expected_sensing = {
+            name: digest
+            for name, digest in (
+                (
+                    "causal_shooting_grammar",
+                    self.causal_sensing_binding.shooting_grammar_content_sha256,
+                ),
+                (
+                    "member_state_graph",
+                    self.causal_sensing_binding.member_state_graph_content_sha256,
+                ),
+                (
+                    "ive_performer_state",
+                    self.causal_sensing_binding.ive_performer_state_content_sha256,
+                ),
+            )
+            if digest is not None
+        }
+        observed_sensing = {
+            name: upstream[name]
+            for name in (
+                "causal_shooting_grammar",
+                "member_state_graph",
+                "ive_performer_state",
+            )
+            if name in upstream
+        }
+        if observed_sensing != expected_sensing:
+            raise ValueError(
+                "StageEdit causal-sensing binding and provenance hashes differ"
             )
         previous = -math.inf
         for token in self.sequence.tokens:
@@ -1518,6 +2439,7 @@ class StageEditFeatureSnapshot:
             sequence=self.sequence,
             token_schema_fingerprint=self.token_schema_fingerprint,
             provenance=self.provenance,
+            causal_sensing_binding=self.causal_sensing_binding,
             snapshot_schema_version=self.schema_version,
         )
         if _payload_sha256(unsigned) != self.snapshot_sha256:
@@ -1530,35 +2452,247 @@ class StageEditFeatureSnapshot:
         *,
         schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
         provenance: StageEditFeatureProvenance = StageEditFeatureProvenance(),
+        causal_sensing_binding: StageEditCausalSensingBinding = (
+            StageEditCausalSensingBinding()
+        ),
+        inspection_only_without_causal_sensing: bool = False,
     ) -> "StageEditFeatureSnapshot":
+        if not isinstance(inspection_only_without_causal_sensing, bool):
+            raise TypeError(
+                "inspection_only_without_causal_sensing must be a boolean"
+            )
+        if not isinstance(
+            causal_sensing_binding,
+            StageEditCausalSensingBinding,
+        ):
+            raise TypeError(
+                "causal_sensing_binding must use StageEditCausalSensingBinding"
+            )
+        if (
+            not causal_sensing_binding.production_complete
+            and not inspection_only_without_causal_sensing
+        ):
+            raise ValueError(
+                "StageEditFeatureSnapshot.build requires the complete production "
+                "causal-sensing triple; inspection-only callers must explicitly "
+                "set inspection_only_without_causal_sensing=True"
+            )
         for token in sequence.tokens:
             _validate_token(token, schema)
         unsigned = _snapshot_unsigned_payload(
             sequence=sequence,
             token_schema_fingerprint=schema.fingerprint,
             provenance=provenance,
+            causal_sensing_binding=causal_sensing_binding,
         )
-        return cls(
+        snapshot = cls(
             sequence=sequence,
             token_schema_fingerprint=schema.fingerprint,
             provenance=provenance,
             snapshot_sha256=_payload_sha256(unsigned),
+            causal_sensing_binding=causal_sensing_binding,
             schema_version=FEATURE_MATERIALIZER_SCHEMA_VERSION,
         )
+        snapshot.require_schema(schema)
+        return snapshot
+
+    def require_production_causal_sensing(
+        self,
+        *,
+        edit_mode: object,
+        target_member: IVEMember | str | None = None,
+        schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+    ) -> dict[str, Any]:
+        """Validate the hash-bound triple and its GROUP/MEMBER interpretation."""
+
+        if self.schema_version != FEATURE_MATERIALIZER_SCHEMA_VERSION:
+            raise ValueError(
+                "production StageEdit causal sensing requires the current "
+                "feature snapshot schema"
+            )
+        self.require_schema(schema)
+        gate = self.causal_sensing_binding.require_production_scope(
+            edit_mode=edit_mode,
+            target_member=target_member,
+        )
+        required_contracts = {
+            STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT,
+            STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT,
+        }
+        if not required_contracts.issubset(self.provenance.contracts):
+            raise ValueError(
+                "production StageEdit causal sensing lacks its hash-binding "
+                "and exact-overlap provenance contracts"
+            )
+        return {
+            **gate,
+            "feature_snapshot_schema_version": self.schema_version,
+            "token_schema_fingerprint": self.token_schema_fingerprint,
+            "feature_materializer_contract": self.provenance.producer,
+        }
 
     def require_schema(self, schema: StageEditTokenSchema) -> None:
         if self.token_schema_fingerprint != schema.fingerprint:
             raise ValueError("StageEdit feature snapshot token schema mismatch")
-        if (
-            self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
-            and _temporal_pose_sidecar_count(self.sequence) != 0
-        ):
-            raise ValueError(
-                "legacy StageEdit feature snapshot v2 cannot carry a temporal "
-                "pose sidecar"
-            )
         for token in self.sequence.tokens:
             _validate_token(token, schema)
+        source_index = {
+            name: index for index, name in enumerate(schema.source_feature_names)
+        }
+        missing_member_names = set(STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES)
+        if not missing_member_names.issubset(source_index):
+            raise ValueError("StageEdit schema lacks member-state source columns")
+        grammar_additional = tuple(
+            name
+            for name in STAGE_EDIT_SHOOTING_GRAMMAR_FEATURE_NAMES
+            if name not in {
+                "camera_roll_degrees_normalized",
+                "detected_person_count_normalized",
+                "formation_pose_coverage",
+            }
+        )
+        if any(name not in source_index for name in grammar_additional):
+            raise ValueError("StageEdit schema lacks shooting-grammar source columns")
+        if any(
+            name not in source_index
+            for name in STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES
+        ):
+            raise ValueError("StageEdit schema lacks IVE performer-state columns")
+        member_feature_mode = self.causal_sensing_binding.member_feature_mode
+        member_target_active = (
+            member_feature_mode == STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER
+        )
+        grammar_active = (
+            self.causal_sensing_binding.shooting_grammar_content_sha256
+            is not None
+        )
+        performer_active = (
+            self.causal_sensing_binding.ive_performer_state_content_sha256
+            is not None
+        )
+        required_member_known = (
+            "target_member_probability",
+            "target_visibility_probability",
+            "target_prominence_probability",
+            "target_member_uncertainty_probability",
+            "target_member_state_observed",
+        )
+        for token in self.sequence.tokens:
+            for candidate in token.source_candidates:
+                if not member_target_active and any(
+                    not candidate.missing_mask[source_index[name]]
+                    for name in STAGE_EDIT_TARGET_MEMBER_SOURCE_FEATURE_NAMES
+                ):
+                    raise ValueError(
+                        "unbound or group-no-target member-state features cannot "
+                        "enter StageEdit as known values"
+                    )
+                if member_target_active:
+                    if any(
+                        candidate.missing_mask[source_index[name]]
+                        for name in required_member_known
+                    ):
+                        raise ValueError(
+                            "bound member-state unknown/observed values must be explicit"
+                        )
+                    observed_value = candidate.features[
+                        source_index["target_member_state_observed"]
+                    ]
+                    if observed_value not in (0.0, 1.0):
+                        raise ValueError(
+                            "target_member_state_observed must be exactly zero or one"
+                        )
+                    if observed_value == 0.0:
+                        expected_unknown = {
+                            "target_member_probability": 0.0,
+                            "target_visibility_probability": 0.0,
+                            "target_prominence_probability": 0.0,
+                            "target_member_uncertainty_probability": 1.0,
+                        }
+                        if any(
+                            candidate.features[source_index[name]] != value
+                            for name, value in expected_unknown.items()
+                        ) or any(
+                            not candidate.missing_mask[source_index[name]]
+                            for name in ("target_center_x", "target_center_y")
+                        ):
+                            raise ValueError(
+                                "unobserved member state must preserve explicit unknown"
+                            )
+                if not grammar_active and any(
+                    not candidate.missing_mask[source_index[name]]
+                    for name in grammar_additional
+                ):
+                    raise ValueError(
+                        "unbound shooting-grammar features cannot enter StageEdit"
+                    )
+                performer_masks = {
+                    name: candidate.missing_mask[source_index[name]]
+                    for name in STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES
+                }
+                if not performer_active and any(
+                    not missing for missing in performer_masks.values()
+                ):
+                    raise ValueError(
+                        "unbound IVE performer-state features cannot enter StageEdit"
+                    )
+                if performer_active:
+                    required = tuple(
+                        name
+                        for name in STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES
+                        if name != "ive_vocal_probability"
+                    )
+                    if any(performer_masks[name] for name in required):
+                        raise ValueError(
+                            "IVE performer-state distributions and known mass "
+                            "must be explicit"
+                        )
+                    center_names = STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES[:7]
+                    active_names = STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES[7:14]
+                    center_values = tuple(
+                        candidate.features[source_index[name]]
+                        for name in center_names
+                    )
+                    active_values = tuple(
+                        candidate.features[source_index[name]]
+                        for name in active_names
+                    )
+                    if not math.isclose(
+                        math.fsum(center_values),
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ) or not math.isclose(
+                        math.fsum(active_values),
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            "IVE performer-state distributions must retain "
+                            "normalized explicit unknown mass"
+                        )
+                    center_known = candidate.features[
+                        source_index["ive_center_member_known_mass"]
+                    ]
+                    active_known = candidate.features[
+                        source_index["ive_active_performer_known_mass"]
+                    ]
+                    if not math.isclose(
+                        center_known,
+                        1.0 - center_values[-1],
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ) or not math.isclose(
+                        active_known,
+                        1.0 - active_values[-1],
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            "IVE performer-state known mass disagrees with "
+                            "explicit unknown mass"
+                        )
 
     def token_at(
         self,
@@ -1586,22 +2720,17 @@ class StageEditFeatureSnapshot:
         )
         observed_count = _temporal_pose_sidecar_count(self.sequence)
         legacy = self.schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
-        if legacy and observed_count != 0:
-            raise ValueError(
-                "legacy StageEdit feature snapshot v2 temporal sidecar audit "
-                "must observe zero sidecars"
-            )
         return {
             "snapshot_schema_version": self.schema_version,
             "status": (
-                "legacy_v2_explicit_temporal_sidecar_missing"
+                "legacy_v3_hash_bound_temporal_sidecar"
                 if legacy
-                else "v3_hash_bound_temporal_sidecar"
+                else "v4_hash_bound_temporal_sidecar_and_causal_sensing"
             ),
             "candidate_count": candidate_count,
             "observed_sidecar_count": observed_count,
             "missing_sidecar_count": candidate_count - observed_count,
-            "sidecar_hash_bound": not legacy,
+            "sidecar_hash_bound": True,
             "enters_transformer_tensors": False,
             "pose_direction_or_velocity_proven_by_snapshot_alone": False,
         }
@@ -1611,6 +2740,7 @@ class StageEditFeatureSnapshot:
             sequence=self.sequence,
             token_schema_fingerprint=self.token_schema_fingerprint,
             provenance=self.provenance,
+            causal_sensing_binding=self.causal_sensing_binding,
             snapshot_schema_version=self.schema_version,
         )
         if _payload_sha256(payload) != self.snapshot_sha256:
@@ -1633,6 +2763,7 @@ class StageEditFeatureSnapshot:
         payload: Mapping[str, Any],
         *,
         schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
+        allow_legacy: bool = False,
     ) -> "StageEditFeatureSnapshot":
         expected = {
             "schema_version",
@@ -1644,14 +2775,24 @@ class StageEditFeatureSnapshot:
             "input_policy",
             "snapshot_sha256",
         }
-        if set(payload) != expected:
-            raise ValueError("StageEdit feature snapshot schema does not match")
         raw_schema_version = payload.get("schema_version")
         if raw_schema_version not in {
             FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
             FEATURE_MATERIALIZER_SCHEMA_VERSION,
         }:
             raise ValueError("unsupported StageEdit feature snapshot version")
+        if (
+            raw_schema_version == FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            and not allow_legacy
+        ):
+            raise ValueError(
+                "legacy StageEdit feature snapshots are inspection-only and "
+                "cannot enter current train or inference"
+            )
+        if raw_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+            expected.add("causal_sensing_binding")
+        if set(payload) != expected:
+            raise ValueError("StageEdit feature snapshot schema does not match")
         if payload.get("snapshot_kind") != FEATURE_SNAPSHOT_KIND:
             raise ValueError("unsupported StageEdit feature snapshot kind")
         policy = payload.get("input_policy")
@@ -1691,7 +2832,10 @@ class StageEditFeatureSnapshot:
                     "available",
                     "hard_gate_passed",
                 }
-                if raw_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION:
+                if raw_schema_version in {
+                    FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+                    FEATURE_MATERIALIZER_SCHEMA_VERSION,
+                }:
                     expected_candidate_keys.add("temporal_pose_sidecar")
                 if (
                     not isinstance(raw_candidate, Mapping)
@@ -1723,7 +2867,10 @@ class StageEditFeatureSnapshot:
                                 raw_candidate["temporal_pose_sidecar"]
                             )
                             if raw_schema_version
-                            == FEATURE_MATERIALIZER_SCHEMA_VERSION
+                            in {
+                                FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+                                FEATURE_MATERIALIZER_SCHEMA_VERSION,
+                            }
                             and raw_candidate["temporal_pose_sidecar"] is not None
                             else None
                         ),
@@ -1758,6 +2905,19 @@ class StageEditFeatureSnapshot:
             raise ValueError("StageEdit snapshot sequence id must be a string")
         sequence = StageEditSequence(raw_sequence_id, tuple(tokens))
         provenance = StageEditFeatureProvenance.from_dict(raw_provenance)
+        causal_sensing_binding = (
+            StageEditCausalSensingBinding.from_dict(
+                payload["causal_sensing_binding"]
+            )
+            if raw_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION
+            and isinstance(payload.get("causal_sensing_binding"), Mapping)
+            else StageEditCausalSensingBinding()
+        )
+        if (
+            raw_schema_version == FEATURE_MATERIALIZER_SCHEMA_VERSION
+            and not isinstance(payload.get("causal_sensing_binding"), Mapping)
+        ):
+            raise ValueError("StageEdit causal-sensing binding must be an object")
         raw_fingerprint = payload.get("token_schema_fingerprint")
         raw_snapshot_sha256 = payload.get("snapshot_sha256")
         if not isinstance(raw_fingerprint, str) or not isinstance(
@@ -1769,6 +2929,7 @@ class StageEditFeatureSnapshot:
             token_schema_fingerprint=raw_fingerprint,
             provenance=provenance,
             snapshot_sha256=raw_snapshot_sha256,
+            causal_sensing_binding=causal_sensing_binding,
             schema_version=raw_schema_version,
         )
         snapshot.require_schema(schema)
@@ -1790,8 +2951,19 @@ def materialize_stage_edit_feature_snapshot(
     performance_start_seconds: float = 0.0,
     performance_end_seconds: float | None = None,
     provenance: StageEditFeatureProvenance = StageEditFeatureProvenance(),
+    causal_sensing: StageEditCausalSensingArtifacts | None = None,
+    production_edit_mode: object | None = None,
+    production_target_member: IVEMember | str | None = None,
+    inspection_only_without_causal_sensing: bool = False,
 ) -> StageEditFeatureSnapshot:
-    """Materialize a deterministic, target-free feature-only sequence."""
+    """Materialize a deterministic feature-only sequence.
+
+    Production callers must supply the complete causal-sensing triple and its
+    exact GROUP/MEMBER scope.  Lightweight schema/inspection callers may omit
+    sensing only through the conspicuous opt-in flag; those snapshots remain
+    structurally loadable but every production gate rejects their empty or
+    partial binding.
+    """
 
     normalized_id = str(sequence_id).strip()
     if not normalized_id:
@@ -1806,6 +2978,54 @@ def materialize_stage_edit_feature_snapshot(
         for left, right in zip(ordered_frames, ordered_frames[1:])
     ):
         raise ValueError("StageEdit feature frames must have unique ordered times")
+    if not isinstance(inspection_only_without_causal_sensing, bool):
+        raise TypeError("inspection_only_without_causal_sensing must be a boolean")
+    if inspection_only_without_causal_sensing:
+        if causal_sensing is not None:
+            raise ValueError(
+                "inspection_only_without_causal_sensing cannot be combined with "
+                "causal_sensing"
+            )
+        if production_edit_mode is not None or production_target_member is not None:
+            raise ValueError(
+                "inspection-only StageEdit materialization cannot claim a "
+                "production edit scope"
+            )
+    elif causal_sensing is None:
+        raise ValueError(
+            "production StageEdit materialization requires the complete causal-"
+            "sensing triple; inspection-only callers must explicitly opt in"
+        )
+    elif production_edit_mode is None:
+        raise ValueError(
+            "production StageEdit materialization requires an explicit edit_mode"
+        )
+    effective_provenance = provenance
+    binding = StageEditCausalSensingBinding()
+    if causal_sensing is not None:
+        if not isinstance(causal_sensing, StageEditCausalSensingArtifacts):
+            raise TypeError(
+                "causal_sensing must use StageEditCausalSensingArtifacts"
+            )
+        first_source_ids = tuple(
+            item.source_id for item in ordered_frames[0].source_observations
+        )
+        expected_sources = frozenset(first_source_ids)
+        if any(
+            frozenset(item.source_id for item in frame.source_observations)
+            != expected_sources
+            for frame in ordered_frames
+        ):
+            raise ValueError(
+                "causal-sensing snapshots require one exact source pool at every time"
+            )
+        causal_sensing.validate_source_pool(first_source_ids)
+        effective_provenance = causal_sensing.bind_provenance(provenance)
+        binding = causal_sensing.binding
+        binding.require_production_scope(
+            edit_mode=production_edit_mode,
+            target_member=production_target_member,
+        )
     if performance_end_seconds is None:
         performance_end_seconds = max(
             ordered_frames[-1].master_time_seconds,
@@ -1824,6 +3044,7 @@ def materialize_stage_edit_feature_snapshot(
                 style_features=style_features,
                 performance_start_seconds=performance_start_seconds,
                 performance_end_seconds=performance_end_seconds,
+                causal_sensing=causal_sensing,
             )
             for frame in ordered_frames
         ),
@@ -1831,7 +3052,11 @@ def materialize_stage_edit_feature_snapshot(
     return StageEditFeatureSnapshot.build(
         sequence,
         schema=schema,
-        provenance=provenance,
+        provenance=effective_provenance,
+        causal_sensing_binding=binding,
+        inspection_only_without_causal_sensing=(
+            inspection_only_without_causal_sensing
+        ),
     )
 
 
@@ -1860,11 +3085,22 @@ def subset_stage_edit_token_sources(
 __all__ = [
     "CausalEditDecision",
     "FEATURE_MATERIALIZER_CONTRACT",
-    "FEATURE_MATERIALIZER_LEGACY_CONTRACT_V2",
+    "FEATURE_MATERIALIZER_LEGACY_CONTRACT_V3",
     "FEATURE_MATERIALIZER_SCHEMA_VERSION",
     "FEATURE_SNAPSHOT_LEGACY_SCHEMA_VERSION",
     "FEATURE_SNAPSHOT_KIND",
     "SourceFeatureObservation",
+    "STAGE_EDIT_CAUSAL_SENSING_BINDING_CONTRACT",
+    "STAGE_EDIT_CAUSAL_SENSING_BINDING_SCHEMA_VERSION",
+    "STAGE_EDIT_CAUSAL_SENSING_MERGE_CONTRACT",
+    "STAGE_EDIT_EXACT_CORROBORATION_OVERLAPS",
+    "STAGE_EDIT_MEMBER_FEATURE_MODE_GROUP_NO_TARGET",
+    "STAGE_EDIT_MEMBER_FEATURE_MODE_NOT_BOUND",
+    "STAGE_EDIT_MEMBER_FEATURE_MODE_TARGET_MEMBER",
+    "STAGE_EDIT_PRODUCTION_CAUSAL_SENSING_GATE_CONTRACT",
+    "STAGE_EDIT_SOURCE_OBSERVATION_AUTHORITATIVE_OVERLAPS",
+    "StageEditCausalSensingArtifacts",
+    "StageEditCausalSensingBinding",
     "StageEditFeatureFrame",
     "StageEditFeatureProvenance",
     "StageEditFeatureSnapshot",
@@ -1874,4 +3110,5 @@ __all__ = [
     "source_observation_from_timeline_candidate",
     "source_observation_from_visual_cache_payload",
     "subset_stage_edit_token_sources",
+    "validate_production_causal_sensing_gate_payload",
 ]
