@@ -318,10 +318,15 @@ DEFAULT_IVE_PROFESSIONAL_MOTION_CUT_PROFILE_FILE_SHA256 = (
 )
 _DIRECT_MEMBER_TARGET_RUN_SECONDS = 3.9
 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE = 13.5
-_DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE = 17.5
+_DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE = 19.5
 _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS = 3.5
 _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS = 4.2
 _DIRECT_MEMBER_MAX_RUN_SECONDS = 7.2
+_DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS = 2.25
+_DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 18.8
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE = 18.0
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE = 2.0
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS = 8.0
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT = 64
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
@@ -3463,12 +3468,229 @@ def _coarsen_direct_full_frame_spans(
     return tuple(spans)
 
 
+def _normalized_direct_member_highlight_intervals(
+    intervals: Sequence[tuple[float, float]],
+    *,
+    range_start: float,
+    range_end: float,
+) -> tuple[tuple[float, float], ...]:
+    """Clip and merge the section plan into one deterministic time union."""
+
+    if not math.isfinite(range_start) or not math.isfinite(range_end):
+        raise ValueError("direct-member highlight range must be finite")
+    if range_end <= range_start:
+        raise ValueError("direct-member highlight range must be positive")
+    clipped: list[tuple[float, float]] = []
+    for raw_start, raw_end in intervals:
+        start = float(raw_start)
+        end = float(raw_end)
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError(
+                "direct-member highlight intervals must be finite and positive"
+            )
+        start = max(range_start, start)
+        end = min(range_end, end)
+        if end > start + 1e-9:
+            clipped.append((start, end))
+    if not clipped:
+        return ()
+    clipped.sort()
+    merged: list[tuple[float, float]] = [clipped[0]]
+    for start, end in clipped[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end + 1e-7:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _direct_member_interval_overlap_seconds(
+    start: float,
+    end: float,
+    intervals: Sequence[tuple[float, float]],
+) -> float:
+    return sum(
+        max(0.0, min(end, interval_end) - max(start, interval_start))
+        for interval_start, interval_end in intervals
+    )
+
+
+def _direct_member_boundary_is_highlight(
+    boundary_seconds: float,
+    intervals: Sequence[tuple[float, float]],
+) -> bool:
+    return any(
+        start - 1e-7 <= boundary_seconds <= end + 1e-7
+        for start, end in intervals
+    )
+
+
+def _direct_member_highlight_priority_boundary_indices(
+    spans: Sequence[_DirectFullFrameSpan],
+    intervals: Sequence[tuple[float, float]],
+) -> tuple[int, ...]:
+    """Return cut boundaries that a no-cut fallback may not consume."""
+
+    items = tuple(spans)
+    if len(items) < 2 or not intervals:
+        return ()
+    return tuple(
+        boundary_index
+        for boundary_index, span in enumerate(items[:-1])
+        if _direct_member_boundary_is_highlight(
+            span.canonical_master_end,
+            intervals,
+        )
+    )
+
+
+def _densify_direct_full_frame_highlights(
+    timing_segments: Sequence[DraftSegment],
+    base_spans: Sequence[_DirectFullFrameSpan],
+    highlight_intervals: Sequence[tuple[float, float]],
+) -> tuple[_DirectFullFrameSpan, ...]:
+    """Add musically bound highlight cuts without weakening visual gates.
+
+    The reference cadence remains roughly four timing units outside active
+    sections.  Inside BUILD/CHORUS-like intervals, selected four/six-unit holds
+    are split only at boundaries already emitted by ``build_group_draft``.
+    The global target is deliberately bounded below the 19.5/min hard ceiling;
+    the visual selector must still independently approve every added cut.
+    """
+
+    items = tuple(timing_segments)
+    baseline = tuple(base_spans)
+    if not items or not baseline or not highlight_intervals:
+        return baseline
+    normalized = _normalized_direct_member_highlight_intervals(
+        highlight_intervals,
+        range_start=items[0].canonical_master_start,
+        range_end=items[-1].canonical_master_end,
+    )
+    if not normalized:
+        return baseline
+    total_duration = (
+        items[-1].canonical_master_end - items[0].canonical_master_start
+    )
+    target_span_count = min(
+        math.floor(
+            total_duration * _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE / 60.0
+        )
+        + 1,
+        max(
+            len(baseline),
+            math.ceil(
+                total_duration
+                * _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE
+                / 60.0
+            )
+            + 1,
+        ),
+    )
+    counts = [span.timing_segment_count for span in baseline]
+    while len(counts) < target_span_count:
+        candidates: list[
+            tuple[
+                tuple[float, float, int, float, int, int],
+                int,
+                int,
+            ]
+        ] = []
+        unit_start = 0
+        for span_index, count in enumerate(counts):
+            if count < 4:
+                unit_start += count
+                continue
+            group_start = items[unit_start].canonical_master_start
+            group_end = items[unit_start + count - 1].canonical_master_end
+            group_duration = group_end - group_start
+            overlap = _direct_member_interval_overlap_seconds(
+                group_start,
+                group_end,
+                normalized,
+            )
+            overlap_fraction = overlap / group_duration
+            if overlap_fraction < 0.50:
+                unit_start += count
+                continue
+            for split_offset in range(2, count - 1):
+                boundary_unit = items[unit_start + split_offset - 1]
+                boundary_seconds = boundary_unit.canonical_master_end
+                if not _direct_member_boundary_is_highlight(
+                    boundary_seconds,
+                    normalized,
+                ):
+                    continue
+                left_duration = boundary_seconds - group_start
+                right_duration = group_end - boundary_seconds
+                if min(left_duration, right_duration) <= 0.0:
+                    continue
+                reasons = set(boundary_unit.end_boundary_reasons)
+                musical_penalty = (
+                    0
+                    if "phrase" in reasons
+                    else 1
+                    if "strong_beat" in reasons
+                    else 2
+                    if "beat" in reasons
+                    else 3
+                )
+                target_errors = sorted(
+                    (
+                        abs(
+                            left_duration
+                            - _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
+                        ),
+                        abs(
+                            right_duration
+                            - _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
+                        ),
+                    )
+                )
+                candidates.append(
+                    (
+                        (
+                            -overlap_fraction,
+                            target_errors[0],
+                            musical_penalty,
+                            target_errors[1],
+                            span_index,
+                            split_offset,
+                        ),
+                        span_index,
+                        split_offset,
+                    )
+                )
+            unit_start += count
+        if not candidates:
+            break
+        _score, span_index, split_offset = min(candidates)
+        original_count = counts[span_index]
+        counts[span_index : span_index + 1] = [
+            split_offset,
+            original_count - split_offset,
+        ]
+    return _direct_full_frame_spans_from_partition(items, counts)
+
+
 def _direct_full_frame_base_partition_profile(
     timing_segments: Sequence[DraftSegment],
+    *,
+    highlight_intervals: Sequence[tuple[float, float]] = (),
 ) -> _DirectFullFramePartitionProfile:
-    spans = _coarsen_direct_full_frame_spans(timing_segments)
+    baseline = _coarsen_direct_full_frame_spans(timing_segments)
+    spans = _densify_direct_full_frame_highlights(
+        timing_segments,
+        baseline,
+        highlight_intervals,
+    )
     return _DirectFullFramePartitionProfile(
-        profile_id="base-reference-coarsening",
+        profile_id=(
+            "highlight-dense-reference-coarsening-v1"
+            if len(spans) > len(baseline)
+            else "base-reference-coarsening"
+        ),
         unit_counts=tuple(span.timing_segment_count for span in spans),
         spans=spans,
     )
@@ -5005,6 +5227,176 @@ def _render_cadence_payload(
     }
 
 
+def _direct_member_highlight_cadence_payload(
+    *,
+    spans: Sequence[_DirectFullFrameSpan],
+    visual_selection: DirectMemberVisualSelection,
+    highlight_intervals: Sequence[tuple[float, float]],
+) -> dict[str, Any]:
+    """Audit the exact selected cuts separately inside active sections."""
+
+    items = tuple(spans)
+    if not items:
+        raise ValueError("highlight cadence audit needs direct-member spans")
+    if len(visual_selection.source_indices) != len(items):
+        raise ValueError("highlight cadence selection does not match spans")
+    if len(visual_selection.boundaries) != len(items) - 1:
+        raise ValueError("highlight cadence boundary count does not match spans")
+    normalized = (
+        _normalized_direct_member_highlight_intervals(
+            highlight_intervals,
+            range_start=items[0].canonical_master_start,
+            range_end=items[-1].canonical_master_end,
+        )
+        if highlight_intervals
+        else ()
+    )
+    total_duration = (
+        items[-1].canonical_master_end - items[0].canonical_master_start
+    )
+    highlight_duration = sum(end - start for start, end in normalized)
+    non_highlight_duration = max(0.0, total_duration - highlight_duration)
+    highlight_boundary_indices = tuple(
+        index
+        for index, span in enumerate(items[:-1])
+        if _direct_member_boundary_is_highlight(
+            span.canonical_master_end,
+            normalized,
+        )
+    )
+    highlight_boundary_set = frozenset(highlight_boundary_indices)
+    applied_cut_indices = tuple(
+        index
+        for index, boundary in enumerate(visual_selection.boundaries)
+        if boundary.cut_applied
+    )
+    highlight_cut_indices = tuple(
+        index for index in applied_cut_indices if index in highlight_boundary_set
+    )
+    non_highlight_cut_indices = tuple(
+        index for index in applied_cut_indices if index not in highlight_boundary_set
+    )
+    highlight_hold_indices = tuple(
+        index
+        for index in highlight_boundary_indices
+        if not visual_selection.boundaries[index].cut_applied
+    )
+    highlight_switches_per_minute = (
+        len(highlight_cut_indices) * 60.0 / highlight_duration
+        if highlight_duration > 1e-9
+        else 0.0
+    )
+    non_highlight_switches_per_minute = (
+        len(non_highlight_cut_indices) * 60.0 / non_highlight_duration
+        if non_highlight_duration > 1e-9
+        else 0.0
+    )
+
+    highlight_gap_seconds: list[float] = []
+    highlight_cut_times = tuple(
+        items[index].canonical_master_end for index in highlight_cut_indices
+    )
+    for interval_start, interval_end in normalized:
+        points = [interval_start]
+        points.extend(
+            value
+            for value in highlight_cut_times
+            if interval_start + 1e-7 < value < interval_end - 1e-7
+        )
+        points.append(interval_end)
+        highlight_gap_seconds.extend(
+            right - left
+            for left, right in zip(points, points[1:])
+            if right > left + 1e-9
+        )
+
+    source_runs: list[tuple[float, float]] = []
+    run_start = items[0].canonical_master_start
+    for boundary_index, boundary in enumerate(visual_selection.boundaries):
+        if boundary.cut_applied:
+            run_end = items[boundary_index].canonical_master_end
+            source_runs.append((run_start, run_end))
+            run_start = run_end
+    source_runs.append((run_start, items[-1].canonical_master_end))
+    highlight_run_overlaps = [
+        overlap
+        for run_start, run_end in source_runs
+        for interval_start, interval_end in normalized
+        if (
+            overlap := max(
+                0.0,
+                min(run_end, interval_end) - max(run_start, interval_start),
+            )
+        )
+        > 1e-9
+    ]
+
+    audit_required = (
+        highlight_duration
+        >= _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS
+    )
+    failure_reasons: list[str] = []
+    if audit_required:
+        if (
+            highlight_switches_per_minute
+            + 1e-9
+            < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+        ):
+            failure_reasons.append("highlight_switch_density_below_minimum")
+        if (
+            non_highlight_duration
+            >= _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS
+            and highlight_switches_per_minute + 1e-9
+            < non_highlight_switches_per_minute
+            + _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE
+        ):
+            failure_reasons.append("highlight_density_lift_below_minimum")
+        if highlight_hold_indices:
+            failure_reasons.append("highlight_boundary_consumed_by_no_cut_hold")
+    return {
+        "contract": "human_like_section_aware_member_cut_density_v1",
+        "audit_required": audit_required,
+        "passed": not failure_reasons,
+        "failure_reasons": failure_reasons,
+        "highlight_intervals": [list(value) for value in normalized],
+        "highlight_duration_seconds": highlight_duration,
+        "non_highlight_duration_seconds": non_highlight_duration,
+        "planned_highlight_boundary_count": len(highlight_boundary_indices),
+        "actual_highlight_cut_count": len(highlight_cut_indices),
+        "actual_non_highlight_cut_count": len(non_highlight_cut_indices),
+        "highlight_no_cut_hold_count": len(highlight_hold_indices),
+        "highlight_no_cut_hold_boundary_indices": list(highlight_hold_indices),
+        "highlight_source_switches_per_minute": (
+            highlight_switches_per_minute
+        ),
+        "non_highlight_source_switches_per_minute": (
+            non_highlight_switches_per_minute
+        ),
+        "density_lift_per_minute": (
+            highlight_switches_per_minute
+            - non_highlight_switches_per_minute
+        ),
+        "minimum_highlight_source_switches_per_minute": (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+        ),
+        "minimum_density_lift_per_minute": (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE
+        ),
+        "target_highlight_run_seconds": [1.8, 2.6],
+        "highlight_cut_gap_median_seconds": (
+            median(highlight_gap_seconds) if highlight_gap_seconds else None
+        ),
+        "highlight_cut_gap_maximum_seconds": (
+            max(highlight_gap_seconds) if highlight_gap_seconds else None
+        ),
+        "highlight_longest_source_run_seconds": (
+            max(highlight_run_overlaps) if highlight_run_overlaps else 0.0
+        ),
+        "cut_times_use_existing_musical_boundaries": True,
+        "visual_gates_relaxed": False,
+    }
+
+
 def _direct_member_visual_payload(
     selection: DirectMemberVisualSelection,
     *,
@@ -5662,6 +6054,7 @@ def _select_direct_member_partition_profile(
     source_timewarps: Sequence[TimeWarpMap | None] | None,
     scene_cut_times: Sequence[Sequence[float]],
     source_cycle: Sequence[int],
+    highlight_intervals: Sequence[tuple[float, float]] = (),
     continuous_official_portrait_fancam_contract: bool = False,
     descriptor_provider: DescriptorProvider | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -5678,7 +6071,22 @@ def _select_direct_member_partition_profile(
         if source_timewarps is not None
         else None
     )
-    base = _direct_full_frame_base_partition_profile(timing_draft.segments)
+    normalized_highlight_intervals = (
+        _normalized_direct_member_highlight_intervals(
+            highlight_intervals,
+            range_start=timing_draft.common_master_start,
+            range_end=timing_draft.common_master_end,
+        )
+        if highlight_intervals
+        else ()
+    )
+    undensified_base_span_count = len(
+        _coarsen_direct_full_frame_spans(timing_draft.segments)
+    )
+    base = _direct_full_frame_base_partition_profile(
+        timing_draft.segments,
+        highlight_intervals=normalized_highlight_intervals,
+    )
     if len(base.spans) < len(source_cycle):
         raise RuntimeError("coarse direct cadence cannot show every eligible source")
 
@@ -5834,6 +6242,12 @@ def _select_direct_member_partition_profile(
             *,
             extra_quota_source_indices: Sequence[int] | None = None,
         ) -> DirectMemberVisualSelection:
+            protected_cut_boundary_indices = (
+                _direct_member_highlight_priority_boundary_indices(
+                    profile.spans,
+                    normalized_highlight_intervals,
+                )
+            )
             return select_balanced_direct_member_sources(
                 sources=eligible_sources,
                 canonical_spans=tuple(
@@ -5848,6 +6262,9 @@ def _select_direct_member_partition_profile(
                 ),
                 preferred_source_order=source_cycle,
                 extra_quota_source_indices=extra_quota_source_indices,
+                protected_cut_boundary_indices=(
+                    protected_cut_boundary_indices
+                ),
                 config=config,
                 descriptor_provider=provider,
             )
@@ -7192,6 +7609,33 @@ def _select_direct_member_partition_profile(
         "profiles_attempted": attempted,
         "selected_profile_id": selected_profile.profile_id,
         "selected_partition_unit_counts": list(selected_profile.unit_counts),
+        "highlight_dense_cadence": {
+            "contract": "section_role_bound_existing_musical_cut_density_v1",
+            "highlight_intervals": [
+                [start, end]
+                for start, end in normalized_highlight_intervals
+            ],
+            "undensified_base_span_count": undensified_base_span_count,
+            "initial_highlight_dense_span_count": len(base.spans),
+            "selected_span_count": len(selected_profile.spans),
+            "added_initial_span_count": (
+                len(base.spans) - undensified_base_span_count
+            ),
+            "target_global_switches_per_minute": (
+                _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE
+            ),
+            "highlight_target_run_seconds": (
+                _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
+            ),
+            "protected_selected_boundary_indices": list(
+                _direct_member_highlight_priority_boundary_indices(
+                    selected_profile.spans,
+                    normalized_highlight_intervals,
+                )
+            ),
+            "no_cut_hold_allowed_on_protected_boundaries": False,
+            "visual_selector_recheck_required_for_every_added_cut": True,
+        },
         "fallback_used": bool(
             selected_profile.boundary_shifts
             or selected_profile.visual_frontier_splits
@@ -7357,6 +7801,7 @@ def _official_target_fancam_direct_full_frame_segments(
             source_timewarps=source_timewarps,
             scene_cut_times=scene_cut_times,
             source_cycle=source_cycle,
+            highlight_intervals=highlight_intervals,
             continuous_official_portrait_fancam_contract=(
                 continuous_official_portrait_fancam_contract
             ),
@@ -7544,6 +7989,18 @@ def _official_target_fancam_direct_full_frame_segments(
             f"max {longest_run:.2f}s"
         )
     cadence["passed"] = True
+    highlight_cadence = _direct_member_highlight_cadence_payload(
+        spans=spans,
+        visual_selection=visual_selection,
+        highlight_intervals=highlight_intervals,
+    )
+    cadence["highlight_cut_density"] = highlight_cadence
+    if not highlight_cadence["passed"]:
+        raise RuntimeError(
+            "direct full-frame highlight cadence missed human-like density "
+            "gates: "
+            + ", ".join(highlight_cadence["failure_reasons"])
+        )
     cadence["source_duration_balance"] = {
         "passed": True,
         "target_policy": (
@@ -7557,7 +8014,7 @@ def _official_target_fancam_direct_full_frame_segments(
         "enforced_from_render_segments": True,
     }
     cadence["policy"] = (
-        "reference_calibrated_proof_directed_partition_fallback_v2"
+        "section_aware_reference_calibrated_proof_directed_partition_fallback_v3"
     )
     cadence["partition_search"] = partition_search
     dissolve_planner_error: str | None = None

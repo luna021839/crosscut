@@ -243,6 +243,51 @@ class DirectMemberVisualTests(unittest.TestCase):
         )
         self.assertFalse(diagnostics["visual_gates_relaxed"])
 
+    def test_bounded_hold_rejects_a_same_source_run_over_render_limit(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrices = (
+            ((safe, safe), (safe, safe)),
+            ((safe, severe), (severe, safe)),
+            ((safe, safe), (safe, safe)),
+        )
+
+        result = _bounded_same_source_hold_visual_path(
+            matrices,
+            source_quotas=(2, 2),
+            source_order=(0, 1),
+            candidate_validity=((True, True),) * 4,
+            span_durations=(4.0,) * 4,
+            config=DirectMemberVisualConfig(beam_width=200),
+        )
+
+        self.assertIsNone(result)
+
+    def test_bounded_hold_cannot_consume_a_protected_highlight_cut(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrices = (
+            ((safe, safe), (safe, safe)),
+            ((safe, severe), (severe, safe)),
+            ((safe, safe), (safe, safe)),
+        )
+
+        result = _bounded_same_source_hold_visual_path(
+            matrices,
+            source_quotas=(2, 2),
+            source_order=(0, 1),
+            candidate_validity=((True, True),) * 4,
+            span_durations=(1.0,) * 4,
+            protected_cut_boundary_indices=(1,),
+            config=DirectMemberVisualConfig(beam_width=200),
+        )
+
+        self.assertIsNone(result)
+
     def test_selected_hold_is_reported_as_no_cut_not_visual_relaxation(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(4))
 

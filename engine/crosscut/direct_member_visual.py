@@ -85,6 +85,7 @@ class DirectMemberVisualConfig:
     maximum_same_source_hold_fraction: float = 0.12
     maximum_same_source_hold_count: int = 8
     maximum_consecutive_same_source_holds: int = 1
+    maximum_same_source_run_seconds: float = 7.2
     minimum_adjacent_motion_magnitude: float = 0.020
     minimum_temporal_motion_component_count: int = 2
     motion_connection_preference_weight: float = 0.22
@@ -155,6 +156,7 @@ class DirectMemberVisualConfig:
             self.ping_pong_penalty,
             self.same_source_hold_penalty,
             self.maximum_same_source_hold_fraction,
+            self.maximum_same_source_run_seconds,
             self.minimum_adjacent_motion_magnitude,
             self.motion_connection_preference_weight,
             self.duration_balance_weight,
@@ -197,6 +199,8 @@ class DirectMemberVisualConfig:
             raise ValueError(
                 "maximum_same_source_hold_fraction must be at most one"
             )
+        if self.maximum_same_source_run_seconds <= 0.0:
+            raise ValueError("maximum_same_source_run_seconds must be positive")
         for name, value in (
             ("maximum_same_source_hold_count", self.maximum_same_source_hold_count),
             (
@@ -391,6 +395,9 @@ class DirectMemberVisualConfig:
                 "maximum_count": self.maximum_same_source_hold_count,
                 "maximum_consecutive": (
                     self.maximum_consecutive_same_source_holds
+                ),
+                "maximum_same_source_run_seconds": (
+                    self.maximum_same_source_run_seconds
                 ),
                 "severe_cross_source_edges_remain_ineligible": True,
                 "all_balanced_source_quotas_remain_required": True,
@@ -4122,6 +4129,7 @@ def _bounded_same_source_hold_visual_path(
     source_order: Sequence[int],
     candidate_validity: Sequence[Sequence[bool]],
     span_durations: Sequence[float],
+    protected_cut_boundary_indices: Sequence[int] = (),
     config: DirectMemberVisualConfig,
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Find a safe all-source path with a small number of no-cut holds.
@@ -4145,6 +4153,16 @@ def _bounded_same_source_hold_visual_path(
     ):
         raise ValueError("same-source hold fallback shape is invalid")
     boundary_count = span_count - 1
+    protected_boundaries = frozenset(
+        int(value) for value in protected_cut_boundary_indices
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < boundary_count
+        for value in protected_cut_boundary_indices
+    ):
+        raise ValueError("protected cut boundary indices are invalid")
     maximum_hold_count = min(
         config.maximum_same_source_hold_count,
         max(
@@ -4246,9 +4264,23 @@ def _bounded_same_source_hold_visual_path(
                     is_hold = source_index == previous
                     if is_hold:
                         if (
-                            hold_count >= maximum_hold_count
+                            position - 1 in protected_boundaries
+                            or hold_count >= maximum_hold_count
                             or consecutive_hold_count
                             >= config.maximum_consecutive_same_source_holds
+                        ):
+                            continue
+                        same_source_run_seconds = durations[position]
+                        prior_position = position - 1
+                        while (
+                            prior_position >= 0
+                            and node.path[prior_position] == source_index
+                        ):
+                            same_source_run_seconds += durations[prior_position]
+                            prior_position -= 1
+                        if (
+                            same_source_run_seconds
+                            > config.maximum_same_source_run_seconds + 1e-9
                         ):
                             continue
                     elif matrix[previous][source_index].severe_flags:
@@ -4378,6 +4410,13 @@ def _bounded_same_source_hold_visual_path(
                     "maximum_consecutive_same_source_holds": (
                         config.maximum_consecutive_same_source_holds
                     ),
+                    "maximum_same_source_run_seconds": (
+                        config.maximum_same_source_run_seconds
+                    ),
+                    "protected_cut_boundary_indices": sorted(
+                        protected_boundaries
+                    ),
+                    "protected_cut_boundary_hold_count": 0,
                     "cross_source_severe_edge_count_selected": 0,
                     "all_source_quotas_satisfied": True,
                     "maximum_duration_relative_deviation": max(deviations),
@@ -4789,6 +4828,7 @@ def select_balanced_direct_member_sources(
     continuous_official_portrait_fancam_contract: bool = False,
     preferred_source_order: Sequence[int] | None = None,
     extra_quota_source_indices: Sequence[int] | None = None,
+    protected_cut_boundary_indices: Sequence[int] = (),
     config: DirectMemberVisualConfig | None = None,
     descriptor_provider: DescriptorProvider | None = None,
 ) -> DirectMemberVisualSelection:
@@ -4828,6 +4868,18 @@ def select_balanced_direct_member_sources(
             abs_tol=1e-7,
         ):
             raise ValueError("direct visual spans must be contiguous")
+    protected_boundaries = tuple(
+        int(value) for value in protected_cut_boundary_indices
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(spans) - 1
+        for value in protected_cut_boundary_indices
+    ):
+        raise ValueError("protected cut boundary indices are invalid")
+    if len(set(protected_boundaries)) != len(protected_boundaries):
+        raise ValueError("protected cut boundary indices must be unique")
     if len(audio_offsets) != source_count:
         raise ValueError("direct visual audio_offsets must match sources")
     offsets = tuple(float(value) for value in audio_offsets)
@@ -5329,6 +5381,7 @@ def select_balanced_direct_member_sources(
                 source_order=order,
                 candidate_validity=candidate_validity,
                 span_durations=tuple(end - start for start, end in spans),
+                protected_cut_boundary_indices=protected_boundaries,
                 config=resolved_config,
             )
             if hold_fallback_authorized
@@ -5401,7 +5454,33 @@ def select_balanced_direct_member_sources(
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,
         "source_quota_assignment": quota_assignment_provenance,
+        "protected_cut_boundary_indices": list(protected_boundaries),
     }
+    protected_hold_indices = tuple(
+        boundary_index
+        for boundary_index in protected_boundaries
+        if path[boundary_index] == path[boundary_index + 1]
+    )
+    if protected_hold_indices:
+        raise RuntimeError(
+            "direct member visual path consumed a protected cut boundary"
+        )
+    current_source = path[0]
+    current_run_seconds = spans[0][1] - spans[0][0]
+    for position, source_index in enumerate(path[1:], start=1):
+        duration = spans[position][1] - spans[position][0]
+        if source_index == current_source:
+            current_run_seconds += duration
+        else:
+            current_source = source_index
+            current_run_seconds = duration
+        if (
+            current_run_seconds
+            > resolved_config.maximum_same_source_run_seconds + 1e-9
+        ):
+            raise RuntimeError(
+                "direct member visual path exceeded same-source run limit"
+            )
     counts = tuple(path.count(index) for index in range(source_count))
     source_durations, source_duration_targets, source_duration_deviations = (
         _source_duration_balance(
