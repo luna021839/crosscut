@@ -4147,7 +4147,15 @@ def _bounded_same_source_hold_visual_path(
     boundary_count = span_count - 1
     maximum_hold_count = min(
         config.maximum_same_source_hold_count,
-        int(math.ceil(boundary_count * config.maximum_same_source_hold_fraction)),
+        max(
+            1,
+            int(
+                math.floor(
+                    boundary_count
+                    * config.maximum_same_source_hold_fraction
+                )
+            ),
+        ),
     )
     if maximum_hold_count <= 0 or config.maximum_consecutive_same_source_holds <= 0:
         return None
