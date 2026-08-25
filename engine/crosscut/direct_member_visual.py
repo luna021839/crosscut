@@ -5297,21 +5297,22 @@ def select_balanced_direct_member_sources(
             if isinstance(strict_search, Mapping)
             else None
         )
-        minimum_severe_count = (
-            strict_counterfactual.get("minimum_severe_transition_count")
-            if isinstance(strict_counterfactual, Mapping)
+        strict_exact_lifeline = (
+            strict_search.get("exact_lifeline")
+            if isinstance(strict_search, Mapping)
             else None
         )
         hold_fallback_authorized = (
             error.diagnostics.get("failure")
             == "validity_quota_path_exhausted"
             and error.diagnostics.get("constraint_infeasibility_proven") is True
-            and isinstance(minimum_severe_count, int)
-            and not isinstance(minimum_severe_count, bool)
-            and minimum_severe_count > 0
-            and strict_counterfactual.get("optimality_proven") is True
-            and strict_counterfactual.get("integrity_check_passed") is True
-            and strict_counterfactual.get("state_capacity_exhausted") is False
+            and isinstance(strict_exact_lifeline, Mapping)
+            and strict_exact_lifeline.get("strategy")
+            == "exact_backward_memoized_hard_feasibility"
+            and strict_exact_lifeline.get("path_found") is False
+            and strict_exact_lifeline.get("state_capacity_exhausted") is False
+            and strict_exact_lifeline.get("duration_state_quantization_applied")
+            is False
         )
         hold_fallback = (
             _bounded_same_source_hold_visual_path(
@@ -5340,6 +5341,16 @@ def select_balanced_direct_member_sources(
                         )
                         if isinstance(strict_counterfactual, Mapping)
                         else None
+                    ),
+                    "exact_lifeline_strategy": strict_exact_lifeline.get(
+                        "strategy"
+                    ),
+                    "exact_lifeline_state_capacity_exhausted": (
+                        strict_exact_lifeline.get("state_capacity_exhausted")
+                    ),
+                    "authorization_basis": (
+                        "proven_strict_no_repeat_infeasibility_then_bounded_"
+                        "same_source_no_cut_search_v1"
                     ),
                     "diagnostic_sha256": _canonical_diagnostic_sha256(
                         error.diagnostics

@@ -259,6 +259,12 @@ class DirectMemberVisualTests(unittest.TestCase):
                 "failure": "validity_quota_path_exhausted",
                 "constraint_infeasibility_proven": True,
                 "search": {
+                    "exact_lifeline": {
+                        "strategy": "exact_backward_memoized_hard_feasibility",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    },
                     "severe_transition_counterfactual": {
                         "minimum_severe_transition_count": 1,
                         "optimality_proven": True,
@@ -302,6 +308,74 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(selection.boundaries[1].mismatch.severe_flags, ())
         self.assertFalse(
             selection.optimizer_search_diagnostics["visual_gates_relaxed"]
+        )
+
+    def test_exact_structural_no_repeat_failure_can_authorize_safe_hold(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(4))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return _descriptor(0.20 + source_index * 0.02)
+
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict no-repeat path failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "exact_lifeline": {
+                        "strategy": "exact_backward_memoized_hard_feasibility",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    },
+                    "severe_transition_counterfactual": {
+                        "minimum_severe_transition_count": None,
+                        "optimality_proven": False,
+                        "state_capacity_exhausted": False,
+                    },
+                },
+            },
+        )
+        fallback = (
+            (0, 1, 1, 0),
+            0.12,
+            {
+                "strategy": "bounded_safe_same_source_hold_fallback_v1",
+                "same_source_hold_count": 1,
+                "visual_gates_relaxed": False,
+            },
+        )
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=fallback,
+        ) as fallback_search:
+            selection = select_balanced_direct_member_sources(
+                sources=(Path("zero.mp4"), Path("one.mp4")),
+                canonical_spans=spans,
+                audio_offsets=(0.0, 0.0),
+                config=DirectMemberVisualConfig(beam_width=200),
+                descriptor_provider=provider,
+            )
+
+        fallback_search.assert_called_once()
+        self.assertEqual(
+            selection.optimizer_search_diagnostics["strict_cross_source_failure"][
+                "authorization_basis"
+            ],
+            "proven_strict_no_repeat_infeasibility_then_bounded_"
+            "same_source_no_cut_search_v1",
+        )
+        self.assertEqual(
+            tuple(boundary.cut_applied for boundary in selection.boundaries),
+            (True, False, True),
         )
 
     def test_hard_boundary_connectivity_localizes_only_the_actual_zero_edge(
