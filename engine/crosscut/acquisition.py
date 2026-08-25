@@ -228,7 +228,7 @@ _PROMOTION_CLUSTER_MAXIMUM_GAP_DAYS = 28
 _CURRENT_HARD_TITLE_AUDIT_POLICY = (
     "selected_title_encore_winner_afterstage_and_music_bank_global_special_v3"
 )
-_MEMBER_PORTRAIT_ASPECT_CONTRACT_VERSION = 1
+_MEMBER_PORTRAIT_ASPECT_CONTRACT_VERSION = 2
 _AUTOMATIC_MEDIA_QUALITY_CONTRACT_VERSION = 1
 _CONTENT_INTEGRITY_CONTRACT_VERSION = 1
 _PERSISTENT_MEDIA_CONTRACT_REJECTION_VERSION = 1
@@ -237,6 +237,7 @@ _PERSISTENT_MEDIA_CONTRACT_REJECTION_REASONS = frozenset(
         "automatic_member_portrait_first_video_stream_missing",
         "automatic_member_portrait_dimensions_unavailable",
         "automatic_member_portrait_aspect_ratio_mismatch",
+        "automatic_member_portrait_crop_headroom_below_production",
         "automatic_group_landscape_first_video_stream_missing",
         "automatic_group_landscape_dimensions_unavailable",
         "automatic_group_landscape_aspect_ratio_mismatch",
@@ -263,6 +264,7 @@ _GROUP_PRODUCTION_WIDTH = 1920
 _GROUP_PRODUCTION_HEIGHT = 1080
 _MEMBER_PRODUCTION_WIDTH = 1080
 _MEMBER_PRODUCTION_HEIGHT = 1920
+_MEMBER_MINIMUM_LOSSLESS_CROP_HEADROOM_ZOOM = 1.0
 _IVE_STAGE_PLAYLIST_ID = "PLPhtNKiHTFyob6KUBxHdAdHlliwZTMBFc"
 _IVE_STAGE_PLAYLIST_URL = (
     "https://www.youtube.com/playlist?list=" + _IVE_STAGE_PLAYLIST_ID
@@ -1716,9 +1718,19 @@ def _validate_media_for_request(
     )
     base = {
         "required": True,
-        "analysis_basis": "first_video_stream_width_over_height",
+        "analysis_basis": (
+            "first_video_stream_dynamic_portrait_crop_without_upscale"
+            if member_portrait
+            else "first_video_stream_width_over_height"
+        ),
         "expected_width_over_height": expected_ratio,
         "tolerance": ratio_tolerance,
+        "source_aspect_must_match_output": not member_portrait,
+        "minimum_lossless_crop_headroom_zoom": (
+            _MEMBER_MINIMUM_LOSSLESS_CROP_HEADROOM_ZOOM
+            if member_portrait
+            else None
+        ),
         "minimum_short_edge": _AUTOMATIC_MINIMUM_SHORT_EDGE,
         "minimum_long_edge": _AUTOMATIC_MINIMUM_LONG_EDGE,
         "minimum_frame_rate": _AUTOMATIC_MINIMUM_FRAME_RATE,
@@ -1840,17 +1852,26 @@ def _validate_media_for_request(
         )
     actual_ratio = stream.width / stream.height
     diagnostics["actual_width_over_height"] = actual_ratio
-    if abs(actual_ratio - expected_ratio) > ratio_tolerance:
-        reason = (
-            "automatic_member_portrait_aspect_ratio_mismatch"
-            if member_portrait
-            else "automatic_group_landscape_aspect_ratio_mismatch"
-        )
+    if (
+        member_portrait
+        and lossless_zoom
+        < _MEMBER_MINIMUM_LOSSLESS_CROP_HEADROOM_ZOOM - 1e-6
+    ):
+        reason = "automatic_member_portrait_crop_headroom_below_production"
         diagnostics["hard_rejection_reason"] = reason
-        contract_label = "9:16±0.01" if member_portrait else "16:9±0.03"
+        raise _MediaContractError(
+            f"{path.name}: 자동 멤버 소스 {stream.width}x{stream.height}는 "
+            f"{_MEMBER_PRODUCTION_WIDTH}x{_MEMBER_PRODUCTION_HEIGHT} 세로 다이나믹 "
+            "크롭을 업스케일 없이 만들 수 없습니다.",
+            hard_rejection_reason=reason,
+            diagnostics=diagnostics,
+        )
+    if not member_portrait and abs(actual_ratio - expected_ratio) > ratio_tolerance:
+        reason = "automatic_group_landscape_aspect_ratio_mismatch"
+        diagnostics["hard_rejection_reason"] = reason
         raise _MediaContractError(
             f"{path.name}: 자동 소스 비율 {actual_ratio:.6f}이 "
-            f"{contract_label} 계약을 벗어났습니다.",
+            "16:9±0.03 계약을 벗어났습니다.",
             hard_rejection_reason=reason,
             diagnostics=diagnostics,
         )
@@ -2558,7 +2579,8 @@ def _issue_member_acquisition_identity_authority(
         and manifest.get("content_integrity_contract_version")
         == _CONTENT_INTEGRITY_CONTRACT_VERSION
         and manifest.get("automatic_media_quality_contract_version") == 1
-        and manifest.get("member_portrait_aspect_contract_version") == 1
+        and manifest.get("member_portrait_aspect_contract_version")
+        == _MEMBER_PORTRAIT_ASPECT_CONTRACT_VERSION
         and isinstance(summary, dict)
         and summary.get("status") == "complete"
         and isinstance(selected, list)
@@ -4698,7 +4720,7 @@ def acquire_sources(
                     [
                         "automatic_member_portrait_first_video_stream_missing",
                         "automatic_member_portrait_dimensions_unavailable",
-                        "automatic_member_portrait_aspect_ratio_mismatch",
+                        "automatic_member_portrait_crop_headroom_below_production",
                     ]
                     if portrait_contract_required
                     else []
@@ -4782,9 +4804,19 @@ def acquire_sources(
             "member_portrait_aspect_contract": (
                 {
                     "required": True,
-                    "analysis_basis": "downloaded_or_cached_first_video_stream_width_over_height",
-                    "expected_width_over_height": _AUTOMATIC_MEMBER_PORTRAIT_RATIO,
-                    "tolerance": _AUTOMATIC_MEMBER_PORTRAIT_RATIO_TOLERANCE,
+                    "analysis_basis": (
+                        "downloaded_or_cached_first_video_stream_dynamic_"
+                        "portrait_crop_without_upscale"
+                    ),
+                    "target_output_width": _MEMBER_PRODUCTION_WIDTH,
+                    "target_output_height": _MEMBER_PRODUCTION_HEIGHT,
+                    "minimum_lossless_crop_headroom_zoom": (
+                        _MEMBER_MINIMUM_LOSSLESS_CROP_HEADROOM_ZOOM
+                    ),
+                    "accepted_source_orientation": (
+                        "portrait_or_landscape_when_dynamic_crop_preserves_"
+                        "target_resolution"
+                    ),
                     "failure_policy": "quarantine_reject_and_continue_to_next_metadata_candidate",
                 }
                 if portrait_contract_required

@@ -15,6 +15,7 @@ from crosscut.acquisition import (
     _IVE_STAGE_PLAYLIST_OWNER_CHANNEL_ID,
     _metadata_candidate,
     _ordered_for_download,
+    _persistent_media_contract_request_identity,
     _quarantine_invalid_media,
     acquire_sources,
 )
@@ -506,6 +507,346 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             self.assertFalse(materialized.member_pose_dissolve_enabled)
             self.assertFalse(
                 materialized.as_dict()["member_pose_dissolve_enabled"]
+            )
+
+    def test_member_six_cache_persists_two_exact_aspect_rejections_and_skips_redownload(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, member=True)
+            rejected_ids = ("Gktj-PLf5kg", "dfBRHilMQxQ")
+            entries = _member_entries(6)
+            for offset, video_id in enumerate(rejected_ids, start=6):
+                entry = _official_entry(
+                    offset,
+                    title=(
+                        "IVE Gaeul I AM Fancam Music Bank "
+                        f"2304{10 + offset:02d}"
+                    ),
+                )
+                entry["id"] = video_id
+                entry["webpage_url"] = (
+                    f"https://www.youtube.com/watch?v={video_id}"
+                )
+                entries.append(entry)
+
+            def member_probe(path: Path) -> MediaInfo:
+                if any(video_id in path.name for video_id in rejected_ids):
+                    return _landscape_media(path)
+                return _media_with_dimensions(path)
+
+            first_client = _FakeClient(entries)
+            first = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=first_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            first_quarantine_counts = {
+                video_id: len(
+                    list(
+                        (root / "cache" / "videos").glob(
+                            f"{video_id}.mp4.invalid*"
+                        )
+                    )
+                )
+                for video_id in rejected_ids
+            }
+            second_client = _FakeClient(entries)
+            second_reporter = _MemoryReporter()
+            second = acquire_sources(
+                request,
+                second_reporter,
+                client=second_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+
+            self.assertEqual(len(first.source_paths), 6)
+            self.assertEqual(set(first_client.download_attempts), set(rejected_ids) | {
+                f"contract{index:04d}" for index in range(6)
+            })
+            self.assertEqual(second.source_paths, first.source_paths)
+            self.assertEqual(second_client.download_attempts, [])
+            self.assertEqual(
+                len(second.manifest["persistent_media_contract_rejections"]),
+                2,
+            )
+            self.assertEqual(
+                second.manifest["summary"][
+                    "persistent_media_contract_skip_count"
+                ],
+                2,
+            )
+            self.assertEqual(
+                second.manifest[
+                    "persistent_media_contract_rejection_refresh"
+                ]["skipped_download_count"],
+                2,
+            )
+            records = {
+                record["video_id"]: record
+                for record in second.manifest["candidates"]
+            }
+            for video_id in rejected_ids:
+                evidence = records[video_id][
+                    "persistent_media_contract_rejection"
+                ]
+                self.assertEqual(
+                    records[video_id]["download_status"],
+                    "skipped_persistent_media_contract_rejection",
+                )
+                self.assertEqual(
+                    records[video_id]["download_hard_rejection_reasons"],
+                    ["automatic_member_portrait_crop_headroom_below_production"],
+                )
+                self.assertEqual(
+                    evidence["request_media_contract_identity"]["payload"][
+                        "edit_mode"
+                    ],
+                    "member",
+                )
+                self.assertEqual(
+                    evidence["request_media_contract_identity"]["payload"][
+                        "aspect_ratio"
+                    ],
+                    "9:16",
+                )
+                self.assertRegex(
+                    evidence["quarantine_artifact"]["content_integrity"][
+                        "sha256"
+                    ],
+                    r"^[0-9a-f]{64}$",
+                )
+                self.assertEqual(
+                    len(
+                        list(
+                            (root / "cache" / "videos").glob(
+                                f"{video_id}.mp4.invalid*"
+                            )
+                        )
+                    ),
+                    first_quarantine_counts[video_id],
+                )
+            warning_messages = [
+                str(payload.get("message", ""))
+                for event_type, payload in second_reporter.events
+                if event_type == "log"
+            ]
+            self.assertTrue(
+                all(
+                    any(
+                        video_id in message
+                        and "automatic_member_portrait_crop_headroom_below_production"
+                        in message
+                        for message in warning_messages
+                    )
+                    for video_id in rejected_ids
+                )
+            )
+
+    def test_persistent_media_rejection_revalidates_metadata_content_and_scope_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, member=True)
+            rejected_id = "Gktj-PLf5kg"
+            entries = _member_entries(6)
+            rejected_entry = _official_entry(
+                6,
+                title="IVE Gaeul I AM Fancam Music Bank 230416",
+            )
+            rejected_entry["id"] = rejected_id
+            rejected_entry["webpage_url"] = (
+                f"https://www.youtube.com/watch?v={rejected_id}"
+            )
+            entries.append(rejected_entry)
+
+            def member_probe(path: Path) -> MediaInfo:
+                return (
+                    _landscape_media(path)
+                    if rejected_id in path.name
+                    else _media_with_dimensions(path)
+                )
+
+            acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+
+            changed_entries = [dict(entry) for entry in entries]
+            changed_entries[-1]["duration"] = float(
+                changed_entries[-1]["duration"]
+            ) + 1.0
+            metadata_changed_client = _FakeClient(changed_entries)
+            metadata_changed = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=metadata_changed_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            self.assertEqual(
+                metadata_changed_client.download_attempts,
+                [rejected_id],
+            )
+
+            evidence = metadata_changed.manifest[
+                "persistent_media_contract_rejections"
+            ][0]
+            quarantine_path = (
+                root
+                / "cache"
+                / evidence["quarantine_artifact"]["relative_path"]
+            )
+            quarantine_path.write_bytes(b"changed quarantined content")
+            content_changed_client = _FakeClient(changed_entries)
+            content_changed = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=content_changed_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            self.assertEqual(
+                content_changed_client.download_attempts,
+                [rejected_id],
+            )
+
+            manifest = json.loads(
+                content_changed.manifest_path.read_text(encoding="utf-8")
+            )
+            group_request = _automatic_request(root, member=False)
+            manifest["persistent_media_contract_rejections"][0][
+                "request_media_contract_identity"
+            ] = _persistent_media_contract_request_identity(
+                request=group_request,
+                client=_FakeClient([]),
+            )
+            content_changed.manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            different_scope_client = _FakeClient(changed_entries)
+            acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=different_scope_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            self.assertEqual(
+                different_scope_client.download_attempts,
+                [rejected_id],
+            )
+
+    def test_legacy_failed_candidate_and_existing_quarantine_migrate_without_download(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = _automatic_request(root, member=True)
+            rejected_id = "dfBRHilMQxQ"
+            entries = _member_entries(6)
+            rejected_entry = _official_entry(
+                6,
+                title="IVE Gaeul I AM Fancam Music Bank 230416",
+            )
+            rejected_entry["id"] = rejected_id
+            rejected_entry["webpage_url"] = (
+                f"https://www.youtube.com/watch?v={rejected_id}"
+            )
+            entries.append(rejected_entry)
+
+            def member_probe(path: Path) -> MediaInfo:
+                return (
+                    _landscape_media(path)
+                    if rejected_id in path.name
+                    else _media_with_dimensions(path)
+                )
+
+            first = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            legacy_manifest = json.loads(
+                first.manifest_path.read_text(encoding="utf-8")
+            )
+            legacy_manifest.pop(
+                "persistent_media_contract_rejection_contract_version"
+            )
+            legacy_manifest.pop("persistent_media_contract_rejections")
+            legacy_manifest.pop("persistent_media_contract_rejection_refresh")
+            legacy_manifest["summary"].pop(
+                "persistent_media_contract_rejection_count"
+            )
+            legacy_manifest["summary"].pop(
+                "persistent_media_contract_new_rejection_count"
+            )
+            legacy_manifest["summary"].pop(
+                "persistent_media_contract_skip_count"
+            )
+            legacy_manifest["summary"].pop(
+                "persistent_media_contract_migrated_legacy_count"
+            )
+            for record in legacy_manifest["candidates"]:
+                record.pop("persistent_media_contract_rejection", None)
+            first.manifest_path.write_text(
+                json.dumps(legacy_manifest, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            migration_client = _FakeClient(entries)
+            migrated = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=migration_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            self.assertEqual(migration_client.download_attempts, [])
+            self.assertEqual(
+                migrated.manifest["summary"][
+                    "persistent_media_contract_migrated_legacy_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                migrated.manifest["persistent_media_contract_rejections"][0][
+                    "evidence_origin"
+                ],
+                "legacy_candidate_rejection_revalidated",
+            )
+
+            replay_client = _FakeClient(entries)
+            replayed = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=replay_client,  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=member_probe,
+            )
+            self.assertEqual(replay_client.download_attempts, [])
+            self.assertEqual(
+                replayed.manifest["summary"][
+                    "persistent_media_contract_skip_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                replayed.manifest["summary"][
+                    "persistent_media_contract_migrated_legacy_count"
+                ],
+                0,
             )
 
     def test_member_three_distinct_fancams_fail_the_four_source_floor(self) -> None:
@@ -1498,7 +1839,7 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             )
             self.assertEqual(failed["download_status"], "failed")
             self.assertIn(
-                "automatic_member_portrait_aspect_ratio_mismatch",
+                "automatic_member_portrait_crop_headroom_below_production",
                 failed["rejection_reasons"],
             )
             self.assertEqual(
@@ -1516,12 +1857,12 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             policy = artifact.manifest["selection_policy"]
             self.assertEqual(
                 policy["member_portrait_aspect_contract"][
-                    "expected_width_over_height"
+                    "minimum_lossless_crop_headroom_zoom"
                 ],
-                9.0 / 16.0,
+                1.0,
             )
             self.assertIn(
-                "automatic_member_portrait_aspect_ratio_mismatch",
+                "automatic_member_portrait_crop_headroom_below_production",
                 policy["hard_rejections"],
             )
             self.assertTrue(
@@ -1578,7 +1919,54 @@ class AutomaticAcquisitionProductContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 failed["download_hard_rejection_reasons"],
-                ["automatic_member_portrait_aspect_ratio_mismatch"],
+                ["automatic_member_portrait_crop_headroom_below_production"],
+            )
+
+    def test_member_4k_landscape_facecam_has_lossless_portrait_crop_headroom(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # Ten is a search target, not a completion requirement: MEMBER
+            # acquisition is allowed to finish with the six real candidates.
+            request = _automatic_request(root, member=True, desired=10)
+            entries = _member_entries(6)
+            first_id = entries[0]["id"]
+
+            def probe(path: Path) -> MediaInfo:
+                if path.stem == first_id:
+                    return _media_with_dimensions(
+                        path,
+                        width=3840,
+                        height=2160,
+                    )
+                return _media_with_dimensions(path)
+
+            artifact = acquire_sources(
+                request,
+                _MemoryReporter(),
+                client=_FakeClient(entries),  # type: ignore[arg-type]
+                media_validator=lambda path: None,
+                media_probe=probe,
+            )
+
+            self.assertEqual(len(artifact.source_paths), 6)
+            selected = next(
+                item
+                for item in artifact.manifest["selected"]
+                if item["video_id"] == first_id
+            )
+            validation = selected["aspect_validation"]
+            self.assertTrue(validation["passed"])
+            self.assertFalse(validation["source_aspect_must_match_output"])
+            self.assertEqual(validation["actual_width_over_height"], 16.0 / 9.0)
+            self.assertAlmostEqual(
+                validation["lossless_crop_headroom_zoom"],
+                1.125,
+            )
+            self.assertEqual(
+                artifact.manifest["member_portrait_aspect_contract_version"],
+                2,
             )
 
     def test_repeated_invalid_cache_files_get_unique_quarantine_paths(self) -> None:

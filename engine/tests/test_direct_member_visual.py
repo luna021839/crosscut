@@ -13,6 +13,7 @@ from crosscut.direct_member_visual import (
     DirectMemberVisualSelectionError,
     _VideoDescriptorProvider,
     _balanced_visual_path,
+    _bounded_same_source_hold_visual_path,
     _exact_feasibility_lifeline,
     _hard_boundary_connectivity_diagnostics,
     _severe_transition_counterfactual_diagnostic,
@@ -212,6 +213,97 @@ def _linear_timewarp(
 
 
 class DirectMemberVisualTests(unittest.TestCase):
+    def test_bounded_hold_avoids_one_forced_severe_cross_source_boundary(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrices = (
+            ((safe, safe), (safe, safe)),
+            ((safe, severe), (severe, safe)),
+            ((safe, safe), (safe, safe)),
+        )
+        result = _bounded_same_source_hold_visual_path(
+            matrices,
+            source_quotas=(2, 2),
+            source_order=(0, 1),
+            candidate_validity=((True, True),) * 4,
+            span_durations=(1.0,) * 4,
+            config=DirectMemberVisualConfig(beam_width=200),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertIn(path, ((0, 1, 1, 0), (1, 0, 0, 1)))
+        self.assertEqual(diagnostics["same_source_hold_count"], 1)
+        self.assertEqual(
+            diagnostics["cross_source_severe_edge_count_selected"],
+            0,
+        )
+        self.assertFalse(diagnostics["visual_gates_relaxed"])
+
+    def test_selected_hold_is_reported_as_no_cut_not_visual_relaxation(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(4))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return _descriptor(0.20 + source_index * 0.02)
+
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict cross-source path failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "severe_transition_counterfactual": {
+                        "minimum_severe_transition_count": 1,
+                        "optimality_proven": True,
+                        "integrity_check_passed": True,
+                        "state_capacity_exhausted": False,
+                    }
+                },
+            },
+        )
+        fallback = (
+            (0, 1, 1, 0),
+            0.12,
+            {
+                "strategy": "bounded_safe_same_source_hold_fallback_v1",
+                "same_source_hold_count": 1,
+                "visual_gates_relaxed": False,
+            },
+        )
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=fallback,
+        ):
+            selection = select_balanced_direct_member_sources(
+                sources=(Path("zero.mp4"), Path("one.mp4")),
+                canonical_spans=spans,
+                audio_offsets=(0.0, 0.0),
+                config=DirectMemberVisualConfig(beam_width=200),
+                descriptor_provider=provider,
+            )
+
+        self.assertEqual(
+            tuple(boundary.cut_applied for boundary in selection.boundaries),
+            (True, False, True),
+        )
+        self.assertEqual(selection.aggregate_diagnostics()["selected_cut_count"], 2)
+        self.assertEqual(selection.aggregate_diagnostics()["same_source_hold_count"], 1)
+        self.assertEqual(selection.boundaries[1].mismatch.severe_flags, ())
+        self.assertFalse(
+            selection.optimizer_search_diagnostics["visual_gates_relaxed"]
+        )
+
     def test_hard_boundary_connectivity_localizes_only_the_actual_zero_edge(
         self,
     ) -> None:

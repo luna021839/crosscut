@@ -21,7 +21,7 @@ import json
 import math
 from pathlib import Path
 from statistics import median
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import cv2
 
@@ -81,6 +81,10 @@ class DirectMemberVisualConfig:
     insufficient_evidence_penalty: float = 0.35
     missing_descriptor_cost: float = 2.75
     ping_pong_penalty: float = 0.14
+    same_source_hold_penalty: float = 0.12
+    maximum_same_source_hold_fraction: float = 0.12
+    maximum_same_source_hold_count: int = 8
+    maximum_consecutive_same_source_holds: int = 1
     minimum_adjacent_motion_magnitude: float = 0.020
     minimum_temporal_motion_component_count: int = 2
     motion_connection_preference_weight: float = 0.22
@@ -149,6 +153,8 @@ class DirectMemberVisualConfig:
             self.insufficient_evidence_penalty,
             self.missing_descriptor_cost,
             self.ping_pong_penalty,
+            self.same_source_hold_penalty,
+            self.maximum_same_source_hold_fraction,
             self.minimum_adjacent_motion_magnitude,
             self.motion_connection_preference_weight,
             self.duration_balance_weight,
@@ -187,6 +193,19 @@ class DirectMemberVisualConfig:
             raise ValueError("early_interior_sample_seconds must be positive")
         if self.span_interior_inset_seconds <= 0.0:
             raise ValueError("span_interior_inset_seconds must be positive")
+        if self.maximum_same_source_hold_fraction > 1.0:
+            raise ValueError(
+                "maximum_same_source_hold_fraction must be at most one"
+            )
+        for name, value in (
+            ("maximum_same_source_hold_count", self.maximum_same_source_hold_count),
+            (
+                "maximum_consecutive_same_source_holds",
+                self.maximum_consecutive_same_source_holds,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
         if (
             isinstance(self.beam_width, bool)
             or not isinstance(self.beam_width, int)
@@ -362,6 +381,20 @@ class DirectMemberVisualConfig:
             ),
             "missing_descriptor_cost": self.missing_descriptor_cost,
             "ping_pong_penalty": self.ping_pong_penalty,
+            "same_source_hold": {
+                "contract": (
+                    "bounded_no_cut_continuation_after_strict_cross_source_"
+                    "path_failure_v1"
+                ),
+                "penalty": self.same_source_hold_penalty,
+                "maximum_fraction": self.maximum_same_source_hold_fraction,
+                "maximum_count": self.maximum_same_source_hold_count,
+                "maximum_consecutive": (
+                    self.maximum_consecutive_same_source_holds
+                ),
+                "severe_cross_source_edges_remain_ineligible": True,
+                "all_balanced_source_quotas_remain_required": True,
+            },
             "adjacent_motion_connection": {
                 "contract": (
                     "cut_adjacent_timestamp_bound_pose_silhouette_subject_motion_v1"
@@ -840,6 +873,7 @@ class DirectBoundaryVisualDiagnostic:
     minimum_pair_cost: float
     selected_pair_cost_delta: float
     ping_pong_penalty_applied: bool
+    cut_applied: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -862,6 +896,7 @@ class DirectBoundaryVisualDiagnostic:
             "minimum_pair_cost": self.minimum_pair_cost,
             "selected_pair_cost_delta": self.selected_pair_cost_delta,
             "ping_pong_penalty_applied": self.ping_pong_penalty_applied,
+            "cut_applied": self.cut_applied,
         }
 
 
@@ -941,13 +976,39 @@ class DirectMemberVisualSelection:
             > self.config.maximum_source_duration_relative_deviation + 1e-9
         ):
             raise ValueError("direct member visual duration balance threshold failed")
-        if any(
-            left == right
-            for left, right in zip(self.source_indices, self.source_indices[1:])
-        ):
-            raise ValueError("direct member visual selection cannot repeat a source")
         if len(self.boundaries) != len(self.source_indices) - 1:
             raise ValueError("direct member visual boundaries must match the path")
+        hold_flags = tuple(
+            left == right
+            for left, right in zip(
+                self.source_indices,
+                self.source_indices[1:],
+            )
+        )
+        if any(
+            boundary.cut_applied == is_hold
+            for boundary, is_hold in zip(self.boundaries, hold_flags)
+        ):
+            raise ValueError("direct member cut/hold diagnostics differ from path")
+        maximum_holds = min(
+            self.config.maximum_same_source_hold_count,
+            int(
+                math.ceil(
+                    len(hold_flags)
+                    * self.config.maximum_same_source_hold_fraction
+                )
+            ),
+        )
+        if sum(hold_flags) > maximum_holds:
+            raise ValueError("direct member same-source hold budget exceeded")
+        consecutive_holds = 0
+        for is_hold in hold_flags:
+            consecutive_holds = consecutive_holds + 1 if is_hold else 0
+            if (
+                consecutive_holds
+                > self.config.maximum_consecutive_same_source_holds
+            ):
+                raise ValueError("direct member consecutive hold budget exceeded")
         if len(self.span_validity) != len(self.source_indices):
             raise ValueError("direct member span validity must match the path")
         if any(
@@ -982,6 +1043,12 @@ class DirectMemberVisualSelection:
         )
         return {
             "selected_boundary_count": len(self.boundaries),
+            "selected_cut_count": sum(
+                boundary.cut_applied for boundary in self.boundaries
+            ),
+            "same_source_hold_count": sum(
+                not boundary.cut_applied for boundary in self.boundaries
+            ),
             "cost": _distribution(
                 [boundary.mismatch.cost for boundary in self.boundaries]
             ),
@@ -1159,8 +1226,9 @@ class DirectMemberVisualSelection:
             ),
             "selection_objective": (
                 "minimum_real_boundary_geometry_mismatch_subject_to_"
-                "all_source_count_duration_no_adjacent_repeat_constraints_"
-                "plus_direction_agnostic_both_moving_endpoint_shape_soft_preference"
+                "all_source_count_duration_constraints_plus_bounded_safe_"
+                "same_source_no_cut_continuation_and_direction_agnostic_both_"
+                "moving_endpoint_shape_soft_preference"
             ),
             "selected_source_indices": list(self.source_indices),
             "distinct_source_count": len(set(self.source_indices)),
@@ -1192,6 +1260,10 @@ class DirectMemberVisualSelection:
                     self.source_indices,
                     self.source_indices[1:],
                 )
+            ),
+            "same_source_adjacent_policy": (
+                "bounded_no_cut_continuation_only_after_strict_cross_source_"
+                "path_failure"
             ),
             "same_source_nonadjacent_reuse_count": sum(
                 max(0, count - 1) for count in self.source_counts
@@ -4043,6 +4115,276 @@ def _balanced_quotas(
     return tuple(quotas)
 
 
+def _bounded_same_source_hold_visual_path(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    span_durations: Sequence[float],
+    config: DirectMemberVisualConfig,
+) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
+    """Find a safe all-source path with a small number of no-cut holds.
+
+    A same-source continuation is not a relaxed visual transition: no cut is
+    rendered at that boundary, so cross-source severe edges remain completely
+    ineligible.  The fallback is attempted only after the strict all-cut path
+    fails, preserves the exact balanced quotas and duration gate, and caps
+    both the total and consecutive holds so MEMBER edits retain normal cut
+    density even with four to six available fancams.
+    """
+
+    span_count = len(matrices) + 1
+    source_count = len(source_quotas)
+    durations = tuple(float(value) for value in span_durations)
+    if (
+        span_count < 2
+        or len(candidate_validity) != span_count
+        or len(durations) != span_count
+        or sum(int(value) for value in source_quotas) != span_count
+    ):
+        raise ValueError("same-source hold fallback shape is invalid")
+    boundary_count = span_count - 1
+    maximum_hold_count = min(
+        config.maximum_same_source_hold_count,
+        int(math.ceil(boundary_count * config.maximum_same_source_hold_fraction)),
+    )
+    if maximum_hold_count <= 0 or config.maximum_consecutive_same_source_holds <= 0:
+        return None
+    total_duration = sum(durations)
+    duration_targets = tuple(
+        total_duration * int(quota) / span_count for quota in source_quotas
+    )
+    future_valid_counts: list[tuple[int, ...]] = [
+        (0,) * source_count for _ in range(span_count + 1)
+    ]
+    for position in range(span_count - 1, -1, -1):
+        following = future_valid_counts[position + 1]
+        future_valid_counts[position] = tuple(
+            following[source_index]
+            + int(bool(candidate_validity[position][source_index]))
+            for source_index in range(source_count)
+        )
+
+    attempted_widths: list[int] = []
+    attempt_diagnostics: list[dict[str, Any]] = []
+    for width in _adaptive_beam_widths(
+        config.beam_width,
+        config.maximum_adaptive_beam_width,
+    ):
+        attempted_widths.append(width)
+        states: dict[
+            tuple[
+                tuple[int, ...],
+                int,
+                int,
+                int,
+                int,
+                tuple[float, ...],
+            ],
+            _BeamNode,
+        ] = {}
+        for source_index in source_order:
+            if not candidate_validity[0][source_index]:
+                continue
+            counts = [0] * source_count
+            counts[source_index] = 1
+            duration_totals = [0.0] * source_count
+            duration_totals[source_index] = durations[0]
+            cost = config.duration_balance_weight * (
+                durations[0] / duration_targets[source_index]
+            ) ** 2
+            states[
+                (
+                    tuple(counts),
+                    source_index,
+                    -1,
+                    0,
+                    0,
+                    _duration_signature(duration_totals),
+                )
+            ] = _BeamNode(cost, (source_index,), tuple(duration_totals))
+
+        pruned_state_count = 0
+        peak_generated_state_count = len(states)
+        failed_at_segment_index: int | None = None
+        for position in range(1, span_count):
+            matrix = matrices[position - 1]
+            next_states: dict[
+                tuple[
+                    tuple[int, ...],
+                    int,
+                    int,
+                    int,
+                    int,
+                    tuple[float, ...],
+                ],
+                _BeamNode,
+            ] = {}
+            for (
+                counts,
+                previous,
+                previous_previous,
+                hold_count,
+                consecutive_hold_count,
+                _duration_state,
+            ), node in states.items():
+                for source_index in source_order:
+                    if (
+                        not candidate_validity[position][source_index]
+                        or counts[source_index] >= source_quotas[source_index]
+                    ):
+                        continue
+                    is_hold = source_index == previous
+                    if is_hold:
+                        if (
+                            hold_count >= maximum_hold_count
+                            or consecutive_hold_count
+                            >= config.maximum_consecutive_same_source_holds
+                        ):
+                            continue
+                    elif matrix[previous][source_index].severe_flags:
+                        continue
+                    updated = list(counts)
+                    updated[source_index] += 1
+                    if any(
+                        source_quotas[index] - updated[index]
+                        > future_valid_counts[position + 1][index]
+                        for index in range(source_count)
+                    ):
+                        continue
+                    next_hold_count = hold_count + int(is_hold)
+                    next_consecutive = consecutive_hold_count + 1 if is_hold else 0
+                    transition_cost = (
+                        config.same_source_hold_penalty
+                        if is_hold
+                        else matrix[previous][source_index].cost
+                    )
+                    cost = node.cost + transition_cost
+                    if (
+                        not is_hold
+                        and source_index == previous_previous
+                    ):
+                        cost += config.ping_pong_penalty
+                    duration_totals = list(node.duration_totals)
+                    previous_duration = duration_totals[source_index]
+                    updated_duration = previous_duration + durations[position]
+                    duration_totals[source_index] = updated_duration
+                    target_duration = duration_targets[source_index]
+                    cost += config.duration_balance_weight * (
+                        (updated_duration / target_duration) ** 2
+                        - (previous_duration / target_duration) ** 2
+                    )
+                    path = node.path + (source_index,)
+                    key = (
+                        tuple(updated),
+                        source_index,
+                        previous,
+                        next_hold_count,
+                        next_consecutive,
+                        _duration_signature(duration_totals),
+                    )
+                    existing = next_states.get(key)
+                    if existing is None or (cost, path) < (
+                        existing.cost,
+                        existing.path,
+                    ):
+                        next_states[key] = _BeamNode(
+                            cost,
+                            path,
+                            tuple(duration_totals),
+                        )
+            peak_generated_state_count = max(
+                peak_generated_state_count,
+                len(next_states),
+            )
+            if not next_states:
+                states = {}
+                failed_at_segment_index = position
+                break
+            if len(next_states) > width:
+                pruned_state_count += len(next_states) - width
+                states = dict(
+                    sorted(
+                        next_states.items(),
+                        key=lambda item: (item[1].cost, item[1].path),
+                    )[:width]
+                )
+            else:
+                states = next_states
+
+        eligible: list[tuple[int, _BeamNode, tuple[float, ...]]] = []
+        for (
+            counts,
+            _last,
+            _previous,
+            hold_count,
+            _consecutive,
+            _duration_state,
+        ), node in states.items():
+            if counts != tuple(source_quotas):
+                continue
+            deviations = tuple(
+                abs(actual - target) / target
+                for actual, target in zip(
+                    node.duration_totals,
+                    duration_targets,
+                )
+            )
+            if (
+                max(deviations)
+                <= config.maximum_source_duration_relative_deviation + 1e-9
+            ):
+                eligible.append((hold_count, node, deviations))
+        attempt_diagnostics.append(
+            {
+                "beam_width": width,
+                "terminal_state_count": len(states),
+                "duration_eligible_path_count": len(eligible),
+                "pruned_state_count": pruned_state_count,
+                "peak_generated_state_count": peak_generated_state_count,
+                "failed_at_segment_index": failed_at_segment_index,
+            }
+        )
+        if eligible:
+            hold_count, best, deviations = min(
+                eligible,
+                key=lambda item: (
+                    item[1].cost,
+                    item[0],
+                    item[1].path,
+                ),
+            )
+            return (
+                best.path,
+                best.cost,
+                {
+                    "strategy": "bounded_safe_same_source_hold_fallback_v1",
+                    "selection_basis": "safe_no_cut_continuation_beam",
+                    "strict_cross_source_path_failed_first": True,
+                    "same_source_hold_count": hold_count,
+                    "maximum_same_source_hold_count": maximum_hold_count,
+                    "maximum_same_source_hold_fraction": (
+                        config.maximum_same_source_hold_fraction
+                    ),
+                    "maximum_consecutive_same_source_holds": (
+                        config.maximum_consecutive_same_source_holds
+                    ),
+                    "cross_source_severe_edge_count_selected": 0,
+                    "all_source_quotas_satisfied": True,
+                    "maximum_duration_relative_deviation": max(deviations),
+                    "visual_gates_relaxed": False,
+                    "attempted_beam_widths": attempted_widths,
+                    "attempts": attempt_diagnostics,
+                    "search_capacity_exhausted": False,
+                    "constraint_infeasibility_proven": False,
+                },
+            )
+        if pruned_state_count == 0:
+            break
+    return None
+
+
 def _balanced_visual_path(
     matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
     *,
@@ -4949,37 +5291,93 @@ def select_balanced_direct_member_sources(
             )
         )
     except DirectMemberVisualSelectionError as error:
-        # Persist the already-computed scalar evidence with every optimizer
-        # failure.  This is intentionally added here, where the complete
-        # 50x10 validity diagnostics still exist, so a failed run never needs
-        # another expensive frame-descriptor pass just to diagnose feasibility.
-        diagnostics = dict(error.diagnostics)
-        diagnostics.setdefault(
-            "span_content_validity",
-            [span.to_dict() for span in span_diagnostics],
+        strict_search = error.diagnostics.get("search")
+        strict_counterfactual = (
+            strict_search.get("severe_transition_counterfactual")
+            if isinstance(strict_search, Mapping)
+            else None
         )
-        diagnostics.setdefault("valid_count_by_source", valid_count_by_source)
-        diagnostics.setdefault(
-            "hard_boundary_connectivity",
-            hard_boundary_connectivity,
+        minimum_severe_count = (
+            strict_counterfactual.get("minimum_severe_transition_count")
+            if isinstance(strict_counterfactual, Mapping)
+            else None
         )
-        diagnostics.setdefault(
-            "source_quota_assignment",
-            quota_assignment_provenance,
+        hold_fallback_authorized = (
+            error.diagnostics.get("failure")
+            == "validity_quota_path_exhausted"
+            and error.diagnostics.get("constraint_infeasibility_proven") is True
+            and isinstance(minimum_severe_count, int)
+            and not isinstance(minimum_severe_count, bool)
+            and minimum_severe_count > 0
+            and strict_counterfactual.get("optimality_proven") is True
+            and strict_counterfactual.get("integrity_check_passed") is True
+            and strict_counterfactual.get("state_capacity_exhausted") is False
         )
-        diagnostics.setdefault(
-            "privacy",
-            {
-                "face_identity_inference_used": False,
-                "face_appearance_embeddings_persisted": False,
-                "raw_pose_silhouette_layout_embeddings_persisted": False,
-                "validity_evidence_is_scalar_only": True,
-            },
+        hold_fallback = (
+            _bounded_same_source_hold_visual_path(
+                matrices,
+                source_quotas=quotas,
+                source_order=order,
+                candidate_validity=candidate_validity,
+                span_durations=tuple(end - start for start, end in spans),
+                config=resolved_config,
+            )
+            if hold_fallback_authorized
+            else None
         )
-        raise DirectMemberVisualSelectionError(
-            str(error),
-            diagnostics,
-        ) from error
+        if hold_fallback is not None:
+            path, optimizer_cost, optimizer_search_diagnostics = hold_fallback
+            optimizer_search_diagnostics = {
+                **optimizer_search_diagnostics,
+                "strict_cross_source_failure": {
+                    "failure": error.diagnostics.get("failure"),
+                    "constraint_infeasibility_proven": error.diagnostics.get(
+                        "constraint_infeasibility_proven"
+                    ),
+                    "minimum_severe_transition_count": (
+                        strict_counterfactual.get(
+                            "minimum_severe_transition_count"
+                        )
+                        if isinstance(strict_counterfactual, Mapping)
+                        else None
+                    ),
+                    "diagnostic_sha256": _canonical_diagnostic_sha256(
+                        error.diagnostics
+                    ),
+                },
+            }
+        else:
+            # Persist the already-computed scalar evidence with every optimizer
+            # failure.  This is intentionally added here, where the complete
+            # 50x10 validity diagnostics still exist, so a failed run never needs
+            # another expensive frame-descriptor pass just to diagnose feasibility.
+            diagnostics = dict(error.diagnostics)
+            diagnostics.setdefault(
+                "span_content_validity",
+                [span.to_dict() for span in span_diagnostics],
+            )
+            diagnostics.setdefault("valid_count_by_source", valid_count_by_source)
+            diagnostics.setdefault(
+                "hard_boundary_connectivity",
+                hard_boundary_connectivity,
+            )
+            diagnostics.setdefault(
+                "source_quota_assignment",
+                quota_assignment_provenance,
+            )
+            diagnostics.setdefault(
+                "privacy",
+                {
+                    "face_identity_inference_used": False,
+                    "face_appearance_embeddings_persisted": False,
+                    "raw_pose_silhouette_layout_embeddings_persisted": False,
+                    "validity_evidence_is_scalar_only": True,
+                },
+            )
+            raise DirectMemberVisualSelectionError(
+                str(error),
+                diagnostics,
+            ) from error
     optimizer_search_diagnostics = {
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,
@@ -4998,7 +5396,26 @@ def select_balanced_direct_member_sources(
     for boundary_index, (outgoing_index, incoming_index) in enumerate(
         zip(path, path[1:])
     ):
-        mismatch = matrices[boundary_index][outgoing_index][incoming_index]
+        cut_applied = outgoing_index != incoming_index
+        mismatch = (
+            matrices[boundary_index][outgoing_index][incoming_index]
+            if cut_applied
+            else DirectBoundaryMismatch(
+                cost=0.0,
+                base_mismatch=0.0,
+                attention_position_mismatch=None,
+                attention_scale_mismatch=None,
+                dominant_pose_mismatch=None,
+                pose_basis=None,
+                formation_mismatch=None,
+                silhouette_mismatch=None,
+                person_layout_mismatch=None,
+                person_count_mismatch=None,
+                evidence_component_count=0,
+                warning_flags=(),
+                severe_flags=(),
+            )
+        )
         content_valid_pairs = tuple(
             (left, right)
             for left in range(source_count)
@@ -5018,7 +5435,7 @@ def select_balanced_direct_member_sources(
                 if not matrices[boundary_index][left][right].severe_flags
             ),
         )
-        if not ranked_pairs:
+        if cut_applied and not ranked_pairs:
             raise DirectMemberVisualSelectionError(
                 "selected direct visual boundary has no eligible diagnostic pairs",
                 {
@@ -5030,12 +5447,19 @@ def select_balanced_direct_member_sources(
                     "severe_pair_count": severe_pair_count,
                 },
             )
-        selected_rank = next(
-            rank
-            for rank, (_cost, left, right) in enumerate(ranked_pairs, start=1)
-            if left == outgoing_index and right == incoming_index
+        selected_rank = (
+            next(
+                rank
+                for rank, (_cost, left, right) in enumerate(
+                    ranked_pairs,
+                    start=1,
+                )
+                if left == outgoing_index and right == incoming_index
+            )
+            if cut_applied
+            else 0
         )
-        minimum_cost = ranked_pairs[0][0]
+        minimum_cost = ranked_pairs[0][0] if ranked_pairs else 0.0
         diagnostics.append(
             DirectBoundaryVisualDiagnostic(
                 boundary_index=boundary_index,
@@ -5053,11 +5477,15 @@ def select_balanced_direct_member_sources(
                 ),
                 severe_pair_count=severe_pair_count,
                 minimum_pair_cost=minimum_cost,
-                selected_pair_cost_delta=mismatch.cost - minimum_cost,
+                selected_pair_cost_delta=(
+                    mismatch.cost - minimum_cost if cut_applied else 0.0
+                ),
                 ping_pong_penalty_applied=(
-                    boundary_index >= 1
+                    cut_applied
+                    and boundary_index >= 1
                     and incoming_index == path[boundary_index - 1]
                 ),
+                cut_applied=cut_applied,
             )
         )
     return DirectMemberVisualSelection(
