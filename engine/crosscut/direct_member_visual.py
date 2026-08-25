@@ -14,8 +14,10 @@ appearance embedding or named identity inference is used.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 import heapq
+import json
 import math
 from pathlib import Path
 from statistics import median
@@ -88,6 +90,8 @@ class DirectMemberVisualConfig:
     minimum_human_sample_count: int = 2
     minimum_acceptable_quality_score: float = 0.72
     minimum_acceptable_quality_sample_count: int = 5
+    portrait_fancam_quality_rescue_mean_minimum: float = 0.50
+    portrait_fancam_quality_rescue_contrast_minimum: float = 0.18
     foreground_obstruction_rejection_score: float = 0.85
     terminal_composite_exit_quality_maximum: float = 0.50
     terminal_composite_pre_exit_quality_maximum: float = 0.90
@@ -101,6 +105,11 @@ class DirectMemberVisualConfig:
     persistent_entry_overexposure_highlight_minimum: float = 0.20
     require_entry_exit_human_evidence: bool = True
     native_scene_cut_boundary_tolerance_seconds: float = 1.0 / 29.97
+    portrait_fancam_scene_cut_continuity_window_seconds: float = 0.10
+    portrait_fancam_scene_cut_continuity_structure_maximum: float = 0.18
+    portrait_fancam_scene_cut_post_graphic_quality_maximum: float = 0.20
+    portrait_fancam_scene_cut_post_graphic_gray_mean_minimum: float = 0.90
+    portrait_fancam_scene_cut_post_graphic_contrast_maximum: float = 0.12
     blank_gray_std_maximum: float = 0.045
     blank_extreme_mean_minimum: float = 0.05
     blank_extreme_mean_maximum: float = 0.95
@@ -145,6 +154,8 @@ class DirectMemberVisualConfig:
             self.duration_balance_weight,
             self.maximum_source_duration_relative_deviation,
             self.minimum_acceptable_quality_score,
+            self.portrait_fancam_quality_rescue_mean_minimum,
+            self.portrait_fancam_quality_rescue_contrast_minimum,
             self.foreground_obstruction_rejection_score,
             self.terminal_composite_exit_quality_maximum,
             self.terminal_composite_pre_exit_quality_maximum,
@@ -157,6 +168,11 @@ class DirectMemberVisualConfig:
             self.persistent_entry_overexposure_gray_contrast_maximum,
             self.persistent_entry_overexposure_highlight_minimum,
             self.native_scene_cut_boundary_tolerance_seconds,
+            self.portrait_fancam_scene_cut_continuity_window_seconds,
+            self.portrait_fancam_scene_cut_continuity_structure_maximum,
+            self.portrait_fancam_scene_cut_post_graphic_quality_maximum,
+            self.portrait_fancam_scene_cut_post_graphic_gray_mean_minimum,
+            self.portrait_fancam_scene_cut_post_graphic_contrast_maximum,
             self.blank_gray_std_maximum,
             self.blank_extreme_mean_minimum,
             self.blank_extreme_mean_maximum,
@@ -262,6 +278,8 @@ class DirectMemberVisualConfig:
             self.total_mismatch_severe,
             self.maximum_source_duration_relative_deviation,
             self.minimum_acceptable_quality_score,
+            self.portrait_fancam_quality_rescue_mean_minimum,
+            self.portrait_fancam_quality_rescue_contrast_minimum,
             self.foreground_obstruction_rejection_score,
             self.minimum_adjacent_motion_magnitude,
             self.motion_connection_preference_weight,
@@ -275,6 +293,10 @@ class DirectMemberVisualConfig:
             self.persistent_entry_overexposure_gray_mean_minimum,
             self.persistent_entry_overexposure_gray_contrast_maximum,
             self.persistent_entry_overexposure_highlight_minimum,
+            self.portrait_fancam_scene_cut_continuity_structure_maximum,
+            self.portrait_fancam_scene_cut_post_graphic_quality_maximum,
+            self.portrait_fancam_scene_cut_post_graphic_gray_mean_minimum,
+            self.portrait_fancam_scene_cut_post_graphic_contrast_maximum,
         ):
             if value > 1.0:
                 raise ValueError("direct member visual thresholds must be at most 1")
@@ -386,6 +408,23 @@ class DirectMemberVisualConfig:
                 "minimum_acceptable_quality_sample_count": (
                     self.minimum_acceptable_quality_sample_count
                 ),
+                "continuous_official_portrait_fancam_quality_rescue": {
+                    "scope": (
+                        "exact_pipeline_verified_official_target_member_"
+                        "portrait_fancam_contract_only"
+                    ),
+                    "minimum_mean_quality": (
+                        self.portrait_fancam_quality_rescue_mean_minimum
+                    ),
+                    "minimum_every_sample_gray_contrast": (
+                        self.portrait_fancam_quality_rescue_contrast_minimum
+                    ),
+                    "required_human_samples": _DIRECT_CONTENT_SAMPLE_COUNT,
+                    "required_verified_yunet_face_samples": 1,
+                    "requires_no_obstruction_blank_composite_or_"
+                    "persistent_overexposure": True,
+                    "generic_quality_threshold_lowered": False,
+                },
                 "foreground_obstruction_rejection_score": (
                     self.foreground_obstruction_rejection_score
                 ),
@@ -435,11 +474,35 @@ class DirectMemberVisualConfig:
                 "require_entry_exit_human_evidence": (
                     self.require_entry_exit_human_evidence
                 ),
-                "native_scene_cut_policy": (
-                    "hard_reject_source_native_cut_strictly_inside_"
-                    "coarsened_span_after_one_output_frame_"
-                    "boundary_quantization_tolerance"
-                ),
+                "native_scene_cut_policy": {
+                    "default": (
+                        "hard_reject_source_native_cut_strictly_inside_"
+                        "coarsened_span_after_one_output_frame_"
+                        "boundary_quantization_tolerance"
+                    ),
+                    "continuous_official_portrait_fancam_exception": (
+                        "suppress_only_when_four_flank_frames_preserve_"
+                        "human_performance_and_low_structure_delta_with_"
+                        "no_obstruction_or_persistent_post_cut_graphic"
+                    ),
+                    "continuity_window_seconds": (
+                        self.portrait_fancam_scene_cut_continuity_window_seconds
+                    ),
+                    "continuity_structure_mismatch_maximum": (
+                        self.portrait_fancam_scene_cut_continuity_structure_maximum
+                    ),
+                    "persistent_post_graphic_quality_maximum": (
+                        self.portrait_fancam_scene_cut_post_graphic_quality_maximum
+                    ),
+                    "persistent_post_graphic_gray_mean_minimum": (
+                        self.portrait_fancam_scene_cut_post_graphic_gray_mean_minimum
+                    ),
+                    "persistent_post_graphic_contrast_maximum": (
+                        self.portrait_fancam_scene_cut_post_graphic_contrast_maximum
+                    ),
+                    "identity_tracking_used": False,
+                    "uncertain_evidence_effect": "retain_hard_reject",
+                },
                 "native_scene_cut_boundary_tolerance_seconds": (
                     self.native_scene_cut_boundary_tolerance_seconds
                 ),
@@ -628,6 +691,8 @@ class DirectSpanSourceValidity:
     static_visual_candidate: bool
     native_scene_cut_source_seconds: tuple[float, ...]
     native_scene_cut_master_seconds: tuple[float, ...]
+    suppressed_portrait_fancam_scene_cut_source_seconds: tuple[float, ...]
+    suppressed_portrait_fancam_scene_cut_master_seconds: tuple[float, ...]
     maximum_structure_mismatch: float | None
     maximum_color_mismatch: float | None
     mean_quality_score: float | None
@@ -639,6 +704,7 @@ class DirectSpanSourceValidity:
     persistent_entry_overexposure_candidate: bool
     gray_mean_sample_scores: tuple[float | None, ...]
     highlight_clipping_sample_scores: tuple[float, ...]
+    portrait_fancam_lighting_quality_rescue_applied: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -657,6 +723,12 @@ class DirectSpanSourceValidity:
             ),
             "native_scene_cut_master_seconds": list(
                 self.native_scene_cut_master_seconds
+            ),
+            "suppressed_portrait_fancam_scene_cut_source_seconds": list(
+                self.suppressed_portrait_fancam_scene_cut_source_seconds
+            ),
+            "suppressed_portrait_fancam_scene_cut_master_seconds": list(
+                self.suppressed_portrait_fancam_scene_cut_master_seconds
             ),
             "maximum_structure_mismatch": self.maximum_structure_mismatch,
             "maximum_color_mismatch": self.maximum_color_mismatch,
@@ -680,6 +752,9 @@ class DirectSpanSourceValidity:
             "gray_mean_sample_scores": list(self.gray_mean_sample_scores),
             "highlight_clipping_sample_scores": list(
                 self.highlight_clipping_sample_scores
+            ),
+            "portrait_fancam_lighting_quality_rescue_applied": (
+                self.portrait_fancam_lighting_quality_rescue_applied
             ),
             "samples": [sample.to_dict() for sample in self.samples],
             "raw_embeddings_persisted": False,
@@ -816,6 +891,7 @@ class DirectMemberVisualSelection:
     sample_count: int
     failed_sample_count: int
     native_scene_cut_evidence_available: bool
+    continuous_official_portrait_fancam_contract: bool
     config: DirectMemberVisualConfig
     optimizer_search_diagnostics: dict[str, Any] = field(default_factory=dict)
 
@@ -1022,6 +1098,18 @@ class DirectMemberVisualSelection:
                     for span in self.span_validity
                     for source in span.sources
                 ),
+                "suppressed_portrait_fancam_scene_cut_count": sum(
+                    len(
+                        source.suppressed_portrait_fancam_scene_cut_master_seconds
+                    )
+                    for span in self.span_validity
+                    for source in span.sources
+                ),
+                "portrait_fancam_lighting_quality_rescue_count": sum(
+                    source.portrait_fancam_lighting_quality_rescue_applied
+                    for span in self.span_validity
+                    for source in span.sources
+                ),
                 "rejection_reason_counts": dict(sorted(validity_reasons.items())),
                 "minimum_valid_source_count_per_span": min(
                     sum(source.valid for source in span.sources)
@@ -1118,6 +1206,9 @@ class DirectMemberVisualSelection:
             "native_scene_cut_evidence": {
                 "available": self.native_scene_cut_evidence_available,
                 "policy_applied": self.native_scene_cut_evidence_available,
+                "continuous_official_portrait_fancam_contract": (
+                    self.continuous_official_portrait_fancam_contract
+                ),
             },
             "config": self.config.to_dict(),
             "aggregate": self.aggregate_diagnostics(),
@@ -1314,11 +1405,91 @@ def _sample_is_blank_or_flat(
     return flat or extreme
 
 
+def _continuous_portrait_fancam_scene_cut_is_transient_artifact(
+    descriptors: tuple[
+        FrameVisualDescriptor | None,
+        FrameVisualDescriptor | None,
+        FrameVisualDescriptor | None,
+        FrameVisualDescriptor | None,
+        FrameVisualDescriptor | None,
+    ],
+    config: DirectMemberVisualConfig,
+) -> bool:
+    """Return true only for a corroborated continuous-performance pseudo-cut.
+
+    The five descriptors are far-before, one-frame-before, detector frame,
+    one-frame-after, and far-after.  This exception is intentionally narrower
+    than scene detection: every flank must retain non-identifying human
+    geometry, the persistent far-side structure must remain close, no sampled
+    camera-equipment obstruction may be present, and the post side must not be
+    a persistent bright broadcast graphic.  Missing or ambiguous evidence
+    therefore keeps the raw source cut as a hard rejection.
+    """
+
+    before_far, before_near, _detector_frame, after_near, after_far = descriptors
+    flank_descriptors = (before_far, before_near, after_near, after_far)
+    if any(descriptor is None for descriptor in flank_descriptors):
+        return False
+    flank_samples = tuple(
+        _BoundarySample(
+            master_seconds=0.0,
+            source_local_seconds=0.0,
+            descriptor=descriptor,
+            attention=_attention_geometry(descriptor),
+        )
+        for descriptor in flank_descriptors
+    )
+    if not all(
+        _sample_has_human_evidence(sample, config) for sample in flank_samples
+    ):
+        return False
+    if any(
+        descriptor is not None
+        and descriptor.foreground_obstruction_score
+        >= config.foreground_obstruction_rejection_score
+        for descriptor in descriptors
+    ):
+        return False
+    assert before_far is not None and after_far is not None
+    structure_mismatch = _embedding_distance(
+        before_far.structure_embedding,
+        after_far.structure_embedding,
+    )
+    if (
+        structure_mismatch is None
+        or structure_mismatch
+        > config.portrait_fancam_scene_cut_continuity_structure_maximum
+    ):
+        return False
+
+    def _persistent_bright_graphic(
+        descriptor: FrameVisualDescriptor | None,
+    ) -> bool:
+        if descriptor is None or len(descriptor.color_embedding) < 8:
+            return False
+        return bool(
+            descriptor.quality_score
+            <= config.portrait_fancam_scene_cut_post_graphic_quality_maximum
+            and float(descriptor.color_embedding[6])
+            >= config.portrait_fancam_scene_cut_post_graphic_gray_mean_minimum
+            and float(descriptor.color_embedding[7])
+            <= config.portrait_fancam_scene_cut_post_graphic_contrast_maximum
+        )
+
+    if _persistent_bright_graphic(after_near) and _persistent_bright_graphic(
+        after_far
+    ):
+        return False
+    return True
+
+
 def _span_source_validity(
     *,
     source_index: int,
     samples: tuple[_BoundarySample, ...],
     native_scene_cuts: tuple[tuple[float, float], ...],
+    suppressed_portrait_fancam_scene_cuts: tuple[tuple[float, float], ...],
+    continuous_official_portrait_fancam_contract: bool,
     config: DirectMemberVisualConfig,
 ) -> DirectSpanSourceValidity:
     descriptors = tuple(
@@ -1326,6 +1497,7 @@ def _span_source_validity(
     )
     human = tuple(_sample_has_human_evidence(sample, config) for sample in samples)
     blank = tuple(_sample_is_blank_or_flat(sample, config) for sample in samples)
+    blank_count = sum(blank)
     structure_distances = tuple(
         value
         for left, right in zip(descriptors, descriptors[1:])
@@ -1443,11 +1615,44 @@ def _span_source_validity(
             >= config.persistent_entry_overexposure_highlight_minimum
             for index in range(2)
         )
+    mean_quality = sum(quality) / len(quality) if quality else None
+    # ``quality_score`` is a generic sharpness/exposure/contrast aesthetic
+    # score.  It is not, by itself, proof that an intentionally dark or bright
+    # music-show frame is unusable.  Only the exact verified continuous
+    # portrait-fancam acquisition contract may rescue that one reason, and
+    # only when all six samples independently preserve a detailed human
+    # performance with a YuNet face and none of the stronger invalid-content
+    # gates fire.  Generic/manual sources retain the original 0.72/5-of-6 gate.
+    portrait_fancam_lighting_quality_rescue = bool(
+        continuous_official_portrait_fancam_contract
+        and acceptable_quality_count
+        < config.minimum_acceptable_quality_sample_count
+        and len(samples) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and len(descriptors) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and human_count == _DIRECT_CONTENT_SAMPLE_COUNT
+        and face_evidence_count >= max(1, config.minimum_face_sample_count)
+        and mean_quality is not None
+        and mean_quality
+        >= config.portrait_fancam_quality_rescue_mean_minimum
+        and len(gray_contrast_scores) == _DIRECT_CONTENT_SAMPLE_COUNT
+        and all(
+            value is not None
+            and float(value)
+            >= config.portrait_fancam_quality_rescue_contrast_minimum
+            for value in gray_contrast_scores
+        )
+        and obstruction_count == 0
+        and blank_count == 0
+        and not terminal_composite
+        and not persistent_entry_overexposure
+        and not native_scene_cuts
+    )
     if face_evidence_count < config.minimum_face_sample_count:
         reasons.append("no_face_performance_evidence")
     if (
         acceptable_quality_count
         < config.minimum_acceptable_quality_sample_count
+        and not portrait_fancam_lighting_quality_rescue
     ):
         reasons.append("persistent_low_visual_quality_or_foreground_obstruction")
     if obstruction_count:
@@ -1465,7 +1670,6 @@ def _span_source_validity(
             reasons.append("no_person_at_span_entry")
         if not human[-1]:
             reasons.append("no_person_at_span_exit")
-    blank_count = sum(blank)
     if blank_count:
         reasons.append("blank_or_flat_frame")
     # Pose/person/silhouette models can fire on large logo shapes.  A static
@@ -1494,9 +1698,21 @@ def _span_source_validity(
         native_scene_cut_master_seconds=tuple(
             master_seconds for _source_seconds, master_seconds in native_scene_cuts
         ),
+        suppressed_portrait_fancam_scene_cut_source_seconds=tuple(
+            source_seconds
+            for source_seconds, _master_seconds in (
+                suppressed_portrait_fancam_scene_cuts
+            )
+        ),
+        suppressed_portrait_fancam_scene_cut_master_seconds=tuple(
+            master_seconds
+            for _source_seconds, master_seconds in (
+                suppressed_portrait_fancam_scene_cuts
+            )
+        ),
         maximum_structure_mismatch=maximum_structure,
         maximum_color_mismatch=maximum_color,
-        mean_quality_score=(sum(quality) / len(quality) if quality else None),
+        mean_quality_score=mean_quality,
         quality_sample_scores=quality,
         foreground_obstruction_sample_count=obstruction_count,
         foreground_obstruction_sample_scores=obstruction_scores,
@@ -1507,6 +1723,9 @@ def _span_source_validity(
         ),
         gray_mean_sample_scores=gray_mean_scores,
         highlight_clipping_sample_scores=highlight_clipping_scores,
+        portrait_fancam_lighting_quality_rescue_applied=(
+            portrait_fancam_lighting_quality_rescue
+        ),
     )
 
 
@@ -2083,6 +2302,7 @@ class _FeasibilityLifelineResult:
     memoized_failed_state_count: int
     state_capacity_exhausted: bool
     root_candidate_diagnostics: tuple[dict[str, Any], ...]
+    admissible_pruning_diagnostics: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2092,6 +2312,9 @@ class _FeasibilityLifelineResult:
             "memoized_failed_state_count": self.memoized_failed_state_count,
             "state_capacity_exhausted": self.state_capacity_exhausted,
             "duration_state_quantization_applied": False,
+            "admissible_pruning": dict(
+                self.admissible_pruning_diagnostics
+            ),
             "root_candidate_diagnostics": [
                 dict(item) for item in self.root_candidate_diagnostics
             ],
@@ -2302,6 +2525,11 @@ def _exact_feasibility_lifeline(
     duration_targets: Sequence[float],
     state_limit: int,
     config: DirectMemberVisualConfig,
+    severe_transition_budget_mask: (
+        Sequence[Sequence[Sequence[bool]]] | None
+    ) = None,
+    minimum_severe_transition_count: int | None = None,
+    maximum_severe_transition_count: int | None = None,
 ) -> _FeasibilityLifelineResult:
     """Find one exact hard-feasible path without lossy beam pruning.
 
@@ -2309,12 +2537,56 @@ def _exact_feasibility_lifeline(
     predecessor immediately.  The memo key retains exact duration totals;
     unlike the quality beam, it applies no rounded duration signature.  A
     capacity hit is reported as search exhaustion and never mislabeled as
-    constraint infeasibility.
+    constraint infeasibility.  When both severe bounds are equal, the search
+    requires exactly that many original severe edges; iterative-deepening
+    callers may do this only after every lower count has been proved hard
+    infeasible.
     """
+
+    if (severe_transition_budget_mask is None) != (
+        maximum_severe_transition_count is None
+    ):
+        raise ValueError(
+            "severe transition budget mask and maximum must be supplied together"
+        )
+    if maximum_severe_transition_count is not None and (
+        isinstance(maximum_severe_transition_count, bool)
+        or not isinstance(maximum_severe_transition_count, int)
+        or maximum_severe_transition_count < 0
+    ):
+        raise ValueError("maximum severe transition count must be non-negative")
+    if minimum_severe_transition_count is not None and (
+        severe_transition_budget_mask is None
+        or isinstance(minimum_severe_transition_count, bool)
+        or not isinstance(minimum_severe_transition_count, int)
+        or minimum_severe_transition_count < 0
+        or minimum_severe_transition_count
+        > int(maximum_severe_transition_count)
+    ):
+        raise ValueError(
+            "minimum severe transition count requires a valid bounded budget"
+        )
 
     span_count = len(candidate_validity)
     source_count = len(source_quotas)
-    maximum_quota = max(int(value) for value in source_quotas)
+    severe_budget_mask = (
+        None
+        if severe_transition_budget_mask is None
+        else tuple(
+            tuple(tuple(bool(value) for value in row) for row in matrix)
+            for matrix in severe_transition_budget_mask
+        )
+    )
+    if severe_budget_mask is not None and (
+        len(severe_budget_mask) != len(matrices)
+        or any(len(matrix) != source_count for matrix in severe_budget_mask)
+        or any(
+            len(row) != source_count
+            for matrix in severe_budget_mask
+            for row in matrix
+        )
+    ):
+        raise ValueError("severe transition budget mask shape is invalid")
     prefix_valid_counts: list[tuple[int, ...]] = [(0,) * source_count]
     for position in range(span_count):
         previous = prefix_valid_counts[-1]
@@ -2325,23 +2597,76 @@ def _exact_feasibility_lifeline(
                 for source_index in range(source_count)
             )
         )
-    prefix_duration_bounds: list[tuple[tuple[float, float], ...]] = []
-    for position in range(span_count + 1):
-        ordered = sorted(float(value) for value in durations[:position])
-        # These are deliberately optimistic necessary bounds: they ignore
-        # content validity, adjacency, and severe-edge restrictions.  The
-        # smallest/largest N durations from the entire remaining prefix can
-        # only widen the achievable interval, so this check cannot discard a
-        # duration-feasible assignment.
-        prefix_duration_bounds.append(
-            tuple(
-                (
-                    sum(ordered[:count]),
-                    sum(ordered[-count:]) if count else 0.0,
-                )
-                for count in range(maximum_quota + 1)
+
+    def _merge_duration_bound(
+        values: dict[int, tuple[float, float]],
+        count: int,
+        minimum_value: float,
+        maximum_value: float,
+    ) -> None:
+        previous = values.get(count)
+        if previous is None:
+            values[count] = (minimum_value, maximum_value)
+        else:
+            values[count] = (
+                min(previous[0], minimum_value),
+                max(previous[1], maximum_value),
             )
-        )
+
+    # For each source and prefix, compute the exact minimum/maximum duration
+    # obtainable by choosing N content-valid, non-adjacent positions.  The
+    # second map additionally requires the final prefix position to remain
+    # unselected, which is mandatory when the already-fixed suffix starts with
+    # the same source.  These are single-source relaxations of the complete
+    # assignment problem: every real completion is represented, while other
+    # sources and transition edges are deliberately ignored.  Their bounds are
+    # therefore admissible necessary conditions and use the original floats.
+    source_prefix_duration_bounds: list[
+        list[
+            tuple[
+                dict[int, tuple[float, float]],
+                dict[int, tuple[float, float]],
+            ]
+        ]
+    ] = []
+    for source_index in range(source_count):
+        unselected: dict[int, tuple[float, float]] = {0: (0.0, 0.0)}
+        selected: dict[int, tuple[float, float]] = {}
+        levels = [(dict(unselected), dict(unselected))]
+        for position, duration in enumerate(durations):
+            next_unselected: dict[int, tuple[float, float]] = {}
+            for count, (minimum_value, maximum_value) in (
+                list(unselected.items()) + list(selected.items())
+            ):
+                _merge_duration_bound(
+                    next_unselected,
+                    count,
+                    minimum_value,
+                    maximum_value,
+                )
+            next_selected: dict[int, tuple[float, float]] = {}
+            if candidate_validity[position][source_index]:
+                for count, (minimum_value, maximum_value) in unselected.items():
+                    _merge_duration_bound(
+                        next_selected,
+                        count + 1,
+                        minimum_value + float(duration),
+                        maximum_value + float(duration),
+                    )
+            unselected = next_unselected
+            selected = next_selected
+            unrestricted: dict[int, tuple[float, float]] = {}
+            for count, (minimum_value, maximum_value) in (
+                list(unselected.items()) + list(selected.items())
+            ):
+                _merge_duration_bound(
+                    unrestricted,
+                    count,
+                    minimum_value,
+                    maximum_value,
+                )
+            levels.append((unrestricted, dict(unselected)))
+        source_prefix_duration_bounds.append(levels)
     lower_duration = tuple(
         target * (1.0 - config.maximum_source_duration_relative_deviation)
         for target in duration_targets
@@ -2352,10 +2677,316 @@ def _exact_feasibility_lifeline(
     )
     order_rank = {source_index: rank for rank, source_index in enumerate(source_order)}
     failed_states: set[
-        tuple[int, tuple[int, ...], int, tuple[float, ...]]
+        tuple[int, tuple[int, ...], int, tuple[float, ...], int]
     ] = set()
     explored_state_count = 0
     capacity_exhausted = False
+    prefix_prune_reason_counts: Counter[str] = Counter()
+
+    # This DP is an exact relaxation of the remaining prefix: it preserves
+    # candidate validity, quotas, no-repeat adjacency, and the original severe
+    # edge budget, while intentionally omitting duration constraints.  All
+    # exact-float duration states sharing one discrete prefix state can reuse
+    # its answer.  ``False`` is therefore an admissible prune.  If this helper
+    # reaches its own finite state cap, it returns ``None`` and the full search
+    # continues unchanged; capacity can never be mistaken for infeasibility.
+    structural_prefix_memo: dict[
+        tuple[int, tuple[int, ...], int, int, int], bool
+    ] = {}
+    structural_prefix_state_limit = state_limit
+    structural_prefix_state_count = 0
+    structural_prefix_memo_hit_count = 0
+    structural_prefix_query_count = 0
+    structural_prefix_infeasible_pruned_state_count = 0
+    structural_prefix_state_capacity_exhausted = False
+
+    def _structural_edge_severe_cost(
+        boundary_index: int,
+        outgoing_source: int,
+        incoming_source: int,
+    ) -> int | None:
+        if severe_budget_mask is None:
+            return (
+                None
+                if matrices[boundary_index][outgoing_source][
+                    incoming_source
+                ].severe_flags
+                else 0
+            )
+        return int(
+            severe_budget_mask[boundary_index][outgoing_source][
+                incoming_source
+            ]
+        )
+
+    # Precompute two uncapped, finite relaxations of every backward prefix
+    # state.  Both retain content validity, no-repeat adjacency, edge
+    # direction, and the original severe-edge cost exactly while omitting
+    # duration and (for the subset envelope) individual source quotas.
+    #
+    # ``layered_severe_reachability[position][current]`` is a bitset of every
+    # exact severe count attainable by a valid prefix of ``position`` slots
+    # ending immediately before ``current``.  The subset table additionally
+    # records, for every source subset and exact severe count, the maximum
+    # number of prefix slots that can belong to that subset.  A real completion
+    # must appear in both relaxations, so a missing count or insufficient
+    # subset capacity is an admissible proof of infeasibility.
+    layered_requested_maximum_severe_count = (
+        0
+        if maximum_severe_transition_count is None
+        else int(maximum_severe_transition_count)
+    )
+    layered_severe_edge_count_upper_bound = max(0, span_count - 1)
+    layered_maximum_severe_count = min(
+        layered_requested_maximum_severe_count,
+        layered_severe_edge_count_upper_bound,
+    )
+    layered_severe_bit_limit = (
+        1 << (layered_maximum_severe_count + 1)
+    ) - 1
+    layered_severe_reachability: list[tuple[int, ...]] = [
+        (1,) * source_count
+    ]
+    layered_subset_source_count_limit = 12
+    layered_subset_projected_cell_limit = 1_000_000
+    layered_subset_projected_work_limit = 10_000_000
+    layered_subset_projected_subset_count = (
+        1 << source_count
+        if source_count <= layered_subset_source_count_limit
+        else None
+    )
+    layered_subset_projected_cell_count = (
+        span_count
+        * source_count
+        * (layered_maximum_severe_count + 1)
+        * layered_subset_projected_subset_count
+        if layered_subset_projected_subset_count is not None
+        else None
+    )
+    layered_subset_projected_work_count = (
+        max(0, span_count - 1)
+        * source_count
+        * max(0, source_count - 1)
+        * (layered_maximum_severe_count + 1)
+        * layered_subset_projected_subset_count
+        if layered_subset_projected_subset_count is not None
+        else None
+    )
+    if source_count > layered_subset_source_count_limit:
+        layered_subset_disabled_reason = "source_count_limit_exceeded"
+    elif (
+        int(layered_subset_projected_cell_count)
+        > layered_subset_projected_cell_limit
+    ):
+        layered_subset_disabled_reason = "projected_cell_limit_exceeded"
+    elif (
+        int(layered_subset_projected_work_count)
+        > layered_subset_projected_work_limit
+    ):
+        layered_subset_disabled_reason = "projected_work_limit_exceeded"
+    else:
+        layered_subset_disabled_reason = None
+    layered_subset_quota_enabled = layered_subset_disabled_reason is None
+    layered_subset_count = (
+        int(layered_subset_projected_subset_count)
+        if layered_subset_quota_enabled
+        else 0
+    )
+    layered_subset_membership: tuple[tuple[int, ...], ...] = (
+        tuple(
+            tuple(
+                int(bool(subset_mask & (1 << source_index)))
+                for subset_mask in range(layered_subset_count)
+            )
+            for source_index in range(source_count)
+        )
+        if layered_subset_quota_enabled
+        else ()
+    )
+    layered_subset_quota_maxima: list[
+        tuple[tuple[tuple[int, ...], ...], ...]
+    ] = []
+    if layered_subset_quota_enabled:
+        unreachable_subset_row = (-1,) * layered_subset_count
+        zero_subset_row = (0,) * layered_subset_count
+        layered_subset_quota_maxima.append(
+            tuple(
+                tuple(
+                    zero_subset_row
+                    if severe_count == 0
+                    else unreachable_subset_row
+                    for severe_count in range(
+                        layered_maximum_severe_count + 1
+                    )
+                )
+                for _current_source in range(source_count)
+            )
+        )
+
+    # A search state never has more than ``span_count - 1`` unassigned prefix
+    # positions because its current source already owns the following span.
+    for position in range(1, span_count):
+        preceding_position = position - 1
+        previous_reachability = layered_severe_reachability[-1]
+        next_reachability: list[int] = []
+        previous_subset_level = (
+            layered_subset_quota_maxima[-1]
+            if layered_subset_quota_enabled
+            else ()
+        )
+        next_subset_level: list[tuple[tuple[int, ...], ...]] = []
+        for current_source in range(source_count):
+            exact_reachability_bits = 0
+            subset_rows = (
+                [
+                    [-1] * layered_subset_count
+                    for _severe_count in range(
+                        layered_maximum_severe_count + 1
+                    )
+                ]
+                if layered_subset_quota_enabled
+                else []
+            )
+            for preceding_source in range(source_count):
+                if (
+                    preceding_source == current_source
+                    or not candidate_validity[preceding_position][
+                        preceding_source
+                    ]
+                ):
+                    continue
+                edge_cost = _structural_edge_severe_cost(
+                    preceding_position,
+                    preceding_source,
+                    current_source,
+                )
+                if edge_cost is None:
+                    continue
+                exact_reachability_bits |= (
+                    previous_reachability[preceding_source] << edge_cost
+                ) & layered_severe_bit_limit
+                if not layered_subset_quota_enabled:
+                    continue
+                membership = layered_subset_membership[preceding_source]
+                preceding_rows = previous_subset_level[preceding_source]
+                for preceding_severe_count in range(
+                    layered_maximum_severe_count - edge_cost + 1
+                ):
+                    preceding_row = preceding_rows[
+                        preceding_severe_count
+                    ]
+                    if preceding_row[0] < 0:
+                        continue
+                    target_row = subset_rows[
+                        preceding_severe_count + edge_cost
+                    ]
+                    for subset_mask in range(layered_subset_count):
+                        candidate_count = (
+                            preceding_row[subset_mask]
+                            + membership[subset_mask]
+                        )
+                        if candidate_count > target_row[subset_mask]:
+                            target_row[subset_mask] = candidate_count
+            next_reachability.append(exact_reachability_bits)
+            if layered_subset_quota_enabled:
+                next_subset_level.append(
+                    tuple(tuple(row) for row in subset_rows)
+                )
+        layered_severe_reachability.append(tuple(next_reachability))
+        if layered_subset_quota_enabled:
+            layered_subset_quota_maxima.append(tuple(next_subset_level))
+
+    layered_severe_reachability_query_count = 0
+    layered_severe_reachability_pruned_state_count = 0
+    layered_subset_quota_query_count = 0
+    layered_subset_quota_pruned_state_count = 0
+    layered_subset_quota_pruned_mask_counts: Counter[int] = Counter()
+
+    def _structural_prefix_feasible(
+        position: int,
+        deficits: tuple[int, ...],
+        current_source: int,
+        remaining_minimum_severe_count: int,
+        remaining_maximum_severe_count: int,
+    ) -> bool | None:
+        nonlocal structural_prefix_state_count
+        nonlocal structural_prefix_memo_hit_count
+        nonlocal structural_prefix_state_capacity_exhausted
+        key = (
+            position,
+            deficits,
+            current_source,
+            remaining_minimum_severe_count,
+            remaining_maximum_severe_count,
+        )
+        cached = structural_prefix_memo.get(key)
+        if cached is not None:
+            structural_prefix_memo_hit_count += 1
+            return cached
+        if structural_prefix_state_capacity_exhausted:
+            return None
+        if structural_prefix_state_count >= structural_prefix_state_limit:
+            structural_prefix_state_capacity_exhausted = True
+            return None
+        structural_prefix_state_count += 1
+        if (
+            remaining_maximum_severe_count < 0
+            or remaining_minimum_severe_count
+            > remaining_maximum_severe_count
+            or any(value < 0 for value in deficits)
+            or sum(deficits) != position
+        ):
+            structural_prefix_memo[key] = False
+            return False
+        if position == 0:
+            feasible = remaining_minimum_severe_count <= 0
+            structural_prefix_memo[key] = feasible
+            return feasible
+        for source_index, deficit in enumerate(deficits):
+            source_bounds = source_prefix_duration_bounds[source_index][
+                position
+            ][int(source_index == current_source)]
+            if deficit not in source_bounds:
+                structural_prefix_memo[key] = False
+                return False
+
+        preceding_position = position - 1
+        unknown_child = False
+        for source_index in source_order:
+            if (
+                source_index == current_source
+                or deficits[source_index] <= 0
+                or not candidate_validity[preceding_position][source_index]
+            ):
+                continue
+            edge_cost = _structural_edge_severe_cost(
+                preceding_position,
+                source_index,
+                current_source,
+            )
+            if (
+                edge_cost is None
+                or edge_cost > remaining_maximum_severe_count
+            ):
+                continue
+            next_deficits = list(deficits)
+            next_deficits[source_index] -= 1
+            child = _structural_prefix_feasible(
+                preceding_position,
+                tuple(next_deficits),
+                source_index,
+                max(0, remaining_minimum_severe_count - edge_cost),
+                remaining_maximum_severe_count - edge_cost,
+            )
+            if child is True:
+                structural_prefix_memo[key] = True
+                return True
+            if child is None:
+                unknown_child = True
+        if unknown_child:
+            return None
+        structural_prefix_memo[key] = False
+        return False
 
     def _prefix_prune_reasons(
         position: int,
@@ -2418,9 +3049,40 @@ def _exact_feasibility_lifeline(
                         "current_suffix_source_index": current_source,
                     }
                 )
-            minimum_addition, maximum_addition = prefix_duration_bounds[position][
-                deficit
-            ]
+            # If the suffix starts with this source, position ``position - 1``
+            # cannot use it.  Otherwise either end-state is allowed.  Absence
+            # of the exact deficit proves a content-valid/non-adjacent slot
+            # shortfall for this source alone.
+            source_bounds = source_prefix_duration_bounds[source_index][
+                position
+            ][int(source_index == current_source)]
+            duration_bound = source_bounds.get(deficit)
+            if duration_bound is None:
+                # Preserve the established, more specific diagnostics when a
+                # plain validity or plain adjacency bound already proves the
+                # shortfall.  This combined reason is emitted only when the
+                # interaction of those two constraints is the new proof.
+                if (
+                    deficit <= prefix_valid_slot_count
+                    and deficit <= maximum_slots
+                ):
+                    reasons.append(
+                        {
+                            "reason": (
+                                "prefix_valid_nonadjacent_slot_shortfall"
+                            ),
+                            "eligible_source_index": source_index,
+                            "quota_deficit": int(deficit),
+                            "maximum_valid_nonadjacent_prefix_slots": max(
+                                source_bounds,
+                                default=0,
+                            ),
+                            "prefix_position_count": position,
+                            "current_suffix_source_index": current_source,
+                        }
+                    )
+                continue
+            minimum_addition, maximum_addition = duration_bound
             projected_minimum = duration_totals[source_index] + minimum_addition
             projected_maximum = duration_totals[source_index] + maximum_addition
             if projected_minimum > upper_duration[source_index] + 1e-9:
@@ -2463,26 +3125,50 @@ def _exact_feasibility_lifeline(
         current_source: int,
         duration_totals: tuple[float, ...],
         suffix_path: tuple[int, ...],
+        severe_transition_count: int,
     ) -> _BeamNode | None:
         nonlocal explored_state_count, capacity_exhausted
+        nonlocal layered_severe_reachability_query_count
+        nonlocal layered_severe_reachability_pruned_state_count
+        nonlocal layered_subset_quota_query_count
+        nonlocal layered_subset_quota_pruned_state_count
+        nonlocal structural_prefix_query_count
+        nonlocal structural_prefix_infeasible_pruned_state_count
         if capacity_exhausted:
             return None
-        key = (position, counts, current_source, duration_totals)
+        key = (
+            position,
+            counts,
+            current_source,
+            duration_totals,
+            severe_transition_count,
+        )
         if key in failed_states:
             return None
         if explored_state_count >= state_limit:
             capacity_exhausted = True
             return None
         explored_state_count += 1
-        if _prefix_prune_reasons(
+        prefix_prune_reasons = _prefix_prune_reasons(
             position,
             counts,
             current_source,
             duration_totals,
-        ):
+        )
+        if prefix_prune_reasons:
+            prefix_prune_reason_counts.update(
+                str(item["reason"]) for item in prefix_prune_reasons
+            )
             failed_states.add(key)
             return None
         if position == 0:
+            if (
+                minimum_severe_transition_count is not None
+                and severe_transition_count
+                < minimum_severe_transition_count
+            ):
+                failed_states.add(key)
+                return None
             cost, verified_totals = _path_optimizer_cost(
                 suffix_path,
                 matrices=matrices,
@@ -2492,6 +3178,88 @@ def _exact_feasibility_lifeline(
             )
             return _BeamNode(cost, suffix_path, verified_totals)
 
+        remaining_maximum_severe_count = (
+            0
+            if severe_budget_mask is None
+            else min(
+                position,
+                layered_maximum_severe_count - severe_transition_count,
+            )
+        )
+        remaining_minimum_severe_count = (
+            0
+            if minimum_severe_transition_count is None
+            else max(
+                0,
+                minimum_severe_transition_count
+                - severe_transition_count,
+            )
+        )
+        quota_deficits = tuple(
+            int(source_quotas[index]) - counts[index]
+            for index in range(source_count)
+        )
+        layered_severe_reachability_query_count += 1
+        reachable_severe_bits = layered_severe_reachability[position][
+            current_source
+        ]
+        reachable_remaining_severe_counts = tuple(
+            severe_count
+            for severe_count in range(
+                max(0, remaining_minimum_severe_count),
+                min(
+                    layered_maximum_severe_count,
+                    remaining_maximum_severe_count,
+                )
+                + 1,
+            )
+            if reachable_severe_bits & (1 << severe_count)
+        )
+        if not reachable_remaining_severe_counts:
+            layered_severe_reachability_pruned_state_count += 1
+            failed_states.add(key)
+            return None
+
+        if layered_subset_quota_enabled:
+            layered_subset_quota_query_count += 1
+            subset_rows = layered_subset_quota_maxima[position][
+                current_source
+            ]
+            failing_subset_mask: int | None = None
+            for subset_mask in range(1, layered_subset_count):
+                required_subset_count = sum(
+                    quota_deficits[source_index]
+                    for source_index in range(source_count)
+                    if subset_mask & (1 << source_index)
+                )
+                maximum_subset_count = max(
+                    subset_rows[severe_count][subset_mask]
+                    for severe_count in reachable_remaining_severe_counts
+                )
+                if required_subset_count > maximum_subset_count:
+                    failing_subset_mask = subset_mask
+                    break
+            if failing_subset_mask is not None:
+                layered_subset_quota_pruned_state_count += 1
+                layered_subset_quota_pruned_mask_counts[
+                    failing_subset_mask
+                ] += 1
+                failed_states.add(key)
+                return None
+
+        structural_prefix_query_count += 1
+        structural_feasible = _structural_prefix_feasible(
+            position,
+            quota_deficits,
+            current_source,
+            remaining_minimum_severe_count,
+            remaining_maximum_severe_count,
+        )
+        if structural_feasible is False:
+            structural_prefix_infeasible_pruned_state_count += 1
+            failed_states.add(key)
+            return None
+
         preceding_position = position - 1
         candidates = [
             source_index
@@ -2499,12 +3267,33 @@ def _exact_feasibility_lifeline(
             if source_index != current_source
             and candidate_validity[preceding_position][source_index]
             and counts[source_index] < source_quotas[source_index]
-            and not matrices[preceding_position][source_index][
-                current_source
-            ].severe_flags
+            and (
+                (
+                    not matrices[preceding_position][source_index][
+                        current_source
+                    ].severe_flags
+                )
+                if severe_budget_mask is None
+                else severe_transition_count
+                + int(
+                    severe_budget_mask[preceding_position][source_index][
+                        current_source
+                    ]
+                )
+                <= int(maximum_severe_transition_count)
+            )
         ]
         candidates.sort(
             key=lambda source_index: (
+                (
+                    int(
+                        severe_budget_mask[preceding_position][source_index][
+                            current_source
+                        ]
+                    )
+                    if severe_budget_mask is not None
+                    else 0
+                ),
                 matrices[preceding_position][source_index][current_source].cost,
                 order_rank[source_index],
             )
@@ -2514,12 +3303,22 @@ def _exact_feasibility_lifeline(
             updated_counts[source_index] += 1
             updated_durations = list(duration_totals)
             updated_durations[source_index] += durations[preceding_position]
+            updated_severe_transition_count = severe_transition_count + (
+                int(
+                    severe_budget_mask[preceding_position][source_index][
+                        current_source
+                    ]
+                )
+                if severe_budget_mask is not None
+                else 0
+            )
             result = _search(
                 preceding_position,
                 tuple(updated_counts),
                 source_index,
                 tuple(updated_durations),
                 (source_index,) + suffix_path,
+                updated_severe_transition_count,
             )
             if result is not None:
                 return result
@@ -2568,14 +3367,38 @@ def _exact_feasibility_lifeline(
                         source_index
                     ].severe_flags
                 )
-                if severe_flags:
+                severe_budget_cost = (
+                    int(
+                        severe_budget_mask[final_position - 1][
+                            predecessor_source_index
+                        ][source_index]
+                    )
+                    if severe_budget_mask is not None
+                    else 0
+                )
+                if severe_flags and severe_budget_mask is None:
                     rejection_reasons.append("severe_boundary_mismatch")
+                if (
+                    severe_budget_mask is not None
+                    and severe_budget_cost
+                    > int(maximum_severe_transition_count)
+                ):
+                    rejection_reasons.append(
+                        "severe_transition_budget_exceeded"
+                    )
                 predecessor_diagnostics.append(
                     {
                         "eligible_source_index": predecessor_source_index,
                         "eligible": not rejection_reasons,
                         "rejection_reasons": rejection_reasons,
                         "severe_flags": severe_flags,
+                        "severe_transition_budget_mode": (
+                            severe_budget_mask is not None
+                        ),
+                        "severe_budget_cost": severe_budget_cost,
+                        "maximum_severe_transition_count": (
+                            maximum_severe_transition_count
+                        ),
                     }
                 )
         eligible_predecessors = [
@@ -2589,6 +3412,7 @@ def _exact_feasibility_lifeline(
             source_index,
             tuple(duration_totals),
             (source_index,),
+            0,
         )
         if node is not None:
             search_outcome = "witness_found"
@@ -2620,7 +3444,543 @@ def _exact_feasibility_lifeline(
         memoized_failed_state_count=len(failed_states),
         state_capacity_exhausted=capacity_exhausted,
         root_candidate_diagnostics=tuple(root_candidate_diagnostics),
+        admissible_pruning_diagnostics={
+            "contract": (
+                "exact_single_source_duration_bounds_plus_"
+                "layered_severe_subset_envelope_plus_"
+                "duration_independent_structural_prefix_dp_v2"
+            ),
+            "single_source_duration_bound_contract": (
+                "candidate_valid_nonadjacent_exact_float_min_max_v1"
+            ),
+            "duration_state_quantization_applied": False,
+            "prefix_prune_reason_counts": dict(
+                sorted(prefix_prune_reason_counts.items())
+            ),
+            "layered_severe_reachability_contract": (
+                "candidate_valid_no_repeat_directed_original_severe_"
+                "exact_count_bitset_v1"
+            ),
+            "layered_severe_reachability_query_count": (
+                layered_severe_reachability_query_count
+            ),
+            "layered_severe_reachability_pruned_state_count": (
+                layered_severe_reachability_pruned_state_count
+            ),
+            "layered_severe_reachability_precomputed_cell_count": (
+                len(layered_severe_reachability) * source_count
+            ),
+            "layered_requested_maximum_severe_transition_count": (
+                maximum_severe_transition_count
+            ),
+            "layered_effective_maximum_severe_transition_count": (
+                layered_maximum_severe_count
+            ),
+            "layered_severe_edge_count_upper_bound": (
+                layered_severe_edge_count_upper_bound
+            ),
+            "layered_severe_count_clamp_applied": bool(
+                layered_requested_maximum_severe_count
+                > layered_maximum_severe_count
+            ),
+            "layered_subset_quota_contract": (
+                "candidate_valid_no_repeat_directed_original_severe_"
+                "exact_count_all_source_subsets_max_envelope_v1"
+            ),
+            "layered_subset_quota_enabled": layered_subset_quota_enabled,
+            "layered_subset_quota_disabled_reason": (
+                layered_subset_disabled_reason
+            ),
+            "layered_subset_quota_source_count_limit": (
+                layered_subset_source_count_limit
+            ),
+            "layered_subset_quota_projected_cell_limit": (
+                layered_subset_projected_cell_limit
+            ),
+            "layered_subset_quota_projected_work_limit": (
+                layered_subset_projected_work_limit
+            ),
+            "layered_subset_quota_projected_cell_count": (
+                layered_subset_projected_cell_count
+            ),
+            "layered_subset_quota_projected_work_count": (
+                layered_subset_projected_work_count
+            ),
+            "layered_subset_quota_subset_count": layered_subset_count,
+            "layered_subset_quota_query_count": (
+                layered_subset_quota_query_count
+            ),
+            "layered_subset_quota_pruned_state_count": (
+                layered_subset_quota_pruned_state_count
+            ),
+            "layered_subset_quota_pruned_mask_counts": {
+                str(mask): count
+                for mask, count in sorted(
+                    layered_subset_quota_pruned_mask_counts.items()
+                )
+            },
+            "layered_subset_quota_precomputed_cell_count": (
+                len(layered_subset_quota_maxima)
+                * source_count
+                * (layered_maximum_severe_count + 1)
+                * layered_subset_count
+            ),
+            "layered_relaxation_state_capacity_applied": False,
+            "layered_subset_quota_fallback_contract": (
+                "disabled_envelope_preserves_layered_reachability_"
+                "structural_prefix_and_full_exact_search_v1"
+            ),
+            "structural_prefix_contract": (
+                "candidate_valid_quota_no_repeat_original_severe_budget_"
+                "duration_relaxation_v1"
+            ),
+            "structural_prefix_query_count": (
+                structural_prefix_query_count
+            ),
+            "structural_prefix_state_count": structural_prefix_state_count,
+            "structural_prefix_memoized_state_count": len(
+                structural_prefix_memo
+            ),
+            "structural_prefix_memo_hit_count": (
+                structural_prefix_memo_hit_count
+            ),
+            "structural_prefix_infeasible_pruned_state_count": (
+                structural_prefix_infeasible_pruned_state_count
+            ),
+            "structural_prefix_state_limit": structural_prefix_state_limit,
+            "structural_prefix_state_capacity_exhausted": (
+                structural_prefix_state_capacity_exhausted
+            ),
+            "severe_transition_count_requirement": (
+                "hard_ineligible"
+                if severe_budget_mask is None
+                else "exact"
+                if minimum_severe_transition_count
+                == maximum_severe_transition_count
+                else "bounded_range"
+            ),
+            "minimum_severe_transition_count": (
+                minimum_severe_transition_count
+            ),
+            "maximum_severe_transition_count": (
+                maximum_severe_transition_count
+            ),
+            "structural_capacity_effect": (
+                "unknown_fallback_to_full_exact_search"
+            ),
+            "hard_thresholds_changed": False,
+        },
     )
+
+
+def _canonical_diagnostic_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _exact_hard_constraint_payload(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    durations: Sequence[float],
+    duration_targets: Sequence[float],
+    maximum_source_duration_relative_deviation: float,
+) -> dict[str, Any]:
+    """Serialize only the exact constraints that decide hard feasibility."""
+
+    return {
+        "contract": "direct_member_exact_hard_constraint_input_v1",
+        "span_count": len(candidate_validity),
+        "source_count": len(source_quotas),
+        "source_quotas": [int(value) for value in source_quotas],
+        "source_order": [int(value) for value in source_order],
+        "candidate_validity": [
+            [bool(value) for value in row] for row in candidate_validity
+        ],
+        # Float hex strings bind the exact binary values used by the search;
+        # decimal formatting must not silently merge nearby duration states.
+        "duration_seconds_float_hex": [
+            float(value).hex() for value in durations
+        ],
+        "duration_target_seconds_float_hex": [
+            float(value).hex() for value in duration_targets
+        ],
+        "maximum_source_duration_relative_deviation_float_hex": (
+            float(maximum_source_duration_relative_deviation).hex()
+        ),
+        "adjacent_severe_flags": [
+            [
+                [
+                    [str(flag) for flag in mismatch.severe_flags]
+                    for mismatch in outgoing_row
+                ]
+                for outgoing_row in matrix
+            ]
+            for matrix in matrices
+        ],
+        "matrix_boundary_count": len(matrices),
+        "no_adjacent_source_repeat": True,
+        "duration_state_quantization_applied": False,
+    }
+
+
+def _severe_transition_counterfactual_diagnostic(
+    matrices: Sequence[Sequence[Sequence[DirectBoundaryMismatch]]],
+    *,
+    source_quotas: Sequence[int],
+    source_order: Sequence[int],
+    candidate_validity: Sequence[Sequence[bool]],
+    durations: Sequence[float],
+    duration_targets: Sequence[float],
+    state_limit: int,
+    config: DirectMemberVisualConfig,
+    original_lifeline: _FeasibilityLifelineResult,
+) -> dict[str, Any]:
+    """Find the exact minimum severe-edge count needed by a valid path.
+
+    This is a non-authoritative counterfactual.  It clones the mismatch
+    matrices and clears only ``severe_flags`` on the clone, while a separate
+    immutable mask charges one unit for every transition whose original edge
+    carried any severe flag.  Exact iterative deepening starts at one because
+    the caller's original hard failure is the zero-budget proof.  Candidate
+    validity, exact durations, balanced quotas, source order, and the
+    no-adjacent-repeat rule are passed unchanged to the same exact feasibility
+    search.  A minimum-one witness may authorize only a partition proposal; it
+    is never a selectable path and can never authorize a render.
+    """
+
+    if original_lifeline.node is not None:
+        raise ValueError("counterfactual requires an original hard failure")
+    if original_lifeline.state_capacity_exhausted:
+        raise ValueError("counterfactual requires proven original infeasibility")
+
+    original_constraint_payload = _exact_hard_constraint_payload(
+        matrices,
+        source_quotas=source_quotas,
+        source_order=source_order,
+        candidate_validity=candidate_validity,
+        durations=durations,
+        duration_targets=duration_targets,
+        maximum_source_duration_relative_deviation=(
+            config.maximum_source_duration_relative_deviation
+        ),
+    )
+    original_constraint_sha256 = _canonical_diagnostic_sha256(
+        original_constraint_payload
+    )
+    original_failure_certificate_sha256 = _canonical_diagnostic_sha256(
+        {
+            "contract": "direct_member_exact_hard_infeasibility_certificate_v1",
+            "hard_constraint_input_sha256": original_constraint_sha256,
+            "exact_lifeline": original_lifeline.to_dict(),
+            "constraint_infeasibility_proven": True,
+            "duration_state_quantization_applied": False,
+        }
+    )
+
+    severe_disabled_matrices = tuple(
+        tuple(
+            tuple(
+                replace(mismatch, severe_flags=())
+                for mismatch in outgoing_row
+            )
+            for outgoing_row in matrix
+        )
+        for matrix in matrices
+    )
+    severe_disabled_constraint_payload = _exact_hard_constraint_payload(
+        severe_disabled_matrices,
+        source_quotas=source_quotas,
+        source_order=source_order,
+        candidate_validity=candidate_validity,
+        durations=durations,
+        duration_targets=duration_targets,
+        maximum_source_duration_relative_deviation=(
+            config.maximum_source_duration_relative_deviation
+        ),
+    )
+    severe_disabled_constraint_sha256 = _canonical_diagnostic_sha256(
+        severe_disabled_constraint_payload
+    )
+    severe_transition_budget_mask = tuple(
+        tuple(
+            tuple(bool(mismatch.severe_flags) for mismatch in outgoing_row)
+            for outgoing_row in matrix
+        )
+        for matrix in matrices
+    )
+    severe_transition_budget_mask_sha256 = _canonical_diagnostic_sha256(
+        {
+            "contract": "direct_member_original_severe_edge_budget_mask_v1",
+            "edge_cost_policy": "one_per_adjacent_transition_with_any_severe_flag",
+            "mask": severe_transition_budget_mask,
+        }
+    )
+    maximum_diagnostic_budget = 3
+    budget_attempts: list[dict[str, Any]] = []
+    minimum_counterfactual: _FeasibilityLifelineResult | None = None
+    minimum_severe_transition_count: int | None = None
+    all_lower_budgets_proven_hard = True
+    any_budget_capacity_exhausted = False
+    for severe_budget in range(1, maximum_diagnostic_budget + 1):
+        counterfactual = _exact_feasibility_lifeline(
+            severe_disabled_matrices,
+            source_quotas=source_quotas,
+            source_order=source_order,
+            candidate_validity=candidate_validity,
+            durations=durations,
+            duration_targets=duration_targets,
+            state_limit=state_limit,
+            config=config,
+            severe_transition_budget_mask=severe_transition_budget_mask,
+            minimum_severe_transition_count=severe_budget,
+            maximum_severe_transition_count=severe_budget,
+        )
+        attempt_payload = {
+            "severe_transition_budget": severe_budget,
+            "path_found": counterfactual.node is not None,
+            "explored_state_count": counterfactual.explored_state_count,
+            "memoized_failed_state_count": (
+                counterfactual.memoized_failed_state_count
+            ),
+            "state_capacity_exhausted": (
+                counterfactual.state_capacity_exhausted
+            ),
+            "constraint_infeasibility_proven": bool(
+                counterfactual.node is None
+                and not counterfactual.state_capacity_exhausted
+            ),
+            "duration_state_quantization_applied": False,
+            "severe_transition_count_requirement": "exactly_budget",
+            "admissible_pruning": dict(
+                counterfactual.admissible_pruning_diagnostics
+            ),
+        }
+        attempt_payload["certificate_sha256"] = _canonical_diagnostic_sha256(
+            {
+                "contract": (
+                    "direct_member_severe_budget_exact_attempt_certificate_v1"
+                ),
+                "original_failure_certificate_sha256": (
+                    original_failure_certificate_sha256
+                ),
+                "severe_disabled_hard_constraint_sha256": (
+                    severe_disabled_constraint_sha256
+                ),
+                "severe_transition_budget_mask_sha256": (
+                    severe_transition_budget_mask_sha256
+                ),
+                **attempt_payload,
+                "root_candidate_diagnostics": (
+                    counterfactual.to_dict()["root_candidate_diagnostics"]
+                ),
+            }
+        )
+        budget_attempts.append(attempt_payload)
+        if counterfactual.state_capacity_exhausted:
+            any_budget_capacity_exhausted = True
+            all_lower_budgets_proven_hard = False
+            break
+        if counterfactual.node is not None:
+            minimum_counterfactual = counterfactual
+            minimum_severe_transition_count = severe_budget
+            break
+        if not attempt_payload["constraint_infeasibility_proven"]:
+            all_lower_budgets_proven_hard = False
+            break
+
+    blocking_transitions: list[dict[str, Any]] = []
+    witness_sha256: str | None = None
+    integrity_check_passed = False
+    maximum_duration_relative_deviation: float | None = None
+    optimality_proven = bool(
+        minimum_counterfactual is not None
+        and minimum_severe_transition_count is not None
+        and all_lower_budgets_proven_hard
+        and not any_budget_capacity_exhausted
+    )
+    if optimality_proven:
+        assert minimum_counterfactual is not None
+        assert minimum_counterfactual.node is not None
+        assert minimum_severe_transition_count is not None
+        path = minimum_counterfactual.node.path
+        counts = tuple(path.count(index) for index in range(len(source_quotas)))
+        deviations = tuple(
+            abs(actual - target) / target
+            for actual, target in zip(
+                minimum_counterfactual.node.duration_totals,
+                duration_targets,
+            )
+        )
+        maximum_duration_relative_deviation = max(deviations)
+        for boundary_index, (outgoing, incoming) in enumerate(
+            zip(path, path[1:])
+        ):
+            original_flags = matrices[boundary_index][outgoing][incoming].severe_flags
+            if original_flags:
+                blocking_transitions.append(
+                    {
+                        "boundary_index": boundary_index,
+                        "outgoing_eligible_source_index": outgoing,
+                        "incoming_eligible_source_index": incoming,
+                        "original_severe_flags": list(original_flags),
+                    }
+                )
+        integrity_check_passed = bool(
+            len(path) == len(candidate_validity)
+            and counts == tuple(int(value) for value in source_quotas)
+            and all(
+                candidate_validity[position][source_index]
+                for position, source_index in enumerate(path)
+            )
+            and all(left != right for left, right in zip(path, path[1:]))
+            and maximum_duration_relative_deviation
+            <= config.maximum_source_duration_relative_deviation + 1e-9
+            and len(blocking_transitions) == minimum_severe_transition_count
+        )
+        if integrity_check_passed:
+            witness_sha256 = _canonical_diagnostic_sha256(
+                {
+                    "contract": (
+                        "direct_member_minimum_severe_exact_witness_v1"
+                    ),
+                    "severe_disabled_hard_constraint_sha256": (
+                        severe_disabled_constraint_sha256
+                    ),
+                    "severe_transition_budget_mask_sha256": (
+                        severe_transition_budget_mask_sha256
+                    ),
+                    "minimum_severe_transition_count": (
+                        minimum_severe_transition_count
+                    ),
+                    "path": list(path),
+                    "duration_totals_float_hex": [
+                        float(value).hex()
+                        for value in minimum_counterfactual.node.duration_totals
+                    ],
+                    "blocking_transitions": blocking_transitions,
+                }
+            )
+
+    witness_found = bool(optimality_proven and integrity_check_passed)
+    explored_state_count = sum(
+        int(item["explored_state_count"]) for item in budget_attempts
+    )
+    memoized_failed_state_count = sum(
+        int(item["memoized_failed_state_count"]) for item in budget_attempts
+    )
+    bounded_budget_domain_infeasibility_proven = bool(
+        minimum_counterfactual is None
+        and len(budget_attempts) == maximum_diagnostic_budget
+        and all(
+            item["constraint_infeasibility_proven"] is True
+            for item in budget_attempts
+        )
+    )
+    zero_budget_hard_proof = {
+        "severe_transition_budget": 0,
+        "path_found": False,
+        "explored_state_count": original_lifeline.explored_state_count,
+        "memoized_failed_state_count": (
+            original_lifeline.memoized_failed_state_count
+        ),
+        "state_capacity_exhausted": False,
+        "constraint_infeasibility_proven": True,
+        "duration_state_quantization_applied": False,
+        "certificate_sha256": original_failure_certificate_sha256,
+    }
+    lower_budget_hard_proofs = [zero_budget_hard_proof]
+    lower_budget_hard_proofs.extend(
+        dict(item)
+        for item in budget_attempts
+        if item["constraint_infeasibility_proven"] is True
+        and (
+            minimum_severe_transition_count is None
+            or int(item["severe_transition_budget"])
+            < minimum_severe_transition_count
+        )
+    )
+    return {
+        "contract": "diagnostic_only_severe_transition_counterfactual_v1",
+        "optimization_contract": (
+            "exact_iterative_deepening_minimum_severe_transition_count_"
+            "then_deterministic_backward_source_order_v1"
+        ),
+        "severe_transition_cost_policy": (
+            "one_per_adjacent_transition_with_any_original_severe_flag"
+        ),
+        "tie_break_contract": (
+            "final_source_order_then_reverse_predecessor_"
+            "severe_cost_mismatch_cost_source_order_v1"
+        ),
+        "invoked": True,
+        "original_hard_constraint_sha256": original_constraint_sha256,
+        "original_failure_certificate_sha256": (
+            original_failure_certificate_sha256
+        ),
+        "severe_disabled_hard_constraint_sha256": (
+            severe_disabled_constraint_sha256
+        ),
+        "severe_transition_budget_mask_sha256": (
+            severe_transition_budget_mask_sha256
+        ),
+        "severe_disabled_witness_sha256": witness_sha256,
+        "minimum_witness_path_sha256": witness_sha256,
+        "minimum_severe_transition_count": (
+            minimum_severe_transition_count if witness_found else None
+        ),
+        "minimum_severe_transition_count_lower_bound": (
+            maximum_diagnostic_budget + 1
+            if bounded_budget_domain_infeasibility_proven
+            else None
+        ),
+        "maximum_diagnostic_severe_transition_budget": (
+            maximum_diagnostic_budget
+        ),
+        "zero_budget_hard_proof": zero_budget_hard_proof,
+        "lower_budget_hard_proofs": lower_budget_hard_proofs,
+        "budget_attempts": budget_attempts,
+        "optimality_proven": bool(witness_found),
+        "production_single_split_proposal_authorized": bool(
+            witness_found and minimum_severe_transition_count == 1
+        ),
+        "witness_found": witness_found,
+        "integrity_check_passed": integrity_check_passed,
+        "blocking_boundary_indices": sorted(
+            {item["boundary_index"] for item in blocking_transitions}
+        ) if witness_found else [],
+        "blocking_transitions": blocking_transitions if witness_found else [],
+        "maximum_duration_relative_deviation": (
+            maximum_duration_relative_deviation if witness_found else None
+        ),
+        "state_limit_per_budget": state_limit,
+        "explored_state_count": explored_state_count,
+        "memoized_failed_state_count": memoized_failed_state_count,
+        "state_capacity_exhausted": any_budget_capacity_exhausted,
+        "constraint_infeasibility_proven": (
+            bounded_budget_domain_infeasibility_proven
+        ),
+        "duration_state_quantization_applied": False,
+        "candidate_validity_semantics_changed": False,
+        "source_quota_semantics_changed": False,
+        "exact_duration_semantics_changed": False,
+        "source_order_semantics_changed": False,
+        "no_adjacent_repeat_semantics_changed": False,
+        "severe_transition_flags_disabled": True,
+        "original_matrices_mutated": False,
+        "selection_eligible": False,
+        "render_authorized": False,
+        "visual_gates_relaxed": False,
+    }
 
 
 def _source_duration_balance(
@@ -2869,6 +4229,19 @@ def _balanced_visual_path(
                 "search": search_diagnostics,
             },
         )
+    search_diagnostics["severe_transition_counterfactual"] = (
+        _severe_transition_counterfactual_diagnostic(
+            matrices,
+            source_quotas=source_quotas,
+            source_order=order,
+            candidate_validity=candidate_validity,
+            durations=durations,
+            duration_targets=duration_targets,
+            state_limit=config.feasibility_lifeline_state_limit,
+            config=config,
+            original_lifeline=lifeline,
+        )
+    )
     if closest_complete is not None:
         (
             maximum_deviation,
@@ -3063,7 +4436,9 @@ def select_balanced_direct_member_sources(
     audio_offsets: Sequence[float],
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     source_scene_cut_times: Sequence[Sequence[float]] | None = None,
+    continuous_official_portrait_fancam_contract: bool = False,
     preferred_source_order: Sequence[int] | None = None,
+    extra_quota_source_indices: Sequence[int] | None = None,
     config: DirectMemberVisualConfig | None = None,
     descriptor_provider: DescriptorProvider | None = None,
 ) -> DirectMemberVisualSelection:
@@ -3074,9 +4449,19 @@ def select_balanced_direct_member_sources(
     through the accepted ``TimeWarpMap`` when present and retain scalar offsets
     otherwise. Any native cut that survives strictly inside a coarsened span is
     a hard-invalid source/span candidate even when six sampled frames miss it.
+    The exact verified continuous official portrait-fancam contract may suppress
+    only a raw detector event whose non-identifying flank evidence proves a
+    continuous performance; generic/manual callers retain the strict policy.
+    ``extra_quota_source_indices`` changes only which sources receive the
+    remainder slots of an otherwise exactly balanced quota.  It never changes
+    source search order, content validity, severe-edge, or duration gates.
     """
 
     resolved_sources = tuple(Path(source) for source in sources)
+    if not isinstance(continuous_official_portrait_fancam_contract, bool):
+        raise TypeError(
+            "continuous_official_portrait_fancam_contract must be boolean"
+        )
     source_count = len(resolved_sources)
     if source_count < 2:
         raise ValueError("direct visual selection needs at least two sources")
@@ -3153,14 +4538,108 @@ def select_balanced_direct_member_sources(
         if preferred_source_order is None
         else tuple(int(index) for index in preferred_source_order)
     )
+    if len(order) != source_count or set(order) != set(range(source_count)):
+        raise ValueError("preferred_source_order must be a source permutation")
+    _base_quota, extra_quota_count = divmod(len(spans), source_count)
+    if extra_quota_source_indices is None:
+        quota_order = order
+        explicit_extra_quota_sources = tuple(order[:extra_quota_count])
+        quota_assignment_basis = "preferred_source_order_default"
+    else:
+        explicit_extra_quota_sources = tuple(
+            int(index) for index in extra_quota_source_indices
+        )
+        if (
+            len(explicit_extra_quota_sources) != extra_quota_count
+            or len(set(explicit_extra_quota_sources))
+            != len(explicit_extra_quota_sources)
+            or any(
+                not 0 <= index < source_count
+                for index in explicit_extra_quota_sources
+            )
+        ):
+            raise ValueError(
+                "extra_quota_source_indices must contain exactly the balanced "
+                "remainder source set"
+            )
+        explicit_set = set(explicit_extra_quota_sources)
+        quota_order = explicit_extra_quota_sources + tuple(
+            index for index in order if index not in explicit_set
+        )
+        quota_assignment_basis = "explicit_extra_quota_source_set"
     resolved_config = config or DirectMemberVisualConfig()
-    quotas = _balanced_quotas(len(spans), source_count, order)
+    quotas = _balanced_quotas(len(spans), source_count, quota_order)
+    quota_assignment_provenance = {
+        "contract": "strict_balanced_extra_quota_assignment_v1",
+        "basis": quota_assignment_basis,
+        "span_count": len(spans),
+        "source_count": source_count,
+        "base_quota": _base_quota,
+        "extra_quota_count": extra_quota_count,
+        "extra_quota_source_indices": list(explicit_extra_quota_sources),
+        "source_search_order": list(order),
+        "source_search_order_changed": False,
+        "counts_differ_by_at_most_one": True,
+    }
 
     owned_provider: _VideoDescriptorProvider | None = None
     provider = descriptor_provider
     if provider is None:
         owned_provider = _VideoDescriptorProvider(resolved_sources)
         provider = owned_provider
+    scene_cut_artifact_cache: dict[tuple[int, int], bool] = {}
+
+    def _scene_cut_is_transient_portrait_fancam_artifact(
+        *,
+        source_index: int,
+        source_seconds: float,
+        master_seconds: float,
+    ) -> bool:
+        if not continuous_official_portrait_fancam_contract:
+            return False
+        key = (source_index, int(round(source_seconds * 1_000_000.0)))
+        cached = scene_cut_artifact_cache.get(key)
+        if cached is not None:
+            return cached
+        far = max(
+            resolved_config.portrait_fancam_scene_cut_continuity_window_seconds,
+            3.0 * resolved_config.sample_frame_step_seconds,
+        )
+        near = resolved_config.sample_frame_step_seconds
+        probe_master_seconds = (
+            master_seconds - far,
+            master_seconds - near,
+            master_seconds,
+            master_seconds + near,
+            master_seconds + far,
+        )
+        probe_source_seconds = tuple(
+            (
+                source_seconds
+                if index == 2
+                else _source_local_time(
+                    probe_master,
+                    source_index=source_index,
+                    audio_offsets=offsets,
+                    source_timewarps=clocks,
+                )
+            )
+            for index, probe_master in enumerate(probe_master_seconds)
+        )
+        descriptors = tuple(
+            provider(
+                source_index,
+                resolved_sources[source_index],
+                max(0.0, local_seconds),
+            )
+            for local_seconds in probe_source_seconds
+        )
+        result = _continuous_portrait_fancam_scene_cut_is_transient_artifact(
+            descriptors,  # type: ignore[arg-type]
+            resolved_config,
+        )
+        scene_cut_artifact_cache[key] = result
+        return result
     outgoing_samples: list[tuple[_BoundarySample, ...]] = []
     incoming_samples: list[tuple[_BoundarySample, ...]] = []
     outgoing_previous_samples: list[tuple[_BoundarySample, ...]] = []
@@ -3212,6 +4691,20 @@ def select_balanced_direct_member_sources(
                     < master_seconds
                     < span_end - cut_tolerance
                 )
+                suppressed_portrait_fancam_scene_cuts = tuple(
+                    cut
+                    for cut in internal_native_cuts
+                    if _scene_cut_is_transient_portrait_fancam_artifact(
+                        source_index=source_index,
+                        source_seconds=cut[0],
+                        master_seconds=cut[1],
+                    )
+                )
+                confirmed_internal_native_cuts = tuple(
+                    cut
+                    for cut in internal_native_cuts
+                    if cut not in suppressed_portrait_fancam_scene_cuts
+                )
                 samples: list[_BoundarySample] = []
                 for master_seconds in master_times:
                     local_seconds = _source_local_time(
@@ -3235,7 +4728,13 @@ def select_balanced_direct_member_sources(
                     _span_source_validity(
                         source_index=source_index,
                         samples=tuple(samples),  # type: ignore[arg-type]
-                        native_scene_cuts=internal_native_cuts,
+                        native_scene_cuts=confirmed_internal_native_cuts,
+                        suppressed_portrait_fancam_scene_cuts=(
+                            suppressed_portrait_fancam_scene_cuts
+                        ),
+                        continuous_official_portrait_fancam_contract=(
+                            continuous_official_portrait_fancam_contract
+                        ),
                         config=resolved_config,
                     )
                 )
@@ -3435,6 +4934,7 @@ def select_balanced_direct_member_sources(
                 ],
                 "valid_count_by_source": valid_count_by_source,
                 "hard_boundary_connectivity": hard_boundary_connectivity,
+                "source_quota_assignment": quota_assignment_provenance,
             },
         )
     try:
@@ -3464,6 +4964,10 @@ def select_balanced_direct_member_sources(
             hard_boundary_connectivity,
         )
         diagnostics.setdefault(
+            "source_quota_assignment",
+            quota_assignment_provenance,
+        )
+        diagnostics.setdefault(
             "privacy",
             {
                 "face_identity_inference_used": False,
@@ -3479,6 +4983,7 @@ def select_balanced_direct_member_sources(
     optimizer_search_diagnostics = {
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,
+        "source_quota_assignment": quota_assignment_provenance,
     }
     counts = tuple(path.count(index) for index in range(source_count))
     source_durations, source_duration_targets, source_duration_deviations = (
@@ -3568,6 +5073,9 @@ def select_balanced_direct_member_sources(
         sample_count=sample_count,
         failed_sample_count=failed_sample_count,
         native_scene_cut_evidence_available=scene_cut_evidence_available,
+        continuous_official_portrait_fancam_contract=(
+            continuous_official_portrait_fancam_contract
+        ),
         config=resolved_config,
         optimizer_search_diagnostics=optimizer_search_diagnostics,
     )

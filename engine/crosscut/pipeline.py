@@ -321,6 +321,7 @@ _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
 _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT = 7
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 1
+_DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
@@ -3489,6 +3490,86 @@ def _direct_partition_failure_is_proven(
     }
 
 
+def _direct_partition_failure_result(
+    diagnostics: Mapping[str, Any],
+) -> str:
+    """Name a selector failure without calling an unproved result hard."""
+
+    if _direct_partition_failure_is_proven(dict(diagnostics)):
+        return "hard_infeasible"
+    if diagnostics.get("failure") == "search_capacity_exhausted":
+        return "capacity_exhausted"
+    return "unproven_failure"
+
+
+def _direct_partition_aggregate_outcome(
+    statuses: Sequence[str],
+    *,
+    profile_cap_reached: bool,
+) -> tuple[str, str, dict[str, int]]:
+    """Summarize a bounded search without upgrading uncertainty to proof."""
+
+    allowed = (
+        "hard_infeasible",
+        "capacity_exhausted",
+        "unproven_failure",
+    )
+    items = tuple(str(status) for status in statuses)
+    if any(status not in allowed for status in items):
+        raise ValueError("direct partition aggregate received an unknown status")
+    counts = {
+        outcome: sum(status == outcome for status in items)
+        for outcome in allowed
+    }
+    if profile_cap_reached:
+        return (
+            "direct_partition_search_capacity_exhausted",
+            "profile_cap_reached",
+            counts,
+        )
+    if counts["capacity_exhausted"]:
+        return (
+            "direct_partition_selector_capacity_exhausted",
+            "selector_capacity_exhausted",
+            counts,
+        )
+    if counts["unproven_failure"]:
+        return (
+            "direct_partition_unproven_failure",
+            "unproven_failure",
+            counts,
+        )
+    return (
+        "direct_partition_profiles_exhausted",
+        "bounded_hard_infeasible",
+        counts,
+    )
+
+
+def _direct_counterfactual_secondary_signature_action(
+    signature: tuple[int, ...],
+    *,
+    evaluated_signatures: set[tuple[int, ...]],
+    queued_signatures: set[tuple[int, ...]],
+    reserved_signatures: set[tuple[int, ...]],
+    seen_signatures: set[tuple[int, ...]],
+) -> str:
+    """Decide whether a bounded secondary candidate is new or promoted.
+
+    A canonical partition already waiting in the primary queue is promoted to
+    the reserved +10 pass rather than discarded.  That distinction matters
+    when the primary queue later reaches its static cap.
+    """
+
+    if signature in evaluated_signatures or signature in reserved_signatures:
+        return "duplicate"
+    if signature in queued_signatures:
+        return "promote_queued"
+    if signature in seen_signatures:
+        return "duplicate"
+    return "new"
+
+
 @dataclass(frozen=True, slots=True)
 class _DirectPartitionBoundaryProof:
     boundary_index: int
@@ -4100,12 +4181,293 @@ def _direct_visual_split_sample_is_hard_safe_proposal_point(
     )
 
 
+def _direct_severe_counterfactual_retry_is_authorized(
+    diagnostics: Mapping[str, Any],
+    *,
+    span_count: int,
+) -> bool:
+    """Accept only an integrity-bound, non-authoritative exact witness.
+
+    The witness may propose one more timing partition, but it can never select
+    a source path or relax a visual/transition gate.  Keeping this validation
+    in the pipeline prevents a partial or stale diagnostic payload from
+    silently expanding the production search.
+    """
+
+    if span_count < 3 or not _direct_partition_failure_is_proven(dict(diagnostics)):
+        return False
+    if diagnostics.get("constraint_infeasibility_proven") is not True:
+        return False
+    search = diagnostics.get("search")
+    if not isinstance(search, dict):
+        return False
+    exact = search.get("exact_lifeline")
+    if not isinstance(exact, dict) or not (
+        exact.get("invoked") is True
+        and exact.get("state_capacity_exhausted") is False
+        and exact.get("duration_state_quantization_applied") is False
+    ):
+        return False
+    counterfactual = search.get("severe_transition_counterfactual")
+    if not isinstance(counterfactual, dict) or not (
+        counterfactual.get("contract")
+        == "diagnostic_only_severe_transition_counterfactual_v1"
+        and counterfactual.get("optimization_contract")
+        == (
+            "exact_iterative_deepening_minimum_severe_transition_count_"
+            "then_deterministic_backward_source_order_v1"
+        )
+        and counterfactual.get("severe_transition_cost_policy")
+        == "one_per_adjacent_transition_with_any_original_severe_flag"
+        and counterfactual.get("tie_break_contract")
+        == (
+            "final_source_order_then_reverse_predecessor_"
+            "severe_cost_mismatch_cost_source_order_v1"
+        )
+        and counterfactual.get("invoked") is True
+        and counterfactual.get("witness_found") is True
+        and counterfactual.get("integrity_check_passed") is True
+        and counterfactual.get("optimality_proven") is True
+        and counterfactual.get("minimum_severe_transition_count") == 1
+        and counterfactual.get(
+            "production_single_split_proposal_authorized"
+        ) is True
+        and counterfactual.get("maximum_diagnostic_severe_transition_budget")
+        == 3
+        and counterfactual.get("state_capacity_exhausted") is False
+        and counterfactual.get("duration_state_quantization_applied") is False
+        and counterfactual.get("constraint_infeasibility_proven") is False
+        and counterfactual.get("severe_transition_flags_disabled") is True
+        and counterfactual.get("original_matrices_mutated") is False
+        and counterfactual.get("selection_eligible") is False
+        and counterfactual.get("render_authorized") is False
+        and counterfactual.get("visual_gates_relaxed") is False
+    ):
+        return False
+    unchanged_markers = (
+        "candidate_validity_semantics_changed",
+        "source_quota_semantics_changed",
+        "exact_duration_semantics_changed",
+        "source_order_semantics_changed",
+        "no_adjacent_repeat_semantics_changed",
+    )
+    if any(counterfactual.get(name) is not False for name in unchanged_markers):
+        return False
+
+    digest_names = (
+        "original_hard_constraint_sha256",
+        "original_failure_certificate_sha256",
+        "severe_disabled_hard_constraint_sha256",
+        "severe_transition_budget_mask_sha256",
+        "severe_disabled_witness_sha256",
+        "minimum_witness_path_sha256",
+    )
+    digests = tuple(counterfactual.get(name) for name in digest_names)
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in digests
+    ):
+        return False
+    if digests[0] == digests[2] or digests[4] != digests[5]:
+        return False
+
+    zero_budget = counterfactual.get("zero_budget_hard_proof")
+    lower_budget_proofs = counterfactual.get("lower_budget_hard_proofs")
+    budget_attempts = counterfactual.get("budget_attempts")
+    if not (
+        isinstance(zero_budget, dict)
+        and zero_budget.get("severe_transition_budget") == 0
+        and zero_budget.get("path_found") is False
+        and zero_budget.get("state_capacity_exhausted") is False
+        and zero_budget.get("constraint_infeasibility_proven") is True
+        and zero_budget.get("duration_state_quantization_applied") is False
+        and zero_budget.get("certificate_sha256") == digests[1]
+        and isinstance(lower_budget_proofs, list)
+        and len(lower_budget_proofs) == 1
+        and lower_budget_proofs[0] == zero_budget
+        and isinstance(budget_attempts, list)
+        and len(budget_attempts) == 1
+    ):
+        return False
+    minimum_attempt = budget_attempts[0]
+    if not (
+        isinstance(minimum_attempt, dict)
+        and minimum_attempt.get("severe_transition_budget") == 1
+        and minimum_attempt.get("path_found") is True
+        and minimum_attempt.get("state_capacity_exhausted") is False
+        and minimum_attempt.get("constraint_infeasibility_proven") is False
+        and minimum_attempt.get("duration_state_quantization_applied") is False
+        and isinstance(minimum_attempt.get("explored_state_count"), int)
+        and minimum_attempt["explored_state_count"] > 0
+        and isinstance(minimum_attempt.get("memoized_failed_state_count"), int)
+        and minimum_attempt["memoized_failed_state_count"] >= 0
+        and isinstance(minimum_attempt.get("certificate_sha256"), str)
+        and len(minimum_attempt["certificate_sha256"]) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in minimum_attempt["certificate_sha256"]
+        )
+        and isinstance(counterfactual.get("state_limit_per_budget"), int)
+        and counterfactual["state_limit_per_budget"] > 0
+    ):
+        return False
+
+    raw_indices = counterfactual.get("blocking_boundary_indices")
+    raw_transitions = counterfactual.get("blocking_transitions")
+    if not isinstance(raw_indices, list) or not isinstance(raw_transitions, list):
+        return False
+    indices = tuple(raw_indices)
+    if (
+        not indices
+        or indices != tuple(sorted(set(indices)))
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < span_count - 1
+            for value in indices
+        )
+    ):
+        return False
+    transition_indices: list[int] = []
+    for transition in raw_transitions:
+        if not isinstance(transition, dict):
+            return False
+        boundary_index = transition.get("boundary_index")
+        outgoing = transition.get("outgoing_eligible_source_index")
+        incoming = transition.get("incoming_eligible_source_index")
+        flags = transition.get("original_severe_flags")
+        if not (
+            isinstance(boundary_index, int)
+            and not isinstance(boundary_index, bool)
+            and boundary_index in indices
+            and isinstance(outgoing, int)
+            and not isinstance(outgoing, bool)
+            and outgoing >= 0
+            and isinstance(incoming, int)
+            and not isinstance(incoming, bool)
+            and incoming >= 0
+            and outgoing != incoming
+            and isinstance(flags, list)
+            and flags
+            and all(isinstance(flag, str) and flag for flag in flags)
+        ):
+            return False
+        transition_indices.append(boundary_index)
+    if (
+        tuple(sorted(set(transition_indices))) != indices
+        or len(raw_transitions) != 1
+        or len(indices) != 1
+    ):
+        return False
+    maximum_deviation = counterfactual.get("maximum_duration_relative_deviation")
+    return bool(
+        isinstance(maximum_deviation, (int, float))
+        and not isinstance(maximum_deviation, bool)
+        and math.isfinite(float(maximum_deviation))
+        and float(maximum_deviation) >= 0.0
+    )
+
+
+def _direct_counterfactual_boundary_proof(
+    diagnostics: Mapping[str, Any],
+    *,
+    boundary_index: int,
+    span_count: int,
+) -> _DirectPartitionBoundaryProof | None:
+    """Bind one severe-only witness edge to live hard-connectivity evidence."""
+
+    if not _direct_severe_counterfactual_retry_is_authorized(
+        diagnostics,
+        span_count=span_count,
+    ):
+        return None
+    search = diagnostics["search"]
+    counterfactual = search["severe_transition_counterfactual"]
+    if boundary_index not in counterfactual["blocking_boundary_indices"]:
+        return None
+    transitions = tuple(
+        item
+        for item in counterfactual["blocking_transitions"]
+        if item["boundary_index"] == boundary_index
+    )
+    outgoing_sources = tuple(
+        sorted({int(item["outgoing_eligible_source_index"]) for item in transitions})
+    )
+    incoming_sources = tuple(
+        sorted({int(item["incoming_eligible_source_index"]) for item in transitions})
+    )
+    connectivity = diagnostics.get("hard_boundary_connectivity")
+    if not isinstance(connectivity, dict) or connectivity.get(
+        "analysis_basis"
+    ) != "content_valid_nonsevere_no_repeat_reachability_v1":
+        return None
+    boundaries = connectivity.get("boundaries")
+    if not isinstance(boundaries, list) or len(boundaries) != span_count - 1:
+        return None
+    item = boundaries[boundary_index]
+    if not isinstance(item, dict) or item.get("boundary_index") != boundary_index:
+        return None
+    left_valid = item.get("left_valid_source_indices")
+    right_valid = item.get("right_valid_source_indices")
+    forward_reachable = item.get("forward_reachable_left_source_indices")
+    local_edges = item.get("nonsevere_cross_source_edge_count")
+    if not (
+        isinstance(left_valid, list)
+        and left_valid
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in left_valid
+        )
+        and isinstance(right_valid, list)
+        and right_valid
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in right_valid
+        )
+        and isinstance(forward_reachable, list)
+        and forward_reachable
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in forward_reachable
+        )
+        and isinstance(local_edges, int)
+        and not isinstance(local_edges, bool)
+        and local_edges >= 0
+        and outgoing_sources
+        and incoming_sources
+        and set(outgoing_sources).issubset(left_valid)
+        and set(outgoing_sources).issubset(forward_reachable)
+        and set(incoming_sources).issubset(right_valid)
+    ):
+        return None
+    return _DirectPartitionBoundaryProof(
+        boundary_index=boundary_index,
+        trigger="diagnostic_severe_transition_counterfactual_safe_bracket",
+        failure=(
+            str(diagnostics["failure"])
+            if diagnostics.get("failure") is not None
+            else None
+        ),
+        failed_segment_index=boundary_index + 1,
+        forward_reachable_left_source_indices=tuple(
+            int(value) for value in forward_reachable
+        ),
+        left_valid_source_indices=tuple(int(value) for value in left_valid),
+        right_valid_source_indices=tuple(int(value) for value in right_valid),
+        local_nonsevere_edge_count=local_edges,
+    )
+
+
 def _direct_full_frame_visual_frontier_split_child_profiles(
     timing_segments: Sequence[DraftSegment],
     parent: _DirectFullFramePartitionProfile,
     diagnostics: dict[str, Any],
     *,
     config: DirectMemberVisualConfig,
+    allow_counterfactual_secondary_split: bool = False,
+    _counterfactual_boundary_index: int | None = None,
 ) -> tuple[_DirectFullFramePartitionProfile, ...]:
     """Add one evidence-bound micro-boundary beside a proven path frontier.
 
@@ -4118,22 +4480,58 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
     is rerun for the child.
     """
 
-    if (
-        len(parent.visual_frontier_splits)
-        >= _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
-    ):
-        return ()
-    proofs = tuple(
-        proof
-        for proof in _direct_partition_exact_shift_proofs(
+    secondary_counterfactual = bool(
+        allow_counterfactual_secondary_split
+        and len(parent.visual_frontier_splits)
+        == _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+        and _direct_severe_counterfactual_retry_is_authorized(
             diagnostics,
             span_count=len(parent.spans),
         )
-        if proof.trigger == "proven_forward_connectivity_frontier_exhaustion"
     )
-    if len(proofs) != 1:
+    if len(parent.visual_frontier_splits) >= (
+        _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+        + int(secondary_counterfactual)
+    ):
         return ()
-    proof = proofs[0]
+    if secondary_counterfactual and _counterfactual_boundary_index is None:
+        counterfactual = diagnostics["search"][
+            "severe_transition_counterfactual"
+        ]
+        for boundary_index in counterfactual["blocking_boundary_indices"]:
+            children = _direct_full_frame_visual_frontier_split_child_profiles(
+                timing_segments,
+                parent,
+                diagnostics,
+                config=config,
+                allow_counterfactual_secondary_split=True,
+                _counterfactual_boundary_index=boundary_index,
+            )
+            if children:
+                return children
+        return ()
+    if secondary_counterfactual:
+        if _counterfactual_boundary_index is None:
+            return ()
+        proof = _direct_counterfactual_boundary_proof(
+            diagnostics,
+            boundary_index=_counterfactual_boundary_index,
+            span_count=len(parent.spans),
+        )
+        if proof is None:
+            return ()
+    else:
+        proofs = tuple(
+            proof
+            for proof in _direct_partition_exact_shift_proofs(
+                diagnostics,
+                span_count=len(parent.spans),
+            )
+            if proof.trigger == "proven_forward_connectivity_frontier_exhaustion"
+        )
+        if len(proofs) != 1:
+            return ()
+        proof = proofs[0]
     if proof.failed_segment_index != proof.boundary_index + 1:
         return ()
 
@@ -4250,7 +4648,19 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
                 else math.nan
                 for sample in samples
             ]
-            if all(math.isfinite(value) for value in sample_times):
+            if (
+                all(math.isfinite(value) for value in sample_times)
+                and all(
+                    span.canonical_master_start - 1e-9
+                    <= value
+                    <= span.canonical_master_end + 1e-9
+                    for value in sample_times
+                )
+                and all(
+                    right > left
+                    for left, right in zip(sample_times, sample_times[1:])
+                )
+            ):
                 for sample_index in range(len(samples) - 1):
                     if safe_flags[sample_index] == safe_flags[sample_index + 1]:
                         continue
@@ -4462,7 +4872,11 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
         right_unit_count=right_count,
         canonical_master_seconds=boundary_seconds,
         boundary_reasons=boundary_reasons,
-        trigger="proven_forward_connectivity_frontier_visual_micro_split",
+        trigger=(
+            "diagnostic_severe_counterfactual_visual_micro_split"
+            if secondary_counterfactual
+            else "proven_forward_connectivity_frontier_visual_micro_split"
+        ),
         parent_profile_id=parent.profile_id,
         parent_partition_signature_sha256=(
             _direct_partition_signature_sha256(parent.unit_counts)
@@ -4474,7 +4888,11 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
             proof.forward_reachable_left_source_indices
         ),
         proof_right_valid_source_indices=proof.right_valid_source_indices,
-        evidence_contract="visual_bracket_bound_existing_timing_boundary_v1",
+        evidence_contract=(
+            "diagnostic_severe_counterfactual_bound_existing_timing_boundary_v1"
+            if secondary_counterfactual
+            else "visual_bracket_bound_existing_timing_boundary_v1"
+        ),
         evidence_kind=evidence_kind,
         evidence_source_indices=evidence_source_indices,
         evidence_master_seconds=evidence_master_seconds,
@@ -4685,15 +5103,21 @@ def _direct_member_failure_report_fallback_payload(
             "initial_profile_count",
             "maximum_profile_count",
             "static_profile_upper_bound",
+            "absolute_profile_upper_bound",
             "maximum_profile_limit_expansion_count",
             "profile_limit_expansions",
             "maximum_shifted_boundary_count",
+            "maximum_visual_frontier_split_count_per_profile",
+            "maximum_counterfactual_visual_frontier_split_count_per_profile",
             "profile_cap_reached",
             "generated_profile_count",
             "canonical_signature_deduplication_count",
             "proof_equivalent_future_state_dominance_count",
             "future_operation_state_count",
             "shift_depth_pruned_parent_count",
+            "exact_lifeline_capacity_retry",
+            "strict_extra_quota_assignment_search",
+            "severe_transition_counterfactual_secondary_partition",
             "queue_order",
             "render_started",
         )
@@ -4711,12 +5135,16 @@ def _direct_member_failure_report_fallback_payload(
         "constraint_infeasibility_proven": diagnostics.get(
             "constraint_infeasibility_proven"
         ),
+        "profile_outcome_counts": diagnostics.get("profile_outcome_counts"),
         "visual_gates_relaxed": diagnostics.get("visual_gates_relaxed", False),
         "latest_failure_summary": _direct_member_selection_failure_summary(
             diagnostics
         ),
         "original_diagnostics_content_fingerprint": (
             _canonical_json_content_fingerprint(diagnostics)
+        ),
+        "latest_severe_transition_counterfactual": (
+            _compact_direct_severe_counterfactual(diagnostics)
         ),
         "partition_search": compact_partition,
     }
@@ -4946,11 +5374,73 @@ def _compact_direct_partition_failure(
             for proof in next_proofs
         ],
         "exact_lifeline": exact,
+        "severe_transition_counterfactual": (
+            _compact_direct_severe_counterfactual(diagnostics)
+        ),
         # Per-segment index arrays remain available in the one latest runtime
         # diagnostic.  Repeating them for every attempted profile made an
         # otherwise scalar failure ledger grow quadratically with search depth.
         "valid_count_by_source": compact_valid_counts,
     }
+
+
+def _compact_direct_severe_counterfactual(
+    diagnostics: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Retain bounded minimum-severe proof scalars in compact reports."""
+
+    search = diagnostics.get("search")
+    if not isinstance(search, dict):
+        return None
+    raw = search.get("severe_transition_counterfactual")
+    if not isinstance(raw, dict):
+        return None
+    compact = {
+        key: raw.get(key)
+        for key in (
+            "contract",
+            "optimization_contract",
+            "severe_transition_cost_policy",
+            "tie_break_contract",
+            "invoked",
+            "original_hard_constraint_sha256",
+            "original_failure_certificate_sha256",
+            "severe_disabled_hard_constraint_sha256",
+            "severe_transition_budget_mask_sha256",
+            "minimum_witness_path_sha256",
+            "minimum_severe_transition_count",
+            "minimum_severe_transition_count_lower_bound",
+            "maximum_diagnostic_severe_transition_budget",
+            "optimality_proven",
+            "production_single_split_proposal_authorized",
+            "witness_found",
+            "integrity_check_passed",
+            "blocking_boundary_indices",
+            "blocking_transitions",
+            "maximum_duration_relative_deviation",
+            "state_limit_per_budget",
+            "explored_state_count",
+            "memoized_failed_state_count",
+            "state_capacity_exhausted",
+            "duration_state_quantization_applied",
+            "selection_eligible",
+            "render_authorized",
+            "visual_gates_relaxed",
+        )
+        if key in raw
+    }
+    for key in (
+        "zero_budget_hard_proof",
+        "lower_budget_hard_proofs",
+        "budget_attempts",
+    ):
+        value = raw.get(key)
+        if isinstance(value, (dict, list)):
+            compact[key] = value
+    compact["full_counterfactual_content_fingerprint"] = (
+        _canonical_json_content_fingerprint(raw)
+    )
+    return compact
 
 
 def _direct_partition_selection_rank(
@@ -5169,6 +5659,18 @@ def _select_direct_member_partition_profile(
     partition_search_extra_quota_feasible_profile_count = 0
     partition_search_extra_quota_exhausted_profile_count = 0
     partition_search_extra_quota_capacity_exhausted_profile_count = 0
+    partition_search_counterfactual_qualified_parent_count = 0
+    partition_search_counterfactual_generated_profile_count = 0
+    partition_search_counterfactual_evaluation_count = 0
+    partition_search_counterfactual_feasible_profile_count = 0
+    partition_search_counterfactual_hard_infeasible_profile_count = 0
+    partition_search_counterfactual_capacity_exhausted_profile_count = 0
+    partition_search_counterfactual_unproven_failure_profile_count = 0
+    partition_search_counterfactual_promoted_queued_profile_count = 0
+    partition_search_counterfactual_authorization_proofs: list[
+        dict[str, Any]
+    ] = []
+    partition_search_primary_evaluation_count = 0
 
     def _emit_progress(**payload: Any) -> None:
         if progress_callback is not None:
@@ -5696,14 +6198,16 @@ def _select_direct_member_partition_profile(
                 )
         if error is not None:
             failure_count += 1
-            all_failures_proven = all_failures_proven and (
-                _direct_partition_failure_is_proven(error.diagnostics)
+            failure_is_proven = _direct_partition_failure_is_proven(
+                error.diagnostics
             )
+            all_failures_proven = all_failures_proven and failure_is_proven
             latest_failure_diagnostics = error.diagnostics
+            failure_result = _direct_partition_failure_result(error.diagnostics)
             attempted.append(
                 {
                     **profile.to_dict(),
-                    "status": "hard_infeasible",
+                    "status": failure_result,
                     "hard_violation_count": None,
                     "visual_gates_relaxed": False,
                     **(
@@ -5732,7 +6236,7 @@ def _select_direct_member_partition_profile(
             )
             _emit_progress(
                 phase="completed",
-                result="hard_infeasible",
+                result=failure_result,
                 failed_segment_index=error.diagnostics.get(
                     "failed_at_segment_index"
                 ),
@@ -5787,6 +6291,7 @@ def _select_direct_member_partition_profile(
 
     try:
         base_error = _evaluate(base)
+        partition_search_primary_evaluation_count = len(attempted)
         if (
             continuous_official_portrait_fancam_contract
             and base_error is not None
@@ -5805,7 +6310,122 @@ def _select_direct_member_partition_profile(
             ] = []
             queued_sequence = 0
             seen_signatures = {base.unit_counts}
+            evaluated_signatures = {base.unit_counts}
             seen_future_operation_states: set[tuple[Any, ...]] = set()
+            counterfactual_secondary_profiles: list[
+                _DirectFullFramePartitionProfile
+            ] = []
+
+            def _collect_counterfactual_secondary_profile(
+                parent: _DirectFullFramePartitionProfile,
+                error: DirectMemberVisualSelectionError,
+            ) -> None:
+                nonlocal partition_search_generated_profile_count
+                nonlocal partition_search_signature_deduplication_count
+                nonlocal partition_search_counterfactual_qualified_parent_count
+                nonlocal partition_search_counterfactual_generated_profile_count
+                nonlocal partition_search_counterfactual_promoted_queued_profile_count
+                if (
+                    len(counterfactual_secondary_profiles)
+                    >= _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                    or partition_search_counterfactual_qualified_parent_count
+                    >= _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                    or len(parent.visual_frontier_splits)
+                    != _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+                    or not _direct_severe_counterfactual_retry_is_authorized(
+                        error.diagnostics,
+                        span_count=len(parent.spans),
+                    )
+                ):
+                    return
+                partition_search_counterfactual_qualified_parent_count += 1
+                children = _direct_full_frame_visual_frontier_split_child_profiles(
+                    timing_draft.segments,
+                    parent,
+                    error.diagnostics,
+                    config=selection_config,
+                    allow_counterfactual_secondary_split=True,
+                )
+                if len(children) > 1:
+                    raise RuntimeError(
+                        "counterfactual secondary split generated multiple children"
+                    )
+                for child in children:
+                    action = _direct_counterfactual_secondary_signature_action(
+                        child.unit_counts,
+                        evaluated_signatures=evaluated_signatures,
+                        queued_signatures={
+                            item[2].unit_counts for item in queued
+                        },
+                        reserved_signatures={
+                            item.unit_counts
+                            for item in counterfactual_secondary_profiles
+                        },
+                        seen_signatures=seen_signatures,
+                    )
+                    if action == "duplicate":
+                        partition_search_signature_deduplication_count += 1
+                        continue
+                    if action == "promote_queued":
+                        queued[:] = [
+                            item
+                            for item in queued
+                            if item[2].unit_counts != child.unit_counts
+                        ]
+                        partition_search_counterfactual_promoted_queued_profile_count += 1
+                    else:
+                        seen_signatures.add(child.unit_counts)
+                        partition_search_generated_profile_count += 1
+                    counterfactual_secondary_profiles.append(child)
+                    partition_search_counterfactual_generated_profile_count += 1
+                    compact_authorization = (
+                        _compact_direct_severe_counterfactual(
+                            error.diagnostics
+                        )
+                    )
+                    if compact_authorization is None:
+                        raise RuntimeError(
+                            "authorized counterfactual secondary split lost "
+                            "its compact minimum-severe proof"
+                        )
+                    partition_search_counterfactual_authorization_proofs.append(
+                        {
+                            "parent_profile_id": parent.profile_id,
+                            "parent_partition_signature_sha256": (
+                                _direct_partition_signature_sha256(
+                                    parent.unit_counts
+                                )
+                            ),
+                            "child_profile_id": child.profile_id,
+                            "child_partition_signature_sha256": (
+                                _direct_partition_signature_sha256(
+                                    child.unit_counts
+                                )
+                            ),
+                            "authorization": compact_authorization,
+                        }
+                    )
+                    _emit_progress(
+                        event=(
+                            "direct_member_severe_counterfactual_secondary_split"
+                        ),
+                        phase="secondary_profile_queued",
+                        result=None,
+                        contract=(
+                            "bounded_diagnostic_severe_counterfactual_"
+                            "secondary_partition_v1"
+                        ),
+                        parent_profile_id=parent.profile_id,
+                        profile_id=child.profile_id,
+                        maximum_profile_count=(
+                            _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                        ),
+                        queued_profile_count=len(counterfactual_secondary_profiles),
+                        witness_selection_eligible=False,
+                        witness_render_authorized=False,
+                        full_selector_recheck_required=True,
+                        visual_gates_relaxed=False,
+                    )
 
             def _enqueue_children(
                 parent: _DirectFullFramePartitionProfile,
@@ -5974,6 +6594,7 @@ def _select_direct_member_partition_profile(
                     )
                 priority, _sequence, profile = queued.pop(0)
                 error = _evaluate(profile)
+                evaluated_signatures.add(profile.unit_counts)
                 if error is None:
                     # Proof progress orders equal-cost exploration only.  It
                     # must not prune another candidate with the same changed
@@ -5981,6 +6602,7 @@ def _select_direct_member_partition_profile(
                     # candidate may win the actual warning/optimizer rank.
                     minimum_feasible_structural_cost = priority[:3]
                     continue
+                _collect_counterfactual_secondary_profile(profile, error)
                 if minimum_feasible_structural_cost is None and (
                     _direct_partition_failure_is_proven(error.diagnostics)
                 ):
@@ -5991,6 +6613,80 @@ def _select_direct_member_partition_profile(
                 and len(attempted) >= partition_search_evaluation_limit
             ):
                 partition_search_cap_reached = True
+            partition_search_primary_evaluation_count = len(attempted)
+            if not feasible and counterfactual_secondary_profiles:
+                partition_search_evaluation_limit = max(
+                    partition_search_evaluation_limit,
+                    partition_search_primary_evaluation_count
+                    + len(counterfactual_secondary_profiles),
+                )
+                for profile in counterfactual_secondary_profiles:
+                    partition_search_counterfactual_evaluation_count += 1
+                    error = _evaluate(profile)
+                    evaluated_signatures.add(profile.unit_counts)
+                    if error is None:
+                        partition_search_counterfactual_feasible_profile_count += 1
+                    elif _direct_partition_failure_result(error.diagnostics) == (
+                        "hard_infeasible"
+                    ):
+                        partition_search_counterfactual_hard_infeasible_profile_count += 1
+                    elif _direct_partition_failure_result(error.diagnostics) == (
+                        "capacity_exhausted"
+                    ):
+                        partition_search_counterfactual_capacity_exhausted_profile_count += 1
+                    else:
+                        partition_search_counterfactual_unproven_failure_profile_count += 1
+                _emit_progress(
+                    event="direct_member_severe_counterfactual_secondary_split",
+                    phase="secondary_search_completed",
+                    result=(
+                        "feasible"
+                        if feasible
+                        else "capacity_exhausted"
+                        if partition_search_counterfactual_capacity_exhausted_profile_count
+                        else "unproven_failure"
+                        if partition_search_counterfactual_unproven_failure_profile_count
+                        else "hard_infeasible"
+                    ),
+                    contract=(
+                        "bounded_diagnostic_severe_counterfactual_"
+                        "secondary_partition_v1"
+                    ),
+                    primary_evaluated_profile_count=(
+                        partition_search_primary_evaluation_count
+                    ),
+                    qualified_parent_count=(
+                        partition_search_counterfactual_qualified_parent_count
+                    ),
+                    generated_profile_count=(
+                        partition_search_counterfactual_generated_profile_count
+                    ),
+                    evaluated_profile_count=(
+                        partition_search_counterfactual_evaluation_count
+                    ),
+                    feasible_profile_count=(
+                        partition_search_counterfactual_feasible_profile_count
+                    ),
+                    hard_infeasible_profile_count=(
+                        partition_search_counterfactual_hard_infeasible_profile_count
+                    ),
+                    capacity_exhausted_profile_count=(
+                        partition_search_counterfactual_capacity_exhausted_profile_count
+                    ),
+                    unproven_failure_profile_count=(
+                        partition_search_counterfactual_unproven_failure_profile_count
+                    ),
+                    promoted_queued_profile_count=(
+                        partition_search_counterfactual_promoted_queued_profile_count
+                    ),
+                    maximum_profile_count=(
+                        _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                    ),
+                    witness_selection_eligible=False,
+                    witness_render_authorized=False,
+                    every_profile_fully_reselected=True,
+                    visual_gates_relaxed=False,
+                )
         elif not feasible and base_error is not None:
             if _direct_partition_failure_is_proven(base_error.diagnostics):
                 bottlenecks = _direct_partition_failure_bottlenecks(
@@ -6005,6 +6701,7 @@ def _select_direct_member_partition_profile(
                 )
                 for profile in primary_profiles:
                     _evaluate(profile)
+                partition_search_primary_evaluation_count = len(attempted)
     finally:
         if owned_provider is not None:
             provider_cache_diagnostics = owned_provider.cache_diagnostics()
@@ -6026,21 +6723,26 @@ def _select_direct_member_partition_profile(
             and all_failures_proven
             and not partition_search_cap_reached
         )
+        (
+            aggregate_failure,
+            aggregate_result,
+            attempted_outcome_counts,
+        ) = _direct_partition_aggregate_outcome(
+            tuple(str(item.get("status")) for item in attempted),
+            profile_cap_reached=partition_search_cap_reached,
+        )
         aggregate_diagnostics: dict[str, Any] = {
             **latest_diagnostics,
-            "failure": (
-                "direct_partition_search_capacity_exhausted"
-                if partition_search_cap_reached
-                else "direct_partition_profiles_exhausted"
-            ),
+            "failure": aggregate_failure,
             "constraint_infeasibility_proven": all_proven,
+            "profile_outcome_counts": attempted_outcome_counts,
             "visual_gates_relaxed": False,
             "partition_search": {
                 "policy": (
                     "canonical_signature_deduplicated_proof_directed_"
                     "adaptive_frontier_visual_micro_split_best_first_"
                     "exact_lifeline_capacity_retry_strict_extra_quota_"
-                    "assignment_partition_v7"
+                    "assignment_severe_counterfactual_secondary_partition_v8"
                 ),
                 "initial_profile_count": (
                     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
@@ -6050,6 +6752,10 @@ def _select_direct_member_partition_profile(
                 ),
                 "static_profile_upper_bound": (
                     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND
+                ),
+                "absolute_profile_upper_bound": (
+                    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND
+                    + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
                 ),
                 "maximum_profile_limit_expansion_count": (
                     _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
@@ -6062,6 +6768,9 @@ def _select_direct_member_partition_profile(
                 ),
                 "maximum_visual_frontier_split_count_per_profile": (
                     _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+                ),
+                "maximum_counterfactual_visual_frontier_split_count_per_profile": (
+                    _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE + 1
                 ),
                 "profile_cap_reached": partition_search_cap_reached,
                 "generated_profile_count": (
@@ -6132,6 +6841,62 @@ def _select_direct_member_partition_profile(
                     "state_limit_expanded": False,
                     "visual_gates_relaxed": False,
                 },
+                "severe_transition_counterfactual_secondary_partition": {
+                    "contract": (
+                        "bounded_diagnostic_severe_counterfactual_"
+                        "secondary_partition_v1"
+                    ),
+                    "maximum_qualified_profile_count": (
+                        _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                    ),
+                    "primary_evaluated_profile_count": (
+                        partition_search_primary_evaluation_count
+                    ),
+                    "actual_evaluated_profile_count": len(attempted),
+                    "actual_evaluation_upper_bound": (
+                        partition_search_primary_evaluation_count
+                        + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+                    ),
+                    "qualified_parent_count": (
+                        partition_search_counterfactual_qualified_parent_count
+                    ),
+                    "generated_profile_count": (
+                        partition_search_counterfactual_generated_profile_count
+                    ),
+                    "evaluation_count": (
+                        partition_search_counterfactual_evaluation_count
+                    ),
+                    "feasible_profile_count": (
+                        partition_search_counterfactual_feasible_profile_count
+                    ),
+                    "hard_infeasible_profile_count": (
+                        partition_search_counterfactual_hard_infeasible_profile_count
+                    ),
+                    "capacity_exhausted_profile_count": (
+                        partition_search_counterfactual_capacity_exhausted_profile_count
+                    ),
+                    "unproven_failure_profile_count": (
+                        partition_search_counterfactual_unproven_failure_profile_count
+                    ),
+                    "promoted_queued_profile_count": (
+                        partition_search_counterfactual_promoted_queued_profile_count
+                    ),
+                    "authorization_proofs": (
+                        partition_search_counterfactual_authorization_proofs
+                    ),
+                    "maximum_added_split_count_per_profile": 1,
+                    "existing_timing_boundary_required": True,
+                    "proposal_evidence_required": True,
+                    "sample_bracket_required_for_sample_evidence": True,
+                    "confirmed_native_cut_snap_allowed": True,
+                    "full_selector_recheck_required": True,
+                    "balanced_source_quota_hard_gate_rechecked": True,
+                    "strict_extra_quota_domain_search_reused": True,
+                    "witness_selection_eligible": False,
+                    "witness_render_authorized": False,
+                    "duration_state_quantization_allowed": False,
+                    "visual_gates_relaxed": False,
+                },
                 "queue_order": (
                     "structural_change_count_then_total_unit_displacement_"
                     "then_musical_penalty_then_furthest_parent_proof_"
@@ -6146,9 +6911,7 @@ def _select_direct_member_partition_profile(
             event="direct_member_partition_search_completed",
             phase="search_completed",
             result=(
-                "profile_cap_reached"
-                if partition_search_cap_reached
-                else "bounded_hard_infeasible"
+                aggregate_result
             ),
             evaluated_profile_count=len(attempted),
             evaluation_limit=partition_search_evaluation_limit,
@@ -6183,11 +6946,35 @@ def _select_direct_member_partition_profile(
             strict_extra_quota_assignment_capacity_exhausted_profile_count=(
                 partition_search_extra_quota_capacity_exhausted_profile_count
             ),
+            counterfactual_secondary_generated_profile_count=(
+                partition_search_counterfactual_generated_profile_count
+            ),
+            counterfactual_secondary_evaluation_count=(
+                partition_search_counterfactual_evaluation_count
+            ),
+            counterfactual_secondary_feasible_profile_count=(
+                partition_search_counterfactual_feasible_profile_count
+            ),
+            counterfactual_secondary_hard_infeasible_profile_count=(
+                partition_search_counterfactual_hard_infeasible_profile_count
+            ),
+            counterfactual_secondary_capacity_exhausted_profile_count=(
+                partition_search_counterfactual_capacity_exhausted_profile_count
+            ),
+            counterfactual_secondary_unproven_failure_profile_count=(
+                partition_search_counterfactual_unproven_failure_profile_count
+            ),
             profile_cap_reached=partition_search_cap_reached,
             selected_profile_id=None,
         )
         raise DirectMemberVisualSelectionError(
-            "all bounded direct-member musical partitions were hard-infeasible",
+            (
+                "all bounded direct-member musical partitions were "
+                "proven hard-infeasible"
+                if all_proven
+                else "direct-member partition search ended without a "
+                "proved feasible selection"
+            ),
             aggregate_diagnostics,
         )
 
@@ -6200,12 +6987,16 @@ def _select_direct_member_partition_profile(
             "canonical_signature_deduplicated_proof_directed_"
             "adaptive_frontier_visual_micro_split_best_first_"
             "exact_lifeline_capacity_retry_strict_extra_quota_"
-            "assignment_partition_v7"
+            "assignment_severe_counterfactual_secondary_partition_v8"
         ),
         "initial_profile_count": _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
         "maximum_profile_count": partition_search_evaluation_limit,
         "static_profile_upper_bound": (
             _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND
+        ),
+        "absolute_profile_upper_bound": (
+            _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND
+            + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
         ),
         "maximum_profile_limit_expansion_count": (
             _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
@@ -6216,6 +7007,9 @@ def _select_direct_member_partition_profile(
         ),
         "maximum_visual_frontier_split_count_per_profile": (
             _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+        ),
+        "maximum_counterfactual_visual_frontier_split_count_per_profile": (
+            _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE + 1
         ),
         "profile_cap_reached": partition_search_cap_reached,
         "generated_profile_count": partition_search_generated_profile_count,
@@ -6278,6 +7072,62 @@ def _select_direct_member_partition_profile(
             "state_limit_expanded": False,
             "visual_gates_relaxed": False,
         },
+        "severe_transition_counterfactual_secondary_partition": {
+            "contract": (
+                "bounded_diagnostic_severe_counterfactual_"
+                "secondary_partition_v1"
+            ),
+            "maximum_qualified_profile_count": (
+                _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+            ),
+            "primary_evaluated_profile_count": (
+                partition_search_primary_evaluation_count
+            ),
+            "actual_evaluated_profile_count": len(attempted),
+            "actual_evaluation_upper_bound": (
+                partition_search_primary_evaluation_count
+                + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
+            ),
+            "qualified_parent_count": (
+                partition_search_counterfactual_qualified_parent_count
+            ),
+            "generated_profile_count": (
+                partition_search_counterfactual_generated_profile_count
+            ),
+            "evaluation_count": (
+                partition_search_counterfactual_evaluation_count
+            ),
+            "feasible_profile_count": (
+                partition_search_counterfactual_feasible_profile_count
+            ),
+            "hard_infeasible_profile_count": (
+                partition_search_counterfactual_hard_infeasible_profile_count
+            ),
+            "capacity_exhausted_profile_count": (
+                partition_search_counterfactual_capacity_exhausted_profile_count
+            ),
+            "unproven_failure_profile_count": (
+                partition_search_counterfactual_unproven_failure_profile_count
+            ),
+            "promoted_queued_profile_count": (
+                partition_search_counterfactual_promoted_queued_profile_count
+            ),
+            "authorization_proofs": (
+                partition_search_counterfactual_authorization_proofs
+            ),
+            "maximum_added_split_count_per_profile": 1,
+            "existing_timing_boundary_required": True,
+            "proposal_evidence_required": True,
+            "sample_bracket_required_for_sample_evidence": True,
+            "confirmed_native_cut_snap_allowed": True,
+            "full_selector_recheck_required": True,
+            "balanced_source_quota_hard_gate_rechecked": True,
+            "strict_extra_quota_domain_search_reused": True,
+            "witness_selection_eligible": False,
+            "witness_render_authorized": False,
+            "duration_state_quantization_allowed": False,
+            "visual_gates_relaxed": False,
+        },
         "queue_order": (
             "structural_change_count_then_total_unit_displacement_"
             "then_musical_penalty_then_furthest_parent_proof_progress_"
@@ -6331,6 +7181,24 @@ def _select_direct_member_partition_profile(
         ),
         strict_extra_quota_assignment_capacity_exhausted_profile_count=(
             partition_search_extra_quota_capacity_exhausted_profile_count
+        ),
+        counterfactual_secondary_generated_profile_count=(
+            partition_search_counterfactual_generated_profile_count
+        ),
+        counterfactual_secondary_evaluation_count=(
+            partition_search_counterfactual_evaluation_count
+        ),
+        counterfactual_secondary_feasible_profile_count=(
+            partition_search_counterfactual_feasible_profile_count
+        ),
+        counterfactual_secondary_hard_infeasible_profile_count=(
+            partition_search_counterfactual_hard_infeasible_profile_count
+        ),
+        counterfactual_secondary_capacity_exhausted_profile_count=(
+            partition_search_counterfactual_capacity_exhausted_profile_count
+        ),
+        counterfactual_secondary_unproven_failure_profile_count=(
+            partition_search_counterfactual_unproven_failure_profile_count
         ),
         profile_cap_reached=partition_search_cap_reached,
         selected_profile_id=selected_profile.profile_id,

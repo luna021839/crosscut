@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from itertools import product
 import math
 from pathlib import Path
 import unittest
@@ -11,7 +13,9 @@ from crosscut.direct_member_visual import (
     DirectMemberVisualSelectionError,
     _VideoDescriptorProvider,
     _balanced_visual_path,
+    _exact_feasibility_lifeline,
     _hard_boundary_connectivity_diagnostics,
+    _severe_transition_counterfactual_diagnostic,
     select_balanced_direct_member_sources,
 )
 from crosscut.pose import FormationPersonDescriptor
@@ -791,6 +795,61 @@ class DirectMemberVisualTests(unittest.TestCase):
             0.08,
         )
 
+    def test_explicit_extra_quota_owner_preserves_source_search_order(self) -> None:
+        spans = tuple(
+            (float(index), float(index + 1))
+            for index in range(7)
+        )
+
+        selection = select_balanced_direct_member_sources(
+            sources=tuple(Path(f"{index}.mp4") for index in range(3)),
+            canonical_spans=spans,
+            audio_offsets=(0.0,) * 3,
+            preferred_source_order=(0, 1, 2),
+            extra_quota_source_indices=(2,),
+            config=DirectMemberVisualConfig(beam_width=4_096),
+            descriptor_provider=lambda source_index, _source, _time: _descriptor(
+                0.20 + source_index * 0.006
+            ),
+        )
+
+        self.assertEqual(selection.source_quotas, (2, 2, 3))
+        self.assertEqual(selection.source_counts, selection.source_quotas)
+        provenance = selection.optimizer_search_diagnostics[
+            "source_quota_assignment"
+        ]
+        self.assertEqual(
+            provenance["contract"],
+            "strict_balanced_extra_quota_assignment_v1",
+        )
+        self.assertEqual(provenance["basis"], "explicit_extra_quota_source_set")
+        self.assertEqual(provenance["extra_quota_source_indices"], [2])
+        self.assertEqual(provenance["source_search_order"], [0, 1, 2])
+        self.assertFalse(provenance["source_search_order_changed"])
+        self.assertTrue(provenance["counts_differ_by_at_most_one"])
+
+    def test_explicit_extra_quota_owner_contract_rejects_invalid_sets(self) -> None:
+        spans = tuple(
+            (float(index), float(index + 1))
+            for index in range(8)
+        )
+        common = {
+            "sources": tuple(Path(f"{index}.mp4") for index in range(3)),
+            "canonical_spans": spans,
+            "audio_offsets": (0.0,) * 3,
+            "preferred_source_order": (0, 1, 2),
+            "descriptor_provider": lambda source_index, _source, _time: _descriptor(
+                0.20 + source_index * 0.006
+            ),
+        }
+
+        for invalid in ((0,), (0, 0), (0, 3)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                select_balanced_direct_member_sources(
+                    **common,
+                    extra_quota_source_indices=invalid,
+                )
+
     def test_eight_source_quota_shortfall_still_fails_closed(self) -> None:
         spans = tuple(
             (index * 3.9, (index + 1) * 3.9)
@@ -1066,6 +1125,110 @@ class DirectMemberVisualTests(unittest.TestCase):
             )
         )
 
+    def test_official_portrait_flash_pseudo_cut_is_suppressed_by_flank_continuity(
+        self,
+    ) -> None:
+        spans = ((0.0, 1.0), (1.0, 2.0))
+
+        selection = select_balanced_direct_member_sources(
+            sources=(Path("continuous.mp4"), Path("other.mp4")),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0),
+            source_scene_cut_times=((0.37,), ()),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=200),
+            descriptor_provider=lambda source_index, _source, _time: _descriptor(
+                0.20 + source_index * 0.01
+            ),
+        )
+
+        candidate = selection.span_validity[0].sources[0]
+        self.assertTrue(candidate.valid)
+        self.assertEqual(candidate.native_scene_cut_source_seconds, ())
+        self.assertEqual(
+            candidate.suppressed_portrait_fancam_scene_cut_source_seconds,
+            (0.37,),
+        )
+        content = selection.aggregate_diagnostics()["content_validity"]
+        self.assertEqual(content["native_scene_cut_count"], 0)
+        self.assertEqual(
+            content["suppressed_portrait_fancam_scene_cut_count"],
+            1,
+        )
+
+    def test_official_portrait_true_structure_cut_remains_hard_invalid(self) -> None:
+        spans = ((0.0, 1.0), (1.0, 2.0))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            if source_index == 0:
+                return _descriptor(0.18 if source_local_seconds < 0.37 else 0.45)
+            return _descriptor(0.30)
+
+        selection = select_balanced_direct_member_sources(
+            sources=(Path("edited.mp4"), Path("continuous.mp4")),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0),
+            source_scene_cut_times=((0.37,), ()),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=200),
+            descriptor_provider=provider,
+        )
+
+        candidate = selection.span_validity[0].sources[0]
+        self.assertFalse(candidate.valid)
+        self.assertEqual(candidate.native_scene_cut_source_seconds, (0.37,))
+        self.assertEqual(
+            candidate.suppressed_portrait_fancam_scene_cut_source_seconds,
+            (),
+        )
+        self.assertIn(
+            "source_native_scene_cut_inside_rendered_span",
+            candidate.rejection_reasons,
+        )
+
+    def test_official_portrait_cut_probe_preserves_unsampled_rig_obstruction(
+        self,
+    ) -> None:
+        spans = ((0.0, 1.0), (1.0, 2.0))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return _descriptor(
+                0.20 + source_index * 0.01,
+                foreground_obstruction_score=(
+                    0.96
+                    if source_index == 0
+                    and abs(source_local_seconds - 0.37) < 0.005
+                    else 0.0
+                ),
+            )
+
+        selection = select_balanced_direct_member_sources(
+            sources=(Path("rig.mp4"), Path("continuous.mp4")),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0),
+            source_scene_cut_times=((0.37,), ()),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=200),
+            descriptor_provider=provider,
+        )
+
+        candidate = selection.span_validity[0].sources[0]
+        self.assertFalse(candidate.valid)
+        self.assertEqual(candidate.foreground_obstruction_sample_count, 0)
+        self.assertEqual(candidate.native_scene_cut_source_seconds, (0.37,))
+        self.assertIn(
+            "source_native_scene_cut_inside_rendered_span",
+            candidate.rejection_reasons,
+        )
+
     def test_ordinary_warning_jump_is_soft_and_exposed_in_aggregate_maxima(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(4))
 
@@ -1154,6 +1317,889 @@ class DirectMemberVisualTests(unittest.TestCase):
                 "severe_boundary_mismatch",
                 cross_source[0]["rejection_reasons"],
             )
+        counterfactual = raised.exception.diagnostics["search"][
+            "severe_transition_counterfactual"
+        ]
+        self.assertEqual(
+            counterfactual["contract"],
+            "diagnostic_only_severe_transition_counterfactual_v1",
+        )
+        self.assertTrue(counterfactual["witness_found"])
+        self.assertTrue(counterfactual["integrity_check_passed"])
+        self.assertTrue(counterfactual["optimality_proven"])
+        self.assertEqual(counterfactual["minimum_severe_transition_count"], 3)
+        self.assertFalse(
+            counterfactual["production_single_split_proposal_authorized"]
+        )
+        self.assertEqual(
+            [
+                item["severe_transition_budget"]
+                for item in counterfactual["budget_attempts"]
+            ],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [item["path_found"] for item in counterfactual["budget_attempts"]],
+            [False, False, True],
+        )
+        self.assertTrue(
+            all(
+                item["severe_transition_count_requirement"]
+                == "exactly_budget"
+                for item in counterfactual["budget_attempts"]
+            )
+        )
+        self.assertEqual(
+            [
+                item["severe_transition_budget"]
+                for item in counterfactual["lower_budget_hard_proofs"]
+            ],
+            [0, 1, 2],
+        )
+        self.assertTrue(
+            all(
+                item["constraint_infeasibility_proven"]
+                for item in counterfactual["lower_budget_hard_proofs"]
+            )
+        )
+        self.assertEqual(
+            counterfactual["blocking_boundary_indices"],
+            [0, 1, 2],
+        )
+        self.assertFalse(counterfactual["state_capacity_exhausted"])
+        self.assertFalse(counterfactual["duration_state_quantization_applied"])
+        self.assertFalse(counterfactual["selection_eligible"])
+        self.assertFalse(counterfactual["render_authorized"])
+        self.assertFalse(counterfactual["visual_gates_relaxed"])
+        self.assertFalse(counterfactual["original_matrices_mutated"])
+        for name in (
+            "original_hard_constraint_sha256",
+            "original_failure_certificate_sha256",
+            "severe_disabled_hard_constraint_sha256",
+            "severe_disabled_witness_sha256",
+            "minimum_witness_path_sha256",
+            "severe_transition_budget_mask_sha256",
+        ):
+            self.assertEqual(len(counterfactual[name]), 64)
+
+    def test_severe_counterfactual_hash_binds_original_adjacent_flags_without_mutation(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe_a = _optimizer_mismatch(severe=True)
+        severe_b = replace(
+            severe_a,
+            severe_flags=("synthetic_tampered_incompatible_edge",),
+        )
+
+        def matrices_with(cross_edge: DirectBoundaryMismatch):
+            return tuple(
+                (
+                    (safe, cross_edge),
+                    (cross_edge, safe),
+                )
+                for _ in range(3)
+            )
+
+        original = matrices_with(severe_a)
+        tampered = matrices_with(severe_b)
+
+        def diagnostic(matrices):
+            with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+                _balanced_visual_path(
+                    matrices,
+                    source_quotas=(2, 2),
+                    source_order=(0, 1),
+                    candidate_validity=((True, True),) * 4,
+                    span_durations=(1.0,) * 4,
+                    config=DirectMemberVisualConfig(
+                        beam_width=100,
+                        maximum_adaptive_beam_width=100,
+                    ),
+                )
+            return raised.exception.diagnostics["search"][
+                "severe_transition_counterfactual"
+            ]
+
+        original_flags_before = tuple(
+            mismatch.severe_flags
+            for matrix in original
+            for row in matrix
+            for mismatch in row
+        )
+        first = diagnostic(original)
+        original_flags_after = tuple(
+            mismatch.severe_flags
+            for matrix in original
+            for row in matrix
+            for mismatch in row
+        )
+        second = diagnostic(tampered)
+
+        self.assertEqual(original_flags_after, original_flags_before)
+        self.assertNotEqual(
+            first["original_hard_constraint_sha256"],
+            second["original_hard_constraint_sha256"],
+        )
+        self.assertNotEqual(
+            first["original_failure_certificate_sha256"],
+            second["original_failure_certificate_sha256"],
+        )
+        self.assertNotEqual(
+            first["severe_disabled_witness_sha256"],
+            second["severe_disabled_witness_sha256"],
+        )
+        self.assertEqual(
+            first["severe_disabled_hard_constraint_sha256"],
+            second["severe_disabled_hard_constraint_sha256"],
+        )
+        self.assertEqual(
+            first["severe_transition_budget_mask_sha256"],
+            second["severe_transition_budget_mask_sha256"],
+        )
+        self.assertTrue(
+            all(
+                item["original_severe_flags"]
+                == ["synthetic_incompatible_edge"]
+                for item in first["blocking_transitions"]
+            )
+        )
+
+    def test_severe_counterfactual_proves_exact_minimum_one_deterministically(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrix = tuple(
+            tuple(
+                safe
+                if left == right or {left, right} == {0, 1}
+                else severe
+                for right in range(3)
+            )
+            for left in range(3)
+        )
+        matrices = (matrix, matrix)
+
+        def diagnostic() -> dict[str, object]:
+            with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+                _balanced_visual_path(
+                    matrices,
+                    source_quotas=(1, 1, 1),
+                    source_order=(0, 1, 2),
+                    candidate_validity=((True, True, True),) * 3,
+                    span_durations=(1.0, 1.0, 1.0),
+                    config=DirectMemberVisualConfig(
+                        beam_width=100,
+                        maximum_adaptive_beam_width=100,
+                    ),
+                )
+            return raised.exception.diagnostics["search"][
+                "severe_transition_counterfactual"
+            ]
+
+        first = diagnostic()
+        second = diagnostic()
+
+        self.assertTrue(first["optimality_proven"])
+        self.assertEqual(first["minimum_severe_transition_count"], 1)
+        self.assertTrue(first["production_single_split_proposal_authorized"])
+        self.assertEqual(
+            [item["severe_transition_budget"] for item in first["budget_attempts"]],
+            [1],
+        )
+        self.assertEqual(
+            [
+                item["severe_transition_budget"]
+                for item in first["lower_budget_hard_proofs"]
+            ],
+            [0],
+        )
+        self.assertEqual(
+            first["blocking_transitions"],
+            [
+                {
+                    "boundary_index": 0,
+                    "outgoing_eligible_source_index": 2,
+                    "incoming_eligible_source_index": 1,
+                    "original_severe_flags": ["synthetic_incompatible_edge"],
+                }
+            ],
+        )
+        self.assertEqual(
+            first["minimum_witness_path_sha256"],
+            second["minimum_witness_path_sha256"],
+        )
+        self.assertEqual(first["budget_attempts"], second["budget_attempts"])
+
+    def test_severe_budget_root_diagnostics_match_the_allowed_search_domain(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrix = (
+            (safe, severe),
+            (severe, safe),
+        )
+        result = _exact_feasibility_lifeline(
+            (matrix,),
+            source_quotas=(1, 1),
+            source_order=(0, 1),
+            candidate_validity=((True, True), (True, True)),
+            durations=(1.0, 1.0),
+            duration_targets=(1.0, 1.0),
+            state_limit=100,
+            config=DirectMemberVisualConfig(),
+            severe_transition_budget_mask=(
+                (
+                    (False, True),
+                    (True, False),
+                ),
+            ),
+            maximum_severe_transition_count=1,
+        )
+
+        self.assertIsNotNone(result.node)
+        predecessor = next(
+            item
+            for item in result.root_candidate_diagnostics[0][
+                "predecessor_diagnostics"
+            ]
+            if item["eligible_source_index"] == 1
+        )
+        self.assertTrue(predecessor["eligible"])
+        self.assertNotIn(
+            "severe_boundary_mismatch",
+            predecessor["rejection_reasons"],
+        )
+        self.assertTrue(predecessor["severe_transition_budget_mode"])
+        self.assertEqual(predecessor["severe_budget_cost"], 1)
+        self.assertEqual(predecessor["maximum_severe_transition_count"], 1)
+
+    def test_exact_severe_count_requirement_rejects_lower_cost_path(self) -> None:
+        safe = _optimizer_mismatch()
+        matrix = (
+            (safe, safe),
+            (safe, safe),
+        )
+        mask = (
+            (
+                (False, False),
+                (False, False),
+            ),
+        )
+        common = {
+            "matrices": (matrix,),
+            "source_quotas": (1, 1),
+            "source_order": (0, 1),
+            "candidate_validity": ((True, True), (True, True)),
+            "durations": (1.0, 1.0),
+            "duration_targets": (1.0, 1.0),
+            "state_limit": 100,
+            "config": DirectMemberVisualConfig(),
+            "severe_transition_budget_mask": mask,
+            "maximum_severe_transition_count": 1,
+        }
+        bounded = _exact_feasibility_lifeline(**common)
+        exact_one = _exact_feasibility_lifeline(
+            **common,
+            minimum_severe_transition_count=1,
+        )
+
+        self.assertIsNotNone(bounded.node)
+        self.assertIsNone(exact_one.node)
+        self.assertFalse(exact_one.state_capacity_exhausted)
+        pruning = exact_one.to_dict()["admissible_pruning"]
+        self.assertEqual(pruning["severe_transition_count_requirement"], "exact")
+        self.assertEqual(pruning["minimum_severe_transition_count"], 1)
+        self.assertEqual(pruning["maximum_severe_transition_count"], 1)
+
+    def test_layered_severe_reachability_prunes_unreachable_exact_count(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        matrix = (
+            (safe, safe),
+            (safe, safe),
+        )
+        result = _exact_feasibility_lifeline(
+            (matrix,),
+            source_quotas=(1, 1),
+            source_order=(0, 1),
+            candidate_validity=((True, True), (True, True)),
+            durations=(1.0, 1.0),
+            duration_targets=(1.0, 1.0),
+            state_limit=100,
+            config=DirectMemberVisualConfig(),
+            severe_transition_budget_mask=(
+                (
+                    (False, False),
+                    (False, False),
+                ),
+            ),
+            minimum_severe_transition_count=1,
+            maximum_severe_transition_count=1,
+        )
+
+        self.assertIsNone(result.node)
+        self.assertFalse(result.state_capacity_exhausted)
+        pruning = result.to_dict()["admissible_pruning"]
+        self.assertEqual(
+            pruning["layered_severe_reachability_contract"],
+            "candidate_valid_no_repeat_directed_original_severe_"
+            "exact_count_bitset_v1",
+        )
+        self.assertGreater(
+            pruning["layered_severe_reachability_pruned_state_count"],
+            0,
+        )
+        self.assertEqual(pruning["structural_prefix_query_count"], 0)
+
+    def test_layered_severe_budget_is_clamped_to_real_boundary_count(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        source_count = 3
+        span_count = 4
+        matrix = tuple(
+            tuple(safe for _right in range(source_count))
+            for _left in range(source_count)
+        )
+        mask = tuple(
+            tuple(
+                tuple(False for _right in range(source_count))
+                for _left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        common = {
+            "matrices": (matrix,) * (span_count - 1),
+            "source_quotas": (2, 1, 1),
+            "source_order": (0, 1, 2),
+            "candidate_validity": ((True, True, True),) * span_count,
+            "durations": (1.0,) * span_count,
+            "duration_targets": (2.0, 1.0, 1.0),
+            "state_limit": 1_000,
+            "config": DirectMemberVisualConfig(),
+            "severe_transition_budget_mask": mask,
+            "maximum_severe_transition_count": 1_000_000,
+        }
+        bounded = _exact_feasibility_lifeline(**common)
+        impossible_exact = _exact_feasibility_lifeline(
+            **common,
+            minimum_severe_transition_count=1_000_000,
+        )
+
+        self.assertIsNotNone(bounded.node)
+        self.assertIsNone(impossible_exact.node)
+        self.assertFalse(impossible_exact.state_capacity_exhausted)
+        pruning = impossible_exact.to_dict()["admissible_pruning"]
+        self.assertEqual(
+            pruning["layered_requested_maximum_severe_transition_count"],
+            1_000_000,
+        )
+        self.assertEqual(
+            pruning["layered_effective_maximum_severe_transition_count"],
+            span_count - 1,
+        )
+        self.assertTrue(pruning["layered_severe_count_clamp_applied"])
+        self.assertEqual(
+            pruning["layered_subset_quota_projected_cell_count"],
+            span_count
+            * source_count
+            * span_count
+            * (1 << source_count),
+        )
+
+    def test_layered_subset_envelope_preflight_caps_fall_back_exactly(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+
+        def solve(source_count: int, span_count: int):
+            base, extra = divmod(span_count, source_count)
+            quotas = tuple(
+                base + int(source_index < extra)
+                for source_index in range(source_count)
+            )
+            matrix = tuple(
+                tuple(safe for _right in range(source_count))
+                for _left in range(source_count)
+            )
+            return _exact_feasibility_lifeline(
+                (matrix,) * (span_count - 1),
+                source_quotas=quotas,
+                source_order=tuple(range(source_count)),
+                candidate_validity=((True,) * source_count,) * span_count,
+                durations=(1.0,) * span_count,
+                duration_targets=tuple(float(quota) for quota in quotas),
+                state_limit=100_000,
+                config=DirectMemberVisualConfig(),
+            )
+
+        cases = (
+            (13, 13, "source_count_limit_exceeded"),
+            (12, 20, "projected_work_limit_exceeded"),
+            (12, 21, "projected_cell_limit_exceeded"),
+        )
+        for source_count, span_count, reason in cases:
+            with self.subTest(reason=reason):
+                result = solve(source_count, span_count)
+                self.assertIsNotNone(result.node)
+                self.assertFalse(result.state_capacity_exhausted)
+                pruning = result.to_dict()["admissible_pruning"]
+                self.assertFalse(pruning["layered_subset_quota_enabled"])
+                self.assertEqual(
+                    pruning["layered_subset_quota_disabled_reason"],
+                    reason,
+                )
+                self.assertEqual(
+                    pruning[
+                        "layered_subset_quota_precomputed_cell_count"
+                    ],
+                    0,
+                )
+                self.assertGreater(
+                    pruning["structural_prefix_query_count"],
+                    0,
+                )
+
+    def test_exact_prefix_bound_combines_validity_and_nonadjacency_soundly(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        matrix = (
+            (safe, safe),
+            (safe, safe),
+        )
+        result = _exact_feasibility_lifeline(
+            (matrix, matrix, matrix),
+            source_quotas=(2, 2),
+            source_order=(0, 1),
+            candidate_validity=(
+                (False, True),
+                (True, True),
+                (True, True),
+                (False, True),
+            ),
+            durations=(1.0, 1.0, 1.0, 1.0),
+            duration_targets=(2.0, 2.0),
+            state_limit=100,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertIsNone(result.node)
+        self.assertFalse(result.state_capacity_exhausted)
+        reasons = result.root_candidate_diagnostics[0]["prune_reasons"]
+        combined = [
+            item
+            for item in reasons
+            if item["reason"]
+            == "prefix_valid_nonadjacent_slot_shortfall"
+        ]
+        self.assertEqual(len(combined), 1)
+        self.assertEqual(combined[0]["eligible_source_index"], 0)
+        self.assertEqual(combined[0]["quota_deficit"], 2)
+        self.assertEqual(
+            combined[0]["maximum_valid_nonadjacent_prefix_slots"],
+            1,
+        )
+        pruning = result.to_dict()["admissible_pruning"]
+        self.assertEqual(
+            pruning["single_source_duration_bound_contract"],
+            "candidate_valid_nonadjacent_exact_float_min_max_v1",
+        )
+        self.assertFalse(pruning["duration_state_quantization_applied"])
+
+    def test_structural_prefix_dp_prunes_disconnected_quota_topology(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        safe_edges = (
+            (
+                (True, True, True),
+                (True, True, False),
+                (True, True, True),
+            ),
+            (
+                (True, True, True),
+                (False, True, False),
+                (True, True, True),
+            ),
+            (
+                (True, True, True),
+                (False, True, True),
+                (True, False, True),
+            ),
+        )
+        matrices = tuple(
+            tuple(
+                tuple(safe if allowed else severe for allowed in row)
+                for row in boundary
+            )
+            for boundary in safe_edges
+        )
+        result = _exact_feasibility_lifeline(
+            matrices,
+            source_quotas=(2, 1, 1),
+            source_order=(0, 1, 2),
+            candidate_validity=(
+                (True, True, True),
+                (True, True, True),
+                (True, True, True),
+                (False, False, True),
+            ),
+            durations=(1.0, 1.0, 1.0, 1.0),
+            duration_targets=(2.0, 1.0, 1.0),
+            state_limit=10_000,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertIsNone(result.node)
+        self.assertFalse(result.state_capacity_exhausted)
+        pruning = result.to_dict()["admissible_pruning"]
+        self.assertEqual(
+            pruning["structural_prefix_contract"],
+            "candidate_valid_quota_no_repeat_original_severe_budget_"
+            "duration_relaxation_v1",
+        )
+        self.assertGreater(
+            pruning["structural_prefix_infeasible_pruned_state_count"],
+            0,
+        )
+        self.assertGreater(pruning["structural_prefix_state_count"], 0)
+        self.assertEqual(
+            pruning["layered_subset_quota_pruned_state_count"],
+            0,
+        )
+        self.assertFalse(
+            pruning["structural_prefix_state_capacity_exhausted"]
+        )
+        self.assertEqual(
+            pruning["structural_capacity_effect"],
+            "unknown_fallback_to_full_exact_search",
+        )
+
+    def test_layered_subset_quota_envelope_prunes_joint_shortfall(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        source_count = 3
+        span_count = 6
+        matrix = tuple(
+            tuple(
+                safe
+                if left == right or 2 in {left, right}
+                else severe
+                for right in range(source_count)
+            )
+            for left in range(source_count)
+        )
+        result = _exact_feasibility_lifeline(
+            (matrix,) * (span_count - 1),
+            source_quotas=(2, 2, 2),
+            source_order=(0, 1, 2),
+            candidate_validity=(
+                ((True, True, True),) * (span_count - 1)
+                + ((False, False, True),)
+            ),
+            durations=(1.0,) * span_count,
+            duration_targets=(2.0, 2.0, 2.0),
+            state_limit=10_000,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertIsNone(result.node)
+        self.assertFalse(result.state_capacity_exhausted)
+        pruning = result.to_dict()["admissible_pruning"]
+        self.assertTrue(pruning["layered_subset_quota_enabled"])
+        self.assertEqual(
+            pruning["layered_subset_quota_contract"],
+            "candidate_valid_no_repeat_directed_original_severe_"
+            "exact_count_all_source_subsets_max_envelope_v1",
+        )
+        self.assertGreater(
+            pruning["layered_subset_quota_pruned_state_count"],
+            0,
+        )
+        self.assertGreater(
+            int(
+                pruning["layered_subset_quota_pruned_mask_counts"].get(
+                    "3",
+                    0,
+                )
+            ),
+            0,
+        )
+        self.assertEqual(pruning["structural_prefix_query_count"], 0)
+
+    def test_admissible_exact_pruning_matches_small_exhaustive_budget_oracle(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        source_count = 3
+        span_count = 4
+        source_quotas = (2, 1, 1)
+        source_order = (0, 1, 2)
+        duration_cases = (
+            (1.0, 1.0, 1.0, 1.0),
+            (0.7, 1.1, 0.9, 1.3),
+            (1.4, 0.6, 1.2, 0.8),
+        )
+        for case_index in range(12):
+            durations = duration_cases[case_index % len(duration_cases)]
+            validity = tuple(
+                tuple(
+                    (position * 5 + source_index * 3 + case_index) % 7
+                    not in {0, 1}
+                    for source_index in range(source_count)
+                )
+                for position in range(span_count)
+            )
+            severe_mask = tuple(
+                tuple(
+                    tuple(
+                        bool(
+                            left != right
+                            and (
+                                boundary_index
+                                + left * 2
+                                + right
+                                + case_index
+                            )
+                            % 4
+                            == 0
+                        )
+                        for right in range(source_count)
+                    )
+                    for left in range(source_count)
+                )
+                for boundary_index in range(span_count - 1)
+            )
+            matrices = tuple(
+                tuple(
+                    tuple(safe for _right in range(source_count))
+                    for _left in range(source_count)
+                )
+                for _boundary in range(span_count - 1)
+            )
+            total_duration = sum(durations)
+            targets = tuple(
+                total_duration * quota / span_count
+                for quota in source_quotas
+            )
+            config = DirectMemberVisualConfig()
+            exhaustive = []
+            exhaustive_exact_one = []
+            for path in product(range(source_count), repeat=span_count):
+                if tuple(path.count(index) for index in range(source_count)) != (
+                    source_quotas
+                ):
+                    continue
+                if any(
+                    not validity[position][source_index]
+                    for position, source_index in enumerate(path)
+                ):
+                    continue
+                if any(left == right for left, right in zip(path, path[1:])):
+                    continue
+                severe_count = sum(
+                    int(severe_mask[index][left][right])
+                    for index, (left, right) in enumerate(
+                        zip(path, path[1:])
+                    )
+                )
+                if severe_count > 1:
+                    continue
+                totals = tuple(
+                    sum(
+                        duration
+                        for duration, assigned in zip(durations, path)
+                        if assigned == source_index
+                    )
+                    for source_index in range(source_count)
+                )
+                if any(
+                    abs(actual - target) / target
+                    > config.maximum_source_duration_relative_deviation + 1e-9
+                    for actual, target in zip(totals, targets)
+                ):
+                    continue
+                exhaustive.append(path)
+                if severe_count == 1:
+                    exhaustive_exact_one.append(path)
+
+            result = _exact_feasibility_lifeline(
+                matrices,
+                source_quotas=source_quotas,
+                source_order=source_order,
+                candidate_validity=validity,
+                durations=durations,
+                duration_targets=targets,
+                state_limit=100_000,
+                config=config,
+                severe_transition_budget_mask=severe_mask,
+                maximum_severe_transition_count=1,
+            )
+            self.assertFalse(
+                result.state_capacity_exhausted,
+                msg=f"case {case_index}",
+            )
+            self.assertEqual(
+                result.node is not None,
+                bool(exhaustive),
+                msg=f"case {case_index}",
+            )
+            if result.node is not None:
+                self.assertIn(result.node.path, exhaustive)
+
+            exact_one = _exact_feasibility_lifeline(
+                matrices,
+                source_quotas=source_quotas,
+                source_order=source_order,
+                candidate_validity=validity,
+                durations=durations,
+                duration_targets=targets,
+                state_limit=100_000,
+                config=config,
+                severe_transition_budget_mask=severe_mask,
+                minimum_severe_transition_count=1,
+                maximum_severe_transition_count=1,
+            )
+            self.assertFalse(
+                exact_one.state_capacity_exhausted,
+                msg=f"exact-one case {case_index}",
+            )
+            self.assertEqual(
+                exact_one.node is not None,
+                bool(exhaustive_exact_one),
+                msg=f"exact-one case {case_index}",
+            )
+            if exact_one.node is not None:
+                self.assertIn(exact_one.node.path, exhaustive_exact_one)
+
+    def test_severe_counterfactual_minimum_above_one_cannot_authorize_single_split(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrix = tuple(
+            tuple(
+                safe if left == right else severe
+                for right in range(3)
+            )
+            for left in range(3)
+        )
+        with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+            _balanced_visual_path(
+                (matrix, matrix),
+                source_quotas=(1, 1, 1),
+                source_order=(0, 1, 2),
+                candidate_validity=((True, True, True),) * 3,
+                span_durations=(1.0, 1.0, 1.0),
+                config=DirectMemberVisualConfig(
+                    beam_width=100,
+                    maximum_adaptive_beam_width=100,
+                ),
+            )
+
+        counterfactual = raised.exception.diagnostics["search"][
+            "severe_transition_counterfactual"
+        ]
+        self.assertTrue(counterfactual["optimality_proven"])
+        self.assertEqual(counterfactual["minimum_severe_transition_count"], 2)
+        self.assertFalse(
+            counterfactual["production_single_split_proposal_authorized"]
+        )
+        self.assertEqual(
+            [item["path_found"] for item in counterfactual["budget_attempts"]],
+            [False, True],
+        )
+        self.assertEqual(
+            [
+                item["severe_transition_budget"]
+                for item in counterfactual["lower_budget_hard_proofs"]
+            ],
+            [0, 1],
+        )
+        self.assertEqual(len(counterfactual["blocking_transitions"]), 2)
+
+    def test_severe_counterfactual_capacity_exhaustion_is_diagnostic_fail_closed(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        source_count = 3
+        span_count = 5
+        safe_matrix = tuple(
+            tuple(safe for _right in range(source_count))
+            for _left in range(source_count)
+        )
+        forced_severe_boundary = tuple(
+            tuple(
+                safe if left == right else severe
+                for right in range(source_count)
+            )
+            for left in range(source_count)
+        )
+        matrices = (
+            safe_matrix,
+            safe_matrix,
+            forced_severe_boundary,
+            safe_matrix,
+        )
+        common = {
+            "source_quotas": (2, 2, 1),
+            "source_order": (0, 1, 2),
+            "candidate_validity": ((True, True, True),) * span_count,
+            "durations": (1.0,) * span_count,
+            "duration_targets": (2.0, 2.0, 1.0),
+            "state_limit": 3,
+            "config": DirectMemberVisualConfig(),
+        }
+        original = _exact_feasibility_lifeline(matrices, **common)
+        self.assertIsNone(original.node)
+        self.assertFalse(original.state_capacity_exhausted)
+        self.assertEqual(original.explored_state_count, 3)
+        self.assertEqual(
+            original.admissible_pruning_diagnostics[
+                "layered_severe_reachability_pruned_state_count"
+            ],
+            3,
+        )
+
+        counterfactual = _severe_transition_counterfactual_diagnostic(
+            matrices,
+            original_lifeline=original,
+            **common,
+        )
+        self.assertFalse(counterfactual["witness_found"])
+        self.assertFalse(counterfactual["integrity_check_passed"])
+        self.assertFalse(counterfactual["optimality_proven"])
+        self.assertFalse(
+            counterfactual["production_single_split_proposal_authorized"]
+        )
+        self.assertTrue(counterfactual["state_capacity_exhausted"])
+        self.assertFalse(counterfactual["constraint_infeasibility_proven"])
+        self.assertIsNone(counterfactual["minimum_severe_transition_count"])
+        self.assertIsNone(counterfactual["severe_disabled_witness_sha256"])
+        self.assertEqual(len(counterfactual["budget_attempts"]), 1)
+        self.assertTrue(
+            counterfactual["budget_attempts"][0]["state_capacity_exhausted"]
+        )
+        self.assertEqual(
+            [
+                item["severe_transition_budget"]
+                for item in counterfactual["lower_budget_hard_proofs"]
+            ],
+            [0],
+        )
+        self.assertEqual(counterfactual["blocking_boundary_indices"], [])
+        self.assertEqual(counterfactual["blocking_transitions"], [])
+        self.assertFalse(counterfactual["selection_eligible"])
+        self.assertFalse(counterfactual["render_authorized"])
 
     def test_persistent_low_quality_is_rejected_but_one_transient_sample_passes(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(6))
@@ -1206,6 +2252,95 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(
             source["quality_sample_scores"],
             [0.6, 0.6, 0.6, 0.6, 0.9, 0.9],
+        )
+
+    def test_official_portrait_low_light_performance_quality_is_rescued(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            low_light = source_index == 0 and 0.0 < source_local_seconds < 1.0
+            return _descriptor(
+                0.20 + source_index * 0.02,
+                quality_score=0.55 if low_light else 0.92,
+                gray_mean_score=0.13 if low_light else 0.50,
+                gray_contrast_score=0.28 if low_light else 0.52,
+            )
+
+        selection = select_balanced_direct_member_sources(
+            sources=tuple(Path(f"{index}.mp4") for index in range(3)),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0, 0.0),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=1_000),
+            descriptor_provider=provider,
+        )
+
+        candidate = selection.span_validity[0].sources[0]
+        self.assertTrue(candidate.valid)
+        self.assertEqual(candidate.acceptable_quality_sample_count, 0)
+        self.assertTrue(
+            candidate.portrait_fancam_lighting_quality_rescue_applied
+        )
+        self.assertNotIn(
+            "persistent_low_visual_quality_or_foreground_obstruction",
+            candidate.rejection_reasons,
+        )
+        self.assertEqual(
+            selection.aggregate_diagnostics()["content_validity"][
+                "portrait_fancam_lighting_quality_rescue_count"
+            ],
+            1,
+        )
+
+    def test_official_portrait_low_quality_rescue_never_overrides_obstruction(
+        self,
+    ) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            first_span = source_index == 0 and 0.0 < source_local_seconds < 1.0
+            return _descriptor(
+                0.20 + source_index * 0.02,
+                quality_score=0.55 if first_span else 0.92,
+                gray_mean_score=0.30 if first_span else 0.50,
+                gray_contrast_score=0.40 if first_span else 0.52,
+                foreground_obstruction_score=(
+                    0.96
+                    if source_index == 0
+                    and 0.0 < source_local_seconds < 0.10
+                    else 0.0
+                ),
+            )
+
+        selection = select_balanced_direct_member_sources(
+            sources=tuple(Path(f"{index}.mp4") for index in range(3)),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0, 0.0),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=1_000),
+            descriptor_provider=provider,
+        )
+
+        candidate = selection.span_validity[0].sources[0]
+        self.assertFalse(candidate.valid)
+        self.assertFalse(
+            candidate.portrait_fancam_lighting_quality_rescue_applied
+        )
+        self.assertIn(
+            "persistent_low_visual_quality_or_foreground_obstruction",
+            candidate.rejection_reasons,
+        )
+        self.assertIn(
+            "foreground_camera_equipment_or_subject_obstruction",
+            candidate.rejection_reasons,
         )
 
     def test_single_foreground_camera_obstruction_sample_is_hard_rejected(self) -> None:
