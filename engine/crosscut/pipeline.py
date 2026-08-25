@@ -170,6 +170,10 @@ from .rendered_montage_grammar_review import (
 from .rhythm import RhythmAnalysis, analyze_rhythm
 from .section_director import SectionPlan, SectionRole, build_section_plan
 from .source_look_match import SourceLookMatchResult, analyze_source_look_match
+from .source_scalar_cache import (
+    PersistentSourceScalarCache,
+    source_content_sha256,
+)
 from .source_derivative_diversity import (
     SourceDerivativeDiversityResult,
     analyze_source_derivative_diversity,
@@ -256,11 +260,18 @@ from .tracking import (
     track_anchored_member,
 )
 from .timeline_review import TimelineReview, review_timeline
-from .timewarp import TimeWarpMap, estimate_local_timewarp
+from .timewarp import (
+    TimeWarpAnchor,
+    TimeWarpConfig,
+    TimeWarpControlPoint,
+    TimeWarpMap,
+    TimeWarpResidualDiagnostics,
+    estimate_local_timewarp,
+)
 from .timeline_interchange import write_timeline_interchange_bundle
 from .vision import (
     SceneDetectionConfig,
-    detect_scene_changes_in_video,
+    detect_scene_changes_in_video_cached,
     iter_video_frames,
 )
 from .visual_candidate_materialization import (
@@ -1778,6 +1789,125 @@ def _validate_media(info: MediaInfo) -> None:
         raise ValueError(f"media duration is unavailable: {info.path}")
 
 
+_AUDIO_ALIGNMENT_SCALAR_FIELDS = frozenset(
+    {
+        "offset_samples",
+        "offset_seconds",
+        "score",
+        "overlap_samples",
+        "overlap_seconds",
+        "second_best_score",
+        "score_margin",
+        "overlap_ratio",
+        "backend",
+    }
+)
+
+
+def _audio_alignment_cache_analyzer(reference_sha256: str) -> dict[str, Any]:
+    return {
+        "analysis_contract": "ive_pairwise_audio_alignment_v1",
+        "reference_source_sha256": reference_sha256,
+        "sample_rate": ANALYSIS_SAMPLE_RATE,
+        "max_offset_seconds": 120.0,
+        "minimum_overlap_policy": "min_10_max_2_shorter_duration_div_3",
+        "primary_backend": "spectral_flux_ncc",
+        "fallback_backend": "waveform_ncc",
+        "audio_implementation_sha256": hashlib.sha256(
+            Path(__file__).with_name("audio.py").read_bytes()
+        ).hexdigest(),
+    }
+
+
+def _audio_alignment_scalar_payload(
+    alignment: SourceAlignment,
+) -> dict[str, Any]:
+    payload = alignment.to_dict()
+    payload.pop("source", None)
+    payload.pop("is_reference", None)
+    return payload
+
+
+def _audio_alignment_from_scalar_payload(
+    payload: Mapping[str, Any],
+    *,
+    source: Path,
+) -> SourceAlignment:
+    if set(payload) != _AUDIO_ALIGNMENT_SCALAR_FIELDS:
+        raise ValueError("audio alignment cache schema does not match")
+    offset_samples = payload["offset_samples"]
+    overlap_samples = payload["overlap_samples"]
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (offset_samples, overlap_samples)
+    ) or int(overlap_samples) <= 0:
+        raise ValueError("audio alignment cached sample counts are invalid")
+    numeric_keys = (
+        "offset_seconds",
+        "score",
+        "overlap_seconds",
+        "score_margin",
+        "overlap_ratio",
+    )
+    if any(
+        isinstance(payload[key], bool)
+        or not isinstance(payload[key], (int, float))
+        for key in numeric_keys
+    ):
+        raise ValueError("audio alignment cache contains non-numeric values")
+    numeric = {key: float(payload[key]) for key in numeric_keys}
+    if any(not math.isfinite(value) for value in numeric.values()):
+        raise ValueError("audio alignment cache contains non-finite values")
+    if not -1.0 <= numeric["score"] <= 1.0:
+        raise ValueError("audio alignment cached score is invalid")
+    if numeric["overlap_seconds"] <= 0.0:
+        raise ValueError("audio alignment cached overlap is invalid")
+    if numeric["score_margin"] < 0.0:
+        raise ValueError("audio alignment cached score margin is invalid")
+    if not 0.0 <= numeric["overlap_ratio"] <= 1.0:
+        raise ValueError("audio alignment cached overlap ratio is invalid")
+    second_best = payload["second_best_score"]
+    if second_best is not None and (
+        not isinstance(second_best, (int, float))
+        or isinstance(second_best, bool)
+        or not math.isfinite(float(second_best))
+        or not -1.0 <= float(second_best) <= 1.0
+    ):
+        raise ValueError("audio alignment cached second-best score is invalid")
+    backend = payload["backend"]
+    if backend not in {"spectral_flux_ncc", "waveform_ncc"}:
+        raise ValueError("audio alignment cached backend is invalid")
+    if not math.isclose(
+        numeric["offset_seconds"],
+        int(offset_samples) / ANALYSIS_SAMPLE_RATE,
+        rel_tol=0.0,
+        abs_tol=1.0 / ANALYSIS_SAMPLE_RATE + 1e-9,
+    ):
+        raise ValueError("audio alignment cached offset/sample count disagree")
+    if not math.isclose(
+        numeric["overlap_seconds"],
+        int(overlap_samples) / ANALYSIS_SAMPLE_RATE,
+        rel_tol=0.0,
+        abs_tol=1.0 / ANALYSIS_SAMPLE_RATE + 1e-9,
+    ):
+        raise ValueError("audio alignment cached overlap/sample count disagree")
+    return SourceAlignment(
+        source=str(source),
+        is_reference=False,
+        offset_samples=int(offset_samples),
+        offset_seconds=numeric["offset_seconds"],
+        score=numeric["score"],
+        overlap_samples=int(overlap_samples),
+        overlap_seconds=numeric["overlap_seconds"],
+        second_best_score=(
+            float(second_best) if second_best is not None else None
+        ),
+        score_margin=numeric["score_margin"],
+        overlap_ratio=numeric["overlap_ratio"],
+        backend=str(backend),
+    )
+
+
 def _align_sequentially(
     request: AnalysisRequest,
     reporter: EventReporter,
@@ -1786,6 +1916,10 @@ def _align_sequentially(
     reporter.status("기준 음원을 추출하는 중…")
     reference_pcm = extract_mono_pcm(reference_path, sample_rate=ANALYSIS_SAMPLE_RATE)
     alignments: list[SourceAlignment] = []
+    try:
+        reference_sha256 = source_content_sha256(reference_path)
+    except (OSError, TypeError, ValueError):
+        reference_sha256 = None
 
     for index, source in enumerate(request.sources):
         if index == request.reference_source:
@@ -1807,6 +1941,45 @@ def _align_sequentially(
             continue
 
         reporter.status(f"음원 정렬 중: {source.name}")
+        alignment_cache: PersistentSourceScalarCache | None = None
+        cached_alignment: SourceAlignment | None = None
+        if (
+            request.source_cache_directory is not None
+            and reference_sha256 is not None
+        ):
+            try:
+                alignment_cache = PersistentSourceScalarCache(
+                    source_cache_directory=request.source_cache_directory,
+                    source_path=source,
+                    namespace="audio-alignment-v1",
+                    analyzer=_audio_alignment_cache_analyzer(
+                        reference_sha256
+                    ),
+                )
+                cached_payload = alignment_cache.get()
+                if cached_payload is not None:
+                    cached_alignment = _audio_alignment_from_scalar_payload(
+                        cached_payload,
+                        source=source,
+                    )
+            except (OSError, TypeError, ValueError):
+                alignment_cache = None
+                cached_alignment = None
+        if cached_alignment is not None:
+            alignments.append(cached_alignment)
+            reporter.log(
+                f"{source.name}: 기준 대비 "
+                f"{cached_alignment.offset_seconds:+.3f}초, 정렬 신뢰도 "
+                f"{cached_alignment.score:.3f}, 후보 간격 "
+                f"{cached_alignment.score_margin:.3f} "
+                f"({cached_alignment.backend}) · 영속 캐시 재사용"
+            )
+            completed_sources = index + 1
+            reporter.progress(
+                0.22 + 0.38 * completed_sources / len(request.sources),
+                "음방 오디오를 정렬하는 중…",
+            )
+            continue
         source_pcm = extract_mono_pcm(source, sample_rate=ANALYSIS_SAMPLE_RATE)
         minimum_overlap = min(
             10.0,
@@ -1833,21 +2006,27 @@ def _align_sequentially(
                 max_offset_seconds=120.0,
                 min_overlap_seconds=minimum_overlap,
             )
-        alignments.append(
-            SourceAlignment(
-                source=str(source),
-                is_reference=False,
-                offset_samples=estimate.offset_samples,
-                offset_seconds=estimate.offset_seconds,
-                score=estimate.score,
-                overlap_samples=estimate.overlap_samples,
-                overlap_seconds=estimate.overlap_seconds,
-                second_best_score=estimate.second_best_score,
-                score_margin=estimate.score_margin,
-                overlap_ratio=estimate.overlap_ratio,
-                backend=estimate.backend,
-            )
+        source_alignment = SourceAlignment(
+            source=str(source),
+            is_reference=False,
+            offset_samples=estimate.offset_samples,
+            offset_seconds=estimate.offset_seconds,
+            score=estimate.score,
+            overlap_samples=estimate.overlap_samples,
+            overlap_seconds=estimate.overlap_seconds,
+            second_best_score=estimate.second_best_score,
+            score_margin=estimate.score_margin,
+            overlap_ratio=estimate.overlap_ratio,
+            backend=estimate.backend,
         )
+        alignments.append(source_alignment)
+        if alignment_cache is not None:
+            try:
+                alignment_cache.put(
+                    _audio_alignment_scalar_payload(source_alignment)
+                )
+            except (OSError, TypeError, ValueError):
+                pass
         reporter.log(
             f"{source.name}: 기준 대비 {estimate.offset_seconds:+.3f}초, "
             f"정렬 신뢰도 {estimate.score:.3f}, 후보 간격 {estimate.score_margin:.3f} "
@@ -1870,6 +2049,348 @@ def _align_sequentially(
             group="IVE",
         ),
         reference_pcm,
+    )
+
+
+_TIMEWARP_SCALAR_FIELDS = frozenset(
+    {
+        "global_offset_seconds",
+        "master_duration_seconds",
+        "source_duration_seconds",
+        "control_points",
+        "anchors",
+        "residuals",
+        "config",
+        "scalar_fallback",
+        "fallback_reason",
+        "backend",
+    }
+)
+
+
+def _timewarp_cache_analyzer(
+    *,
+    reference_sha256: str,
+    global_offset_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "analysis_contract": "ive_local_audio_timewarp_v1",
+        "reference_source_sha256": reference_sha256,
+        "sample_rate": ANALYSIS_SAMPLE_RATE,
+        "global_offset_seconds": global_offset_seconds,
+        "configuration": TimeWarpConfig().to_dict(),
+        "timewarp_implementation_sha256": hashlib.sha256(
+            Path(__file__).with_name("timewarp.py").read_bytes()
+        ).hexdigest(),
+        "rhythm_implementation_sha256": hashlib.sha256(
+            Path(__file__).with_name("rhythm.py").read_bytes()
+        ).hexdigest(),
+    }
+
+
+def _timewarp_scalar_payload(timewarp: TimeWarpMap) -> dict[str, Any]:
+    return {
+        "global_offset_seconds": timewarp.global_offset_seconds,
+        "master_duration_seconds": timewarp.master_duration_seconds,
+        "source_duration_seconds": timewarp.source_duration_seconds,
+        "control_points": [
+            point.to_dict() for point in timewarp.control_points
+        ],
+        "anchors": [anchor.to_dict() for anchor in timewarp.anchors],
+        "residuals": timewarp.residuals.to_dict(),
+        "config": timewarp.config.to_dict(),
+        "scalar_fallback": timewarp.scalar_fallback,
+        "fallback_reason": timewarp.fallback_reason,
+        "backend": timewarp.backend,
+    }
+
+
+def _timewarp_from_scalar_payload(
+    payload: Mapping[str, Any],
+) -> TimeWarpMap:
+    if set(payload) != _TIMEWARP_SCALAR_FIELDS:
+        raise ValueError("timewarp cache schema does not match")
+
+    def finite(value: Any, label: str) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"cached {label} is invalid")
+        return float(value)
+
+    raw_config = payload["config"]
+    expected_config_keys = set(TimeWarpConfig().to_dict())
+    if not isinstance(raw_config, dict) or set(raw_config) != expected_config_keys:
+        raise ValueError("timewarp cached configuration schema does not match")
+    minimum_anchor_count = raw_config["minimum_anchor_count"]
+    if (
+        isinstance(minimum_anchor_count, bool)
+        or not isinstance(minimum_anchor_count, int)
+    ):
+        raise ValueError("timewarp cached minimum anchor count is invalid")
+    config = TimeWarpConfig(
+        window_seconds=finite(raw_config["window_seconds"], "window seconds"),
+        hop_seconds=finite(raw_config["hop_seconds"], "hop seconds"),
+        search_radius_seconds=finite(
+            raw_config["search_radius_seconds"],
+            "search radius",
+        ),
+        peak_exclusion_seconds=finite(
+            raw_config["peak_exclusion_seconds"],
+            "peak exclusion",
+        ),
+        minimum_score=finite(raw_config["minimum_score"], "minimum score"),
+        minimum_score_margin=finite(
+            raw_config["minimum_score_margin"],
+            "minimum score margin",
+        ),
+        minimum_anchor_count=minimum_anchor_count,
+        minimum_anchor_fraction=finite(
+            raw_config["minimum_anchor_fraction"],
+            "minimum anchor fraction",
+        ),
+        maximum_drift_rate=finite(
+            raw_config["maximum_drift_rate"],
+            "maximum drift rate",
+        ),
+        maximum_trend_residual_seconds=finite(
+            raw_config["maximum_trend_residual_seconds"],
+            "maximum trend residual",
+        ),
+    )
+    if not math.isclose(
+        finite(raw_config["minimum_slope"], "minimum slope"),
+        config.minimum_slope,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ) or not math.isclose(
+        finite(raw_config["maximum_slope"], "maximum slope"),
+        config.maximum_slope,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("timewarp cached slope bounds disagree with config")
+
+    raw_points = payload["control_points"]
+    if not isinstance(raw_points, list):
+        raise TypeError("timewarp cached control points must be a list")
+    points: list[TimeWarpControlPoint] = []
+    for raw in raw_points:
+        if not isinstance(raw, dict) or set(raw) != {
+            "master_seconds",
+            "source_seconds",
+            "offset_seconds",
+        }:
+            raise ValueError("timewarp cached control point schema does not match")
+        master = finite(raw["master_seconds"], "control master time")
+        source = finite(raw["source_seconds"], "control source time")
+        if not math.isclose(
+            finite(raw["offset_seconds"], "control offset"),
+            source - master,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("timewarp cached control offset disagrees")
+        points.append(
+            TimeWarpControlPoint(
+                master_seconds=master,
+                source_seconds=source,
+            )
+        )
+
+    raw_anchors = payload["anchors"]
+    if not isinstance(raw_anchors, list):
+        raise TypeError("timewarp cached anchors must be a list")
+    anchors: list[TimeWarpAnchor] = []
+    anchor_keys = {
+        "window_index",
+        "window_start_seconds",
+        "window_end_seconds",
+        "master_seconds",
+        "source_seconds",
+        "offset_seconds",
+        "score",
+        "second_best_score",
+        "score_margin",
+        "accepted",
+        "rejection_reason",
+        "trend_residual_seconds",
+    }
+    for raw in raw_anchors:
+        if not isinstance(raw, dict) or set(raw) != anchor_keys:
+            raise ValueError("timewarp cached anchor schema does not match")
+        window_index = raw["window_index"]
+        accepted = raw["accepted"]
+        rejection_reason = raw["rejection_reason"]
+        if (
+            isinstance(window_index, bool)
+            or not isinstance(window_index, int)
+            or window_index < 0
+            or not isinstance(accepted, bool)
+            or (
+                rejection_reason is not None
+                and not isinstance(rejection_reason, str)
+            )
+        ):
+            raise ValueError("timewarp cached anchor metadata is invalid")
+
+        def optional_finite(value: Any, label: str) -> float | None:
+            return None if value is None else finite(value, label)
+
+        anchor = TimeWarpAnchor(
+                window_index=window_index,
+                window_start_seconds=finite(
+                    raw["window_start_seconds"],
+                    "anchor window start",
+                ),
+                window_end_seconds=finite(
+                    raw["window_end_seconds"],
+                    "anchor window end",
+                ),
+                master_seconds=finite(raw["master_seconds"], "anchor master"),
+                source_seconds=finite(raw["source_seconds"], "anchor source"),
+                offset_seconds=finite(raw["offset_seconds"], "anchor offset"),
+                score=optional_finite(raw["score"], "anchor score"),
+                second_best_score=optional_finite(
+                    raw["second_best_score"],
+                    "anchor second-best score",
+                ),
+                score_margin=optional_finite(
+                    raw["score_margin"],
+                    "anchor score margin",
+                ),
+                accepted=accepted,
+                rejection_reason=rejection_reason,
+                trend_residual_seconds=optional_finite(
+                    raw["trend_residual_seconds"],
+                    "anchor trend residual",
+                ),
+        )
+        if (
+            anchor.window_end_seconds <= anchor.window_start_seconds
+            or not math.isclose(
+                anchor.offset_seconds,
+                anchor.source_seconds - anchor.master_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or (anchor.accepted and anchor.rejection_reason is not None)
+            or (
+                not anchor.accepted
+                and (
+                    anchor.rejection_reason is None
+                    or not anchor.rejection_reason
+                )
+            )
+            or (
+                anchor.score is not None
+                and not -1.0 <= anchor.score <= 1.0
+            )
+            or (
+                anchor.second_best_score is not None
+                and not -1.0 <= anchor.second_best_score <= 1.0
+            )
+            or (
+                anchor.score_margin is not None
+                and anchor.score_margin < 0.0
+            )
+            or (
+                anchor.trend_residual_seconds is not None
+                and anchor.trend_residual_seconds < 0.0
+            )
+        ):
+            raise ValueError("timewarp cached anchor invariants are invalid")
+        anchors.append(anchor)
+
+    raw_residuals = payload["residuals"]
+    if not isinstance(raw_residuals, dict) or set(raw_residuals) != {
+        "p50_seconds",
+        "p95_seconds",
+        "maximum_seconds",
+        "sample_count",
+        "definition",
+    }:
+        raise ValueError("timewarp cached residual schema does not match")
+    sample_count = raw_residuals["sample_count"]
+    definition = raw_residuals["definition"]
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < 0
+        or not isinstance(definition, str)
+    ):
+        raise ValueError("timewarp cached residual metadata is invalid")
+
+    def residual_value(key: str) -> float | None:
+        value = raw_residuals[key]
+        return None if value is None else finite(value, f"residual {key}")
+
+    residual_p50 = residual_value("p50_seconds")
+    residual_p95 = residual_value("p95_seconds")
+    residual_maximum = residual_value("maximum_seconds")
+    if (
+        definition != "absolute_anchor_residual_to_robust_affine_trend"
+        or any(
+            value is not None and value < 0.0
+            for value in (residual_p50, residual_p95, residual_maximum)
+        )
+    ):
+        raise ValueError("timewarp cached residual values are invalid")
+
+    scalar_fallback = payload["scalar_fallback"]
+    fallback_reason = payload["fallback_reason"]
+    backend = payload["backend"]
+    if (
+        not isinstance(scalar_fallback, bool)
+        or (fallback_reason is not None and not isinstance(fallback_reason, str))
+        or backend != "spectral_flux_local_ncc"
+    ):
+        raise ValueError("timewarp cached policy metadata is invalid")
+    accepted_anchor_count = sum(anchor.accepted for anchor in anchors)
+    if scalar_fallback:
+        if (
+            points
+            or accepted_anchor_count
+            or sample_count != 0
+            or any(
+                value is not None
+                for value in (residual_p50, residual_p95, residual_maximum)
+            )
+        ):
+            raise ValueError("cached scalar fallback contains drift evidence")
+    elif (
+        accepted_anchor_count < config.minimum_anchor_count
+        or sample_count != accepted_anchor_count
+    ):
+        raise ValueError("cached timewarp accepted-anchor evidence is incomplete")
+    return TimeWarpMap(
+        global_offset_seconds=finite(
+            payload["global_offset_seconds"],
+            "global offset",
+        ),
+        master_duration_seconds=finite(
+            payload["master_duration_seconds"],
+            "master duration",
+        ),
+        source_duration_seconds=finite(
+            payload["source_duration_seconds"],
+            "source duration",
+        ),
+        control_points=tuple(points),
+        anchors=tuple(anchors),
+        residuals=TimeWarpResidualDiagnostics(
+            p50_seconds=residual_p50,
+            p95_seconds=residual_p95,
+            maximum_seconds=residual_maximum,
+            sample_count=sample_count,
+            definition=definition,
+        ),
+        config=config,
+        scalar_fallback=scalar_fallback,
+        fallback_reason=fallback_reason,
+        backend=backend,
     )
 
 
@@ -1914,6 +2435,12 @@ def _estimate_source_timewarps(
     maps: list[TimeWarpMap | None] = [None] * len(request.sources)
     payloads: list[dict[str, Any]] = []
     reference_index = request.reference_source
+    try:
+        reference_sha256 = source_content_sha256(
+            request.sources[reference_index]
+        )
+    except (OSError, TypeError, ValueError):
+        reference_sha256 = None
     for index, source in enumerate(request.sources):
         if index not in eligible:
             payloads.append(
@@ -1925,6 +2452,85 @@ def _estimate_source_timewarps(
             )
             continue
         reporter.status(f"로컬 음원 드리프트 분석 중: {source.name}")
+        timewarp_cache: PersistentSourceScalarCache | None = None
+        cached_timewarp: TimeWarpMap | None = None
+        if (
+            request.source_cache_directory is not None
+            and reference_sha256 is not None
+        ):
+            try:
+                timewarp_cache = PersistentSourceScalarCache(
+                    source_cache_directory=request.source_cache_directory,
+                    source_path=source,
+                    namespace="local-timewarp-v1",
+                    analyzer=_timewarp_cache_analyzer(
+                        reference_sha256=reference_sha256,
+                        global_offset_seconds=(
+                            alignment.alignments[index].offset_seconds
+                        ),
+                    ),
+                )
+                cached_payload = timewarp_cache.get()
+                if cached_payload is not None:
+                    cached_timewarp = _timewarp_from_scalar_payload(
+                        cached_payload
+                    )
+                    if not math.isclose(
+                        cached_timewarp.global_offset_seconds,
+                        alignment.alignments[index].offset_seconds,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            "cached timewarp global offset does not match alignment"
+                        )
+            except (OSError, TypeError, ValueError):
+                cached_timewarp = None
+        if cached_timewarp is not None:
+            try:
+                if decoded_pcm_by_source is not None and index != reference_index:
+                    decoded_pcm_by_source[index] = np.asarray(
+                        extract_mono_pcm(
+                            source,
+                            sample_rate=ANALYSIS_SAMPLE_RATE,
+                        ),
+                        dtype=np.float32,
+                    )
+            except (AudioDecodeError, OSError, TypeError, ValueError):
+                cached_timewarp = None
+            else:
+                maps[index] = cached_timewarp
+                payload = cached_timewarp.to_dict()
+                payload.update(
+                    {
+                        "source_index": index,
+                        "status": (
+                            "global_scalar_offset"
+                            if cached_timewarp.scalar_fallback
+                            else "local_monotonic_timewarp"
+                        ),
+                        "persistent_scalar_cache": {
+                            **timewarp_cache.diagnostics(),
+                            "analysis_reused": True,
+                        },
+                    }
+                )
+                payloads.append(payload)
+                if cached_timewarp.scalar_fallback:
+                    reporter.log(
+                        f"{source.name}: 로컬 드리프트 근거 부족 · "
+                        "단일 오프셋 유지 "
+                        f"({cached_timewarp.fallback_reason}) · 영속 캐시 재사용"
+                    )
+                else:
+                    reporter.log(
+                        f"{source.name}: 로컬 드리프트 앵커 "
+                        f"{len(cached_timewarp.accepted_anchors)}개 · "
+                        "최대 재생률 편차 "
+                        f"{max(abs(slope - 1.0) for slope in cached_timewarp.segment_slopes) * 100.0:.3f}% "
+                        "· 영속 캐시 재사용"
+                    )
+                continue
         try:
             source_pcm = (
                 reference_pcm
@@ -1962,6 +2568,11 @@ def _estimate_source_timewarps(
             continue
 
         maps[index] = timewarp
+        if timewarp_cache is not None:
+            try:
+                timewarp_cache.put(_timewarp_scalar_payload(timewarp))
+            except (OSError, TypeError, ValueError):
+                pass
         payload = timewarp.to_dict()
         payload.update(
             {
@@ -1973,6 +2584,11 @@ def _estimate_source_timewarps(
                 ),
             }
         )
+        if timewarp_cache is not None:
+            payload["persistent_scalar_cache"] = {
+                **timewarp_cache.diagnostics(),
+                "analysis_reused": False,
+            }
         payloads.append(payload)
         if timewarp.scalar_fallback:
             reporter.log(
@@ -6081,6 +6697,7 @@ def _select_direct_member_partition_profile(
     source_cycle: Sequence[int],
     highlight_intervals: Sequence[tuple[float, float]] = (),
     continuous_official_portrait_fancam_contract: bool = False,
+    feature_cache_directory: Path | None = None,
     descriptor_provider: DescriptorProvider | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
@@ -6118,7 +6735,10 @@ def _select_direct_member_partition_profile(
     owned_provider: _VideoDescriptorProvider | None = None
     provider = descriptor_provider
     if provider is None:
-        owned_provider = _VideoDescriptorProvider(eligible_sources)
+        owned_provider = _VideoDescriptorProvider(
+            eligible_sources,
+            feature_cache_directory=feature_cache_directory,
+        )
         provider = owned_provider
 
     attempted: list[dict[str, Any]] = []
@@ -7785,6 +8405,7 @@ def _official_target_fancam_direct_full_frame_segments(
     source_timewarps: Sequence[TimeWarpMap | None] | None,
     scene_cut_times: Sequence[Sequence[float]],
     eligible_source_aspect_ratios: Sequence[float] | None = None,
+    feature_cache_directory: Path | None = None,
     descriptor_provider: DescriptorProvider | None = None,
     eligible_source_durations_seconds: Sequence[float] | None = None,
     source_metadata_contract: str | None = None,
@@ -7855,6 +8476,7 @@ def _official_target_fancam_direct_full_frame_segments(
             continuous_official_portrait_fancam_contract=(
                 continuous_official_portrait_fancam_contract
             ),
+            feature_cache_directory=feature_cache_directory,
             descriptor_provider=descriptor_provider,
             progress_callback=partition_progress_callback,
         )
@@ -13268,10 +13890,11 @@ def analyze(
     scene_config = SceneDetectionConfig(min_gap_frames=8)
     for index, (source, info) in enumerate(zip(request.sources, media, strict=True)):
         reporter.status(f"카메라 컷 분석 중: {source.name}")
-        changes = detect_scene_changes_in_video(
+        changes, scene_cache_diagnostics = detect_scene_changes_in_video_cached(
             source,
             config=scene_config,
             sample_every=2,
+            source_cache_directory=request.source_cache_directory,
         )
         frame_rate = info.video_streams[0].frame_rate or 30.0
         scene_payloads.append(
@@ -13294,6 +13917,7 @@ def analyze(
                     "minimum_gap_frames": scene_config.min_gap_frames,
                     "sample_every_source_frames": 2,
                 },
+                "persistent_scalar_cache": scene_cache_diagnostics,
                 "changes": [
                     {
                         "frame_index": change.frame_index,
@@ -13306,7 +13930,14 @@ def analyze(
                 ],
             }
         )
-        reporter.log(f"{source.name}: 방송 카메라 컷 {len(changes)}개 감지")
+        cache_label = (
+            " · 영속 캐시 재사용"
+            if scene_cache_diagnostics.get("analysis_reused") is True
+            else ""
+        )
+        reporter.log(
+            f"{source.name}: 방송 카메라 컷 {len(changes)}개 감지{cache_label}"
+        )
         reporter.progress(
             0.64 + 0.30 * (index + 1) / len(request.sources),
             "방송 카메라 컷을 분석하는 중…",
@@ -15670,6 +16301,7 @@ def analyze(
                     common_master_start=member_common_start,
                     source_timewarps=source_timewarps,
                     scene_cut_times=scene_cut_times,
+                    feature_cache_directory=request.source_cache_directory,
                     eligible_source_durations_seconds=tuple(
                         float(
                             media[index].video_streams[0].duration_seconds

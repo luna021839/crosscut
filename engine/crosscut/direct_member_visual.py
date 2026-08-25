@@ -27,7 +27,8 @@ import cv2
 
 from .timeline import formation_assignment_mismatch
 from .timewarp import TimeWarpMap
-from .visual_score import FrameVisualDescriptor, describe_frame
+from .visual_feature_cache import CanonicalFrameIdentity
+from .visual_score import FrameVisualDescriptor, _VideoSampler
 
 
 DescriptorProvider = Callable[
@@ -1309,23 +1310,30 @@ class DirectMemberVisualSelection:
 
 
 class _VideoDescriptorProvider:
-    """Sequential random-access decoder for all boundary samples."""
+    """Sequential decoder with interruption-safe numeric feature reuse."""
 
-    def __init__(self, sources: Sequence[Path]) -> None:
-        self._captures: list[cv2.VideoCapture | None] = []
+    def __init__(
+        self,
+        sources: Sequence[Path],
+        *,
+        feature_cache_directory: Path | None = None,
+    ) -> None:
+        self._samplers: list[_VideoSampler | None] = []
         self._descriptor_cache: dict[
-            tuple[int, int], FrameVisualDescriptor | None
+            tuple[int, CanonicalFrameIdentity], FrameVisualDescriptor | None
         ] = {}
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
         for source in sources:
-            capture = cv2.VideoCapture(str(source))
-            if capture.isOpened():
-                self._captures.append(capture)
-            else:
-                capture.release()
-                self._captures.append(None)
+            try:
+                sampler = _VideoSampler(
+                    source,
+                    feature_cache_directory=feature_cache_directory,
+                )
+            except (OSError, TypeError, ValueError, cv2.error):
+                sampler = None
+            self._samplers.append(sampler)
 
     def __call__(
         self,
@@ -1334,23 +1342,17 @@ class _VideoDescriptorProvider:
         source_local_seconds: float,
     ) -> FrameVisualDescriptor | None:
         self._request_count += 1
-        key = (source_index, int(round(source_local_seconds * 1000.0)))
+        sampler = self._samplers[source_index]
+        if sampler is None:
+            return None
+        key = (source_index, sampler.frame_identity(source_local_seconds))
         if key in self._descriptor_cache:
             self._cache_hit_count += 1
             return self._descriptor_cache[key]
-        capture = self._captures[source_index]
-        if capture is None:
-            self._descriptor_cache[key] = None
-            return None
         self._decode_count += 1
-        capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, source_local_seconds) * 1000.0)
-        success, frame = capture.read()
-        if not success or frame is None:
-            self._descriptor_cache[key] = None
-            return None
         try:
-            descriptor = describe_frame(
-                frame,
+            descriptor = sampler.feature_descriptor_at(
+                source_local_seconds,
                 include_subject_geometry=True,
                 include_formation_pose=True,
             )
@@ -1359,20 +1361,40 @@ class _VideoDescriptorProvider:
         self._descriptor_cache[key] = descriptor
         return descriptor
 
-    def cache_diagnostics(self) -> dict[str, int]:
-        """Return non-media counters proving cross-profile sample reuse."""
+    def cache_diagnostics(self) -> dict[str, Any]:
+        """Return RAM and persistent counters without source paths or media."""
+
+        persistent = tuple(
+            diagnostics
+            for sampler in self._samplers
+            if sampler is not None
+            and (diagnostics := sampler.feature_cache_diagnostics()) is not None
+        )
 
         return {
             "descriptor_request_count": self._request_count,
             "descriptor_cache_hit_count": self._cache_hit_count,
             "descriptor_decode_count": self._decode_count,
             "descriptor_cache_entry_count": len(self._descriptor_cache),
+            "persistent_visual_feature_cache": {
+                "contract": "ive_source_local_visual_features_v1",
+                "enabled_source_count": len(persistent),
+                "hit_count": sum(int(item["hit_count"]) for item in persistent),
+                "miss_count": sum(int(item["miss_count"]) for item in persistent),
+                "write_count": sum(int(item["write_count"]) for item in persistent),
+                "invalid_record_count": sum(
+                    int(item["invalid_record_count"]) for item in persistent
+                ),
+                "interrupted_run_records_reusable": bool(persistent),
+                "raw_frames_persisted": False,
+                "face_identity_embeddings_persisted": False,
+            },
         }
 
     def close(self) -> None:
-        for capture in self._captures:
-            if capture is not None:
-                capture.release()
+        for sampler in self._samplers:
+            if sampler is not None:
+                sampler.close()
 
 
 def _attention_geometry(

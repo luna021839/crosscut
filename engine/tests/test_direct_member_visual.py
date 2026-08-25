@@ -480,49 +480,59 @@ class DirectMemberVisualTests(unittest.TestCase):
             [0, 1],
         )
 
-    def test_video_descriptor_provider_reuses_the_same_millisecond_sample(self) -> None:
-        class Capture:
-            def __init__(self) -> None:
-                self.read_count = 0
-
-            def set(self, _property: int, _value: float) -> None:
-                return None
-
-            def read(self) -> tuple[bool, object]:
-                self.read_count += 1
-                return (True, object())
-
-            def release(self) -> None:
-                return None
-
-        capture = Capture()
-        provider = object.__new__(_VideoDescriptorProvider)
-        provider._captures = [capture]
-        provider._descriptor_cache = {}
-        provider._request_count = 0
-        provider._cache_hit_count = 0
-        provider._decode_count = 0
+    def test_video_descriptor_provider_reuses_the_same_canonical_sample(self) -> None:
         descriptor = _descriptor(0.2)
 
+        class Sampler:
+            def __init__(
+                self,
+                _source: Path,
+                *,
+                feature_cache_directory: Path | None = None,
+            ) -> None:
+                self.feature_cache_directory = feature_cache_directory
+                self.request_count = 0
+
+            def frame_identity(self, seconds: float) -> float:
+                return seconds
+
+            def feature_descriptor_at(self, _seconds: float, **_kwargs):  # type: ignore[no-untyped-def]
+                self.request_count += 1
+                return descriptor
+
+            def feature_cache_diagnostics(self) -> dict[str, object]:
+                return {
+                    "hit_count": 1,
+                    "miss_count": 0,
+                    "write_count": 0,
+                    "invalid_record_count": 0,
+                }
+
+            def close(self) -> None:
+                return None
+
         with patch(
-            "crosscut.direct_member_visual.describe_frame",
-            return_value=descriptor,
-        ) as describe:
+            "crosscut.direct_member_visual._VideoSampler",
+            side_effect=Sampler,
+        ):
+            provider = _VideoDescriptorProvider(
+                (Path("source.mp4"),),
+                feature_cache_directory=Path("cache"),
+            )
             first = provider(0, Path("source.mp4"), 1.0001)
-            second = provider(0, Path("source.mp4"), 1.0004)
+            second = provider(0, Path("source.mp4"), 1.0001)
 
         self.assertIs(first, descriptor)
         self.assertIs(second, descriptor)
-        self.assertEqual(capture.read_count, 1)
-        describe.assert_called_once()
+        self.assertEqual(provider._samplers[0].request_count, 1)  # type: ignore[union-attr]
+        diagnostics = provider.cache_diagnostics()
+        self.assertEqual(diagnostics["descriptor_request_count"], 2)
+        self.assertEqual(diagnostics["descriptor_cache_hit_count"], 1)
+        self.assertEqual(diagnostics["descriptor_decode_count"], 1)
+        self.assertEqual(diagnostics["descriptor_cache_entry_count"], 1)
         self.assertEqual(
-            provider.cache_diagnostics(),
-            {
-                "descriptor_request_count": 2,
-                "descriptor_cache_hit_count": 1,
-                "descriptor_decode_count": 1,
-                "descriptor_cache_entry_count": 1,
-            },
+            diagnostics["persistent_visual_feature_cache"]["hit_count"],
+            1,
         )
 
     def test_visual_path_beats_round_robin_while_remaining_exactly_balanced(self) -> None:

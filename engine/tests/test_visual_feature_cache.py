@@ -10,6 +10,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from crosscut.direct_member_visual import _VideoDescriptorProvider
 from crosscut.pose import FormationPersonDescriptor
 from crosscut.timeline import (
     ShotType,
@@ -354,6 +355,52 @@ class VisualFeatureCacheTests(unittest.TestCase):
             joined = b"".join(path.read_bytes() for path in records)
             self.assertNotIn(b"SFACE_PRIVATE_SENTINEL", joined)
             self.assertNotIn(source.read_bytes(), joined)
+
+    def test_direct_member_provider_reuses_interrupted_run_features(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"fake-video-source")
+            cache_root = root / "cache"
+            with patch(
+                "crosscut.visual_score.cv2.VideoCapture",
+                side_effect=lambda path: _FakeCapture(path),
+            ), patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=_descriptor(),
+            ) as describe:
+                cold_provider = _VideoDescriptorProvider(
+                    (source,),
+                    feature_cache_directory=cache_root,
+                )
+                cold = cold_provider(0, source, 1.0)
+                cold_diagnostics = cold_provider.cache_diagnostics()
+                cold_provider.close()
+
+                warm_provider = _VideoDescriptorProvider(
+                    (source,),
+                    feature_cache_directory=cache_root,
+                )
+                warm = warm_provider(0, source, 1.0)
+                warm_diagnostics = warm_provider.cache_diagnostics()
+                warm_provider.close()
+
+            self.assertEqual(cold, warm)
+            self.assertEqual(describe.call_count, 1)
+            cold_persistent = cold_diagnostics[
+                "persistent_visual_feature_cache"
+            ]
+            warm_persistent = warm_diagnostics[
+                "persistent_visual_feature_cache"
+            ]
+            self.assertEqual(cold_persistent["write_count"], 1)
+            self.assertEqual(warm_persistent["hit_count"], 1)
+            self.assertTrue(
+                warm_persistent["interrupted_run_records_reusable"]
+            )
 
     def test_sampler_frame_lru_uses_canonical_frames_not_milliseconds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

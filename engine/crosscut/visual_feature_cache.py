@@ -42,6 +42,10 @@ _FORBIDDEN_PAYLOAD_KEY_PARTS = (
     "appearance_embedding",
     "orb_descriptor",
 )
+_STABLE_FILE_DIGEST_PROCESS_CACHE: dict[
+    tuple[str, tuple[int, int, int, int, int]], str
+] = {}
+_STABLE_FILE_DIGEST_PROCESS_CACHE_LIMIT = 64
 
 
 def _stable_sha256(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
@@ -51,11 +55,6 @@ def _stable_sha256(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
     before = resolved.stat()
     if not resolved.is_file():
         raise ValueError(f"visual feature source is not a regular file: {resolved}")
-    digest = hashlib.sha256()
-    with resolved.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-            digest.update(block)
-    after = resolved.stat()
     before_identity = (
         before.st_dev,
         before.st_ino,
@@ -63,6 +62,25 @@ def _stable_sha256(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
         before.st_mtime_ns,
         before.st_ctime_ns,
     )
+    cache_key = (str(resolved), before_identity)
+    cached_digest = _STABLE_FILE_DIGEST_PROCESS_CACHE.get(cache_key)
+    if cached_digest is not None:
+        after = resolved.stat()
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise OSError("visual feature source changed while SHA-256 was reused")
+        return (cached_digest, after_identity)
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    after = resolved.stat()
     after_identity = (
         after.st_dev,
         after.st_ino,
@@ -72,7 +90,18 @@ def _stable_sha256(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
     )
     if before_identity != after_identity:
         raise OSError("visual feature source changed while SHA-256 was computed")
-    return (digest.hexdigest(), after_identity)
+    resolved_digest = digest.hexdigest()
+    for stale_key in tuple(_STABLE_FILE_DIGEST_PROCESS_CACHE):
+        if stale_key[0] == str(resolved) and stale_key != cache_key:
+            _STABLE_FILE_DIGEST_PROCESS_CACHE.pop(stale_key, None)
+    if len(_STABLE_FILE_DIGEST_PROCESS_CACHE) >= (
+        _STABLE_FILE_DIGEST_PROCESS_CACHE_LIMIT
+    ):
+        _STABLE_FILE_DIGEST_PROCESS_CACHE.pop(
+            next(iter(_STABLE_FILE_DIGEST_PROCESS_CACHE))
+        )
+    _STABLE_FILE_DIGEST_PROCESS_CACHE[cache_key] = resolved_digest
+    return (resolved_digest, after_identity)
 
 
 def _file_digest(path: Path) -> str:

@@ -15,13 +15,16 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import math
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import cv2
 import numpy as np
 
 from .ive import IVEMember
+from .source_scalar_cache import PersistentSourceScalarCache
 
 IVE_MEMBER_STABLE_IDS: dict[IVEMember, str] = {
     IVEMember.ANYUJIN: "an_yujin",
@@ -313,6 +316,184 @@ def detect_scene_changes_in_video(
     # ``indices`` is populated lazily in lockstep with frame consumption.
     return detect_scene_changes(
         frames_only(), config=config, frame_indices=indices_in_lockstep()
+    )
+
+
+def _scene_detection_analyzer_identity(
+    config: SceneDetectionConfig,
+    *,
+    sample_every: int,
+) -> dict[str, Any]:
+    return {
+        "analysis_contract": "ive_component_gated_scene_changes_v2",
+        "implementation_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
+        "opencv_version": str(cv2.__version__),
+        "sample_every": sample_every,
+        "config": {
+            "threshold": config.threshold,
+            "minimum_frame_difference": config.minimum_frame_difference,
+            "minimum_histogram_distance": (
+                config.minimum_histogram_distance
+            ),
+            "min_gap_frames": config.min_gap_frames,
+            "frame_difference_weight": config.frame_difference_weight,
+            "histogram_weight": config.histogram_weight,
+            "difference_gain": config.difference_gain,
+            "analysis_size": list(config.analysis_size),
+            "histogram_bins": config.histogram_bins,
+        },
+    }
+
+
+def _scene_changes_from_scalar_payload(
+    payload: Mapping[str, Any],
+) -> tuple[SceneChange, ...]:
+    if set(payload) != {"changes"}:
+        raise ValueError("scene cache payload schema does not match")
+    raw_changes = payload["changes"]
+    if not isinstance(raw_changes, list):
+        raise TypeError("scene cache changes must be a list")
+    changes: list[SceneChange] = []
+    for raw in raw_changes:
+        if not isinstance(raw, dict) or set(raw) != {
+            "frame_index",
+            "score",
+            "frame_difference",
+            "histogram_distance",
+        }:
+            raise ValueError("scene cache change schema does not match")
+        frame_index = raw["frame_index"]
+        if (
+            isinstance(frame_index, bool)
+            or not isinstance(frame_index, int)
+            or frame_index < 0
+        ):
+            raise ValueError("scene cache frame index is invalid")
+        measurement_keys = (
+            "score",
+            "frame_difference",
+            "histogram_distance",
+        )
+        if any(
+            isinstance(raw[key], bool)
+            or not isinstance(raw[key], (int, float))
+            for key in measurement_keys
+        ):
+            raise ValueError("scene cache measurement type is invalid")
+        measurements = tuple(float(raw[key]) for key in measurement_keys)
+        if any(
+            not math.isfinite(value) or not 0.0 <= value <= 1.0
+            for value in measurements
+        ):
+            raise ValueError("scene cache measurement is invalid")
+        changes.append(
+            SceneChange(
+                frame_index=frame_index,
+                score=measurements[0],
+                frame_difference=measurements[1],
+                histogram_distance=measurements[2],
+            )
+        )
+    if any(
+        left.frame_index >= right.frame_index
+        for left, right in zip(changes, changes[1:])
+    ):
+        raise ValueError("scene cache changes are not strictly chronological")
+    return tuple(changes)
+
+
+def detect_scene_changes_in_video_cached(
+    path: str | Path,
+    *,
+    config: SceneDetectionConfig | None = None,
+    sample_every: int = 1,
+    source_cache_directory: Path | None = None,
+) -> tuple[tuple[SceneChange, ...], dict[str, Any]]:
+    """Reuse completed per-source scene scans and recompute on any mismatch."""
+
+    settings = config or SceneDetectionConfig()
+    if source_cache_directory is None:
+        return (
+            detect_scene_changes_in_video(
+                path,
+                config=settings,
+                sample_every=sample_every,
+            ),
+            {
+                "enabled": False,
+                "analysis_reused": False,
+                "raw_media_persisted": False,
+            },
+        )
+    try:
+        cache = PersistentSourceScalarCache(
+            source_cache_directory=source_cache_directory,
+            source_path=Path(path),
+            namespace="scene-changes-v2",
+            analyzer=_scene_detection_analyzer_identity(
+                settings,
+                sample_every=sample_every,
+            ),
+        )
+    except (OSError, TypeError, ValueError):
+        return (
+            detect_scene_changes_in_video(
+                path,
+                config=settings,
+                sample_every=sample_every,
+            ),
+            {
+                "enabled": False,
+                "analysis_reused": False,
+                "setup_failed_closed": True,
+                "raw_media_persisted": False,
+            },
+        )
+    semantic_invalid = 0
+    cached = cache.get()
+    if cached is not None:
+        try:
+            changes = _scene_changes_from_scalar_payload(cached)
+        except (TypeError, ValueError):
+            semantic_invalid = 1
+        else:
+            return (
+                changes,
+                {
+                    **cache.diagnostics(),
+                    "enabled": True,
+                    "analysis_reused": True,
+                    "semantic_invalid_record_count": 0,
+                },
+            )
+    changes = detect_scene_changes_in_video(
+        path,
+        config=settings,
+        sample_every=sample_every,
+    )
+    cache.put(
+        {
+            "changes": [
+                {
+                    "frame_index": change.frame_index,
+                    "score": change.score,
+                    "frame_difference": change.frame_difference,
+                    "histogram_distance": change.histogram_distance,
+                }
+                for change in changes
+            ]
+        }
+    )
+    return (
+        changes,
+        {
+            **cache.diagnostics(),
+            "enabled": True,
+            "analysis_reused": False,
+            "semantic_invalid_record_count": semantic_invalid,
+        },
     )
 
 
