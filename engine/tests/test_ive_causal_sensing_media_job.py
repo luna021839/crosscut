@@ -11,6 +11,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from crosscut import ive_causal_sensing_media_job as media_job
 from crosscut.causal_shooting_grammar import (
     load_causal_shooting_grammar_artifact,
 )
@@ -377,6 +378,82 @@ class IVECausalSensingMediaJobTests(unittest.TestCase):
                 record.active_performer.unknown_mass == 1.0
                 for record in performer.records
             )
+        )
+
+    def test_direct_typed_publication_has_no_local_staging_or_whole_file_copy(
+        self,
+    ) -> None:
+        output = self.root / "out-direct-typed-publication"
+        request = self._request(output)
+        with (
+            patch(
+                "tempfile.TemporaryDirectory",
+                side_effect=AssertionError("local artifact staging is forbidden"),
+            ),
+            patch.object(
+                media_job,
+                "write_causal_shooting_grammar_artifact",
+                wraps=media_job.write_causal_shooting_grammar_artifact,
+            ) as grammar_writer,
+            patch.object(
+                media_job,
+                "write_member_state_graph_artifact",
+                wraps=media_job.write_member_state_graph_artifact,
+            ) as member_writer,
+            patch.object(
+                media_job,
+                "write_ive_performer_state_artifact",
+                wraps=media_job.write_ive_performer_state_artifact,
+            ) as performer_writer,
+        ):
+            result = materialize_ive_causal_sensing_from_media(
+                request,
+                runtime=_runtime(_FakeFrameProvider()),
+            )
+
+        self.assertEqual(
+            output / "shooting-grammar",
+            grammar_writer.call_args.args[1],
+        )
+        self.assertEqual(output / "member-state", member_writer.call_args.args[0])
+        self.assertEqual(
+            output / "performer-state",
+            performer_writer.call_args.args[0],
+        )
+        self.assertFalse(hasattr(media_job, "_publish_staged_artifact"))
+        self.assertFalse(hasattr(media_job, "_publish_encoded_artifact"))
+        self.assertFalse(hasattr(media_job, "_read_regular_artifact"))
+        self.assertEqual(
+            "shooting-grammar",
+            result.shooting_grammar_path.relative_to(output).parts[0],
+        )
+        self.assertEqual(
+            "member-state",
+            result.member_state_graph_path.relative_to(output).parts[0],
+        )
+        self.assertEqual(
+            "performer-state",
+            result.ive_performer_state_path.relative_to(output).parts[0],
+        )
+        load_causal_shooting_grammar_artifact(
+            result.shooting_grammar_path,
+            expected_content_sha256=result.shooting_grammar_content_sha256,
+        )
+        load_member_state_graph_artifact(
+            result.member_state_graph_path,
+            expected_content_sha256=result.member_state_graph_content_sha256,
+        )
+        load_ive_performer_state_artifact(
+            result.ive_performer_state_path,
+            expected_content_sha256=result.ive_performer_state_content_sha256,
+            expected_source_content_sha256={
+                source.source_id: source.media_content_sha256
+                for source in request.sources
+            },
+        )
+        result.stage_edit_artifacts.binding.require_production_scope(
+            edit_mode="member",
+            target_member=IVEMember.GAEUL,
         )
 
     def test_group_scope_reuses_target_independent_triple(self) -> None:

@@ -24,18 +24,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import errno
 import hashlib
-import hmac
 import json
 import math
-import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
-import uuid
 
 import cv2
 
@@ -107,14 +101,6 @@ _MAXIMUM_SOURCE_TIME_CELLS = 50_000
 _MAXIMUM_MEMBER_OBSERVATIONS_PER_FRAME = 12
 _FILE_BLOCK_BYTES = 4 * 1024 * 1024
 _FLOAT_TOLERANCE = 1e-12
-_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
-    {
-        errno.EINVAL,
-        errno.ENOTSUP,
-        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
-        getattr(errno, "ENOTTY", errno.EINVAL),
-    }
-)
 
 
 class IVECausalSensingMediaJobError(ValueError):
@@ -1110,217 +1096,6 @@ def _update_manifest_digest(
     digest.update(encoded)
 
 
-def _safe_artifact_directory(parent: Path, name: str) -> Path:
-    child = parent / name
-    if child.is_symlink():
-        raise IVECausalSensingMediaJobError(
-            "artifact directory cannot be a symbolic link"
-        )
-    child.mkdir(exist_ok=True)
-    if child.is_symlink() or not child.is_dir():
-        raise IVECausalSensingMediaJobError("artifact directory is unsafe")
-    return child
-
-
-def _fsync_directory(directory: Path) -> None:
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError as exc:
-        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
-            return
-        raise IVECausalSensingMediaJobError(
-            "cannot open artifact directory for durability"
-        ) from exc
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError as exc:
-            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
-                raise IVECausalSensingMediaJobError(
-                    "cannot flush artifact directory"
-                ) from exc
-    finally:
-        os.close(descriptor)
-
-
-def _read_regular_artifact(path: Path) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise IVECausalSensingMediaJobError(
-            "artifact must be a non-symlink regular file"
-        )
-    before = path.stat()
-    try:
-        encoded = path.read_bytes()
-    except OSError as exc:
-        raise IVECausalSensingMediaJobError("cannot read artifact") from exc
-    after = path.stat()
-    identity = lambda item: (
-        item.st_dev,
-        item.st_ino,
-        item.st_size,
-        item.st_mtime_ns,
-    )
-    if identity(before) != identity(after):
-        raise IVECausalSensingMediaJobError("artifact changed while reading")
-    return encoded
-
-
-def _publish_encoded_artifact(
-    destination: Path,
-    encoded: bytes,
-    *,
-    content_sha256: str,
-) -> Path:
-    """No-clobber publish on POSIX and ExFAT under an exclusive lock."""
-
-    digest = _sha256(content_sha256, "artifact content SHA-256")
-    if destination.name != f"{digest}.json":
-        raise IVECausalSensingMediaJobError(
-            "artifact destination is not content addressed"
-        )
-    if destination.is_symlink():
-        raise IVECausalSensingMediaJobError(
-            "artifact destination cannot be a symbolic link"
-        )
-    if destination.exists():
-        if hmac.compare_digest(_read_regular_artifact(destination), encoded):
-            return destination
-        raise IVECausalSensingMediaJobError(
-            "content-addressed destination contains different bytes"
-        )
-
-    shard = destination.parent
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{digest}.",
-        suffix=".tmp",
-        dir=shard,
-    )
-    temporary = Path(temporary_name)
-    lock = shard / f".{digest}.publish-lock"
-    lock_descriptor: int | None = None
-    lock_identity: os.stat_result | None = None
-    marker = f"{os.getpid()}:{uuid.uuid4().hex}\n".encode("ascii")
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.chmod(0o400)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            lock_descriptor = os.open(lock, flags, 0o600)
-        except FileExistsError as exc:
-            if destination.exists() and not destination.is_symlink() and hmac.compare_digest(
-                _read_regular_artifact(destination),
-                encoded,
-            ):
-                return destination
-            raise IVECausalSensingMediaJobError(
-                "artifact publication lock is already held"
-            ) from exc
-        lock_identity = os.fstat(lock_descriptor)
-        if os.write(lock_descriptor, marker) != len(marker):
-            raise IVECausalSensingMediaJobError(
-                "artifact publication lock write was incomplete"
-            )
-        os.fsync(lock_descriptor)
-        if destination.is_symlink():
-            raise IVECausalSensingMediaJobError(
-                "artifact destination became a symbolic link"
-            )
-        if destination.exists():
-            if not hmac.compare_digest(
-                _read_regular_artifact(destination),
-                encoded,
-            ):
-                raise IVECausalSensingMediaJobError(
-                    "concurrent artifact writer published different bytes"
-                )
-        else:
-            os.replace(temporary, destination)
-            destination.chmod(0o400)
-        if not hmac.compare_digest(_read_regular_artifact(destination), encoded):
-            raise IVECausalSensingMediaJobError(
-                "published artifact bytes do not reproduce"
-            )
-        _fsync_directory(shard)
-        return destination
-    except IVECausalSensingMediaJobError:
-        raise
-    except OSError as exc:
-        raise IVECausalSensingMediaJobError(
-            "failed to publish immutable artifact"
-        ) from exc
-    finally:
-        if lock_descriptor is not None:
-            os.close(lock_descriptor)
-        try:
-            current = os.lstat(lock)
-            owned = bool(
-                lock_identity is not None
-                and stat.S_ISREG(current.st_mode)
-                and (current.st_dev, current.st_ino)
-                == (lock_identity.st_dev, lock_identity.st_ino)
-            )
-            if not owned and stat.S_ISREG(current.st_mode):
-                reader = os.open(
-                    lock,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                )
-                try:
-                    opened = os.fstat(reader)
-                    owned = bool(
-                        opened.st_size == len(marker)
-                        and os.read(reader, len(marker) + 1) == marker
-                    )
-                finally:
-                    os.close(reader)
-            if owned:
-                lock.unlink()
-        except OSError:
-            pass
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-
-
-def _publish_staged_artifact(
-    *,
-    staged_path: Path,
-    staged_root: Path,
-    destination_root: Path,
-    content_sha256: str,
-) -> Path:
-    try:
-        resolved_staged_root = staged_root.resolve(strict=True)
-        resolved_staged_path = staged_path.resolve(strict=True)
-        relative = resolved_staged_path.relative_to(resolved_staged_root)
-    except (OSError, ValueError) as exc:
-        raise IVECausalSensingMediaJobError(
-            "staged artifact escaped its private root"
-        ) from exc
-    if any(part in {"", ".", ".."} for part in relative.parts):
-        raise IVECausalSensingMediaJobError("staged artifact path is unsafe")
-    root = Path(destination_root)
-    if root.is_symlink():
-        raise IVECausalSensingMediaJobError(
-            "artifact root cannot be a symbolic link"
-        )
-    root.mkdir(parents=True, exist_ok=True)
-    if root.is_symlink() or not root.is_dir():
-        raise IVECausalSensingMediaJobError("artifact root is unsafe")
-    parent = root
-    for part in relative.parts[:-1]:
-        parent = _safe_artifact_directory(parent, part)
-    destination = parent / relative.name
-    return _publish_encoded_artifact(
-        destination,
-        _read_regular_artifact(resolved_staged_path),
-        content_sha256=content_sha256,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class IVECausalSensingMediaJobResult:
     shooting_grammar_path: Path
@@ -1679,53 +1454,37 @@ def materialize_ive_causal_sensing_from_media(
             "performer-state output lost exact source/time coverage"
         )
 
-    # Existing scalar artifact writers use hard-link publication, which ExFAT
-    # rejects.  First let those canonical writers build and self-validate the
-    # exact bytes on a private local filesystem, then publish the three files
-    # to the requested filesystem with a lock+rename no-clobber fallback.
-    with tempfile.TemporaryDirectory(
-        prefix="ive-causal-sensing-stage-"
-    ) as temporary_directory:
-        staged_root = Path(temporary_directory)
-        staged_grammar_path = write_causal_shooting_grammar_artifact(
-            grammar,
-            staged_root / "shooting-grammar",
+    # The three typed writers now own bounded streaming serialization,
+    # no-clobber publication, ExFAT lock+rename fallback, and typed readback.
+    # Publish directly to the requested filesystem so a 50-100 MiB scalar
+    # artifact is never materialized locally and then read/copied in full.
+    output_root = request.artifact_directory
+    if output_root.is_symlink():
+        raise IVECausalSensingMediaJobError(
+            "artifact root cannot be a symbolic link"
         )
-        staged_member_artifact = write_member_state_graph_artifact(
-            staged_root / "member-state",
-            member_graph,
-            member_provenance,
-        )
-        staged_performer_path = write_ive_performer_state_artifact(
-            staged_root / "performer-state",
-            performer,
-        )
-        output_root = request.artifact_directory
-        grammar_path = _publish_staged_artifact(
-            staged_path=staged_grammar_path,
-            staged_root=staged_root,
-            destination_root=output_root,
-            content_sha256=grammar.artifact_content_sha256,
-        )
-        member_path = _publish_staged_artifact(
-            staged_path=staged_member_artifact.path,
-            staged_root=staged_root,
-            destination_root=output_root,
-            content_sha256=staged_member_artifact.content_sha256,
-        )
-        performer_path = _publish_staged_artifact(
-            staged_path=staged_performer_path,
-            staged_root=staged_root,
-            destination_root=output_root,
-            content_sha256=performer.content_sha256,
-        )
+    output_root.mkdir(parents=True, exist_ok=True)
+    if output_root.is_symlink() or not output_root.is_dir():
+        raise IVECausalSensingMediaJobError("artifact root is unsafe")
+    grammar_path = write_causal_shooting_grammar_artifact(
+        grammar,
+        output_root / "shooting-grammar",
+    )
+    member_artifact = write_member_state_graph_artifact(
+        output_root / "member-state",
+        member_graph,
+        member_provenance,
+    )
+    performer_path = write_ive_performer_state_artifact(
+        output_root / "performer-state",
+        performer,
+    )
+    member_path = member_artifact.path
     stage_edit_artifacts = StageEditCausalSensingArtifacts(
         shooting_grammar_path=grammar_path,
         shooting_grammar_content_sha256=grammar.artifact_content_sha256,
         member_state_graph_path=member_path,
-        member_state_graph_content_sha256=(
-            staged_member_artifact.content_sha256
-        ),
+        member_state_graph_content_sha256=member_artifact.content_sha256,
         target_member=request.target_member,
         ive_performer_state_path=performer_path,
         ive_performer_state_content_sha256=performer.content_sha256,
@@ -1741,9 +1500,7 @@ def materialize_ive_causal_sensing_from_media(
         shooting_grammar_path=grammar_path,
         shooting_grammar_content_sha256=grammar.artifact_content_sha256,
         member_state_graph_path=member_path,
-        member_state_graph_content_sha256=(
-            staged_member_artifact.content_sha256
-        ),
+        member_state_graph_content_sha256=member_artifact.content_sha256,
         ive_performer_state_path=performer_path,
         ive_performer_state_content_sha256=performer.content_sha256,
         stage_edit_artifacts=stage_edit_artifacts,
