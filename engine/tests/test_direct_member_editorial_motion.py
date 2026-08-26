@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from crosscut.direct_member_editorial_motion import (
+    DirectMemberDenseFaceProvider,
     DirectMemberEditorialMotionConfig,
     DirectMemberFaceSample,
     build_direct_member_editorial_motion_plan,
@@ -320,6 +323,113 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.accepted_boundary_indices, (0,))
         self.assertEqual(plan.boundary_match_count, 1)
         self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.18)
+
+    def test_required_dense_rejection_reports_the_measured_cause(self) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        repair = DirectMemberBoundaryTransformRepair(
+            transformed_side="outgoing",
+            transformed_source_index=0,
+            zoom=1.20,
+            center_x=0.5,
+            center_y=0.5,
+            source_geometry=geometry,
+            raw_attention_position_mismatch=0.12,
+            raw_attention_scale_mismatch=0.40,
+            residual_attention_position_mismatch=0.0,
+            residual_attention_scale_mismatch=0.0,
+            baseline_face_geometry_mismatch=0.20,
+            transformed_face_geometry_mismatch=0.0,
+            improvement_fraction=1.0,
+            face_visible_fraction=1.0,
+            subject_geometry_basis="pphumanseg_full_subject_silhouette",
+            subject_visible_fraction=1.0,
+            repaired_severe_flags=("attention_scale",),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {"mismatch": SimpleNamespace(transform_repair=repair)}
+            },
+        )
+        selection.source_frame_geometries = (geometry, geometry)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "dense_widened_subject_evidence_missing=1",
+        ):
+            build_direct_member_editorial_motion_plan(
+                visual_selection=selection,
+                render_segments=self._renders((0, 1), (1.5, 1.5)),
+                transitions=(RenderTransition(),),
+                common_master_start=0.0,
+                geometry_provider=lambda source, _time: self._sample(
+                    boxes[source]
+                ),
+                fps=30.0,
+            )
+
+    def test_dense_provider_uses_canonical_frame_sampler_and_numeric_cache(self) -> None:
+        descriptor = SimpleNamespace(
+            silhouette_bbox_xywh=(0.25, 0.10, 0.50, 0.80),
+            silhouette_confidence=0.90,
+            silhouette_backend=SILHOUETTE_BACKEND,
+            primary_face_bbox=(0.40, 0.20, 0.20, 0.20),
+            face_count=1,
+            face_detector_backend="yunet",
+            formation_people=(),
+        )
+
+        class FakeSampler:
+            instances: list["FakeSampler"] = []
+
+            def __init__(self, _path, *, feature_cache_directory=None):
+                self.feature_cache_directory = feature_cache_directory
+                self.frame_decode_count = 0
+                self.feature_calls = 0
+                self.closed = False
+                self.instances.append(self)
+
+            def frame_identity(self, seconds):
+                return int(round(float(seconds) * 30.0))
+
+            def feature_descriptor_at(self, _seconds, **_kwargs):
+                self.feature_calls += 1
+                self.frame_decode_count += 1
+                return descriptor
+
+            def feature_cache_diagnostics(self):
+                return {
+                    "hit_count": 2,
+                    "miss_count": 1,
+                    "write_count": 1,
+                }
+
+            def close(self):
+                self.closed = True
+
+        with patch(
+            "crosscut.direct_member_editorial_motion._VideoSampler",
+            FakeSampler,
+        ):
+            provider = DirectMemberDenseFaceProvider(
+                (Path("source.mp4"),),
+                feature_cache_directory=Path("cache"),
+            )
+            first = provider.sample(0, 1.0)
+            second = provider.sample(0, 1.001)
+            diagnostics = provider.diagnostics()
+            provider.close()
+
+        self.assertIs(first, second)
+        self.assertEqual(FakeSampler.instances[0].feature_calls, 1)
+        self.assertEqual(diagnostics["decode_count"], 1)
+        self.assertEqual(diagnostics["persistent_feature_cache_hit_count"], 2)
+        self.assertTrue(FakeSampler.instances[0].closed)
 
     def test_widened_zoom_requires_dense_full_subject_and_enlarges_smaller_side(self) -> None:
         source_indices = (0, 1)

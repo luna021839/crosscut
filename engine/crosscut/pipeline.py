@@ -18596,7 +18596,8 @@ def analyze(
             )
             try:
                 dense_face_provider = DirectMemberDenseFaceProvider(
-                    tuple(request.sources[index] for index in eligible_indices)
+                    tuple(request.sources[index] for index in eligible_indices),
+                    feature_cache_directory=request.source_cache_directory,
                 )
 
                 def direct_member_geometry_provider(
