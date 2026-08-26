@@ -246,6 +246,18 @@ def _zero_boundary_diagnostics(
     return diagnostics
 
 
+def _forward_frontier_diagnostics(
+    *,
+    span_count: int,
+    boundary_index: int,
+) -> dict:
+    diagnostics = _diagnostics(span_count=span_count)
+    diagnostics["hard_boundary_connectivity"]["boundaries"][
+        boundary_index
+    ]["forward_reachable_right_source_indices"] = []
+    return diagnostics
+
+
 def _recorded_shift(
     profile: _DirectFullFramePartitionProfile,
     *,
@@ -532,6 +544,49 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         )
         self.assertTrue(
             all(child.boundary_merges == merge_lineage for child in children)
+        )
+
+    def test_global_frontier_enumerates_every_cadence_valid_two_span_cut(
+        self,
+    ) -> None:
+        segments = _professional_timing_segments(34)
+        unit_counts = (6, 2, 4, 4, 4, 4, 4, 4, 2)
+        parent = _DirectFullFramePartitionProfile(
+            profile_id="six-plus-two-frontier",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+
+        children = _direct_full_frame_proof_directed_child_profiles(
+            segments,
+            parent,
+            _forward_frontier_diagnostics(
+                span_count=len(parent.unit_counts),
+                boundary_index=0,
+            ),
+        )
+
+        self.assertEqual(
+            [child.unit_counts[:2] for child in children],
+            [
+                (5, 3),
+                (4, 4),
+                (3, 5),
+                (2, 6),
+            ],
+        )
+        self.assertTrue(
+            all(len(child.boundary_shifts) == 1 for child in children)
+        )
+        self.assertTrue(
+            all(
+                child.boundary_shifts[0].trigger
+                == "proven_forward_connectivity_frontier_exhaustion"
+                for child in children
+            )
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:

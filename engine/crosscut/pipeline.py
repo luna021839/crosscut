@@ -5199,14 +5199,23 @@ def _direct_full_frame_proof_directed_child_profiles(
         # Unit counts are not durations: one draft unit can be a complete
         # 1.9-second musical phraselet.  Admit a one-unit side only when the
         # materialized span independently passes the real-time 1.8-second
-        # professional floor below.  The two-unit alternatives remain a
-        # single-boundary representation of the same adjacent compensation.
-        shift_options = (
-            (1, -1, 2, -2)
-            if proof.trigger
+        # professional floor below.  A globally exhausted frontier authorizes
+        # every integer placement inside the same two-span window, nearest
+        # first.  The former +/-2 cap skipped valid 3+5 and 2+6 placements
+        # after a 6+2 merge even though total duration, cut count, and every
+        # downstream visual/cadence gate were unchanged and fully rechecked.
+        if (
+            proof.trigger
             == "proven_forward_connectivity_frontier_exhaustion"
-            else (1, -1)
-        )
+        ):
+            maximum_distance = max(left_units - 1, right_units - 1)
+            shift_options = tuple(
+                shift_units
+                for distance in range(1, maximum_distance + 1)
+                for shift_units in (distance, -distance)
+            )
+        else:
+            shift_options = (1, -1)
         for shift_units in shift_options:
             left_count = left_units + shift_units
             right_count = right_units - shift_units
