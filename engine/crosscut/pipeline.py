@@ -377,6 +377,16 @@ _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = 12
 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
     2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
 )
+_DIRECT_MEMBER_PARTITION_WARM_START_FILENAME = (
+    "direct-member-partition-candidate-cache-v1.json"
+)
+_DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT = (
+    "exact_acquisition_manifest_and_base_partition_bound_full_recheck_"
+    "candidate_cache_v1"
+)
+_DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES = 256 * 1024
+_DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT = 32
+_DIRECT_MEMBER_PARTITION_WARM_START_MAX_MATCH_COUNT = 4
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
@@ -4005,6 +4015,8 @@ class _DirectFullFramePartitionProfile:
         ...,
     ] = ()
     latest_operation_kind: str | None = None
+    warm_start_binding_sha256: str | None = None
+    warm_start_cache_file_sha256: str | None = None
 
     @property
     def shifted_boundary_index(self) -> int | None:
@@ -4218,6 +4230,17 @@ class _DirectFullFramePartitionProfile:
             "secondary_shift_trigger": self.secondary_shift_trigger,
             "parent_profile_id": self.parent_profile_id,
             "latest_operation_kind": self.latest_operation_kind,
+            "input_bound_partition_warm_start": (
+                {
+                    "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+                    "binding_sha256": self.warm_start_binding_sha256,
+                    "cache_file_sha256": self.warm_start_cache_file_sha256,
+                    "full_selector_recheck_required": True,
+                    "visual_gates_relaxed": False,
+                }
+                if self.warm_start_binding_sha256 is not None
+                else None
+            ),
             "proof_directed_boundary_shifts": [
                 shift.to_dict() for shift in self.boundary_shifts
             ],
@@ -4917,6 +4940,332 @@ def _direct_partition_signature_sha256(unit_counts: Sequence[int]) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _direct_member_partition_warm_start_binding(
+    feature_cache_directory: Path | None,
+    base: _DirectFullFramePartitionProfile,
+    *,
+    source_count: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Bind reusable cadence candidates to one exact acquired source set.
+
+    A cached cadence is never a visual-selection result.  It only decides
+    which existing musical partition receives an early, complete selector
+    audition.  Binding it to the acquisition manifest and base partition
+    avoids wasting that audition after sources or timing have changed.
+    """
+
+    diagnostics: dict[str, Any] = {
+        "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+        "requested": feature_cache_directory is not None,
+        "cache_filename": _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME,
+        "full_selector_recheck_required": True,
+        "visual_gates_relaxed": False,
+    }
+    if feature_cache_directory is None:
+        diagnostics["status"] = "feature_cache_unavailable"
+        return None, diagnostics
+    if isinstance(source_count, bool) or source_count <= 0:
+        raise ValueError("direct member warm-start source count must be positive")
+    manifest_path = Path(feature_cache_directory) / "acquisition-manifest.json"
+    try:
+        _manifest_bytes, manifest_fingerprint = _read_stable_regular_file(
+            manifest_path
+        )
+    except (OSError, ValueError) as exc:
+        diagnostics.update(
+            {
+                "status": "acquisition_manifest_unavailable",
+                "rejection": type(exc).__name__,
+            }
+        )
+        return None, diagnostics
+    binding_payload = {
+        "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+        "acquisition_manifest_sha256": manifest_fingerprint["sha256"],
+        "base_partition_signature_sha256": (
+            _direct_partition_signature_sha256(base.unit_counts)
+        ),
+        "timing_segment_count": sum(base.unit_counts),
+        "source_count": int(source_count),
+    }
+    binding_sha256 = hashlib.sha256(
+        json.dumps(
+            binding_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    binding = {**binding_payload, "binding_sha256": binding_sha256}
+    diagnostics.update(
+        {
+            "status": "binding_ready",
+            "acquisition_manifest_sha256": manifest_fingerprint["sha256"],
+            "base_partition_signature_sha256": (
+                binding_payload["base_partition_signature_sha256"]
+            ),
+            "binding_sha256": binding_sha256,
+        }
+    )
+    return binding, diagnostics
+
+
+def _load_direct_member_partition_warm_start_profiles(
+    feature_cache_directory: Path | None,
+    timing_segments: Sequence[DraftSegment],
+    base: _DirectFullFramePartitionProfile,
+    *,
+    source_count: int,
+) -> tuple[tuple[_DirectFullFramePartitionProfile, ...], dict[str, Any]]:
+    """Load exact-input-bound cadence candidates for a full visual recheck."""
+
+    binding, diagnostics = _direct_member_partition_warm_start_binding(
+        feature_cache_directory,
+        base,
+        source_count=source_count,
+    )
+    diagnostics.update(
+        {
+            "entry_count": 0,
+            "matching_entry_count": 0,
+            "loaded_candidate_count": 0,
+            "rejected_entry_count": 0,
+            "rejection_reason_counts": {},
+        }
+    )
+    if binding is None or feature_cache_directory is None:
+        return (), diagnostics
+    cache_path = (
+        Path(feature_cache_directory)
+        / _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME
+    )
+    if not cache_path.exists():
+        diagnostics["status"] = "cache_missing"
+        return (), diagnostics
+    try:
+        encoded, cache_fingerprint = _read_stable_regular_file(cache_path)
+    except (OSError, ValueError) as exc:
+        diagnostics.update(
+            {
+                "status": "cache_rejected",
+                "rejection": type(exc).__name__,
+            }
+        )
+        return (), diagnostics
+    if len(encoded) > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES:
+        diagnostics.update(
+            {
+                "status": "cache_rejected",
+                "rejection": "cache_size_limit_exceeded",
+            }
+        )
+        return (), diagnostics
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": "invalid_json"}
+        )
+        return (), diagnostics
+    if not (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 1
+        and payload.get("contract")
+        == _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT
+        and isinstance(payload.get("entries"), list)
+        and len(payload["entries"])
+        <= _DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT
+    ):
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": "schema_mismatch"}
+        )
+        return (), diagnostics
+
+    entries = payload["entries"]
+    diagnostics["entry_count"] = len(entries)
+    rejection_reasons: dict[str, int] = {}
+
+    def _reject(reason: str) -> None:
+        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+
+    items = tuple(timing_segments)
+    candidates: list[_DirectFullFramePartitionProfile] = []
+    seen_signatures = {base.unit_counts}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            _reject("entry_not_object")
+            continue
+        if any(entry.get(key) != value for key, value in binding.items()):
+            _reject("input_binding_mismatch")
+            continue
+        diagnostics["matching_entry_count"] += 1
+        raw_counts = entry.get("partition_unit_counts")
+        if not (
+            isinstance(raw_counts, list)
+            and len(raw_counts) >= source_count
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in raw_counts
+            )
+        ):
+            _reject("invalid_partition_unit_counts")
+            continue
+        counts = tuple(raw_counts)
+        signature_sha256 = _direct_partition_signature_sha256(counts)
+        if entry.get("candidate_partition_signature_sha256") != signature_sha256:
+            _reject("candidate_signature_mismatch")
+            continue
+        if counts in seen_signatures:
+            _reject("duplicate_partition")
+            continue
+        try:
+            spans = _direct_full_frame_spans_from_partition(items, counts)
+        except ValueError:
+            _reject("timing_partition_mismatch")
+            continue
+        duration = sum(span.duration_seconds for span in spans)
+        switches_per_minute = (len(spans) - 1) * 60.0 / duration
+        span_median = median(span.duration_seconds for span in spans)
+        if not (
+            _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+            <= switches_per_minute
+            <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
+            and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
+            <= span_median
+            <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+            and max(span.duration_seconds for span in spans)
+            <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
+        ):
+            _reject("cadence_gate_failed")
+            continue
+        candidates.append(
+            _DirectFullFramePartitionProfile(
+                profile_id=f"input-bound-warm-start-{signature_sha256[:16]}",
+                unit_counts=counts,
+                spans=spans,
+                warm_start_binding_sha256=binding["binding_sha256"],
+                warm_start_cache_file_sha256=cache_fingerprint["sha256"],
+            )
+        )
+        seen_signatures.add(counts)
+        if len(candidates) >= _DIRECT_MEMBER_PARTITION_WARM_START_MAX_MATCH_COUNT:
+            break
+    diagnostics.update(
+        {
+            "status": "candidates_loaded" if candidates else "no_match",
+            "cache_file_sha256": cache_fingerprint["sha256"],
+            "loaded_candidate_count": len(candidates),
+            "loaded_candidate_partition_signatures_sha256": [
+                _direct_partition_signature_sha256(profile.unit_counts)
+                for profile in candidates
+            ],
+            "rejected_entry_count": sum(rejection_reasons.values()),
+            "rejection_reason_counts": rejection_reasons,
+        }
+    )
+    return tuple(candidates), diagnostics
+
+
+def _persist_direct_member_partition_warm_start_profile(
+    feature_cache_directory: Path | None,
+    base: _DirectFullFramePartitionProfile,
+    selected: _DirectFullFramePartitionProfile,
+    *,
+    source_count: int,
+) -> dict[str, Any]:
+    """Persist a fully selected cadence as a future exact-bound candidate."""
+
+    binding, diagnostics = _direct_member_partition_warm_start_binding(
+        feature_cache_directory,
+        base,
+        source_count=source_count,
+    )
+    diagnostics["persisted"] = False
+    if binding is None or feature_cache_directory is None:
+        return diagnostics
+    cache_path = (
+        Path(feature_cache_directory)
+        / _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME
+    )
+    entries: list[dict[str, Any]] = []
+    if cache_path.exists():
+        try:
+            encoded, _fingerprint = _read_stable_regular_file(cache_path)
+            existing = json.loads(encoded.decode("utf-8"))
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            diagnostics.update(
+                {
+                    "status": "existing_cache_rejected",
+                    "rejection": type(exc).__name__,
+                }
+            )
+            return diagnostics
+        if not (
+            isinstance(existing, dict)
+            and existing.get("schema_version") == 1
+            and existing.get("contract")
+            == _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT
+            and isinstance(existing.get("entries"), list)
+            and len(existing["entries"])
+            <= _DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT
+        ):
+            diagnostics.update(
+                {
+                    "status": "existing_cache_rejected",
+                    "rejection": "schema_mismatch",
+                }
+            )
+            return diagnostics
+        entries = [item for item in existing["entries"] if isinstance(item, dict)]
+    candidate_signature = _direct_partition_signature_sha256(
+        selected.unit_counts
+    )
+    entries = [
+        item
+        for item in entries
+        if not (
+            item.get("binding_sha256") == binding["binding_sha256"]
+            and item.get("candidate_partition_signature_sha256")
+            == candidate_signature
+        )
+    ]
+    entries.insert(
+        0,
+        {
+            **binding,
+            "candidate_partition_signature_sha256": candidate_signature,
+            "partition_unit_counts": list(selected.unit_counts),
+            "origin": "full_visual_selector_feasible",
+            "full_selector_recheck_required_on_reuse": True,
+            "visual_gates_relaxed": False,
+        },
+    )
+    payload = {
+        "schema_version": 1,
+        "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+        "entries": entries[:_DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT],
+    }
+    try:
+        _write_analysis_manifest_atomically(cache_path, payload)
+        _persisted, fingerprint = _read_stable_regular_file(cache_path)
+    except (OSError, ValueError) as exc:
+        diagnostics.update(
+            {"status": "persistence_failed", "rejection": type(exc).__name__}
+        )
+        return diagnostics
+    diagnostics.update(
+        {
+            "status": "persisted",
+            "persisted": True,
+            "candidate_partition_signature_sha256": candidate_signature,
+            "cache_file_sha256": fingerprint["sha256"],
+        }
+    )
+    return diagnostics
 
 
 def _direct_partition_queue_signature_digest(
@@ -7063,8 +7412,10 @@ def _direct_member_failure_report_fallback_payload(
             "proof_equivalent_future_state_dominance_count",
             "future_operation_state_count",
             "shift_depth_pruned_parent_count",
+            "input_bound_partition_warm_start",
             "exact_lifeline_capacity_retry",
             "strict_extra_quota_assignment_search",
+            "last_resort_safe_hold_search",
             "severe_transition_counterfactual_secondary_partition",
             "queue_order",
             "render_started",
@@ -7695,6 +8046,26 @@ def _select_direct_member_partition_profile(
     )
     if len(base.spans) < len(source_cycle):
         raise RuntimeError("coarse direct cadence cannot show every eligible source")
+    if continuous_official_portrait_fancam_contract:
+        warm_start_profiles, warm_start_diagnostics = (
+            _load_direct_member_partition_warm_start_profiles(
+                feature_cache_directory,
+                timing_draft.segments,
+                base,
+                source_count=len(eligible_sources),
+            )
+        )
+    else:
+        warm_start_profiles = ()
+        warm_start_diagnostics = {
+            "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+            "requested": False,
+            "status": "continuous_official_member_contract_required",
+            "loaded_candidate_count": 0,
+            "full_selector_recheck_required": True,
+            "visual_gates_relaxed": False,
+        }
+    warm_start_diagnostics["candidate_evaluations"] = []
     partition_search_max_boundary_merge_count = (
         _direct_partition_proof_directed_boundary_merge_limit(base)
     )
@@ -7734,7 +8105,7 @@ def _select_direct_member_partition_profile(
         _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND,
     )
     partition_search_limit_expansions: list[dict[str, Any]] = []
-    partition_search_generated_profile_count = 1
+    partition_search_generated_profile_count = 1 + len(warm_start_profiles)
     partition_search_signature_deduplication_count = 0
     partition_search_future_state_dominance_count = 0
     partition_search_future_operation_state_count = 0
@@ -8463,6 +8834,170 @@ def _select_direct_member_partition_profile(
         partition_search_primary_evaluation_count = len(attempted)
         if (
             continuous_official_portrait_fancam_contract
+            and not feasible
+            and base_error is not None
+            and _direct_partition_failure_is_proven(base_error.diagnostics)
+            and warm_start_profiles
+        ):
+            for warm_start_index, warm_profile in enumerate(
+                warm_start_profiles,
+                start=1,
+            ):
+                warm_signature = _direct_partition_signature_sha256(
+                    warm_profile.unit_counts
+                )
+                warm_error = _evaluate(warm_profile)
+                partition_search_primary_evaluation_count = len(attempted)
+                warm_evaluation: dict[str, Any] = {
+                    "candidate_index": warm_start_index,
+                    "candidate_count": len(warm_start_profiles),
+                    "partition_signature_sha256": warm_signature,
+                    "strict_result": (
+                        "feasible" if warm_error is None else "infeasible"
+                    ),
+                    "strict_failure": (
+                        warm_error.diagnostics.get("failure")
+                        if warm_error is not None
+                        else None
+                    ),
+                    "strict_constraint_infeasibility_proven": (
+                        _direct_partition_failure_is_proven(
+                            warm_error.diagnostics
+                        )
+                        if warm_error is not None
+                        else False
+                    ),
+                    "terminal_audition_attempted": False,
+                    "full_selector_recheck_completed": True,
+                    "visual_gates_relaxed": False,
+                }
+                warm_start_diagnostics["candidate_evaluations"].append(
+                    warm_evaluation
+                )
+                if warm_error is None:
+                    warm_evaluation["result"] = "strict_feasible"
+                    break
+                if not _direct_partition_failure_is_proven(
+                    warm_error.diagnostics
+                ):
+                    warm_evaluation["result"] = (
+                        "strict_failure_not_terminal_authorized"
+                    )
+                    continue
+
+                partition_search_terminal_safe_hold_candidate_count += 1
+                partition_search_terminal_safe_hold_evaluation_count += 1
+                warm_evaluation["terminal_audition_attempted"] = True
+                terminal_payload = {
+                    "contract": (
+                        "exact_input_bound_partition_warm_start_"
+                        "independent_safe_hold_effect_audition_v1"
+                    ),
+                    "attempted": True,
+                    "trigger": "exact_input_binding_and_strict_hard_failure",
+                    "candidate_count": len(warm_start_profiles),
+                    "evaluation_index": warm_start_index,
+                    "evaluation_limit": len(warm_start_profiles),
+                    "selected_profile_id": warm_profile.profile_id,
+                    "selected_partition_signature_sha256": warm_signature,
+                    "selected_strict_failed_segment_index": (
+                        warm_error.diagnostics.get("failed_at_segment_index")
+                    ),
+                    "full_selector_recheck_required": True,
+                    "visual_gates_relaxed": False,
+                }
+                _emit_progress(
+                    event="direct_member_input_bound_partition_warm_start",
+                    phase="terminal_audition_started",
+                    result=None,
+                    **terminal_payload,
+                )
+                terminal_selection: DirectMemberVisualSelection | None = None
+                terminal_hold_error: DirectMemberVisualSelectionError | None = None
+                try:
+                    terminal_selection = _select_profile_with_config(
+                        warm_profile,
+                        selection_config,
+                        allow_safe_hold_search=True,
+                    )
+                except DirectMemberVisualSelectionError as caught:
+                    terminal_hold_error = caught
+                terminal_payload["result"] = (
+                    "feasible"
+                    if terminal_selection is not None
+                    else "infeasible"
+                )
+                terminal_payload["final_failure"] = (
+                    terminal_hold_error.diagnostics.get("failure")
+                    if terminal_hold_error is not None
+                    else None
+                )
+                attempted_item = attempted[-1]
+                if (
+                    attempted_item.get("partition_signature_sha256")
+                    != warm_signature
+                ):
+                    raise RuntimeError(
+                        "warm-start strict attempt lost its terminal binding"
+                    )
+                attempted_item["input_bound_warm_start_audition"] = dict(
+                    terminal_payload
+                )
+                warm_evaluation.update(
+                    {
+                        "terminal_result": terminal_payload["result"],
+                        "terminal_failure": terminal_payload["final_failure"],
+                        "result": terminal_payload["result"],
+                    }
+                )
+                if terminal_selection is not None:
+                    partition_search_terminal_safe_hold_success_count += 1
+                    feasible.append((warm_profile, terminal_selection))
+                    terminal_rank = _direct_partition_selection_rank(
+                        warm_profile,
+                        terminal_selection,
+                    )
+                    attempted_item[
+                        "strict_status_before_input_bound_warm_start_audition"
+                    ] = attempted_item.get("status")
+                    strict_diagnostics = attempted_item.pop("diagnostics", None)
+                    if strict_diagnostics is not None:
+                        attempted_item[
+                            "strict_failure_before_input_bound_warm_start_audition"
+                        ] = strict_diagnostics
+                    attempted_item["status"] = "feasible"
+                    attempted_item["hard_violation_count"] = 0
+                    attempted_item["selection_rank"] = {
+                        "warning_boundary_count": terminal_rank[0],
+                        "optimizer_cost": terminal_rank[1],
+                        "changed_span_count": terminal_rank[2],
+                        "musical_boundary_penalty": terminal_rank[3],
+                    }
+                else:
+                    assert terminal_hold_error is not None
+                    latest_failure_diagnostics = terminal_hold_error.diagnostics
+                    all_failures_proven = bool(
+                        all_failures_proven
+                        and _direct_partition_failure_is_proven(
+                            terminal_hold_error.diagnostics
+                        )
+                    )
+                    attempted_item["input_bound_warm_start_failure"] = (
+                        _compact_direct_partition_failure(
+                            terminal_hold_error,
+                            span_count=len(warm_profile.spans),
+                        )
+                    )
+                _emit_progress(
+                    event="direct_member_input_bound_partition_warm_start",
+                    phase="terminal_audition_completed",
+                    **terminal_payload,
+                )
+                if terminal_selection is not None:
+                    break
+        if (
+            continuous_official_portrait_fancam_contract
+            and not feasible
             and base_error is not None
             and _direct_partition_failure_is_proven(base_error.diagnostics)
         ):
@@ -8478,8 +9013,11 @@ def _select_direct_member_partition_profile(
                 ]
             ] = []
             queued_sequence = 0
-            seen_signatures = {base.unit_counts}
-            evaluated_signatures = {base.unit_counts}
+            seen_signatures = {
+                base.unit_counts,
+                *(profile.unit_counts for profile in warm_start_profiles),
+            }
+            evaluated_signatures = set(seen_signatures)
             seen_future_operation_states: set[tuple[Any, ...]] = set()
             counterfactual_secondary_profiles: list[
                 _DirectFullFramePartitionProfile
@@ -9145,7 +9683,8 @@ def _select_direct_member_partition_profile(
                     "connectivity_precheck_best_first_global_terminal_hold_"
                     "exact_lifeline_capacity_retry_strict_extra_quota_"
                     "assignment_proof_progress_terminal_audition_"
-                    "severe_counterfactual_secondary_partition_v14"
+                    "input_bound_warm_start_"
+                    "severe_counterfactual_secondary_partition_v15"
                 ),
                 "initial_profile_count": (
                     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
@@ -9205,6 +9744,7 @@ def _select_direct_member_partition_profile(
                 "queue_priority_contract": (
                     "furthest_proven_frontier_then_structural_cost_v1"
                 ),
+                "input_bound_partition_warm_start": warm_start_diagnostics,
                 "maximum_strict_terminal_audition_count": (
                     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
                 ),
@@ -9272,8 +9812,9 @@ def _select_direct_member_partition_profile(
                 },
                 "last_resort_safe_hold_search": {
                     "contract": (
-                        "proof_progress_ordered_strict_terminal_audition_"
-                        "then_bounded_safe_hold_cohort_v4"
+                        "input_bound_candidate_audition_then_proof_progress_"
+                        "ordered_strict_terminal_audition_then_bounded_"
+                        "safe_hold_cohort_v5"
                     ),
                     "candidate_count": (
                         partition_search_terminal_safe_hold_candidate_count
@@ -9357,9 +9898,9 @@ def _select_direct_member_partition_profile(
                     "visual_gates_relaxed": False,
                 },
                 "queue_order": (
-                    "structural_change_count_then_total_unit_displacement_"
-                    "then_musical_penalty_then_furthest_parent_proof_"
-                    "progress_then_generation_order"
+                    "furthest_parent_proof_progress_then_structural_change_"
+                    "count_then_total_unit_displacement_then_musical_"
+                    "penalty_then_generation_order"
                 ),
                 "profiles_attempted": attempted,
                 "descriptor_cache": provider_cache_diagnostics,
@@ -9441,6 +9982,14 @@ def _select_direct_member_partition_profile(
         feasible,
         key=lambda item: _direct_partition_selection_rank(item[0], item[1]),
     )
+    warm_start_diagnostics["persistence"] = (
+        _persist_direct_member_partition_warm_start_profile(
+            feature_cache_directory,
+            base,
+            selected_profile,
+            source_count=len(eligible_sources),
+        )
+    )
     partition_search = {
         "policy": (
             "canonical_signature_deduplicated_proof_directed_"
@@ -9450,7 +9999,8 @@ def _select_direct_member_partition_profile(
             "connectivity_precheck_global_terminal_hold_"
             "exact_lifeline_capacity_retry_strict_extra_quota_"
             "assignment_proof_progress_terminal_audition_"
-            "severe_counterfactual_secondary_partition_v14"
+            "input_bound_warm_start_"
+            "severe_counterfactual_secondary_partition_v15"
         ),
         "initial_profile_count": _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
         "maximum_profile_count": partition_search_evaluation_limit,
@@ -9502,6 +10052,7 @@ def _select_direct_member_partition_profile(
         "queue_priority_contract": (
             "furthest_proven_frontier_then_structural_cost_v1"
         ),
+        "input_bound_partition_warm_start": warm_start_diagnostics,
         "maximum_strict_terminal_audition_count": (
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
         ),
@@ -9563,8 +10114,9 @@ def _select_direct_member_partition_profile(
         },
         "last_resort_safe_hold_search": {
             "contract": (
-                "proof_progress_ordered_strict_terminal_audition_"
-                "then_bounded_safe_hold_cohort_v4"
+                "input_bound_candidate_audition_then_proof_progress_"
+                "ordered_strict_terminal_audition_then_bounded_safe_hold_"
+                "cohort_v5"
             ),
             "candidate_count": (
                 partition_search_terminal_safe_hold_candidate_count
@@ -9646,9 +10198,9 @@ def _select_direct_member_partition_profile(
             "visual_gates_relaxed": False,
         },
         "queue_order": (
-            "structural_change_count_then_total_unit_displacement_"
-            "then_musical_penalty_then_furthest_parent_proof_progress_"
-            "then_generation_order"
+            "furthest_parent_proof_progress_then_structural_change_count_"
+            "then_total_unit_displacement_then_musical_penalty_then_"
+            "generation_order"
         ),
         "profiles_attempted": attempted,
         "selected_profile_id": selected_profile.profile_id,
@@ -9695,6 +10247,7 @@ def _select_direct_member_partition_profile(
             or selected_profile.window_redistributions
             or selected_profile.visual_frontier_splits
             or selected_profile.boundary_merges
+            or selected_profile.warm_start_binding_sha256 is not None
         ),
         "visual_gates_relaxed": False,
         "continuous_official_portrait_fancam_contract": (
