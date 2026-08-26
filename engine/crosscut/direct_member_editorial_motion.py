@@ -1009,10 +1009,13 @@ def _track_is_dense_face_safe(
     source_frame_geometry: DirectMemberSourceFrameGeometry | None,
     alignment_geometry_basis: str | None = None,
     rejection_callback: Callable[[str], None] | None = None,
+    rejection_detail_callback: Callable[[str], None] | None = None,
 ) -> bool:
-    def reject(reason: str) -> bool:
+    def reject(reason: str, detail: str | None = None) -> bool:
         if rejection_callback is not None:
             rejection_callback(reason)
+        if detail is not None and rejection_detail_callback is not None:
+            rejection_detail_callback(f"{reason}({detail})")
         return False
 
     active_frames = tuple(
@@ -1099,7 +1102,12 @@ def _track_is_dense_face_safe(
             config=config,
         )
         if reconstructed is None:
-            return reject("dense_face_track_gap_unresolved")
+            return reject(
+                "dense_face_track_gap_unresolved",
+                "face_detections="
+                f"{sum(face_box is not None for face_box in face_boxes)},"
+                f"review_frames={len(ordered_frames)}",
+            )
         boxes = reconstructed
     elif resolved_basis in {
         "aggregate_human_silhouette",
@@ -1234,18 +1242,37 @@ def _track_is_dense_face_safe(
                 maximum_center_step=config.maximum_dense_center_step,
                 maximum_height_ratio=config.maximum_dense_height_ratio,
             ):
-                return reject("dense_face_geometry_jump")
+                center_step = math.hypot(
+                    _center(previous_box)[0] - _center(box)[0],
+                    _center(previous_box)[1] - _center(box)[1],
+                )
+                height_ratio = max(previous_box[3], box[3]) / max(
+                    1e-9,
+                    min(previous_box[3], box[3]),
+                )
+                return reject(
+                    "dense_face_geometry_jump",
+                    f"frame={frame_index},center_step={center_step:.6f},"
+                    f"height_ratio={height_ratio:.6f},"
+                    f"basis={resolved_basis}",
+                )
         state_sample = track.evaluate(local_time)
         state = _State(
             state_sample.zoom,
             state_sample.center_x,
             state_sample.center_y,
         )
+        face_visible_fraction = _visible_fraction(box, state)
         if (
-            _visible_fraction(box, state) + 1e-9
+            face_visible_fraction + 1e-9
             < config.minimum_dense_face_visible_fraction
         ):
-            return reject("dense_face_crop_exceeds_visible_fraction")
+            return reject(
+                "dense_face_crop_exceeds_visible_fraction",
+                f"frame={frame_index},visible={face_visible_fraction:.6f},"
+                f"zoom={state.zoom:.6f},center_x={state.center_x:.6f},"
+                f"center_y={state.center_y:.6f}",
+            )
         if widened_subject_proof_required:
             if (
                 subject_box is None
@@ -1274,17 +1301,42 @@ def _track_is_dense_face_safe(
                         config.maximum_dense_subject_height_ratio
                     ),
                 ):
-                    return reject("dense_subject_geometry_jump")
+                    subject_center_step = math.hypot(
+                        _center(previous_subject_box)[0]
+                        - _center(subject_box)[0],
+                        _center(previous_subject_box)[1]
+                        - _center(subject_box)[1],
+                    )
+                    subject_height_ratio = max(
+                        previous_subject_box[3],
+                        subject_box[3],
+                    ) / max(
+                        1e-9,
+                        min(previous_subject_box[3], subject_box[3]),
+                    )
+                    return reject(
+                        "dense_subject_geometry_jump",
+                        f"frame={frame_index},"
+                        f"center_step={subject_center_step:.6f},"
+                        f"height_ratio={subject_height_ratio:.6f}",
+                    )
             minimum_subject_visible_fraction = (
                 config.minimum_face_associated_subject_visible_fraction
                 if sample.face_count == 1
                 else config.minimum_widened_subject_visible_fraction
             )
+            subject_visible_fraction = _visible_fraction(subject_box, state)
             if (
-                _visible_fraction(subject_box, state) + 1e-9
+                subject_visible_fraction + 1e-9
                 < minimum_subject_visible_fraction
             ):
-                return reject("dense_subject_crop_exceeds_visible_fraction")
+                return reject(
+                    "dense_subject_crop_exceeds_visible_fraction",
+                    f"frame={frame_index},"
+                    f"visible={subject_visible_fraction:.6f},"
+                    f"minimum={minimum_subject_visible_fraction:.6f},"
+                    f"zoom={state.zoom:.6f}",
+                )
             previous_subject_box = subject_box
         previous_box = box
         previous_frame_index = frame_index
@@ -1678,6 +1730,7 @@ def build_direct_member_editorial_motion_plan(
         accepted_state: _State | None = None
         accepted_track: EditorialTransformTrack | None = None
         dense_rejection_reasons: set[str] = set()
+        dense_rejection_details: set[str] = set()
         candidate_alignment_bases = set(
             segment_alignment_bases[affected_index]
         )
@@ -1716,6 +1769,7 @@ def build_direct_member_editorial_motion_plan(
                 ],
                 alignment_geometry_basis=review_alignment_basis,
                 rejection_callback=dense_rejection_reasons.add,
+                rejection_detail_callback=dense_rejection_details.add,
             ):
                 accepted_state = state
                 accepted_track = track
@@ -1732,6 +1786,10 @@ def build_direct_member_editorial_motion_plan(
                     dense_rejection_reasons
                     or {"dense_face_containment_or_continuity_failed"}
                 )
+                if dense_rejection_details:
+                    required_rejection_context[
+                        candidate.boundary_index
+                    ] = ";".join(sorted(dense_rejection_details))
             continue
         tracks[affected_index] = accepted_track
         segment_alignment_bases[affected_index] = candidate_alignment_bases
