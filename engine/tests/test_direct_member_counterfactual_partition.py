@@ -10,7 +10,6 @@ from crosscut.direct_member_visual import (
 from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
-    _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
     _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT,
     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
@@ -31,6 +30,7 @@ from crosscut.pipeline import (
     _direct_partition_failure_result,
     _direct_partition_aggregate_outcome,
     _direct_partition_current_shifted_boundary_indices,
+    _direct_partition_proof_directed_boundary_merge_limit,
     _direct_severe_counterfactual_retry_is_authorized,
 )
 
@@ -272,6 +272,22 @@ def _recorded_shift(
 
 
 class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
+    def test_merge_budget_is_derived_from_song_switch_density(self) -> None:
+        segments = _professional_timing_segments(68)
+        unit_counts = (4,) * 11 + (3,) * 4 + (2,) * 6
+        parent = _DirectFullFramePartitionProfile(
+            profile_id="density-derived-merge-budget",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        self.assertEqual(
+            _direct_partition_proof_directed_boundary_merge_limit(parent),
+            4,
+        )
+
     def test_terminal_audition_cannot_truncate_primary_profile_frontier(
         self,
     ) -> None:
@@ -363,8 +379,8 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             _direct_partition_current_shifted_boundary_indices(child),
             (9,),
         )
-        self.assertGreaterEqual(
-            _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
+        self.assertEqual(
+            _direct_partition_proof_directed_boundary_merge_limit(child),
             3,
         )
         second_children = _direct_full_frame_proof_directed_merge_profiles(
@@ -401,6 +417,10 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             (4, 4, 4, 4, 4, 4, 4, 4, 2),
         )
         self.assertEqual(len(third_child.boundary_merges), 3)
+        self.assertEqual(
+            _direct_partition_proof_directed_boundary_merge_limit(third_child),
+            3,
+        )
         self.assertEqual(
             _direct_partition_current_shifted_boundary_indices(third_child),
             (7,),

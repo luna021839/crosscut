@@ -355,7 +355,6 @@ _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT = 64
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
 _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT = 7
-_DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT = 3
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 4
 _DIRECT_MEMBER_COUNTERFACTUAL_SECONDARY_SPLIT_TRIGGER_COUNT = 1
 _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
@@ -382,16 +381,6 @@ _DIRECT_MEMBER_FAILURE_DIAGNOSTIC_FINGERPRINT_CONTRACT = (
 _DIRECT_MEMBER_FAILURE_REPORT_STORAGE_CONTRACT = (
     "bounded_direct_member_failure_report_v1"
 )
-# Each adaptive epoch is an exact snapshot of already generated,
-# proof-bound queue signatures.  The number of epochs is itself bounded by
-# the maximum number of distinct proof-directed structural operations, not by
-# an arbitrary larger profile-count constant.
-_DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT = (
-    _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
-    + _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
-)
-
-
 @dataclass(frozen=True, slots=True)
 class AnalysisArtifact:
     manifest_path: Path
@@ -4848,6 +4837,33 @@ def _direct_partition_current_shifted_boundary_indices(
     )
 
 
+def _direct_partition_proof_directed_boundary_merge_limit(
+    profile: _DirectFullFramePartitionProfile,
+) -> int:
+    """Derive the total merge budget from the professional density floor.
+
+    Every admitted merge removes exactly one potential source switch.  The
+    budget therefore stops at the first integer switch count that would fall
+    below the 15-per-minute professional floor for this exact song range.  It
+    is a search-capacity calculation only: materialized children must still
+    pass the 7.2-second hold bound, median cadence, content, transition,
+    source-balance, highlight, and rendered-continuity gates independently.
+    """
+
+    if not profile.spans:
+        return len(profile.boundary_merges)
+    duration = sum(span.duration_seconds for span in profile.spans)
+    minimum_switch_count = math.ceil(
+        _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE * duration / 60.0 - 1e-9
+    )
+    current_switch_count = len(profile.spans) - 1
+    remaining_density_capacity = max(
+        0,
+        current_switch_count - minimum_switch_count,
+    )
+    return len(profile.boundary_merges) + remaining_density_capacity
+
+
 def _direct_partition_future_operation_state_key(
     parent: _DirectFullFramePartitionProfile,
     diagnostics: dict[str, Any],
@@ -4922,7 +4938,7 @@ def _direct_partition_future_operation_state_key(
             for merge in parent.boundary_merges
         ),
         (
-            _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
+            _direct_partition_proof_directed_boundary_merge_limit(parent)
             - len(parent.boundary_merges)
         ),
         proof_key,
@@ -5283,7 +5299,7 @@ def _direct_full_frame_proof_directed_merge_profiles(
     if (
         parent.visual_frontier_splits
         or len(parent.boundary_merges)
-        >= _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
+        >= _direct_partition_proof_directed_boundary_merge_limit(parent)
     ):
         return ()
     proofs = _direct_partition_exact_shift_proofs(
@@ -7198,6 +7214,13 @@ def _select_direct_member_partition_profile(
     )
     if len(base.spans) < len(source_cycle):
         raise RuntimeError("coarse direct cadence cannot show every eligible source")
+    partition_search_max_boundary_merge_count = (
+        _direct_partition_proof_directed_boundary_merge_limit(base)
+    )
+    partition_search_max_limit_expansion_count = (
+        _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        + partition_search_max_boundary_merge_count
+    )
 
     owned_provider: _VideoDescriptorProvider | None = None
     provider = descriptor_provider
@@ -8166,7 +8189,7 @@ def _select_direct_member_partition_profile(
                 if len(attempted) >= partition_search_evaluation_limit:
                     if (
                         len(partition_search_limit_expansions)
-                        >= _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
+                        >= partition_search_max_limit_expansion_count
                     ):
                         partition_search_cap_reached = True
                         break
@@ -8194,7 +8217,7 @@ def _select_direct_member_partition_profile(
                     expansion = {
                         "epoch": epoch,
                         "max_epochs": (
-                            _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
+                            partition_search_max_limit_expansion_count
                         ),
                         "initial_limit": (
                             _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
@@ -8631,7 +8654,7 @@ def _select_direct_member_partition_profile(
                     + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
                 ),
                 "maximum_profile_limit_expansion_count": (
-                    _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
+                    partition_search_max_limit_expansion_count
                 ),
                 "profile_limit_expansions": (
                     partition_search_limit_expansions
@@ -8640,7 +8663,7 @@ def _select_direct_member_partition_profile(
                     _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
                 ),
                 "maximum_proof_directed_boundary_merge_count": (
-                    _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
+                    partition_search_max_boundary_merge_count
                 ),
                 "maximum_visual_frontier_split_count_per_profile": (
                     _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
@@ -8923,14 +8946,14 @@ def _select_direct_member_partition_profile(
             + _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT
         ),
         "maximum_profile_limit_expansion_count": (
-            _DIRECT_MEMBER_MAX_PARTITION_LIMIT_EXPANSION_COUNT
+            partition_search_max_limit_expansion_count
         ),
         "profile_limit_expansions": partition_search_limit_expansions,
         "maximum_shifted_boundary_count": (
             _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
         ),
         "maximum_proof_directed_boundary_merge_count": (
-            _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
+            partition_search_max_boundary_merge_count
         ),
         "maximum_visual_frontier_split_count_per_profile": (
             _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
