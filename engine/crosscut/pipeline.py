@@ -342,6 +342,12 @@ _DIRECT_MEMBER_INITIAL_MAX_SWITCHES_PER_MINUTE = 19.5
 _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS = 3.5
 _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS = 4.2
 _DIRECT_MEMBER_MAX_RUN_SECONDS = 7.2
+_DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES = frozenset(
+    {
+        "heterogeneous_role_aware_safe_hold_v1",
+        "heterogeneous_role_aware_cinematic_v1",
+    }
+)
 _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS = 2.25
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS = 1.8
 _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 19.3
@@ -10052,7 +10058,7 @@ def _official_target_fancam_direct_full_frame_segments(
             raise RuntimeError(
                 "direct full-frame render failed balanced visual selection"
             )
-    elif source_usage_policy == "heterogeneous_role_aware_cinematic_v1":
+    elif source_usage_policy in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES:
         rendered_counts = tuple(counts[source] for source in eligible)
         if any(
             actual < minimum or actual > maximum
@@ -10080,7 +10086,7 @@ def _official_target_fancam_direct_full_frame_segments(
             )
         duration_totals[eligible_source_index] += segment.duration
     total_duration = sum(segment.duration for segment in resolved)
-    if source_usage_policy == "heterogeneous_role_aware_cinematic_v1":
+    if source_usage_policy in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES:
         duration_targets = tuple(
             visual_selection.source_target_durations_seconds
         )
@@ -10190,7 +10196,7 @@ def _official_target_fancam_direct_full_frame_segments(
         "target_policy": (
             "heterogeneous_role_soft_target_with_hard_exposure_bounds"
             if source_usage_policy
-            == "heterogeneous_role_aware_cinematic_v1"
+            in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES
             else "total_duration_times_source_quota_divided_by_span_count"
         ),
         "source_usage_policy": source_usage_policy,
@@ -10203,7 +10209,7 @@ def _official_target_fancam_direct_full_frame_segments(
         "maximum_allowed_relative_deviation": (
             None
             if source_usage_policy
-            == "heterogeneous_role_aware_cinematic_v1"
+            in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES
             else maximum_duration_deviation
         ),
         "enforced_from_render_segments": True,

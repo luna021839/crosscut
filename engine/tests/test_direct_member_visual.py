@@ -402,6 +402,85 @@ class DirectMemberVisualTests(unittest.TestCase):
             ["all_sources_minimum_usage_preserved"]
         )
 
+    def test_role_aware_safe_hold_needs_no_effect_bridge(self) -> None:
+        source_count = 4
+        span_count = 12
+        safe = _optimizer_mismatch(0.04)
+        matrices = tuple(
+            tuple(
+                tuple(safe for _right in range(source_count))
+                for _left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        geometries = (
+            direct_member_source_frame_geometry((2160, 3840)),
+            direct_member_source_frame_geometry((1080, 1920)),
+            direct_member_source_frame_geometry((3840, 2160)),
+            direct_member_source_frame_geometry((3840, 2160)),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2, 3),
+            candidate_validity=((True,) * source_count,) * span_count,
+            span_durations=(1.0,) * span_count,
+            source_geometries=geometries,
+            priority_cut_boundary_indices=(3, 4, 5, 6, 7),
+            maximum_priority_cut_hold_count=1,
+            config=DirectMemberVisualConfig(),
+            require_cinematic_bridge=False,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertTrue(all(path.count(index) > 0 for index in range(source_count)))
+        self.assertEqual(
+            diagnostics["usage_policy"],
+            "heterogeneous_role_aware_safe_hold_v1",
+        )
+        self.assertEqual(diagnostics["cinematic_bridge_count"], 0)
+        self.assertFalse(diagnostics["required_transition_effect"])
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+
+    def test_role_aware_safe_hold_supports_all_portrait_sources(self) -> None:
+        source_count = 3
+        span_count = 9
+        safe = _optimizer_mismatch(0.04)
+        matrices = tuple(
+            tuple(
+                tuple(safe for _right in range(source_count))
+                for _left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        geometries = (
+            direct_member_source_frame_geometry((2160, 3840)),
+            direct_member_source_frame_geometry((1080, 1920)),
+            direct_member_source_frame_geometry((2160, 3840)),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2),
+            candidate_validity=((True,) * source_count,) * span_count,
+            span_durations=(1.0,) * span_count,
+            source_geometries=geometries,
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+            require_cinematic_bridge=False,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertTrue(all(path.count(index) > 0 for index in range(source_count)))
+        self.assertEqual(diagnostics["landscape_source_indices"], [])
+        self.assertEqual(diagnostics["carrier_source_indices"], [0, 1, 2])
+        self.assertEqual(diagnostics["cinematic_bridge_count"], 0)
+
     def test_large_exact_path_uses_audited_sparse_milp_without_beam(self) -> None:
         source_count = 6
         span_count = 40
@@ -722,6 +801,98 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(
             tuple(boundary.cut_applied for boundary in selection.boundaries),
             (True, False, True),
+        )
+
+    def test_exact_quota_failure_can_use_role_aware_all_source_bounds(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(12))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return _descriptor(0.20 + source_index * 0.01)
+
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict exact-quota path failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "exact_lifeline": {
+                        "strategy": "scipy_highs_binary_path_milp_v1",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    },
+                    "severe_transition_counterfactual": {
+                        "minimum_severe_transition_count": 1,
+                    },
+                },
+            },
+        )
+        fallback_path = (0, 1, 0, 2, 0, 3, 0, 1, 0, 2, 1, 3)
+        role_aware_fallback = (
+            fallback_path,
+            0.25,
+            {
+                "strategy": "scipy_highs_role_aware_safe_hold_path_milp_v1",
+                "usage_policy": "heterogeneous_role_aware_safe_hold_v1",
+                "source_count_targets": [5, 3, 2, 2],
+                "source_count_minimums": [2, 1, 1, 1],
+                "source_count_maximums": [8, 5, 3, 3],
+                "source_duration_targets_seconds": [5.0, 3.0, 2.0, 2.0],
+                "source_duration_minimums_seconds": [2.0, 1.0, 1.0, 1.0],
+                "source_duration_maximums_seconds": [8.0, 5.0, 3.0, 3.0],
+                "same_source_hold_count": 0,
+                "maximum_same_source_run_seconds": 7.2,
+                "visual_gates_relaxed": False,
+            },
+        )
+
+        def role_aware_search(*_args: object, **kwargs: object):
+            self.assertFalse(kwargs["require_cinematic_bridge"])
+            return role_aware_fallback
+
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=None,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_heterogeneous_cinematic_visual_path",
+            side_effect=role_aware_search,
+        ) as role_search:
+            selection = select_balanced_direct_member_sources(
+                sources=tuple(Path(f"source-{index}.mp4") for index in range(4)),
+                canonical_spans=spans,
+                audio_offsets=(0.0,) * 4,
+                source_frame_sizes=(
+                    (2160, 3840),
+                    (2160, 3840),
+                    (2160, 3840),
+                    (2160, 3840),
+                ),
+                output_frame_size=(1080, 1920),
+                config=DirectMemberVisualConfig(beam_width=200),
+                descriptor_provider=provider,
+            )
+
+        role_search.assert_called_once()
+        self.assertEqual(selection.source_indices, fallback_path)
+        self.assertEqual(
+            selection.usage_policy,
+            "heterogeneous_role_aware_safe_hold_v1",
+        )
+        self.assertEqual(selection.source_counts, (5, 3, 2, 2))
+        self.assertTrue(
+            selection.optimizer_search_diagnostics["strict_cross_source_failure"]
+            ["authorization_basis"].endswith(
+                "role_aware_all_source_bounds_v1"
+            )
         )
 
     def test_hard_boundary_connectivity_localizes_only_the_actual_zero_edge(

@@ -58,6 +58,12 @@ _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT = 4
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_BOUNDARY_GAP = 3
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_COST_PENALTY = 8.0
 _DIRECT_MEMBER_HETEROGENEOUS_MAXIMUM_RUN_SECONDS = 7.75
+_DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES = frozenset(
+    {
+        "heterogeneous_role_aware_safe_hold_v1",
+        "heterogeneous_role_aware_cinematic_v1",
+    }
+)
 
 
 class DirectMemberVisualSelectionError(RuntimeError):
@@ -1828,11 +1834,12 @@ class DirectMemberVisualSelection:
             raise ValueError("source duration-balance lengths must match")
         if self.usage_policy not in {
             "exact_balanced_quota_v1",
+            "heterogeneous_role_aware_safe_hold_v1",
             "heterogeneous_role_aware_cinematic_v1",
         }:
             raise ValueError("direct member visual usage policy is invalid")
-        heterogeneous_usage = bool(
-            self.usage_policy == "heterogeneous_role_aware_cinematic_v1"
+        heterogeneous_usage = self.usage_policy in (
+            _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES
         )
         if not heterogeneous_usage and self.source_counts != self.source_quotas:
             raise ValueError("direct member visual selection must satisfy every quota")
@@ -2274,7 +2281,7 @@ class DirectMemberVisualSelection:
                         )
                     )
                     if self.usage_policy
-                    == "heterogeneous_role_aware_cinematic_v1"
+                    in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES
                     else max(self.source_duration_relative_deviations)
                     <= self.config.maximum_source_duration_relative_deviation
                     + 1e-9
@@ -2282,7 +2289,7 @@ class DirectMemberVisualSelection:
                 "target_policy": (
                     "heterogeneous_role_soft_target_with_hard_exposure_bounds"
                     if self.usage_policy
-                    == "heterogeneous_role_aware_cinematic_v1"
+                    in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES
                     else "total_duration_times_source_quota_divided_by_span_count"
                 ),
                 "total_duration_seconds": sum(self.source_durations_seconds),
@@ -2292,7 +2299,7 @@ class DirectMemberVisualSelection:
                 "maximum_allowed_relative_deviation": (
                     None
                     if self.usage_policy
-                    == "heterogeneous_role_aware_cinematic_v1"
+                    in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES
                     else self.config.maximum_source_duration_relative_deviation
                 ),
                 "normalized_squared_load_cost": (
@@ -7344,6 +7351,7 @@ def _heterogeneous_cinematic_visual_path(
     priority_cut_boundary_indices: Sequence[int],
     maximum_priority_cut_hold_count: int,
     config: DirectMemberVisualConfig,
+    require_cinematic_bridge: bool = True,
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Use heterogeneous fancams by role without authoring a bad hard cut.
 
@@ -7351,8 +7359,11 @@ def _heterogeneous_cinematic_visual_path(
     portrait performance fancams carry the continuous edit.  A raw severe edge
     is admitted only when ``DirectMemberCinematicBridge`` proves that the
     remaining discrepancy is framing-only and the outgoing handle is itself a
-    content-valid span.  Such an edge is not a hard cut: downstream rendering
-    must author and verify its required zoom/blur overlap.
+    content-valid span.  When ``require_cinematic_bridge`` is false, severe
+    edges remain entirely forbidden and this solver only replaces mechanically
+    exact source quotas with hard role-aware exposure bounds.  When true, at
+    least one selected severe edge must carry the downstream-verified
+    zoom/blur overlap contract.
     """
 
     try:
@@ -7374,17 +7385,34 @@ def _heterogeneous_cinematic_visual_path(
         or len(durations) != span_count
     ):
         raise ValueError("heterogeneous cinematic path shape is invalid")
-    landscape_sources = tuple(
+    geometric_landscape_sources = tuple(
         index
         for index, geometry in enumerate(source_geometries)
         if geometry is not None
         and geometry.source_width > geometry.source_height
     )
-    portrait_sources = tuple(
-        index for index in range(source_count) if index not in landscape_sources
+    geometric_portrait_sources = tuple(
+        index
+        for index in range(source_count)
+        if index not in geometric_landscape_sources
     )
-    if not landscape_sources or not portrait_sources:
+    if require_cinematic_bridge and (
+        not geometric_landscape_sources or not geometric_portrait_sources
+    ):
         return None
+    # Mixed-orientation edits reserve landscape facecams for highlight roles.
+    # A homogeneous all-portrait or all-landscape request still gets adaptive
+    # all-source exposure instead of falling back to mechanically exact quotas.
+    landscape_sources = (
+        geometric_landscape_sources
+        if geometric_portrait_sources
+        else ()
+    )
+    portrait_sources = (
+        geometric_portrait_sources
+        if geometric_portrait_sources
+        else tuple(range(source_count))
+    )
     high_resolution_portrait_sources = tuple(
         index
         for index in portrait_sources
@@ -7399,7 +7427,9 @@ def _heterogeneous_cinematic_visual_path(
     priority_boundaries = frozenset(
         int(value) for value in priority_cut_boundary_indices
     )
-    if not priority_boundaries:
+    if require_cinematic_bridge and not priority_boundaries:
+        return None
+    if landscape_sources and not priority_boundaries:
         return None
     highlight_spans = frozenset(
         span_index
@@ -7575,7 +7605,8 @@ def _heterogeneous_cinematic_visual_path(
                 mismatch = matrices[boundary_index][left_source][right_source]
                 is_hold = left_source == right_source
                 is_bridge = bool(
-                    not is_hold
+                    require_cinematic_bridge
+                    and not is_hold
                     and mismatch.severe_flags
                     and (left_source, right_source) in retained_bridges
                 )
@@ -7852,13 +7883,14 @@ def _heterogeneous_cinematic_visual_path(
         for values in bridge_edges_by_boundary
         for edge_index in values
     )
-    if not bridge_variables:
+    if require_cinematic_bridge and not bridge_variables:
         return None
-    add_constraint(
-        bridge_variables,
-        0.0,
-        float(_DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT),
-    )
+    if bridge_variables:
+        add_constraint(
+            bridge_variables,
+            1.0 if require_cinematic_bridge else 0.0,
+            float(_DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT),
+        )
     gap = _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_BOUNDARY_GAP
     for start in range(max(0, boundary_count - gap + 1)):
         window = tuple(
@@ -7926,7 +7958,7 @@ def _heterogeneous_cinematic_visual_path(
         return None
     if solution is None:
         raise DirectMemberVisualSelectionError(
-            "heterogeneous cinematic MILP exhausted bounded solver capacity",
+            "role-aware direct member MILP exhausted bounded solver capacity",
             {
                 "failure": "search_capacity_exhausted",
                 "constraint_infeasibility_proven": False,
@@ -7934,6 +7966,8 @@ def _heterogeneous_cinematic_visual_path(
                 "search": {
                     "strategy": (
                         "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                        if require_cinematic_bridge
+                        else "scipy_highs_role_aware_safe_hold_path_milp_v1"
                     ),
                     "solver": solver_diagnostics,
                 },
@@ -8022,10 +8056,13 @@ def _heterogeneous_cinematic_visual_path(
         > maximum_priority_cut_hold_count
     ):
         audit_failures.append("maximum_priority_cut_hold_count_exceeded")
-    if not bridge_indices or len(bridge_indices) > (
-        _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
-    ):
-        audit_failures.append("cinematic_bridge_count_invalid")
+    if require_cinematic_bridge:
+        if not bridge_indices or len(bridge_indices) > (
+            _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
+        ):
+            audit_failures.append("cinematic_bridge_count_invalid")
+    elif bridge_indices:
+        audit_failures.append("unexpected_cinematic_bridge")
     if any(index not in priority_boundaries for index in bridge_indices):
         audit_failures.append("cinematic_bridge_outside_highlight")
     if any(
@@ -8047,7 +8084,7 @@ def _heterogeneous_cinematic_visual_path(
     solver_diagnostics["postsolve_path_audit_failures"] = audit_failures
     if audit_failures:
         raise DirectMemberVisualSelectionError(
-            "heterogeneous cinematic MILP witness failed independent audit",
+            "role-aware direct member MILP witness failed independent audit",
             {
                 "failure": "solver_witness_audit_failed",
                 "constraint_infeasibility_proven": False,
@@ -8055,6 +8092,8 @@ def _heterogeneous_cinematic_visual_path(
                 "search": {
                     "strategy": (
                         "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                        if require_cinematic_bridge
+                        else "scipy_highs_role_aware_safe_hold_path_milp_v1"
                     ),
                     "solver": solver_diagnostics,
                 },
@@ -8068,11 +8107,21 @@ def _heterogeneous_cinematic_visual_path(
         path,
         float(result.fun),
         {
-            "strategy": "scipy_highs_heterogeneous_cinematic_path_milp_v1",
+            "strategy": (
+                "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                if require_cinematic_bridge
+                else "scipy_highs_role_aware_safe_hold_path_milp_v1"
+            ),
             "selection_basis": (
                 "all_source_role_aware_highlight_facecam_effect_bridge"
+                if require_cinematic_bridge
+                else "all_source_role_aware_nonsevere_cut_and_bounded_hold"
             ),
-            "usage_policy": "heterogeneous_role_aware_cinematic_v1",
+            "usage_policy": (
+                "heterogeneous_role_aware_cinematic_v1"
+                if require_cinematic_bridge
+                else "heterogeneous_role_aware_safe_hold_v1"
+            ),
             "source_count_targets": list(count_targets),
             "source_count_minimums": list(count_minimums),
             "source_count_maximums": list(count_maximums),
@@ -8080,8 +8129,12 @@ def _heterogeneous_cinematic_visual_path(
             "source_duration_minimums_seconds": list(duration_minimums),
             "source_duration_maximums_seconds": list(duration_maximums),
             "source_duration_relative_deviations": list(deviations),
-            "landscape_source_indices": list(landscape_sources),
-            "portrait_source_indices": list(portrait_sources),
+            "landscape_source_indices": list(geometric_landscape_sources),
+            "portrait_source_indices": list(geometric_portrait_sources),
+            "highlight_only_landscape_source_indices": list(
+                landscape_sources
+            ),
+            "carrier_source_indices": list(portrait_sources),
             "high_resolution_portrait_source_indices": list(
                 high_resolution_portrait_sources
             ),
@@ -8112,7 +8165,7 @@ def _heterogeneous_cinematic_visual_path(
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
             ),
             "cinematic_bridge_hard_cut_authorized": False,
-            "required_transition_effect": True,
+            "required_transition_effect": require_cinematic_bridge,
             "all_sources_used": all(count > 0 for count in counts),
             "visual_gates_relaxed": False,
             "search_capacity_exhausted": False,
@@ -9383,6 +9436,32 @@ def select_balanced_direct_member_sources(
                 },
             }
         else:
+            role_aware_safe_hold_authorized = bool(
+                hold_fallback_authorized
+                and all(
+                    geometry is not None
+                    for geometry in source_frame_geometries
+                )
+            )
+            role_aware_safe_hold_fallback = (
+                _heterogeneous_cinematic_visual_path(
+                    matrices,
+                    source_order=order,
+                    candidate_validity=candidate_validity,
+                    span_durations=tuple(
+                        end - start for start, end in spans
+                    ),
+                    source_geometries=source_frame_geometries,
+                    priority_cut_boundary_indices=priority_boundaries,
+                    maximum_priority_cut_hold_count=(
+                        maximum_priority_cut_hold_count
+                    ),
+                    config=resolved_config,
+                    require_cinematic_bridge=False,
+                )
+                if role_aware_safe_hold_authorized
+                else None
+            )
             heterogeneous_fallback_authorized = bool(
                 hold_fallback_authorized
                 and heterogeneous_cinematic_authorized
@@ -9402,16 +9481,30 @@ def select_balanced_direct_member_sources(
                     ),
                     config=resolved_config,
                 )
-                if heterogeneous_fallback_authorized
+                if (
+                    role_aware_safe_hold_fallback is None
+                    and heterogeneous_fallback_authorized
+                )
                 else None
             )
-            if heterogeneous_fallback is not None:
+            role_aware_fallback = (
+                role_aware_safe_hold_fallback
+                if role_aware_safe_hold_fallback is not None
+                else heterogeneous_fallback
+            )
+            if role_aware_fallback is not None:
                 (
                     path,
                     optimizer_cost,
                     optimizer_search_diagnostics,
-                ) = heterogeneous_fallback
-                usage_policy = "heterogeneous_role_aware_cinematic_v1"
+                ) = role_aware_fallback
+                usage_policy = str(
+                    optimizer_search_diagnostics["usage_policy"]
+                )
+                if usage_policy not in _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES:
+                    raise RuntimeError(
+                        "role-aware direct member solver returned an unknown policy"
+                    )
                 selected_source_targets = tuple(
                     int(value)
                     for value in optimizer_search_diagnostics[
@@ -9453,7 +9546,11 @@ def select_balanced_direct_member_sources(
                     "strict_cross_source_failure": {
                         **strict_failure_summary,
                         "authorization_basis": (
-                            "proven_strict_and_bounded_safe_hold_"
+                            "proven_strict_and_exact_quota_safe_hold_"
+                            "infeasibility_then_role_aware_all_source_bounds_v1"
+                            if usage_policy
+                            == "heterogeneous_role_aware_safe_hold_v1"
+                            else "proven_strict_and_bounded_safe_hold_"
                             "infeasibility_then_required_effect_bridge_v1"
                         ),
                     },
@@ -9510,6 +9607,13 @@ def select_balanced_direct_member_sources(
                         "strict_failure_authorized_safe_hold": (
                             hold_fallback_authorized
                         ),
+                        "role_aware_safe_hold_authorized": (
+                            role_aware_safe_hold_authorized
+                        ),
+                        "role_aware_safe_hold_attempted": (
+                            role_aware_safe_hold_authorized
+                        ),
+                        "role_aware_safe_hold_path_found": False,
                         "authorized": heterogeneous_fallback_authorized,
                         "attempted": heterogeneous_fallback_authorized,
                         "path_found": False,
