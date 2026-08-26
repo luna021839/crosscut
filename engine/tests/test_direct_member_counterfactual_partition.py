@@ -31,6 +31,7 @@ from crosscut.pipeline import (
     _direct_partition_aggregate_outcome,
     _direct_partition_current_shifted_boundary_indices,
     _direct_partition_proof_directed_boundary_merge_limit,
+    _direct_partition_proof_directed_boundary_shift_limit,
     _direct_severe_counterfactual_retry_is_authorized,
 )
 
@@ -461,6 +462,77 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             "boundary_merge",
         )
         self.assertEqual(len(repair_children[0].boundary_merges), 3)
+
+    def test_merge_grants_one_compensating_shift_for_exposed_frontier(
+        self,
+    ) -> None:
+        segments = _professional_timing_segments(34)
+        unit_counts = (4, 4, 4, 4, 4, 4, 4, 4, 2)
+        bare_parent = _DirectFullFramePartitionProfile(
+            profile_id="merge-exposed-frontier",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        merge_lineage = _direct_full_frame_proof_directed_merge_profiles(
+            segments,
+            _DirectFullFramePartitionProfile(
+                profile_id="merge-parent",
+                unit_counts=(2, 2, 4, 4, 4, 4, 4, 4, 4, 2),
+                spans=_direct_full_frame_spans_from_partition(
+                    segments,
+                    (2, 2, 4, 4, 4, 4, 4, 4, 4, 2),
+                ),
+            ),
+            _zero_boundary_diagnostics(
+                span_count=10,
+                boundary_index=0,
+            ),
+        )[0].boundary_merges
+        parent = _DirectFullFramePartitionProfile(
+            profile_id=bare_parent.profile_id,
+            unit_counts=bare_parent.unit_counts,
+            spans=bare_parent.spans,
+            boundary_shifts=tuple(
+                _recorded_shift(bare_parent, boundary_index=boundary_index)
+                for boundary_index in range(1, 8)
+            ),
+            boundary_merges=merge_lineage,
+            latest_operation_kind="boundary_shift",
+        )
+        self.assertEqual(
+            len(parent.boundary_shifts),
+            _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT,
+        )
+        self.assertEqual(
+            _direct_partition_proof_directed_boundary_shift_limit(parent),
+            _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT + 1,
+        )
+
+        children = _direct_full_frame_proof_directed_child_profiles(
+            segments,
+            parent,
+            _zero_boundary_diagnostics(
+                span_count=len(parent.unit_counts),
+                boundary_index=0,
+            ),
+        )
+
+        self.assertEqual(
+            {child.unit_counts for child in children},
+            {
+                (5, 3, 4, 4, 4, 4, 4, 4, 2),
+                (3, 5, 4, 4, 4, 4, 4, 4, 2),
+            },
+        )
+        self.assertTrue(
+            all(len(child.boundary_shifts) == 8 for child in children)
+        )
+        self.assertTrue(
+            all(child.boundary_merges == merge_lineage for child in children)
+        )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
         self.assertEqual(

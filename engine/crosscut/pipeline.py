@@ -4864,6 +4864,28 @@ def _direct_partition_proof_directed_boundary_merge_limit(
     return len(profile.boundary_merges) + remaining_density_capacity
 
 
+def _direct_partition_proof_directed_boundary_shift_limit(
+    profile: _DirectFullFramePartitionProfile,
+) -> int:
+    """Grant one compensating proof-directed shift per admitted merge.
+
+    The base seven-shift bound limits ordinary search branching.  A merge is
+    different: it removes the proved cut and can expose either neighbouring
+    cut as the next exact connectivity frontier.  Keeping the old fixed bound
+    after such a merge made a saturated lineage jump directly to another
+    merge or a visual split even when a cadence-preserving boundary shift was
+    still available.  One additional shift per independently admitted merge
+    covers that newly exposed local frontier without relaxing any visual or
+    cadence gate.  The number of surviving cuts remains an absolute bound.
+    """
+
+    return min(
+        max(0, len(profile.spans) - 1),
+        _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        + len(profile.boundary_merges),
+    )
+
+
 def _direct_partition_future_operation_state_key(
     parent: _DirectFullFramePartitionProfile,
     diagnostics: dict[str, Any],
@@ -4914,7 +4936,8 @@ def _direct_partition_future_operation_state_key(
         tuple(parent.unit_counts),
         used_boundaries,
         last_boundary,
-        _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT - len(parent.boundary_shifts),
+        _direct_partition_proof_directed_boundary_shift_limit(parent)
+        - len(parent.boundary_shifts),
         tuple(
             (
                 split.parent_span_index,
@@ -5148,7 +5171,7 @@ def _direct_full_frame_proof_directed_child_profiles(
 
     if (
         len(parent.boundary_shifts)
-        >= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        >= _direct_partition_proof_directed_boundary_shift_limit(parent)
     ):
         return ()
     proofs = _direct_partition_exact_shift_proofs(
@@ -7217,8 +7240,13 @@ def _select_direct_member_partition_profile(
     partition_search_max_boundary_merge_count = (
         _direct_partition_proof_directed_boundary_merge_limit(base)
     )
-    partition_search_max_limit_expansion_count = (
+    partition_search_max_shifted_boundary_count = min(
+        max(0, len(base.spans) - 1),
         _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        + partition_search_max_boundary_merge_count,
+    )
+    partition_search_max_limit_expansion_count = (
+        partition_search_max_shifted_boundary_count
         + partition_search_max_boundary_merge_count
     )
 
@@ -8134,7 +8162,9 @@ def _select_direct_member_partition_profile(
                 if (
                     not children
                     and len(parent.boundary_shifts)
-                    >= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+                    >= _direct_partition_proof_directed_boundary_shift_limit(
+                        parent
+                    )
                 ):
                     partition_search_shift_depth_pruned_count += 1
                     return 0
@@ -8660,7 +8690,14 @@ def _select_direct_member_partition_profile(
                     partition_search_limit_expansions
                 ),
                 "maximum_shifted_boundary_count": (
+                    partition_search_max_shifted_boundary_count
+                ),
+                "base_maximum_shifted_boundary_count": (
                     _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+                ),
+                "shift_capacity_contract": (
+                    "base_bound_plus_one_compensating_shift_per_"
+                    "independently_admitted_merge_v1"
                 ),
                 "maximum_proof_directed_boundary_merge_count": (
                     partition_search_max_boundary_merge_count
@@ -8950,7 +8987,14 @@ def _select_direct_member_partition_profile(
         ),
         "profile_limit_expansions": partition_search_limit_expansions,
         "maximum_shifted_boundary_count": (
+            partition_search_max_shifted_boundary_count
+        ),
+        "base_maximum_shifted_boundary_count": (
             _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        ),
+        "shift_capacity_contract": (
+            "base_bound_plus_one_compensating_shift_per_"
+            "independently_admitted_merge_v1"
         ),
         "maximum_proof_directed_boundary_merge_count": (
             partition_search_max_boundary_merge_count
