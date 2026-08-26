@@ -323,7 +323,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
 
     def test_merge_after_shift_preserves_physical_cut_coordinates(self) -> None:
         segments = _professional_timing_segments(34)
-        unit_counts = (4, 4, 2, 2, 4, 2, 2, 2, 5, 3, 4)
+        unit_counts = (4, 4, 2, 2, 4, 2, 2, 4, 2, 2, 4, 2)
         bare_parent = _DirectFullFramePartitionProfile(
             profile_id="shift-before-immovable-cut",
             unit_counts=unit_counts,
@@ -337,7 +337,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             unit_counts=bare_parent.unit_counts,
             spans=bare_parent.spans,
             boundary_shifts=(
-                _recorded_shift(bare_parent, boundary_index=8),
+                _recorded_shift(bare_parent, boundary_index=10),
             ),
             latest_operation_kind="boundary_shift",
         )
@@ -353,17 +353,17 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         child = children[0]
         self.assertEqual(
             child.unit_counts,
-            (4, 4, 4, 4, 2, 2, 2, 5, 3, 4),
+            (4, 4, 4, 4, 2, 2, 4, 2, 2, 4, 2),
         )
         self.assertEqual(child.boundary_shifts, parent.boundary_shifts)
         self.assertEqual(len(child.boundary_merges), 1)
         self.assertEqual(
             _direct_partition_current_shifted_boundary_indices(child),
-            (7,),
+            (9,),
         )
         self.assertGreaterEqual(
             _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
-            2,
+            3,
         )
         second_children = _direct_full_frame_proof_directed_merge_profiles(
             segments,
@@ -377,12 +377,31 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         second_child = second_children[0]
         self.assertEqual(
             second_child.unit_counts,
-            (4, 4, 4, 4, 4, 2, 5, 3, 4),
+            (4, 4, 4, 4, 4, 4, 2, 2, 4, 2),
         )
         self.assertEqual(len(second_child.boundary_merges), 2)
         self.assertEqual(
             _direct_partition_current_shifted_boundary_indices(second_child),
-            (6,),
+            (8,),
+        )
+        third_children = _direct_full_frame_proof_directed_merge_profiles(
+            segments,
+            second_child,
+            _zero_boundary_diagnostics(
+                span_count=len(second_child.unit_counts),
+                boundary_index=6,
+            ),
+        )
+        self.assertEqual(len(third_children), 1)
+        third_child = third_children[0]
+        self.assertEqual(
+            third_child.unit_counts,
+            (4, 4, 4, 4, 4, 4, 4, 4, 2),
+        )
+        self.assertEqual(len(third_child.boundary_merges), 3)
+        self.assertEqual(
+            _direct_partition_current_shifted_boundary_indices(third_child),
+            (7,),
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
