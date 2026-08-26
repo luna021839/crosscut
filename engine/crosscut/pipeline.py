@@ -358,19 +358,19 @@ _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT = 7
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 4
 _DIRECT_MEMBER_COUNTERFACTUAL_SECONDARY_SPLIT_TRIGGER_COUNT = 1
 _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
-# The terminal cohort must not stop the proof-directed frontier before the
-# already-admitted primary profile budget is exhausted.  A smaller independent
-# cap previously stopped a 64-profile search after 24 evaluations merely
-# because eight failed leaves had accumulated, even though two generated
-# profiles were still waiting in the queue.  Keep the cohort bounded by the
-# same primary budget; visual gates and the separate static upper bound remain
-# unchanged.
+# The strict all-cut search is deliberately wider than the initial queue, but
+# it must not chase the combinatorial static upper bound before trying the
+# audited no-cut/effect bridge.  Two complete primary budgets expose materially
+# different frontiers while retaining a deterministic wall against multi-hour
+# expansion.  Every candidate still runs the unrelaxed selector; this cap only
+# decides when the bounded terminal audition begins.
 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
-    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
+    2 * _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
 )
-_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = (
-    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
-)
+# Audition only the strongest proof-progress representatives.  The terminal
+# selector independently caps holds by fraction, count, consecutive use, run
+# length, and highlight priority, and never admits a severe cross-source cut.
+_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = 12
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
@@ -7460,6 +7460,34 @@ def _direct_partition_queue_priority(
     )
 
 
+def _direct_partition_terminal_audition_due(
+    *,
+    evaluated_profile_count: int,
+    feasible_profile_count: int,
+    queued_profile_count: int,
+) -> bool:
+    """Bound strict expansion before the audited hold/effect audition.
+
+    Crossing this budget is not a visual-gate relaxation and is not reported
+    as hard infeasibility: it transfers the best proven failures to the
+    independently constrained terminal selector.
+    """
+
+    for name, value in (
+        ("evaluated_profile_count", evaluated_profile_count),
+        ("feasible_profile_count", feasible_profile_count),
+        ("queued_profile_count", queued_profile_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    return bool(
+        feasible_profile_count == 0
+        and queued_profile_count > 0
+        and evaluated_profile_count
+        >= _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+    )
+
+
 def _direct_visual_split_exact_lifeline_retry_is_authorized(
     profile: _DirectFullFramePartitionProfile,
     error: DirectMemberVisualSelectionError,
@@ -8615,10 +8643,42 @@ def _select_direct_member_partition_profile(
                     enqueued_count += 1
                 return enqueued_count
 
-            if _enqueue_children(base, base_error) == 0:
-                _record_terminal_safe_hold_candidate(base, base_error)
+            _record_terminal_safe_hold_candidate(base, base_error)
+            _enqueue_children(base, base_error)
             minimum_feasible_structural_cost: tuple[int, int, int] | None = None
             while queued:
+                if _direct_partition_terminal_audition_due(
+                    evaluated_profile_count=len(attempted),
+                    feasible_profile_count=len(feasible),
+                    queued_profile_count=len(queued),
+                ):
+                    partition_search_strict_terminal_audition_limit_reached = True
+                    partition_search_strict_terminal_audition_pruned_profile_count = (
+                        len(queued)
+                    )
+                    _emit_progress(
+                        event=(
+                            "direct_member_strict_terminal_audition_completed"
+                        ),
+                        phase="strict_terminal_audition_completed",
+                        result="bounded_terminal_cohort_ready",
+                        evaluated_terminal_candidate_count=len(
+                            terminal_safe_hold_candidates
+                        ),
+                        maximum_terminal_candidate_count=(
+                            _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+                        ),
+                        maximum_proof_progress=max(
+                            (
+                                _terminal_candidate_progress(item[0], item[1])
+                                for item in terminal_safe_hold_candidates.values()
+                            ),
+                            default=-1,
+                        ),
+                        unevaluated_structural_profile_count=len(queued),
+                        visual_gates_relaxed=False,
+                    )
+                    break
                 if minimum_feasible_structural_cost is None:
                     queued.sort(key=lambda item: (item[0], item[1]))
                 else:
@@ -8736,37 +8796,8 @@ def _select_direct_member_partition_profile(
                 if minimum_feasible_structural_cost is None and (
                     _direct_partition_failure_is_proven(error.diagnostics)
                 ):
-                    if _enqueue_children(profile, error) == 0:
-                        _record_terminal_safe_hold_candidate(profile, error)
-                        if (
-                            len(terminal_safe_hold_candidates)
-                            >= _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
-                        ):
-                            partition_search_strict_terminal_audition_limit_reached = True
-                            partition_search_strict_terminal_audition_pruned_profile_count = len(
-                                queued
-                            )
-                            _emit_progress(
-                                event=(
-                                    "direct_member_strict_terminal_audition_"
-                                    "completed"
-                                ),
-                                phase="strict_terminal_audition_completed",
-                                result="bounded_terminal_cohort_ready",
-                                evaluated_terminal_candidate_count=len(
-                                    terminal_safe_hold_candidates
-                                ),
-                                maximum_terminal_candidate_count=(
-                                    _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
-                                ),
-                                maximum_proof_progress=max(
-                                    _terminal_candidate_progress(item[0], item[1])
-                                    for item in terminal_safe_hold_candidates.values()
-                                ),
-                                unevaluated_structural_profile_count=len(queued),
-                                visual_gates_relaxed=False,
-                            )
-                            break
+                    _record_terminal_safe_hold_candidate(profile, error)
+                    _enqueue_children(profile, error)
             if (
                 not feasible
                 and queued
@@ -8876,7 +8907,7 @@ def _select_direct_member_partition_profile(
                 )
                 terminal_contract = (
                     "proof_progress_ordered_strict_terminal_audition_"
-                    "then_bounded_safe_hold_cohort_v3"
+                    "then_bounded_safe_hold_cohort_v4"
                 )
                 terminal_trigger = (
                     "bounded_strict_terminal_audition_completed"
@@ -9218,7 +9249,7 @@ def _select_direct_member_partition_profile(
                 "last_resort_safe_hold_search": {
                     "contract": (
                         "proof_progress_ordered_strict_terminal_audition_"
-                        "then_bounded_safe_hold_cohort_v3"
+                        "then_bounded_safe_hold_cohort_v4"
                     ),
                     "candidate_count": (
                         partition_search_terminal_safe_hold_candidate_count
@@ -9509,7 +9540,7 @@ def _select_direct_member_partition_profile(
         "last_resort_safe_hold_search": {
             "contract": (
                 "proof_progress_ordered_strict_terminal_audition_"
-                "then_bounded_safe_hold_cohort_v3"
+                "then_bounded_safe_hold_cohort_v4"
             ),
             "candidate_count": (
                 partition_search_terminal_safe_hold_candidate_count

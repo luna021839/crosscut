@@ -33,6 +33,7 @@ from crosscut.pipeline import (
     _direct_partition_current_shifted_boundary_indices,
     _direct_partition_proof_directed_boundary_merge_limit,
     _direct_partition_proof_directed_boundary_shift_limit,
+    _direct_partition_terminal_audition_due,
     _direct_severe_counterfactual_retry_is_authorized,
 )
 
@@ -302,16 +303,44 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             4,
         )
 
-    def test_terminal_audition_cannot_truncate_primary_profile_frontier(
+    def test_terminal_audition_bounds_combinatorial_strict_expansion(
         self,
     ) -> None:
-        self.assertGreaterEqual(
+        self.assertEqual(
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
-            _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+            2 * _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
         )
-        self.assertGreaterEqual(
+        self.assertLess(
             _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+        )
+        self.assertGreaterEqual(_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT, 8)
+        self.assertFalse(
+            _direct_partition_terminal_audition_due(
+                evaluated_profile_count=(
+                    _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT - 1
+                ),
+                feasible_profile_count=0,
+                queued_profile_count=1,
+            )
+        )
+        self.assertTrue(
+            _direct_partition_terminal_audition_due(
+                evaluated_profile_count=(
+                    _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+                ),
+                feasible_profile_count=0,
+                queued_profile_count=1,
+            )
+        )
+        self.assertFalse(
+            _direct_partition_terminal_audition_due(
+                evaluated_profile_count=(
+                    _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+                ),
+                feasible_profile_count=1,
+                queued_profile_count=1,
+            )
         )
 
     def test_adjacent_proven_cut_can_move_after_neighbor_shift(self) -> None:
