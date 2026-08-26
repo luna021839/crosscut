@@ -61,6 +61,7 @@ class RenderTests(unittest.TestCase):
             contrast=1.04,
             saturation=0.96,
             temperature_balance=0.015,
+            tint_balance=-0.012,
         )
         plan = RenderPlan(
             sources=(Path("one.mp4"),),
@@ -83,14 +84,16 @@ class RenderTests(unittest.TestCase):
         graph = build_filter_graph(plan)
 
         eq = "eq=brightness=0.020000:contrast=1.040000:saturation=0.960000"
-        balance = (
-            "colorbalance=rs=0.015000:rm=0.015000:rh=0.015000:"
-            "bs=-0.015000:bm=-0.015000:bh=-0.015000:pl=1"
+        chroma = (
+            "geq=lum='lum(X,Y)':"
+            "cb='clip(cb(X,Y)-0.522000,0,255)':"
+            "cr='clip(cr(X,Y)+2.070000,0,255)'"
         )
         self.assertIn(eq, graph)
-        self.assertIn(balance, graph)
+        self.assertIn(chroma, graph)
+        self.assertNotIn("colorbalance=", graph)
         self.assertLess(graph.index(eq), graph.index("crop="))
-        self.assertLess(graph.index(balance), graph.index("crop="))
+        self.assertLess(graph.index(chroma), graph.index("crop="))
         self.assertEqual(plan.output_frame_count, 30)
         payload = plan.to_json()["segments"][0]  # type: ignore[index]
         self.assertEqual(
@@ -100,6 +103,7 @@ class RenderTests(unittest.TestCase):
                 "contrast": 1.04,
                 "saturation": 0.96,
                 "temperature_balance": 0.015,
+                "tint_balance": -0.012,
             },
         )
 
@@ -122,14 +126,17 @@ class RenderTests(unittest.TestCase):
         graph = build_filter_graph(plan)
         self.assertNotIn("eq=brightness", graph)
         self.assertNotIn("colorbalance=", graph)
+        self.assertNotIn("geq=lum='lum(X,Y)'", graph)
         with self.assertRaisesRegex(ValueError, "brightness"):
-            SourceLookAdjustment(brightness=0.051)
+            SourceLookAdjustment(brightness=0.181)
         with self.assertRaisesRegex(ValueError, "contrast"):
-            SourceLookAdjustment(contrast=1.061)
+            SourceLookAdjustment(contrast=1.401)
         with self.assertRaisesRegex(ValueError, "saturation"):
-            SourceLookAdjustment(saturation=0.939)
+            SourceLookAdjustment(saturation=0.799)
         with self.assertRaisesRegex(ValueError, "temperature"):
-            SourceLookAdjustment(temperature_balance=0.031)
+            SourceLookAdjustment(temperature_balance=0.181)
+        with self.assertRaisesRegex(ValueError, "tint"):
+            SourceLookAdjustment(tint_balance=-0.101)
         with self.assertRaisesRegex(TypeError, "look_adjustment"):
             RenderSegment(
                 0,
@@ -640,6 +647,10 @@ class RenderTests(unittest.TestCase):
 
         graph = build_filter_graph(plan)
 
+        self.assertIn(
+            "scale=2228:1254:force_original_aspect_ratio=increase,crop=2228:1254",
+            graph,
+        )
         self.assertIn("fps=30.000000,rotate=angle=", graph)
         self.assertIn("zoompan=z=", graph)
         self.assertIn("on/30.0000000000", graph)

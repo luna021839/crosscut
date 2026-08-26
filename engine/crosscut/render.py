@@ -271,12 +271,12 @@ class EditorialTransformKeyframe:
             raise ValueError("group transform values must be finite")
         if self.time_seconds < 0.0:
             raise ValueError("group transform time must be non-negative")
-        if not 1.0 <= self.zoom <= 1.18:
-            raise ValueError("editorial transform zoom must be in [1.0, 1.18]")
+        if not 1.0 <= self.zoom <= 1.35:
+            raise ValueError("editorial transform zoom must be in [1.0, 1.35]")
         if not 0.0 <= self.center_x <= 1.0 or not 0.0 <= self.center_y <= 1.0:
             raise ValueError("editorial transform center must be normalized")
-        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.040 + 1e-9:
-            raise ValueError("editorial transform pan exceeds the four-percent cap")
+        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.080 + 1e-9:
+            raise ValueError("editorial transform pan exceeds the eight-percent cap")
         if abs(self.roll_degrees) > 1.60:
             raise ValueError("editorial transform roll exceeds the subtle-roll bound")
         if abs(self.roll_degrees) > 1e-9 and (
@@ -458,17 +458,21 @@ def _tier_d_transform_is_frame_continuous(
 
 @dataclass(frozen=True, slots=True)
 class SourceLookAdjustment:
-    """Small, duration-neutral source look correction consumed by FFmpeg.
+    """Static, duration-neutral source look correction consumed by FFmpeg.
 
-    The bounds are intentionally much tighter than FFmpeg's legal ranges.  A
-    source-quality gate, rather than this color layer, remains responsible for
-    rejecting soft, clipped, or low-resolution footage.
+    The ordinary synchronized-source matcher still uses its tighter production
+    defaults.  The wider serialization envelope also accommodates automatic
+    member cache calibration. Its bounds cover the equivalent composition of
+    the empirically validated three-pass member grade while the renderer emits
+    one duration-neutral pass. They remain far inside FFmpeg's legal ranges and
+    never alter timing.
     """
 
     brightness: float = 0.0
     contrast: float = 1.0
     saturation: float = 1.0
     temperature_balance: float = 0.0
+    tint_balance: float = 0.0
 
     def __post_init__(self) -> None:
         values = (
@@ -476,19 +480,22 @@ class SourceLookAdjustment:
             self.contrast,
             self.saturation,
             self.temperature_balance,
+            self.tint_balance,
         )
         if any(not math.isfinite(value) for value in values):
             raise ValueError("source look adjustment values must be finite")
-        if not -0.05 <= self.brightness <= 0.05:
-            raise ValueError("source look brightness exceeds the conservative bound")
-        if not 0.94 <= self.contrast <= 1.06:
-            raise ValueError("source look contrast exceeds the conservative bound")
-        if not 0.94 <= self.saturation <= 1.06:
-            raise ValueError("source look saturation exceeds the conservative bound")
-        if not -0.03 <= self.temperature_balance <= 0.03:
+        if not -0.18 <= self.brightness <= 0.18:
+            raise ValueError("source look brightness exceeds the calibrated bound")
+        if not 0.60 <= self.contrast <= 1.40:
+            raise ValueError("source look contrast exceeds the calibrated bound")
+        if not 0.80 <= self.saturation <= 1.20:
+            raise ValueError("source look saturation exceeds the calibrated bound")
+        if not -0.18 <= self.temperature_balance <= 0.18:
             raise ValueError(
-                "source look temperature balance exceeds the conservative bound"
+                "source look temperature balance exceeds the calibrated bound"
             )
+        if not -0.10 <= self.tint_balance <= 0.10:
+            raise ValueError("source look tint balance exceeds the calibrated bound")
 
     @property
     def is_identity(self) -> bool:
@@ -497,6 +504,7 @@ class SourceLookAdjustment:
             and abs(self.contrast - 1.0) <= 1e-12
             and abs(self.saturation - 1.0) <= 1e-12
             and abs(self.temperature_balance) <= 1e-12
+            and abs(self.tint_balance) <= 1e-12
         )
 
 
@@ -520,15 +528,22 @@ class BoundaryLookKeyframe:
     def __post_init__(self) -> None:
         if not math.isfinite(self.time_seconds) or self.time_seconds < 0.0:
             raise ValueError("boundary look keyframe time must be non-negative")
-        # Reuse the renderer's conservative numeric contract.  Boundary-local
-        # analysis applies tighter configuration bounds before constructing a
-        # keyframe; this check is the final serialization safety net.
-        SourceLookAdjustment(
-            brightness=self.brightness,
-            contrast=self.contrast,
-            saturation=self.saturation,
-            temperature_balance=self.temperature_balance,
+        values = (
+            self.brightness,
+            self.contrast,
+            self.saturation,
+            self.temperature_balance,
         )
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("boundary look values must be finite")
+        if not -0.05 <= self.brightness <= 0.05:
+            raise ValueError("boundary look brightness exceeds its local bound")
+        if not 0.94 <= self.contrast <= 1.06:
+            raise ValueError("boundary look contrast exceeds its local bound")
+        if not 0.94 <= self.saturation <= 1.06:
+            raise ValueError("boundary look saturation exceeds its local bound")
+        if not -0.03 <= self.temperature_balance <= 0.03:
+            raise ValueError("boundary look temperature exceeds its local bound")
 
     @property
     def is_identity(self) -> bool:
@@ -787,6 +802,20 @@ class TransitionKind(str, Enum):
 
     HARD_CUT = "hard_cut"
     FACE_DISSOLVE = "face_dissolve"
+    MEMBER_ZOOM_BRIDGE = "member_zoom_bridge"
+    MEMBER_BLUR_BRIDGE = "member_blur_bridge"
+
+    @property
+    def uses_overlap(self) -> bool:
+        return self is not TransitionKind.HARD_CUT
+
+
+MEMBER_ZOOM_BRIDGE_REASON = (
+    "official_target_member_required_zoom_in_bridge_v1"
+)
+MEMBER_BLUR_BRIDGE_REASON = (
+    "official_target_member_required_horizontal_blur_bridge_v1"
+)
 
 
 FACE_DISSOLVE_ALPHA_CURVE = "normalized_logistic_sigmoid_k12_v1"
@@ -812,9 +841,9 @@ _FACE_DISSOLVE_XFADE_EXPRESSION = (
 class RenderTransition:
     """Explicit per-boundary transition metadata.
 
-    ``FACE_DISSOLVE`` uses an outgoing-only source handle.  The incoming shot
-    still begins at the nominal cut, so both pictures show the same canonical
-    song time during the overlap and the edit's total frame count is unchanged.
+    Every overlap transition uses an outgoing-only source handle. The incoming
+    shot still begins at the nominal cut, so both pictures show the same
+    canonical song time and the edit's total frame count is unchanged.
     """
 
     kind: TransitionKind = TransitionKind.HARD_CUT
@@ -837,8 +866,8 @@ class RenderTransition:
             raise ValueError("transition frame_count must be a non-negative integer")
         if self.kind is TransitionKind.HARD_CUT and self.frame_count != 0:
             raise ValueError("hard cuts cannot have overlap frames")
-        if self.kind is TransitionKind.FACE_DISSOLVE and self.frame_count < 3:
-            raise ValueError("face dissolves need at least three frames")
+        if self.kind.uses_overlap and self.frame_count < 3:
+            raise ValueError("overlap transitions need at least three frames")
         if not self.reason:
             raise ValueError("transition reason cannot be blank")
         if self.tier is not None and self.tier not in {"A", "B", "C", "D"}:
@@ -885,6 +914,10 @@ class RenderTransition:
             "alpha_curve": (
                 FACE_DISSOLVE_ALPHA_CURVE
                 if self.kind is TransitionKind.FACE_DISSOLVE
+                else "ffmpeg_xfade_zoomin_v1"
+                if self.kind is TransitionKind.MEMBER_ZOOM_BRIDGE
+                else "ffmpeg_xfade_hblur_v1"
+                if self.kind is TransitionKind.MEMBER_BLUR_BRIDGE
                 else None
             ),
         }
@@ -955,6 +988,22 @@ class RenderPlan:
             )
         if len(self.transitions) != len(self.segments) - 1:
             raise ValueError("render plan needs one transition per segment boundary")
+        member_bridge_reasons = {
+            TransitionKind.MEMBER_ZOOM_BRIDGE: MEMBER_ZOOM_BRIDGE_REASON,
+            TransitionKind.MEMBER_BLUR_BRIDGE: MEMBER_BLUR_BRIDGE_REASON,
+        }
+        actual_member_bridges = sum(
+            transition.kind in member_bridge_reasons
+            for transition in self.transitions
+        )
+        if any(
+            transition.kind in member_bridge_reasons
+            and transition.reason != member_bridge_reasons[transition.kind]
+            for transition in self.transitions
+        ):
+            raise ValueError(
+                "direct member render contains an uncontracted cinematic bridge"
+            )
         member_dissolve_fields = (
             self.member_pose_dissolve_requested,
             self.member_pose_dissolve_effective,
@@ -1002,10 +1051,15 @@ class RenderPlan:
                 self.member_pose_dissolve_effective
                 or self.member_pose_dissolve_count != 0
                 or actual_face_dissolves != 0
+                or actual_member_bridges != 0
             ):
                 raise ValueError(
                     "disabled member pose dissolve cannot author an effect"
                 )
+        elif actual_member_bridges:
+            raise ValueError(
+                "member cinematic bridge requires complete request metadata"
+            )
         counts = segment_frame_counts(self)
         for segment, frame_count in zip(self.segments, counts, strict=True):
             if segment.editorial_transform is None:
@@ -1064,32 +1118,34 @@ class RenderPlan:
                     "same-source hold cannot contain a boundary-local look reset"
                 )
             if (
-                transition.kind is TransitionKind.FACE_DISSOLVE
+                transition.kind.uses_overlap
                 and (
                     self.segments[index].editorial_transform is not None
                     or self.segments[index + 1].editorial_transform is not None
                 )
             ):
                 raise ValueError(
-                    "face dissolve cannot use an unreviewed editorial transform"
+                    "overlap transition cannot use an unreviewed editorial transform"
                 )
-            if transition.kind is TransitionKind.FACE_DISSOLVE and not (
+            if transition.kind.uses_overlap and not (
                 left_endpoint_identity and right_endpoint_identity
             ):
                 raise ValueError(
-                    "face dissolve cannot use a hard-cut boundary look ramp"
+                    "overlap transition cannot use a hard-cut boundary look ramp"
                 )
             if (
-                transition.kind is TransitionKind.FACE_DISSOLVE
+                transition.kind.uses_overlap
                 and transition.frame_count > counts[index + 1]
             ):
-                raise ValueError("face dissolve cannot exceed the incoming segment")
+                raise ValueError(
+                    "overlap transition cannot exceed the incoming segment"
+                )
             if (
-                transition.kind is TransitionKind.FACE_DISSOLVE
+                transition.kind.uses_overlap
                 and self.segments[index].source_index
                 == self.segments[index + 1].source_index
             ):
-                raise ValueError("face dissolve requires a real source change")
+                raise ValueError("overlap transition requires a real source change")
 
     @property
     def duration(self) -> float:
@@ -1134,6 +1190,13 @@ class RenderPlan:
         serialized_segments: list[dict[str, object]] = []
         for segment in self.segments:
             payload = asdict(segment)
+            serialized_look = payload.get("look_adjustment")
+            if (
+                isinstance(serialized_look, dict)
+                and abs(float(serialized_look.get("tint_balance", 0.0))) <= 1e-12
+            ):
+                # Preserve exact replay/hash compatibility with v1-v2 plans.
+                serialized_look.pop("tint_balance", None)
             payload["effective_source_duration"] = segment.effective_source_duration
             payload["source_playback_rate"] = segment.source_playback_rate
             payload["source_local_start"] = segment.source_start
@@ -1340,9 +1403,27 @@ def _editorial_transform_filters(
             time_variable=output_clock,
         )
     )
+    maximum_zoom = max(keyframe.zoom for keyframe in track.keyframes)
+    # Preserve source detail through the authored camera move. Scaling to the
+    # final canvas before zoompan would discard 4K pixels and then enlarge the
+    # already-downsampled 1080p frame. The larger even working canvas makes a
+    # zoom of Z consume width*Z by height*Z source pixels before the final
+    # output sample. Direct-member selection independently proves that this
+    # canvas fits inside its post-aspect-fill source geometry.
+    working_width = max(
+        width,
+        int(math.ceil(width * maximum_zoom / 2.0)) * 2,
+    )
+    working_height = max(
+        height,
+        int(math.ceil(height * maximum_zoom / 2.0)) * 2,
+    )
     filters = [
-        f"scale={width}:{height}:force_original_aspect_ratio=increase",
-        f"crop={width}:{height}",
+        (
+            f"scale={working_width}:{working_height}:"
+            "force_original_aspect_ratio=increase"
+        ),
+        f"crop={working_width}:{working_height}",
         "setsar=1",
         # Canonicalize after local time-warp before zoompan. zoompan emits one
         # output frame per input frame, so the small source-rate correction is
@@ -1388,16 +1469,26 @@ def _source_look_filters(
             f"contrast={adjustment.contrast:.6f}:"
             f"saturation={adjustment.saturation:.6f}"
         )
-    if abs(adjustment.temperature_balance) > 1e-12:
+    if (
+        abs(adjustment.temperature_balance) > 1e-12
+        or abs(adjustment.tint_balance) > 1e-12
+    ):
         warm = adjustment.temperature_balance
-        cool = -warm
-        # Apply the same subtle red/blue shift to shadows, midtones, and
-        # highlights.  preserve-lightness prevents this temperature repair
-        # from undoing the separately bounded luma match above.
+        tint = adjustment.tint_balance
+        # Keep source look calibration in native YUV and copy luma exactly.
+        # FFmpeg colorbalance's preserve-lightness mode is not numerically
+        # safe for tiny all-range RGB offsets on saturated LED backgrounds: it
+        # can turn smooth blue/magenta walls into large gray posterized blocks
+        # even though the stream still decodes without errors.  These two
+        # affine chroma axes approximate the former RGB intent while remaining
+        # sample-exact on Y and continuous for every legal adjustment.
+        cb_offset = -86.0 * warm - 64.0 * tint
+        cr_offset = 74.0 * warm - 80.0 * tint
         filters.append(
-            "colorbalance="
-            f"rs={warm:.6f}:rm={warm:.6f}:rh={warm:.6f}:"
-            f"bs={cool:.6f}:bm={cool:.6f}:bh={cool:.6f}:pl=1"
+            "geq="
+            "lum='lum(X,Y)':"
+            f"cb='clip(cb(X,Y){cb_offset:+.6f},0,255)':"
+            f"cr='clip(cr(X,Y){cr_offset:+.6f},0,255)'"
         )
     return filters
 
@@ -1882,14 +1973,13 @@ def build_filter_graph(plan: RenderPlan) -> str:
             (
                 plan.transitions[unit.last_segment_index].frame_count
                 if unit.last_segment_index < len(plan.transitions)
-                and plan.transitions[unit.last_segment_index].kind
-                is TransitionKind.FACE_DISSOLVE
+                and plan.transitions[unit.last_segment_index].kind.uses_overlap
                 else 0
             ),
         )
         for unit in units
     ]
-    # Build each maximal run of dissolve-linked shots as one xfade chain, then
+    # Build each maximal run of overlap-linked shots as one xfade chain, then
     # concatenate those runs across ordinary hard cuts.  Extending only the
     # outgoing side by the overlap makes every xfade duration-neutral.
     chunk_labels: list[str] = []
@@ -1901,17 +1991,26 @@ def build_filter_graph(plan: RenderPlan) -> str:
         cumulative_frames = unit.frame_count
         while (
             unit.last_segment_index < len(plan.transitions)
-            and plan.transitions[unit.last_segment_index].kind
-            is TransitionKind.FACE_DISSOLVE
+            and plan.transitions[unit.last_segment_index].kind.uses_overlap
         ):
             transition = plan.transitions[unit.last_segment_index]
             next_unit_index = unit_index + 1
             next_unit = units[next_unit_index]
             output_label = f"vx{xfade_index}"
+            if transition.kind is TransitionKind.FACE_DISSOLVE:
+                xfade = (
+                    "xfade=transition=custom:"
+                    f"expr='{_FACE_DISSOLVE_XFADE_EXPRESSION}':"
+                )
+            elif transition.kind is TransitionKind.MEMBER_ZOOM_BRIDGE:
+                xfade = "xfade=transition=zoomin:"
+            elif transition.kind is TransitionKind.MEMBER_BLUR_BRIDGE:
+                xfade = "xfade=transition=hblur:"
+            else:  # pragma: no cover - guarded by uses_overlap
+                raise ValueError("unsupported overlap transition kind")
             parts.append(
                 f"[{current_label}][v{next_unit.first_segment_index}]"
-                "xfade=transition=custom:"
-                f"expr='{_FACE_DISSOLVE_XFADE_EXPRESSION}':"
+                f"{xfade}"
                 f"duration={transition.duration_seconds(plan.fps):.9f}:"
                 f"offset={cumulative_frames / plan.fps:.9f},format=yuv420p"
                 f"[{output_label}]"

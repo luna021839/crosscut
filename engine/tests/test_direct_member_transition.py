@@ -80,12 +80,12 @@ def _motion(
         timestamp_bound_adjacent=True,
         outgoing_previous_master_seconds=canonical_master - 2.0 * step,
         outgoing_endpoint_master_seconds=canonical_master - step,
-        incoming_start_master_seconds=canonical_master + step,
-        incoming_next_master_seconds=canonical_master + 2.0 * step,
+        incoming_start_master_seconds=canonical_master,
+        incoming_next_master_seconds=canonical_master + step,
         outgoing_previous_source_local_seconds=canonical_master - 2.0 * step,
         outgoing_endpoint_source_local_seconds=canonical_master - step,
-        incoming_start_source_local_seconds=canonical_master + step,
-        incoming_next_source_local_seconds=canonical_master + 2.0 * step,
+        incoming_start_source_local_seconds=canonical_master,
+        incoming_next_source_local_seconds=canonical_master + step,
         outgoing_motion_magnitude=0.07 if both_moving else 0.0,
         incoming_motion_magnitude=0.065 if both_moving else 0.0,
         outgoing_motion_component_count=3 if both_moving else 2,
@@ -123,7 +123,7 @@ def _selection(
                 outgoing_eligible_source_index=left_source,
                 incoming_eligible_source_index=right_source,
                 outgoing_sample=_sample(boundary - 1.0 / fps, index * 0.01),
-                incoming_sample=_sample(boundary + 1.0 / fps, index * 0.01 + 0.01),
+                incoming_sample=_sample(boundary, index * 0.01 + 0.01),
                 mismatch=SimpleNamespace(
                     warning_flags=("attention_position",)
                     if index in warning_boundaries
@@ -137,6 +137,8 @@ def _selection(
                     dominant_pose_mismatch=0.08,
                     formation_mismatch=None,
                     silhouette_mismatch=0.08,
+                    transform_repair=None,
+                    cinematic_bridge=None,
                     motion_connection=_motion(
                         canonical_master=boundary,
                         fps=fps,
@@ -173,6 +175,7 @@ def _selection(
             sources.append(
                 SimpleNamespace(
                     eligible_source_index=source_index,
+                    valid=True,
                     samples=samples,
                     native_scene_cut_master_seconds=native_cuts,
                     native_scene_cut_source_seconds=native_cuts,
@@ -181,6 +184,7 @@ def _selection(
         spans.append(SimpleNamespace(sources=tuple(sources)))
     return SimpleNamespace(
         source_indices=source_path,
+        usage_policy="exact_balanced_quota_v1",
         boundaries=tuple(boundaries),
         span_validity=tuple(spans),
         config=SimpleNamespace(
@@ -188,6 +192,24 @@ def _selection(
             minimum_silhouette_confidence=0.30,
         ),
     )
+
+
+def _cinematic_selection(*, style: str = "zoom_in"):
+    selection = _selection((0, 1))
+    selection.usage_policy = "heterogeneous_role_aware_cinematic_v1"
+    boundary = selection.boundaries[0]
+    severe_flags = ("attention_position", "attention_scale")
+    boundary.mismatch.severe_flags = severe_flags
+    boundary.mismatch.warning_flags = (
+        "cinematic_effect_bridge_required",
+    )
+    boundary.mismatch.cinematic_bridge = SimpleNamespace(
+        style=style,
+        authorized_severe_flags=severe_flags,
+        pose_mismatch=0.10,
+        silhouette_mismatch=0.12,
+    )
+    return selection
 
 
 def _segments(
@@ -295,6 +317,22 @@ class DirectMemberTransitionTests(unittest.TestCase):
         self.assertTrue(
             all(item.kind is TransitionKind.HARD_CUT for item in plan.transitions)
         )
+
+    def test_required_geometry_repair_cannot_overlap_a_dissolve(self) -> None:
+        source_path = (0, 1)
+        selection = _selection(source_path)
+        selection.boundaries[0].mismatch.transform_repair = SimpleNamespace(
+            required=True
+        )
+
+        plan = _plan(source_path, selection=selection)
+
+        self.assertEqual(plan.selected_count, 0)
+        self.assertEqual(
+            plan.decisions[0].rejection_reasons,
+            ("lossless_transform_repair_requires_hard_cut",),
+        )
+        self.assertIs(plan.transitions[0].kind, TransitionKind.HARD_CUT)
 
     def test_disabled_or_unverified_metadata_is_exact_all_hard_cut(self) -> None:
         source_path = (0, 1, 2, 3)
@@ -502,6 +540,62 @@ class DirectMemberTransitionTests(unittest.TestCase):
             "outgoing_handle_entry_discontinuity",
             plan.decisions[0].rejection_reasons,
         )
+
+    def test_required_cinematic_bridges_render_exact_zoom_and_blur_effects(self) -> None:
+        for style, expected_kind, filter_token in (
+            (
+                "zoom_in",
+                TransitionKind.MEMBER_ZOOM_BRIDGE,
+                "xfade=transition=zoomin",
+            ),
+            (
+                "horizontal_blur",
+                TransitionKind.MEMBER_BLUR_BRIDGE,
+                "xfade=transition=hblur",
+            ),
+        ):
+            with self.subTest(style=style):
+                transition_plan = _plan(
+                    (0, 1),
+                    selection=_cinematic_selection(style=style),
+                    highlight_intervals=((3.5, 4.5),),
+                )
+                self.assertEqual(transition_plan.selected_count, 0)
+                self.assertEqual(transition_plan.cinematic_bridge_count, 1)
+                self.assertIs(
+                    transition_plan.transitions[0].kind,
+                    expected_kind,
+                )
+                self.assertTrue(
+                    transition_plan.decisions[0].required_cinematic_bridge
+                )
+                render_plan = RenderPlan(
+                    sources=(Path("0.mp4"), Path("1.mp4")),
+                    segments=_segments((0, 1)),
+                    reference_source=0,
+                    aspect_ratio=AspectRatio.PORTRAIT,
+                    output=Path("out.mp4"),
+                    width=1080,
+                    height=1920,
+                    fps=30.0,
+                    transitions=transition_plan.transitions,
+                    member_pose_dissolve_requested=True,
+                    member_pose_dissolve_effective=False,
+                    member_pose_dissolve_count=0,
+                )
+                self.assertIn(filter_token, build_filter_graph(render_plan))
+
+    def test_required_cinematic_bridge_never_degrades_to_hard_cut(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "required direct member cinematic bridge",
+        ):
+            _plan(
+                (0, 1),
+                selection=_cinematic_selection(),
+                highlight_intervals=((3.5, 4.5),),
+                enabled=False,
+            )
 
     def test_malformed_source_metadata_and_low_fps_degrade_to_hard_cut(self) -> None:
         source_path = (0, 1)

@@ -8,6 +8,11 @@ from crosscut.direct_member_editorial_motion import (
     DirectMemberFaceSample,
     build_direct_member_editorial_motion_plan,
 )
+from crosscut.direct_member_transform import (
+    DirectMemberBoundaryTransformRepair,
+    direct_member_source_frame_geometry,
+)
+from crosscut.pose import SILHOUETTE_BACKEND
 from crosscut.render import RenderSegment, RenderTransition
 
 
@@ -46,6 +51,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
                 "incoming_eligible_source_index": right_source,
                 "outgoing_sample": cls._audited_sample(boxes[index]),
                 "incoming_sample": cls._audited_sample(boxes[index + 1]),
+                "mismatch": SimpleNamespace(transform_repair=None),
             }
             values.update(overrides.get(index, {}))
             boundaries.append(SimpleNamespace(**values))
@@ -127,17 +133,192 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.05)
         self.assertEqual(
             plan.analysis_basis,
-            "official_target_fancam_unambiguous_face_dense_output_frame_"
-            "plus_widened_full_subject_containment_review_v2",
+            "official_target_fancam_face_or_verified_full_subject_dense_"
+            "output_frame_resolution_bound_repair_and_lossless_pulse_review_v5",
         )
+
+    def test_verified_full_subject_match_is_accepted_without_face(self) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+
+        def audited(box):
+            return SimpleNamespace(
+                attention=SimpleNamespace(
+                    bbox_xywh=box,
+                    basis="aggregate_human_silhouette",
+                ),
+                descriptor=SimpleNamespace(
+                    face_count=0,
+                    silhouette_backend=SILHOUETTE_BACKEND,
+                    silhouette_confidence=0.95,
+                ),
+            )
+
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "outgoing_sample": audited(boxes[0]),
+                    "incoming_sample": audited(boxes[1]),
+                }
+            },
+        )
+        renders = self._renders((0, 1), (8.0, 8.0))
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: DirectMemberFaceSample(
+                boxes[source],
+                0,
+                "none",
+                boxes[source],
+                0.95,
+                "pphumanseg_full_subject_silhouette",
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.boundary_match_count, 1)
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertIsNotNone(plan.track_for(0))
 
     def test_direct_defaults_expand_only_to_renderer_safe_reference_bounds(self) -> None:
         config = DirectMemberEditorialMotionConfig()
 
-        self.assertEqual(config.maximum_boundary_zoom, 1.18)
-        self.assertEqual(config.maximum_center_shift, 0.04)
+        self.assertEqual(config.maximum_boundary_zoom, 1.35)
+        self.assertEqual(config.maximum_center_shift, 0.08)
         self.assertEqual(config.legacy_face_only_maximum_zoom, 1.12)
         self.assertEqual(config.legacy_face_only_maximum_center_shift, 0.025)
+        self.assertEqual(config.target_events_per_minute, 12.0)
+        self.assertEqual(config.minimum_event_spacing_seconds, 2.0)
+        self.assertFalse(config.enable_interior_zoom_pulses)
+        self.assertEqual(config.target_rich_motion_events_per_minute, 4.0)
+        self.assertEqual(config.interior_pulse_zoom, 1.05)
+
+    def test_enabled_interior_pulse_fills_sparse_motion_with_lossless_headroom(
+        self,
+    ) -> None:
+        source_indices = (0, 1, 2)
+        boxes = (
+            (0.40, 0.20, 0.20, 0.60),
+            (0.40, 0.20, 0.20, 0.60),
+            (0.40, 0.20, 0.20, 0.60),
+        )
+        selection = self._selection(source_indices, boxes)
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_frame_geometries = (geometry, geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders(source_indices, (5.0, 5.0, 5.0)),
+            transitions=(RenderTransition(), RenderTransition()),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+            config=DirectMemberEditorialMotionConfig(
+                enable_interior_zoom_pulses=True,
+            ),
+        )
+
+        self.assertEqual(plan.boundary_match_count, 0)
+        self.assertEqual(plan.interior_zoom_pulse_count, 1)
+        self.assertEqual(plan.applied_count, 1)
+        track = plan.track_for(0)
+        self.assertIsNotNone(track)
+        assert track is not None
+        self.assertEqual(len(track.keyframes), 3)
+        self.assertEqual(track.keyframes[0].zoom, 1.0)
+        self.assertAlmostEqual(track.keyframes[1].zoom, 1.05)
+        self.assertEqual(track.keyframes[-1].zoom, 1.0)
+
+    def test_interior_pulse_never_upscales_native_resolution_source(self) -> None:
+        source_indices = (0, 1, 2)
+        boxes = (
+            (0.40, 0.20, 0.20, 0.60),
+            (0.40, 0.20, 0.20, 0.60),
+            (0.40, 0.20, 0.20, 0.60),
+        )
+        selection = self._selection(source_indices, boxes)
+        geometry = direct_member_source_frame_geometry((1080, 1920))
+        selection.source_frame_geometries = (geometry, geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders(source_indices, (5.0, 5.0, 5.0)),
+            transitions=(RenderTransition(), RenderTransition()),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+            config=DirectMemberEditorialMotionConfig(
+                enable_interior_zoom_pulses=True,
+            ),
+        )
+
+        self.assertEqual(plan.interior_zoom_pulse_count, 0)
+        self.assertEqual(plan.applied_count, 0)
+        self.assertIn(
+            ("interior_pulse_no_lossless_zoom_headroom", 3),
+            plan.skipped_boundary_reasons,
+        )
+
+    def test_required_lossless_repair_bypasses_decorative_density_cap(self) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        repair = DirectMemberBoundaryTransformRepair(
+            transformed_side="outgoing",
+            transformed_source_index=0,
+            zoom=1.20,
+            center_x=0.5,
+            center_y=0.5,
+            source_geometry=geometry,
+            raw_attention_position_mismatch=0.12,
+            raw_attention_scale_mismatch=0.40,
+            residual_attention_position_mismatch=0.0,
+            residual_attention_scale_mismatch=0.0,
+            baseline_face_geometry_mismatch=0.20,
+            transformed_face_geometry_mismatch=0.0,
+            improvement_fraction=1.0,
+            face_visible_fraction=1.0,
+            subject_geometry_basis="pphumanseg_full_subject_silhouette",
+            subject_visible_fraction=1.0,
+            repaired_severe_flags=("attention_scale",),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "mismatch": SimpleNamespace(transform_repair=repair),
+                }
+            },
+        )
+        selection.source_frame_geometries = (geometry, geometry)
+        renders = self._renders((0, 1), (1.5, 1.5))
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source],
+                subject_box=(0.30, 0.10, 0.40, 0.75),
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertEqual(plan.boundary_match_count, 1)
+        self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.18)
 
     def test_widened_zoom_requires_dense_full_subject_and_enlarges_smaller_side(self) -> None:
         source_indices = (0, 1)

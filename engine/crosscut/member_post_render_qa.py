@@ -28,6 +28,15 @@ from .cut_local_sync import (
     MEMBER_ACTIVATION as MEMBER_CUT_LOCAL_SYNC_ACTIVATION,
     validate_cut_local_sync_evidence,
 )
+from .direct_member_look import (
+    ANALYSIS_BASIS as MEMBER_LOOK_ANALYSIS_BASIS,
+    DirectMemberLookConfig,
+)
+from .direct_member_rendered_continuity import (
+    ANALYSIS_BASIS as RENDERED_CONTINUITY_ANALYSIS_BASIS,
+    DirectMemberRenderedContinuityConfig,
+    evaluate_direct_member_rendered_continuity,
+)
 from .post_render_perceptual_quality import (
     ANALYSIS_BASIS as PERCEPTUAL_ANALYSIS_BASIS,
     PerceptualQualityConfig,
@@ -87,6 +96,104 @@ def _numbers_close(left: Any, right: Any, *, tolerance: float = 1e-6) -> bool:
             rel_tol=0.0,
             abs_tol=tolerance,
         )
+    )
+
+
+def _structured_numbers_close(
+    left: Any,
+    right: Any,
+    *,
+    tolerance: float = 1e-9,
+) -> bool:
+    """Compare JSON contracts exactly except for finite float roundoff."""
+
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return False
+        if set(left) != set(right):
+            return False
+        return all(
+            _structured_numbers_close(
+                left[key],
+                right[key],
+                tolerance=tolerance,
+            )
+            for key in left
+        )
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _structured_numbers_close(
+                left_item,
+                right_item,
+                tolerance=tolerance,
+            )
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is bool and type(right) is bool and left == right
+    if isinstance(left, int) or isinstance(right, int):
+        return type(left) is int and type(right) is int and left == right
+    if isinstance(left, float) or isinstance(right, float):
+        return _numbers_close(left, right, tolerance=tolerance)
+    return left == right
+
+
+def _direct_segment_geometry_matches(
+    direct: Mapping[str, Any],
+    segment: Mapping[str, Any],
+) -> bool:
+    """Bind lossless portrait-fill metadata to the exact rendered crop."""
+
+    crop_applied = direct.get("crop_applied")
+    portrait_fill_crop = direct.get("portrait_fill_crop")
+    render_crop = segment.get("crop")
+    if crop_applied is False:
+        crop_matches = portrait_fill_crop is None and render_crop is None
+    elif crop_applied is True:
+        crop_matches = bool(
+            isinstance(portrait_fill_crop, Mapping)
+            and isinstance(render_crop, Mapping)
+            and _structured_numbers_close(
+                portrait_fill_crop,
+                render_crop,
+                tolerance=1e-9,
+            )
+        )
+    else:
+        crop_matches = False
+    editorial_applied = direct.get("editorial_transform_applied")
+    return bool(
+        crop_matches
+        and isinstance(editorial_applied, bool)
+        and editorial_applied == (segment.get("editorial_transform") is not None)
+    )
+
+
+def _normalized_source_look(value: Any) -> dict[str, float] | None:
+    mapping = _mapping(value)
+    if mapping is None:
+        return None
+    result = {
+        "brightness": _number(mapping.get("brightness")),
+        "contrast": _number(mapping.get("contrast")),
+        "saturation": _number(mapping.get("saturation")),
+        "temperature_balance": _number(mapping.get("temperature_balance")),
+        "tint_balance": _number(mapping.get("tint_balance", 0.0)),
+    }
+    if any(item is None for item in result.values()):
+        return None
+    return {name: float(item) for name, item in result.items() if item is not None}
+
+
+def _source_look_is_identity(value: Mapping[str, float]) -> bool:
+    return bool(
+        abs(value["brightness"]) <= 1e-12
+        and abs(value["contrast"] - 1.0) <= 1e-12
+        and abs(value["saturation"] - 1.0) <= 1e-12
+        and abs(value["temperature_balance"]) <= 1e-12
+        and abs(value["tint_balance"]) <= 1e-12
     )
 
 
@@ -185,15 +292,30 @@ class AutomaticMemberPostRenderQAConfig:
     tool_timeout_seconds: float = 900.0
     fps_tolerance: float = 0.05
     duration_tolerance_frames: float = 1.0
-    maximum_sync_residual_p95_frames: float = 0.5
+    # One 29.97-fps frame is 33.4 ms. The automatic member path already binds
+    # every cut to exact source PTS and a non-static body-motion window, so a
+    # sub-frame p95 remains visually synchronous without rejecting legitimate
+    # 30/60-fps renderer ownership differences.
+    maximum_sync_residual_p95_frames: float = 1.0
     minimum_structure_samples_per_eligible_source: int = 1
     perceptual_quality: PerceptualQualityConfig = field(
         default_factory=PerceptualQualityConfig
+    )
+    rendered_continuity: DirectMemberRenderedContinuityConfig = field(
+        default_factory=DirectMemberRenderedContinuityConfig
     )
 
     def __post_init__(self) -> None:
         if not isinstance(self.perceptual_quality, PerceptualQualityConfig):
             raise TypeError("perceptual_quality must be PerceptualQualityConfig")
+        if not isinstance(
+            self.rendered_continuity,
+            DirectMemberRenderedContinuityConfig,
+        ):
+            raise TypeError(
+                "rendered_continuity must be "
+                "DirectMemberRenderedContinuityConfig"
+            )
         if (
             not math.isfinite(self.tool_timeout_seconds)
             or self.tool_timeout_seconds <= 0.0
@@ -222,6 +344,7 @@ class AutomaticMemberPostRenderQAConfig:
                 self.minimum_structure_samples_per_eligible_source
             ),
             "perceptual_quality": self.perceptual_quality.to_dict(),
+            "rendered_continuity": self.rendered_continuity.to_dict(),
         }
 
 
@@ -606,14 +729,20 @@ def _validate_member_contract(
     usage_valid = bool(
         segments_valid
         and actual_used == eligible
-        and usage == derived_usage
+        and _structured_numbers_close(usage, derived_usage)
         and member_direct is not None
         and member_direct.get("eligible_request_source_indices") == eligible
         and member_direct.get("required_used_request_source_indices") == eligible
         and member_direct.get("minimum_required_distinct_source_count")
         == len(eligible)
-        and member_direct.get("final_source_usage") == derived_usage
-        and render.get("final_source_usage") == derived_usage
+        and _structured_numbers_close(
+            member_direct.get("final_source_usage"),
+            derived_usage,
+        )
+        and _structured_numbers_close(
+            render.get("final_source_usage"),
+            derived_usage,
+        )
     )
     if not usage_valid:
         issues.add(
@@ -634,7 +763,10 @@ def _validate_member_contract(
             (_mapping(direct) or {}).get("segment_index") == index
             and (_mapping(direct) or {}).get("request_source_index")
             == segment_indices[index]
-            and (_mapping(direct) or {}).get("crop_applied") is False
+            and _direct_segment_geometry_matches(
+                _mapping(direct) or {},
+                _mapping(segments[index]) or {},
+            )
             and _numbers_close(
                 (_mapping(direct) or {}).get("source_local_start"),
                 (_mapping(segments[index]) or {}).get("source_local_start"),
@@ -653,6 +785,235 @@ def _validate_member_contract(
             path="member_direct_full_frame.segments",
         )
     return eligible, [str(value) for value in sources if isinstance(value, str)]
+
+
+def _member_look_calibration_metrics(
+    analysis: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    eligible: Sequence[int],
+    issues: _Issues,
+) -> dict[str, Any]:
+    """Bind cache-only look evidence to every rendered member segment."""
+
+    settings = DirectMemberLookConfig()
+    member_direct = _mapping(analysis.get("member_direct_full_frame")) or {}
+    render = _mapping(analysis.get("render")) or {}
+    top_level = _mapping(analysis.get("member_look_calibration"))
+    member_payload = _mapping(member_direct.get("look_calibration"))
+    render_payload = _mapping(render.get("member_look_calibration"))
+    locations_bound = bool(
+        top_level is not None
+        and member_payload is not None
+        and render_payload is not None
+        and _structured_numbers_close(top_level, member_payload)
+        and _structured_numbers_close(top_level, render_payload)
+    )
+    if not locations_bound:
+        issues.add(
+            "member_look_calibration_not_canonically_bound",
+            "Member look evidence must match in the analysis and render payloads.",
+            path="member_look_calibration",
+        )
+    payload = top_level or {}
+    calibration = _mapping(payload.get("calibration")) or {}
+    privacy = _mapping(payload.get("privacy")) or {}
+    provenance_valid = bool(
+        payload.get("analysis_basis") == MEMBER_LOOK_ANALYSIS_BASIS
+        and _structured_numbers_close(payload.get("config"), settings.to_dict())
+        and calibration.get("color_axes")
+        == "ffmpeg_native_yuv_luma_exact_temperature_tint_geq_v1"
+        and calibration.get("lab_response_basis")
+        == "eight_real_ive_member_sources_exact_ffmpeg_central_difference_v2"
+        and calibration.get("cached_descriptor_fields")
+        == "lab_mean_gray_mean_gray_contrast"
+        and calibration.get("full_song_proxy_rendered") is False
+        and calibration.get("additional_source_frames_decoded") is False
+        and privacy.get("raw_frames_persisted") is False
+        and privacy.get("raw_descriptor_embeddings_persisted") is False
+        and privacy.get("scalar_aggregate_only") is True
+    )
+    if not provenance_valid:
+        issues.add(
+            "member_look_calibration_provenance_invalid",
+            "Member look calibration must use the declared cache-only evidence path.",
+            path="member_look_calibration.calibration",
+        )
+
+    rapid_count = _integer(payload.get("rapid_boundary_count"))
+    high_count = _integer(payload.get("predicted_high_shock_count"))
+    high_fraction = _number(payload.get("predicted_high_shock_fraction"))
+    selected_regularization = _number(
+        payload.get("selected_graph_regularization")
+    )
+    diagnostics = _sequence(payload.get("diagnostics"))
+    fraction_consistent = bool(
+        rapid_count is not None
+        and high_count is not None
+        and 0 <= high_count <= rapid_count
+        and (
+            (
+                rapid_count == 0
+                and payload.get("predicted_high_shock_fraction") is None
+                and high_count == 0
+            )
+            or (
+                rapid_count > 0
+                and high_fraction is not None
+                and _numbers_close(
+                    high_fraction,
+                    high_count / rapid_count,
+                    tolerance=1e-12,
+                )
+            )
+        )
+    )
+    diagnostics_valid = bool(
+        rapid_count is not None
+        and diagnostics is not None
+        and len(diagnostics) == rapid_count
+        and sum(
+            (_mapping(item) or {}).get("above_threshold") is True
+            for item in diagnostics
+        )
+        == high_count
+        and all(
+            _integer((_mapping(item) or {}).get("outgoing_run_index")) is not None
+            and _integer((_mapping(item) or {}).get("incoming_run_index"))
+            is not None
+            and _integer((_mapping(item) or {}).get("outgoing_source_index"))
+            is not None
+            and _integer((_mapping(item) or {}).get("incoming_source_index"))
+            is not None
+            and isinstance(
+                (_mapping(item) or {}).get("above_threshold"),
+                bool,
+            )
+            and _number((_mapping(item) or {}).get("normalized_shock"))
+            is not None
+            and (
+                (_mapping(item) or {}).get("above_threshold")
+                is (
+                    float((_mapping(item) or {})["normalized_shock"])
+                    > 1.0
+                )
+            )
+            for item in diagnostics
+        )
+    )
+    source_spans = _mapping(payload.get("predicted_source_spans")) or {}
+    sharpness_span = _number(source_spans.get("sharpness_log"))
+    luma_span = _number(source_spans.get("luma"))
+    chroma_span = _number(source_spans.get("chroma"))
+    predicted_quality_valid = bool(
+        fraction_consistent
+        and diagnostics_valid
+        and (
+            rapid_count is not None
+            and (
+                rapid_count < 4
+                or (
+                    high_fraction is not None
+                    and high_fraction
+                    <= settings.maximum_rapid_high_shock_fraction + 1e-12
+                )
+            )
+        )
+        and sharpness_span is not None
+        and sharpness_span <= settings.source_sharpness_log_span + 1e-12
+        and luma_span is not None
+        and luma_span <= settings.source_luma_span + 1e-12
+        and chroma_span is not None
+        and chroma_span <= settings.source_chroma_span + 1e-12
+        and selected_regularization is not None
+        and any(
+            _numbers_close(
+                selected_regularization,
+                regularization,
+                tolerance=1e-12,
+            )
+            for regularization in settings.graph_regularizations
+        )
+    )
+    if not predicted_quality_valid:
+        issues.add(
+            "member_look_calibration_predicted_quality_not_pass",
+            "Cached member look evidence does not satisfy the production policy.",
+            path="member_look_calibration.predicted_quality",
+            value={
+                "rapid_boundary_count": rapid_count,
+                "predicted_high_shock_count": high_count,
+                "predicted_high_shock_fraction": high_fraction,
+                "predicted_source_spans": source_spans,
+            },
+            threshold={
+                "maximum_high_shock_fraction": (
+                    settings.maximum_rapid_high_shock_fraction
+                ),
+                "maximum_source_spans": {
+                    "sharpness_log": settings.source_sharpness_log_span,
+                    "luma": settings.source_luma_span,
+                    "chroma": settings.source_chroma_span,
+                },
+            },
+        )
+
+    segments = _sequence(plan.get("segments")) or []
+    serialized_adjustments = _sequence(payload.get("segment_adjustments"))
+    request_to_eligible = {
+        request_source_index: eligible_source_index
+        for eligible_source_index, request_source_index in enumerate(eligible)
+    }
+    segment_binding_valid = bool(
+        serialized_adjustments is not None
+        and len(serialized_adjustments) == len(segments)
+        and all(
+            (
+                adjustment_item := _mapping(raw_adjustment)
+            )
+            is not None
+            and (segment := _mapping(segments[index])) is not None
+            and adjustment_item.get("segment_index") == index
+            and adjustment_item.get("source_index")
+            == request_to_eligible.get(_integer(segment.get("source_index")))
+            and (declared := _normalized_source_look(adjustment_item))
+            is not None
+            and (rendered := _normalized_source_look(segment.get("look_adjustment")))
+            is not None
+            and _structured_numbers_close(declared, rendered)
+            and adjustment_item.get("identity")
+            is _source_look_is_identity(declared)
+            for index, raw_adjustment in enumerate(serialized_adjustments)
+        )
+    )
+    if not segment_binding_valid:
+        issues.add(
+            "member_look_calibration_not_bound_to_render_plan",
+            "Every member look adjustment must exactly match its render segment.",
+            path="member_look_calibration.segment_adjustments",
+        )
+    return {
+        "analysis_basis": payload.get("analysis_basis"),
+        "locations_bound": locations_bound,
+        "cache_only_provenance_valid": provenance_valid,
+        "predicted_quality_valid": predicted_quality_valid,
+        "segment_binding_valid": segment_binding_valid,
+        "segment_adjustment_count": (
+            len(serialized_adjustments)
+            if serialized_adjustments is not None
+            else 0
+        ),
+        "rapid_boundary_count": rapid_count,
+        "predicted_high_shock_count": high_count,
+        "predicted_high_shock_fraction": high_fraction,
+        "predicted_source_spans": source_spans,
+        "selected_graph_regularization": selected_regularization,
+        "passed": bool(
+            locations_bound
+            and provenance_valid
+            and predicted_quality_valid
+            and segment_binding_valid
+        ),
+    }
 
 
 def _member_cut_local_sync_metrics(
@@ -753,6 +1114,7 @@ def _member_cut_local_sync_metrics(
 
 RunCommand = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
 PerceptualEvaluator = Callable[..., Mapping[str, Any]]
+RenderedContinuityEvaluator = Callable[..., Any]
 
 
 def _run_command(
@@ -927,6 +1289,62 @@ def _probe_and_decode(
     }
 
 
+def _rendered_continuity_payload(
+    artifacts: AutomaticMemberPostRenderArtifactSet,
+    plan: Mapping[str, Any],
+    config: AutomaticMemberPostRenderQAConfig,
+    evaluator: RenderedContinuityEvaluator,
+    issues: _Issues,
+) -> dict[str, Any]:
+    """Run the fail-closed exact-frame action/geometry continuity gate."""
+
+    try:
+        raw = evaluator(
+            artifacts.video_path,
+            plan,
+            config=config.rendered_continuity,
+        )
+        if isinstance(raw, Mapping):
+            payload = dict(raw)
+        else:
+            to_dict = getattr(raw, "to_dict", None)
+            payload = dict(to_dict()) if callable(to_dict) else {}
+    except Exception as exc:
+        payload = {}
+        issues.add(
+            "member_rendered_continuity_evaluation_failed",
+            "Final member cut continuity could not be evaluated.",
+            path="rendered_continuity",
+            value=f"{type(exc).__name__}: {exc}",
+        )
+    contract_valid = bool(
+        payload.get("schema_version") == 1
+        and payload.get("analysis") == RENDERED_CONTINUITY_ANALYSIS_BASIS
+        and isinstance(payload.get("passed"), bool)
+        and isinstance(payload.get("failure_reasons"), list)
+        and isinstance(payload.get("failure_boundary_indices"), Mapping)
+        and isinstance(payload.get("metrics"), Mapping)
+        and isinstance(payload.get("boundaries"), list)
+    )
+    if not contract_valid or payload.get("passed") is not True:
+        issues.add(
+            "member_rendered_continuity_not_pass",
+            (
+                "Final member MP4 must preserve subject position, scale, pose, "
+                "motion direction, speed, and phase across every hard source "
+                "switch."
+            ),
+            path="rendered_continuity",
+            value={
+                "contract_valid": contract_valid,
+                "passed": payload.get("passed"),
+                "failure_reasons": payload.get("failure_reasons"),
+            },
+            threshold={"passed": True},
+        )
+    return payload
+
+
 def _perceptual_and_receipt(
     artifacts: AutomaticMemberPostRenderArtifactSet,
     plan: Mapping[str, Any],
@@ -1085,6 +1503,9 @@ def evaluate_automatic_member_post_render_qa(
     perceptual_evaluator: PerceptualEvaluator = (
         evaluate_post_render_perceptual_quality
     ),
+    rendered_continuity_evaluator: RenderedContinuityEvaluator = (
+        evaluate_direct_member_rendered_continuity
+    ),
     created_at: datetime | None = None,
 ) -> AutomaticMemberPostRenderQAReport:
     """Evaluate one pending automatic member render without mutating inputs."""
@@ -1123,6 +1544,12 @@ def evaluate_automatic_member_post_render_qa(
     eligible, source_paths = _validate_member_contract(
         artifacts, analysis, plan, issues
     )
+    metrics["member_look_calibration"] = _member_look_calibration_metrics(
+        analysis,
+        plan,
+        eligible,
+        issues,
+    )
     cut_local_sync = _member_cut_local_sync_metrics(
         analysis,
         plan,
@@ -1147,6 +1574,14 @@ def evaluate_automatic_member_post_render_qa(
     metrics["tool_checks"] = _probe_and_decode(
         artifacts, plan, settings, runner, issues
     )
+    rendered_continuity = _rendered_continuity_payload(
+        artifacts,
+        plan,
+        settings,
+        rendered_continuity_evaluator,
+        issues,
+    )
+    metrics["rendered_continuity"] = rendered_continuity
     perceptual, receipt = _perceptual_and_receipt(
         artifacts,
         plan,
@@ -1160,6 +1595,7 @@ def evaluate_automatic_member_post_render_qa(
     )
     metrics["perceptual_quality"] = perceptual
     receipt["cut_local_sync"] = dict(cut_local_sync)
+    receipt["rendered_continuity"] = dict(rendered_continuity)
 
     source_identity_stable = True
     source_identities_after: dict[int, Mapping[str, Any]] = {}
@@ -1211,6 +1647,7 @@ def evaluate_automatic_member_post_render_qa(
     receipt["passed"] = bool(
         receipt.get("all_eligible_sources_pixel_proven") is True
         and cut_local_sync.get("passed") is True
+        and rendered_continuity.get("passed") is True
         and source_identity_stable
         and artifact_stable
     )
@@ -1241,6 +1678,9 @@ def evaluate_and_write_automatic_member_post_render_qa(
     perceptual_evaluator: PerceptualEvaluator = (
         evaluate_post_render_perceptual_quality
     ),
+    rendered_continuity_evaluator: RenderedContinuityEvaluator = (
+        evaluate_direct_member_rendered_continuity
+    ),
     created_at: datetime | None = None,
 ) -> tuple[AutomaticMemberPostRenderQAReport, Path]:
     report = evaluate_automatic_member_post_render_qa(
@@ -1248,6 +1688,7 @@ def evaluate_and_write_automatic_member_post_render_qa(
         config=config,
         runner=runner,
         perceptual_evaluator=perceptual_evaluator,
+        rendered_continuity_evaluator=rendered_continuity_evaluator,
         created_at=created_at,
     )
     return report, report.write_atomic(output_path)

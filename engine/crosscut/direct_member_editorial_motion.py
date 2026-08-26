@@ -17,6 +17,12 @@ from typing import Callable, Sequence
 import cv2
 
 from .direct_member_visual import DirectMemberVisualSelection
+from .direct_member_transform import (
+    DirectMemberBoundaryTransformRepair,
+    DirectMemberSourceFrameGeometry,
+    direct_member_source_frame_geometry,
+    map_box_to_portrait_fill,
+)
 from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from .member_editorial_motion import (
     MemberEditorialMotionConfig,
@@ -31,6 +37,7 @@ from .member_editorial_motion import (
 )
 from .pose import SILHOUETTE_BACKEND
 from .render import (
+    EditorialTransformKeyframe,
     EditorialTransformTrack,
     RenderSegment,
     RenderTransition,
@@ -69,12 +76,13 @@ class DirectMemberFaceSample:
         if (
             isinstance(self.face_count, bool)
             or not isinstance(self.face_count, int)
-            or self.face_count != 1
+            or self.face_count not in {0, 1}
         ):
-            raise ValueError("direct member face sample needs exactly one face")
+            raise ValueError(
+                "direct member geometry sample needs exactly one face or "
+                "verified subject-only geometry"
+            )
         backend = self.detector_backend.strip().casefold()
-        if backend != "yunet":
-            raise ValueError("direct member face sample needs verified YuNet geometry")
         subject_box = self.subject_bbox_xywh
         if subject_box is not None:
             if len(subject_box) != 4:
@@ -109,11 +117,39 @@ class DirectMemberFaceSample:
             "face_associated_formation_person_box",
         }:
             raise ValueError("direct member subject geometry is unverified")
+        if self.face_count == 1:
+            if backend != "yunet":
+                raise ValueError(
+                    "direct member face sample needs verified YuNet geometry"
+                )
+        elif (
+            backend != "none"
+            or subject_box is None
+            or any(
+                abs(value - subject_value) > 1e-7
+                for value, subject_value in zip(
+                    (x, y, width, height),
+                    subject_box,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError(
+                "subject-only geometry must use its verified body box"
+            )
         object.__setattr__(self, "bbox_xywh", (x, y, width, height))
         object.__setattr__(self, "detector_backend", backend)
         object.__setattr__(self, "subject_bbox_xywh", subject_box)
         object.__setattr__(self, "subject_confidence", confidence)
         object.__setattr__(self, "subject_geometry_basis", basis)
+
+    @property
+    def alignment_geometry_basis(self) -> str:
+        if self.face_count == 1:
+            return "unambiguous_dominant_face_bbox_geometry_only"
+        if self.subject_geometry_basis == "pphumanseg_full_subject_silhouette":
+            return "aggregate_human_silhouette"
+        return "unambiguous_dominant_person_box_geometry_only"
 
 
 DirectMemberGeometryProvider = Callable[
@@ -207,8 +243,12 @@ class DirectMemberDenseFaceProvider:
                     subject_box = associated[0].bbox_xywh
                     subject_confidence = associated[0].detection_confidence
                     subject_basis = "face_associated_formation_person_box"
-            sample = (
-                DirectMemberFaceSample(
+            if (
+                descriptor.primary_face_bbox is not None
+                and descriptor.face_count == 1
+                and descriptor.face_detector_backend.casefold() == "yunet"
+            ):
+                sample = DirectMemberFaceSample(
                     descriptor.primary_face_bbox,
                     descriptor.face_count,
                     descriptor.face_detector_backend,
@@ -216,11 +256,17 @@ class DirectMemberDenseFaceProvider:
                     subject_confidence,
                     subject_basis,
                 )
-                if descriptor.primary_face_bbox is not None
-                and descriptor.face_count == 1
-                and descriptor.face_detector_backend.casefold() == "yunet"
-                else None
-            )
+            elif subject_box is not None:
+                sample = DirectMemberFaceSample(
+                    subject_box,
+                    0,
+                    "none",
+                    subject_box,
+                    subject_confidence,
+                    subject_basis,
+                )
+            else:
+                sample = None
         except (cv2.error, ValueError, FloatingPointError):
             sample = None
         self._cache[key] = sample
@@ -229,7 +275,7 @@ class DirectMemberDenseFaceProvider:
     def diagnostics(self) -> dict[str, int | bool | str]:
         return {
             "backend": (
-                "yunet_face_plus_pphumanseg_or_face_associated_person_"
+                "yunet_face_or_verified_full_subject_geometry_"
                 "dense_selected_ramps"
             ),
             "request_count": self._request_count,
@@ -249,9 +295,9 @@ class DirectMemberDenseFaceProvider:
 @dataclass(frozen=True, slots=True)
 class DirectMemberEditorialMotionConfig:
     ramp_seconds: float = 0.75
-    maximum_boundary_zoom: float = 1.18
-    maximum_center_shift: float = 0.040
-    maximum_boundary_center_distance: float = 0.18
+    maximum_boundary_zoom: float = 1.35
+    maximum_center_shift: float = 0.080
+    maximum_boundary_center_distance: float = 0.30
     maximum_residual_center_distance: float = 0.08
     minimum_mismatch_improvement_fraction: float = 0.20
     minimum_face_visible_fraction: float = 0.995
@@ -265,8 +311,12 @@ class DirectMemberEditorialMotionConfig:
     maximum_dense_height_ratio: float = 1.35
     maximum_endpoint_center_disagreement: float = 0.08
     maximum_endpoint_height_ratio: float = 1.25
-    target_events_per_minute: float = 8.3
-    minimum_event_spacing_seconds: float = 3.5
+    target_events_per_minute: float = 12.0
+    minimum_event_spacing_seconds: float = 2.0
+    enable_interior_zoom_pulses: bool = False
+    target_rich_motion_events_per_minute: float = 4.0
+    minimum_interior_pulse_duration_seconds: float = 2.2
+    interior_pulse_zoom: float = 1.05
 
     def __post_init__(self) -> None:
         values = tuple(float(getattr(self, name)) for name in (
@@ -289,6 +339,9 @@ class DirectMemberEditorialMotionConfig:
             "maximum_endpoint_height_ratio",
             "target_events_per_minute",
             "minimum_event_spacing_seconds",
+            "target_rich_motion_events_per_minute",
+            "minimum_interior_pulse_duration_seconds",
+            "interior_pulse_zoom",
         ))
         if any(not math.isfinite(value) for value in values):
             raise ValueError("direct member editorial configuration must be finite")
@@ -315,6 +368,14 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("dense endpoint center gate is invalid")
         if not 1.0 <= self.maximum_endpoint_height_ratio <= 2.0:
             raise ValueError("dense endpoint height-ratio gate is invalid")
+        if not isinstance(self.enable_interior_zoom_pulses, bool):
+            raise ValueError("interior zoom pulse switch must be boolean")
+        if not 0.0 <= self.target_rich_motion_events_per_minute <= 12.0:
+            raise ValueError("rich direct-member motion density is invalid")
+        if not 1.5 <= self.minimum_interior_pulse_duration_seconds <= 6.0:
+            raise ValueError("interior zoom pulse duration floor is invalid")
+        if not 1.02 <= self.interior_pulse_zoom <= 1.12:
+            raise ValueError("interior zoom pulse must remain subtle")
 
 
 def _shared_settings(
@@ -343,14 +404,34 @@ class _BoundaryCandidate:
     side: str
     state: _State
     alternative_states: tuple[_State, ...] = ()
+    required: bool = False
 
 
-def _attention_face_box(sample: object) -> tuple[float, float, float, float] | None:
+def _attention_alignment_geometry(
+    sample: object,
+) -> tuple[tuple[float, float, float, float], str] | None:
     attention = getattr(sample, "attention", None)
-    if attention is None or getattr(attention, "basis", None) != _FACE_ATTENTION_BASIS:
+    if attention is None:
         return None
+    basis = str(getattr(attention, "basis", ""))
     descriptor = getattr(sample, "descriptor", None)
-    if descriptor is None or getattr(descriptor, "face_count", None) != 1:
+    if descriptor is None:
+        return None
+    if basis == _FACE_ATTENTION_BASIS:
+        if getattr(descriptor, "face_count", None) != 1:
+            return None
+    elif basis == "aggregate_human_silhouette":
+        if (
+            getattr(descriptor, "silhouette_backend", None)
+            != SILHOUETTE_BACKEND
+            or float(getattr(descriptor, "silhouette_confidence", 0.0))
+            < 0.30
+        ):
+            return None
+    elif basis == "unambiguous_dominant_person_box_geometry_only":
+        if not tuple(getattr(descriptor, "formation_people", ())):
+            return None
+    else:
         return None
     raw = getattr(attention, "bbox_xywh", None)
     if not isinstance(raw, tuple) or len(raw) != 4:
@@ -358,7 +439,7 @@ def _attention_face_box(sample: object) -> tuple[float, float, float, float] | N
     box = tuple(float(value) for value in raw)
     if any(not math.isfinite(value) for value in box):
         return None
-    return box  # type: ignore[return-value]
+    return (box, basis)  # type: ignore[return-value]
 
 
 def _endpoint_agrees(
@@ -400,6 +481,7 @@ def _track_is_dense_face_safe(
     geometry_provider: DirectMemberGeometryProvider,
     fps: float,
     config: DirectMemberEditorialMotionConfig,
+    source_frame_geometry: DirectMemberSourceFrameGeometry | None,
 ) -> bool:
     active_frames = tuple(
         not _neutral(track, frame_index / fps)
@@ -446,7 +528,14 @@ def _track_is_dense_face_safe(
         sample = geometry_provider(eligible_source_index, canonical_time)
         if sample is None:
             return False
-        box = sample.bbox_xywh
+        box = (
+            map_box_to_portrait_fill(
+                sample.bbox_xywh,
+                source_frame_geometry,
+            )
+            if source_frame_geometry is not None
+            else sample.bbox_xywh
+        )
         if previous_box is not None:
             center_step = math.hypot(
                 _center(box)[0] - _center(previous_box)[0],
@@ -484,6 +573,11 @@ def _track_is_dense_face_safe(
                 }
             ):
                 return False
+            if source_frame_geometry is not None:
+                subject_box = map_box_to_portrait_fill(
+                    subject_box,
+                    source_frame_geometry,
+                )
             if previous_subject_box is not None:
                 subject_center_step = math.hypot(
                     _center(subject_box)[0] - _center(previous_subject_box)[0],
@@ -510,6 +604,37 @@ def _track_is_dense_face_safe(
     return True
 
 
+def _resolved_source_frame_geometries(
+    visual_selection: DirectMemberVisualSelection,
+    *,
+    source_count: int,
+    source_frame_sizes: Sequence[tuple[int, int]] | None,
+    output_frame_size: tuple[int, int],
+) -> tuple[DirectMemberSourceFrameGeometry | None, ...]:
+    stored = tuple(
+        getattr(visual_selection, "source_frame_geometries", ())
+    )
+    if stored:
+        if len(stored) != source_count or any(
+            item is not None
+            and not isinstance(item, DirectMemberSourceFrameGeometry)
+            for item in stored
+        ):
+            raise ValueError("direct member stored source geometry is invalid")
+        return stored
+    if source_frame_sizes is None:
+        return (None,) * source_count
+    if len(source_frame_sizes) != source_count:
+        raise ValueError("direct member source frame sizes must match sources")
+    return tuple(
+        direct_member_source_frame_geometry(
+            size,
+            output_size=output_frame_size,
+        )
+        for size in source_frame_sizes
+    )
+
+
 def build_direct_member_editorial_motion_plan(
     *,
     visual_selection: DirectMemberVisualSelection,
@@ -519,8 +644,10 @@ def build_direct_member_editorial_motion_plan(
     geometry_provider: DirectMemberGeometryProvider,
     fps: float = 29.97,
     config: DirectMemberEditorialMotionConfig | None = None,
+    source_frame_sizes: Sequence[tuple[int, int]] | None = None,
+    output_frame_size: tuple[int, int] = (1080, 1920),
 ) -> EditorialMotionPlan:
-    """Add only dense-verified dominant-face matches to direct 9:16 cuts."""
+    """Add dense-verified face or full-subject matches to direct 9:16 cuts."""
 
     renders = tuple(render_segments)
     transition_items = tuple(transitions)
@@ -536,6 +663,13 @@ def build_direct_member_editorial_motion_plan(
         raise ValueError("direct member editorial fps is invalid")
     settings = config or DirectMemberEditorialMotionConfig()
     shared = _shared_settings(settings)
+    source_count = max(source_path) + 1
+    source_frame_geometries = _resolved_source_frame_geometries(
+        visual_selection,
+        source_count=source_count,
+        source_frame_sizes=source_frame_sizes,
+        output_frame_size=output_frame_size,
+    )
     frame_counts, last_frame_times, boundary_times = _frame_schedule(renders, fps)
     if any(segment.crop is not None or segment.pan_crop is not None for segment in renders):
         raise ValueError("direct member editorial motion requires original full frames")
@@ -543,7 +677,7 @@ def build_direct_member_editorial_motion_plan(
     blocked: set[int] = set()
     for index, transition in enumerate(transition_items):
         if (
-            transition.kind is TransitionKind.FACE_DISSOLVE
+            transition.kind.uses_overlap
             or transition.tier == "D"
         ):
             blocked.update((index, index + 1))
@@ -553,6 +687,7 @@ def build_direct_member_editorial_motion_plan(
         skipped[reason] = skipped.get(reason, 0) + 1
 
     candidates: list[_BoundaryCandidate] = []
+    required_boundary_indices: set[int] = set()
     for boundary_index, diagnostic in enumerate(boundaries):
         if getattr(diagnostic, "boundary_index", None) != boundary_index:
             raise ValueError("direct member boundary indices must be contiguous")
@@ -560,6 +695,16 @@ def build_direct_member_editorial_motion_plan(
         right_source = source_path[boundary_index + 1]
         if left_source == right_source:
             continue
+        mismatch = getattr(diagnostic, "mismatch", None)
+        repair = getattr(mismatch, "transform_repair", None)
+        if repair is not None and not isinstance(
+            repair,
+            DirectMemberBoundaryTransformRepair,
+        ):
+            raise ValueError("direct member boundary transform repair is invalid")
+        required = repair is not None
+        if required:
+            required_boundary_indices.add(boundary_index)
         if boundary_index in blocked or boundary_index + 1 in blocked:
             skip("dissolve_adjacent")
             continue
@@ -570,11 +715,33 @@ def build_direct_member_editorial_motion_plan(
             != right_source
         ):
             raise ValueError("direct member boundary source evidence disagrees with path")
-        audited_left = _attention_face_box(diagnostic.outgoing_sample)
-        audited_right = _attention_face_box(diagnostic.incoming_sample)
-        if audited_left is None or audited_right is None:
+        audited_left_geometry = _attention_alignment_geometry(
+            diagnostic.outgoing_sample
+        )
+        audited_right_geometry = _attention_alignment_geometry(
+            diagnostic.incoming_sample
+        )
+        if (
+            audited_left_geometry is None
+            or audited_right_geometry is None
+            or audited_left_geometry[1] != audited_right_geometry[1]
+        ):
             skip("no_unambiguous_face_pair")
             continue
+        audited_left, audited_basis = audited_left_geometry
+        audited_right, _right_basis = audited_right_geometry
+        left_geometry = source_frame_geometries[left_source]
+        right_geometry = source_frame_geometries[right_source]
+        audited_left = (
+            map_box_to_portrait_fill(audited_left, left_geometry)
+            if left_geometry is not None
+            else audited_left
+        )
+        audited_right = (
+            map_box_to_portrait_fill(audited_right, right_geometry)
+            if right_geometry is not None
+            else audited_right
+        )
         left_time = (
             common_master_start
             + renders[boundary_index].master_start
@@ -586,8 +753,22 @@ def build_direct_member_editorial_motion_plan(
         if left_sample is None or right_sample is None:
             skip("dense_boundary_face_missing")
             continue
-        left_box = left_sample.bbox_xywh
-        right_box = right_sample.bbox_xywh
+        if (
+            left_sample.alignment_geometry_basis != audited_basis
+            or right_sample.alignment_geometry_basis != audited_basis
+        ):
+            skip("dense_boundary_face_disagrees_with_audit")
+            continue
+        left_box = (
+            map_box_to_portrait_fill(left_sample.bbox_xywh, left_geometry)
+            if left_geometry is not None
+            else left_sample.bbox_xywh
+        )
+        right_box = (
+            map_box_to_portrait_fill(right_sample.bbox_xywh, right_geometry)
+            if right_geometry is not None
+            else right_sample.bbox_xywh
+        )
         if not _endpoint_agrees(left_box, audited_left, settings) or not _endpoint_agrees(
             right_box, audited_right, settings
         ):
@@ -603,14 +784,30 @@ def build_direct_member_editorial_motion_plan(
         ratio = max(left_box[3], right_box[3]) / max(
             1e-9, min(left_box[3], right_box[3])
         )
-        if ratio > settings.maximum_boundary_zoom + 1e-9:
-            skip("boundary_scale_exceeds_transform_bound")
-            continue
         if ratio <= 1.015 and center_distance <= 0.025:
             skip("already_scale_position_matched")
             continue
         baseline = _mismatch(left_box, right_box)
-        if left_box[3] + 1e-9 < right_box[3]:
+        if required and repair is not None:
+            if repair.alignment_geometry_basis != audited_basis:
+                raise ValueError(
+                    "required transform geometry basis disagrees with dense audit"
+                )
+            side = "left" if repair.transformed_side == "outgoing" else "right"
+            affected_index = (
+                boundary_index if side == "left" else boundary_index + 1
+            )
+            box, target_box = (
+                (left_box, right_box) if side == "left" else (right_box, left_box)
+            )
+            expected_source = (
+                left_source if side == "left" else right_source
+            )
+            if repair.transformed_source_index != expected_source:
+                raise ValueError(
+                    "direct member required transform source disagrees with path"
+                )
+        elif left_box[3] + 1e-9 < right_box[3]:
             side = "left"
             affected_index = boundary_index
             box, target_box = left_box, right_box
@@ -621,7 +818,26 @@ def build_direct_member_editorial_motion_plan(
         if last_frame_times[affected_index] < 0.55 - 1e-9:
             skip("window_shorter_than_reference_ramp")
             continue
-        zoom = min(settings.maximum_boundary_zoom, max(1.02, ratio))
+        affected_source = source_path[affected_index]
+        affected_geometry = source_frame_geometries[affected_source]
+        lossless_zoom_limit = (
+            min(
+                settings.maximum_boundary_zoom,
+                affected_geometry.lossless_zoom_capacity,
+            )
+            if affected_geometry is not None
+            else settings.maximum_boundary_zoom
+        )
+        if required and affected_geometry is None:
+            skip("required_transform_source_resolution_missing")
+            continue
+        if lossless_zoom_limit <= 1.0 + 1e-9:
+            skip("source_resolution_has_no_lossless_transform_headroom")
+            continue
+        requested_zoom = max(1.02, target_box[3] / box[3])
+        zoom = min(lossless_zoom_limit, requested_zoom)
+        if required and repair is not None:
+            zoom = min(lossless_zoom_limit, max(zoom, repair.zoom))
         qualifying: list[tuple[float, _State]] = []
         for state in _state_for_match(
             box=box,
@@ -662,6 +878,7 @@ def build_direct_member_editorial_motion_plan(
                 side=side,
                 state=best_state,
                 alternative_states=tuple(state for _score, state in qualifying[1:]),
+                required=required,
             )
         )
 
@@ -673,11 +890,18 @@ def build_direct_member_editorial_motion_plan(
     exit_states: list[_State | None] = [None] * len(renders)
     tracks: list[EditorialTransformTrack | None] = [None] * len(renders)
     accepted: list[_BoundaryCandidate] = []
-    for candidate in sorted(candidates, key=lambda item: (-item.score, item.event_time)):
-        if len(accepted) >= maximum_events:
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            not item.required,
+            -item.score,
+            item.event_time,
+        ),
+    ):
+        if not candidate.required and len(accepted) >= maximum_events:
             skip("event_density_cap")
             continue
-        if any(
+        if not candidate.required and any(
             abs(candidate.event_time - item.event_time)
             < settings.minimum_event_spacing_seconds - 1e-9
             for item in accepted
@@ -717,6 +941,9 @@ def build_direct_member_editorial_motion_plan(
                 geometry_provider=geometry_provider,
                 fps=fps,
                 config=settings,
+                source_frame_geometry=source_frame_geometries[
+                    source_path[affected_index]
+                ],
             ):
                 accepted_state = state
                 accepted_track = track
@@ -734,8 +961,117 @@ def build_direct_member_editorial_motion_plan(
                 score=candidate.score,
                 side=candidate.side,
                 state=accepted_state,
+                required=candidate.required,
             )
         )
+
+    interior_pulse_segments: set[int] = set()
+    if settings.enable_interior_zoom_pulses:
+        target_rich_motion_count = min(
+            maximum_events,
+            math.ceil(
+                quantized_duration
+                * settings.target_rich_motion_events_per_minute
+                / 60.0
+                - 1e-12
+            ),
+        )
+        accepted_event_times = [item.event_time for item in accepted]
+
+        def interior_activity_score(segment_index: int) -> float:
+            values: list[float] = []
+            for boundary_index in (segment_index - 1, segment_index):
+                if not 0 <= boundary_index < len(boundaries):
+                    continue
+                motion = getattr(
+                    getattr(boundaries[boundary_index], "mismatch", None),
+                    "motion_connection",
+                    None,
+                )
+                if motion is None:
+                    continue
+                for name in (
+                    "outgoing_motion_magnitude",
+                    "incoming_motion_magnitude",
+                ):
+                    value = getattr(motion, name, None)
+                    if value is not None and math.isfinite(float(value)):
+                        values.append(float(value))
+            return max(values, default=0.0)
+
+        pulse_candidates = sorted(
+            range(len(renders)),
+            key=lambda index: (
+                -interior_activity_score(index),
+                -last_frame_times[index],
+                renders[index].master_start,
+                index,
+            ),
+        )
+        for index in pulse_candidates:
+            if len(accepted) + len(interior_pulse_segments) >= target_rich_motion_count:
+                break
+            if tracks[index] is not None or index in blocked:
+                continue
+            if (
+                last_frame_times[index]
+                < settings.minimum_interior_pulse_duration_seconds - 1e-9
+            ):
+                skip("interior_pulse_segment_too_short")
+                continue
+            event_time = renders[index].master_start + last_frame_times[index] / 2.0
+            if any(
+                abs(event_time - other_time)
+                < settings.minimum_event_spacing_seconds - 1e-9
+                for other_time in accepted_event_times
+            ):
+                skip("interior_pulse_spacing_cap")
+                continue
+            source_geometry = source_frame_geometries[source_path[index]]
+            if source_geometry is None:
+                skip("interior_pulse_source_resolution_missing")
+                continue
+            zoom = min(
+                settings.interior_pulse_zoom,
+                settings.maximum_boundary_zoom,
+                source_geometry.lossless_zoom_capacity,
+            )
+            if zoom < 1.02 - 1e-9:
+                skip("interior_pulse_no_lossless_zoom_headroom")
+                continue
+            track = EditorialTransformTrack(
+                keyframes=(
+                    EditorialTransformKeyframe(0.0, 1.0),
+                    EditorialTransformKeyframe(
+                        last_frame_times[index] / 2.0,
+                        zoom,
+                    ),
+                    EditorialTransformKeyframe(
+                        last_frame_times[index],
+                        1.0,
+                    ),
+                ),
+                reason=(
+                    "official_fancam_dense_subject_lossless_interior_zoom_pulse"
+                ),
+            )
+            if not _track_is_dense_face_safe(
+                segment_index=index,
+                eligible_source_index=source_path[index],
+                segment=renders[index],
+                track=track,
+                frame_count=frame_counts[index],
+                common_master_start=common_master_start,
+                geometry_provider=geometry_provider,
+                fps=fps,
+                config=settings,
+                source_frame_geometry=source_geometry,
+            ):
+                skip("interior_pulse_dense_containment_or_continuity_failed")
+                continue
+            tracks[index] = track
+            interior_pulse_segments.add(index)
+            accepted_event_times.append(event_time)
 
     for index in range(len(renders)):
         if entry_states[index] is None and exit_states[index] is None:
@@ -756,6 +1092,7 @@ def build_direct_member_editorial_motion_plan(
             geometry_provider=geometry_provider,
             fps=fps,
             config=settings,
+            source_frame_geometry=source_frame_geometries[source_path[index]],
         ):
             raise ValueError("accepted direct member camera failed final dense review")
         tracks[index] = track
@@ -764,6 +1101,17 @@ def build_direct_member_editorial_motion_plan(
         item.boundary_index if item.side == "left" else item.boundary_index + 1
         for item in accepted
     }
+    accepted_boundary_indices = tuple(
+        sorted(item.boundary_index for item in accepted)
+    )
+    missing_required = tuple(
+        sorted(required_boundary_indices.difference(accepted_boundary_indices))
+    )
+    if missing_required:
+        raise ValueError(
+            "required direct member transform failed dense review at boundaries "
+            + ",".join(str(index) for index in missing_required)
+        )
     return EditorialMotionPlan(
         segments=tuple(
             EditorialMotionSegment(
@@ -776,25 +1124,32 @@ def build_direct_member_editorial_motion_plan(
                         "scale_position_match",
                     )
                     if index in accepted_segments
+                    else (
+                        "official_fancam_dense_subject_"
+                        "lossless_interior_zoom_pulse",
+                    )
+                    if index in interior_pulse_segments
                     else ("no_safe_dense_face_editorial_motion",)
                 ),
             )
             for index in range(len(renders))
         ),
         boundary_match_count=len(accepted),
-        zoom_event_count=len(accepted),
+        zoom_event_count=len(accepted) + len(interior_pulse_segments),
         pan_event_count=sum(
             abs(item.state.center_x - 0.5) > 1e-6
             or abs(item.state.center_y - 0.5) > 1e-6
             for item in accepted
         ),
         roll_event_count=0,
+        interior_zoom_pulse_count=len(interior_pulse_segments),
         blocked_dissolve_segment_count=len(blocked),
         skipped_boundary_reasons=tuple(sorted(skipped.items())),
         analysis_basis=(
-            "official_target_fancam_unambiguous_face_dense_output_frame_"
-            "plus_widened_full_subject_containment_review_v2"
+            "official_target_fancam_face_or_verified_full_subject_dense_"
+            "output_frame_resolution_bound_repair_and_lossless_pulse_review_v5"
         ),
+        accepted_boundary_indices=accepted_boundary_indices,
     )
 
 

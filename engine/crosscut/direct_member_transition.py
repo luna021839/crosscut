@@ -21,7 +21,13 @@ from statistics import fmean
 from typing import Any, Sequence
 
 from .direct_member_visual import DirectMemberVisualSelection
-from .render import RenderSegment, RenderTransition, TransitionKind
+from .render import (
+    MEMBER_BLUR_BRIDGE_REASON,
+    MEMBER_ZOOM_BRIDGE_REASON,
+    RenderSegment,
+    RenderTransition,
+    TransitionKind,
+)
 from .timeline import formation_assignment_mismatch
 
 
@@ -33,6 +39,9 @@ DIRECT_MEMBER_POSE_DISSOLVE_CONTRACT = (
 )
 DIRECT_MEMBER_POSE_DISSOLVE_REASON = (
     "official_target_member_pose_matched_logistic_face_dissolve_v1"
+)
+DIRECT_MEMBER_CINEMATIC_BRIDGE_CONTRACT = (
+    "official_target_member_required_cinematic_effect_bridge_v1"
 )
 
 _FACE_ATTENTION_BASIS = "unambiguous_dominant_face_bbox_geometry_only"
@@ -284,17 +293,28 @@ class DirectMemberPoseDissolveDecision:
     incoming_segment_frame_count: int
     transition_frame_count: int
     exact_endpoint_evidence_used: bool
+    transition_kind: TransitionKind | None = None
+    required_cinematic_bridge: bool = False
+    cinematic_bridge_style: str | None = None
+
+    @property
+    def resolved_transition_kind(self) -> TransitionKind:
+        if self.transition_kind is not None:
+            return TransitionKind(self.transition_kind)
+        return (
+            TransitionKind.FACE_DISSOLVE
+            if self.selected
+            else TransitionKind.HARD_CUT
+        )
 
     def to_dict(self, *, fps: float) -> dict[str, Any]:
         return {
             "boundary_index": self.boundary_index,
             "canonical_master_seconds": self.canonical_master_seconds,
             "selected": self.selected,
-            "transition_kind": (
-                TransitionKind.FACE_DISSOLVE.value
-                if self.selected
-                else TransitionKind.HARD_CUT.value
-            ),
+            "transition_kind": self.resolved_transition_kind.value,
+            "required_cinematic_bridge": self.required_cinematic_bridge,
+            "cinematic_bridge_style": self.cinematic_bridge_style,
             "rejection_reasons": list(self.rejection_reasons),
             "priority_score": self.priority_score,
             "highlight_priority": self.highlight_priority,
@@ -361,26 +381,57 @@ class DirectMemberPoseDissolvePlan:
         ):
             if decision.boundary_index != index:
                 raise ValueError("direct member dissolve decisions are not contiguous")
-            if decision.selected != (
-                transition.kind is TransitionKind.FACE_DISSOLVE
-            ):
+            if decision.resolved_transition_kind is not transition.kind:
                 raise ValueError("direct member dissolve decision disagrees with render")
-            if decision.selected and transition.reason != DIRECT_MEMBER_POSE_DISSOLVE_REASON:
+            if decision.selected != transition.kind.uses_overlap:
+                raise ValueError("direct member effect selection disagrees with render")
+            if (
+                transition.kind is TransitionKind.FACE_DISSOLVE
+                and transition.reason != DIRECT_MEMBER_POSE_DISSOLVE_REASON
+            ):
                 raise ValueError("direct member dissolve reason is outside its contract")
+            expected_bridge_reason = (
+                MEMBER_ZOOM_BRIDGE_REASON
+                if transition.kind is TransitionKind.MEMBER_ZOOM_BRIDGE
+                else MEMBER_BLUR_BRIDGE_REASON
+                if transition.kind is TransitionKind.MEMBER_BLUR_BRIDGE
+                else None
+            )
+            if expected_bridge_reason is not None and (
+                not decision.required_cinematic_bridge
+                or transition.reason != expected_bridge_reason
+            ):
+                raise ValueError(
+                    "direct member cinematic bridge is outside its contract"
+                )
             if decision.selected and not (
                 self.config.minimum_duration_seconds - 1e-9
                 <= transition.duration_seconds(self.fps)
                 <= self.config.maximum_duration_seconds + 1e-9
             ):
                 raise ValueError("direct member dissolve duration is outside its contract")
-        if self.selected_count and (
+        if (self.selected_count or self.cinematic_bridge_count) and (
             not self.enabled_requested or not self.source_metadata_contract_verified
         ):
             raise ValueError("direct member dissolve lacks request or provenance authority")
 
     @property
     def selected_count(self) -> int:
-        return sum(decision.selected for decision in self.decisions)
+        return sum(
+            decision.resolved_transition_kind is TransitionKind.FACE_DISSOLVE
+            for decision in self.decisions
+        )
+
+    @property
+    def cinematic_bridge_count(self) -> int:
+        return sum(
+            decision.resolved_transition_kind
+            in {
+                TransitionKind.MEMBER_ZOOM_BRIDGE,
+                TransitionKind.MEMBER_BLUR_BRIDGE,
+            }
+            for decision in self.decisions
+        )
 
     def to_dict(self) -> dict[str, Any]:
         rejection_counts: Counter[str] = Counter(
@@ -389,10 +440,23 @@ class DirectMemberPoseDissolvePlan:
             if not decision.selected
             for reason in decision.rejection_reasons
         )
-        selected = tuple(item for item in self.decisions if item.selected)
+        selected = tuple(
+            item
+            for item in self.decisions
+            if item.resolved_transition_kind is TransitionKind.FACE_DISSOLVE
+        )
+        cinematic_bridges = tuple(
+            item
+            for item in self.decisions
+            if item.required_cinematic_bridge
+        )
         eligible_count = sum(
-            not decision.rejection_reasons
-            or decision.rejection_reasons == ("density_or_spacing_budget",)
+            not decision.required_cinematic_bridge
+            and (
+                not decision.rejection_reasons
+                or decision.rejection_reasons
+                == ("density_or_spacing_budget",)
+            )
             for decision in self.decisions
         )
         duration_minutes = self.timeline_duration_seconds / 60.0
@@ -413,6 +477,21 @@ class DirectMemberPoseDissolvePlan:
             "member_pose_dissolve_requested": self.enabled_requested,
             "member_pose_dissolve_effective": bool(selected),
             "member_pose_dissolve_count": len(selected),
+            "cinematic_bridge_contract": (
+                DIRECT_MEMBER_CINEMATIC_BRIDGE_CONTRACT
+            ),
+            "cinematic_bridge_effective": bool(cinematic_bridges),
+            "cinematic_bridge_count": len(cinematic_bridges),
+            "cinematic_bridge_styles": dict(
+                sorted(
+                    Counter(
+                        item.cinematic_bridge_style
+                        for item in cinematic_bridges
+                        if item.cinematic_bridge_style is not None
+                    ).items()
+                )
+            ),
+            "cinematic_bridge_hard_cut_authorized": False,
             "analysis_basis": (
                 "precomputed_exact_boundary_and_first_0_20s_handle_"
                 "non_identity_geometry_with_source_duration_proof"
@@ -426,7 +505,9 @@ class DirectMemberPoseDissolvePlan:
             "eligible_candidates_per_minute": eligible_density,
             "selected_dissolve_count": len(selected),
             "selected_dissolves_per_minute": selected_density,
-            "hard_cut_count": len(self.decisions) - len(selected),
+            "hard_cut_count": (
+                len(self.decisions) - len(selected) - len(cinematic_bridges)
+            ),
             "selected_highlight_count": sum(
                 item.highlight_priority for item in selected
             ),
@@ -470,11 +551,42 @@ class _SafeCandidate:
     transition_frame_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RequiredCinematicBridgeCandidate:
+    boundary_index: int
+    canonical_master_seconds: float
+    style: str
+    transition_kind: TransitionKind
+    transition_reason: str
+    both_moving: bool
+    attention_basis: str
+    endpoint_attention_position_mismatch: float | None
+    endpoint_attention_scale_mismatch: float | None
+    endpoint_pose_mismatch: float
+    endpoint_formation_mismatch: float | None
+    endpoint_silhouette_mismatch: float
+    outgoing_handle_available_seconds: float
+    required_outgoing_handle_seconds: float
+    incoming_segment_frame_count: int
+    transition_frame_count: int
+
+
 def _finite_float(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _diagnostic_cut_master_seconds(diagnostic: Any) -> float | None:
+    """Return the render-materialized local-search cut, with v1 fallback."""
+
+    selected = _finite_float(
+        getattr(diagnostic, "selected_cut_master_seconds", None)
+    )
+    if selected is not None:
+        return selected
+    return _finite_float(getattr(diagnostic, "canonical_master_seconds", None))
 
 
 def _embedding_distance(left: Any, right: Any) -> float | None:
@@ -673,9 +785,7 @@ def _safe_candidate(
 ) -> tuple[_SafeCandidate | None, tuple[str, ...]]:
     reasons: list[str] = []
     expected_master = common_master_start + render_segments[boundary_index + 1].master_start
-    canonical_master = _finite_float(
-        getattr(diagnostic, "canonical_master_seconds", None)
-    )
+    canonical_master = _diagnostic_cut_master_seconds(diagnostic)
     if (
         getattr(diagnostic, "boundary_index", None) != boundary_index
         or canonical_master is None
@@ -745,7 +855,7 @@ def _safe_candidate(
             outgoing_master is None
             or incoming_master is None
             or abs(outgoing_master - (canonical_master - step)) > 0.26 * step
-            or abs(incoming_master - (canonical_master + step)) > 0.26 * step
+            or abs(incoming_master - canonical_master) > 0.26 * step
         ):
             reasons.append("endpoint_samples_not_output_frame_bound")
         outgoing_local = _finite_float(
@@ -758,10 +868,7 @@ def _safe_candidate(
             outgoing_segment.source_end
             - step * outgoing_segment.source_playback_rate
         )
-        incoming_expected_local = (
-            incoming_segment.source_start
-            + step * incoming_segment.source_playback_rate
-        )
+        incoming_expected_local = incoming_segment.source_start
         outgoing_tolerance = max(
             1e-4,
             0.35 * step * outgoing_segment.source_playback_rate,
@@ -859,11 +966,11 @@ def _safe_candidate(
             ),
             (
                 "incoming_start_master_seconds",
-                canonical_master + step,
+                canonical_master,
             ),
             (
                 "incoming_next_master_seconds",
-                canonical_master + 2.0 * step,
+                canonical_master + step,
             ),
         )
         if any(
@@ -928,6 +1035,36 @@ def _safe_candidate(
             or int(getattr(motion, "incoming_motion_component_count", 0)) < 2
         ):
             reasons.append("both_moving_component_evidence_insufficient")
+        speed_mismatch = _finite_float(
+            getattr(motion, "motion_speed_ratio_mismatch", None)
+        )
+        speed_maximum = float(
+            getattr(
+                getattr(visual_selection, "config", None),
+                "maximum_motion_speed_ratio_mismatch",
+                0.60,
+            )
+        )
+        if (
+            speed_mismatch is not None
+            and speed_mismatch > speed_maximum + 1e-9
+        ):
+            reasons.append("motion_speed_discontinuity_exceeds_dissolve_bound")
+        phase_mismatch = _finite_float(
+            getattr(motion, "pose_phase_continuation_mismatch", None)
+        )
+        phase_maximum = float(
+            getattr(
+                getattr(visual_selection, "config", None),
+                "maximum_pose_phase_continuation_mismatch",
+                0.34,
+            )
+        )
+        if (
+            phase_mismatch is not None
+            and phase_mismatch > phase_maximum + 1e-9
+        ):
+            reasons.append("pose_phase_discontinuity_exceeds_dissolve_bound")
     elif shape_values and 1.0 - fmean(shape_values) < config.minimum_static_shape_strength:
         reasons.append("static_pose_connection_not_strong_enough")
 
@@ -1232,6 +1369,340 @@ def _safe_candidate(
     )
 
 
+def _required_cinematic_bridge_candidate(
+    *,
+    boundary_index: int,
+    diagnostic: Any,
+    visual_selection: DirectMemberVisualSelection,
+    render_segments: tuple[RenderSegment, ...],
+    eligible_request_source_indices: tuple[int, ...],
+    eligible_source_durations_seconds: tuple[float, ...],
+    frame_counts: tuple[int, ...],
+    common_master_start: float,
+    fps: float,
+    highlight_intervals: tuple[tuple[float, float], ...],
+    config: DirectMemberPoseDissolveConfig,
+) -> tuple[
+    _RequiredCinematicBridgeCandidate | None,
+    tuple[str, ...],
+]:
+    """Bind a selector-required effect to exact render clocks and handles."""
+
+    reasons: list[str] = []
+    mismatch = getattr(diagnostic, "mismatch", None)
+    bridge = getattr(mismatch, "cinematic_bridge", None)
+    if bridge is None:
+        return (None, ("cinematic_bridge_contract_missing",))
+    if (
+        getattr(visual_selection, "usage_policy", None)
+        != "heterogeneous_role_aware_cinematic_v1"
+    ):
+        reasons.append("cinematic_bridge_usage_authority_missing")
+    if getattr(mismatch, "transform_repair", None) is not None:
+        reasons.append("cinematic_bridge_conflicts_with_transform_repair")
+    severe_flags = tuple(getattr(mismatch, "severe_flags", ()))
+    if (
+        not severe_flags
+        or frozenset(severe_flags)
+        != frozenset(getattr(bridge, "authorized_severe_flags", ()))
+    ):
+        reasons.append("cinematic_bridge_severe_authority_mismatch")
+
+    expected_master = (
+        common_master_start + render_segments[boundary_index + 1].master_start
+    )
+    canonical_master = _diagnostic_cut_master_seconds(diagnostic)
+    if (
+        getattr(diagnostic, "boundary_index", None) != boundary_index
+        or canonical_master is None
+        or abs(canonical_master - expected_master) > 1e-6
+    ):
+        reasons.append("stale_or_nonexact_boundary_diagnostic")
+    elif not _in_highlight(canonical_master, highlight_intervals):
+        reasons.append("cinematic_bridge_outside_highlight")
+
+    source_path = tuple(getattr(visual_selection, "source_indices", ()))
+    if len(source_path) != len(render_segments):
+        return (
+            None,
+            tuple(dict.fromkeys(reasons + ["selected_source_path_length_mismatch"])),
+        )
+    left_source = source_path[boundary_index]
+    right_source = source_path[boundary_index + 1]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(eligible_request_source_indices)
+        for value in (left_source, right_source)
+    ):
+        return (
+            None,
+            tuple(dict.fromkeys(reasons + ["selected_source_domain_invalid"])),
+        )
+    outgoing_segment = render_segments[boundary_index]
+    incoming_segment = render_segments[boundary_index + 1]
+    if (
+        left_source == right_source
+        or not bool(getattr(diagnostic, "cut_applied", True))
+    ):
+        reasons.append("cinematic_bridge_requires_real_source_change")
+    if (
+        getattr(diagnostic, "outgoing_eligible_source_index", None)
+        != left_source
+        or getattr(diagnostic, "incoming_eligible_source_index", None)
+        != right_source
+        or outgoing_segment.source_index
+        != eligible_request_source_indices[left_source]
+        or incoming_segment.source_index
+        != eligible_request_source_indices[right_source]
+    ):
+        reasons.append("boundary_source_metadata_disagrees_with_render")
+
+    style = getattr(bridge, "style", None)
+    if style == "zoom_in":
+        transition_kind = TransitionKind.MEMBER_ZOOM_BRIDGE
+        transition_reason = MEMBER_ZOOM_BRIDGE_REASON
+    elif style == "horizontal_blur":
+        transition_kind = TransitionKind.MEMBER_BLUR_BRIDGE
+        transition_reason = MEMBER_BLUR_BRIDGE_REASON
+    else:
+        reasons.append("cinematic_bridge_style_invalid")
+        transition_kind = TransitionKind.HARD_CUT
+        transition_reason = "invalid_required_cinematic_bridge"
+
+    step = 1.0 / fps
+    outgoing_sample = getattr(diagnostic, "outgoing_sample", None)
+    incoming_sample = getattr(diagnostic, "incoming_sample", None)
+    attention_basis = _attention_basis_pair(outgoing_sample, incoming_sample)
+    if attention_basis is None:
+        reasons.append("cinematic_bridge_attention_basis_unverified")
+    if canonical_master is not None:
+        outgoing_master = _finite_float(
+            getattr(outgoing_sample, "master_seconds", None)
+        )
+        incoming_master = _finite_float(
+            getattr(incoming_sample, "master_seconds", None)
+        )
+        outgoing_local = _finite_float(
+            getattr(outgoing_sample, "source_local_seconds", None)
+        )
+        incoming_local = _finite_float(
+            getattr(incoming_sample, "source_local_seconds", None)
+        )
+        if (
+            outgoing_master is None
+            or incoming_master is None
+            or abs(outgoing_master - (canonical_master - step)) > 0.26 * step
+            or abs(incoming_master - canonical_master) > 0.26 * step
+        ):
+            reasons.append("cinematic_bridge_endpoint_samples_not_frame_bound")
+        if (
+            outgoing_local is None
+            or incoming_local is None
+            or abs(
+                outgoing_local
+                - (
+                    outgoing_segment.source_end
+                    - step * outgoing_segment.source_playback_rate
+                )
+            )
+            > max(1e-4, 0.35 * step * outgoing_segment.source_playback_rate)
+            or abs(
+                incoming_local
+                - (
+                    incoming_segment.source_start
+                )
+            )
+            > max(1e-4, 0.35 * step * incoming_segment.source_playback_rate)
+        ):
+            reasons.append("cinematic_bridge_endpoint_source_clock_invalid")
+
+    motion = getattr(mismatch, "motion_connection", None)
+    both_moving = bool(getattr(motion, "both_moving", False))
+    if motion is None or not bool(
+        getattr(motion, "timestamp_bound_adjacent", False)
+    ):
+        reasons.append("cinematic_bridge_adjacent_motion_evidence_missing")
+    elif canonical_master is not None:
+        exact_motion_times = (
+            ("outgoing_previous_master_seconds", canonical_master - 2.0 * step),
+            ("outgoing_endpoint_master_seconds", canonical_master - step),
+            ("incoming_start_master_seconds", canonical_master),
+            ("incoming_next_master_seconds", canonical_master + step),
+        )
+        if any(
+            (value := _finite_float(getattr(motion, name, None))) is None
+            or abs(value - expected) > 0.26 * step
+            for name, expected in exact_motion_times
+        ):
+            reasons.append("cinematic_bridge_motion_timestamps_not_frame_bound")
+        if (
+            _finite_float(
+                getattr(motion, "outgoing_endpoint_source_local_seconds", None)
+            )
+            != _finite_float(
+                getattr(outgoing_sample, "source_local_seconds", None)
+            )
+            or _finite_float(
+                getattr(motion, "incoming_start_source_local_seconds", None)
+            )
+            != _finite_float(
+                getattr(incoming_sample, "source_local_seconds", None)
+            )
+        ):
+            reasons.append("cinematic_bridge_motion_source_clock_invalid")
+
+    minimum_frames = max(
+        3,
+        int(math.ceil(config.minimum_duration_seconds * fps - 1e-12)),
+    )
+    maximum_frames = max(
+        minimum_frames,
+        int(math.floor(config.maximum_duration_seconds * fps + 1e-12)),
+    )
+    transition_frames = min(
+        maximum_frames,
+        max(minimum_frames, int(round(0.22 * fps))),
+    )
+    transition_duration = transition_frames / fps
+    spans = tuple(getattr(visual_selection, "span_validity", ()))
+    next_span = (
+        spans[boundary_index + 1]
+        if len(spans) > boundary_index + 1
+        else None
+    )
+    outgoing_future = (
+        _span_source(next_span, left_source) if next_span is not None else None
+    )
+    incoming_future = (
+        _span_source(next_span, right_source) if next_span is not None else None
+    )
+    if outgoing_future is None or incoming_future is None:
+        reasons.append("cinematic_bridge_future_content_evidence_missing")
+    else:
+        for label, future, segment in (
+            ("outgoing", outgoing_future, outgoing_segment),
+            ("incoming", incoming_future, incoming_segment),
+        ):
+            if not bool(getattr(future, "valid", False)):
+                reasons.append(f"cinematic_bridge_{label}_future_content_invalid")
+            samples = tuple(getattr(future, "samples", ()))[:2]
+            if len(samples) != 2:
+                reasons.append(f"cinematic_bridge_{label}_future_samples_incomplete")
+                continue
+            for sample in samples:
+                descriptor = getattr(sample, "descriptor", None)
+                if (
+                    descriptor is None
+                    or float(getattr(descriptor, "quality_score", 0.0))
+                    < config.minimum_handle_quality_score
+                ):
+                    reasons.append(
+                        f"cinematic_bridge_{label}_future_quality_too_low"
+                    )
+                sample_master = _finite_float(
+                    getattr(sample, "master_seconds", None)
+                )
+                sample_local = _finite_float(
+                    getattr(sample, "source_local_seconds", None)
+                )
+                if (
+                    canonical_master is None
+                    or sample_master is None
+                    or sample_local is None
+                    or sample_master <= canonical_master
+                    or sample_master
+                    > canonical_master
+                    + max(transition_duration, config.handle_sample_horizon_seconds)
+                    + 0.05
+                ):
+                    reasons.append(
+                        f"cinematic_bridge_{label}_future_timestamp_invalid"
+                    )
+                    continue
+                expected_local = (
+                    segment.source_end
+                    + (sample_master - canonical_master)
+                    * segment.source_playback_rate
+                    if label == "outgoing"
+                    else segment.source_start
+                    + (sample_master - canonical_master)
+                    * segment.source_playback_rate
+                )
+                if abs(sample_local - expected_local) > max(
+                    1e-4,
+                    0.35 * step * segment.source_playback_rate,
+                ):
+                    reasons.append(
+                        f"cinematic_bridge_{label}_future_source_clock_invalid"
+                    )
+            if canonical_master is not None and any(
+                canonical_master - 1e-9
+                < float(value)
+                < canonical_master + transition_duration - 1e-9
+                for value in getattr(
+                    future,
+                    "native_scene_cut_master_seconds",
+                    (),
+                )
+            ):
+                reasons.append(
+                    f"cinematic_bridge_{label}_crosses_native_source_cut"
+                )
+
+    available_handle = (
+        eligible_source_durations_seconds[left_source]
+        - outgoing_segment.source_end
+    )
+    required_handle = (
+        transition_duration * outgoing_segment.source_playback_rate
+    )
+    if available_handle + 1e-7 < required_handle:
+        reasons.append("cinematic_bridge_outgoing_source_handle_too_short")
+    incoming_frame_count = frame_counts[boundary_index + 1]
+    if incoming_frame_count < transition_frames:
+        reasons.append("cinematic_bridge_incoming_segment_too_short")
+
+    reasons = list(dict.fromkeys(reasons))
+    if reasons:
+        return (None, tuple(reasons))
+    assert canonical_master is not None
+    assert attention_basis is not None
+    return (
+        _RequiredCinematicBridgeCandidate(
+            boundary_index=boundary_index,
+            canonical_master_seconds=canonical_master,
+            style=str(style),
+            transition_kind=transition_kind,
+            transition_reason=transition_reason,
+            both_moving=both_moving,
+            attention_basis=attention_basis,
+            endpoint_attention_position_mismatch=(
+                _finite_float(
+                    getattr(mismatch, "attention_position_mismatch", None)
+                )
+            ),
+            endpoint_attention_scale_mismatch=(
+                _finite_float(
+                    getattr(mismatch, "attention_scale_mismatch", None)
+                )
+            ),
+            endpoint_pose_mismatch=float(getattr(bridge, "pose_mismatch")),
+            endpoint_formation_mismatch=(
+                _finite_float(getattr(mismatch, "formation_mismatch", None))
+            ),
+            endpoint_silhouette_mismatch=float(
+                getattr(bridge, "silhouette_mismatch")
+            ),
+            outgoing_handle_available_seconds=available_handle,
+            required_outgoing_handle_seconds=required_handle,
+            incoming_segment_frame_count=incoming_frame_count,
+            transition_frame_count=transition_frames,
+        ),
+        (),
+    )
+
+
 def _choose_candidates(
     candidates: Sequence[_SafeCandidate],
     *,
@@ -1359,6 +1830,8 @@ def build_direct_member_pose_dissolve_plan(
     frame_counts = _quantized_frame_counts(renders, fps)
     boundaries = tuple(getattr(visual_selection, "boundaries", ()))
     safe: list[_SafeCandidate] = []
+    required_bridges: dict[int, _RequiredCinematicBridgeCandidate] = {}
+    required_bridge_failures: dict[int, tuple[str, ...]] = {}
     hard_reasons: dict[int, tuple[str, ...]] = {}
     boundary_count = len(renders) - 1
     for boundary_index in range(boundary_count):
@@ -1375,8 +1848,46 @@ def build_direct_member_pose_dissolve_plan(
             reasons.append("boundary_diagnostic_count_mismatch")
         if not eligible_values_valid:
             reasons.append("eligible_request_source_metadata_invalid")
+        diagnostic = (
+            boundaries[boundary_index]
+            if boundary_index < len(boundaries)
+            else None
+        )
+        mismatch = getattr(diagnostic, "mismatch", None)
+        required_bridge = getattr(mismatch, "cinematic_bridge", None)
+        if required_bridge is not None:
+            if reasons:
+                required_bridge_failures[boundary_index] = tuple(
+                    dict.fromkeys(reasons)
+                )
+                continue
+            bridge_candidate, bridge_reasons = (
+                _required_cinematic_bridge_candidate(
+                    boundary_index=boundary_index,
+                    diagnostic=diagnostic,
+                    visual_selection=visual_selection,
+                    render_segments=renders,
+                    eligible_request_source_indices=eligible,
+                    eligible_source_durations_seconds=raw_durations,
+                    frame_counts=frame_counts,
+                    common_master_start=common_master_start,
+                    fps=fps,
+                    highlight_intervals=intervals,
+                    config=settings,
+                )
+            )
+            if bridge_candidate is None:
+                required_bridge_failures[boundary_index] = bridge_reasons
+            else:
+                required_bridges[boundary_index] = bridge_candidate
+            continue
         if reasons or boundary_index >= len(boundaries):
             hard_reasons[boundary_index] = tuple(dict.fromkeys(reasons))
+            continue
+        if getattr(mismatch, "transform_repair", None) is not None:
+            hard_reasons[boundary_index] = (
+                "lossless_transform_repair_requires_hard_cut",
+            )
             continue
         candidate, candidate_reasons = _safe_candidate(
             boundary_index=boundary_index,
@@ -1396,6 +1907,39 @@ def build_direct_member_pose_dissolve_plan(
         else:
             safe.append(candidate)
 
+    if required_bridge_failures:
+        failure_text = "; ".join(
+            f"boundary {boundary_index}: {','.join(reasons)}"
+            for boundary_index, reasons in sorted(
+                required_bridge_failures.items()
+            )
+        )
+        raise RuntimeError(
+            "required direct member cinematic bridge could not be authored: "
+            + failure_text
+        )
+
+    if required_bridges:
+        safe = [
+            candidate
+            for candidate in safe
+            if all(
+                candidate.boundary_index
+                > bridge.boundary_index + settings.minimum_boundary_gap
+                or bridge.boundary_index
+                > candidate.boundary_index + settings.minimum_boundary_gap
+                for bridge in required_bridges.values()
+            )
+            and all(
+                abs(
+                    candidate.canonical_master_seconds
+                    - bridge.canonical_master_seconds
+                )
+                >= settings.minimum_event_spacing_seconds - 1e-9
+                for bridge in required_bridges.values()
+            )
+        ]
+
     total_duration = sum(segment.duration for segment in renders)
     density_budget = max(
         1,
@@ -1405,7 +1949,13 @@ def build_direct_member_pose_dissolve_plan(
         1,
         int(math.floor(boundary_count * settings.maximum_boundary_fraction + 1e-12)),
     )
-    maximum_count = min(len(safe), density_budget, fraction_budget)
+    remaining_density_budget = max(0, density_budget - len(required_bridges))
+    remaining_fraction_budget = max(0, fraction_budget - len(required_bridges))
+    maximum_count = min(
+        len(safe),
+        remaining_density_budget,
+        remaining_fraction_budget,
+    )
     selected_indices = _choose_candidates(
         safe,
         maximum_count=maximum_count,
@@ -1416,13 +1966,45 @@ def build_direct_member_pose_dissolve_plan(
     transitions: list[RenderTransition] = []
     decisions: list[DirectMemberPoseDissolveDecision] = []
     for boundary_index in range(boundary_count):
+        bridge_candidate = required_bridges.get(boundary_index)
         candidate = safe_by_index.get(boundary_index)
-        selected = candidate is not None and boundary_index in selected_indices
-        if selected:
-            assert candidate is not None
+        selected = bool(
+            bridge_candidate is not None
+            or (
+                candidate is not None
+                and boundary_index in selected_indices
+            )
+        )
+        if bridge_candidate is not None:
+            bridge_face_values = tuple(
+                value
+                for value in (
+                    bridge_candidate.endpoint_attention_position_mismatch,
+                    bridge_candidate.endpoint_attention_scale_mismatch,
+                )
+                if value is not None
+            )
+            transition_kind = bridge_candidate.transition_kind
             transitions.append(
                 RenderTransition(
-                    kind=TransitionKind.FACE_DISSOLVE,
+                    kind=transition_kind,
+                    frame_count=bridge_candidate.transition_frame_count,
+                    reason=bridge_candidate.transition_reason,
+                    face_mismatch=(
+                        fmean(bridge_face_values)
+                        if bridge_face_values
+                        else None
+                    ),
+                    tier="A",
+                )
+            )
+            rejection_reasons = ()
+        elif selected:
+            assert candidate is not None
+            transition_kind = TransitionKind.FACE_DISSOLVE
+            transitions.append(
+                RenderTransition(
+                    kind=transition_kind,
                     frame_count=candidate.transition_frame_count,
                     reason=DIRECT_MEMBER_POSE_DISSOLVE_REASON,
                     face_mismatch=fmean(
@@ -1442,54 +2024,72 @@ def build_direct_member_pose_dissolve_plan(
                     ),
                 )
             )
-            rejection_reasons: tuple[str, ...] = ()
+            rejection_reasons = ()
         else:
+            transition_kind = TransitionKind.HARD_CUT
             transitions.append(RenderTransition(reason=hard_cut_reason))
             rejection_reasons = hard_reasons.get(
                 boundary_index,
                 ("density_or_spacing_budget",),
             )
+        evidence_candidate = (
+            bridge_candidate if bridge_candidate is not None else candidate
+        )
         decisions.append(
             DirectMemberPoseDissolveDecision(
                 boundary_index=boundary_index,
                 canonical_master_seconds=(
-                    candidate.canonical_master_seconds
-                    if candidate is not None
+                    evidence_candidate.canonical_master_seconds
+                    if evidence_candidate is not None
                     else common_master_start + renders[boundary_index + 1].master_start
                 ),
                 selected=selected,
                 rejection_reasons=rejection_reasons,
-                priority_score=(candidate.priority_score if candidate is not None else 0.0),
+                priority_score=(
+                    candidate.priority_score
+                    if candidate is not None
+                    else 1.0
+                    if bridge_candidate is not None
+                    else 0.0
+                ),
                 highlight_priority=(
                     candidate.highlight_priority
                     if candidate is not None
+                    else bridge_candidate is not None
+                ),
+                both_moving=(
+                    evidence_candidate.both_moving
+                    if evidence_candidate is not None
                     else False
                 ),
-                both_moving=(candidate.both_moving if candidate is not None else False),
-                attention_basis=(candidate.attention_basis if candidate is not None else None),
+                attention_basis=(
+                    evidence_candidate.attention_basis
+                    if evidence_candidate is not None
+                    else None
+                ),
                 endpoint_attention_position_mismatch=(
-                    candidate.endpoint_attention_position_mismatch
-                    if candidate is not None
+                    evidence_candidate.endpoint_attention_position_mismatch
+                    if evidence_candidate is not None
                     else None
                 ),
                 endpoint_attention_scale_mismatch=(
-                    candidate.endpoint_attention_scale_mismatch
-                    if candidate is not None
+                    evidence_candidate.endpoint_attention_scale_mismatch
+                    if evidence_candidate is not None
                     else None
                 ),
                 endpoint_pose_mismatch=(
-                    candidate.endpoint_pose_mismatch
-                    if candidate is not None
+                    evidence_candidate.endpoint_pose_mismatch
+                    if evidence_candidate is not None
                     else None
                 ),
                 endpoint_formation_mismatch=(
-                    candidate.endpoint_formation_mismatch
-                    if candidate is not None
+                    evidence_candidate.endpoint_formation_mismatch
+                    if evidence_candidate is not None
                     else None
                 ),
                 endpoint_silhouette_mismatch=(
-                    candidate.endpoint_silhouette_mismatch
-                    if candidate is not None
+                    evidence_candidate.endpoint_silhouette_mismatch
+                    if evidence_candidate is not None
                     else None
                 ),
                 future_attention_position_max_mismatch=(
@@ -1518,26 +2118,33 @@ def build_direct_member_pose_dissolve_plan(
                     else None
                 ),
                 outgoing_handle_available_seconds=(
-                    candidate.outgoing_handle_available_seconds
-                    if candidate is not None
+                    evidence_candidate.outgoing_handle_available_seconds
+                    if evidence_candidate is not None
                     else None
                 ),
                 required_outgoing_handle_seconds=(
-                    candidate.required_outgoing_handle_seconds
-                    if candidate is not None
+                    evidence_candidate.required_outgoing_handle_seconds
+                    if evidence_candidate is not None
                     else None
                 ),
                 incoming_segment_frame_count=(
-                    candidate.incoming_segment_frame_count
-                    if candidate is not None
+                    evidence_candidate.incoming_segment_frame_count
+                    if evidence_candidate is not None
                     else frame_counts[boundary_index + 1]
                 ),
                 transition_frame_count=(
-                    candidate.transition_frame_count
-                    if selected and candidate is not None
+                    evidence_candidate.transition_frame_count
+                    if selected and evidence_candidate is not None
                     else 0
                 ),
-                exact_endpoint_evidence_used=(candidate is not None),
+                exact_endpoint_evidence_used=(evidence_candidate is not None),
+                transition_kind=transition_kind,
+                required_cinematic_bridge=(bridge_candidate is not None),
+                cinematic_bridge_style=(
+                    bridge_candidate.style
+                    if bridge_candidate is not None
+                    else None
+                ),
             )
         )
     return DirectMemberPoseDissolvePlan(
@@ -1552,6 +2159,7 @@ def build_direct_member_pose_dissolve_plan(
 
 
 __all__ = [
+    "DIRECT_MEMBER_CINEMATIC_BRIDGE_CONTRACT",
     "DIRECT_MEMBER_POSE_DISSOLVE_CONTRACT",
     "DIRECT_MEMBER_POSE_DISSOLVE_REASON",
     "OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT",
