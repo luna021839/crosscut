@@ -466,7 +466,7 @@ class DirectMemberEditorialMotionConfig:
     minimum_face_associated_subject_visible_fraction: float = 0.720
     maximum_dense_subject_center_step: float = 0.12
     maximum_dense_subject_height_ratio: float = 1.40
-    maximum_dense_center_step: float = 0.10
+    maximum_dense_center_step: float = 0.12
     maximum_dense_height_ratio: float = 1.35
     maximum_dense_face_interpolation_gap_frames: int = 24
     maximum_dense_face_edge_extrapolation_frames: int = 24
@@ -823,7 +823,7 @@ def _median_smooth_geometry(
     if radius <= 0:
         return list(boxes)
     output = list(boxes)
-    for index in range(1, len(boxes) - 1):
+    for index in range(len(boxes)):
         run_start = index
         while (
             run_start > 0
@@ -836,8 +836,6 @@ def _median_smooth_geometry(
             and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
         ):
             run_end += 1
-        if index in {run_start, run_end}:
-            continue
         low = max(run_start, index - radius)
         high = min(run_end, index + radius)
         window = boxes[low : high + 1]
@@ -845,6 +843,174 @@ def _median_smooth_geometry(
             _median_value(tuple(box[component] for box in window))
             for component in range(4)
         )  # type: ignore[assignment]
+    return output
+
+
+def _stabilize_subject_relative_face_track(
+    *,
+    frame_indices: Sequence[int],
+    face_boxes: Sequence[tuple[float, float, float, float] | None],
+    subject_boxes: Sequence[tuple[float, float, float, float] | None],
+    frame_count: int,
+    config: DirectMemberEditorialMotionConfig,
+) -> list[tuple[float, float, float, float] | None]:
+    """Keep the boundary-anchored, temporally continuous face path.
+
+    Official portrait fancams are authenticated as target-member sources, but
+    YuNet can still prefer a second member for a few frames.  The real edit
+    boundary is independently decoded and audited before this function runs,
+    so a transformed run touching frame zero or the final frame has a trusted
+    temporal anchor.  We retain only detections connected to that anchor in
+    subject-relative coordinates.  A skipped excursion is subsequently
+    reconstructed only within the configured gap limit; a persistent switch
+    therefore still fails closed.
+    """
+
+    output = list(face_boxes)
+
+    def connected(left: int, right: int) -> bool:
+        left_box = output[left]
+        right_box = output[right]
+        left_subject = subject_boxes[left]
+        right_subject = subject_boxes[right]
+        if (
+            left_box is None
+            or right_box is None
+            or left_subject is None
+            or right_subject is None
+        ):
+            return False
+        left_relative = _relative_box(left_box, left_subject)
+        right_relative = _relative_box(right_box, right_subject)
+        if left_relative is None or right_relative is None:
+            return False
+        frame_gap = abs(frame_indices[right] - frame_indices[left])
+        if (
+            frame_gap <= 0
+            or frame_gap
+            > config.maximum_dense_face_interpolation_gap_frames + 1
+        ):
+            return False
+        center_distance = math.hypot(
+            left_relative[0] - right_relative[0],
+            left_relative[1] - right_relative[1],
+        )
+        maximum_center_distance = min(
+            0.30,
+            0.18 + 0.010 * max(0, frame_gap - 1),
+        )
+        height_ratio = max(left_relative[3], right_relative[3]) / max(
+            1e-9,
+            min(left_relative[3], right_relative[3]),
+        )
+        maximum_height_ratio = min(
+            1.80,
+            config.maximum_dense_height_ratio
+            + 0.025 * max(0, frame_gap - 1),
+        )
+        return (
+            center_distance <= maximum_center_distance + 1e-9
+            and height_ratio <= maximum_height_ratio + 1e-9
+        )
+
+    run_start = 0
+    while run_start < len(frame_indices):
+        run_end = run_start
+        while (
+            run_end + 1 < len(frame_indices)
+            and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
+        ):
+            run_end += 1
+        detections = [
+            index
+            for index in range(run_start, run_end + 1)
+            if output[index] is not None and subject_boxes[index] is not None
+        ]
+        if len(detections) < 3:
+            run_start = run_end + 1
+            continue
+        if frame_indices[run_start] == 0:
+            ordered = detections
+            anchored = True
+        elif frame_indices[run_end] == frame_count - 1:
+            ordered = list(reversed(detections))
+            anchored = True
+        else:
+            ordered = detections
+            anchored = False
+
+        scores = [float("-inf")] * len(ordered)
+        lengths = [0] * len(ordered)
+        predecessors: list[int | None] = [None] * len(ordered)
+        for position, current in enumerate(ordered):
+            if not anchored or position == 0:
+                scores[position] = 1.0
+                lengths[position] = 1
+            for previous_position in range(position):
+                if not math.isfinite(scores[previous_position]):
+                    continue
+                previous = ordered[previous_position]
+                if not connected(previous, current):
+                    continue
+                frame_gap = abs(
+                    frame_indices[current] - frame_indices[previous]
+                )
+                candidate_score = (
+                    scores[previous_position]
+                    + 1.0
+                    - 0.02 * max(0, frame_gap - 1)
+                )
+                candidate_length = lengths[previous_position] + 1
+                if (
+                    candidate_score > scores[position] + 1e-9
+                    or abs(candidate_score - scores[position]) <= 1e-9
+                    and candidate_length > lengths[position]
+                ):
+                    scores[position] = candidate_score
+                    lengths[position] = candidate_length
+                    predecessors[position] = previous_position
+
+        reachable = [
+            position
+            for position, score in enumerate(scores)
+            if math.isfinite(score)
+        ]
+        if not reachable:
+            run_start = run_end + 1
+            continue
+        if anchored:
+            # Coverage is primary: if the audited face cannot be connected
+            # across the run, the remaining edge gap is left for the strict
+            # reconstruction limit to reject.
+            endpoint = max(
+                reachable,
+                key=lambda position: (
+                    abs(
+                        frame_indices[ordered[position]]
+                        - frame_indices[ordered[0]]
+                    ),
+                    scores[position],
+                    lengths[position],
+                ),
+            )
+        else:
+            endpoint = max(
+                reachable,
+                key=lambda position: (
+                    scores[position],
+                    lengths[position],
+                    -frame_indices[ordered[position]],
+                ),
+            )
+        kept: set[int] = set()
+        cursor: int | None = endpoint
+        while cursor is not None:
+            kept.add(ordered[cursor])
+            cursor = predecessors[cursor]
+        for index in detections:
+            if index not in kept:
+                output[index] = None
+        run_start = run_end + 1
     return output
 
 
@@ -890,18 +1056,25 @@ def _reconstruct_dense_face_geometry(
             if anchor_subject is None or target_subject is None:
                 return anchor_box
             relative = _relative_box(anchor_box, anchor_subject)
-            if relative is not None:
-                uncertainty = min(0.12, abs(target - anchor) * 0.005)
-                relative = (
-                    relative[0],
-                    relative[1],
-                    relative[2] + uncertainty * 2.0,
-                    relative[3] + uncertainty * 2.0,
-                )
+            if relative is None:
+                return anchor_box
+            uncertainty = min(0.12, abs(target - anchor) * 0.005)
+            expanded_relative = (
+                relative[0],
+                relative[1],
+                relative[2] + uncertainty * 2.0,
+                relative[3] + uncertainty * 2.0,
+            )
+            # Expansion is deliberately conservative, but a face near the
+            # subject/frame edge can make only the uncertainty envelope leave
+            # bounds.  Preserve the unexpanded subject-relative projection in
+            # that case; if even that cannot be represented, retain the last
+            # verified absolute box.  The later output-crop review still
+            # rejects any unsafe camera transform.
             return (
-                _box_from_relative(relative, target_subject)
-                if relative is not None
-                else None
+                _box_from_relative(expanded_relative, target_subject)
+                or _box_from_relative(relative, target_subject)
+                or anchor_box
             )
 
         for index in range(run_start, first_anchor):
@@ -1086,6 +1259,16 @@ def _track_is_dense_face_safe(
             else "aggregate_human_silhouette"
         )
     if resolved_basis == _FACE_ATTENTION_BASIS:
+        if all(subject_box is not None for subject_box in subject_boxes):
+            subject_boxes = _median_smooth_geometry(
+                ordered_frames,
+                [
+                    subject_box
+                    for subject_box in subject_boxes
+                    if subject_box is not None
+                ],
+                radius=config.dense_geometry_median_radius_frames,
+            )
         for index, face_box in enumerate(face_boxes):
             subject_box = subject_boxes[index]
             if (
@@ -1094,6 +1277,13 @@ def _track_is_dense_face_safe(
                 and not _box_contains_center(subject_box, face_box)
             ):
                 face_boxes[index] = None
+        face_boxes = _stabilize_subject_relative_face_track(
+            frame_indices=ordered_frames,
+            face_boxes=face_boxes,
+            subject_boxes=subject_boxes,
+            frame_count=frame_count,
+            config=config,
+        )
         reconstructed = _reconstruct_dense_face_geometry(
             frame_indices=ordered_frames,
             face_boxes=face_boxes,
@@ -1126,7 +1316,10 @@ def _track_is_dense_face_safe(
     else:
         return reject("dense_alignment_geometry_basis_invalid")
 
-    if all(subject_box is not None for subject_box in subject_boxes):
+    if (
+        resolved_basis != _FACE_ATTENTION_BASIS
+        and all(subject_box is not None for subject_box in subject_boxes)
+    ):
         smoothed_subject_boxes = _median_smooth_geometry(
             ordered_frames,
             [
@@ -1617,6 +1810,14 @@ def build_direct_member_editorial_motion_plan(
                 max(maximum_candidate_zoom, repair.zoom),
             )
         qualifying: list[tuple[float, _State]] = []
+        required_improvement_fraction = (
+            min(settings.minimum_mismatch_improvement_fraction, 0.05)
+            if required
+            and baseline <= 0.10 + 1e-9
+            and center_distance <= 0.05 + 1e-9
+            and ratio <= 1.05 + 1e-9
+            else settings.minimum_mismatch_improvement_fraction
+        )
         zoom_values = [maximum_candidate_zoom]
         while zoom_values[-1] > 1.02 + 1e-9:
             next_zoom = max(1.02, zoom_values[-1] - 0.02)
@@ -1661,7 +1862,7 @@ def build_direct_member_editorial_motion_plan(
                 ):
                     continue
                 if transformed > baseline * (
-                    1.0 - settings.minimum_mismatch_improvement_fraction
+                    1.0 - required_improvement_fraction
                 ) + 1e-9:
                     continue
                 if transformed + 1e-4 < baseline:

@@ -203,6 +203,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(config.maximum_center_shift, 0.12)
         self.assertEqual(config.minimum_dense_face_visible_fraction, 0.98)
         self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.95)
+        self.assertEqual(config.maximum_dense_center_step, 0.12)
         self.assertEqual(
             config.minimum_face_associated_subject_visible_fraction,
             0.72,
@@ -451,6 +452,30 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             box = boxes[source]
             if source == 0 and 7.49 <= time_seconds <= 7.51:
                 box = (0.56, 0.225, 0.20, 0.55)
+            return self._sample(box, subject_box=subject_box)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=geometry,
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.boundary_match_count, 1)
+        self.assertIsNotNone(plan.track_for(0))
+
+    def test_multi_frame_face_switch_returns_to_boundary_anchored_track(
+        self,
+    ) -> None:
+        selection, renders, boxes = self._basic_inputs()
+        subject_box = (0.20, 0.08, 0.60, 0.84)
+
+        def geometry(source: int, time_seconds: float):
+            box = boxes[source]
+            if source == 0 and 7.40 <= time_seconds <= 7.60:
+                box = (0.61, 0.225, 0.18, 0.55)
             return self._sample(box, subject_box=subject_box)
 
         plan = build_direct_member_editorial_motion_plan(

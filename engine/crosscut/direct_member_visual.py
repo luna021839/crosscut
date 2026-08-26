@@ -184,7 +184,7 @@ class DirectMemberVisualConfig:
     transform_repair_legacy_face_only_maximum_zoom: float = 1.12
     transform_repair_legacy_face_only_maximum_center_shift: float = 0.025
     transform_repair_minimum_subject_confidence: float = 0.30
-    transform_repair_minimum_subject_visible_fraction: float = 0.980
+    transform_repair_minimum_subject_visible_fraction: float = 0.950
     transform_alignment_position_trigger: float = 0.08
     transform_alignment_scale_trigger: float = 0.06
     transform_body_alignment_position_trigger: float = 0.12
