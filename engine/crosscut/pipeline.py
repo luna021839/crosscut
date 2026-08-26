@@ -347,6 +347,8 @@ _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS = 1.8
 _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 19.3
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE = 18.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE = 2.0
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUT_FRACTION = 0.30
+_DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUTS_PER_MINUTE = 5.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS = 8.0
 _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT = 4
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT = 64
@@ -6248,6 +6250,17 @@ def _direct_member_highlight_cadence_payload(
     highlight_cut_indices = tuple(
         index for index in applied_cut_indices if index in highlight_boundary_set
     )
+    highlight_moving_cut_indices = tuple(
+        index
+        for index in highlight_cut_indices
+        if (
+            visual_selection.boundaries[index].mismatch.motion_connection
+            is not None
+            and visual_selection.boundaries[
+                index
+            ].mismatch.motion_connection.both_moving
+        )
+    )
     non_highlight_cut_indices = tuple(
         index for index in applied_cut_indices if index not in highlight_boundary_set
     )
@@ -6264,6 +6277,16 @@ def _direct_member_highlight_cadence_payload(
     non_highlight_switches_per_minute = (
         len(non_highlight_cut_indices) * 60.0 / non_highlight_duration
         if non_highlight_duration > 1e-9
+        else 0.0
+    )
+    highlight_moving_cuts_per_minute = (
+        len(highlight_moving_cut_indices) * 60.0 / highlight_duration
+        if highlight_duration > 1e-9
+        else 0.0
+    )
+    highlight_moving_cut_fraction = (
+        len(highlight_moving_cut_indices) / len(highlight_cut_indices)
+        if highlight_cut_indices
         else 0.0
     )
 
@@ -6333,6 +6356,20 @@ def _direct_member_highlight_cadence_payload(
             failure_reasons.append(
                 "compensated_highlight_hold_budget_exceeded"
             )
+        if (
+            highlight_moving_cut_fraction + 1e-9
+            < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUT_FRACTION
+        ):
+            failure_reasons.append(
+                "highlight_moving_cut_fraction_below_minimum"
+            )
+        if (
+            highlight_moving_cuts_per_minute + 1e-9
+            < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUTS_PER_MINUTE
+        ):
+            failure_reasons.append(
+                "highlight_moving_cut_density_below_minimum"
+            )
     return {
         "contract": "human_like_section_aware_member_cut_density_v1",
         "audit_required": audit_required,
@@ -6343,6 +6380,12 @@ def _direct_member_highlight_cadence_payload(
         "non_highlight_duration_seconds": non_highlight_duration,
         "planned_highlight_boundary_count": len(highlight_boundary_indices),
         "actual_highlight_cut_count": len(highlight_cut_indices),
+        "actual_highlight_moving_cut_count": len(
+            highlight_moving_cut_indices
+        ),
+        "highlight_moving_cut_boundary_indices": list(
+            highlight_moving_cut_indices
+        ),
         "actual_non_highlight_cut_count": len(non_highlight_cut_indices),
         "highlight_no_cut_hold_count": len(highlight_hold_indices),
         "highlight_no_cut_hold_boundary_indices": list(highlight_hold_indices),
@@ -6360,11 +6403,21 @@ def _direct_member_highlight_cadence_payload(
             highlight_switches_per_minute
             - non_highlight_switches_per_minute
         ),
+        "highlight_moving_cuts_per_minute": (
+            highlight_moving_cuts_per_minute
+        ),
+        "highlight_moving_cut_fraction": highlight_moving_cut_fraction,
         "minimum_highlight_source_switches_per_minute": (
             _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
         ),
         "minimum_density_lift_per_minute": (
             _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE
+        ),
+        "minimum_highlight_moving_cut_fraction": (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUT_FRACTION
+        ),
+        "minimum_highlight_moving_cuts_per_minute": (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUTS_PER_MINUTE
         ),
         "target_highlight_run_seconds": [1.8, 2.6],
         "highlight_cut_gap_median_seconds": (

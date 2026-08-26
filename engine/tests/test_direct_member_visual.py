@@ -981,6 +981,7 @@ class DirectMemberVisualTests(unittest.TestCase):
             canonical_spans=((0.0, 1.0), (1.0, 2.0)),
             audio_offsets=(0.0, 0.0),
             preferred_source_order=(1, 0),
+            priority_cut_boundary_indices=(0,),
             config=DirectMemberVisualConfig(
                 sample_frame_step_seconds=0.1,
                 beam_width=200,
@@ -998,6 +999,11 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertTrue(evidence.timestamp_bound_adjacent)
         self.assertTrue(evidence.both_moving)
         self.assertGreater(evidence.soft_preference_applied, 0.0)
+        self.assertGreater(
+            selection.boundaries[0].mismatch.
+            priority_motion_preference_applied,
+            0.0,
+        )
         self.assertIsNotNone(evidence.direction_cosine_audit_only)
         self.assertGreater(
             float(evidence.direction_cosine_audit_only),
@@ -1015,6 +1021,12 @@ class DirectMemberVisualTests(unittest.TestCase):
         )
         payload = selection.to_dict()
         motion = payload["boundaries"][0]["mismatch"]["motion_connection"]
+        self.assertGreater(
+            payload["boundaries"][0]["mismatch"][
+                "priority_motion_preference_applied"
+            ],
+            0.0,
+        )
         self.assertTrue(
             motion["direction_cosine_influenced_gate_or_bonus"]
         )

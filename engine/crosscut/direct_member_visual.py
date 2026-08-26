@@ -110,6 +110,7 @@ class DirectMemberVisualConfig:
     minimum_adjacent_motion_magnitude: float = 0.020
     minimum_temporal_motion_component_count: int = 2
     motion_connection_preference_weight: float = 0.22
+    priority_motion_connection_preference_weight: float = 0.18
     minimum_motion_direction_cosine: float = 0.12
     maximum_motion_speed_ratio_mismatch: float = 0.60
     maximum_pose_phase_continuation_mismatch: float = 0.34
@@ -204,6 +205,7 @@ class DirectMemberVisualConfig:
             self.maximum_same_source_run_seconds,
             self.minimum_adjacent_motion_magnitude,
             self.motion_connection_preference_weight,
+            self.priority_motion_connection_preference_weight,
             self.minimum_motion_direction_cosine,
             self.maximum_motion_speed_ratio_mismatch,
             self.maximum_pose_phase_continuation_mismatch,
@@ -417,6 +419,7 @@ class DirectMemberVisualConfig:
             self.foreground_obstruction_rejection_score,
             self.minimum_adjacent_motion_magnitude,
             self.motion_connection_preference_weight,
+            self.priority_motion_connection_preference_weight,
             self.minimum_motion_direction_cosine,
             self.maximum_motion_speed_ratio_mismatch,
             self.maximum_pose_phase_continuation_mismatch,
@@ -596,6 +599,9 @@ class DirectMemberVisualConfig:
                 ),
                 "soft_preference_weight": (
                     self.motion_connection_preference_weight
+                ),
+                "priority_boundary_additional_preference_weight": (
+                    self.priority_motion_connection_preference_weight
                 ),
                 "minimum_direction_cosine": (
                     self.minimum_motion_direction_cosine
@@ -1133,6 +1139,7 @@ class DirectBoundaryMismatch:
     boundary_search_offset_seconds: float = 0.0
     boundary_search_offset_penalty: float = 0.0
     boundary_search_candidate_count: int = 1
+    priority_motion_preference_applied: float = 0.0
 
     def components(self) -> dict[str, float | None]:
         return {
@@ -1179,6 +1186,9 @@ class DirectBoundaryMismatch:
                 "candidate_count": self.boundary_search_candidate_count,
                 "cost_includes_offset_penalty": True,
             },
+            "priority_motion_preference_applied": (
+                self.priority_motion_preference_applied
+            ),
         }
 
 
@@ -1263,6 +1273,7 @@ def _scored_boundary_search_mismatch(
     outgoing_source_index: int,
     incoming_source_index: int,
     candidate_count: int,
+    priority_boundary: bool,
     config: DirectMemberVisualConfig,
 ) -> DirectBoundaryMismatch:
     mismatch = candidate.matrix[outgoing_source_index][incoming_source_index]
@@ -1270,15 +1281,35 @@ def _scored_boundary_search_mismatch(
         abs(candidate.offset_frames)
         * config.boundary_search_offset_penalty_per_frame
     )
+    motion = mismatch.motion_connection
+    priority_motion_preference = 0.0
+    if (
+        priority_boundary
+        and outgoing_source_index != incoming_source_index
+        and motion is not None
+        and motion.both_moving
+        and motion.soft_preference_applied > 0.0
+        and config.motion_connection_preference_weight > 1e-12
+    ):
+        normalized_motion_quality = min(
+            1.0,
+            motion.soft_preference_applied
+            / config.motion_connection_preference_weight,
+        )
+        priority_motion_preference = (
+            config.priority_motion_connection_preference_weight
+            * normalized_motion_quality
+        )
     return replace(
         mismatch,
-        cost=mismatch.cost + penalty,
+        cost=mismatch.cost + penalty - priority_motion_preference,
         boundary_search_offset_frames=candidate.offset_frames,
         boundary_search_offset_seconds=(
             candidate.offset_frames * config.sample_frame_step_seconds
         ),
         boundary_search_offset_penalty=penalty,
         boundary_search_candidate_count=candidate_count,
+        priority_motion_preference_applied=priority_motion_preference,
     )
 
 
@@ -1287,6 +1318,7 @@ def _best_boundary_search_edge(
     *,
     outgoing_source_index: int,
     incoming_source_index: int,
+    priority_boundary: bool,
     config: DirectMemberVisualConfig,
 ) -> tuple[_DirectBoundarySearchCandidate, DirectBoundaryMismatch]:
     if not candidates:
@@ -1300,6 +1332,7 @@ def _best_boundary_search_edge(
                 outgoing_source_index=outgoing_source_index,
                 incoming_source_index=incoming_source_index,
                 candidate_count=candidate_count,
+                priority_boundary=priority_boundary,
                 config=config,
             ),
         )
@@ -1347,6 +1380,7 @@ def _joint_boundary_search_assignment(
     source_duration_minimums: Sequence[float],
     source_duration_maximums: Sequence[float],
     usage_policy: str,
+    priority_boundary_indices: frozenset[int],
     config: DirectMemberVisualConfig,
 ) -> tuple[
     tuple[_DirectBoundarySearchCandidate, ...],
@@ -1385,6 +1419,9 @@ def _joint_boundary_search_assignment(
                     outgoing_source_index=left,
                     incoming_source_index=right,
                     candidate_count=candidate_count,
+                    priority_boundary=(
+                        boundary_index in priority_boundary_indices
+                    ),
                     config=config,
                 ),
             )
@@ -2089,6 +2126,17 @@ class DirectMemberVisualSelection:
                         evidence.soft_preference_applied
                         for evidence in motion_evidence
                     ]
+                ),
+                "priority_motion_preference": _distribution(
+                    [
+                        boundary.mismatch.priority_motion_preference_applied
+                        for boundary in self.boundaries
+                        if boundary.cut_applied
+                    ]
+                ),
+                "priority_motion_preference_applied_boundary_count": sum(
+                    boundary.mismatch.priority_motion_preference_applied > 0.0
+                    for boundary in self.boundaries
                 ),
                 "direction_cosine": _distribution(
                     [
@@ -9107,6 +9155,9 @@ def select_balanced_direct_member_sources(
                             candidate_tuple,
                             outgoing_source_index=left_index,
                             incoming_source_index=right_index,
+                            priority_boundary=(
+                                boundary_index in priority_boundaries
+                            ),
                             config=resolved_config,
                         )[1]
                         for right_index in range(source_count)
@@ -9545,6 +9596,7 @@ def select_balanced_direct_member_sources(
         source_duration_minimums=joint_duration_minimums,
         source_duration_maximums=joint_duration_maximums,
         usage_policy=usage_policy,
+        priority_boundary_indices=frozenset(priority_boundaries),
         config=resolved_config,
     )
     selected_boundary_master_seconds = tuple(
