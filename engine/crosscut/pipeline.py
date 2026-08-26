@@ -6161,13 +6161,6 @@ def _direct_full_frame_proof_directed_repair_profiles(
     proof frontier.  Every returned child is fully reselected by the caller.
     """
 
-    if len(parent.boundary_shifts) >= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT:
-        return _direct_full_frame_visual_frontier_split_child_profiles(
-            timing_segments,
-            parent,
-            diagnostics,
-            config=config,
-        )
     children = _direct_full_frame_proof_directed_child_profiles(
         timing_segments,
         parent,

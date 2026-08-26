@@ -12,6 +12,7 @@ from crosscut.pipeline import (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
     _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
+    _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT,
     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
     _DirectFullFrameBoundaryShift,
     _DirectFullFramePartitionProfile,
@@ -22,6 +23,7 @@ from crosscut.pipeline import (
     _direct_counterfactual_secondary_signature_action,
     _direct_full_frame_proof_directed_child_profiles,
     _direct_full_frame_proof_directed_merge_profiles,
+    _direct_full_frame_proof_directed_repair_profiles,
     _direct_full_frame_spans_from_partition,
     _direct_full_frame_visual_frontier_split_child_profiles,
     _direct_member_failure_report_fallback_payload,
@@ -403,6 +405,42 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             _direct_partition_current_shifted_boundary_indices(third_child),
             (7,),
         )
+
+        shift_saturated_second_child = _DirectFullFramePartitionProfile(
+            profile_id=second_child.profile_id,
+            unit_counts=second_child.unit_counts,
+            spans=second_child.spans,
+            boundary_shifts=tuple(
+                _recorded_shift(second_child, boundary_index=boundary_index)
+                for boundary_index in (0, 1, 2, 3, 4, 5, 8)
+            ),
+            visual_frontier_splits=second_child.visual_frontier_splits,
+            boundary_merges=second_child.boundary_merges,
+            latest_operation_kind="boundary_shift",
+        )
+        self.assertEqual(
+            len(shift_saturated_second_child.boundary_shifts),
+            _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT,
+        )
+        repair_children = _direct_full_frame_proof_directed_repair_profiles(
+            segments,
+            shift_saturated_second_child,
+            _zero_boundary_diagnostics(
+                span_count=len(shift_saturated_second_child.unit_counts),
+                boundary_index=6,
+            ),
+            config=DirectMemberVisualConfig(),
+        )
+        self.assertEqual(len(repair_children), 1)
+        self.assertEqual(
+            repair_children[0].unit_counts,
+            third_child.unit_counts,
+        )
+        self.assertEqual(
+            repair_children[0].latest_operation_kind,
+            "boundary_merge",
+        )
+        self.assertEqual(len(repair_children[0].boundary_merges), 3)
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
         self.assertEqual(
