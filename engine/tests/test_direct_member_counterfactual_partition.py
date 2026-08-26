@@ -23,6 +23,7 @@ from crosscut.pipeline import (
     _direct_full_frame_proof_directed_child_profiles,
     _direct_full_frame_proof_directed_merge_profiles,
     _direct_full_frame_proof_directed_repair_profiles,
+    _direct_full_frame_proof_directed_window_profiles,
     _direct_full_frame_spans_from_partition,
     _direct_full_frame_visual_frontier_split_child_profiles,
     _direct_member_failure_report_fallback_payload,
@@ -587,6 +588,113 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
                 == "proven_forward_connectivity_frontier_exhaustion"
                 for child in children
             )
+        )
+
+    def test_global_frontier_redistributes_both_cuts_in_three_span_window(
+        self,
+    ) -> None:
+        segments = _professional_timing_segments(34)
+        unit_counts = (5, 3, 4, 4, 4, 4, 4, 4, 2)
+        bare_parent = _DirectFullFramePartitionProfile(
+            profile_id="three-span-frontier",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        parent = _DirectFullFramePartitionProfile(
+            profile_id=bare_parent.profile_id,
+            unit_counts=bare_parent.unit_counts,
+            spans=bare_parent.spans,
+            boundary_shifts=(
+                _recorded_shift(bare_parent, boundary_index=0),
+            ),
+            latest_operation_kind="boundary_shift",
+        )
+
+        children = _direct_full_frame_proof_directed_window_profiles(
+            segments,
+            parent,
+            _forward_frontier_diagnostics(
+                span_count=len(parent.unit_counts),
+                boundary_index=0,
+            ),
+        )
+
+        self.assertEqual(len(children), 20)
+        self.assertIn(
+            (3, 4, 5),
+            {
+                child.unit_counts[:3]
+                for child in children
+            },
+        )
+        for child in children:
+            self.assertEqual(sum(child.unit_counts[:3]), 12)
+            self.assertNotEqual(child.unit_counts[0], 5)
+            self.assertNotEqual(sum(child.unit_counts[:2]), 8)
+            self.assertEqual(len(child.window_redistributions), 1)
+            self.assertEqual(
+                child.latest_operation_kind,
+                "window_redistribution",
+            )
+            self.assertEqual(
+                child.proof_directed_boundary_motion_count,
+                3,
+            )
+            redistribution = child.window_redistributions[0]
+            self.assertEqual(redistribution.original_unit_counts, (5, 3, 4))
+            self.assertEqual(
+                redistribution.replacement_unit_counts,
+                child.unit_counts[:3],
+            )
+            self.assertTrue(
+                redistribution.to_dict()["safety_contract"][
+                    "full_selector_recheck_required"
+                ]
+            )
+
+    def test_repair_uses_three_span_window_before_visual_split(self) -> None:
+        segments = _professional_timing_segments(34)
+        unit_counts = (5, 3, 4, 4, 4, 4, 4, 4, 2)
+        bare_parent = _DirectFullFramePartitionProfile(
+            profile_id="window-before-visual-split",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        parent = _DirectFullFramePartitionProfile(
+            profile_id=bare_parent.profile_id,
+            unit_counts=bare_parent.unit_counts,
+            spans=bare_parent.spans,
+            boundary_shifts=(
+                _recorded_shift(bare_parent, boundary_index=0),
+            ),
+            latest_operation_kind="boundary_shift",
+        )
+
+        children = _direct_full_frame_proof_directed_repair_profiles(
+            segments,
+            parent,
+            _forward_frontier_diagnostics(
+                span_count=len(parent.unit_counts),
+                boundary_index=0,
+            ),
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertTrue(children)
+        self.assertTrue(
+            all(
+                child.latest_operation_kind == "window_redistribution"
+                for child in children
+            )
+        )
+        self.assertTrue(
+            all(not child.visual_frontier_splits for child in children)
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:

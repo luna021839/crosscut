@@ -3763,6 +3763,96 @@ class _DirectFullFrameBoundaryShift:
 
 
 @dataclass(frozen=True, slots=True)
+class _DirectFullFrameProofDirectedWindowRedistribution:
+    """Move two cuts in one three-span window around a proven frontier."""
+
+    window_start_span_index: int
+    proof_frontier_boundary_index: int
+    proof_frontier_offset_in_window: int
+    original_unit_counts: tuple[int, int, int]
+    replacement_unit_counts: tuple[int, int, int]
+    original_boundary_master_seconds: tuple[float, float]
+    replacement_boundary_master_seconds: tuple[float, float]
+    replacement_boundary_reasons: tuple[tuple[str, ...], tuple[str, ...]]
+    trigger: str
+    parent_profile_id: str
+    parent_partition_signature_sha256: str
+    proof_failure: str | None
+    proof_failed_segment_index: int | None
+    proof_forward_reachable_left_source_indices: tuple[int, ...]
+    proof_left_valid_source_indices: tuple[int, ...]
+    proof_right_valid_source_indices: tuple[int, ...]
+    proof_local_nonsevere_edge_count: int
+
+    @property
+    def boundary_displacement_units(self) -> int:
+        old_first, old_second, _old_third = self.original_unit_counts
+        new_first, new_second, _new_third = self.replacement_unit_counts
+        return abs(new_first - old_first) + abs(
+            (new_first + new_second) - (old_first + old_second)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "window_start_span_index": self.window_start_span_index,
+            "moved_boundary_indices": [
+                self.window_start_span_index,
+                self.window_start_span_index + 1,
+            ],
+            "proof_frontier_boundary_index": (
+                self.proof_frontier_boundary_index
+            ),
+            "proof_frontier_offset_in_window": (
+                self.proof_frontier_offset_in_window
+            ),
+            "original_unit_counts": list(self.original_unit_counts),
+            "replacement_unit_counts": list(self.replacement_unit_counts),
+            "original_boundary_master_seconds": list(
+                self.original_boundary_master_seconds
+            ),
+            "replacement_boundary_master_seconds": list(
+                self.replacement_boundary_master_seconds
+            ),
+            "replacement_boundary_reasons": [
+                list(reasons) for reasons in self.replacement_boundary_reasons
+            ],
+            "boundary_displacement_units": self.boundary_displacement_units,
+            "trigger": self.trigger,
+            "parent_profile_id": self.parent_profile_id,
+            "parent_partition_signature_sha256": (
+                self.parent_partition_signature_sha256
+            ),
+            "proof": {
+                "failure": self.proof_failure,
+                "failed_segment_index": self.proof_failed_segment_index,
+                "forward_reachable_left_source_indices": list(
+                    self.proof_forward_reachable_left_source_indices
+                ),
+                "left_valid_source_indices": list(
+                    self.proof_left_valid_source_indices
+                ),
+                "right_valid_source_indices": list(
+                    self.proof_right_valid_source_indices
+                ),
+                "local_nonsevere_cross_source_edge_count": (
+                    self.proof_local_nonsevere_edge_count
+                ),
+                "constraint_infeasibility_proven": True,
+            },
+            "safety_contract": {
+                "window_total_duration_preserved": True,
+                "cut_count_preserved": True,
+                "existing_timing_boundaries_only": True,
+                "visual_thresholds_relaxed": False,
+                "all_three_spans_content_validity_recomputed": True,
+                "all_three_spans_native_scene_cut_gate_recomputed": True,
+                "balanced_source_quotas_recomputed": True,
+                "full_selector_recheck_required": True,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _DirectFullFrameVisualFrontierSplit:
     """One proof-bound added cut on an existing musical/action boundary."""
 
@@ -3896,6 +3986,10 @@ class _DirectFullFramePartitionProfile:
     unit_counts: tuple[int, ...]
     spans: tuple[_DirectFullFrameSpan, ...]
     boundary_shifts: tuple[_DirectFullFrameBoundaryShift, ...] = ()
+    window_redistributions: tuple[
+        _DirectFullFrameProofDirectedWindowRedistribution,
+        ...,
+    ] = ()
     visual_frontier_splits: tuple[
         _DirectFullFrameVisualFrontierSplit,
         ...,
@@ -3962,6 +4056,11 @@ class _DirectFullFramePartitionProfile:
             "boundary_shift": (
                 self.boundary_shifts[-1] if self.boundary_shifts else None
             ),
+            "window_redistribution": (
+                self.window_redistributions[-1]
+                if self.window_redistributions
+                else None
+            ),
             "visual_frontier_split": (
                 self.visual_frontier_splits[-1]
                 if self.visual_frontier_splits
@@ -4001,6 +4100,13 @@ class _DirectFullFramePartitionProfile:
         changed_indices: set[int] = set()
         for shift in self.boundary_shifts:
             changed_indices.update((shift.boundary_index, shift.boundary_index + 1))
+        for redistribution in self.window_redistributions:
+            changed_indices.update(
+                range(
+                    redistribution.window_start_span_index,
+                    redistribution.window_start_span_index + 3,
+                )
+            )
         for split in self.visual_frontier_splits:
             changed_indices.update(
                 (split.parent_span_index, split.parent_span_index + 1)
@@ -4015,8 +4121,24 @@ class _DirectFullFramePartitionProfile:
     def structural_change_count(self) -> int:
         return (
             len(self.boundary_shifts)
+            + 2 * len(self.window_redistributions)
             + len(self.visual_frontier_splits)
             + len(self.boundary_merges)
+        )
+
+    @property
+    def proof_directed_boundary_motion_count(self) -> int:
+        return len(self.boundary_shifts) + 2 * len(
+            self.window_redistributions
+        )
+
+    @property
+    def total_unit_displacement(self) -> int:
+        return sum(
+            abs(shift.shift_units) for shift in self.boundary_shifts
+        ) + sum(
+            redistribution.boundary_displacement_units
+            for redistribution in self.window_redistributions
         )
 
     @property
@@ -4034,6 +4156,11 @@ class _DirectFullFramePartitionProfile:
         penalties = [
             _penalty(shift.boundary_reasons) for shift in self.boundary_shifts
         ]
+        penalties.extend(
+            _penalty(reasons)
+            for redistribution in self.window_redistributions
+            for reasons in redistribution.replacement_boundary_reasons
+        )
         penalties.extend(
             _penalty(split.boundary_reasons)
             for split in self.visual_frontier_splits
@@ -4060,6 +4187,13 @@ class _DirectFullFramePartitionProfile:
             "boundary_shift_units": self.boundary_shift_units,
             "changed_span_count": self.changed_span_count,
             "shifted_boundary_count": len(self.boundary_shifts),
+            "window_redistribution_count": len(
+                self.window_redistributions
+            ),
+            "proof_directed_boundary_motion_count": (
+                self.proof_directed_boundary_motion_count
+            ),
+            "total_unit_displacement": self.total_unit_displacement,
             "visual_frontier_split_count": len(self.visual_frontier_splits),
             "proof_directed_boundary_merge_count": len(
                 self.boundary_merges
@@ -4080,6 +4214,10 @@ class _DirectFullFramePartitionProfile:
             "latest_operation_kind": self.latest_operation_kind,
             "proof_directed_boundary_shifts": [
                 shift.to_dict() for shift in self.boundary_shifts
+            ],
+            "proof_directed_window_redistributions": [
+                redistribution.to_dict()
+                for redistribution in self.window_redistributions
             ],
             "proof_directed_visual_frontier_splits": [
                 split.to_dict() for split in self.visual_frontier_splits
@@ -4817,18 +4955,30 @@ def _direct_partition_current_boundary_index_at_time(
 def _direct_partition_current_shifted_boundary_indices(
     profile: _DirectFullFramePartitionProfile,
 ) -> tuple[int, ...]:
-    """Map surviving shifted cuts after any index-changing merge."""
+    """Map every surviving moved cut after any index-changing merge."""
 
     return tuple(
         sorted(
             {
                 boundary_index
-                for shift in profile.boundary_shifts
+                for canonical_master_seconds in (
+                    tuple(
+                        shift.canonical_master_seconds
+                        for shift in profile.boundary_shifts
+                    )
+                    + tuple(
+                        boundary_seconds
+                        for redistribution in profile.window_redistributions
+                        for boundary_seconds in (
+                            redistribution.replacement_boundary_master_seconds
+                        )
+                    )
+                )
                 if (
                     boundary_index
                     := _direct_partition_current_boundary_index_at_time(
                         profile,
-                        shift.canonical_master_seconds,
+                        canonical_master_seconds,
                     )
                 )
                 is not None
@@ -4867,16 +5017,17 @@ def _direct_partition_proof_directed_boundary_merge_limit(
 def _direct_partition_proof_directed_boundary_shift_limit(
     profile: _DirectFullFramePartitionProfile,
 ) -> int:
-    """Grant one compensating proof-directed shift per admitted merge.
+    """Grant one compensating proof-directed cut motion per admitted merge.
 
     The base seven-shift bound limits ordinary search branching.  A merge is
     different: it removes the proved cut and can expose either neighbouring
     cut as the next exact connectivity frontier.  Keeping the old fixed bound
     after such a merge made a saturated lineage jump directly to another
     merge or a visual split even when a cadence-preserving boundary shift was
-    still available.  One additional shift per independently admitted merge
-    covers that newly exposed local frontier without relaxing any visual or
-    cadence gate.  The number of surviving cuts remains an absolute bound.
+    still available.  One additional moved-cut slot per independently admitted
+    merge covers that newly exposed local frontier without relaxing any visual
+    or cadence gate.  A three-span redistribution consumes two slots.  The
+    number of surviving cuts remains an absolute bound.
     """
 
     return min(
@@ -4937,7 +5088,16 @@ def _direct_partition_future_operation_state_key(
         used_boundaries,
         last_boundary,
         _direct_partition_proof_directed_boundary_shift_limit(parent)
-        - len(parent.boundary_shifts),
+        - parent.proof_directed_boundary_motion_count,
+        tuple(
+            (
+                redistribution.window_start_span_index,
+                redistribution.proof_frontier_boundary_index,
+                redistribution.original_unit_counts,
+                redistribution.replacement_unit_counts,
+            )
+            for redistribution in parent.window_redistributions
+        ),
         tuple(
             (
                 split.parent_span_index,
@@ -5085,6 +5245,9 @@ def _direct_full_frame_shifted_partition_profiles(
                     unit_counts=signature,
                     spans=spans,
                     boundary_shifts=base.boundary_shifts + (shift,),
+                    window_redistributions=base.window_redistributions,
+                    visual_frontier_splits=base.visual_frontier_splits,
+                    boundary_merges=base.boundary_merges,
                     latest_operation_kind="boundary_shift",
                 )
             )
@@ -5170,7 +5333,7 @@ def _direct_full_frame_proof_directed_child_profiles(
     """
 
     if (
-        len(parent.boundary_shifts)
+        parent.proof_directed_boundary_motion_count
         >= _direct_partition_proof_directed_boundary_shift_limit(parent)
     ):
         return ()
@@ -5291,7 +5454,9 @@ def _direct_full_frame_proof_directed_child_profiles(
             )
             profile_id = (
                 f"boundary-{boundary_index}-{left_count}-plus-{right_count}"
-                if not parent.boundary_shifts and not parent.boundary_merges
+                if not parent.boundary_shifts
+                and not parent.window_redistributions
+                and not parent.boundary_merges
                 else (
                     f"{parent.profile_id}__{label}-{boundary_index}-"
                     f"{left_count}-plus-{right_count}"
@@ -5303,6 +5468,7 @@ def _direct_full_frame_proof_directed_child_profiles(
                     unit_counts=signature,
                     spans=spans,
                     boundary_shifts=parent.boundary_shifts + (shift,),
+                    window_redistributions=parent.window_redistributions,
                     visual_frontier_splits=parent.visual_frontier_splits,
                     boundary_merges=parent.boundary_merges,
                     latest_operation_kind="boundary_shift",
@@ -5401,6 +5567,7 @@ def _direct_full_frame_proof_directed_merge_profiles(
                 profile_id=(
                     f"boundary-{boundary_index}-merge-{merged_count}"
                     if not parent.boundary_shifts
+                    and not parent.window_redistributions
                     and not parent.boundary_merges
                     else (
                         f"{parent.profile_id}__merge-{boundary_index}-"
@@ -5410,11 +5577,226 @@ def _direct_full_frame_proof_directed_merge_profiles(
                 unit_counts=signature,
                 spans=spans,
                 boundary_shifts=parent.boundary_shifts,
+                window_redistributions=parent.window_redistributions,
                 visual_frontier_splits=parent.visual_frontier_splits,
                 boundary_merges=parent.boundary_merges + (merge,),
                 latest_operation_kind="boundary_merge",
             )
         )
+    return tuple(profiles)
+
+
+def _direct_full_frame_proof_directed_window_profiles(
+    timing_segments: Sequence[DraftSegment],
+    parent: _DirectFullFramePartitionProfile,
+    diagnostics: dict[str, Any],
+) -> tuple[_DirectFullFramePartitionProfile, ...]:
+    """Redistribute two cuts across three spans around an exact frontier.
+
+    This operator is reached only after every cadence-valid placement inside
+    the proved two-span window has been fully selected and rejected.  It keeps
+    the surrounding three-span range and both cut counts fixed, moves the
+    proved cut plus one previously untouched adjacent cut, and enumerates only
+    existing timing-unit boundaries.  Every child is materialized through the
+    ordinary duration/cadence gates here and the complete visual selector in
+    the caller; no severe edge or visual threshold is relaxed.
+    """
+
+    if (
+        parent.visual_frontier_splits
+        or parent.proof_directed_boundary_motion_count + 2
+        > _direct_partition_proof_directed_boundary_shift_limit(parent)
+    ):
+        return ()
+    proofs = tuple(
+        proof
+        for proof in _direct_partition_exact_shift_proofs(
+            diagnostics,
+            span_count=len(parent.spans),
+        )
+        if proof.trigger
+        == "proven_forward_connectivity_frontier_exhaustion"
+    )
+    if not proofs:
+        return ()
+
+    items = tuple(timing_segments)
+    used_moved_boundaries = set(
+        _direct_partition_current_shifted_boundary_indices(parent)
+    )
+    seen_signatures: set[tuple[int, ...]] = set()
+    profiles: list[_DirectFullFramePartitionProfile] = []
+    for proof in proofs:
+        frontier = proof.boundary_index
+        window_starts = tuple(
+            start
+            for start in (frontier, frontier - 1)
+            if 0 <= start and start + 2 < len(parent.unit_counts)
+        )
+        for window_start in window_starts:
+            adjacent_boundary_index = (
+                window_start + 1
+                if frontier == window_start
+                else window_start
+            )
+            if adjacent_boundary_index in used_moved_boundaries:
+                continue
+            original = tuple(
+                int(value)
+                for value in parent.unit_counts[
+                    window_start : window_start + 3
+                ]
+            )
+            if len(original) != 3:
+                continue
+            original_first_boundary_units = original[0]
+            original_second_boundary_units = original[0] + original[1]
+            total_units = sum(original)
+            for first_count in range(1, total_units - 1):
+                for second_count in range(1, total_units - first_count):
+                    third_count = total_units - first_count - second_count
+                    replacement = (
+                        first_count,
+                        second_count,
+                        third_count,
+                    )
+                    if replacement == original:
+                        continue
+                    if (
+                        first_count == original_first_boundary_units
+                        or first_count + second_count
+                        == original_second_boundary_units
+                    ):
+                        # A three-span repair must move both cuts.  Single-cut
+                        # placements were exhausted by the preceding operator.
+                        continue
+                    counts = list(parent.unit_counts)
+                    counts[window_start : window_start + 3] = replacement
+                    signature = tuple(counts)
+                    if signature in seen_signatures:
+                        continue
+                    try:
+                        spans = _direct_full_frame_spans_from_partition(
+                            items,
+                            signature,
+                        )
+                    except ValueError:
+                        continue
+                    if (
+                        min(
+                            span.duration_seconds
+                            for span in spans[
+                                window_start : window_start + 3
+                            ]
+                        )
+                        + 1e-9
+                        < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+                    ):
+                        continue
+                    duration = sum(span.duration_seconds for span in spans)
+                    switches_per_minute = (len(spans) - 1) * 60.0 / duration
+                    span_median = median(
+                        span.duration_seconds for span in spans
+                    )
+                    if not (
+                        _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+                        <= switches_per_minute
+                        <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
+                        and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
+                        <= span_median
+                        <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                    ):
+                        continue
+                    first_unit_end = sum(signature[: window_start + 1])
+                    second_unit_end = sum(signature[: window_start + 2])
+                    replacement_reasons = (
+                        items[first_unit_end - 1].end_boundary_reasons,
+                        items[second_unit_end - 1].end_boundary_reasons,
+                    )
+                    redistribution = (
+                        _DirectFullFrameProofDirectedWindowRedistribution(
+                            window_start_span_index=window_start,
+                            proof_frontier_boundary_index=frontier,
+                            proof_frontier_offset_in_window=(
+                                frontier - window_start
+                            ),
+                            original_unit_counts=original,
+                            replacement_unit_counts=replacement,
+                            original_boundary_master_seconds=(
+                                parent.spans[
+                                    window_start
+                                ].canonical_master_end,
+                                parent.spans[
+                                    window_start + 1
+                                ].canonical_master_end,
+                            ),
+                            replacement_boundary_master_seconds=(
+                                spans[window_start].canonical_master_end,
+                                spans[
+                                    window_start + 1
+                                ].canonical_master_end,
+                            ),
+                            replacement_boundary_reasons=(
+                                tuple(replacement_reasons[0]),
+                                tuple(replacement_reasons[1]),
+                            ),
+                            trigger=(
+                                "proven_forward_connectivity_frontier_"
+                                "three_span_redistribution"
+                            ),
+                            parent_profile_id=parent.profile_id,
+                            parent_partition_signature_sha256=(
+                                _direct_partition_signature_sha256(
+                                    parent.unit_counts
+                                )
+                            ),
+                            proof_failure=proof.failure,
+                            proof_failed_segment_index=(
+                                proof.failed_segment_index
+                            ),
+                            proof_forward_reachable_left_source_indices=(
+                                proof.forward_reachable_left_source_indices
+                            ),
+                            proof_left_valid_source_indices=(
+                                proof.left_valid_source_indices
+                            ),
+                            proof_right_valid_source_indices=(
+                                proof.right_valid_source_indices
+                            ),
+                            proof_local_nonsevere_edge_count=(
+                                proof.local_nonsevere_edge_count
+                            ),
+                        )
+                    )
+                    profiles.append(
+                        _DirectFullFramePartitionProfile(
+                            profile_id=(
+                                f"{parent.profile_id}__window-{window_start}-"
+                                f"{first_count}-plus-{second_count}-plus-"
+                                f"{third_count}"
+                            ),
+                            unit_counts=signature,
+                            spans=spans,
+                            boundary_shifts=parent.boundary_shifts,
+                            window_redistributions=(
+                                parent.window_redistributions
+                                + (redistribution,)
+                            ),
+                            visual_frontier_splits=(
+                                parent.visual_frontier_splits
+                            ),
+                            boundary_merges=parent.boundary_merges,
+                            latest_operation_kind="window_redistribution",
+                        )
+                    )
+                    seen_signatures.add(signature)
+    profiles.sort(
+        key=lambda profile: (
+            profile.window_redistributions[-1].boundary_displacement_units,
+            profile.musical_boundary_penalty,
+            profile.profile_id,
+        )
+    )
     return tuple(profiles)
 
 
@@ -6185,6 +6567,7 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
             unit_counts=signature,
             spans=spans,
             boundary_shifts=parent.boundary_shifts,
+            window_redistributions=parent.window_redistributions,
             visual_frontier_splits=parent.visual_frontier_splits + (split,),
             boundary_merges=parent.boundary_merges,
             latest_operation_kind="visual_frontier_split",
@@ -6202,11 +6585,12 @@ def _direct_full_frame_proof_directed_repair_profiles(
     """Continue an exact frontier repair without leaving a dead-end gap.
 
     Boundary shifts remain the least structural repair and a merge remains the
-    fallback for an immovable minimum-duration cut.  If neither operator can
-    create a new canonical partition, the same exact failure proof may add one
-    evidence-bound musical micro-boundary immediately; waiting for an
-    unrelated maximum shift depth would otherwise terminate a still-actionable
-    proof frontier.  Every returned child is fully reselected by the caller.
+    fallback for an immovable minimum-duration cut.  If every two-span
+    placement is exhausted, a global frontier may redistribute both cuts in
+    the surrounding three-span window while preserving duration and cut count.
+    Only after those fixed-count repairs fail may the same exact proof add one
+    evidence-bound musical micro-boundary.  Every returned child is fully
+    reselected by the caller.
     """
 
     children = _direct_full_frame_proof_directed_child_profiles(
@@ -6216,6 +6600,12 @@ def _direct_full_frame_proof_directed_repair_profiles(
     )
     if not children:
         children = _direct_full_frame_proof_directed_merge_profiles(
+            timing_segments,
+            parent,
+            diagnostics,
+        )
+    if not children:
+        children = _direct_full_frame_proof_directed_window_profiles(
             timing_segments,
             parent,
             diagnostics,
@@ -6655,6 +7045,9 @@ def _direct_member_failure_report_fallback_payload(
             "maximum_profile_limit_expansion_count",
             "profile_limit_expansions",
             "maximum_shifted_boundary_count",
+            "base_maximum_shifted_boundary_count",
+            "shift_capacity_contract",
+            "proof_directed_window_redistribution_enabled",
             "maximum_proof_directed_boundary_merge_count",
             "maximum_visual_frontier_split_count_per_profile",
             "maximum_counterfactual_visual_frontier_split_count_per_profile",
@@ -7022,7 +7415,7 @@ def _direct_partition_structural_search_cost(
 
     return (
         profile.structural_change_count,
-        sum(abs(shift.shift_units) for shift in profile.boundary_shifts),
+        profile.total_unit_displacement,
         profile.musical_boundary_penalty,
     )
 
@@ -7337,7 +7730,11 @@ def _select_direct_member_partition_profile(
             "evaluation_index": evaluation_index,
             "evaluation_limit": partition_search_evaluation_limit,
             "profile_id": profile.profile_id,
-            "shift_depth": len(profile.boundary_shifts),
+            "shift_depth": profile.proof_directed_boundary_motion_count,
+            "ordinary_shift_count": len(profile.boundary_shifts),
+            "window_redistribution_count": len(
+                profile.window_redistributions
+            ),
             "visual_frontier_split_count": len(
                 profile.visual_frontier_splits
             ),
@@ -7345,9 +7742,7 @@ def _select_direct_member_partition_profile(
                 profile.boundary_merges
             ),
             "changed_boundary_count": profile.structural_change_count,
-            "total_unit_displacement": sum(
-                abs(shift.shift_units) for shift in profile.boundary_shifts
-            ),
+            "total_unit_displacement": profile.total_unit_displacement,
             "partition_signature_sha256": (
                 _direct_partition_signature_sha256(profile.unit_counts)
             ),
@@ -7376,6 +7771,26 @@ def _select_direct_member_partition_profile(
                     "shift_units": shift.shift_units,
                 }
                 for shift in profile.boundary_shifts
+            ],
+            "window_redistributions": [
+                {
+                    "window_start_span_index": (
+                        redistribution.window_start_span_index
+                    ),
+                    "proof_frontier_boundary_index": (
+                        redistribution.proof_frontier_boundary_index
+                    ),
+                    "original_unit_counts": list(
+                        redistribution.original_unit_counts
+                    ),
+                    "replacement_unit_counts": list(
+                        redistribution.replacement_unit_counts
+                    ),
+                    "boundary_displacement_units": (
+                        redistribution.boundary_displacement_units
+                    ),
+                }
+                for redistribution in profile.window_redistributions
             ],
             "visual_frontier_splits": [
                 {
@@ -8170,7 +8585,7 @@ def _select_direct_member_partition_profile(
                 )
                 if (
                     not children
-                    and len(parent.boundary_shifts)
+                    and parent.proof_directed_boundary_motion_count
                     >= _direct_partition_proof_directed_boundary_shift_limit(
                         parent
                     )
@@ -8270,11 +8685,11 @@ def _select_direct_member_partition_profile(
                             )
                         ),
                         "minimum_queued_shift_depth": min(
-                            len(profile.boundary_shifts)
+                            profile.proof_directed_boundary_motion_count
                             for profile in queued_profiles
                         ),
                         "maximum_queued_shift_depth": max(
-                            len(profile.boundary_shifts)
+                            profile.proof_directed_boundary_motion_count
                             for profile in queued_profiles
                         ),
                         "exact_frontier_continuation_upper_bound": next_limit,
@@ -8453,10 +8868,7 @@ def _select_direct_member_partition_profile(
                         key=lambda item: (
                             -_terminal_candidate_progress(item[0], item[1]),
                             item[0].structural_change_count,
-                            sum(
-                                abs(shift.shift_units)
-                                for shift in item[0].boundary_shifts
-                            ),
+                            item[0].total_unit_displacement,
                             item[0].musical_boundary_penalty,
                             item[0].profile_id,
                         ),
@@ -8673,11 +9085,12 @@ def _select_direct_member_partition_profile(
                 "policy": (
                     "canonical_signature_deduplicated_proof_directed_"
                     "adaptive_frontier_boundary_merge_dead_end_"
+                    "three_span_fixed_cut_window_redistribution_"
                     "visual_micro_split_"
                     "connectivity_precheck_best_first_global_terminal_hold_"
                     "exact_lifeline_capacity_retry_strict_extra_quota_"
                     "assignment_proof_progress_terminal_audition_"
-                    "severe_counterfactual_secondary_partition_v13"
+                    "severe_counterfactual_secondary_partition_v14"
                 ),
                 "initial_profile_count": (
                     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
@@ -8708,6 +9121,7 @@ def _select_direct_member_partition_profile(
                     "base_bound_plus_one_compensating_shift_per_"
                     "independently_admitted_merge_v1"
                 ),
+                "proof_directed_window_redistribution_enabled": True,
                 "maximum_proof_directed_boundary_merge_count": (
                     partition_search_max_boundary_merge_count
                 ),
@@ -8976,11 +9390,12 @@ def _select_direct_member_partition_profile(
         "policy": (
             "canonical_signature_deduplicated_proof_directed_"
             "adaptive_frontier_boundary_merge_dead_end_"
+            "three_span_fixed_cut_window_redistribution_"
             "visual_micro_split_best_first_"
             "connectivity_precheck_global_terminal_hold_"
             "exact_lifeline_capacity_retry_strict_extra_quota_"
             "assignment_proof_progress_terminal_audition_"
-            "severe_counterfactual_secondary_partition_v13"
+            "severe_counterfactual_secondary_partition_v14"
         ),
         "initial_profile_count": _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
         "maximum_profile_count": partition_search_evaluation_limit,
@@ -9005,6 +9420,7 @@ def _select_direct_member_partition_profile(
             "base_bound_plus_one_compensating_shift_per_"
             "independently_admitted_merge_v1"
         ),
+        "proof_directed_window_redistribution_enabled": True,
         "maximum_proof_directed_boundary_merge_count": (
             partition_search_max_boundary_merge_count
         ),
@@ -9182,6 +9598,10 @@ def _select_direct_member_partition_profile(
         "profiles_attempted": attempted,
         "selected_profile_id": selected_profile.profile_id,
         "selected_partition_unit_counts": list(selected_profile.unit_counts),
+        "selected_window_redistributions": [
+            redistribution.to_dict()
+            for redistribution in selected_profile.window_redistributions
+        ],
         "highlight_dense_cadence": {
             "contract": "section_role_bound_existing_musical_cut_density_v1",
             "highlight_intervals": [
@@ -9217,6 +9637,7 @@ def _select_direct_member_partition_profile(
         },
         "fallback_used": bool(
             selected_profile.boundary_shifts
+            or selected_profile.window_redistributions
             or selected_profile.visual_frontier_splits
             or selected_profile.boundary_merges
         ),
@@ -9301,6 +9722,26 @@ def _select_direct_member_partition_profile(
                 "shift_units": shift.shift_units,
             }
             for shift in selected_profile.boundary_shifts
+        ],
+        selected_window_redistributions=[
+            {
+                "window_start_span_index": (
+                    redistribution.window_start_span_index
+                ),
+                "proof_frontier_boundary_index": (
+                    redistribution.proof_frontier_boundary_index
+                ),
+                "original_unit_counts": list(
+                    redistribution.original_unit_counts
+                ),
+                "replacement_unit_counts": list(
+                    redistribution.replacement_unit_counts
+                ),
+                "boundary_displacement_units": (
+                    redistribution.boundary_displacement_units
+                ),
+            }
+            for redistribution in selected_profile.window_redistributions
         ],
         selected_visual_frontier_splits=[
             {
