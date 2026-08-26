@@ -3725,6 +3725,7 @@ class _DirectFullFrameBoundaryShift:
     shift_units: int
     left_unit_count: int
     right_unit_count: int
+    canonical_master_seconds: float
     boundary_reasons: tuple[str, ...]
     trigger: str
     parent_profile_id: str
@@ -3744,6 +3745,7 @@ class _DirectFullFrameBoundaryShift:
                 self.left_unit_count,
                 self.right_unit_count,
             ],
+            "canonical_master_seconds": self.canonical_master_seconds,
             "boundary_reasons": list(self.boundary_reasons),
             "trigger": self.trigger,
             "parent_profile_id": self.parent_profile_id,
@@ -4803,6 +4805,48 @@ def _direct_partition_queue_signature_digest(
     ).hexdigest()
 
 
+def _direct_partition_current_boundary_index_at_time(
+    profile: _DirectFullFramePartitionProfile,
+    canonical_master_seconds: float,
+) -> int | None:
+    """Resolve a lineage cut in the current partition's coordinate system."""
+
+    if not math.isfinite(canonical_master_seconds):
+        raise ValueError("direct partition lineage cut time must be finite")
+    for boundary_index, span in enumerate(profile.spans[:-1]):
+        if math.isclose(
+            span.canonical_master_end,
+            canonical_master_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-7,
+        ):
+            return boundary_index
+    return None
+
+
+def _direct_partition_current_shifted_boundary_indices(
+    profile: _DirectFullFramePartitionProfile,
+) -> tuple[int, ...]:
+    """Map surviving shifted cuts after any index-changing merge."""
+
+    return tuple(
+        sorted(
+            {
+                boundary_index
+                for shift in profile.boundary_shifts
+                if (
+                    boundary_index
+                    := _direct_partition_current_boundary_index_at_time(
+                        profile,
+                        shift.canonical_master_seconds,
+                    )
+                )
+                is not None
+            }
+        )
+    )
+
+
 def _direct_partition_future_operation_state_key(
     parent: _DirectFullFramePartitionProfile,
     diagnostics: dict[str, Any],
@@ -4811,22 +4855,25 @@ def _direct_partition_future_operation_state_key(
     """Return a lossless key for one proof-authorized expansion domain.
 
     This is intentionally stricter than a failure/frontier label.  The full
-    parent partition, every already-used boundary, the last boundary (which
-    controls adjacent compensation), remaining depth, exact scalar proof, and
-    every cadence-valid child partition all participate.  Consequently two
-    states are dominated only when every future operator available *now* is
-    identical; visual feasibility is never inferred or merged.
+    parent partition, every surviving already-used physical cut, the most
+    recent cut, remaining depth, exact scalar proof, and every cadence-valid
+    child partition all participate.  Consequently two states are dominated
+    only when every future operator available *now* is identical; visual
+    feasibility is never inferred or merged.
     """
 
     proofs = _direct_partition_exact_shift_proofs(
         diagnostics,
         span_count=len(parent.spans),
     )
-    used_boundaries = tuple(
-        sorted(shift.boundary_index for shift in parent.boundary_shifts)
+    used_boundaries = _direct_partition_current_shifted_boundary_indices(
+        parent
     )
     last_boundary = (
-        parent.boundary_shifts[-1].boundary_index
+        _direct_partition_current_boundary_index_at_time(
+            parent,
+            parent.boundary_shifts[-1].canonical_master_seconds,
+        )
         if parent.boundary_shifts
         else None
     )
@@ -4947,6 +4994,9 @@ def _direct_full_frame_shifted_partition_profiles(
                 shift_units=shift_units,
                 left_unit_count=left_count,
                 right_unit_count=right_count,
+                canonical_master_seconds=(
+                    spans[boundary_index].canonical_master_end
+                ),
                 boundary_reasons=boundary_reasons,
                 trigger=(
                     exact_proof.trigger
@@ -5072,12 +5122,11 @@ def _direct_full_frame_proof_directed_child_profiles(
     """Create deterministic children from this parent's exact failure proof.
 
     The ordinary operator moves one independently proven boundary by one unit.
-    When the just-moved cut exposes the immediately following exact forward
-    frontier, that adjacent cut may move as a bounded compensation; the same
-    proof may also propose a two-unit single-boundary equivalent.  A boundary
-    is never moved twice, non-forward adjacent moves are rejected, and every
-    child must still pass span duration and cadence gates before the caller
-    re-evaluates all visual, quota, and transition constraints.
+    When one moved cut exposes an adjacent exact failure, that adjacent cut may
+    also move.  Adjacent moves are ordinary compositions of the final canonical
+    partition: every materialized span and every visual, quota, cadence, and
+    transition constraint is recomputed before selection.  A physical cut time
+    is never moved twice, even after an earlier merge changes boundary indices.
     """
 
     if (
@@ -5094,29 +5143,13 @@ def _direct_full_frame_proof_directed_child_profiles(
 
     items = tuple(timing_segments)
     profiles: list[_DirectFullFramePartitionProfile] = []
-    used_boundaries = {shift.boundary_index for shift in parent.boundary_shifts}
-    last_shifted_boundary = (
-        parent.boundary_shifts[-1].boundary_index
-        if parent.boundary_shifts
-        else None
+    used_boundaries = set(
+        _direct_partition_current_shifted_boundary_indices(parent)
     )
     seen_signatures: set[tuple[int, ...]] = set()
     for proof in proofs:
         boundary_index = proof.boundary_index
         if boundary_index in used_boundaries:
-            continue
-        adjacent_to_shift = any(
-            abs(boundary_index - used) == 1 for used in used_boundaries
-        )
-        adjacent_forward_chain = bool(
-            adjacent_to_shift
-            and last_shifted_boundary is not None
-            and boundary_index == last_shifted_boundary + 1
-            and proof.trigger
-            == "proven_forward_connectivity_frontier_exhaustion"
-            and proof.local_nonsevere_edge_count > 0
-        )
-        if adjacent_to_shift and not adjacent_forward_chain:
             continue
         left_units, right_units = parent.unit_counts[
             boundary_index : boundary_index + 2
@@ -5181,6 +5214,9 @@ def _direct_full_frame_proof_directed_child_profiles(
                 shift_units=shift_units,
                 left_unit_count=left_count,
                 right_unit_count=right_count,
+                canonical_master_seconds=(
+                    spans[boundary_index].canonical_master_end
+                ),
                 boundary_reasons=boundary_reasons,
                 trigger=proof.trigger,
                 parent_profile_id=parent.profile_id,
@@ -5232,19 +5268,19 @@ def _direct_full_frame_proof_directed_merge_profiles(
     parent: _DirectFullFramePartitionProfile,
     diagnostics: dict[str, Any],
 ) -> tuple[_DirectFullFramePartitionProfile, ...]:
-    """Remove only a proven bottleneck that cannot move by one safe unit.
+    """Remove only a proven bottleneck after no new safe shift remains.
 
     A two-sided minimum-duration cadence such as ``2+2`` has no legal shifted
-    representation: ``1+3`` would create a sub-1.8-second flash cut.  Once the
-    exact selector proves that fixed cut infeasible, merging the two adjacent
-    spans is the only non-relaxed local partition change.  The merged child is
-    still sent through the complete content, native-cut, transition, quota,
-    duration, and highlight-density audits before it can render.
+    representation: ``1+3`` would create a sub-1.8-second flash cut.  The
+    repair dispatcher invokes this operator only after the shift operator has
+    produced no new child for the exact current proof.  Merging the two
+    adjacent spans is then the remaining non-relaxed local representation. The
+    merged child is still sent through complete content, native-cut,
+    transition, quota, duration, and highlight-density audits before render.
     """
 
     if (
-        parent.boundary_shifts
-        or parent.visual_frontier_splits
+        parent.visual_frontier_splits
         or len(parent.boundary_merges)
         >= _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT
     ):
@@ -5264,41 +5300,6 @@ def _direct_full_frame_proof_directed_merge_profiles(
         left_count, right_count = parent.unit_counts[
             boundary_index : boundary_index + 2
         ]
-        # This operator is a last local representation, not a shortcut around
-        # an available beat shift.  If either one-unit shift materializes two
-        # professional-length spans, the ordinary proof-directed child owns
-        # this boundary instead.
-        safe_shift_exists = False
-        for shift_units in (1, -1):
-            shifted_left = left_count + shift_units
-            shifted_right = right_count - shift_units
-            if shifted_left < 1 or shifted_right < 1:
-                continue
-            shifted_counts = list(parent.unit_counts)
-            shifted_counts[boundary_index : boundary_index + 2] = [
-                shifted_left,
-                shifted_right,
-            ]
-            try:
-                shifted_spans = _direct_full_frame_spans_from_partition(
-                    items,
-                    shifted_counts,
-                )
-            except ValueError:
-                continue
-            if (
-                min(
-                    shifted_spans[boundary_index].duration_seconds,
-                    shifted_spans[boundary_index + 1].duration_seconds,
-                )
-                + 1e-9
-                >= _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
-            ):
-                safe_shift_exists = True
-                break
-        if safe_shift_exists:
-            continue
-
         counts = list(parent.unit_counts)
         merged_count = left_count + right_count
         counts[boundary_index : boundary_index + 2] = [merged_count]
@@ -5350,9 +5351,17 @@ def _direct_full_frame_proof_directed_merge_profiles(
             _DirectFullFramePartitionProfile(
                 profile_id=(
                     f"boundary-{boundary_index}-merge-{merged_count}"
+                    if not parent.boundary_shifts
+                    and not parent.boundary_merges
+                    else (
+                        f"{parent.profile_id}__merge-{boundary_index}-"
+                        f"{merged_count}"
+                    )
                 ),
                 unit_counts=signature,
                 spans=spans,
+                boundary_shifts=parent.boundary_shifts,
+                visual_frontier_splits=parent.visual_frontier_splits,
                 boundary_merges=parent.boundary_merges + (merge,),
                 latest_operation_kind="boundary_merge",
             )

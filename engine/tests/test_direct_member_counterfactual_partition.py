@@ -12,18 +12,22 @@ from crosscut.pipeline import (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+    _DirectFullFrameBoundaryShift,
     _DirectFullFramePartitionProfile,
     _DirectFullFrameVisualFrontierSplit,
     _compact_direct_partition_failure,
     _compact_direct_severe_counterfactual,
     _direct_counterfactual_boundary_proof,
     _direct_counterfactual_secondary_signature_action,
+    _direct_full_frame_proof_directed_child_profiles,
+    _direct_full_frame_proof_directed_merge_profiles,
     _direct_full_frame_spans_from_partition,
     _direct_full_frame_visual_frontier_split_child_profiles,
     _direct_member_failure_report_fallback_payload,
     _direct_partition_signature_sha256,
     _direct_partition_failure_result,
     _direct_partition_aggregate_outcome,
+    _direct_partition_current_shifted_boundary_indices,
     _direct_severe_counterfactual_retry_is_authorized,
 )
 
@@ -199,6 +203,71 @@ def _parent_profile() -> _DirectFullFramePartitionProfile:
     )
 
 
+def _professional_timing_segments(
+    count: int,
+) -> tuple[DraftSegment, ...]:
+    duration = 0.9
+    return tuple(
+        DraftSegment(
+            segment_index=index,
+            source_index=0,
+            canonical_master_start=index * duration,
+            canonical_master_end=(index + 1) * duration,
+            output_start_seconds=index * duration,
+            source_local_start=index * duration,
+            source_local_end=(index + 1) * duration,
+            audio_offset_seconds=0.0,
+            sync_score=1.0,
+            estimated_beat_count=1.0,
+            start_boundary_reasons=("beat",),
+            end_boundary_reasons=("beat",),
+        )
+        for index in range(count)
+    )
+
+
+def _zero_boundary_diagnostics(
+    *,
+    span_count: int,
+    boundary_index: int,
+) -> dict:
+    diagnostics = _diagnostics(span_count=span_count)
+    connectivity = diagnostics["hard_boundary_connectivity"]
+    connectivity["zero_local_nonsevere_transition_boundary_indices"] = [
+        boundary_index
+    ]
+    connectivity["boundaries"][boundary_index][
+        "nonsevere_cross_source_edge_count"
+    ] = 0
+    return diagnostics
+
+
+def _recorded_shift(
+    profile: _DirectFullFramePartitionProfile,
+    *,
+    boundary_index: int,
+) -> _DirectFullFrameBoundaryShift:
+    return _DirectFullFrameBoundaryShift(
+        boundary_index=boundary_index,
+        shift_units=1,
+        left_unit_count=profile.unit_counts[boundary_index],
+        right_unit_count=profile.unit_counts[boundary_index + 1],
+        canonical_master_seconds=(
+            profile.spans[boundary_index].canonical_master_end
+        ),
+        boundary_reasons=("beat",),
+        trigger="zero_local_nonsevere_transition_edges",
+        parent_profile_id="prior",
+        parent_partition_signature_sha256="e" * 64,
+        proof_failure="validity_quota_path_exhausted",
+        proof_failed_segment_index=1,
+        proof_forward_reachable_left_source_indices=(0,),
+        proof_left_valid_source_indices=(0, 1),
+        proof_right_valid_source_indices=(0, 1),
+        proof_local_nonsevere_edge_count=0,
+    )
+
+
 class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
     def test_terminal_audition_cannot_truncate_primary_profile_frontier(
         self,
@@ -210,6 +279,86 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         self.assertGreaterEqual(
             _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+        )
+
+    def test_adjacent_proven_cut_can_move_after_neighbor_shift(self) -> None:
+        segments = _professional_timing_segments(32)
+        unit_counts = (4, 3, 3, 2, 4, 4, 4, 4, 4)
+        bare_parent = _DirectFullFramePartitionProfile(
+            profile_id="neighbor-shifted",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        parent = _DirectFullFramePartitionProfile(
+            profile_id=bare_parent.profile_id,
+            unit_counts=bare_parent.unit_counts,
+            spans=bare_parent.spans,
+            boundary_shifts=(
+                _recorded_shift(bare_parent, boundary_index=1),
+            ),
+            latest_operation_kind="boundary_shift",
+        )
+        children = _direct_full_frame_proof_directed_child_profiles(
+            segments,
+            parent,
+            _zero_boundary_diagnostics(
+                span_count=len(unit_counts),
+                boundary_index=0,
+            ),
+        )
+        self.assertEqual(
+            {child.unit_counts for child in children},
+            {
+                (5, 2, 3, 2, 4, 4, 4, 4, 4),
+                (3, 4, 3, 2, 4, 4, 4, 4, 4),
+            },
+        )
+        self.assertTrue(
+            all(len(child.boundary_shifts) == 2 for child in children)
+        )
+
+    def test_merge_after_shift_preserves_physical_cut_coordinates(self) -> None:
+        segments = _professional_timing_segments(34)
+        unit_counts = (4, 4, 2, 2, 2, 4, 5, 3, 4, 4)
+        bare_parent = _DirectFullFramePartitionProfile(
+            profile_id="shift-before-immovable-cut",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                unit_counts,
+            ),
+        )
+        parent = _DirectFullFramePartitionProfile(
+            profile_id=bare_parent.profile_id,
+            unit_counts=bare_parent.unit_counts,
+            spans=bare_parent.spans,
+            boundary_shifts=(
+                _recorded_shift(bare_parent, boundary_index=6),
+            ),
+            latest_operation_kind="boundary_shift",
+        )
+        children = _direct_full_frame_proof_directed_merge_profiles(
+            segments,
+            parent,
+            _zero_boundary_diagnostics(
+                span_count=len(unit_counts),
+                boundary_index=2,
+            ),
+        )
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual(
+            child.unit_counts,
+            (4, 4, 4, 2, 4, 5, 3, 4, 4),
+        )
+        self.assertEqual(child.boundary_shifts, parent.boundary_shifts)
+        self.assertEqual(len(child.boundary_merges), 1)
+        self.assertEqual(
+            _direct_partition_current_shifted_boundary_indices(child),
+            (5,),
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
