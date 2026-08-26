@@ -10,6 +10,7 @@ from crosscut.direct_member_visual import (
 from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+    _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
     _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
     _DirectFullFrameBoundaryShift,
@@ -322,7 +323,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
 
     def test_merge_after_shift_preserves_physical_cut_coordinates(self) -> None:
         segments = _professional_timing_segments(34)
-        unit_counts = (4, 4, 2, 2, 2, 4, 5, 3, 4, 4)
+        unit_counts = (4, 4, 2, 2, 4, 2, 2, 2, 5, 3, 4)
         bare_parent = _DirectFullFramePartitionProfile(
             profile_id="shift-before-immovable-cut",
             unit_counts=unit_counts,
@@ -336,7 +337,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             unit_counts=bare_parent.unit_counts,
             spans=bare_parent.spans,
             boundary_shifts=(
-                _recorded_shift(bare_parent, boundary_index=6),
+                _recorded_shift(bare_parent, boundary_index=8),
             ),
             latest_operation_kind="boundary_shift",
         )
@@ -352,13 +353,36 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         child = children[0]
         self.assertEqual(
             child.unit_counts,
-            (4, 4, 4, 2, 4, 5, 3, 4, 4),
+            (4, 4, 4, 4, 2, 2, 2, 5, 3, 4),
         )
         self.assertEqual(child.boundary_shifts, parent.boundary_shifts)
         self.assertEqual(len(child.boundary_merges), 1)
         self.assertEqual(
             _direct_partition_current_shifted_boundary_indices(child),
-            (5,),
+            (7,),
+        )
+        self.assertGreaterEqual(
+            _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT,
+            2,
+        )
+        second_children = _direct_full_frame_proof_directed_merge_profiles(
+            segments,
+            child,
+            _zero_boundary_diagnostics(
+                span_count=len(child.unit_counts),
+                boundary_index=4,
+            ),
+        )
+        self.assertEqual(len(second_children), 1)
+        second_child = second_children[0]
+        self.assertEqual(
+            second_child.unit_counts,
+            (4, 4, 4, 4, 4, 2, 5, 3, 4),
+        )
+        self.assertEqual(len(second_child.boundary_merges), 2)
+        self.assertEqual(
+            _direct_partition_current_shifted_boundary_indices(second_child),
+            (6,),
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
