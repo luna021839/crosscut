@@ -203,7 +203,8 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(config.maximum_center_shift, 0.12)
         self.assertEqual(config.minimum_dense_face_visible_fraction, 0.98)
         self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.95)
-        self.assertEqual(config.maximum_dense_center_step, 0.12)
+        self.assertEqual(config.maximum_dense_center_step, 0.15)
+        self.assertEqual(config.maximum_dense_subject_center_step, 0.15)
         self.assertEqual(
             config.minimum_face_associated_subject_visible_fraction,
             0.72,
@@ -334,6 +335,62 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.accepted_boundary_indices, (0,))
         self.assertEqual(plan.boundary_match_count, 1)
         self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.18)
+
+    def test_required_repair_records_dense_natural_match_without_forced_crop(
+        self,
+    ) -> None:
+        boxes = (
+            (0.00, 0.000, 1.00, 0.550),
+            (0.03, 0.030, 0.94, 0.561),
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        repair = DirectMemberBoundaryTransformRepair(
+            transformed_side="outgoing",
+            transformed_source_index=0,
+            zoom=1.02,
+            center_x=0.5,
+            center_y=0.5,
+            source_geometry=geometry,
+            raw_attention_position_mismatch=0.0355,
+            raw_attention_scale_mismatch=0.02,
+            residual_attention_position_mismatch=0.0355,
+            residual_attention_scale_mismatch=0.02,
+            baseline_face_geometry_mismatch=0.05,
+            transformed_face_geometry_mismatch=0.05,
+            improvement_fraction=0.0,
+            face_visible_fraction=1.0,
+            subject_geometry_basis="pphumanseg_full_subject_silhouette",
+            subject_visible_fraction=1.0,
+            repaired_severe_flags=(),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {"mismatch": SimpleNamespace(transform_repair=repair)}
+            },
+        )
+        selection.source_frame_geometries = (geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (2.0, 2.0)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source],
+                subject_box=(0.00, 0.00, 1.00, 1.00),
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, ())
+        self.assertEqual(plan.natural_match_boundary_indices, (0,))
+        self.assertEqual(plan.applied_count, 0)
+        self.assertIn(
+            ("required_dense_natural_match", 1),
+            plan.skipped_boundary_reasons,
+        )
 
     def test_required_dense_rejection_reports_the_measured_cause(self) -> None:
         boxes = (

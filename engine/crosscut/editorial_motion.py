@@ -192,6 +192,8 @@ class EditorialMotionPlan:
         "tier_d_plus_pixel_affine_virtual_camera_v3"
     )
     boundary_subject_alignment_plan: BoundarySubjectAlignmentPlan | None = None
+    accepted_boundary_indices: tuple[int, ...] = ()
+    natural_match_boundary_indices: tuple[int, ...] = ()
 
     @property
     def applied_count(self) -> int:
@@ -293,6 +295,10 @@ class EditorialMotionPlan:
                 {"reason": reason, "count": count}
                 for reason, count in self.skipped_boundary_reasons
             ],
+            "accepted_boundary_indices": list(self.accepted_boundary_indices),
+            "natural_match_boundary_indices": list(
+                self.natural_match_boundary_indices
+            ),
             "boundary_subject_alignment": (
                 self.boundary_subject_alignment_plan.to_dict()
                 if self.boundary_subject_alignment_plan is not None
@@ -964,7 +970,7 @@ def build_editorial_motion_plan(
     }
     blocked: set[int] = set()
     for index, transition in enumerate(transitions):
-        if transition.kind is TransitionKind.FACE_DISSOLVE:
+        if transition.kind.uses_overlap:
             blocked.update((index, index + 1))
 
     entry_states: list[_State | None] = [None] * len(choices)

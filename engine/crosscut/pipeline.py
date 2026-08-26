@@ -18675,7 +18675,11 @@ def analyze(
                     )
                 )
                 if not set(required_transform_boundary_indices).issubset(
-                    candidate_member_motion_plan.accepted_boundary_indices
+                    set(
+                        candidate_member_motion_plan.accepted_boundary_indices
+                    ).union(
+                        candidate_member_motion_plan.natural_match_boundary_indices
+                    )
                 ):
                     raise ValueError(
                         "required direct-member transform was not densely accepted"

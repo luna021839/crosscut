@@ -361,7 +361,13 @@ def evaluate_direct_member_professional_pre_render_gate(
             uncontracted_severe.append(boundary.boundary_index)
 
     accepted_repairs = (
-        frozenset(editorial_motion_plan.accepted_boundary_indices)
+        frozenset(editorial_motion_plan.accepted_boundary_indices).union(
+            getattr(
+                editorial_motion_plan,
+                "natural_match_boundary_indices",
+                (),
+            )
+        )
         if editorial_motion_plan is not None
         else frozenset()
     )

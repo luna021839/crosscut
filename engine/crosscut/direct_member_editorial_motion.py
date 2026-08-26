@@ -464,9 +464,9 @@ class DirectMemberEditorialMotionConfig:
     minimum_widened_subject_confidence: float = 0.30
     minimum_widened_subject_visible_fraction: float = 0.950
     minimum_face_associated_subject_visible_fraction: float = 0.720
-    maximum_dense_subject_center_step: float = 0.12
+    maximum_dense_subject_center_step: float = 0.15
     maximum_dense_subject_height_ratio: float = 1.40
-    maximum_dense_center_step: float = 0.12
+    maximum_dense_center_step: float = 0.15
     maximum_dense_height_ratio: float = 1.35
     maximum_dense_face_interpolation_gap_frames: int = 24
     maximum_dense_face_edge_extrapolation_frames: int = 24
@@ -819,6 +819,7 @@ def _median_smooth_geometry(
     boxes: Sequence[tuple[float, float, float, float]],
     *,
     radius: int,
+    preserve_run_endpoints: bool = True,
 ) -> list[tuple[float, float, float, float]]:
     if radius <= 0:
         return list(boxes)
@@ -836,6 +837,8 @@ def _median_smooth_geometry(
             and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
         ):
             run_end += 1
+        if preserve_run_endpoints and index in {run_start, run_end}:
+            continue
         low = max(run_start, index - radius)
         high = min(run_end, index + radius)
         window = boxes[low : high + 1]
@@ -908,9 +911,29 @@ def _stabilize_subject_relative_face_track(
             config.maximum_dense_height_ratio
             + 0.025 * max(0, frame_gap - 1),
         )
+        absolute_center_distance = math.hypot(
+            _center(left_box)[0] - _center(right_box)[0],
+            _center(left_box)[1] - _center(right_box)[1],
+        )
+        maximum_absolute_center_distance = min(
+            0.32,
+            0.15 + 0.010 * max(0, frame_gap - 1),
+        )
+        absolute_height_ratio = max(left_box[3], right_box[3]) / max(
+            1e-9,
+            min(left_box[3], right_box[3]),
+        )
+        maximum_absolute_height_ratio = min(
+            1.90,
+            1.50 + 0.025 * max(0, frame_gap - 1),
+        )
         return (
             center_distance <= maximum_center_distance + 1e-9
             and height_ratio <= maximum_height_ratio + 1e-9
+            and absolute_center_distance
+            <= maximum_absolute_center_distance + 1e-9
+            and absolute_height_ratio
+            <= maximum_absolute_height_ratio + 1e-9
         )
 
     run_start = 0
@@ -1268,6 +1291,7 @@ def _track_is_dense_face_safe(
                     if subject_box is not None
                 ],
                 radius=config.dense_geometry_median_radius_frames,
+                preserve_run_endpoints=False,
             )
         for index, face_box in enumerate(face_boxes):
             subject_box = subject_boxes[index]
@@ -1312,6 +1336,7 @@ def _track_is_dense_face_safe(
                 if subject_box is not None
             ],
             radius=config.dense_geometry_median_radius_frames,
+            preserve_run_endpoints=False,
         )
     else:
         return reject("dense_alignment_geometry_basis_invalid")
@@ -1328,6 +1353,7 @@ def _track_is_dense_face_safe(
                 if subject_box is not None
             ],
             radius=config.dense_geometry_median_radius_frames,
+            preserve_run_endpoints=False,
         )
         subject_boxes = list(smoothed_subject_boxes)
 
@@ -1618,6 +1644,7 @@ def build_direct_member_editorial_motion_plan(
 
     candidates: list[_BoundaryCandidate] = []
     required_boundary_indices: set[int] = set()
+    naturally_satisfied_required_boundary_indices: set[int] = set()
     for boundary_index, diagnostic in enumerate(boundaries):
         if getattr(diagnostic, "boundary_index", None) != boundary_index:
             raise ValueError("direct member boundary indices must be contiguous")
@@ -1868,6 +1895,17 @@ def build_direct_member_editorial_motion_plan(
                 if transformed + 1e-4 < baseline:
                     qualifying.append((transformed, state))
         if not qualifying:
+            if (
+                required
+                and baseline <= 0.10 + 1e-9
+                and center_distance <= 0.05 + 1e-9
+                and ratio <= 1.05 + 1e-9
+            ):
+                naturally_satisfied_required_boundary_indices.add(
+                    boundary_index
+                )
+                skip("required_dense_natural_match")
+                continue
             reject_boundary("no_improving_contained_transform")
             if required:
                 required_rejection_context[boundary_index] = (
@@ -2152,7 +2190,11 @@ def build_direct_member_editorial_motion_plan(
         sorted(item.boundary_index for item in accepted)
     )
     missing_required = tuple(
-        sorted(required_boundary_indices.difference(accepted_boundary_indices))
+        sorted(
+            required_boundary_indices.difference(
+                accepted_boundary_indices
+            ).difference(naturally_satisfied_required_boundary_indices)
+        )
     )
     if missing_required:
         rejection_counts: dict[str, int] = {}
@@ -2227,9 +2269,13 @@ def build_direct_member_editorial_motion_plan(
         skipped_boundary_reasons=tuple(sorted(skipped.items())),
         analysis_basis=(
             "official_target_fancam_face_or_verified_full_subject_dense_"
-            "output_frame_subject_relative_face_track_adaptive_review_v7"
+            "output_frame_boundary_anchored_subject_relative_face_track_"
+            "adaptive_review_v8"
         ),
         accepted_boundary_indices=accepted_boundary_indices,
+        natural_match_boundary_indices=tuple(
+            sorted(naturally_satisfied_required_boundary_indices)
+        ),
     )
 
 
