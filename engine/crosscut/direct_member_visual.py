@@ -49,15 +49,32 @@ DescriptorProvider = Callable[
 
 _DIRECT_CONTENT_SAMPLE_COUNT = 6
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS = frozenset(
-    {"attention_position", "attention_scale", "formation"}
+    {
+        "attention_position",
+        "attention_scale",
+        "formation",
+        "silhouette",
+        "cross_source_silhouette_mismatch",
+    }
 )
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.65
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT = 4
-_DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_BOUNDARY_GAP = 3
+_DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS = 3.0
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_COST_PENALTY = 8.0
+_DIRECT_MEMBER_CINEMATIC_BRIDGE_NONPRIORITY_COST_PENALTY = 4.0
+_DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
+_DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.48
+_DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.52
 _DIRECT_MEMBER_HETEROGENEOUS_MAXIMUM_RUN_SECONDS = 7.75
+_DIRECT_MEMBER_ROLE_LANDSCAPE_HIGHLIGHT_ONLY = True
+_DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MINIMUM_FRACTION = 0.45
+_DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MAXIMUM_FACTOR = 1.50
+_DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MINIMUM_FRACTION = 0.45
+_DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MAXIMUM_FACTOR = 1.65
+_DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MINIMUM_FRACTION = 0.25
+_DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MAXIMUM_FACTOR = 3.00
 _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES = frozenset(
     {
         "heterogeneous_role_aware_safe_hold_v1",
@@ -1069,7 +1086,7 @@ class DirectSpanVisualDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class DirectMemberCinematicBridge:
-    """A required effect contract for a landscape/portrait member boundary.
+    """A required effect contract for a landscape-involved member boundary.
 
     This does not make the edge eligible for a hard cut.  It records that the
     target pose and silhouette are compatible while the remaining mismatch is
@@ -1089,8 +1106,8 @@ class DirectMemberCinematicBridge:
     def __post_init__(self) -> None:
         if self.style not in {"zoom_in", "horizontal_blur"}:
             raise ValueError("direct member cinematic bridge style is invalid")
-        if self.outgoing_is_landscape == self.incoming_is_landscape:
-            raise ValueError("cinematic bridge requires one landscape source")
+        if not (self.outgoing_is_landscape or self.incoming_is_landscape):
+            raise ValueError("cinematic bridge requires a landscape source")
         flags = frozenset(self.authorized_severe_flags)
         if not flags or not flags <= (
             _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
@@ -1196,6 +1213,104 @@ class DirectBoundaryMismatch:
                 self.priority_motion_preference_applied
             ),
         }
+
+
+def _cinematic_bridge_from_verified_evidence(
+    *,
+    severe_flags: Sequence[str],
+    continuous_official_portrait_fancam_contract: bool,
+    cross_source_edge: bool,
+    actual_pose: bool,
+    pose_mismatch: float | None,
+    silhouette_mismatch: float | None,
+    base_mismatch: float,
+    outgoing_source_geometry: DirectMemberSourceFrameGeometry | None,
+    incoming_source_geometry: DirectMemberSourceFrameGeometry | None,
+    timestamp_bound_adjacent: bool,
+    transform_repair: DirectMemberBoundaryTransformRepair | None,
+) -> DirectMemberCinematicBridge | None:
+    """Authorize an effect-only bridge from scalar pose/body evidence.
+
+    A face box on one side and a verified body/silhouette box on the other are
+    not directly comparable enough for a hard cut or an affine repair.  They
+    can still support a short zoom/blur bridge when the independently measured
+    pose and silhouette agree, every hard flag is effect-maskable framing, and
+    exact adjacent-frame motion evidence exists.  The downstream transition
+    planner and rendered-pixel QA remain mandatory.
+    """
+
+    flags = frozenset(str(value) for value in severe_flags)
+    if (
+        not flags
+        or not continuous_official_portrait_fancam_contract
+        or not cross_source_edge
+        or not actual_pose
+        or pose_mismatch is None
+        or pose_mismatch
+        > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+        or silhouette_mismatch is None
+        or silhouette_mismatch
+        > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+        or base_mismatch
+        > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+        or not flags <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
+        or not flags
+        & {
+            "attention_position",
+            "attention_scale",
+            "cross_source_silhouette_mismatch",
+        }
+        or outgoing_source_geometry is None
+        or incoming_source_geometry is None
+        or not timestamp_bound_adjacent
+        or transform_repair is not None
+    ):
+        return None
+    outgoing_is_landscape = bool(
+        outgoing_source_geometry.source_width
+        > outgoing_source_geometry.source_height
+    )
+    incoming_is_landscape = bool(
+        incoming_source_geometry.source_width
+        > incoming_source_geometry.source_height
+    )
+    if not (outgoing_is_landscape or incoming_is_landscape):
+        return None
+    return DirectMemberCinematicBridge(
+        style=("horizontal_blur" if outgoing_is_landscape else "zoom_in"),
+        outgoing_is_landscape=outgoing_is_landscape,
+        incoming_is_landscape=incoming_is_landscape,
+        authorized_severe_flags=tuple(severe_flags),
+        pose_mismatch=float(pose_mismatch),
+        silhouette_mismatch=float(silhouette_mismatch),
+        base_mismatch=float(base_mismatch),
+    )
+
+
+def _exceptional_nonpriority_cinematic_bridge(
+    mismatch: DirectBoundaryMismatch,
+) -> bool:
+    """Admit a non-highlight effect only for unusually close pose/body matches.
+
+    Every coarse direct-member boundary is still rhythm-derived.  Highlight
+    boundaries may use the ordinary cinematic bridge contract; elsewhere the
+    match must satisfy this narrower scalar envelope.  This prevents source
+    diversity from turning an arbitrary weak edge into an effect cut while
+    allowing a frame-proven close-up insert when the musical highlight labels
+    are incomplete near an outro or bridge section.
+    """
+
+    bridge = mismatch.cinematic_bridge
+    return bool(
+        bridge is not None
+        and bridge.pose_mismatch
+        <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+        and bridge.silhouette_mismatch
+        <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
+        + 1e-9
+        and bridge.base_mismatch
+        <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4062,51 +4177,25 @@ def _boundary_mismatch(
     if not available:
         severe_flags.append("no_geometry_evidence")
     severe_flags = list(dict.fromkeys(severe_flags))
-    cinematic_bridge: DirectMemberCinematicBridge | None = None
-    if (
-        severe_flags
-        and official_face_pair
-        and actual_pose
-        and pose is not None
-        and pose
-        <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
-        and silhouette is not None
-        and silhouette
-        <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
-        + 1e-9
-        and base <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
-        and frozenset(severe_flags)
-        <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
-        and bool(
-            frozenset(severe_flags)
-            & {"attention_position", "attention_scale"}
-        )
-        and outgoing_source_geometry is not None
-        and incoming_source_geometry is not None
-        and (
-            outgoing_source_geometry.source_width
-            > outgoing_source_geometry.source_height
-        )
-        != (
-            incoming_source_geometry.source_width
-            > incoming_source_geometry.source_height
-        )
-        and motion_connection is not None
-        and motion_connection.timestamp_bound_adjacent
-    ):
-        outgoing_is_landscape = bool(
-            outgoing_source_geometry.source_width
-            > outgoing_source_geometry.source_height
-        )
-        cinematic_bridge = DirectMemberCinematicBridge(
-            style=("horizontal_blur" if outgoing_is_landscape else "zoom_in"),
-            outgoing_is_landscape=outgoing_is_landscape,
-            incoming_is_landscape=not outgoing_is_landscape,
-            authorized_severe_flags=tuple(severe_flags),
-            pose_mismatch=float(pose),
-            silhouette_mismatch=float(silhouette),
-            base_mismatch=float(base),
-        )
+    cinematic_bridge = _cinematic_bridge_from_verified_evidence(
+        severe_flags=severe_flags,
+        continuous_official_portrait_fancam_contract=(
+            continuous_official_portrait_fancam_contract
+        ),
+        cross_source_edge=cross_source_edge,
+        actual_pose=actual_pose,
+        pose_mismatch=pose,
+        silhouette_mismatch=silhouette,
+        base_mismatch=base,
+        outgoing_source_geometry=outgoing_source_geometry,
+        incoming_source_geometry=incoming_source_geometry,
+        timestamp_bound_adjacent=bool(
+            motion_connection is not None
+            and motion_connection.timestamp_bound_adjacent
+        ),
+        transform_repair=transform_repair,
+    )
+    if cinematic_bridge is not None:
         warning_flags.append("cinematic_effect_bridge_required")
     warning_flags = list(dict.fromkeys(warning_flags))
     cost = base
@@ -7358,12 +7447,14 @@ def _heterogeneous_cinematic_visual_path(
     Landscape facecams receive a small, guaranteed highlight allocation while
     portrait performance fancams carry the continuous edit.  A raw severe edge
     is admitted only when ``DirectMemberCinematicBridge`` proves that the
-    remaining discrepancy is framing-only and the outgoing handle is itself a
-    content-valid span.  When ``require_cinematic_bridge`` is false, severe
-    edges remain entirely forbidden and this solver only replaces mechanically
-    exact source quotas with hard role-aware exposure bounds.  When true, at
-    least one selected severe edge must carry the downstream-verified
-    zoom/blur overlap contract.
+    remaining discrepancy is framing-only.  The outgoing overlap handle is
+    deliberately not approximated with whole-span validity here: the
+    transition planner independently verifies its exact adjacent frames,
+    quality, source clocks, and native-cut clearance.  When
+    ``require_cinematic_bridge`` is false, severe edges remain entirely
+    forbidden and this solver only replaces mechanically exact source quotas
+    with hard role-aware exposure bounds.  When true, at least one selected
+    severe edge must carry that downstream-verified zoom/blur contract.
     """
 
     try:
@@ -7413,6 +7504,11 @@ def _heterogeneous_cinematic_visual_path(
         if geometric_portrait_sources
         else tuple(range(source_count))
     )
+    highlight_only_landscape_sources = (
+        landscape_sources
+        if _DIRECT_MEMBER_ROLE_LANDSCAPE_HIGHLIGHT_ONLY
+        else ()
+    )
     high_resolution_portrait_sources = tuple(
         index
         for index in portrait_sources
@@ -7427,15 +7523,41 @@ def _heterogeneous_cinematic_visual_path(
     priority_boundaries = frozenset(
         int(value) for value in priority_cut_boundary_indices
     )
-    if require_cinematic_bridge and not priority_boundaries:
-        return None
-    if landscape_sources and not priority_boundaries:
+    exceptional_nonpriority_bridge_boundaries = (
+        frozenset(
+            boundary_index
+            for boundary_index, matrix in enumerate(matrices)
+            if boundary_index not in priority_boundaries
+            and any(
+                left_source != right_source
+                and _exceptional_nonpriority_cinematic_bridge(
+                    matrix[left_source][right_source]
+                )
+                for left_source in range(source_count)
+                for right_source in range(source_count)
+            )
+        )
+        if require_cinematic_bridge
+        else frozenset()
+    )
+    cinematic_bridge_eligible_boundaries = (
+        priority_boundaries | exceptional_nonpriority_bridge_boundaries
+    )
+    if require_cinematic_bridge and not cinematic_bridge_eligible_boundaries:
         return None
     highlight_spans = frozenset(
         span_index
         for boundary_index in priority_boundaries
         for span_index in (boundary_index, boundary_index + 1)
     )
+    exceptional_bridge_spans = frozenset(
+        span_index
+        for boundary_index in exceptional_nonpriority_bridge_boundaries
+        for span_index in (boundary_index, boundary_index + 1)
+    )
+    landscape_allowed_spans = highlight_spans | exceptional_bridge_spans
+    if highlight_only_landscape_sources and not landscape_allowed_spans:
+        return None
 
     average_count = span_count / source_count
     landscape_target = max(1, int(round(average_count * 0.25)))
@@ -7498,7 +7620,15 @@ def _heterogeneous_cinematic_visual_path(
         (
             1
             if source_index in landscape_sources
-            else max(2, int(math.floor(count_targets[source_index] * 0.45)))
+            else max(
+                2,
+                int(
+                    math.floor(
+                        count_targets[source_index]
+                        * _DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MINIMUM_FRACTION
+                    )
+                ),
+            )
         )
         for source_index in range(source_count)
     )
@@ -7506,7 +7636,15 @@ def _heterogeneous_cinematic_visual_path(
         (
             max(landscape_target, int(math.ceil(average_count * 0.65)))
             if source_index in landscape_sources
-            else max(2, int(math.ceil(count_targets[source_index] * 1.50)))
+            else max(
+                2,
+                int(
+                    math.ceil(
+                        count_targets[source_index]
+                        * _DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MAXIMUM_FACTOR
+                    )
+                ),
+            )
         )
         for source_index in range(source_count)
     )
@@ -7517,17 +7655,81 @@ def _heterogeneous_cinematic_visual_path(
         total_duration * target / span_count for target in count_targets
     )
     duration_minimums = tuple(
-        target * (0.25 if source_index in landscape_sources else 0.45)
+        target
+        * (
+            _DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MINIMUM_FRACTION
+            if source_index in landscape_sources
+            else _DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MINIMUM_FRACTION
+        )
         for source_index, target in enumerate(duration_targets)
     )
     duration_maximums = tuple(
-        target * (3.00 if source_index in landscape_sources else 1.65)
+        target
+        * (
+            _DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MAXIMUM_FACTOR
+            if source_index in landscape_sources
+            else _DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MAXIMUM_FACTOR
+        )
         for source_index, target in enumerate(duration_targets)
     )
     maximum_same_source_run_seconds = max(
         config.maximum_same_source_run_seconds,
         _DIRECT_MEMBER_HETEROGENEOUS_MAXIMUM_RUN_SECONDS,
     )
+    maximum_hold_count = min(
+        config.maximum_same_source_hold_count,
+        max(
+            1,
+            int(
+                math.floor(
+                    boundary_count * config.maximum_same_source_hold_fraction
+                )
+            ),
+        ),
+    )
+    role_constraint_diagnostics = {
+        "source_count_targets": list(count_targets),
+        "source_count_minimums": list(count_minimums),
+        "source_count_maximums": list(count_maximums),
+        "source_duration_targets_seconds": list(duration_targets),
+        "source_duration_minimums_seconds": list(duration_minimums),
+        "source_duration_maximums_seconds": list(duration_maximums),
+        "landscape_source_indices": list(geometric_landscape_sources),
+        "portrait_source_indices": list(geometric_portrait_sources),
+        "highlight_only_landscape_source_indices": list(
+            highlight_only_landscape_sources
+        ),
+        "carrier_source_indices": list(portrait_sources),
+        "priority_cut_boundary_indices": sorted(priority_boundaries),
+        "exceptional_nonpriority_cinematic_bridge_boundary_indices": sorted(
+            exceptional_nonpriority_bridge_boundaries
+        ),
+        "cinematic_bridge_eligible_boundary_indices": sorted(
+            cinematic_bridge_eligible_boundaries
+        ),
+        "exceptional_nonpriority_bridge_thresholds": {
+            "maximum_pose_mismatch": (
+                _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH
+            ),
+            "maximum_silhouette_mismatch": (
+                _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
+            ),
+            "maximum_base_mismatch": (
+                _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH
+            ),
+        },
+        "maximum_priority_cut_hold_count": maximum_priority_cut_hold_count,
+        "maximum_same_source_hold_count": maximum_hold_count,
+        "maximum_consecutive_same_source_holds": (
+            config.maximum_consecutive_same_source_holds
+        ),
+        "maximum_same_source_run_seconds": maximum_same_source_run_seconds,
+        "all_sources_minimum_usage_preserved": True,
+        "severe_cross_source_edges_eligible": require_cinematic_bridge,
+        "nonhighlight_landscape_requires_selected_incident_bridge": (
+            require_cinematic_bridge
+        ),
+    }
 
     x_count = span_count * source_count
     upper_x = [1.0] * x_count
@@ -7536,8 +7738,8 @@ def _heterogeneous_cinematic_visual_path(
             if (
                 not candidate_validity[position][source_index]
                 or (
-                    source_index in landscape_sources
-                    and position not in highlight_spans
+                    source_index in highlight_only_landscape_sources
+                    and position not in landscape_allowed_spans
                 )
             ):
                 upper_x[position * source_count + source_index] = 0.0
@@ -7549,6 +7751,24 @@ def _heterogeneous_cinematic_visual_path(
         < count_minimums[source_index]
         for source_index in range(source_count)
     ):
+        if require_cinematic_bridge:
+            raise DirectMemberVisualSelectionError(
+                "cinematic effect-bridge source availability is insufficient",
+                {
+                    "failure": (
+                        "cinematic_bridge_role_source_availability_exhausted"
+                    ),
+                    "constraint_infeasibility_proven": True,
+                    "visual_gates_relaxed": False,
+                    "role_constraints": role_constraint_diagnostics,
+                    "search": {
+                        "strategy": (
+                            "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                        ),
+                        "solver_invoked": False,
+                    },
+                },
+            )
         return None
 
     edge_specs: list[tuple[int, int, int, bool, bool, float]] = []
@@ -7574,8 +7794,12 @@ def _heterogeneous_cinematic_visual_path(
                 mismatch = matrices[boundary_index][left_source][right_source]
                 if (
                     mismatch.cinematic_bridge is not None
-                    and boundary_index in priority_boundaries
-                    and candidate_validity[boundary_index + 1][left_source]
+                    and (
+                        boundary_index in priority_boundaries
+                        or _exceptional_nonpriority_cinematic_bridge(
+                            mismatch
+                        )
+                    )
                 ):
                     bridge_candidates.append(
                         (float(mismatch.cost), left_source, right_source)
@@ -7628,8 +7852,47 @@ def _heterogeneous_cinematic_visual_path(
                     hold_edges_by_boundary[boundary_index].append(edge_index)
                 if is_bridge:
                     bridge_edges_by_boundary[boundary_index].append(edge_index)
-    if any(not values for values in edges_by_boundary):
-        return None
+    empty_edge_boundaries = tuple(
+        index for index, values in enumerate(edges_by_boundary) if not values
+    )
+    if empty_edge_boundaries:
+        if not require_cinematic_bridge:
+            raise DirectMemberVisualSelectionError(
+                "role-aware safe-hold path has an empty boundary edge domain",
+                {
+                    "failure": "role_aware_boundary_edge_domain_exhausted",
+                    "failed_at_segment_index": empty_edge_boundaries[0] + 1,
+                    "empty_boundary_edge_indices": list(
+                        empty_edge_boundaries
+                    ),
+                    "constraint_infeasibility_proven": True,
+                    "visual_gates_relaxed": False,
+                    "role_constraints": role_constraint_diagnostics,
+                    "search": {
+                        "strategy": (
+                            "scipy_highs_role_aware_safe_hold_path_milp_v1"
+                        ),
+                        "solver_invoked": False,
+                    },
+                },
+            )
+        raise DirectMemberVisualSelectionError(
+            "cinematic effect-bridge path has an empty boundary edge domain",
+            {
+                "failure": "cinematic_bridge_boundary_edge_domain_exhausted",
+                "failed_at_segment_index": empty_edge_boundaries[0] + 1,
+                "empty_boundary_edge_indices": list(empty_edge_boundaries),
+                "constraint_infeasibility_proven": True,
+                "visual_gates_relaxed": False,
+                "role_constraints": role_constraint_diagnostics,
+                "search": {
+                    "strategy": (
+                        "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                    ),
+                    "solver_invoked": False,
+                },
+            },
+        )
 
     edge_base = x_count
     ping_specs = tuple(
@@ -7655,7 +7918,7 @@ def _heterogeneous_cinematic_visual_path(
                 order_rank[source_index] * 1e-9
             )
     for edge_index, (
-        _boundary,
+        boundary_index,
         _left,
         right,
         is_hold,
@@ -7667,6 +7930,11 @@ def _heterogeneous_cinematic_visual_path(
             + (
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_COST_PENALTY
                 if is_bridge
+                else 0.0
+            )
+            + (
+                _DIRECT_MEMBER_CINEMATIC_BRIDGE_NONPRIORITY_COST_PENALTY
+                if is_bridge and boundary_index not in priority_boundaries
                 else 0.0
             )
             + (max(2.0, config.same_source_hold_penalty) if is_hold else 0.0)
@@ -7786,6 +8054,49 @@ def _heterogeneous_cinematic_visual_path(
                 -math.inf,
                 0.0,
             )
+    # A landscape facecam outside an annotated highlight is available only as
+    # a frame-proven effect insert.  Merely being adjacent to some exceptional
+    # candidate must not let the optimizer start or coast on that source
+    # without actually selecting its required bridge edge.
+    if require_cinematic_bridge:
+        for position in range(span_count):
+            if position in highlight_spans:
+                continue
+            for source_index in highlight_only_landscape_sources:
+                variable = position * source_count + source_index
+                if upper_x[variable] <= 0.5:
+                    continue
+                incident_bridge_edges = tuple(
+                    edge_index
+                    for edge_index, (
+                        boundary_index,
+                        left_source,
+                        right_source,
+                        _is_hold,
+                        is_bridge,
+                        _cost,
+                    ) in enumerate(edge_specs)
+                    if is_bridge
+                    and (
+                        (
+                            boundary_index == position - 1
+                            and right_source == source_index
+                        )
+                        or (
+                            boundary_index == position
+                            and left_source == source_index
+                        )
+                    )
+                )
+                add_constraint(
+                    ((variable, 1.0),)
+                    + tuple(
+                        (edge_base + edge_index, -1.0)
+                        for edge_index in incident_bridge_edges
+                    ),
+                    -math.inf,
+                    0.0,
+                )
     for ping_index, (position, source_index) in enumerate(ping_specs):
         ping_variable = ping_base + ping_index
         current = position * source_count + source_index
@@ -7817,17 +8128,6 @@ def _heterogeneous_cinematic_visual_path(
             math.inf,
         )
 
-    maximum_hold_count = min(
-        config.maximum_same_source_hold_count,
-        max(
-            1,
-            int(
-                math.floor(
-                    boundary_count * config.maximum_same_source_hold_fraction
-                )
-            ),
-        ),
-    )
     hold_variables = tuple(
         (edge_base + edge_index, 1.0)
         for values in hold_edges_by_boundary
@@ -7884,22 +8184,54 @@ def _heterogeneous_cinematic_visual_path(
         for edge_index in values
     )
     if require_cinematic_bridge and not bridge_variables:
-        return None
+        raise DirectMemberVisualSelectionError(
+            "cinematic effect-bridge path has no eligible effect edge",
+            {
+                "failure": "cinematic_bridge_edge_domain_exhausted",
+                "constraint_infeasibility_proven": True,
+                "visual_gates_relaxed": False,
+                "role_constraints": role_constraint_diagnostics,
+                "search": {
+                    "strategy": (
+                        "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                    ),
+                    "solver_invoked": False,
+                },
+            },
+        )
     if bridge_variables:
         add_constraint(
             bridge_variables,
             1.0 if require_cinematic_bridge else 0.0,
             float(_DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT),
         )
-    gap = _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_BOUNDARY_GAP
-    for start in range(max(0, boundary_count - gap + 1)):
-        window = tuple(
-            (edge_base + edge_index, 1.0)
-            for boundary_index in range(start, start + gap)
-            for edge_index in bridge_edges_by_boundary[boundary_index]
-        )
-        if window:
-            add_constraint(window, 0.0, 1.0)
+    boundary_master_offsets: list[float] = []
+    elapsed_seconds = 0.0
+    for duration in durations[:-1]:
+        elapsed_seconds += duration
+        boundary_master_offsets.append(elapsed_seconds)
+    for left_boundary in range(boundary_count):
+        if not bridge_edges_by_boundary[left_boundary]:
+            continue
+        for right_boundary in range(left_boundary + 1, boundary_count):
+            if not bridge_edges_by_boundary[right_boundary]:
+                continue
+            separation_seconds = (
+                boundary_master_offsets[right_boundary]
+                - boundary_master_offsets[left_boundary]
+            )
+            if (
+                separation_seconds
+                + 1e-9
+                >= _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
+            ):
+                continue
+            pair = tuple(
+                (edge_base + edge_index, 1.0)
+                for boundary_index in (left_boundary, right_boundary)
+                for edge_index in bridge_edges_by_boundary[boundary_index]
+            )
+            add_constraint(pair, 0.0, 1.0)
 
     matrix = coo_array(
         (
@@ -7955,7 +8287,39 @@ def _heterogeneous_cinematic_visual_path(
         "postsolve_path_audit_required": True,
     }
     if status == 2:
-        return None
+        if not require_cinematic_bridge:
+            raise DirectMemberVisualSelectionError(
+                "role-aware safe-hold MILP proved its exposure path infeasible",
+                {
+                    "failure": "role_aware_safe_hold_path_infeasible",
+                    "failed_at_segment_index": span_count - 1,
+                    "constraint_infeasibility_proven": True,
+                    "visual_gates_relaxed": False,
+                    "role_constraints": role_constraint_diagnostics,
+                    "search": {
+                        "strategy": (
+                            "scipy_highs_role_aware_safe_hold_path_milp_v1"
+                        ),
+                        "solver": solver_diagnostics,
+                    },
+                },
+            )
+        raise DirectMemberVisualSelectionError(
+            "cinematic effect-bridge MILP proved its role path infeasible",
+            {
+                "failure": "cinematic_bridge_path_infeasible",
+                "failed_at_segment_index": span_count - 1,
+                "constraint_infeasibility_proven": True,
+                "visual_gates_relaxed": False,
+                "role_constraints": role_constraint_diagnostics,
+                "search": {
+                    "strategy": (
+                        "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                    ),
+                    "solver": solver_diagnostics,
+                },
+            },
+        )
     if solution is None:
         raise DirectMemberVisualSelectionError(
             "role-aware direct member MILP exhausted bounded solver capacity",
@@ -8029,10 +8393,24 @@ def _heterogeneous_cinematic_visual_path(
     ):
         audit_failures.append("content_invalid_choice")
     if any(
-        source_index in landscape_sources and position not in highlight_spans
+        source_index in highlight_only_landscape_sources
+        and position not in landscape_allowed_spans
         for position, source_index in enumerate(path)
     ):
-        audit_failures.append("landscape_facecam_outside_highlight")
+        audit_failures.append(
+            "landscape_facecam_outside_highlight_or_verified_bridge_span"
+        )
+    if any(
+        source_index in highlight_only_landscape_sources
+        and position not in highlight_spans
+        and not (
+            position - 1 in bridge_indices or position in bridge_indices
+        )
+        for position, source_index in enumerate(path)
+    ):
+        audit_failures.append(
+            "nonhighlight_landscape_without_selected_incident_bridge"
+        )
     if len(hold_indices) > maximum_hold_count:
         audit_failures.append("maximum_same_source_hold_count_exceeded")
     measured_maximum_run_seconds = max(
@@ -8063,10 +8441,19 @@ def _heterogeneous_cinematic_visual_path(
             audit_failures.append("cinematic_bridge_count_invalid")
     elif bridge_indices:
         audit_failures.append("unexpected_cinematic_bridge")
-    if any(index not in priority_boundaries for index in bridge_indices):
-        audit_failures.append("cinematic_bridge_outside_highlight")
     if any(
-        right - left < _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_BOUNDARY_GAP
+        index not in priority_boundaries
+        and not _exceptional_nonpriority_cinematic_bridge(
+            matrices[index][path[index]][path[index + 1]]
+        )
+        for index in bridge_indices
+    ):
+        audit_failures.append("cinematic_bridge_outside_eligible_boundary")
+    if any(
+        boundary_master_offsets[right]
+        - boundary_master_offsets[left]
+        + 1e-9
+        < _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
         for left, right in zip(bridge_indices, bridge_indices[1:])
     ):
         audit_failures.append("cinematic_bridge_spacing_missed")
@@ -8076,12 +8463,12 @@ def _heterogeneous_cinematic_visual_path(
             if (
                 mismatch.cinematic_bridge is None
                 or boundary_index not in bridge_indices
-                or not candidate_validity[boundary_index + 1][left]
             ):
                 audit_failures.append("uncontracted_severe_edge_selected")
                 break
     solver_diagnostics["postsolve_path_audit_passed"] = not audit_failures
     solver_diagnostics["postsolve_path_audit_failures"] = audit_failures
+    solver_diagnostics["postsolve_witness_path"] = list(path)
     if audit_failures:
         raise DirectMemberVisualSelectionError(
             "role-aware direct member MILP witness failed independent audit",
@@ -8113,7 +8500,7 @@ def _heterogeneous_cinematic_visual_path(
                 else "scipy_highs_role_aware_safe_hold_path_milp_v1"
             ),
             "selection_basis": (
-                "all_source_role_aware_highlight_facecam_effect_bridge"
+                "all_source_role_aware_musical_or_verified_effect_bridge"
                 if require_cinematic_bridge
                 else "all_source_role_aware_nonsevere_cut_and_bounded_hold"
             ),
@@ -8132,7 +8519,7 @@ def _heterogeneous_cinematic_visual_path(
             "landscape_source_indices": list(geometric_landscape_sources),
             "portrait_source_indices": list(geometric_portrait_sources),
             "highlight_only_landscape_source_indices": list(
-                landscape_sources
+                highlight_only_landscape_sources
             ),
             "carrier_source_indices": list(portrait_sources),
             "high_resolution_portrait_source_indices": list(
@@ -8147,7 +8534,27 @@ def _heterogeneous_cinematic_visual_path(
                 "native_output_resolution_weight": 1.0,
                 "all_sources_minimum_usage_preserved": True,
             },
-            "landscape_highlight_only": True,
+            "landscape_highlight_only": bool(
+                highlight_only_landscape_sources
+                and all(
+                    position in highlight_spans
+                    for position, source_index in enumerate(path)
+                    if source_index in highlight_only_landscape_sources
+                )
+            ),
+            "landscape_placement_policy": (
+                "highlight_or_exceptional_pose_silhouette_effect_bridge_v1"
+                if require_cinematic_bridge
+                else "highlight_only_nonsevere_v1"
+            ),
+            "exceptional_nonpriority_cinematic_bridge_boundary_indices": sorted(
+                exceptional_nonpriority_bridge_boundaries
+            ),
+            "selected_nonpriority_cinematic_bridge_boundary_indices": [
+                index
+                for index in bridge_indices
+                if index not in priority_boundaries
+            ],
             "same_source_hold_count": len(hold_indices),
             "same_source_hold_boundary_indices": list(hold_indices),
             "maximum_same_source_run_seconds": (
@@ -8163,6 +8570,9 @@ def _heterogeneous_cinematic_visual_path(
             "cinematic_bridge_count": len(bridge_indices),
             "maximum_cinematic_bridge_count": (
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
+            ),
+            "minimum_cinematic_bridge_separation_seconds": (
+                _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
             ),
             "cinematic_bridge_hard_cut_authorized": False,
             "required_transition_effect": require_cinematic_bridge,
@@ -9438,55 +9848,68 @@ def select_balanced_direct_member_sources(
         else:
             role_aware_safe_hold_authorized = bool(
                 hold_fallback_authorized
+                and resolved_config.maximum_same_source_hold_count > 0
                 and all(
                     geometry is not None
                     for geometry in source_frame_geometries
                 )
             )
-            role_aware_safe_hold_fallback = (
-                _heterogeneous_cinematic_visual_path(
-                    matrices,
-                    source_order=order,
-                    candidate_validity=candidate_validity,
-                    span_durations=tuple(
-                        end - start for start, end in spans
-                    ),
-                    source_geometries=source_frame_geometries,
-                    priority_cut_boundary_indices=priority_boundaries,
-                    maximum_priority_cut_hold_count=(
-                        maximum_priority_cut_hold_count
-                    ),
-                    config=resolved_config,
-                    require_cinematic_bridge=False,
-                )
-                if role_aware_safe_hold_authorized
-                else None
-            )
+            role_aware_safe_hold_fallback = None
+            role_aware_safe_hold_error: (
+                DirectMemberVisualSelectionError | None
+            ) = None
+            if role_aware_safe_hold_authorized:
+                try:
+                    role_aware_safe_hold_fallback = (
+                        _heterogeneous_cinematic_visual_path(
+                            matrices,
+                            source_order=order,
+                            candidate_validity=candidate_validity,
+                            span_durations=tuple(
+                                end - start for start, end in spans
+                            ),
+                            source_geometries=source_frame_geometries,
+                            priority_cut_boundary_indices=priority_boundaries,
+                            maximum_priority_cut_hold_count=(
+                                maximum_priority_cut_hold_count
+                            ),
+                            config=resolved_config,
+                            require_cinematic_bridge=False,
+                        )
+                    )
+                except DirectMemberVisualSelectionError as caught:
+                    role_aware_safe_hold_error = caught
             heterogeneous_fallback_authorized = bool(
                 hold_fallback_authorized
                 and heterogeneous_cinematic_authorized
             )
-            heterogeneous_fallback = (
-                _heterogeneous_cinematic_visual_path(
-                    matrices,
-                    source_order=order,
-                    candidate_validity=candidate_validity,
-                    span_durations=tuple(
-                        end - start for start, end in spans
-                    ),
-                    source_geometries=source_frame_geometries,
-                    priority_cut_boundary_indices=priority_boundaries,
-                    maximum_priority_cut_hold_count=(
-                        maximum_priority_cut_hold_count
-                    ),
-                    config=resolved_config,
-                )
-                if (
-                    role_aware_safe_hold_fallback is None
-                    and heterogeneous_fallback_authorized
-                )
-                else None
-            )
+            heterogeneous_fallback = None
+            heterogeneous_fallback_error: (
+                DirectMemberVisualSelectionError | None
+            ) = None
+            if (
+                role_aware_safe_hold_fallback is None
+                and heterogeneous_fallback_authorized
+            ):
+                try:
+                    heterogeneous_fallback = (
+                        _heterogeneous_cinematic_visual_path(
+                            matrices,
+                            source_order=order,
+                            candidate_validity=candidate_validity,
+                            span_durations=tuple(
+                                end - start for start, end in spans
+                            ),
+                            source_geometries=source_frame_geometries,
+                            priority_cut_boundary_indices=priority_boundaries,
+                            maximum_priority_cut_hold_count=(
+                                maximum_priority_cut_hold_count
+                            ),
+                            config=resolved_config,
+                        )
+                    )
+                except DirectMemberVisualSelectionError as caught:
+                    heterogeneous_fallback_error = caught
             role_aware_fallback = (
                 role_aware_safe_hold_fallback
                 if role_aware_safe_hold_fallback is not None
@@ -9561,7 +9984,53 @@ def select_balanced_direct_member_sources(
                 # the complete validity diagnostics still exist, so a failed
                 # run never needs another expensive descriptor pass merely to
                 # diagnose feasibility.
-                diagnostics = dict(error.diagnostics)
+                primary_fallback_error = (
+                    heterogeneous_fallback_error
+                    or role_aware_safe_hold_error
+                    or error
+                )
+                diagnostics = dict(primary_fallback_error.diagnostics)
+                diagnostics.setdefault(
+                    "strict_cross_source_failure",
+                    strict_failure_summary,
+                )
+                diagnostics["role_aware_safe_hold_failure"] = (
+                    {
+                        "message": str(role_aware_safe_hold_error),
+                        "failure": role_aware_safe_hold_error.diagnostics.get(
+                            "failure"
+                        ),
+                        "constraint_infeasibility_proven": (
+                            role_aware_safe_hold_error.diagnostics.get(
+                                "constraint_infeasibility_proven"
+                            )
+                        ),
+                        "search": role_aware_safe_hold_error.diagnostics.get(
+                            "search"
+                        ),
+                    }
+                    if role_aware_safe_hold_error is not None
+                    else None
+                )
+                diagnostics["heterogeneous_cinematic_failure"] = (
+                    {
+                        "message": str(heterogeneous_fallback_error),
+                        "failure": heterogeneous_fallback_error.diagnostics.get(
+                            "failure"
+                        ),
+                        "constraint_infeasibility_proven": (
+                            heterogeneous_fallback_error.diagnostics.get(
+                                "constraint_infeasibility_proven"
+                            )
+                        ),
+                        "search": heterogeneous_fallback_error.diagnostics.get(
+                            "search"
+                        ),
+                    }
+                    if heterogeneous_fallback_error is not None
+                    else None
+                )
+                diagnostics.setdefault("source_quotas", list(quotas))
                 diagnostics.setdefault(
                     "span_content_validity",
                     [span.to_dict() for span in span_diagnostics],
@@ -9642,9 +10111,9 @@ def select_balanced_direct_member_sources(
                     },
                 )
                 raise DirectMemberVisualSelectionError(
-                    str(error),
+                    str(primary_fallback_error),
                     diagnostics,
-                ) from error
+                ) from primary_fallback_error
     optimizer_search_diagnostics = {
         **optimizer_search_diagnostics,
         "hard_boundary_connectivity": hard_boundary_connectivity,

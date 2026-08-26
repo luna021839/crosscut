@@ -194,10 +194,36 @@ def _selection(
     )
 
 
-def _cinematic_selection(*, style: str = "zoom_in"):
+def _cinematic_selection(
+    *,
+    style: str = "zoom_in",
+    cross_attention_basis: bool = False,
+):
     selection = _selection((0, 1))
     selection.usage_policy = "heterogeneous_role_aware_cinematic_v1"
     boundary = selection.boundaries[0]
+    if cross_attention_basis:
+        incoming = boundary.incoming_sample
+        descriptor = replace(
+            incoming.descriptor,
+            face_count=0,
+            face_detector_backend="none",
+            primary_face_bbox=None,
+        )
+        assert descriptor.silhouette_bbox_xywh is not None
+        box = descriptor.silhouette_bbox_xywh
+        boundary.incoming_sample = replace(
+            incoming,
+            descriptor=descriptor,
+            attention=_AttentionGeometry(
+                bbox_xywh=box,
+                centroid_xy=(
+                    box[0] + box[2] / 2.0,
+                    box[1] + box[3] / 2.0,
+                ),
+                basis="aggregate_human_silhouette",
+            ),
+        )
     severe_flags = ("attention_position", "attention_scale")
     boundary.mismatch.severe_flags = severe_flags
     boundary.mismatch.warning_flags = (
@@ -584,6 +610,39 @@ class DirectMemberTransitionTests(unittest.TestCase):
                     member_pose_dissolve_count=0,
                 )
                 self.assertIn(filter_token, build_filter_graph(render_plan))
+
+    def test_required_bridge_accepts_verified_cross_attention_basis(self) -> None:
+        transition_plan = _plan(
+            (0, 1),
+            selection=_cinematic_selection(cross_attention_basis=True),
+            highlight_intervals=((3.5, 4.5),),
+        )
+
+        self.assertEqual(transition_plan.cinematic_bridge_count, 1)
+        self.assertTrue(
+            transition_plan.decisions[0].required_cinematic_bridge
+        )
+        self.assertEqual(
+            transition_plan.decisions[0].attention_basis,
+            "verified_cross_basis_pose_silhouette_effect_bridge",
+        )
+
+    def test_required_bridge_audits_short_outgoing_handle_independently(self) -> None:
+        selection = _cinematic_selection()
+        outgoing_future = selection.span_validity[1].sources[0]
+        outgoing_future.valid = False
+
+        transition_plan = _plan(
+            (0, 1),
+            selection=selection,
+            highlight_intervals=((3.5, 4.5),),
+        )
+
+        self.assertEqual(transition_plan.cinematic_bridge_count, 1)
+        self.assertNotIn(
+            "cinematic_bridge_outgoing_future_content_invalid",
+            transition_plan.decisions[0].rejection_reasons,
+        )
 
     def test_required_cinematic_bridge_never_degrades_to_hard_cut(self) -> None:
         with self.assertRaisesRegex(

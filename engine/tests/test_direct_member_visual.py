@@ -15,6 +15,7 @@ from crosscut.direct_member_visual import (
     _VideoDescriptorProvider,
     _balanced_visual_path,
     _bounded_same_source_hold_visual_path,
+    _cinematic_bridge_from_verified_evidence,
     _exact_feasibility_lifeline,
     _hard_boundary_connectivity_diagnostics,
     _hard_boundary_forward_exhaustion_boundary,
@@ -218,6 +219,235 @@ def _linear_timewarp(
 
 
 class DirectMemberVisualTests(unittest.TestCase):
+    def test_cross_basis_pose_safe_fancam_edge_requires_effect_bridge(
+        self,
+    ) -> None:
+        portrait = direct_member_source_frame_geometry((2160, 3840))
+        landscape = direct_member_source_frame_geometry((3840, 2160))
+
+        bridge = _cinematic_bridge_from_verified_evidence(
+            severe_flags=(
+                "attention_scale",
+                "formation",
+                "cross_source_silhouette_mismatch",
+            ),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=True,
+            pose_mismatch=0.19,
+            silhouette_mismatch=0.44,
+            base_mismatch=0.48,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=landscape,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+        )
+
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertEqual(bridge.style, "zoom_in")
+        self.assertFalse(bridge.outgoing_is_landscape)
+        self.assertTrue(bridge.incoming_is_landscape)
+        self.assertFalse(bridge.to_dict()["hard_cut_authorized"])
+        self.assertTrue(bridge.to_dict()["required_transition_effect"])
+
+        facecam_bridge = _cinematic_bridge_from_verified_evidence(
+            severe_flags=(
+                "attention_position",
+                "attention_scale",
+                "cross_source_silhouette_mismatch",
+            ),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=True,
+            pose_mismatch=0.13,
+            silhouette_mismatch=0.43,
+            base_mismatch=0.45,
+            outgoing_source_geometry=landscape,
+            incoming_source_geometry=landscape,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+        )
+        self.assertIsNotNone(facecam_bridge)
+        assert facecam_bridge is not None
+        self.assertEqual(facecam_bridge.style, "horizontal_blur")
+
+        portrait_only = _cinematic_bridge_from_verified_evidence(
+            severe_flags=("attention_scale",),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=True,
+            pose_mismatch=0.13,
+            silhouette_mismatch=0.25,
+            base_mismatch=0.35,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=portrait,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+        )
+        self.assertIsNone(portrait_only)
+
+        blocked = _cinematic_bridge_from_verified_evidence(
+            severe_flags=("attention_scale", "pose_phase_discontinuity"),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=True,
+            pose_mismatch=0.19,
+            silhouette_mismatch=0.30,
+            base_mismatch=0.42,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=landscape,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+        )
+        self.assertIsNone(blocked)
+
+    def test_cinematic_solver_uses_exact_handle_not_whole_future_span(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.50, severe=True)
+        bridge = DirectMemberCinematicBridge(
+            style="zoom_in",
+            outgoing_is_landscape=False,
+            incoming_is_landscape=True,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.16,
+            silhouette_mismatch=0.24,
+            base_mismatch=0.35,
+        )
+        bridge_edge = replace(
+            severe,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=bridge,
+        )
+        matrices = (
+            ((safe, severe), (severe, safe)),
+            ((safe, bridge_edge), (severe, safe)),
+            ((safe, severe), (safe, safe)),
+        )
+        validity = (
+            (True, False),
+            (True, False),
+            (False, True),
+            (True, False),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1),
+            candidate_validity=validity,
+            span_durations=(1.0, 1.0, 1.0, 1.0),
+            source_geometries=(
+                direct_member_source_frame_geometry((2160, 3840)),
+                direct_member_source_frame_geometry((3840, 2160)),
+            ),
+            priority_cut_boundary_indices=(1,),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(path, (0, 0, 1, 0))
+        self.assertEqual(diagnostics["cinematic_bridge_boundary_indices"], [1])
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+
+    def test_exceptional_nonpriority_bridges_use_elapsed_seconds(self) -> None:
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.50, severe=True)
+        incoming_bridge = DirectMemberCinematicBridge(
+            style="zoom_in",
+            outgoing_is_landscape=False,
+            incoming_is_landscape=True,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.12,
+            silhouette_mismatch=0.18,
+            base_mismatch=0.30,
+        )
+        outgoing_bridge = DirectMemberCinematicBridge(
+            style="horizontal_blur",
+            outgoing_is_landscape=True,
+            incoming_is_landscape=False,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.13,
+            silhouette_mismatch=0.19,
+            base_mismatch=0.31,
+        )
+        incoming_edge = replace(
+            severe,
+            cost=0.30,
+            base_mismatch=0.30,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=incoming_bridge,
+        )
+        outgoing_edge = replace(
+            severe,
+            cost=0.31,
+            base_mismatch=0.31,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=outgoing_bridge,
+        )
+        matrices = (
+            ((safe, severe), (severe, safe)),
+            ((safe, incoming_edge), (severe, safe)),
+            ((safe, severe), (outgoing_edge, safe)),
+        )
+        validity = (
+            (True, False),
+            (True, False),
+            (False, True),
+            (True, False),
+        )
+        geometries = (
+            direct_member_source_frame_geometry((2160, 3840)),
+            direct_member_source_frame_geometry((3840, 2160)),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1),
+            candidate_validity=validity,
+            span_durations=(1.0, 1.0, 3.81, 1.0),
+            source_geometries=geometries,
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(path, (0, 0, 1, 0))
+        self.assertEqual(
+            diagnostics[
+                "selected_nonpriority_cinematic_bridge_boundary_indices"
+            ],
+            [1, 2],
+        )
+        self.assertEqual(
+            diagnostics["minimum_cinematic_bridge_separation_seconds"],
+            3.0,
+        )
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+
+        with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+            _heterogeneous_cinematic_visual_path(
+                matrices,
+                source_order=(0, 1),
+                candidate_validity=validity,
+                span_durations=(1.0, 1.0, 2.0, 1.0),
+                source_geometries=geometries,
+                priority_cut_boundary_indices=(),
+                maximum_priority_cut_hold_count=0,
+                config=DirectMemberVisualConfig(),
+            )
+        self.assertEqual(
+            raised.exception.diagnostics["failure"],
+            "cinematic_bridge_path_infeasible",
+        )
+
     def test_heterogeneous_facecams_use_highlight_block_with_required_bridges(
         self,
     ) -> None:
@@ -480,6 +710,51 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(diagnostics["landscape_source_indices"], [])
         self.assertEqual(diagnostics["carrier_source_indices"], [0, 1, 2])
         self.assertEqual(diagnostics["cinematic_bridge_count"], 0)
+
+    def test_role_aware_safe_hold_persists_proven_milp_failure(self) -> None:
+        source_count = 3
+        span_count = 9
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.04, severe=True)
+        matrices = tuple(
+            tuple(
+                tuple(
+                    safe if left == right else severe
+                    for right in range(source_count)
+                )
+                for left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        geometries = tuple(
+            direct_member_source_frame_geometry((2160, 3840))
+            for _source_index in range(source_count)
+        )
+
+        with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+            _heterogeneous_cinematic_visual_path(
+                matrices,
+                source_order=(0, 1, 2),
+                candidate_validity=((True,) * source_count,) * span_count,
+                span_durations=(1.0,) * span_count,
+                source_geometries=geometries,
+                priority_cut_boundary_indices=(),
+                maximum_priority_cut_hold_count=0,
+                config=DirectMemberVisualConfig(),
+                require_cinematic_bridge=False,
+            )
+
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(
+            diagnostics["failure"],
+            "role_aware_safe_hold_path_infeasible",
+        )
+        self.assertTrue(diagnostics["constraint_infeasibility_proven"])
+        self.assertEqual(
+            diagnostics["role_constraints"]["maximum_same_source_hold_count"],
+            1,
+        )
+        self.assertEqual(diagnostics["search"]["solver"]["status"], 2)
 
     def test_large_exact_path_uses_audited_sparse_milp_without_beam(self) -> None:
         source_count = 6
@@ -893,6 +1168,145 @@ class DirectMemberVisualTests(unittest.TestCase):
             ["authorization_basis"].endswith(
                 "role_aware_all_source_bounds_v1"
             )
+        )
+
+    def test_role_aware_fallback_stays_deferred_when_holds_are_disabled(
+        self,
+    ) -> None:
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict path failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "exact_lifeline": {
+                        "strategy": "scipy_highs_binary_path_milp_v1",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    }
+                },
+            },
+        )
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=None,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_heterogeneous_cinematic_visual_path",
+        ) as role_search:
+            with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+                select_balanced_direct_member_sources(
+                    sources=(Path("zero.mp4"), Path("one.mp4")),
+                    canonical_spans=(
+                        (0.0, 1.0),
+                        (1.0, 2.0),
+                        (2.0, 3.0),
+                        (3.0, 4.0),
+                    ),
+                    audio_offsets=(0.0, 0.0),
+                    source_frame_sizes=((2160, 3840), (2160, 3840)),
+                    output_frame_size=(1080, 1920),
+                    config=DirectMemberVisualConfig(
+                        beam_width=200,
+                        maximum_same_source_hold_count=0,
+                    ),
+                    descriptor_provider=(
+                        lambda source_index, _source, _time: _descriptor(
+                            0.20 + source_index * 0.01
+                        )
+                    ),
+                )
+
+        role_search.assert_not_called()
+        self.assertEqual(
+            raised.exception.diagnostics["failure"],
+            "validity_quota_path_exhausted",
+        )
+
+    def test_selector_persists_role_and_cinematic_milp_failures(self) -> None:
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict path failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "exact_lifeline": {
+                        "strategy": "scipy_highs_binary_path_milp_v1",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    }
+                },
+            },
+        )
+        role_failure = DirectMemberVisualSelectionError(
+            "role path failed",
+            {
+                "failure": "role_aware_safe_hold_path_infeasible",
+                "constraint_infeasibility_proven": True,
+                "search": {"solver": {"status": 2}},
+            },
+        )
+        cinematic_failure = DirectMemberVisualSelectionError(
+            "cinematic path failed",
+            {
+                "failure": "cinematic_bridge_path_infeasible",
+                "constraint_infeasibility_proven": True,
+                "search": {"solver": {"status": 2}},
+            },
+        )
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=None,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_heterogeneous_cinematic_visual_path",
+            side_effect=(role_failure, cinematic_failure),
+        ) as searches:
+            with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+                select_balanced_direct_member_sources(
+                    sources=(Path("portrait.mp4"), Path("landscape.mp4")),
+                    canonical_spans=(
+                        (0.0, 1.0),
+                        (1.0, 2.0),
+                        (2.0, 3.0),
+                        (3.0, 4.0),
+                    ),
+                    audio_offsets=(0.0, 0.0),
+                    source_frame_sizes=((2160, 3840), (3840, 2160)),
+                    output_frame_size=(1080, 1920),
+                    continuous_official_portrait_fancam_contract=True,
+                    cinematic_bridge_enabled=True,
+                    config=DirectMemberVisualConfig(beam_width=200),
+                    descriptor_provider=(
+                        lambda source_index, _source, _time: _descriptor(
+                            0.20 + source_index * 0.01
+                        )
+                    ),
+                )
+
+        self.assertEqual(searches.call_count, 2)
+        diagnostics = raised.exception.diagnostics
+        self.assertEqual(
+            diagnostics["failure"],
+            "cinematic_bridge_path_infeasible",
+        )
+        self.assertEqual(
+            diagnostics["role_aware_safe_hold_failure"]["failure"],
+            "role_aware_safe_hold_path_infeasible",
+        )
+        self.assertEqual(
+            diagnostics["heterogeneous_cinematic_failure"]["failure"],
+            "cinematic_bridge_path_infeasible",
         )
 
     def test_hard_boundary_connectivity_localizes_only_the_actual_zero_edge(

@@ -49,6 +49,11 @@ _BODY_ATTENTION_BASES = {
     "aggregate_human_silhouette",
     "unambiguous_dominant_person_box_geometry_only",
 }
+_CROSS_BASIS_CINEMATIC_BRIDGE_ATTENTION_BASIS = (
+    "verified_cross_basis_pose_silhouette_effect_bridge"
+)
+_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
+_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,6 +670,65 @@ def _attention_basis_pair(left: Any, right: Any) -> str | None:
     if left_basis == right_basis and left_basis in _BODY_ATTENTION_BASES:
         return str(left_basis)
     return None
+
+
+def _verified_attention_sample_basis(sample: Any) -> str | None:
+    attention = getattr(sample, "attention", None)
+    descriptor = getattr(sample, "descriptor", None)
+    basis = getattr(attention, "basis", None)
+    if attention is None or descriptor is None:
+        return None
+    if basis == _FACE_ATTENTION_BASIS:
+        if (
+            str(getattr(descriptor, "face_detector_backend", "")).casefold()
+            == "yunet"
+            and int(getattr(descriptor, "face_count", 0)) >= 1
+            and getattr(descriptor, "primary_face_bbox", None) is not None
+        ):
+            return _FACE_ATTENTION_BASIS
+        return None
+    if basis == "aggregate_human_silhouette":
+        if (
+            getattr(descriptor, "silhouette_bbox_xywh", None) is not None
+            and float(getattr(descriptor, "silhouette_confidence", 0.0)) > 0.0
+        ):
+            return str(basis)
+        return None
+    if basis == "unambiguous_dominant_person_box_geometry_only":
+        if tuple(getattr(descriptor, "formation_people", ())):
+            return str(basis)
+        return None
+    return None
+
+
+def _required_bridge_attention_basis(
+    left: Any,
+    right: Any,
+    bridge: Any,
+) -> str | None:
+    """Accept unlike attention boxes only under the selector's pose contract."""
+
+    shared = _attention_basis_pair(left, right)
+    if shared is not None:
+        return shared
+    left_basis = _verified_attention_sample_basis(left)
+    right_basis = _verified_attention_sample_basis(right)
+    pose_mismatch = _finite_float(getattr(bridge, "pose_mismatch", None))
+    silhouette_mismatch = _finite_float(
+        getattr(bridge, "silhouette_mismatch", None)
+    )
+    if (
+        left_basis is None
+        or right_basis is None
+        or left_basis == right_basis
+        or pose_mismatch is None
+        or pose_mismatch > _CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+        or silhouette_mismatch is None
+        or silhouette_mismatch
+        > _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+    ):
+        return None
+    return _CROSS_BASIS_CINEMATIC_BRIDGE_ATTENTION_BASIS
 
 
 def _descriptor_shape_mismatches(
@@ -1473,7 +1537,11 @@ def _required_cinematic_bridge_candidate(
     step = 1.0 / fps
     outgoing_sample = getattr(diagnostic, "outgoing_sample", None)
     incoming_sample = getattr(diagnostic, "incoming_sample", None)
-    attention_basis = _attention_basis_pair(outgoing_sample, incoming_sample)
+    attention_basis = _required_bridge_attention_basis(
+        outgoing_sample,
+        incoming_sample,
+        bridge,
+    )
     if attention_basis is None:
         reasons.append("cinematic_bridge_attention_basis_unverified")
     if canonical_master is not None:
@@ -1584,7 +1652,15 @@ def _required_cinematic_bridge_candidate(
             ("outgoing", outgoing_future, outgoing_segment),
             ("incoming", incoming_future, incoming_segment),
         ):
-            if not bool(getattr(future, "valid", False)):
+            # The outgoing source is not rendered for the following full span;
+            # only its short overlap handle is.  Whole-span invalidity can be
+            # caused by a later obstruction or native cut and must not erase a
+            # frame-proven 0.22 s handle.  The selected incoming source still
+            # requires ordinary full-span validity.
+            if (
+                label == "incoming"
+                and not bool(getattr(future, "valid", False))
+            ):
                 reasons.append(f"cinematic_bridge_{label}_future_content_invalid")
             samples = tuple(getattr(future, "samples", ()))[:2]
             if len(samples) != 2:
