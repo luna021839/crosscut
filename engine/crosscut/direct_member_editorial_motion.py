@@ -329,7 +329,15 @@ class DirectMemberDenseFaceProvider:
             subject_box = None
             subject_confidence = 0.0
             subject_basis = "none"
-            if descriptor.primary_face_bbox is not None:
+            if (
+                descriptor.silhouette_bbox_xywh is not None
+                and descriptor.silhouette_confidence >= 0.30
+                and descriptor.silhouette_backend == SILHOUETTE_BACKEND
+            ):
+                subject_box = descriptor.silhouette_bbox_xywh
+                subject_confidence = descriptor.silhouette_confidence
+                subject_basis = "pphumanseg_full_subject_silhouette"
+            elif descriptor.primary_face_bbox is not None:
                 face = descriptor.primary_face_bbox
                 face_center = (
                     face[0] + face[2] / 2.0,
@@ -350,15 +358,6 @@ class DirectMemberDenseFaceProvider:
                     subject_box = associated[0].bbox_xywh
                     subject_confidence = associated[0].detection_confidence
                     subject_basis = "face_associated_formation_person_box"
-            if (
-                subject_box is None
-                and descriptor.silhouette_bbox_xywh is not None
-                and descriptor.silhouette_confidence >= 0.30
-                and descriptor.silhouette_backend == SILHOUETTE_BACKEND
-            ):
-                subject_box = descriptor.silhouette_bbox_xywh
-                subject_confidence = descriptor.silhouette_confidence
-                subject_basis = "pphumanseg_full_subject_silhouette"
             if (
                 descriptor.primary_face_bbox is not None
                 and descriptor.face_count == 1
@@ -459,11 +458,11 @@ class DirectMemberEditorialMotionConfig:
     maximum_residual_center_distance: float = 0.08
     minimum_mismatch_improvement_fraction: float = 0.20
     minimum_face_visible_fraction: float = 0.995
-    minimum_dense_face_visible_fraction: float = 0.995
+    minimum_dense_face_visible_fraction: float = 0.980
     legacy_face_only_maximum_zoom: float = 1.12
     legacy_face_only_maximum_center_shift: float = 0.025
     minimum_widened_subject_confidence: float = 0.30
-    minimum_widened_subject_visible_fraction: float = 0.980
+    minimum_widened_subject_visible_fraction: float = 0.950
     minimum_face_associated_subject_visible_fraction: float = 0.720
     maximum_dense_subject_center_step: float = 0.12
     maximum_dense_subject_height_ratio: float = 1.40

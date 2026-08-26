@@ -201,8 +201,8 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
 
         self.assertEqual(config.maximum_boundary_zoom, 1.50)
         self.assertEqual(config.maximum_center_shift, 0.12)
-        self.assertEqual(config.minimum_dense_face_visible_fraction, 0.995)
-        self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.98)
+        self.assertEqual(config.minimum_dense_face_visible_fraction, 0.98)
+        self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.95)
         self.assertEqual(
             config.minimum_face_associated_subject_visible_fraction,
             0.72,
@@ -1056,6 +1056,9 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             common_master_start=0.0,
             geometry_provider=geometry,
             fps=30.0,
+            config=DirectMemberEditorialMotionConfig(
+                minimum_dense_face_visible_fraction=0.995,
+            ),
         )
 
         self.assertEqual(plan.applied_count, 0)
