@@ -369,6 +369,9 @@ _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
 )
+_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = (
+    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
+)
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
@@ -8379,161 +8382,178 @@ def _select_direct_member_partition_profile(
                 partition_search_terminal_safe_hold_candidate_count = len(
                     terminal_safe_hold_candidates
                 )
-                terminal_profile, terminal_error = min(
-                    terminal_safe_hold_candidates.values(),
-                    key=lambda item: (
-                        -_terminal_candidate_progress(item[0], item[1]),
-                        item[0].structural_change_count,
-                        sum(
-                            abs(shift.shift_units)
-                            for shift in item[0].boundary_shifts
+                terminal_candidates = tuple(
+                    sorted(
+                        terminal_safe_hold_candidates.values(),
+                        key=lambda item: (
+                            -_terminal_candidate_progress(item[0], item[1]),
+                            item[0].structural_change_count,
+                            sum(
+                                abs(shift.shift_units)
+                                for shift in item[0].boundary_shifts
+                            ),
+                            item[0].musical_boundary_penalty,
+                            item[0].profile_id,
                         ),
-                        item[0].musical_boundary_penalty,
-                        item[0].profile_id,
-                    ),
+                    )[:_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT]
                 )
-                terminal_signature = _direct_partition_signature_sha256(
-                    terminal_profile.unit_counts
+                terminal_contract = (
+                    "proof_progress_ordered_strict_terminal_audition_"
+                    "then_bounded_safe_hold_cohort_v3"
                 )
-                attempted_index = next(
-                    (
-                        index
-                        for index, item in enumerate(attempted)
-                        if item.get("partition_signature_sha256")
-                        == terminal_signature
-                    ),
-                    None,
+                terminal_trigger = (
+                    "bounded_strict_terminal_audition_completed"
+                    if partition_search_strict_terminal_audition_limit_reached
+                    else "global_structural_candidate_queue_exhausted"
                 )
-                if attempted_index is None:
-                    raise RuntimeError(
-                        "terminal safe-hold candidate has no strict attempt"
+                for terminal_evaluation_index, (
+                    terminal_profile,
+                    terminal_error,
+                ) in enumerate(terminal_candidates, start=1):
+                    terminal_signature = _direct_partition_signature_sha256(
+                        terminal_profile.unit_counts
                     )
-                terminal_payload = {
-                    "contract": (
-                        "proof_progress_ordered_strict_terminal_audition_"
-                        "then_single_bounded_safe_hold_v2"
-                    ),
-                    "attempted": True,
-                    "trigger": (
-                        "bounded_strict_terminal_audition_completed"
-                        if partition_search_strict_terminal_audition_limit_reached
-                        else "global_structural_candidate_queue_exhausted"
-                    ),
-                    "candidate_count": (
-                        partition_search_terminal_safe_hold_candidate_count
-                    ),
-                    "maximum_strict_terminal_audition_count": (
-                        _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
-                    ),
-                    "strict_terminal_audition_limit_reached": (
-                        partition_search_strict_terminal_audition_limit_reached
-                    ),
-                    "unevaluated_structural_profile_count": (
-                        partition_search_strict_terminal_audition_pruned_profile_count
-                    ),
-                    "selected_profile_id": terminal_profile.profile_id,
-                    "selected_partition_signature_sha256": terminal_signature,
-                    "selected_strict_failed_segment_index": (
-                        terminal_error.diagnostics.get(
-                            "failed_at_segment_index"
-                        )
-                    ),
-                    "selected_proof_progress": _terminal_candidate_progress(
-                        terminal_profile,
-                        terminal_error,
-                    ),
-                    "selection_policy": (
-                        "furthest_strict_failure_then_minimum_structural_"
-                        "change_displacement_musical_penalty"
-                    ),
-                    "visual_gates_relaxed": False,
-                }
-                partition_search_terminal_safe_hold_evaluation_count = 1
-                _emit_progress(
-                    event="direct_member_last_resort_safe_hold_search",
-                    phase="last_resort_safe_hold_started",
-                    result=None,
-                    **terminal_payload,
-                )
-                terminal_selection: DirectMemberVisualSelection | None = None
-                terminal_hold_error: DirectMemberVisualSelectionError | None = None
-                try:
-                    terminal_selection = _select_profile_with_config(
-                        terminal_profile,
-                        selection_config,
-                        allow_safe_hold_search=True,
-                    )
-                except DirectMemberVisualSelectionError as caught:
-                    terminal_hold_error = caught
-                terminal_payload["result"] = (
-                    "feasible"
-                    if terminal_selection is not None
-                    else "infeasible"
-                )
-                terminal_payload["final_failure"] = (
-                    terminal_hold_error.diagnostics.get("failure")
-                    if terminal_hold_error is not None
-                    else None
-                )
-                attempted_item = attempted[attempted_index]
-                attempted_item["last_resort_safe_hold_search"] = dict(
-                    terminal_payload
-                )
-                if terminal_selection is not None:
-                    partition_search_terminal_safe_hold_success_count = 1
-                    feasible.append((terminal_profile, terminal_selection))
-                    terminal_rank = _direct_partition_selection_rank(
-                        terminal_profile,
-                        terminal_selection,
-                    )
-                    attempted_item[
-                        "strict_status_before_last_resort_safe_hold"
-                    ] = attempted_item.get("status")
-                    strict_diagnostics = attempted_item.pop(
-                        "diagnostics",
+                    attempted_index = next(
+                        (
+                            index
+                            for index, item in enumerate(attempted)
+                            if item.get("partition_signature_sha256")
+                            == terminal_signature
+                        ),
                         None,
                     )
-                    if strict_diagnostics is not None:
-                        attempted_item[
-                            "strict_failure_before_last_resort_safe_hold"
-                        ] = strict_diagnostics
-                    attempted_item["status"] = "feasible"
-                    attempted_item["hard_violation_count"] = 0
-                    attempted_item["selection_rank"] = {
-                        "warning_boundary_count": terminal_rank[0],
-                        "optimizer_cost": terminal_rank[1],
-                        "changed_span_count": terminal_rank[2],
-                        "musical_boundary_penalty": terminal_rank[3],
+                    if attempted_index is None:
+                        raise RuntimeError(
+                            "terminal safe-hold candidate has no strict attempt"
+                        )
+                    terminal_payload = {
+                        "contract": terminal_contract,
+                        "attempted": True,
+                        "trigger": terminal_trigger,
+                        "candidate_count": (
+                            partition_search_terminal_safe_hold_candidate_count
+                        ),
+                        "evaluation_index": terminal_evaluation_index,
+                        "evaluation_limit": len(terminal_candidates),
+                        "maximum_safe_hold_profile_count": (
+                            _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
+                        ),
+                        "maximum_strict_terminal_audition_count": (
+                            _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+                        ),
+                        "strict_terminal_audition_limit_reached": (
+                            partition_search_strict_terminal_audition_limit_reached
+                        ),
+                        "unevaluated_structural_profile_count": (
+                            partition_search_strict_terminal_audition_pruned_profile_count
+                        ),
+                        "selected_profile_id": terminal_profile.profile_id,
+                        "selected_partition_signature_sha256": terminal_signature,
+                        "selected_strict_failed_segment_index": (
+                            terminal_error.diagnostics.get(
+                                "failed_at_segment_index"
+                            )
+                        ),
+                        "selected_proof_progress": _terminal_candidate_progress(
+                            terminal_profile,
+                            terminal_error,
+                        ),
+                        "selection_policy": (
+                            "all_proof_progress_ranked_terminal_profiles_"
+                            "then_best_feasible_visual_rank"
+                        ),
+                        "visual_gates_relaxed": False,
                     }
-                else:
-                    assert terminal_hold_error is not None
-                    if (
-                        partition_search_strict_terminal_audition_limit_reached
-                        and queued
-                    ):
-                        # The one authorized hold search failed while bounded
-                        # structural siblings remain.  Report this honestly as
-                        # search capacity, never as a proof that every sibling
-                        # is hard-infeasible.
-                        partition_search_cap_reached = True
-                    latest_failure_diagnostics = terminal_hold_error.diagnostics
-                    all_failures_proven = bool(
-                        all_failures_proven
-                        and _direct_partition_failure_is_proven(
+                    partition_search_terminal_safe_hold_evaluation_count += 1
+                    _emit_progress(
+                        event="direct_member_last_resort_safe_hold_search",
+                        phase="last_resort_safe_hold_started",
+                        result=None,
+                        **terminal_payload,
+                    )
+                    terminal_selection: DirectMemberVisualSelection | None = None
+                    terminal_hold_error: (
+                        DirectMemberVisualSelectionError | None
+                    ) = None
+                    try:
+                        terminal_selection = _select_profile_with_config(
+                            terminal_profile,
+                            selection_config,
+                            allow_safe_hold_search=True,
+                        )
+                    except DirectMemberVisualSelectionError as caught:
+                        terminal_hold_error = caught
+                    terminal_payload["result"] = (
+                        "feasible"
+                        if terminal_selection is not None
+                        else "infeasible"
+                    )
+                    terminal_payload["final_failure"] = (
+                        terminal_hold_error.diagnostics.get("failure")
+                        if terminal_hold_error is not None
+                        else None
+                    )
+                    attempted_item = attempted[attempted_index]
+                    attempted_item["last_resort_safe_hold_search"] = dict(
+                        terminal_payload
+                    )
+                    if terminal_selection is not None:
+                        partition_search_terminal_safe_hold_success_count += 1
+                        feasible.append((terminal_profile, terminal_selection))
+                        terminal_rank = _direct_partition_selection_rank(
+                            terminal_profile,
+                            terminal_selection,
+                        )
+                        attempted_item[
+                            "strict_status_before_last_resort_safe_hold"
+                        ] = attempted_item.get("status")
+                        strict_diagnostics = attempted_item.pop(
+                            "diagnostics",
+                            None,
+                        )
+                        if strict_diagnostics is not None:
+                            attempted_item[
+                                "strict_failure_before_last_resort_safe_hold"
+                            ] = strict_diagnostics
+                        attempted_item["status"] = "feasible"
+                        attempted_item["hard_violation_count"] = 0
+                        attempted_item["selection_rank"] = {
+                            "warning_boundary_count": terminal_rank[0],
+                            "optimizer_cost": terminal_rank[1],
+                            "changed_span_count": terminal_rank[2],
+                            "musical_boundary_penalty": terminal_rank[3],
+                        }
+                    else:
+                        assert terminal_hold_error is not None
+                        latest_failure_diagnostics = (
                             terminal_hold_error.diagnostics
                         )
-                    )
-                    attempted_item["last_resort_safe_hold_failure"] = (
-                        _compact_direct_partition_failure(
-                            terminal_hold_error,
-                            span_count=len(terminal_profile.spans),
+                        all_failures_proven = bool(
+                            all_failures_proven
+                            and _direct_partition_failure_is_proven(
+                                terminal_hold_error.diagnostics
+                            )
                         )
+                        attempted_item["last_resort_safe_hold_failure"] = (
+                            _compact_direct_partition_failure(
+                                terminal_hold_error,
+                                span_count=len(terminal_profile.spans),
+                            )
+                        )
+                    _emit_progress(
+                        event="direct_member_last_resort_safe_hold_search",
+                        phase="last_resort_safe_hold_completed",
+                        **terminal_payload,
                     )
-                _emit_progress(
-                    event="direct_member_last_resort_safe_hold_search",
-                    phase="last_resort_safe_hold_completed",
-                    **terminal_payload,
-                )
+                if (
+                    partition_search_terminal_safe_hold_success_count == 0
+                    and partition_search_strict_terminal_audition_limit_reached
+                    and queued
+                ):
+                    # Every authorized hold cohort member failed while bounded
+                    # structural siblings remain. Report search capacity, never
+                    # claim those unevaluated siblings were hard-infeasible.
+                    partition_search_cap_reached = True
         elif not feasible and base_error is not None:
             if _direct_partition_failure_is_proven(base_error.diagnostics):
                 bottlenecks = _direct_partition_failure_bottlenecks(
@@ -8712,7 +8732,7 @@ def _select_direct_member_partition_profile(
                 "last_resort_safe_hold_search": {
                     "contract": (
                         "proof_progress_ordered_strict_terminal_audition_"
-                        "then_single_bounded_safe_hold_v2"
+                        "then_bounded_safe_hold_cohort_v3"
                     ),
                     "candidate_count": (
                         partition_search_terminal_safe_hold_candidate_count
@@ -8723,7 +8743,9 @@ def _select_direct_member_partition_profile(
                     "success_count": (
                         partition_search_terminal_safe_hold_success_count
                     ),
-                    "maximum_evaluation_count": 1,
+                    "maximum_evaluation_count": (
+                        _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
+                    ),
                     "maximum_strict_terminal_audition_count": (
                         _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
                     ),
@@ -8992,7 +9014,7 @@ def _select_direct_member_partition_profile(
         "last_resort_safe_hold_search": {
             "contract": (
                 "proof_progress_ordered_strict_terminal_audition_"
-                "then_single_bounded_safe_hold_v2"
+                "then_bounded_safe_hold_cohort_v3"
             ),
             "candidate_count": (
                 partition_search_terminal_safe_hold_candidate_count
@@ -9001,7 +9023,9 @@ def _select_direct_member_partition_profile(
                 partition_search_terminal_safe_hold_evaluation_count
             ),
             "success_count": partition_search_terminal_safe_hold_success_count,
-            "maximum_evaluation_count": 1,
+            "maximum_evaluation_count": (
+                _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
+            ),
             "maximum_strict_terminal_audition_count": (
                 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
             ),

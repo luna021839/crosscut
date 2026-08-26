@@ -10,6 +10,7 @@ from crosscut.direct_member_visual import (
 from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
     _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+    _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
     _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
     _DirectFullFramePartitionProfile,
     _DirectFullFrameVisualFrontierSplit,
@@ -205,6 +206,10 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         self.assertGreaterEqual(
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
             _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+        )
+        self.assertGreaterEqual(
+            _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
+            _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
         )
 
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
