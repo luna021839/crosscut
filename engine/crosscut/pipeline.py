@@ -18670,10 +18670,6 @@ def analyze(
                                 direct_visual_config.
                                 transform_repair_minimum_subject_confidence
                             ),
-                            minimum_widened_subject_visible_fraction=(
-                                direct_visual_config.
-                                transform_repair_minimum_subject_visible_fraction
-                            ),
                             enable_interior_zoom_pulses=True,
                         ),
                     )
