@@ -469,9 +469,9 @@ class DirectMemberEditorialMotionConfig:
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.10
     maximum_dense_height_ratio: float = 1.35
-    maximum_dense_face_interpolation_gap_frames: int = 8
-    maximum_dense_face_edge_extrapolation_frames: int = 2
-    dense_geometry_median_radius_frames: int = 2
+    maximum_dense_face_interpolation_gap_frames: int = 24
+    maximum_dense_face_edge_extrapolation_frames: int = 24
+    dense_geometry_median_radius_frames: int = 3
     maximum_endpoint_center_disagreement: float = 0.08
     maximum_endpoint_height_ratio: float = 1.25
     target_events_per_minute: float = 12.0
@@ -521,12 +521,12 @@ class DirectMemberEditorialMotionConfig:
             (
                 "maximum_dense_face_interpolation_gap_frames",
                 self.maximum_dense_face_interpolation_gap_frames,
-                12,
+                30,
             ),
             (
                 "maximum_dense_face_edge_extrapolation_frames",
                 self.maximum_dense_face_edge_extrapolation_frames,
-                4,
+                30,
             ),
             (
                 "dense_geometry_median_radius_frames",
@@ -891,6 +891,14 @@ def _reconstruct_dense_face_geometry(
             if anchor_subject is None or target_subject is None:
                 return anchor_box
             relative = _relative_box(anchor_box, anchor_subject)
+            if relative is not None:
+                uncertainty = min(0.12, abs(target - anchor) * 0.005)
+                relative = (
+                    relative[0],
+                    relative[1],
+                    relative[2] + uncertainty * 2.0,
+                    relative[3] + uncertainty * 2.0,
+                )
             return (
                 _box_from_relative(relative, target_subject)
                 if relative is not None
@@ -946,6 +954,39 @@ def _reconstruct_dense_face_geometry(
     if len(resolved) != len(output):
         return None
     if all(subject_box is not None for subject_box in subject_boxes):
+        resolved_subjects = [
+            subject_box
+            for subject_box in subject_boxes
+            if subject_box is not None
+        ]
+        relative_boxes = [
+            _relative_box(box, subject)
+            for box, subject in zip(
+                resolved,
+                resolved_subjects,
+                strict=True,
+            )
+        ]
+        if all(relative is not None for relative in relative_boxes):
+            smoothed_relative = _median_smooth_geometry(
+                frame_indices,
+                [
+                    relative
+                    for relative in relative_boxes
+                    if relative is not None
+                ],
+                radius=config.dense_geometry_median_radius_frames,
+            )
+            remapped = [
+                _box_from_relative(relative, subject)
+                for relative, subject in zip(
+                    smoothed_relative,
+                    resolved_subjects,
+                    strict=True,
+                )
+            ]
+            if all(box is not None for box in remapped):
+                return [box for box in remapped if box is not None]
         return _median_smooth_geometry(
             frame_indices,
             resolved,
@@ -1502,7 +1543,22 @@ def build_direct_member_editorial_motion_plan(
         if lossless_zoom_limit <= 1.0 + 1e-9:
             reject_boundary("source_resolution_has_no_lossless_transform_headroom")
             continue
-        requested_zoom = max(1.02, target_box[3] / box[3])
+        desired_center_shift = min(
+            settings.maximum_center_shift,
+            math.hypot(
+                _center(box)[0] - _center(target_box)[0],
+                _center(box)[1] - _center(target_box)[1],
+            ),
+        )
+        pan_headroom_zoom = 1.0 / max(
+            1e-9,
+            1.0 - 2.0 * desired_center_shift,
+        )
+        requested_zoom = max(
+            1.02,
+            target_box[3] / box[3],
+            pan_headroom_zoom,
+        )
         maximum_candidate_zoom = min(lossless_zoom_limit, requested_zoom)
         if required and repair is not None:
             maximum_candidate_zoom = min(

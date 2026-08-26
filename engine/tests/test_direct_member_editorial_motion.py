@@ -517,6 +517,10 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             common_master_start=0.0,
             geometry_provider=geometry,
             fps=30.0,
+            config=DirectMemberEditorialMotionConfig(
+                maximum_dense_face_interpolation_gap_frames=8,
+                maximum_dense_face_edge_extrapolation_frames=2,
+            ),
         )
 
         self.assertEqual(plan.applied_count, 0)
@@ -594,7 +598,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
 
         def geometry(source: int, time_seconds: float):
             box = boxes[source]
-            if source == 0 and 7.78 <= time_seconds <= 7.88:
+            if source == 0 and 7.72 <= time_seconds <= 7.92:
                 box = (0.02, 0.225, 0.94, 0.55)
             return self._sample(box, subject_box=subject_box)
 
@@ -836,7 +840,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.applied_count, 1)
         self.assertGreater(plan.track_for(0).final_keyframe.zoom, 1.12)
 
-    def test_widened_pan_alone_also_requires_full_subject_proof(self) -> None:
+    def test_widened_pan_uses_subject_proof_beyond_legacy_fallback(self) -> None:
         source_indices = (0, 1)
         boxes = (
             (0.31, 0.25, 0.18, 0.50),
@@ -865,7 +869,14 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             fps=30.0,
         )
 
-        self.assertEqual(without_subject.applied_count, 0)
+        self.assertEqual(without_subject.applied_count, 1)
+        without_subject_track = without_subject.track_for(0)
+        self.assertIsNotNone(without_subject_track)
+        assert without_subject_track is not None
+        self.assertLessEqual(
+            abs(without_subject_track.final_keyframe.center_x - 0.5),
+            0.025,
+        )
         self.assertEqual(with_subject.applied_count, 1)
         track = with_subject.track_for(0)
         self.assertIsNotNone(track)
