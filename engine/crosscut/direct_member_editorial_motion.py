@@ -201,9 +201,10 @@ class DirectMemberDenseFaceProvider:
         sampler = self._samplers[source_index]
         if sampler is None:
             return None
+        normalized_seconds = max(0.0, source_local_seconds)
         key = (
             source_index,
-            sampler.frame_identity(max(0.0, source_local_seconds)),
+            sampler.frame_identity(normalized_seconds),
         )
         if key in self._cache:
             self._cache_hit_count += 1
@@ -211,7 +212,7 @@ class DirectMemberDenseFaceProvider:
         previous_decode_count = sampler.frame_decode_count
         try:
             descriptor = sampler.feature_descriptor_at(
-                source_local_seconds,
+                normalized_seconds,
                 include_subject_geometry=True,
                 include_formation_pose=True,
             )
@@ -331,10 +332,12 @@ class DirectMemberEditorialMotionConfig:
     maximum_residual_center_distance: float = 0.08
     minimum_mismatch_improvement_fraction: float = 0.20
     minimum_face_visible_fraction: float = 0.995
+    minimum_dense_face_visible_fraction: float = 0.995
     legacy_face_only_maximum_zoom: float = 1.12
     legacy_face_only_maximum_center_shift: float = 0.025
     minimum_widened_subject_confidence: float = 0.30
     minimum_widened_subject_visible_fraction: float = 0.980
+    minimum_face_associated_subject_visible_fraction: float = 0.720
     maximum_dense_subject_center_step: float = 0.12
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.10
@@ -357,10 +360,12 @@ class DirectMemberEditorialMotionConfig:
             "maximum_residual_center_distance",
             "minimum_mismatch_improvement_fraction",
             "minimum_face_visible_fraction",
+            "minimum_dense_face_visible_fraction",
             "legacy_face_only_maximum_zoom",
             "legacy_face_only_maximum_center_shift",
             "minimum_widened_subject_confidence",
             "minimum_widened_subject_visible_fraction",
+            "minimum_face_associated_subject_visible_fraction",
             "maximum_dense_subject_center_step",
             "maximum_dense_subject_height_ratio",
             "maximum_dense_center_step",
@@ -390,6 +395,21 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("widened subject confidence gate is invalid")
         if not 0.95 <= self.minimum_widened_subject_visible_fraction <= 1.0:
             raise ValueError("widened subject containment gate is invalid")
+        if not (
+            0.95
+            <= self.minimum_dense_face_visible_fraction
+            <= self.minimum_face_visible_fraction
+            <= 1.0
+        ):
+            raise ValueError("dense face containment gate is invalid")
+        if not (
+            0.60
+            <= self.minimum_face_associated_subject_visible_fraction
+            <= self.minimum_widened_subject_visible_fraction
+        ):
+            raise ValueError(
+                "face-associated subject containment gate is invalid"
+            )
         if not 0.0 <= self.maximum_dense_subject_center_step <= 0.20:
             raise ValueError("dense subject center-step gate is invalid")
         if not 1.0 <= self.maximum_dense_subject_height_ratio <= 2.0:
@@ -500,6 +520,86 @@ def _neutral(track: EditorialTransformTrack, time_seconds: float) -> bool:
     )
 
 
+def _geometry_step_exceeds(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+    *,
+    maximum_center_step: float,
+    maximum_height_ratio: float,
+) -> bool:
+    center_step = math.hypot(
+        _center(left)[0] - _center(right)[0],
+        _center(left)[1] - _center(right)[1],
+    )
+    height_ratio = max(left[3], right[3]) / max(
+        1e-9, min(left[3], right[3])
+    )
+    return (
+        center_step > maximum_center_step + 1e-9
+        or height_ratio > maximum_height_ratio + 1e-9
+    )
+
+
+def _midpoint_box(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return tuple(
+        (left_value + right_value) / 2.0
+        for left_value, right_value in zip(left, right, strict=True)
+    )  # type: ignore[return-value]
+
+
+def _box_contains_center(
+    container: tuple[float, float, float, float],
+    item: tuple[float, float, float, float],
+) -> bool:
+    center_x, center_y = _center(item)
+    return (
+        container[0] - 1e-6
+        <= center_x
+        <= container[0] + container[2] + 1e-6
+        and container[1] - 1e-6
+        <= center_y
+        <= container[1] + container[3] + 1e-6
+    )
+
+
+def _isolated_outlier_replacement(
+    previous: tuple[float, float, float, float],
+    current: tuple[float, float, float, float],
+    following: tuple[float, float, float, float],
+    *,
+    maximum_center_step: float,
+    maximum_height_ratio: float,
+) -> tuple[float, float, float, float] | None:
+    """Repair only a one-frame detector excursion with neighbor consensus."""
+
+    if _geometry_step_exceeds(
+        previous,
+        following,
+        maximum_center_step=maximum_center_step,
+        maximum_height_ratio=maximum_height_ratio,
+    ):
+        return None
+    if not (
+        _geometry_step_exceeds(
+            previous,
+            current,
+            maximum_center_step=maximum_center_step,
+            maximum_height_ratio=maximum_height_ratio,
+        )
+        or _geometry_step_exceeds(
+            current,
+            following,
+            maximum_center_step=maximum_center_step,
+            maximum_height_ratio=maximum_height_ratio,
+        )
+    ):
+        return None
+    return _midpoint_box(previous, following)
+
+
 def _track_is_dense_face_safe(
     *,
     segment_index: int,
@@ -549,17 +649,12 @@ def _track_is_dense_face_safe(
         )
     )
 
-    previous_box: tuple[float, float, float, float] | None = None
-    previous_subject_box: tuple[float, float, float, float] | None = None
-    previous_frame_index: int | None = None
-    for frame_index in sorted(review_frames):
+    ordered_frames = tuple(sorted(review_frames))
+    samples: list[DirectMemberFaceSample] = []
+    boxes: list[tuple[float, float, float, float]] = []
+    subject_boxes: list[tuple[float, float, float, float] | None] = []
+    for frame_index in ordered_frames:
         local_time = frame_index / fps
-        if (
-            previous_frame_index is None
-            or frame_index != previous_frame_index + 1
-        ):
-            previous_box = None
-            previous_subject_box = None
         canonical_time = common_master_start + segment.master_start + local_time
         sample = geometry_provider(eligible_source_index, canonical_time)
         if sample is None:
@@ -572,17 +667,118 @@ def _track_is_dense_face_safe(
             if source_frame_geometry is not None
             else sample.bbox_xywh
         )
+        subject_box = sample.subject_bbox_xywh
+        if subject_box is not None and source_frame_geometry is not None:
+            subject_box = map_box_to_portrait_fill(
+                subject_box,
+                source_frame_geometry,
+            )
+        samples.append(sample)
+        boxes.append(box)
+        subject_boxes.append(subject_box)
+
+    # YuNet and silhouette boxes can make a single-frame excursion while the
+    # authenticated member track is otherwise continuous. Replace only that
+    # isolated excursion, and only when the same verified subject contains the
+    # face on all three frames. A persistent jump or native source cut remains
+    # visible to the continuity gate below.
+    for index in range(1, len(ordered_frames) - 1):
+        if not (
+            ordered_frames[index - 1] + 1 == ordered_frames[index]
+            and ordered_frames[index] + 1 == ordered_frames[index + 1]
+            and all(
+                samples[item].face_count == 1
+                for item in (index - 1, index, index + 1)
+            )
+            and all(
+                subject_boxes[item] is not None
+                for item in (index - 1, index, index + 1)
+            )
+        ):
+            continue
+        previous_subject = subject_boxes[index - 1]
+        current_subject = subject_boxes[index]
+        following_subject = subject_boxes[index + 1]
+        assert previous_subject is not None
+        assert current_subject is not None
+        assert following_subject is not None
+        if not all(
+            _box_contains_center(subject, boxes[item])
+            for item, subject in (
+                (index - 1, previous_subject),
+                (index, current_subject),
+                (index + 1, following_subject),
+            )
+        ):
+            continue
+        replacement = _isolated_outlier_replacement(
+            boxes[index - 1],
+            boxes[index],
+            boxes[index + 1],
+            maximum_center_step=config.maximum_dense_center_step,
+            maximum_height_ratio=config.maximum_dense_height_ratio,
+        )
+        if replacement is not None:
+            boxes[index] = replacement
+
+    # Silhouette bounds breathe with limbs. The same one-frame consensus rule
+    # is safe when the independently tracked face stays associated throughout.
+    for index in range(1, len(ordered_frames) - 1):
+        if not (
+            ordered_frames[index - 1] + 1 == ordered_frames[index]
+            and ordered_frames[index] + 1 == ordered_frames[index + 1]
+        ):
+            continue
+        previous_subject = subject_boxes[index - 1]
+        current_subject = subject_boxes[index]
+        following_subject = subject_boxes[index + 1]
+        if (
+            previous_subject is None
+            or current_subject is None
+            or following_subject is None
+            or not all(
+                _box_contains_center(subject, boxes[item])
+                for item, subject in (
+                    (index - 1, previous_subject),
+                    (index, current_subject),
+                    (index + 1, following_subject),
+                )
+            )
+        ):
+            continue
+        replacement = _isolated_outlier_replacement(
+            previous_subject,
+            current_subject,
+            following_subject,
+            maximum_center_step=config.maximum_dense_subject_center_step,
+            maximum_height_ratio=config.maximum_dense_subject_height_ratio,
+        )
+        if replacement is not None:
+            subject_boxes[index] = replacement
+
+    previous_box: tuple[float, float, float, float] | None = None
+    previous_subject_box: tuple[float, float, float, float] | None = None
+    previous_frame_index: int | None = None
+    for frame_index, sample, box, subject_box in zip(
+        ordered_frames,
+        samples,
+        boxes,
+        subject_boxes,
+        strict=True,
+    ):
+        local_time = frame_index / fps
+        if (
+            previous_frame_index is None
+            or frame_index != previous_frame_index + 1
+        ):
+            previous_box = None
+            previous_subject_box = None
         if previous_box is not None:
-            center_step = math.hypot(
-                _center(box)[0] - _center(previous_box)[0],
-                _center(box)[1] - _center(previous_box)[1],
-            )
-            height_ratio = max(box[3], previous_box[3]) / max(
-                1e-9, min(box[3], previous_box[3])
-            )
-            if (
-                center_step > config.maximum_dense_center_step + 1e-9
-                or height_ratio > config.maximum_dense_height_ratio + 1e-9
+            if _geometry_step_exceeds(
+                previous_box,
+                box,
+                maximum_center_step=config.maximum_dense_center_step,
+                maximum_height_ratio=config.maximum_dense_height_ratio,
             ):
                 return reject("dense_face_geometry_jump")
         state_sample = track.evaluate(local_time)
@@ -593,11 +789,10 @@ def _track_is_dense_face_safe(
         )
         if (
             _visible_fraction(box, state) + 1e-9
-            < config.minimum_face_visible_fraction
+            < config.minimum_dense_face_visible_fraction
         ):
             return reject("dense_face_crop_exceeds_visible_fraction")
         if widened_subject_proof_required:
-            subject_box = sample.subject_bbox_xywh
             if (
                 subject_box is None
                 or sample.subject_confidence + 1e-9
@@ -609,29 +804,31 @@ def _track_is_dense_face_safe(
                 }
             ):
                 return reject("dense_widened_subject_evidence_missing")
-            if source_frame_geometry is not None:
-                subject_box = map_box_to_portrait_fill(
-                    subject_box,
-                    source_frame_geometry,
-                )
+            if sample.face_count == 1 and not _box_contains_center(
+                subject_box,
+                box,
+            ):
+                return reject("dense_subject_face_association_failed")
             if previous_subject_box is not None:
-                subject_center_step = math.hypot(
-                    _center(subject_box)[0] - _center(previous_subject_box)[0],
-                    _center(subject_box)[1] - _center(previous_subject_box)[1],
-                )
-                subject_height_ratio = max(
-                    subject_box[3], previous_subject_box[3]
-                ) / max(1e-9, min(subject_box[3], previous_subject_box[3]))
-                if (
-                    subject_center_step
-                    > config.maximum_dense_subject_center_step + 1e-9
-                    or subject_height_ratio
-                    > config.maximum_dense_subject_height_ratio + 1e-9
+                if _geometry_step_exceeds(
+                    previous_subject_box,
+                    subject_box,
+                    maximum_center_step=(
+                        config.maximum_dense_subject_center_step
+                    ),
+                    maximum_height_ratio=(
+                        config.maximum_dense_subject_height_ratio
+                    ),
                 ):
                     return reject("dense_subject_geometry_jump")
+            minimum_subject_visible_fraction = (
+                config.minimum_face_associated_subject_visible_fraction
+                if sample.face_count == 1
+                else config.minimum_widened_subject_visible_fraction
+            )
             if (
                 _visible_fraction(subject_box, state) + 1e-9
-                < config.minimum_widened_subject_visible_fraction
+                < minimum_subject_visible_fraction
             ):
                 return reject("dense_subject_crop_exceeds_visible_fraction")
             previous_subject_box = subject_box
@@ -712,10 +909,7 @@ def build_direct_member_editorial_motion_plan(
 
     blocked: set[int] = set()
     for index, transition in enumerate(transition_items):
-        if (
-            transition.kind.uses_overlap
-            or transition.tier == "D"
-        ):
+        if transition.kind.uses_overlap:
             blocked.update((index, index + 1))
     skipped: dict[str, int] = {}
     required_rejection_reasons: dict[int, set[str]] = {}
@@ -881,36 +1075,62 @@ def build_direct_member_editorial_motion_plan(
             reject_boundary("source_resolution_has_no_lossless_transform_headroom")
             continue
         requested_zoom = max(1.02, target_box[3] / box[3])
-        zoom = min(lossless_zoom_limit, requested_zoom)
+        maximum_candidate_zoom = min(lossless_zoom_limit, requested_zoom)
         if required and repair is not None:
-            zoom = min(lossless_zoom_limit, max(zoom, repair.zoom))
-        qualifying: list[tuple[float, _State]] = []
-        for state in _state_for_match(
-            box=box,
-            target_box=target_box,
-            zoom=zoom,
-            settings=shared,
-        ):
-            if (
-                _visible_fraction(box, state) + 1e-9
-                < settings.minimum_face_visible_fraction
-            ):
-                continue
-            projected_left = _project(left_box, state) if side == "left" else left_box
-            projected_right = _project(right_box, state) if side == "right" else right_box
-            transformed = _mismatch(projected_left, projected_right)
-            residual_center = math.hypot(
-                _center(projected_left)[0] - _center(projected_right)[0],
-                _center(projected_left)[1] - _center(projected_right)[1],
+            maximum_candidate_zoom = min(
+                lossless_zoom_limit,
+                max(maximum_candidate_zoom, repair.zoom),
             )
-            if residual_center > settings.maximum_residual_center_distance + 1e-9:
-                continue
-            if transformed > baseline * (
-                1.0 - settings.minimum_mismatch_improvement_fraction
-            ) + 1e-9:
-                continue
-            if transformed + 1e-4 < baseline:
-                qualifying.append((transformed, state))
+        qualifying: list[tuple[float, _State]] = []
+        zoom_values = [maximum_candidate_zoom]
+        while zoom_values[-1] > 1.02 + 1e-9:
+            next_zoom = max(1.02, zoom_values[-1] - 0.02)
+            if abs(next_zoom - zoom_values[-1]) <= 1e-9:
+                break
+            zoom_values.append(next_zoom)
+        seen_states: set[tuple[float, float, float]] = set()
+        for zoom in zoom_values:
+            for state in _state_for_match(
+                box=box,
+                target_box=target_box,
+                zoom=zoom,
+                settings=shared,
+            ):
+                state_key = (
+                    round(state.zoom, 9),
+                    round(state.center_x, 9),
+                    round(state.center_y, 9),
+                )
+                if state_key in seen_states:
+                    continue
+                seen_states.add(state_key)
+                if (
+                    _visible_fraction(box, state) + 1e-9
+                    < settings.minimum_face_visible_fraction
+                ):
+                    continue
+                projected_left = (
+                    _project(left_box, state) if side == "left" else left_box
+                )
+                projected_right = (
+                    _project(right_box, state) if side == "right" else right_box
+                )
+                transformed = _mismatch(projected_left, projected_right)
+                residual_center = math.hypot(
+                    _center(projected_left)[0] - _center(projected_right)[0],
+                    _center(projected_left)[1] - _center(projected_right)[1],
+                )
+                if (
+                    residual_center
+                    > settings.maximum_residual_center_distance + 1e-9
+                ):
+                    continue
+                if transformed > baseline * (
+                    1.0 - settings.minimum_mismatch_improvement_fraction
+                ) + 1e-9:
+                    continue
+                if transformed + 1e-4 < baseline:
+                    qualifying.append((transformed, state))
         if not qualifying:
             reject_boundary("no_improving_contained_transform")
             continue
@@ -1176,11 +1396,25 @@ def build_direct_member_editorial_motion_plan(
             f"{reason}={count}"
             for reason, count in sorted(rejection_counts.items())
         )
+        rejection_details = "|".join(
+            f"{boundary_index}:"
+            + ",".join(
+                sorted(
+                    required_rejection_reasons.get(
+                        boundary_index,
+                        {"required_candidate_missing_without_reason"},
+                    )
+                )
+            )
+            for boundary_index in missing_required
+        )
         raise ValueError(
             "required direct member transform failed dense review at boundaries "
             + ",".join(str(index) for index in missing_required)
             + "; required rejection counts "
             + rejection_summary
+            + "; required rejection details "
+            + rejection_details
         )
     return EditorialMotionPlan(
         segments=tuple(
@@ -1217,7 +1451,7 @@ def build_direct_member_editorial_motion_plan(
         skipped_boundary_reasons=tuple(sorted(skipped.items())),
         analysis_basis=(
             "official_target_fancam_face_or_verified_full_subject_dense_"
-            "output_frame_resolution_bound_repair_and_lossless_pulse_review_v5"
+            "output_frame_temporally_stabilized_adaptive_repair_review_v6"
         ),
         accepted_boundary_indices=accepted_boundary_indices,
     )
