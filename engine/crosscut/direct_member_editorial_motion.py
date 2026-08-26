@@ -43,7 +43,7 @@ from .render import (
     RenderTransition,
     TransitionKind,
 )
-from .visual_score import _VideoSampler
+from .visual_score import _VideoSampler, _working_frame
 
 
 _FACE_ATTENTION_BASIS = "unambiguous_dominant_face_bbox_geometry_only"
@@ -157,6 +157,106 @@ DirectMemberGeometryProvider = Callable[
 ]
 
 
+def _enable_dense_sequential_frame_reads(sampler: object) -> None:
+    """Avoid an AV1 random seek for every adjacent dense-review frame.
+
+    This optimization is intentionally local to the direct-member reviewer.
+    It falls back to the canonical timestamp seek whenever OpenCV's reported
+    frame position does not prove that the capture is exactly one frame ahead.
+    """
+
+    required_attributes = (
+        "cache",
+        "capture",
+        "frame_at",
+        "frame_decode_count",
+        "frame_identity",
+        "frame_rate",
+    )
+    if any(not hasattr(sampler, name) for name in required_attributes):
+        return
+    original_frame_at = sampler.frame_at  # type: ignore[attr-defined]
+    capture = sampler.capture  # type: ignore[attr-defined]
+    cache = sampler.cache  # type: ignore[attr-defined]
+    frame_rate = float(sampler.frame_rate)  # type: ignore[attr-defined]
+    if not math.isfinite(frame_rate) or frame_rate <= 0.0:
+        return
+    previous_decoded_identity = None
+    sequential_decode_count = 0
+    random_seek_decode_count = 0
+
+    def frame_at(seconds: float):
+        nonlocal previous_decoded_identity
+        nonlocal sequential_decode_count
+        nonlocal random_seek_decode_count
+        key = sampler.frame_identity(seconds)  # type: ignore[attr-defined]
+        if key in cache:
+            return original_frame_at(seconds)
+        expected_step = 1.0 / frame_rate
+        adjacent = bool(
+            previous_decoded_identity is not None
+            and key.frame_index == previous_decoded_identity.frame_index + 1
+            and key.fps_numerator
+            == previous_decoded_identity.fps_numerator
+            and key.fps_denominator
+            == previous_decoded_identity.fps_denominator
+            and abs(
+                key.canonical_seconds
+                - previous_decoded_identity.canonical_seconds
+                - expected_step
+            )
+            <= expected_step * 0.05 + 1e-9
+        )
+        if adjacent:
+            position_before = float(capture.get(cv2.CAP_PROP_POS_FRAMES))
+            if (
+                math.isfinite(position_before)
+                and abs(position_before - key.frame_index) <= 0.51
+            ):
+                success, frame = capture.read()
+                sampler.frame_decode_count += 1  # type: ignore[attr-defined]
+                position_after = float(capture.get(cv2.CAP_PROP_POS_FRAMES))
+                if (
+                    success
+                    and math.isfinite(position_after)
+                    and abs(position_after - (key.frame_index + 1)) <= 0.51
+                ):
+                    value = _working_frame(frame)
+                    cache[key] = value
+                    while len(cache) > 32:
+                        cache.popitem(last=False)
+                    previous_decoded_identity = key
+                    sequential_decode_count += 1
+                    setattr(
+                        sampler,
+                        "dense_sequential_frame_decode_count",
+                        sequential_decode_count,
+                    )
+                    return value
+        before = int(sampler.frame_decode_count)  # type: ignore[attr-defined]
+        value = original_frame_at(seconds)
+        if int(sampler.frame_decode_count) > before:  # type: ignore[attr-defined]
+            random_seek_decode_count += 1
+            setattr(
+                sampler,
+                "dense_random_seek_frame_decode_count",
+                random_seek_decode_count,
+            )
+        position_after = float(capture.get(cv2.CAP_PROP_POS_FRAMES))
+        previous_decoded_identity = (
+            key
+            if value is not None
+            and math.isfinite(position_after)
+            and abs(position_after - (key.frame_index + 1)) <= 0.51
+            else None
+        )
+        return value
+
+    setattr(sampler, "frame_at", frame_at)
+    setattr(sampler, "dense_sequential_frame_decode_count", 0)
+    setattr(sampler, "dense_random_seek_frame_decode_count", 0)
+
+
 class DirectMemberDenseFaceProvider:
     """Decode selected geometry on canonical source frames, never identities."""
 
@@ -169,7 +269,7 @@ class DirectMemberDenseFaceProvider:
         self._sources = tuple(Path(source) for source in sources)
         self._samplers: list[_VideoSampler | None] = []
         self._cache: dict[
-            tuple[int, object], DirectMemberFaceSample | None
+            tuple[object, ...], DirectMemberFaceSample | None
         ] = {}
         self._request_count = 0
         self._cache_hit_count = 0
@@ -180,6 +280,7 @@ class DirectMemberDenseFaceProvider:
                     source,
                     feature_cache_directory=feature_cache_directory,
                 )
+                _enable_dense_sequential_frame_reads(sampler)
             except (OSError, TypeError, ValueError, cv2.error):
                 sampler = None
             self._samplers.append(sampler)
@@ -202,9 +303,12 @@ class DirectMemberDenseFaceProvider:
         if sampler is None:
             return None
         normalized_seconds = max(0.0, source_local_seconds)
+        identity = sampler.frame_identity(normalized_seconds)
         key = (
             source_index,
-            sampler.frame_identity(normalized_seconds),
+            identity.frame_index,
+            identity.fps_numerator,
+            identity.fps_denominator,
         )
         if key in self._cache:
             self._cache_hit_count += 1
@@ -312,6 +416,28 @@ class DirectMemberDenseFaceProvider:
             ),
             "persistent_feature_cache_write_count": sum(
                 int(item.get("write_count", 0)) for item in persistent
+            ),
+            "sequential_frame_decode_count": sum(
+                int(
+                    getattr(
+                        sampler,
+                        "dense_sequential_frame_decode_count",
+                        0,
+                    )
+                )
+                for sampler in self._samplers
+                if sampler is not None
+            ),
+            "random_seek_frame_decode_count": sum(
+                int(
+                    getattr(
+                        sampler,
+                        "dense_random_seek_frame_decode_count",
+                        0,
+                    )
+                )
+                for sampler in self._samplers
+                if sampler is not None
             ),
             "pixels_persisted": False,
             "face_embeddings_computed": False,

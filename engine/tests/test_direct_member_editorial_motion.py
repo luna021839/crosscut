@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+import cv2
+import numpy as np
 
 from crosscut.direct_member_editorial_motion import (
     DirectMemberDenseFaceProvider,
@@ -17,6 +21,7 @@ from crosscut.direct_member_transform import (
 )
 from crosscut.pose import SILHOUETTE_BACKEND
 from crosscut.render import RenderSegment, RenderTransition
+from crosscut.visual_feature_cache import CanonicalFrameIdentity
 
 
 _FACE_BASIS = "unambiguous_dominant_face_bbox_geometry_only"
@@ -510,7 +515,10 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
                 self.instances.append(self)
 
             def frame_identity(self, seconds):
-                return int(round(float(seconds) * 30.0))
+                return CanonicalFrameIdentity.from_seconds(
+                    seconds,
+                    frame_rate=30.0,
+                )
 
             def feature_descriptor_at(self, _seconds, **_kwargs):
                 self.feature_calls += 1
@@ -545,6 +553,92 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(diagnostics["decode_count"], 1)
         self.assertEqual(diagnostics["persistent_feature_cache_hit_count"], 2)
         self.assertTrue(FakeSampler.instances[0].closed)
+
+    def test_dense_provider_decodes_proven_adjacent_frames_sequentially(
+        self,
+    ) -> None:
+        descriptor = SimpleNamespace(
+            silhouette_bbox_xywh=(0.25, 0.10, 0.50, 0.80),
+            silhouette_confidence=0.90,
+            silhouette_backend=SILHOUETTE_BACKEND,
+            primary_face_bbox=(0.40, 0.20, 0.20, 0.20),
+            face_count=1,
+            face_detector_backend="yunet",
+            formation_people=(),
+        )
+
+        class FakeCapture:
+            def __init__(self):
+                self.position = 0.0
+                self.sequential_reads = 0
+
+            def get(self, property_id):
+                if property_id == cv2.CAP_PROP_POS_FRAMES:
+                    return self.position
+                return 0.0
+
+            def read(self):
+                self.sequential_reads += 1
+                self.position += 1.0
+                return True, np.zeros(
+                    (8, 8, 3),
+                    dtype="uint8",
+                )
+
+        class FakeSampler:
+            instances: list["FakeSampler"] = []
+
+            def __init__(self, _path, *, feature_cache_directory=None):
+                self.feature_cache_directory = feature_cache_directory
+                self.frame_rate = 30.0
+                self.capture = FakeCapture()
+                self.cache = OrderedDict()
+                self.frame_decode_count = 0
+                self.random_seeks = 0
+                self.instances.append(self)
+
+            def frame_identity(self, seconds):
+                return CanonicalFrameIdentity.from_seconds(
+                    seconds,
+                    frame_rate=self.frame_rate,
+                )
+
+            def frame_at(self, seconds):
+                key = self.frame_identity(seconds)
+                if key not in self.cache:
+                    self.random_seeks += 1
+                    self.capture.position = float(key.frame_index + 1)
+                    self.frame_decode_count += 1
+                    self.cache[key] = np.zeros(
+                        (8, 8, 3),
+                        dtype="uint8",
+                    )
+                return self.cache[key]
+
+            def feature_descriptor_at(self, seconds, **_kwargs):
+                self.frame_at(seconds)
+                return descriptor
+
+            def feature_cache_diagnostics(self):
+                return None
+
+            def close(self):
+                pass
+
+        with patch(
+            "crosscut.direct_member_editorial_motion._VideoSampler",
+            FakeSampler,
+        ):
+            provider = DirectMemberDenseFaceProvider((Path("source.mp4"),))
+            for frame_index in range(3):
+                self.assertIsNotNone(provider.sample(0, frame_index / 30.0))
+            diagnostics = provider.diagnostics()
+
+        sampler = FakeSampler.instances[0]
+        self.assertEqual(sampler.random_seeks, 1)
+        self.assertEqual(sampler.capture.sequential_reads, 2)
+        self.assertEqual(diagnostics["random_seek_frame_decode_count"], 1)
+        self.assertEqual(diagnostics["sequential_frame_decode_count"], 2)
 
     def test_widened_zoom_requires_dense_full_subject_and_enlarges_smaller_side(self) -> None:
         source_indices = (0, 1)
