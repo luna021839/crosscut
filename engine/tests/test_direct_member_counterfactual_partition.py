@@ -33,6 +33,7 @@ from crosscut.pipeline import (
     _direct_partition_current_shifted_boundary_indices,
     _direct_partition_proof_directed_boundary_merge_limit,
     _direct_partition_proof_directed_boundary_shift_limit,
+    _direct_partition_terminal_candidate_progress,
     _direct_partition_terminal_audition_due,
     _direct_severe_counterfactual_retry_is_authorized,
 )
@@ -341,6 +342,45 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
                 feasible_profile_count=1,
                 queued_profile_count=1,
             )
+        )
+
+    def test_terminal_rank_uses_current_failure_not_old_remote_repair(self) -> None:
+        segments = _professional_timing_segments(68)
+        bare = _DirectFullFramePartitionProfile(
+            profile_id="remote-repair-parent",
+            unit_counts=(1,) * 68,
+            spans=_direct_full_frame_spans_from_partition(
+                segments,
+                (1,) * 68,
+            ),
+        )
+        profile = _DirectFullFramePartitionProfile(
+            profile_id="remote-repair-child",
+            unit_counts=bare.unit_counts,
+            spans=bare.spans,
+            boundary_shifts=(
+                _recorded_shift(bare, boundary_index=58),
+            ),
+            latest_operation_kind="boundary_shift",
+        )
+        current_error = DirectMemberVisualSelectionError(
+            "current full path stops near the start",
+            {"failed_at_segment_index": 1},
+        )
+
+        self.assertEqual(
+            _direct_partition_terminal_candidate_progress(
+                profile,
+                current_error,
+            ),
+            1,
+        )
+        self.assertEqual(
+            _direct_partition_terminal_candidate_progress(
+                profile,
+                DirectMemberVisualSelectionError("legacy", {}),
+            ),
+            59,
         )
 
     def test_adjacent_proven_cut_can_move_after_neighbor_shift(self) -> None:

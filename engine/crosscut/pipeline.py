@@ -7449,6 +7449,28 @@ def _direct_partition_proof_progress(
     )
 
 
+def _direct_partition_terminal_candidate_progress(
+    profile: _DirectFullFramePartitionProfile,
+    error: DirectMemberVisualSelectionError,
+) -> int:
+    """Rank a terminal candidate by its current proved reachable prefix.
+
+    A profile can contain an old repair at a far-away boundary while its latest
+    full re-selection still fails near the start.  That historical operation
+    location is useful for queue exploration, but must never outrank a profile
+    whose current hard-feasible path actually reaches farther through the song.
+    """
+
+    failed = error.diagnostics.get("failed_at_segment_index")
+    if (
+        isinstance(failed, int)
+        and not isinstance(failed, bool)
+        and failed >= 0
+    ):
+        return failed
+    return _direct_partition_proof_progress(profile)
+
+
 def _direct_partition_queue_priority(
     profile: _DirectFullFramePartitionProfile,
 ) -> tuple[int, int, int, int]:
@@ -8480,16 +8502,6 @@ def _select_direct_member_partition_profile(
                         (profile, error),
                     )
 
-            def _terminal_candidate_progress(
-                profile: _DirectFullFramePartitionProfile,
-                error: DirectMemberVisualSelectionError,
-            ) -> int:
-                failed = error.diagnostics.get("failed_at_segment_index")
-                return max(
-                    failed if isinstance(failed, int) else -1,
-                    _direct_partition_proof_progress(profile),
-                )
-
             def _collect_counterfactual_secondary_profile(
                 parent: _DirectFullFramePartitionProfile,
                 error: DirectMemberVisualSelectionError,
@@ -8676,7 +8688,9 @@ def _select_direct_member_partition_profile(
                         ),
                         maximum_proof_progress=max(
                             (
-                                _terminal_candidate_progress(item[0], item[1])
+                                _direct_partition_terminal_candidate_progress(
+                                    item[0], item[1]
+                                )
                                 for item in terminal_safe_hold_candidates.values()
                             ),
                             default=-1,
@@ -8903,7 +8917,9 @@ def _select_direct_member_partition_profile(
                     sorted(
                         terminal_safe_hold_candidates.values(),
                         key=lambda item: (
-                            -_terminal_candidate_progress(item[0], item[1]),
+                            -_direct_partition_terminal_candidate_progress(
+                                item[0], item[1]
+                            ),
                             item[0].structural_change_count,
                             item[0].total_unit_displacement,
                             item[0].musical_boundary_penalty,
@@ -8968,9 +8984,11 @@ def _select_direct_member_partition_profile(
                                 "failed_at_segment_index"
                             )
                         ),
-                        "selected_proof_progress": _terminal_candidate_progress(
-                            terminal_profile,
-                            terminal_error,
+                        "selected_proof_progress": (
+                            _direct_partition_terminal_candidate_progress(
+                                terminal_profile,
+                                terminal_error,
+                            )
                         ),
                         "selection_policy": (
                             "all_proof_progress_ranked_terminal_profiles_"
