@@ -59,14 +59,40 @@ class DirectMemberPartitionWarmStartTests(unittest.TestCase):
             (2, 2, *((4,) * 18)),
         )
 
-    def _write_manifest(self, cache_directory: Path, *, revision: int = 1) -> None:
+    def _write_manifest(
+        self,
+        cache_directory: Path,
+        *,
+        revision: int = 1,
+        first_source_sha256: str = "a" * 64,
+    ) -> None:
         (cache_directory / "acquisition-manifest.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,
                     "group": "IVE",
                     "song": "TEST",
+                    "edit_mode": "member",
+                    "target_member": "가을",
                     "revision": revision,
+                    "selected": [
+                        {
+                            "source_index": source_index,
+                            "video_id": f"source_{source_index:02d}",
+                            "broadcast_date": f"2026-03-{source_index + 1:02d}",
+                            "broadcast_program": f"show_{source_index:02d}",
+                            "content_integrity": {
+                                "algorithm": "sha256",
+                                "sha256": (
+                                    first_source_sha256
+                                    if source_index == 0
+                                    else f"{source_index + 1:064x}"
+                                ),
+                                "size_bytes": 1_000_000 + source_index,
+                            },
+                        }
+                        for source_index in range(8)
+                    ],
                 },
                 separators=(",", ":"),
             ),
@@ -131,6 +157,25 @@ class DirectMemberPartitionWarmStartTests(unittest.TestCase):
             self.assertFalse(warm_start["visual_gates_relaxed"])
 
             self._write_manifest(cache_directory, revision=2)
+            refreshed_profiles, refreshed_diagnostics = (
+                _load_direct_member_partition_warm_start_profiles(
+                    cache_directory,
+                    self.segments,
+                    self.base,
+                    source_count=8,
+                )
+            )
+            self.assertEqual(len(refreshed_profiles), 1)
+            self.assertEqual(
+                refreshed_diagnostics["status"],
+                "candidates_loaded",
+            )
+
+            self._write_manifest(
+                cache_directory,
+                revision=3,
+                first_source_sha256="b" * 64,
+            )
             stale_profiles, stale_diagnostics = (
                 _load_direct_member_partition_warm_start_profiles(
                     cache_directory,

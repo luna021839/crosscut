@@ -54,6 +54,11 @@ _CROSS_BASIS_CINEMATIC_BRIDGE_ATTENTION_BASIS = (
 )
 _CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
 _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
+_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.65
+_NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
+_NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.48
+_NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.52
+_CINEMATIC_BRIDGE_MINIMUM_EVENT_SPACING_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +568,7 @@ class _RequiredCinematicBridgeCandidate:
     style: str
     transition_kind: TransitionKind
     transition_reason: str
+    highlight_priority: bool
     both_moving: bool
     attention_basis: str
     endpoint_attention_position_mismatch: float | None
@@ -1476,14 +1482,66 @@ def _required_cinematic_bridge_candidate(
         common_master_start + render_segments[boundary_index + 1].master_start
     )
     canonical_master = _diagnostic_cut_master_seconds(diagnostic)
+    highlight_priority = False
     if (
         getattr(diagnostic, "boundary_index", None) != boundary_index
         or canonical_master is None
         or abs(canonical_master - expected_master) > 1e-6
     ):
         reasons.append("stale_or_nonexact_boundary_diagnostic")
-    elif not _in_highlight(canonical_master, highlight_intervals):
-        reasons.append("cinematic_bridge_outside_highlight")
+    else:
+        highlight_priority = _in_highlight(
+            canonical_master,
+            highlight_intervals,
+        )
+
+    bridge_pose_mismatch = _finite_float(
+        getattr(bridge, "pose_mismatch", None)
+    )
+    bridge_silhouette_mismatch = _finite_float(
+        getattr(bridge, "silhouette_mismatch", None)
+    )
+    bridge_base_mismatch = _finite_float(
+        getattr(bridge, "base_mismatch", None)
+    )
+    if (
+        bridge_pose_mismatch is None
+        or bridge_pose_mismatch
+        > _CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+    ):
+        reasons.append("cinematic_bridge_pose_mismatch_unverified")
+    if (
+        bridge_silhouette_mismatch is None
+        or bridge_silhouette_mismatch
+        > _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+    ):
+        reasons.append("cinematic_bridge_silhouette_mismatch_unverified")
+    if (
+        bridge_base_mismatch is None
+        or bridge_base_mismatch
+        > _CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+    ):
+        reasons.append("cinematic_bridge_base_mismatch_unverified")
+    if canonical_master is not None and not highlight_priority:
+        if (
+            bridge_pose_mismatch is None
+            or bridge_pose_mismatch
+            > _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+        ):
+            reasons.append("cinematic_bridge_nonpriority_pose_mismatch")
+        if (
+            bridge_silhouette_mismatch is None
+            or bridge_silhouette_mismatch
+            > _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
+            + 1e-9
+        ):
+            reasons.append("cinematic_bridge_nonpriority_silhouette_mismatch")
+        if (
+            bridge_base_mismatch is None
+            or bridge_base_mismatch
+            > _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+        ):
+            reasons.append("cinematic_bridge_nonpriority_base_mismatch")
 
     source_path = tuple(getattr(visual_selection, "source_indices", ()))
     if len(source_path) != len(render_segments):
@@ -1744,6 +1802,8 @@ def _required_cinematic_bridge_candidate(
         return (None, tuple(reasons))
     assert canonical_master is not None
     assert attention_basis is not None
+    assert bridge_pose_mismatch is not None
+    assert bridge_silhouette_mismatch is not None
     return (
         _RequiredCinematicBridgeCandidate(
             boundary_index=boundary_index,
@@ -1751,6 +1811,7 @@ def _required_cinematic_bridge_candidate(
             style=str(style),
             transition_kind=transition_kind,
             transition_reason=transition_reason,
+            highlight_priority=highlight_priority,
             both_moving=both_moving,
             attention_basis=attention_basis,
             endpoint_attention_position_mismatch=(
@@ -1763,13 +1824,11 @@ def _required_cinematic_bridge_candidate(
                     getattr(mismatch, "attention_scale_mismatch", None)
                 )
             ),
-            endpoint_pose_mismatch=float(getattr(bridge, "pose_mismatch")),
+            endpoint_pose_mismatch=bridge_pose_mismatch,
             endpoint_formation_mismatch=(
                 _finite_float(getattr(mismatch, "formation_mismatch", None))
             ),
-            endpoint_silhouette_mismatch=float(
-                getattr(bridge, "silhouette_mismatch")
-            ),
+            endpoint_silhouette_mismatch=bridge_silhouette_mismatch,
             outgoing_handle_available_seconds=available_handle,
             required_outgoing_handle_seconds=required_handle,
             incoming_segment_frame_count=incoming_frame_count,
@@ -1983,6 +2042,28 @@ def build_direct_member_pose_dissolve_plan(
         else:
             safe.append(candidate)
 
+    ordered_required_bridges = tuple(
+        sorted(
+            required_bridges.values(),
+            key=lambda candidate: (
+                candidate.canonical_master_seconds,
+                candidate.boundary_index,
+            ),
+        )
+    )
+    for previous, current in zip(
+        ordered_required_bridges,
+        ordered_required_bridges[1:],
+    ):
+        if (
+            current.canonical_master_seconds
+            - previous.canonical_master_seconds
+            < _CINEMATIC_BRIDGE_MINIMUM_EVENT_SPACING_SECONDS - 1e-9
+        ):
+            required_bridge_failures[current.boundary_index] = (
+                "cinematic_bridge_required_event_spacing_too_short",
+            )
+
     if required_bridge_failures:
         failure_text = "; ".join(
             f"boundary {boundary_index}: {','.join(reasons)}"
@@ -2071,7 +2152,7 @@ def build_direct_member_pose_dissolve_plan(
                         if bridge_face_values
                         else None
                     ),
-                    tier="A",
+                    tier=("A" if bridge_candidate.highlight_priority else "B"),
                 )
             )
             rejection_reasons = ()
@@ -2131,7 +2212,9 @@ def build_direct_member_pose_dissolve_plan(
                 highlight_priority=(
                     candidate.highlight_priority
                     if candidate is not None
-                    else bridge_candidate is not None
+                    else bridge_candidate.highlight_priority
+                    if bridge_candidate is not None
+                    else False
                 ),
                 both_moving=(
                     evidence_candidate.both_moving

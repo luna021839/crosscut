@@ -234,6 +234,7 @@ def _cinematic_selection(
         authorized_severe_flags=severe_flags,
         pose_mismatch=0.10,
         silhouette_mismatch=0.12,
+        base_mismatch=0.20,
     )
     return selection
 
@@ -626,6 +627,30 @@ class DirectMemberTransitionTests(unittest.TestCase):
             transition_plan.decisions[0].attention_basis,
             "verified_cross_basis_pose_silhouette_effect_bridge",
         )
+
+    def test_nonhighlight_bridge_requires_exceptional_pose_body_envelope(self) -> None:
+        accepted = _plan(
+            (0, 1),
+            selection=_cinematic_selection(),
+            highlight_intervals=(),
+        )
+        rejected_selection = _cinematic_selection()
+        rejected_selection.boundaries[
+            0
+        ].mismatch.cinematic_bridge.pose_mismatch = 0.23
+
+        self.assertEqual(accepted.cinematic_bridge_count, 1)
+        self.assertFalse(accepted.decisions[0].highlight_priority)
+        self.assertEqual(accepted.transitions[0].tier, "B")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cinematic_bridge_nonpriority_pose_mismatch",
+        ):
+            _plan(
+                (0, 1),
+                selection=rejected_selection,
+                highlight_intervals=(),
+            )
 
     def test_required_bridge_audits_short_outgoing_handle_independently(self) -> None:
         selection = _cinematic_selection()

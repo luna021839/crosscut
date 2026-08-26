@@ -378,11 +378,11 @@ _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
     2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
 )
 _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME = (
-    "direct-member-partition-candidate-cache-v1.json"
+    "direct-member-partition-candidate-cache-v2.json"
 )
 _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT = (
-    "exact_acquisition_manifest_and_base_partition_bound_full_recheck_"
-    "candidate_cache_v1"
+    "stable_acquisition_source_identity_and_base_partition_bound_full_"
+    "recheck_candidate_cache_v2"
 )
 _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES = 256 * 1024
 _DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT = 32
@@ -4942,6 +4942,84 @@ def _direct_partition_signature_sha256(unit_counts: Sequence[int]) -> str:
     ).hexdigest()
 
 
+def _direct_member_stable_acquisition_source_identity_sha256(
+    encoded_manifest: bytes,
+    *,
+    source_count: int,
+) -> str:
+    """Hash only acquired-source identity fields, never volatile search data."""
+
+    try:
+        manifest = json.loads(encoded_manifest.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("direct member acquisition manifest is invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("direct member acquisition manifest must be an object")
+    selected = manifest.get("selected")
+    if not (
+        str(manifest.get("group", "")).strip().upper() == "IVE"
+        and str(manifest.get("edit_mode", "")).strip().lower() == "member"
+        and isinstance(manifest.get("song"), str)
+        and manifest.get("song")
+        and isinstance(manifest.get("target_member"), str)
+        and manifest.get("target_member")
+        and isinstance(selected, list)
+        and len(selected) == source_count
+    ):
+        raise ValueError("direct member acquisition manifest scope mismatch")
+    stable_sources: list[dict[str, Any]] = []
+    for source_index, entry in enumerate(selected):
+        if not isinstance(entry, dict):
+            raise ValueError("direct member acquisition entry is invalid")
+        integrity = entry.get("content_integrity")
+        video_id = entry.get("video_id")
+        broadcast_date = entry.get("broadcast_date")
+        broadcast_program = entry.get("broadcast_program")
+        if not (
+            entry.get("source_index") == source_index
+            and isinstance(video_id, str)
+            and re.fullmatch(r"[0-9A-Za-z_-]{6,32}", video_id)
+            and isinstance(broadcast_date, str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", broadcast_date)
+            and isinstance(broadcast_program, str)
+            and broadcast_program.strip()
+            and isinstance(integrity, dict)
+            and integrity.get("algorithm") == "sha256"
+            and isinstance(integrity.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", integrity["sha256"])
+            and isinstance(integrity.get("size_bytes"), int)
+            and not isinstance(integrity.get("size_bytes"), bool)
+            and integrity["size_bytes"] > 0
+        ):
+            raise ValueError("direct member acquisition source identity is invalid")
+        stable_sources.append(
+            {
+                "source_index": source_index,
+                "video_id": video_id,
+                "broadcast_date": broadcast_date,
+                "broadcast_program": broadcast_program.strip(),
+                "source_content_sha256": integrity["sha256"],
+                "source_size_bytes": integrity["size_bytes"],
+            }
+        )
+    stable_identity = {
+        "contract": "stable_automatic_member_acquisition_source_identity_v1",
+        "group": "IVE",
+        "song": manifest["song"],
+        "edit_mode": "member",
+        "target_member": manifest["target_member"],
+        "sources": stable_sources,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            stable_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _direct_member_partition_warm_start_binding(
     feature_cache_directory: Path | None,
     base: _DirectFullFramePartitionProfile,
@@ -4970,8 +5048,14 @@ def _direct_member_partition_warm_start_binding(
         raise ValueError("direct member warm-start source count must be positive")
     manifest_path = Path(feature_cache_directory) / "acquisition-manifest.json"
     try:
-        _manifest_bytes, manifest_fingerprint = _read_stable_regular_file(
+        manifest_bytes, manifest_fingerprint = _read_stable_regular_file(
             manifest_path
+        )
+        source_identity_sha256 = (
+            _direct_member_stable_acquisition_source_identity_sha256(
+                manifest_bytes,
+                source_count=source_count,
+            )
         )
     except (OSError, ValueError) as exc:
         diagnostics.update(
@@ -4983,7 +5067,7 @@ def _direct_member_partition_warm_start_binding(
         return None, diagnostics
     binding_payload = {
         "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
-        "acquisition_manifest_sha256": manifest_fingerprint["sha256"],
+        "acquisition_source_identity_sha256": source_identity_sha256,
         "base_partition_signature_sha256": (
             _direct_partition_signature_sha256(base.unit_counts)
         ),
@@ -5002,7 +5086,8 @@ def _direct_member_partition_warm_start_binding(
     diagnostics.update(
         {
             "status": "binding_ready",
-            "acquisition_manifest_sha256": manifest_fingerprint["sha256"],
+            "acquisition_manifest_file_sha256": manifest_fingerprint["sha256"],
+            "acquisition_source_identity_sha256": source_identity_sha256,
             "base_partition_signature_sha256": (
                 binding_payload["base_partition_signature_sha256"]
             ),
