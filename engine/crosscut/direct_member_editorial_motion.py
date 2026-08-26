@@ -329,15 +329,7 @@ class DirectMemberDenseFaceProvider:
             subject_box = None
             subject_confidence = 0.0
             subject_basis = "none"
-            if (
-                descriptor.silhouette_bbox_xywh is not None
-                and descriptor.silhouette_confidence >= 0.30
-                and descriptor.silhouette_backend == SILHOUETTE_BACKEND
-            ):
-                subject_box = descriptor.silhouette_bbox_xywh
-                subject_confidence = descriptor.silhouette_confidence
-                subject_basis = "pphumanseg_full_subject_silhouette"
-            elif descriptor.primary_face_bbox is not None:
+            if descriptor.primary_face_bbox is not None:
                 face = descriptor.primary_face_bbox
                 face_center = (
                     face[0] + face[2] / 2.0,
@@ -358,6 +350,15 @@ class DirectMemberDenseFaceProvider:
                     subject_box = associated[0].bbox_xywh
                     subject_confidence = associated[0].detection_confidence
                     subject_basis = "face_associated_formation_person_box"
+            if (
+                subject_box is None
+                and descriptor.silhouette_bbox_xywh is not None
+                and descriptor.silhouette_confidence >= 0.30
+                and descriptor.silhouette_backend == SILHOUETTE_BACKEND
+            ):
+                subject_box = descriptor.silhouette_bbox_xywh
+                subject_confidence = descriptor.silhouette_confidence
+                subject_basis = "pphumanseg_full_subject_silhouette"
             if (
                 descriptor.primary_face_bbox is not None
                 and descriptor.face_count == 1
@@ -468,6 +469,9 @@ class DirectMemberEditorialMotionConfig:
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.10
     maximum_dense_height_ratio: float = 1.35
+    maximum_dense_face_interpolation_gap_frames: int = 8
+    maximum_dense_face_edge_extrapolation_frames: int = 2
+    dense_geometry_median_radius_frames: int = 2
     maximum_endpoint_center_disagreement: float = 0.08
     maximum_endpoint_height_ratio: float = 1.25
     target_events_per_minute: float = 12.0
@@ -513,6 +517,29 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("dense face center-step gate is invalid")
         if not 1.0 <= self.maximum_dense_height_ratio <= 2.0:
             raise ValueError("dense face height-ratio gate is invalid")
+        for name, value, maximum in (
+            (
+                "maximum_dense_face_interpolation_gap_frames",
+                self.maximum_dense_face_interpolation_gap_frames,
+                12,
+            ),
+            (
+                "maximum_dense_face_edge_extrapolation_frames",
+                self.maximum_dense_face_edge_extrapolation_frames,
+                4,
+            ),
+            (
+                "dense_geometry_median_radius_frames",
+                self.dense_geometry_median_radius_frames,
+                3,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= maximum
+            ):
+                raise ValueError(f"{name} is invalid")
         if not 1.0 <= self.legacy_face_only_maximum_zoom <= 1.12:
             raise ValueError("legacy face-only zoom boundary is invalid")
         if not 0.0 <= self.legacy_face_only_maximum_center_shift <= 0.025:
@@ -579,6 +606,7 @@ class _BoundaryCandidate:
     score: float
     side: str
     state: _State
+    alignment_geometry_basis: str
     alternative_states: tuple[_State, ...] = ()
     required: bool = False
 
@@ -726,6 +754,206 @@ def _isolated_outlier_replacement(
     return _midpoint_box(previous, following)
 
 
+def _linear_box(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+    alpha: float,
+) -> tuple[float, float, float, float]:
+    return tuple(
+        left_value + (right_value - left_value) * alpha
+        for left_value, right_value in zip(left, right, strict=True)
+    )  # type: ignore[return-value]
+
+
+def _relative_box(
+    item: tuple[float, float, float, float],
+    container: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    if container[2] <= 1e-9 or container[3] <= 1e-9:
+        return None
+    item_center = _center(item)
+    return (
+        (item_center[0] - container[0]) / container[2],
+        (item_center[1] - container[1]) / container[3],
+        item[2] / container[2],
+        item[3] / container[3],
+    )
+
+
+def _box_from_relative(
+    relative: tuple[float, float, float, float],
+    container: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    width = relative[2] * container[2]
+    height = relative[3] * container[3]
+    center_x = container[0] + relative[0] * container[2]
+    center_y = container[1] + relative[1] * container[3]
+    x = center_x - width / 2.0
+    y = center_y - height / 2.0
+    if (
+        width <= 0.0
+        or height <= 0.0
+        or x < -1e-6
+        or y < -1e-6
+        or x + width > 1.0 + 1e-6
+        or y + height > 1.0 + 1e-6
+    ):
+        return None
+    return (
+        max(0.0, x),
+        max(0.0, y),
+        min(width, 1.0 - max(0.0, x)),
+        min(height, 1.0 - max(0.0, y)),
+    )
+
+
+def _median_value(values: Sequence[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def _median_smooth_geometry(
+    frame_indices: Sequence[int],
+    boxes: Sequence[tuple[float, float, float, float]],
+    *,
+    radius: int,
+) -> list[tuple[float, float, float, float]]:
+    if radius <= 0:
+        return list(boxes)
+    output = list(boxes)
+    for index in range(1, len(boxes) - 1):
+        run_start = index
+        while (
+            run_start > 0
+            and frame_indices[run_start - 1] + 1 == frame_indices[run_start]
+        ):
+            run_start -= 1
+        run_end = index
+        while (
+            run_end + 1 < len(boxes)
+            and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
+        ):
+            run_end += 1
+        if index in {run_start, run_end}:
+            continue
+        low = max(run_start, index - radius)
+        high = min(run_end, index + radius)
+        window = boxes[low : high + 1]
+        output[index] = tuple(
+            _median_value(tuple(box[component] for box in window))
+            for component in range(4)
+        )  # type: ignore[assignment]
+    return output
+
+
+def _reconstruct_dense_face_geometry(
+    *,
+    frame_indices: Sequence[int],
+    face_boxes: Sequence[tuple[float, float, float, float] | None],
+    subject_boxes: Sequence[tuple[float, float, float, float] | None],
+    config: DirectMemberEditorialMotionConfig,
+) -> list[tuple[float, float, float, float]] | None:
+    """Bridge short detector gaps in target-subject relative coordinates."""
+
+    output = list(face_boxes)
+    run_start = 0
+    while run_start < len(frame_indices):
+        run_end = run_start
+        while (
+            run_end + 1 < len(frame_indices)
+            and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
+        ):
+            run_end += 1
+        anchors = [
+            index
+            for index in range(run_start, run_end + 1)
+            if output[index] is not None
+        ]
+        if not anchors:
+            return None
+        first_anchor = anchors[0]
+        prefix = first_anchor - run_start
+        if prefix > config.maximum_dense_face_edge_extrapolation_frames:
+            return None
+        last_anchor = anchors[-1]
+        suffix = run_end - last_anchor
+        if suffix > config.maximum_dense_face_edge_extrapolation_frames:
+            return None
+
+        def project_anchor(anchor: int, target: int):
+            anchor_box = output[anchor]
+            assert anchor_box is not None
+            anchor_subject = subject_boxes[anchor]
+            target_subject = subject_boxes[target]
+            if anchor_subject is None or target_subject is None:
+                return anchor_box
+            relative = _relative_box(anchor_box, anchor_subject)
+            return (
+                _box_from_relative(relative, target_subject)
+                if relative is not None
+                else None
+            )
+
+        for index in range(run_start, first_anchor):
+            output[index] = project_anchor(first_anchor, index)
+        for index in range(last_anchor + 1, run_end + 1):
+            output[index] = project_anchor(last_anchor, index)
+
+        for left_anchor, right_anchor in zip(anchors, anchors[1:]):
+            gap = right_anchor - left_anchor - 1
+            if gap <= 0:
+                continue
+            if gap > config.maximum_dense_face_interpolation_gap_frames:
+                return None
+            left_box = output[left_anchor]
+            right_box = output[right_anchor]
+            assert left_box is not None and right_box is not None
+            left_subject = subject_boxes[left_anchor]
+            right_subject = subject_boxes[right_anchor]
+            left_relative = (
+                _relative_box(left_box, left_subject)
+                if left_subject is not None
+                else None
+            )
+            right_relative = (
+                _relative_box(right_box, right_subject)
+                if right_subject is not None
+                else None
+            )
+            for index in range(left_anchor + 1, right_anchor):
+                alpha = (index - left_anchor) / (right_anchor - left_anchor)
+                target_subject = subject_boxes[index]
+                reconstructed = None
+                if (
+                    left_relative is not None
+                    and right_relative is not None
+                    and target_subject is not None
+                ):
+                    reconstructed = _box_from_relative(
+                        _linear_box(left_relative, right_relative, alpha),
+                        target_subject,
+                    )
+                if reconstructed is None:
+                    reconstructed = _linear_box(left_box, right_box, alpha)
+                output[index] = reconstructed
+        if any(output[index] is None for index in range(run_start, run_end + 1)):
+            return None
+        run_start = run_end + 1
+    resolved = [box for box in output if box is not None]
+    if len(resolved) != len(output):
+        return None
+    if all(subject_box is not None for subject_box in subject_boxes):
+        return _median_smooth_geometry(
+            frame_indices,
+            resolved,
+            radius=config.dense_geometry_median_radius_frames,
+        )
+    return resolved
+
+
 def _track_is_dense_face_safe(
     *,
     segment_index: int,
@@ -738,6 +966,7 @@ def _track_is_dense_face_safe(
     fps: float,
     config: DirectMemberEditorialMotionConfig,
     source_frame_geometry: DirectMemberSourceFrameGeometry | None,
+    alignment_geometry_basis: str | None = None,
     rejection_callback: Callable[[str], None] | None = None,
 ) -> bool:
     def reject(reason: str) -> bool:
@@ -777,7 +1006,8 @@ def _track_is_dense_face_safe(
 
     ordered_frames = tuple(sorted(review_frames))
     samples: list[DirectMemberFaceSample] = []
-    boxes: list[tuple[float, float, float, float]] = []
+    raw_boxes: list[tuple[float, float, float, float]] = []
+    face_boxes: list[tuple[float, float, float, float] | None] = []
     subject_boxes: list[tuple[float, float, float, float] | None] = []
     for frame_index in ordered_frames:
         local_time = frame_index / fps
@@ -800,8 +1030,65 @@ def _track_is_dense_face_safe(
                 source_frame_geometry,
             )
         samples.append(sample)
-        boxes.append(box)
+        raw_boxes.append(box)
+        face_boxes.append(box if sample.face_count == 1 else None)
         subject_boxes.append(subject_box)
+
+    resolved_basis = alignment_geometry_basis
+    if resolved_basis is None:
+        resolved_basis = (
+            _FACE_ATTENTION_BASIS
+            if sum(sample.face_count == 1 for sample in samples)
+            >= max(2, math.ceil(len(samples) / 2.0))
+            else "aggregate_human_silhouette"
+        )
+    if resolved_basis == _FACE_ATTENTION_BASIS:
+        for index, face_box in enumerate(face_boxes):
+            subject_box = subject_boxes[index]
+            if (
+                face_box is not None
+                and subject_box is not None
+                and not _box_contains_center(subject_box, face_box)
+            ):
+                face_boxes[index] = None
+        reconstructed = _reconstruct_dense_face_geometry(
+            frame_indices=ordered_frames,
+            face_boxes=face_boxes,
+            subject_boxes=subject_boxes,
+            config=config,
+        )
+        if reconstructed is None:
+            return reject("dense_face_track_gap_unresolved")
+        boxes = reconstructed
+    elif resolved_basis in {
+        "aggregate_human_silhouette",
+        "unambiguous_dominant_person_box_geometry_only",
+    }:
+        if any(subject_box is None for subject_box in subject_boxes):
+            return reject("dense_subject_track_gap_unresolved")
+        boxes = _median_smooth_geometry(
+            ordered_frames,
+            [
+                subject_box
+                for subject_box in subject_boxes
+                if subject_box is not None
+            ],
+            radius=config.dense_geometry_median_radius_frames,
+        )
+    else:
+        return reject("dense_alignment_geometry_basis_invalid")
+
+    if all(subject_box is not None for subject_box in subject_boxes):
+        smoothed_subject_boxes = _median_smooth_geometry(
+            ordered_frames,
+            [
+                subject_box
+                for subject_box in subject_boxes
+                if subject_box is not None
+            ],
+            radius=config.dense_geometry_median_radius_frames,
+        )
+        subject_boxes = list(smoothed_subject_boxes)
 
     # YuNet and silhouette boxes can make a single-frame excursion while the
     # authenticated member track is otherwise continuous. Replace only that
@@ -1039,6 +1326,7 @@ def build_direct_member_editorial_motion_plan(
             blocked.update((index, index + 1))
     skipped: dict[str, int] = {}
     required_rejection_reasons: dict[int, set[str]] = {}
+    required_rejection_context: dict[int, str] = {}
 
     def skip(reason: str) -> None:
         skipped[reason] = skipped.get(reason, 0) + 1
@@ -1071,9 +1359,6 @@ def build_direct_member_editorial_motion_plan(
                     set(),
                 ).add(reason)
 
-        if boundary_index in blocked or boundary_index + 1 in blocked:
-            reject_boundary("dissolve_adjacent")
-            continue
         if (
             getattr(diagnostic, "outgoing_eligible_source_index", None)
             != left_source
@@ -1181,6 +1466,23 @@ def build_direct_member_editorial_motion_plan(
             side = "right"
             affected_index = boundary_index + 1
             box, target_box = right_box, left_box
+        if affected_index in blocked:
+            alternate_side = "right" if side == "left" else "left"
+            alternate_index = (
+                boundary_index
+                if alternate_side == "left"
+                else boundary_index + 1
+            )
+            if alternate_index in blocked:
+                reject_boundary("dissolve_adjacent")
+                continue
+            side = alternate_side
+            affected_index = alternate_index
+            box, target_box = (
+                (left_box, right_box)
+                if side == "left"
+                else (right_box, left_box)
+            )
         if last_frame_times[affected_index] < 0.55 - 1e-9:
             reject_boundary("window_shorter_than_reference_ramp")
             continue
@@ -1259,6 +1561,12 @@ def build_direct_member_editorial_motion_plan(
                     qualifying.append((transformed, state))
         if not qualifying:
             reject_boundary("no_improving_contained_transform")
+            if required:
+                required_rejection_context[boundary_index] = (
+                    f"baseline={baseline:.6f},center={center_distance:.6f},"
+                    f"height_ratio={ratio:.6f},side={side},"
+                    f"maximum_zoom={maximum_candidate_zoom:.6f}"
+                )
             continue
         qualifying.sort(key=lambda item: item[0])
         best_score, best_state = qualifying[0]
@@ -1269,6 +1577,7 @@ def build_direct_member_editorial_motion_plan(
                 score=baseline - best_score,
                 side=side,
                 state=best_state,
+                alignment_geometry_basis=audited_basis,
                 alternative_states=tuple(state for _score, state in qualifying[1:]),
                 required=required,
             )
@@ -1281,6 +1590,9 @@ def build_direct_member_editorial_motion_plan(
     entry_states: list[_State | None] = [None] * len(renders)
     exit_states: list[_State | None] = [None] * len(renders)
     tracks: list[EditorialTransformTrack | None] = [None] * len(renders)
+    segment_alignment_bases: list[set[str]] = [
+        set() for _segment in renders
+    ]
     accepted: list[_BoundaryCandidate] = []
     for candidate in sorted(
         candidates,
@@ -1310,6 +1622,15 @@ def build_direct_member_editorial_motion_plan(
         accepted_state: _State | None = None
         accepted_track: EditorialTransformTrack | None = None
         dense_rejection_reasons: set[str] = set()
+        candidate_alignment_bases = set(
+            segment_alignment_bases[affected_index]
+        )
+        candidate_alignment_bases.add(candidate.alignment_geometry_basis)
+        review_alignment_basis = (
+            next(iter(candidate_alignment_bases))
+            if len(candidate_alignment_bases) == 1
+            else None
+        )
         for state in (candidate.state,) + candidate.alternative_states:
             if candidate.side == "left":
                 exit_states[affected_index] = state
@@ -1337,6 +1658,7 @@ def build_direct_member_editorial_motion_plan(
                 source_frame_geometry=source_frame_geometries[
                     source_path[affected_index]
                 ],
+                alignment_geometry_basis=review_alignment_basis,
                 rejection_callback=dense_rejection_reasons.add,
             ):
                 accepted_state = state
@@ -1356,6 +1678,7 @@ def build_direct_member_editorial_motion_plan(
                 )
             continue
         tracks[affected_index] = accepted_track
+        segment_alignment_bases[affected_index] = candidate_alignment_bases
         accepted.append(
             _BoundaryCandidate(
                 boundary_index=candidate.boundary_index,
@@ -1363,6 +1686,9 @@ def build_direct_member_editorial_motion_plan(
                 score=candidate.score,
                 side=candidate.side,
                 state=accepted_state,
+                alignment_geometry_basis=(
+                    candidate.alignment_geometry_basis
+                ),
                 required=candidate.required,
             )
         )
@@ -1495,6 +1821,11 @@ def build_direct_member_editorial_motion_plan(
             fps=fps,
             config=settings,
             source_frame_geometry=source_frame_geometries[source_path[index]],
+            alignment_geometry_basis=(
+                next(iter(segment_alignment_bases[index]))
+                if len(segment_alignment_bases[index]) == 1
+                else None
+            ),
         ):
             raise ValueError("accepted direct member camera failed final dense review")
         tracks[index] = track
@@ -1531,6 +1862,11 @@ def build_direct_member_editorial_motion_plan(
                         {"required_candidate_missing_without_reason"},
                     )
                 )
+            )
+            + (
+                f"[{required_rejection_context[boundary_index]}]"
+                if boundary_index in required_rejection_context
+                else ""
             )
             for boundary_index in missing_required
         )
@@ -1577,7 +1913,7 @@ def build_direct_member_editorial_motion_plan(
         skipped_boundary_reasons=tuple(sorted(skipped.items())),
         analysis_basis=(
             "official_target_fancam_face_or_verified_full_subject_dense_"
-            "output_frame_temporally_stabilized_adaptive_repair_review_v6"
+            "output_frame_subject_relative_face_track_adaptive_review_v7"
         ),
         accepted_boundary_indices=accepted_boundary_indices,
     )

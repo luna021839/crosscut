@@ -20,7 +20,7 @@ from crosscut.direct_member_transform import (
     direct_member_source_frame_geometry,
 )
 from crosscut.pose import SILHOUETTE_BACKEND
-from crosscut.render import RenderSegment, RenderTransition
+from crosscut.render import RenderSegment, RenderTransition, TransitionKind
 from crosscut.visual_feature_cache import CanonicalFrameIdentity
 
 
@@ -142,7 +142,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(
             plan.analysis_basis,
             "official_target_fancam_face_or_verified_full_subject_dense_"
-            "output_frame_temporally_stabilized_adaptive_repair_review_v6",
+            "output_frame_subject_relative_face_track_adaptive_review_v7",
         )
 
     def test_verified_full_subject_match_is_accepted_without_face(self) -> None:
@@ -465,6 +465,127 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.boundary_match_count, 1)
         self.assertIsNotNone(plan.track_for(0))
 
+    def test_short_face_detection_gap_is_reconstructed_from_subject_track(
+        self,
+    ) -> None:
+        selection, renders, boxes = self._basic_inputs()
+        subject_box = (0.20, 0.08, 0.60, 0.84)
+
+        def geometry(source: int, time_seconds: float):
+            if source == 0 and 7.49 <= time_seconds <= 7.51:
+                return DirectMemberFaceSample(
+                    subject_box,
+                    0,
+                    "none",
+                    subject_box,
+                    0.95,
+                    "pphumanseg_full_subject_silhouette",
+                )
+            return self._sample(boxes[source], subject_box=subject_box)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=geometry,
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.boundary_match_count, 1)
+
+    def test_long_face_detection_gap_is_not_invented(self) -> None:
+        selection, renders, boxes = self._basic_inputs()
+        subject_box = (0.20, 0.08, 0.60, 0.84)
+
+        def geometry(source: int, time_seconds: float):
+            if source == 0 and 7.40 <= time_seconds <= 7.80:
+                return DirectMemberFaceSample(
+                    subject_box,
+                    0,
+                    "none",
+                    subject_box,
+                    0.95,
+                    "pphumanseg_full_subject_silhouette",
+                )
+            return self._sample(boxes[source], subject_box=subject_box)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=geometry,
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.applied_count, 0)
+        self.assertIn(
+            ("dense_face_containment_or_continuity_failed", 1),
+            plan.skipped_boundary_reasons,
+        )
+
+    def test_required_repair_uses_other_side_beside_overlap_effect(self) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        repair = DirectMemberBoundaryTransformRepair(
+            transformed_side="incoming",
+            transformed_source_index=1,
+            zoom=1.20,
+            center_x=0.5,
+            center_y=0.5,
+            source_geometry=geometry,
+            raw_attention_position_mismatch=0.12,
+            raw_attention_scale_mismatch=0.40,
+            residual_attention_position_mismatch=0.0,
+            residual_attention_scale_mismatch=0.0,
+            baseline_face_geometry_mismatch=0.20,
+            transformed_face_geometry_mismatch=0.0,
+            improvement_fraction=1.0,
+            face_visible_fraction=1.0,
+            subject_geometry_basis="pphumanseg_full_subject_silhouette",
+            subject_visible_fraction=1.0,
+            repaired_severe_flags=("attention_scale",),
+        )
+        selection = self._selection(
+            (0, 1, 2),
+            boxes,
+            boundary_overrides={
+                0: {"mismatch": SimpleNamespace(transform_repair=repair)}
+            },
+        )
+        selection.source_frame_geometries = (
+            geometry,
+            geometry,
+            geometry,
+        )
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1, 2), (2.0, 2.0, 2.0)),
+            transitions=(
+                RenderTransition(),
+                RenderTransition(
+                    kind=TransitionKind.FACE_DISSOLVE,
+                    frame_count=3,
+                ),
+            ),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source],
+                subject_box=(0.30, 0.10, 0.40, 0.75),
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertIsNotNone(plan.track_for(0))
+        self.assertIsNone(plan.track_for(1))
+
     def test_dense_crop_falls_back_to_a_smaller_still_improving_zoom(
         self,
     ) -> None:
@@ -473,7 +594,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
 
         def geometry(source: int, time_seconds: float):
             box = boxes[source]
-            if source == 0 and 7.82 <= time_seconds <= 7.84:
+            if source == 0 and 7.78 <= time_seconds <= 7.88:
                 box = (0.02, 0.225, 0.94, 0.55)
             return self._sample(box, subject_box=subject_box)
 
