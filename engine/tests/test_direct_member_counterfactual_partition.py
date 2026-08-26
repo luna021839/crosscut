@@ -9,6 +9,8 @@ from crosscut.direct_member_visual import (
 )
 from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
+    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+    _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
     _DirectFullFramePartitionProfile,
     _DirectFullFrameVisualFrontierSplit,
     _compact_direct_partition_failure,
@@ -197,6 +199,14 @@ def _parent_profile() -> _DirectFullFramePartitionProfile:
 
 
 class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
+    def test_terminal_audition_cannot_truncate_primary_profile_frontier(
+        self,
+    ) -> None:
+        self.assertGreaterEqual(
+            _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+            _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+        )
+
     def test_failure_result_does_not_mislabel_capacity_as_hard(self) -> None:
         self.assertEqual(
             _direct_partition_failure_result(

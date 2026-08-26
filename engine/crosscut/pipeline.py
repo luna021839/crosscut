@@ -359,7 +359,16 @@ _DIRECT_MEMBER_MAX_PROOF_DIRECTED_BOUNDARY_MERGE_COUNT = 1
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 4
 _DIRECT_MEMBER_COUNTERFACTUAL_SECONDARY_SPLIT_TRIGGER_COUNT = 1
 _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
-_DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = 8
+# The terminal cohort must not stop the proof-directed frontier before the
+# already-admitted primary profile budget is exhausted.  A smaller independent
+# cap previously stopped a 64-profile search after 24 evaluations merely
+# because eight failed leaves had accumulated, even though two generated
+# profiles were still waiting in the queue.  Keep the cohort bounded by the
+# same primary budget; visual gates and the separate static upper bound remain
+# unchanged.
+_DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
+    _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
+)
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
