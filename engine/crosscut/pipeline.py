@@ -364,19 +364,19 @@ _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT = 7
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 4
 _DIRECT_MEMBER_COUNTERFACTUAL_SECONDARY_SPLIT_TRIGGER_COUNT = 1
 _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
-# The strict all-cut search is deliberately wider than the initial queue, but
-# it must not chase the combinatorial static upper bound before trying the
-# audited no-cut/effect bridge.  Two complete primary budgets expose materially
-# different frontiers while retaining a deterministic wall against multi-hour
-# expansion.  Every candidate still runs the unrelaxed selector; this cap only
-# decides when the bounded terminal audition begins.
-_DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
-    2 * _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
-)
 # Audition only the strongest proof-progress representatives.  The terminal
 # selector independently caps holds by fraction, count, consecutive use, run
-# length, and highlight priority, and never admits a severe cross-source cut.
+# length, highlight priority, and verified effect spacing.
 _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = 12
+# The strict all-cut search is deliberately wider than the initial queue, but
+# it must not chase the combinatorial static upper bound before trying the
+# audited no-cut/effect bridge.  Two complete terminal cohorts expose
+# materially different frontiers while retaining a deterministic wall against
+# multi-hour expansion.  Every candidate still runs the unrelaxed selector;
+# this cap only decides when the independently constrained audition begins.
+_DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
+    2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
+)
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20

@@ -309,11 +309,15 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
     ) -> None:
         self.assertEqual(
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
-            2 * _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+            2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
         )
         self.assertLess(
             _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT,
             _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+        )
+        self.assertLess(
+            _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT,
+            _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
         )
         self.assertGreaterEqual(_DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT, 8)
         self.assertFalse(
