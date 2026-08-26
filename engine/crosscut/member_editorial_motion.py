@@ -62,9 +62,9 @@ class MemberEditorialMotionConfig:
             raise ValueError("member editorial configuration must be finite")
         if not 0.55 <= self.ramp_seconds <= 0.85:
             raise ValueError("member editorial ramp is outside the reference window")
-        if not 1.02 <= self.maximum_boundary_zoom <= 1.18:
+        if not 1.02 <= self.maximum_boundary_zoom <= 1.50:
             raise ValueError("member editorial zoom is outside the renderer bound")
-        if not 0.0 <= self.maximum_center_shift <= 0.04:
+        if not 0.0 <= self.maximum_center_shift <= 0.12:
             raise ValueError("member editorial pan exceeds the shared-camera bound")
         if not 0.0 <= self.maximum_boundary_center_distance <= 0.30:
             raise ValueError("member boundary center-distance gate is invalid")
@@ -446,7 +446,7 @@ def build_member_editorial_motion_plan(
 
     blocked: set[int] = set()
     for index, transition in enumerate(transition_items):
-        if transition.kind is TransitionKind.FACE_DISSOLVE:
+        if transition.kind.uses_overlap:
             blocked.update((index, index + 1))
 
     skipped: dict[str, int] = {}

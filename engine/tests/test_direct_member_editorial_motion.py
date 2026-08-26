@@ -191,8 +191,9 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
     def test_direct_defaults_expand_only_to_renderer_safe_reference_bounds(self) -> None:
         config = DirectMemberEditorialMotionConfig()
 
-        self.assertEqual(config.maximum_boundary_zoom, 1.35)
-        self.assertEqual(config.maximum_center_shift, 0.08)
+        self.assertEqual(config.maximum_boundary_zoom, 1.50)
+        self.assertEqual(config.maximum_center_shift, 0.12)
+        self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.98)
         self.assertEqual(config.legacy_face_only_maximum_zoom, 1.12)
         self.assertEqual(config.legacy_face_only_maximum_center_shift, 0.025)
         self.assertEqual(config.target_events_per_minute, 12.0)

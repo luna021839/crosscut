@@ -17325,6 +17325,7 @@ def analyze(
                         source_local_seconds,
                     )
 
+                direct_visual_config = direct_visual_selection.config
                 candidate_member_motion_plan = (
                     build_direct_member_editorial_motion_plan(
                         visual_selection=direct_visual_selection,
@@ -17334,6 +17335,45 @@ def analyze(
                         geometry_provider=direct_member_geometry_provider,
                         fps=29.97,
                         config=DirectMemberEditorialMotionConfig(
+                            maximum_boundary_zoom=(
+                                direct_visual_config.transform_repair_maximum_zoom
+                            ),
+                            maximum_center_shift=(
+                                direct_visual_config.
+                                transform_repair_maximum_center_shift
+                            ),
+                            maximum_boundary_center_distance=(
+                                direct_visual_config.
+                                transform_repair_maximum_boundary_center_distance
+                            ),
+                            maximum_residual_center_distance=(
+                                direct_visual_config.
+                                transform_repair_maximum_residual_center_distance
+                            ),
+                            minimum_mismatch_improvement_fraction=(
+                                direct_visual_config.
+                                transform_repair_minimum_improvement_fraction
+                            ),
+                            minimum_face_visible_fraction=(
+                                direct_visual_config.
+                                transform_repair_minimum_face_visible_fraction
+                            ),
+                            legacy_face_only_maximum_zoom=(
+                                direct_visual_config.
+                                transform_repair_legacy_face_only_maximum_zoom
+                            ),
+                            legacy_face_only_maximum_center_shift=(
+                                direct_visual_config.
+                                transform_repair_legacy_face_only_maximum_center_shift
+                            ),
+                            minimum_widened_subject_confidence=(
+                                direct_visual_config.
+                                transform_repair_minimum_subject_confidence
+                            ),
+                            minimum_widened_subject_visible_fraction=(
+                                direct_visual_config.
+                                transform_repair_minimum_subject_visible_fraction
+                            ),
                             enable_interior_zoom_pulses=True,
                         ),
                     )

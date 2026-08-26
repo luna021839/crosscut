@@ -151,8 +151,8 @@ class DirectMemberVisualConfig:
     blank_extreme_mean_maximum: float = 0.95
     static_structure_mismatch_maximum: float = 0.018
     static_color_mismatch_maximum: float = 0.018
-    transform_repair_maximum_zoom: float = 1.35
-    transform_repair_maximum_center_shift: float = 0.080
+    transform_repair_maximum_zoom: float = 1.50
+    transform_repair_maximum_center_shift: float = 0.120
     transform_repair_maximum_boundary_center_distance: float = 0.30
     transform_repair_maximum_residual_center_distance: float = 0.080
     transform_repair_minimum_improvement_fraction: float = 0.20
@@ -160,7 +160,7 @@ class DirectMemberVisualConfig:
     transform_repair_legacy_face_only_maximum_zoom: float = 1.12
     transform_repair_legacy_face_only_maximum_center_shift: float = 0.025
     transform_repair_minimum_subject_confidence: float = 0.30
-    transform_repair_minimum_subject_visible_fraction: float = 0.995
+    transform_repair_minimum_subject_visible_fraction: float = 0.980
     transform_alignment_position_trigger: float = 0.08
     transform_alignment_scale_trigger: float = 0.06
     transform_body_alignment_position_trigger: float = 0.12
@@ -267,9 +267,9 @@ class DirectMemberVisualConfig:
             )
         if self.maximum_same_source_run_seconds <= 0.0:
             raise ValueError("maximum_same_source_run_seconds must be positive")
-        if not 1.02 <= self.transform_repair_maximum_zoom <= 1.35:
+        if not 1.02 <= self.transform_repair_maximum_zoom <= 1.50:
             raise ValueError("direct member transform repair zoom is invalid")
-        if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.080:
+        if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.120:
             raise ValueError("direct member transform repair pan is invalid")
         if not (
             0.0

@@ -271,12 +271,12 @@ class EditorialTransformKeyframe:
             raise ValueError("group transform values must be finite")
         if self.time_seconds < 0.0:
             raise ValueError("group transform time must be non-negative")
-        if not 1.0 <= self.zoom <= 1.35:
-            raise ValueError("editorial transform zoom must be in [1.0, 1.35]")
+        if not 1.0 <= self.zoom <= 1.50:
+            raise ValueError("editorial transform zoom must be in [1.0, 1.50]")
         if not 0.0 <= self.center_x <= 1.0 or not 0.0 <= self.center_y <= 1.0:
             raise ValueError("editorial transform center must be normalized")
-        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.080 + 1e-9:
-            raise ValueError("editorial transform pan exceeds the eight-percent cap")
+        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.120 + 1e-9:
+            raise ValueError("editorial transform pan exceeds the twelve-percent cap")
         if abs(self.roll_degrees) > 1.60:
             raise ValueError("editorial transform roll exceeds the subtle-roll bound")
         if abs(self.roll_degrees) > 1e-9 and (

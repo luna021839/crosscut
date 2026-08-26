@@ -295,8 +295,8 @@ class DirectMemberDenseFaceProvider:
 @dataclass(frozen=True, slots=True)
 class DirectMemberEditorialMotionConfig:
     ramp_seconds: float = 0.75
-    maximum_boundary_zoom: float = 1.35
-    maximum_center_shift: float = 0.080
+    maximum_boundary_zoom: float = 1.50
+    maximum_center_shift: float = 0.120
     maximum_boundary_center_distance: float = 0.30
     maximum_residual_center_distance: float = 0.08
     minimum_mismatch_improvement_fraction: float = 0.20
@@ -304,7 +304,7 @@ class DirectMemberEditorialMotionConfig:
     legacy_face_only_maximum_zoom: float = 1.12
     legacy_face_only_maximum_center_shift: float = 0.025
     minimum_widened_subject_confidence: float = 0.30
-    minimum_widened_subject_visible_fraction: float = 0.995
+    minimum_widened_subject_visible_fraction: float = 0.980
     maximum_dense_subject_center_step: float = 0.12
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.10
