@@ -2053,12 +2053,35 @@ def build_direct_member_editorial_motion_plan(
             qualifying: list[tuple[float, _State]] = []
             seen_states: set[tuple[float, float, float]] = set()
             for zoom in zoom_values:
-                for state in _state_for_match(
-                    box=box,
-                    target_box=target_box,
-                    zoom=zoom,
-                    settings=shared,
-                ):
+                candidate_states = list(
+                    _state_for_match(
+                        box=box,
+                        target_box=target_box,
+                        zoom=zoom,
+                        settings=shared,
+                    )
+                )
+                half_viewport = 0.5 / zoom
+                camera_axis_values = (
+                    half_viewport,
+                    0.5,
+                    1.0 - half_viewport,
+                )
+                for center_x in camera_axis_values:
+                    for center_y in camera_axis_values:
+                        if (
+                            math.hypot(center_x - 0.5, center_y - 0.5)
+                            > settings.maximum_center_shift + 1e-9
+                        ):
+                            continue
+                        candidate_states.append(
+                            _State(
+                                zoom=zoom,
+                                center_x=center_x,
+                                center_y=center_y,
+                            )
+                        )
+                for state in candidate_states:
                     state_key = (
                         round(state.zoom, 9),
                         round(state.center_x, 9),
