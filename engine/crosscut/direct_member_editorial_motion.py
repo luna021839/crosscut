@@ -329,32 +329,16 @@ class DirectMemberDenseFaceProvider:
             subject_box = None
             subject_confidence = 0.0
             subject_basis = "none"
-            face = descriptor.primary_face_bbox
-            silhouette_box = descriptor.silhouette_bbox_xywh
-            verified_silhouette = bool(
-                silhouette_box is not None
+            if (
+                descriptor.silhouette_bbox_xywh is not None
                 and descriptor.silhouette_confidence >= 0.30
                 and descriptor.silhouette_backend == SILHOUETTE_BACKEND
-            )
-            silhouette_contains_face = bool(
-                verified_silhouette
-                and face is not None
-                and silhouette_box is not None
-                and silhouette_box[0] - 1e-6
-                <= face[0] + face[2] / 2.0
-                <= silhouette_box[0] + silhouette_box[2] + 1e-6
-                and silhouette_box[1] - 1e-6
-                <= face[1] + face[3] / 2.0
-                <= silhouette_box[1] + silhouette_box[3] + 1e-6
-            )
-            if verified_silhouette and (
-                face is None or silhouette_contains_face
             ):
-                assert silhouette_box is not None
-                subject_box = silhouette_box
+                subject_box = descriptor.silhouette_bbox_xywh
                 subject_confidence = descriptor.silhouette_confidence
                 subject_basis = "pphumanseg_full_subject_silhouette"
-            elif face is not None:
+            elif descriptor.primary_face_bbox is not None:
+                face = descriptor.primary_face_bbox
                 face_center = (
                     face[0] + face[2] / 2.0,
                     face[1] + face[3] / 2.0,
@@ -1402,9 +1386,10 @@ def _track_is_dense_face_safe(
     previous_box: tuple[float, float, float, float] | None = None
     previous_subject_box: tuple[float, float, float, float] | None = None
     previous_frame_index: int | None = None
-    for frame_index, sample, box, subject_box in zip(
+    for frame_index, sample, raw_box, box, subject_box in zip(
         ordered_frames,
         samples,
+        raw_boxes,
         boxes,
         subject_boxes,
         strict=True,
@@ -1435,7 +1420,9 @@ def _track_is_dense_face_safe(
                     "dense_face_geometry_jump",
                     f"frame={frame_index},center_step={center_step:.6f},"
                     f"height_ratio={height_ratio:.6f},"
-                    f"basis={resolved_basis}",
+                    f"basis={resolved_basis},"
+                    f"raw_box={','.join(f'{value:.6f}' for value in raw_box)},"
+                    f"resolved_box={','.join(f'{value:.6f}' for value in box)}",
                 )
         state_sample = track.evaluate(local_time)
         state = _State(
@@ -1448,11 +1435,16 @@ def _track_is_dense_face_safe(
             face_visible_fraction + 1e-9
             < config.minimum_dense_face_visible_fraction
         ):
+            raw_face_visible_fraction = _visible_fraction(raw_box, state)
             return reject(
                 "dense_face_crop_exceeds_visible_fraction",
                 f"frame={frame_index},visible={face_visible_fraction:.6f},"
+                f"raw_visible={raw_face_visible_fraction:.6f},"
                 f"zoom={state.zoom:.6f},center_x={state.center_x:.6f},"
-                f"center_y={state.center_y:.6f}",
+                f"center_y={state.center_y:.6f},"
+                f"raw_box={','.join(f'{value:.6f}' for value in raw_box)},"
+                f"resolved_box={','.join(f'{value:.6f}' for value in box)},"
+                f"subject_basis={sample.subject_geometry_basis}",
             )
         if widened_subject_proof_required:
             if (
