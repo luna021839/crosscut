@@ -464,7 +464,7 @@ class DirectMemberEditorialMotionConfig:
     minimum_widened_subject_confidence: float = 0.30
     minimum_widened_subject_visible_fraction: float = 0.950
     minimum_face_associated_subject_visible_fraction: float = 0.720
-    maximum_dense_subject_center_step: float = 0.15
+    maximum_dense_subject_center_step: float = 0.18
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.15
     maximum_dense_height_ratio: float = 1.35
@@ -1081,22 +1081,13 @@ def _reconstruct_dense_face_geometry(
             relative = _relative_box(anchor_box, anchor_subject)
             if relative is None:
                 return anchor_box
-            uncertainty = min(0.12, abs(target - anchor) * 0.005)
-            expanded_relative = (
-                relative[0],
-                relative[1],
-                relative[2] + uncertainty * 2.0,
-                relative[3] + uncertainty * 2.0,
-            )
-            # Expansion is deliberately conservative, but a face near the
-            # subject/frame edge can make only the uncertainty envelope leave
-            # bounds.  Preserve the unexpanded subject-relative projection in
-            # that case; if even that cannot be represented, retain the last
-            # verified absolute box.  The later output-crop review still
-            # rejects any unsafe camera transform.
+            # Keep the estimated face geometry itself unchanged.  Inflating
+            # this box as an uncertainty envelope feeds the uncertainty back
+            # into visible face size, which can manufacture a crop failure or
+            # a two-fold geometry jump.  The downstream crop/continuity gates
+            # remain the conservative uncertainty check.
             return (
-                _box_from_relative(expanded_relative, target_subject)
-                or _box_from_relative(relative, target_subject)
+                _box_from_relative(relative, target_subject)
                 or anchor_box
             )
 
