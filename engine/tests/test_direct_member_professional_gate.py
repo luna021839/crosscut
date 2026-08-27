@@ -12,9 +12,16 @@ from crosscut.render import RenderTransition, TransitionKind
 
 
 class _MotionPlan:
-    def __init__(self, *, applied_count: int, accepted: tuple[int, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        applied_count: int,
+        accepted: tuple[int, ...] = (),
+        residuals: tuple[tuple[int, float, float], ...] = (),
+    ) -> None:
         self.applied_count = applied_count
         self.accepted_boundary_indices = accepted
+        self.boundary_residual_attention_mismatches = residuals
 
 
 def _selection(
@@ -169,6 +176,66 @@ class DirectMemberProfessionalGateTests(unittest.TestCase):
             rejected.failure_reasons,
         )
         self.assertTrue(accepted.passed, accepted.to_dict())
+
+    def test_gate_uses_materialized_dense_attention_residuals(self) -> None:
+        selection = _selection()
+        selection.boundaries[5].mismatch.attention_position_mismatch = 0.24
+        selection.boundaries[5].mismatch.attention_scale_mismatch = 0.20
+
+        result = evaluate_direct_member_professional_pre_render_gate(
+            visual_selection=selection,
+            cadence=_cadence(),
+            editorial_motion_plan=_MotionPlan(
+                applied_count=8,
+                residuals=((5, 0.03, 0.02),),
+            ),
+            transitions=tuple(RenderTransition() for _ in range(20)),
+            duration_seconds=80.0,
+            dense_geometry_review_completed=True,
+        )
+
+        self.assertTrue(result.passed, result.to_dict())
+        diagnostic = result.boundary_diagnostics[5]
+        self.assertEqual(
+            diagnostic["effective_attention_position_mismatch"],
+            0.03,
+        )
+        self.assertEqual(
+            diagnostic["effective_attention_scale_mismatch"],
+            0.02,
+        )
+
+    def test_materialized_cinematic_bridge_uses_its_effect_contract(self) -> None:
+        selection = _selection()
+        bridge_index = 5
+        boundary = selection.boundaries[bridge_index]
+        boundary.incoming_sample.attention = SimpleNamespace(
+            basis="aggregate_human_silhouette"
+        )
+        boundary.mismatch.attention_position_mismatch = 0.70
+        boundary.mismatch.attention_scale_mismatch = 0.80
+        boundary.mismatch.silhouette_mismatch = 0.50
+        boundary.mismatch.motion_connection.motion_speed_ratio_mismatch = 0.95
+        boundary.mismatch.severe_flags = ("attention_scale",)
+        boundary.mismatch.cinematic_bridge = SimpleNamespace()
+        transitions = [RenderTransition() for _ in range(20)]
+        transitions[bridge_index] = RenderTransition(
+            kind=TransitionKind.MEMBER_ZOOM_BRIDGE,
+            frame_count=4,
+        )
+        cadence = _cadence()
+        cadence["member_cinematic_bridge_count"] = 1
+
+        result = evaluate_direct_member_professional_pre_render_gate(
+            visual_selection=selection,
+            cadence=cadence,
+            editorial_motion_plan=_MotionPlan(applied_count=8),
+            transitions=tuple(transitions),
+            duration_seconds=80.0,
+            dense_geometry_review_completed=True,
+        )
+
+        self.assertTrue(result.passed, result.to_dict())
 
     def test_speed_and_pose_phase_discontinuities_fail_closed(self) -> None:
         result = evaluate_direct_member_professional_pre_render_gate(

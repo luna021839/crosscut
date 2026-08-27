@@ -6,6 +6,7 @@ import unittest
 from crosscut.direct_member_rendered_continuity import (
     evaluate_direct_member_rendered_continuity,
 )
+from crosscut.direct_member_target_face import FocalFaceCandidate
 from crosscut.timeline import ShotType
 from crosscut.visual_score import FrameVisualDescriptor
 
@@ -15,18 +16,30 @@ def _descriptor(
     position: float,
     pose: float,
     scale: float = 0.20,
+    face_position: float | None = None,
+    include_face: bool = True,
 ) -> FrameVisualDescriptor:
     box = (position, 0.20, scale, 0.48)
+    face_box = (
+        (
+            (face_position if face_position is not None else position),
+            0.20,
+            scale,
+            0.48,
+        )
+        if include_face
+        else None
+    )
     embedding = (pose, pose * 0.5, 1.0 - pose * 0.25)
     return FrameVisualDescriptor(
         quality_score=0.95,
         composition_score=0.95,
         shot_scale=0.50,
         shot_type=ShotType.MEDIUM,
-        face_count=1,
+        face_count=1 if include_face else 0,
         face_detector_backend="yunet",
         structure_embedding=embedding,
-        primary_face_bbox=box,
+        primary_face_bbox=face_box,
         pose_embedding=embedding,
         pose_confidence=0.95,
         pose_backend="synthetic_verified_pose",
@@ -74,6 +87,25 @@ def _provider(
         return descriptors.get(frame)
 
     return provide
+
+
+class _FocalProvider:
+    def __init__(
+        self,
+        descriptors: dict[int, FrameVisualDescriptor],
+        candidates: dict[int, tuple[FocalFaceCandidate, ...]],
+    ) -> None:
+        self.descriptors = descriptors
+        self.candidates = candidates
+
+    def __call__(self, seconds: float) -> FrameVisualDescriptor | None:
+        return self.descriptors.get(int(round(seconds * 10.0)))
+
+    def focal_face_candidates(
+        self,
+        seconds: float,
+    ) -> tuple[FocalFaceCandidate, ...]:
+        return self.candidates.get(int(round(seconds * 10.0)), ())
 
 
 class DirectMemberRenderedContinuityTests(unittest.TestCase):
@@ -130,6 +162,77 @@ class DirectMemberRenderedContinuityTests(unittest.TestCase):
                 "rendered_boundary_position_discontinuity"
             ],
             (0,),
+        )
+
+    def test_boundary_uses_one_common_attention_basis(self) -> None:
+        descriptors = {
+            2: _descriptor(position=0.29, face_position=0.08, pose=0.20),
+            3: _descriptor(position=0.30, face_position=0.09, pose=0.25),
+            4: _descriptor(position=0.31, include_face=False, pose=0.30),
+            5: _descriptor(position=0.32, include_face=False, pose=0.35),
+        }
+
+        result = evaluate_direct_member_rendered_continuity(
+            Path("synthetic-member.mp4"),
+            _plan(),
+            descriptor_provider=_provider(descriptors),
+        )
+
+        self.assertTrue(result.passed, result.failure_reasons)
+        self.assertEqual(
+            result.boundaries[0]["attention_basis"],
+            {
+                "outgoing": "aggregate_human_silhouette",
+                "incoming": "aggregate_human_silhouette",
+            },
+        )
+        self.assertLess(
+            result.boundaries[0]["attention_position_mismatch"],
+            0.10,
+        )
+
+    def test_official_fancam_focal_face_overrides_group_silhouette(self) -> None:
+        descriptors = {
+            2: _descriptor(position=0.08, pose=0.20),
+            3: _descriptor(position=0.09, pose=0.25),
+            4: _descriptor(position=0.66, pose=0.30),
+            5: _descriptor(position=0.67, pose=0.35),
+        }
+        candidates = {
+            frame: (
+                FocalFaceCandidate(
+                    (0.36 + 0.01 * (frame - 2), 0.28, 0.12, 0.10),
+                    (1.0, 0.04 * (frame - 2), 0.0),
+                ),
+                FocalFaceCandidate(
+                    (0.80, 0.24, 0.10, 0.09),
+                    (0.0, 1.0, 0.0),
+                ),
+            )
+            for frame in (2, 3, 4, 5)
+        }
+
+        result = evaluate_direct_member_rendered_continuity(
+            Path("synthetic-member.mp4"),
+            _plan(),
+            descriptor_provider=_FocalProvider(descriptors, candidates),
+        )
+
+        self.assertTrue(result.passed, result.failure_reasons)
+        self.assertEqual(
+            result.boundaries[0]["attention_basis"],
+            {
+                "outgoing": (
+                    "verified_official_fancam_focal_face_correspondence"
+                ),
+                "incoming": (
+                    "verified_official_fancam_focal_face_correspondence"
+                ),
+            },
+        )
+        self.assertEqual(
+            result.metrics["focal_face_correspondence_boundary_count"],
+            1,
         )
 
     def test_pose_discontinuity_fails_closed(self) -> None:

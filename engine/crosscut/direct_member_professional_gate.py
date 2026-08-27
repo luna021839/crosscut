@@ -13,7 +13,12 @@ from dataclasses import dataclass
 import math
 from typing import Any, Mapping, Sequence
 
-from .direct_member_visual import DirectMemberVisualSelection
+from .direct_member_visual import (
+    DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE,
+    DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_MOTION_SPEED_P95,
+    DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_SILHOUETTE_P95,
+    DirectMemberVisualSelection,
+)
 from .editorial_motion import EditorialMotionPlan
 from .render import RenderTransition, TransitionKind
 
@@ -39,10 +44,14 @@ class DirectMemberProfessionalGateConfig:
     minimum_editorial_transform_segments: int = 8
     minimum_editorial_transform_segments_per_minute: float = 3.0
     maximum_pose_mismatch_p95: float = 0.24
-    maximum_silhouette_mismatch_p95: float = 0.35
+    maximum_silhouette_mismatch_p95: float = (
+        DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_SILHOUETTE_P95
+    )
     maximum_effective_attention_position_mismatch_p95: float = 0.12
     maximum_effective_attention_scale_mismatch_p95: float = 0.10
-    maximum_motion_speed_ratio_mismatch_p95: float = 0.55
+    maximum_motion_speed_ratio_mismatch_p95: float = (
+        DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_MOTION_SPEED_P95
+    )
     maximum_pose_phase_continuation_mismatch_p95: float = 0.30
     minimum_selected_effect_count_when_requested: int = 1
     minimum_selected_effects_per_minute_when_requested: float = 1.5
@@ -215,9 +224,20 @@ def evaluate_direct_member_professional_pre_render_gate(
         for boundary in selected
         if boundary.mismatch.silhouette_mismatch is None
     )
+    materialized_cinematic_bridge_indices = frozenset(
+        boundary.boundary_index
+        for boundary in selected
+        if boundary.mismatch.cinematic_bridge is not None
+        and transition_items[boundary.boundary_index].kind
+        in {
+            TransitionKind.MEMBER_ZOOM_BRIDGE,
+            TransitionKind.MEMBER_BLUR_BRIDGE,
+        }
+    )
     silhouette_over_limit = tuple(
         boundary.boundary_index
         for boundary in selected
+        if boundary.boundary_index not in materialized_cinematic_bridge_indices
         if boundary.mismatch.silhouette_mismatch is not None
         and boundary.mismatch.silhouette_mismatch
         > visual_selection.config.maximum_cross_source_silhouette_mismatch + 1e-9
@@ -228,8 +248,22 @@ def evaluate_direct_member_professional_pre_render_gate(
     unrepaired_attention_geometry: list[int] = []
     effective_positions: list[float] = []
     effective_scales: list[float] = []
+    dense_attention_residuals = {
+        int(boundary_index): (float(position), float(scale))
+        for boundary_index, position, scale in (
+            getattr(
+                editorial_motion_plan,
+                "boundary_residual_attention_mismatches",
+                (),
+            )
+            if editorial_motion_plan is not None
+            else ()
+        )
+    }
     for boundary in selected:
         mismatch = boundary.mismatch
+        if boundary.boundary_index in materialized_cinematic_bridge_indices:
+            continue
         left_attention = boundary.outgoing_sample.attention
         right_attention = boundary.incoming_sample.attention
         if left_attention is None or right_attention is None:
@@ -239,13 +273,18 @@ def evaluate_direct_member_professional_pre_render_gate(
         if left_attention.basis != right_attention.basis and repair is None:
             incompatible_attention_geometry.append(boundary.boundary_index)
             continue
+        dense_residual = dense_attention_residuals.get(boundary.boundary_index)
         effective_position = (
-            repair.residual_attention_position_mismatch
+            dense_residual[0]
+            if dense_residual is not None
+            else repair.residual_attention_position_mismatch
             if repair is not None
             else mismatch.attention_position_mismatch
         )
         effective_scale = (
-            repair.residual_attention_scale_mismatch
+            dense_residual[1]
+            if dense_residual is not None
+            else repair.residual_attention_scale_mismatch
             if repair is not None
             else mismatch.attention_scale_mismatch
         )
@@ -270,8 +309,18 @@ def evaluate_direct_member_professional_pre_render_gate(
             else visual_selection.config.transform_body_alignment_scale_trigger
         )
         if (
-            (effective_position > position_trigger + 1e-9)
-            or (effective_scale > scale_trigger + 1e-9)
+            (
+                effective_position
+                > position_trigger
+                + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+                + 1e-9
+            )
+            or (
+                effective_scale
+                > scale_trigger
+                + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+                + 1e-9
+            )
         ):
             unrepaired_attention_geometry.append(boundary.boundary_index)
 
@@ -283,6 +332,8 @@ def evaluate_direct_member_professional_pre_render_gate(
     pose_phase_mismatches: list[float] = []
     both_moving_count = 0
     for boundary in selected:
+        if boundary.boundary_index in materialized_cinematic_bridge_indices:
+            continue
         motion = boundary.mismatch.motion_connection
         if motion is None or not motion.both_moving:
             continue
@@ -452,6 +503,7 @@ def evaluate_direct_member_professional_pre_render_gate(
         [
             boundary.mismatch.dominant_pose_mismatch
             for boundary in selected
+            if boundary.boundary_index not in materialized_cinematic_bridge_indices
             if boundary.mismatch.dominant_pose_mismatch is not None
         ]
     )
@@ -459,6 +511,7 @@ def evaluate_direct_member_professional_pre_render_gate(
         [
             boundary.mismatch.silhouette_mismatch
             for boundary in selected
+            if boundary.boundary_index not in materialized_cinematic_bridge_indices
             if boundary.mismatch.silhouette_mismatch is not None
         ]
     )
@@ -639,12 +692,16 @@ def evaluate_direct_member_professional_pre_render_gate(
                 boundary.mismatch.attention_scale_mismatch
             ),
             "effective_attention_position_mismatch": (
-                boundary.mismatch.transform_repair.residual_attention_position_mismatch
+                dense_attention_residuals[boundary.boundary_index][0]
+                if boundary.boundary_index in dense_attention_residuals
+                else boundary.mismatch.transform_repair.residual_attention_position_mismatch
                 if boundary.mismatch.transform_repair is not None
                 else boundary.mismatch.attention_position_mismatch
             ),
             "effective_attention_scale_mismatch": (
-                boundary.mismatch.transform_repair.residual_attention_scale_mismatch
+                dense_attention_residuals[boundary.boundary_index][1]
+                if boundary.boundary_index in dense_attention_residuals
+                else boundary.mismatch.transform_repair.residual_attention_scale_mismatch
                 if boundary.mismatch.transform_repair is not None
                 else boundary.mismatch.attention_scale_mismatch
             ),

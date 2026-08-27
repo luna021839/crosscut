@@ -11,6 +11,7 @@ import numpy as np
 
 from crosscut.direct_member_editorial_motion import (
     DirectMemberDenseFaceProvider,
+    DirectMemberEditorialMotionError,
     DirectMemberEditorialMotionConfig,
     DirectMemberFaceSample,
     build_direct_member_editorial_motion_plan,
@@ -19,6 +20,7 @@ from crosscut.direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     direct_member_source_frame_geometry,
 )
+from crosscut.direct_member_target_face import FOCAL_FACE_BASIS
 from crosscut.pose import SILHOUETTE_BACKEND
 from crosscut.render import RenderSegment, RenderTransition, TransitionKind
 from crosscut.visual_feature_cache import CanonicalFrameIdentity
@@ -143,7 +145,121 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             plan.analysis_basis,
             "official_target_fancam_face_or_verified_full_subject_dense_"
             "output_frame_boundary_anchored_subject_relative_face_track_"
-            "adaptive_review_v8",
+            "adaptive_review_v9",
+        )
+
+    def test_required_equal_scale_offset_uses_bilateral_camera_match(self) -> None:
+        boxes = (
+            (0.3750, 0.25, 0.15, 0.40),
+            (0.4217, 0.25, 0.15, 0.40),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "mismatch": SimpleNamespace(
+                        transform_repair=None,
+                        dense_attention_validation_required=True,
+                    )
+                }
+            },
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_frame_geometries = (geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (8.0, 8.0)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source],
+                subject_box=(0.15, 0.02, 0.70, 0.90),
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertIsNotNone(plan.track_for(0))
+        self.assertIsNotNone(plan.track_for(1))
+        self.assertEqual(plan.zoom_event_count, 2)
+        boundary_index, position, scale = (
+            plan.boundary_residual_attention_mismatches[0]
+        )
+        self.assertEqual(boundary_index, 0)
+        self.assertAlmostEqual(position, 0.0, places=7)
+        self.assertAlmostEqual(scale, 0.0, places=7)
+
+    def test_paired_focal_face_provider_overrides_coarse_person_geometry(self) -> None:
+        coarse_boxes = (
+            (0.10, 0.10, 0.70, 0.80),
+            (0.20, 0.05, 0.65, 0.90),
+        )
+        focal_boxes = (
+            (0.35, 0.35, 0.12, 0.12),
+            (0.42, 0.30, 0.16, 0.16),
+        )
+        selection = self._selection((0, 1), coarse_boxes)
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_frame_geometries = (geometry, geometry)
+
+        class PairedFocalProvider:
+            def __init__(self) -> None:
+                self.paired_call_count = 0
+                self.scalar_call_count = 0
+
+            @staticmethod
+            def sample(source: int) -> DirectMemberFaceSample:
+                return DirectMemberFaceSample(
+                    focal_boxes[source],
+                    1,
+                    "yunet",
+                    (0.20, 0.05, 0.60, 0.90),
+                    0.95,
+                    "pphumanseg_full_subject_silhouette",
+                    FOCAL_FACE_BASIS,
+                )
+
+            def paired_samples(
+                self,
+                left_source: int,
+                _left_time: float,
+                right_source: int,
+                _right_time: float,
+            ) -> tuple[DirectMemberFaceSample, DirectMemberFaceSample]:
+                self.paired_call_count += 1
+                return (self.sample(left_source), self.sample(right_source))
+
+            def __call__(
+                self,
+                source: int,
+                _time: float,
+            ) -> DirectMemberFaceSample:
+                self.scalar_call_count += 1
+                return self.sample(source)
+
+        provider = PairedFocalProvider()
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (8.0, 8.0)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=provider,
+            fps=30.0,
+        )
+
+        self.assertEqual(provider.paired_call_count, 1)
+        self.assertGreater(provider.scalar_call_count, 0)
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertEqual(plan.boundary_residual_attention_mismatches[0][0], 0)
+        self.assertLessEqual(
+            plan.boundary_residual_attention_mismatches[0][1],
+            0.18,
+        )
+        self.assertLessEqual(
+            plan.boundary_residual_attention_mismatches[0][2],
+            0.14,
         )
 
     def test_verified_full_subject_match_is_accepted_without_face(self) -> None:
@@ -197,15 +313,70 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.accepted_boundary_indices, (0,))
         self.assertIsNotNone(plan.track_for(0))
 
+    def test_provisional_edge_can_establish_common_basis_from_dense_endpoints(
+        self,
+    ) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+        ambiguous = SimpleNamespace(attention=None, descriptor=SimpleNamespace())
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "outgoing_sample": ambiguous,
+                    "incoming_sample": ambiguous,
+                    "mismatch": SimpleNamespace(
+                        transform_repair=None,
+                        dense_attention_validation_required=True,
+                    ),
+                }
+            },
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_frame_geometries = (geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (8.0, 8.0)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: DirectMemberFaceSample(
+                boxes[source],
+                1 if source == 0 else 0,
+                "yunet" if source == 0 else "none",
+                boxes[source],
+                0.95,
+                "pphumanseg_full_subject_silhouette",
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertEqual(plan.boundary_match_count, 1)
+
     def test_direct_defaults_expand_only_to_renderer_safe_reference_bounds(self) -> None:
         config = DirectMemberEditorialMotionConfig()
 
         self.assertEqual(config.maximum_boundary_zoom, 1.50)
-        self.assertEqual(config.maximum_center_shift, 0.12)
+        self.assertEqual(config.maximum_center_shift, 0.16)
+        self.assertEqual(config.maximum_face_residual_position_mismatch, 0.085)
+        self.assertEqual(config.maximum_face_residual_scale_mismatch, 0.065)
         self.assertEqual(config.minimum_dense_face_visible_fraction, 0.98)
-        self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.95)
+        self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.93)
+        self.assertEqual(
+            config.minimum_widened_subject_vertical_visible_fraction,
+            0.98,
+        )
         self.assertEqual(config.maximum_dense_center_step, 0.15)
         self.assertEqual(config.maximum_dense_subject_center_step, 0.20)
+        self.assertEqual(config.maximum_dense_follow_zoom_correction, 0.08)
+        self.assertEqual(config.maximum_dense_face_follow_zoom_correction, 0.03)
+        self.assertEqual(config.maximum_dense_follow_center_correction, 0.12)
+        self.assertEqual(config.maximum_dense_follow_zoom_step, 0.04)
+        self.assertEqual(config.maximum_dense_follow_center_step, 0.05)
         self.assertEqual(
             config.minimum_face_associated_subject_visible_fraction,
             0.72,
@@ -217,6 +388,18 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertFalse(config.enable_interior_zoom_pulses)
         self.assertEqual(config.target_rich_motion_events_per_minute, 4.0)
         self.assertEqual(config.interior_pulse_zoom, 1.05)
+
+    def test_direct_residual_gates_must_preserve_face_before_subject_order(self) -> None:
+        with self.assertRaisesRegex(ValueError, "position residual"):
+            DirectMemberEditorialMotionConfig(
+                maximum_face_residual_position_mismatch=0.13,
+                maximum_subject_residual_position_mismatch=0.12,
+            )
+        with self.assertRaisesRegex(ValueError, "scale residual"):
+            DirectMemberEditorialMotionConfig(
+                maximum_face_residual_scale_mismatch=0.11,
+                maximum_subject_residual_scale_mismatch=0.10,
+            )
 
     def test_enabled_interior_pulse_fills_sparse_motion_with_lossless_headroom(
         self,
@@ -388,6 +571,23 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(plan.accepted_boundary_indices, ())
         self.assertEqual(plan.natural_match_boundary_indices, (0,))
         self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(
+            tuple(item[0] for item in plan.boundary_residual_attention_mismatches),
+            (0,),
+        )
+        _boundary_index, position, scale = (
+            plan.boundary_residual_attention_mismatches[0]
+        )
+        self.assertLessEqual(
+            position,
+            DirectMemberEditorialMotionConfig()
+            .maximum_face_residual_position_mismatch,
+        )
+        self.assertLessEqual(
+            scale,
+            DirectMemberEditorialMotionConfig()
+            .maximum_face_residual_scale_mismatch,
+        )
         self.assertIn(
             ("required_dense_natural_match", 1),
             plan.skipped_boundary_reasons,
@@ -427,10 +627,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         )
         selection.source_frame_geometries = (geometry, geometry)
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "dense_widened_subject_evidence_missing=1",
-        ):
+        with self.assertRaises(DirectMemberEditorialMotionError) as raised:
             build_direct_member_editorial_motion_plan(
                 visual_selection=selection,
                 render_segments=self._renders((0, 1), (1.5, 1.5)),
@@ -444,6 +641,16 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
                     minimum_mismatch_improvement_fraction=0.80,
                 ),
             )
+
+        self.assertEqual(raised.exception.missing_boundary_indices, (0,))
+        self.assertIn(
+            "dense_widened_subject_evidence_missing",
+            raised.exception.rejection_reasons[0],
+        )
+        self.assertIn(
+            "dense_widened_subject_evidence_missing=1",
+            str(raised.exception),
+        )
 
     def test_tier_d_neighbor_does_not_block_a_continuous_required_ramp(
         self,
@@ -612,11 +819,11 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             plan.skipped_boundary_reasons,
         )
 
-    def test_required_repair_uses_other_side_beside_overlap_effect(self) -> None:
+    def test_required_repair_uses_non_overlapping_edge_beside_effect(self) -> None:
         boxes = (
+            (0.40, 0.20, 0.18, 0.60),
             (0.40, 0.25, 0.18, 0.50),
-            (0.40, 0.20, 0.18, 0.60),
-            (0.40, 0.20, 0.18, 0.60),
+            (0.40, 0.25, 0.18, 0.50),
         )
         geometry = direct_member_source_frame_geometry((2160, 3840))
         repair = DirectMemberBoundaryTransformRepair(
@@ -646,7 +853,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             },
         )
         selection.source_frame_geometries = (
-            geometry,
+            direct_member_source_frame_geometry((1080, 1920)),
             geometry,
             geometry,
         )
@@ -670,8 +877,8 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.accepted_boundary_indices, (0,))
-        self.assertIsNotNone(plan.track_for(0))
-        self.assertIsNone(plan.track_for(1))
+        self.assertIsNone(plan.track_for(0))
+        self.assertIsNotNone(plan.track_for(1))
 
     def test_dense_crop_falls_back_to_a_smaller_still_improving_zoom(
         self,
@@ -927,7 +1134,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         source_indices = (0, 1)
         boxes = (
             (0.31, 0.25, 0.18, 0.50),
-            (0.41, 0.235, 0.18, 0.53),
+            (0.41, 0.1875, 0.18, 0.625),
         )
         selection = self._selection(source_indices, boxes)
         renders = self._renders(source_indices, (8.0, 8.0))
@@ -952,26 +1159,21 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             fps=30.0,
         )
 
-        self.assertEqual(without_subject.applied_count, 1)
-        without_subject_track = without_subject.track_for(0)
-        self.assertIsNotNone(without_subject_track)
-        assert without_subject_track is not None
-        self.assertLessEqual(
-            abs(without_subject_track.final_keyframe.center_x - 0.5),
-            0.025,
-        )
+        self.assertEqual(without_subject.applied_count, 0)
+        self.assertIsNone(without_subject.track_for(0))
         self.assertEqual(with_subject.applied_count, 1)
         track = with_subject.track_for(0)
         self.assertIsNotNone(track)
         assert track is not None
-        self.assertLessEqual(track.final_keyframe.zoom, 1.12)
+        self.assertGreater(track.final_keyframe.zoom, 1.12)
+        self.assertLessEqual(track.final_keyframe.zoom, 1.50)
         self.assertGreater(
             abs(track.final_keyframe.center_x - 0.5),
             0.025,
         )
         self.assertLessEqual(
             abs(track.final_keyframe.center_x - 0.5),
-            0.04,
+            0.16,
         )
 
     def test_non_face_or_multiple_face_audit_is_rejected(self) -> None:
@@ -1150,7 +1352,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             plan.skipped_boundary_reasons,
         )
 
-    def test_full_run_review_falls_back_from_pan_to_centered_scale(self) -> None:
+    def test_full_run_review_accepts_wider_pan_only_when_dense_safe(self) -> None:
         selection, renders, boxes = self._basic_inputs()
 
         def geometry(source: int, time_seconds: float):
@@ -1181,12 +1383,12 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.boundary_match_count, 1)
-        self.assertEqual(plan.pan_event_count, 0)
+        self.assertEqual(plan.pan_event_count, 1)
         track = plan.track_for(0)
         self.assertIsNotNone(track)
         self.assertTrue(
-            all(
-                keyframe.center_x == 0.5 and keyframe.center_y == 0.5
+            any(
+                keyframe.center_x != 0.5 or keyframe.center_y != 0.5
                 for keyframe in track.keyframes
             )
         )

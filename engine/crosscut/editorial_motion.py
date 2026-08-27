@@ -194,6 +194,9 @@ class EditorialMotionPlan:
     boundary_subject_alignment_plan: BoundarySubjectAlignmentPlan | None = None
     accepted_boundary_indices: tuple[int, ...] = ()
     natural_match_boundary_indices: tuple[int, ...] = ()
+    boundary_residual_attention_mismatches: tuple[
+        tuple[int, float, float], ...
+    ] = ()
 
     @property
     def applied_count(self) -> int:
@@ -299,6 +302,15 @@ class EditorialMotionPlan:
             "natural_match_boundary_indices": list(
                 self.natural_match_boundary_indices
             ),
+            "boundary_residual_attention_mismatches": [
+                {
+                    "boundary_index": boundary_index,
+                    "position": position,
+                    "scale": scale,
+                }
+                for boundary_index, position, scale
+                in self.boundary_residual_attention_mismatches
+            ],
             "boundary_subject_alignment": (
                 self.boundary_subject_alignment_plan.to_dict()
                 if self.boundary_subject_alignment_plan is not None

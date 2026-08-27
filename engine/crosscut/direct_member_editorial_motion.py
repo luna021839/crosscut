@@ -16,18 +16,29 @@ from typing import Callable, Sequence
 
 import cv2
 
-from .direct_member_visual import DirectMemberVisualSelection
+from .direct_member_visual import (
+    DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE,
+    DirectMemberVisualSelection,
+)
 from .direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     DirectMemberSourceFrameGeometry,
     direct_member_source_frame_geometry,
     map_box_to_portrait_fill,
 )
+from .direct_member_target_face import (
+    FOCAL_FACE_BASIS,
+    FocalFaceCandidate,
+    detect_focal_face_candidates,
+    select_focal_face_matching_reference,
+    select_focal_face_pair,
+)
 from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from .member_editorial_motion import (
     MemberEditorialMotionConfig,
     _State,
     _center,
+    _dedupe_points,
     _frame_schedule,
     _mismatch,
     _project,
@@ -57,6 +68,7 @@ class DirectMemberFaceSample:
     subject_bbox_xywh: tuple[float, float, float, float] | None = None
     subject_confidence: float = 0.0
     subject_geometry_basis: str = "none"
+    alignment_geometry_basis_override: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.bbox_xywh) != 4:
@@ -107,6 +119,11 @@ class DirectMemberFaceSample:
         if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
             raise ValueError("direct member subject confidence must be normalized")
         basis = self.subject_geometry_basis.strip()
+        alignment_override = self.alignment_geometry_basis_override
+        if alignment_override is not None and alignment_override != FOCAL_FACE_BASIS:
+            raise ValueError("direct member alignment basis override is invalid")
+        if alignment_override is not None and self.face_count != 1:
+            raise ValueError("focal face basis requires one verified face")
         if subject_box is None:
             if confidence != 0.0 or basis != "none":
                 raise ValueError(
@@ -142,9 +159,16 @@ class DirectMemberFaceSample:
         object.__setattr__(self, "subject_bbox_xywh", subject_box)
         object.__setattr__(self, "subject_confidence", confidence)
         object.__setattr__(self, "subject_geometry_basis", basis)
+        object.__setattr__(
+            self,
+            "alignment_geometry_basis_override",
+            alignment_override,
+        )
 
     @property
     def alignment_geometry_basis(self) -> str:
+        if self.alignment_geometry_basis_override is not None:
+            return self.alignment_geometry_basis_override
         if self.face_count == 1:
             return "unambiguous_dominant_face_bbox_geometry_only"
         if self.subject_geometry_basis == "pphumanseg_full_subject_silhouette":
@@ -155,6 +179,35 @@ class DirectMemberFaceSample:
 DirectMemberGeometryProvider = Callable[
     [int, float], DirectMemberFaceSample | None
 ]
+
+
+def _is_face_alignment_basis(value: str | None) -> bool:
+    return value in {_FACE_ATTENTION_BASIS, FOCAL_FACE_BASIS}
+
+
+class DirectMemberEditorialMotionError(ValueError):
+    """Structured dense-render failure that can trigger path reselection."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        missing_boundary_indices: Sequence[int],
+        rejection_reasons: dict[int, set[str]],
+        rejection_context: dict[int, str],
+    ) -> None:
+        super().__init__(message)
+        self.missing_boundary_indices = tuple(
+            int(value) for value in missing_boundary_indices
+        )
+        self.rejection_reasons = {
+            int(boundary_index): tuple(sorted(str(value) for value in values))
+            for boundary_index, values in rejection_reasons.items()
+        }
+        self.rejection_context = {
+            int(boundary_index): str(value)
+            for boundary_index, value in rejection_context.items()
+        }
 
 
 def _enable_dense_sequential_frame_reads(sampler: object) -> None:
@@ -271,9 +324,18 @@ class DirectMemberDenseFaceProvider:
         self._cache: dict[
             tuple[object, ...], DirectMemberFaceSample | None
         ] = {}
+        self._focal_candidate_cache: dict[
+            tuple[object, ...], tuple[FocalFaceCandidate, ...]
+        ] = {}
+        self._focal_references: list[list[FocalFaceCandidate]] = [
+            [] for _source in self._sources
+        ]
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
+        self._focal_pair_request_count = 0
+        self._focal_pair_match_count = 0
+        self._focal_reference_match_count = 0
         for source in self._sources:
             try:
                 sampler = _VideoSampler(
@@ -284,6 +346,184 @@ class DirectMemberDenseFaceProvider:
             except (OSError, TypeError, ValueError, cv2.error):
                 sampler = None
             self._samplers.append(sampler)
+
+    @staticmethod
+    def _identity_key(
+        source_index: int,
+        sampler: _VideoSampler,
+        seconds: float,
+    ) -> tuple[object, ...]:
+        identity = sampler.frame_identity(seconds)
+        return (
+            source_index,
+            identity.frame_index,
+            identity.fps_numerator,
+            identity.fps_denominator,
+        )
+
+    def _focal_candidates(
+        self,
+        source_index: int,
+        seconds: float,
+    ) -> tuple[FocalFaceCandidate, ...]:
+        sampler = self._samplers[source_index]
+        if sampler is None:
+            return ()
+        key = self._identity_key(source_index, sampler, seconds)
+        if key in self._focal_candidate_cache:
+            return self._focal_candidate_cache[key]
+        before = sampler.frame_decode_count
+        try:
+            frame = sampler.frame_at(seconds)
+            candidates = (
+                detect_focal_face_candidates(frame)
+                if frame is not None
+                else ()
+            )
+        except (cv2.error, ValueError, FloatingPointError):
+            candidates = ()
+        self._decode_count += max(0, sampler.frame_decode_count - before)
+        self._focal_candidate_cache[key] = candidates
+        return candidates
+
+    @staticmethod
+    def _associated_subject(
+        descriptor: object,
+        candidate: FocalFaceCandidate,
+    ) -> tuple[
+        tuple[float, float, float, float] | None,
+        float,
+        str,
+    ]:
+        center_x, center_y = candidate.center_xy
+        associated = tuple(
+            person
+            for person in getattr(descriptor, "formation_people", ())
+            if person.detection_confidence >= 0.35
+            and person.bbox_xywh[0] - 1e-6
+            <= center_x
+            <= person.bbox_xywh[0] + person.bbox_xywh[2] + 1e-6
+            and person.bbox_xywh[1] - 1e-6
+            <= center_y
+            <= person.bbox_xywh[1] + person.bbox_xywh[3] + 1e-6
+        )
+        if not associated:
+            return (None, 0.0, "none")
+        selected = min(
+            associated,
+            key=lambda person: (
+                person.bbox_xywh[2] * person.bbox_xywh[3],
+                -person.detection_confidence,
+            ),
+        )
+        return (
+            selected.bbox_xywh,
+            selected.detection_confidence,
+            "face_associated_formation_person_box",
+        )
+
+    def _sample_for_focal_candidate(
+        self,
+        source_index: int,
+        seconds: float,
+        candidate: FocalFaceCandidate,
+    ) -> DirectMemberFaceSample:
+        sampler = self._samplers[source_index]
+        assert sampler is not None
+        before = sampler.frame_decode_count
+        descriptor = sampler.feature_descriptor_at(
+            seconds,
+            include_subject_geometry=True,
+            include_formation_pose=True,
+        )
+        self._decode_count += max(0, sampler.frame_decode_count - before)
+        subject_box, confidence, basis = (
+            self._associated_subject(descriptor, candidate)
+            if descriptor is not None
+            else (None, 0.0, "none")
+        )
+        return DirectMemberFaceSample(
+            candidate.bbox_xywh,
+            1,
+            "yunet",
+            subject_box,
+            confidence,
+            basis,
+            FOCAL_FACE_BASIS,
+        )
+
+    def _register_focal_reference(
+        self,
+        source_index: int,
+        candidate: FocalFaceCandidate,
+    ) -> None:
+        references = self._focal_references[source_index]
+        if candidate not in references:
+            references.append(candidate)
+        if len(references) > 32:
+            del references[:-32]
+
+    def paired_samples(
+        self,
+        outgoing_source_index: int,
+        outgoing_seconds: float,
+        incoming_source_index: int,
+        incoming_seconds: float,
+    ) -> tuple[DirectMemberFaceSample | None, DirectMemberFaceSample | None]:
+        """Resolve one focal face pair before any aggregate fallback."""
+
+        self._focal_pair_request_count += 1
+        left_candidates = self._focal_candidates(
+            outgoing_source_index,
+            max(0.0, outgoing_seconds),
+        )
+        right_candidates = self._focal_candidates(
+            incoming_source_index,
+            max(0.0, incoming_seconds),
+        )
+        pair = select_focal_face_pair(left_candidates, right_candidates)
+        if pair is None:
+            return (
+                self.sample(outgoing_source_index, outgoing_seconds),
+                self.sample(incoming_source_index, incoming_seconds),
+            )
+        self._focal_pair_match_count += 1
+        self._register_focal_reference(
+            outgoing_source_index,
+            pair.outgoing,
+        )
+        self._register_focal_reference(
+            incoming_source_index,
+            pair.incoming,
+        )
+        left_sample = self._sample_for_focal_candidate(
+            outgoing_source_index,
+            max(0.0, outgoing_seconds),
+            pair.outgoing,
+        )
+        right_sample = self._sample_for_focal_candidate(
+            incoming_source_index,
+            max(0.0, incoming_seconds),
+            pair.incoming,
+        )
+        left_sampler = self._samplers[outgoing_source_index]
+        right_sampler = self._samplers[incoming_source_index]
+        assert left_sampler is not None and right_sampler is not None
+        self._cache[
+            self._identity_key(
+                outgoing_source_index,
+                left_sampler,
+                max(0.0, outgoing_seconds),
+            )
+        ] = left_sample
+        self._cache[
+            self._identity_key(
+                incoming_source_index,
+                right_sampler,
+                max(0.0, incoming_seconds),
+            )
+        ] = right_sample
+        return (left_sample, right_sample)
 
     def sample(
         self,
@@ -303,16 +543,30 @@ class DirectMemberDenseFaceProvider:
         if sampler is None:
             return None
         normalized_seconds = max(0.0, source_local_seconds)
-        identity = sampler.frame_identity(normalized_seconds)
-        key = (
+        key = self._identity_key(
             source_index,
-            identity.frame_index,
-            identity.fps_numerator,
-            identity.fps_denominator,
+            sampler,
+            normalized_seconds,
         )
         if key in self._cache:
             self._cache_hit_count += 1
             return self._cache[key]
+        references = self._focal_references[source_index]
+        if references:
+            selected = select_focal_face_matching_reference(
+                self._focal_candidates(source_index, normalized_seconds),
+                references,
+            )
+            if selected is not None:
+                self._focal_reference_match_count += 1
+                sample = self._sample_for_focal_candidate(
+                    source_index,
+                    normalized_seconds,
+                    selected,
+                )
+                self._register_focal_reference(source_index, selected)
+                self._cache[key] = sample
+                return sample
         previous_decode_count = sampler.frame_decode_count
         try:
             descriptor = sampler.feature_descriptor_at(
@@ -407,6 +661,13 @@ class DirectMemberDenseFaceProvider:
             "cache_hit_count": self._cache_hit_count,
             "decode_count": self._decode_count,
             "cache_entry_count": len(self._cache),
+            "focal_pair_request_count": self._focal_pair_request_count,
+            "focal_pair_match_count": self._focal_pair_match_count,
+            "focal_reference_match_count": self._focal_reference_match_count,
+            "focal_reference_count": sum(
+                len(values) for values in self._focal_references
+            ),
+            "focal_face_basis": FOCAL_FACE_BASIS,
             "persistent_feature_cache_enabled_source_count": len(persistent),
             "persistent_feature_cache_hit_count": sum(
                 int(item.get("hit_count", 0)) for item in persistent
@@ -441,6 +702,8 @@ class DirectMemberDenseFaceProvider:
             ),
             "pixels_persisted": False,
             "face_embeddings_computed": False,
+            "transient_focal_face_embeddings_computed": True,
+            "focal_face_embeddings_persisted": False,
         }
 
     def close(self) -> None:
@@ -453,16 +716,34 @@ class DirectMemberDenseFaceProvider:
 class DirectMemberEditorialMotionConfig:
     ramp_seconds: float = 0.75
     maximum_boundary_zoom: float = 1.50
-    maximum_center_shift: float = 0.120
+    maximum_center_shift: float = 0.160
     maximum_boundary_center_distance: float = 0.30
     maximum_residual_center_distance: float = 0.08
+    maximum_face_residual_position_mismatch: float = (
+        0.08 + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+    )
+    maximum_face_residual_scale_mismatch: float = (
+        0.06 + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+    )
+    maximum_subject_residual_position_mismatch: float = (
+        0.12 + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+    )
+    maximum_subject_residual_scale_mismatch: float = (
+        0.10 + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+    )
     minimum_mismatch_improvement_fraction: float = 0.20
     minimum_face_visible_fraction: float = 0.995
     minimum_dense_face_visible_fraction: float = 0.980
     legacy_face_only_maximum_zoom: float = 1.12
     legacy_face_only_maximum_center_shift: float = 0.025
     minimum_widened_subject_confidence: float = 0.30
-    minimum_widened_subject_visible_fraction: float = 0.950
+    # Subject-only silhouettes are conservative bounding rectangles rather
+    # than anatomy masks.  Allow at most seven percent of that rectangle outside
+    # the viewport during a small, lossless action-matching move, while the
+    # separate vertical gate protects the head-to-feet axis. Dense center,
+    # height, confidence, and residual gates still apply independently.
+    minimum_widened_subject_visible_fraction: float = 0.930
+    minimum_widened_subject_vertical_visible_fraction: float = 0.980
     minimum_face_associated_subject_visible_fraction: float = 0.720
     maximum_dense_subject_center_step: float = 0.20
     maximum_dense_subject_height_ratio: float = 1.40
@@ -471,6 +752,11 @@ class DirectMemberEditorialMotionConfig:
     maximum_dense_face_interpolation_gap_frames: int = 24
     maximum_dense_face_edge_extrapolation_frames: int = 24
     dense_geometry_median_radius_frames: int = 3
+    maximum_dense_follow_zoom_correction: float = 0.08
+    maximum_dense_face_follow_zoom_correction: float = 0.03
+    maximum_dense_follow_center_correction: float = 0.12
+    maximum_dense_follow_zoom_step: float = 0.04
+    maximum_dense_follow_center_step: float = 0.05
     maximum_endpoint_center_disagreement: float = 0.08
     maximum_endpoint_height_ratio: float = 1.25
     target_events_per_minute: float = 12.0
@@ -487,6 +773,10 @@ class DirectMemberEditorialMotionConfig:
             "maximum_center_shift",
             "maximum_boundary_center_distance",
             "maximum_residual_center_distance",
+            "maximum_face_residual_position_mismatch",
+            "maximum_face_residual_scale_mismatch",
+            "maximum_subject_residual_position_mismatch",
+            "maximum_subject_residual_scale_mismatch",
             "minimum_mismatch_improvement_fraction",
             "minimum_face_visible_fraction",
             "minimum_dense_face_visible_fraction",
@@ -494,11 +784,17 @@ class DirectMemberEditorialMotionConfig:
             "legacy_face_only_maximum_center_shift",
             "minimum_widened_subject_confidence",
             "minimum_widened_subject_visible_fraction",
+            "minimum_widened_subject_vertical_visible_fraction",
             "minimum_face_associated_subject_visible_fraction",
             "maximum_dense_subject_center_step",
             "maximum_dense_subject_height_ratio",
             "maximum_dense_center_step",
             "maximum_dense_height_ratio",
+            "maximum_dense_follow_zoom_correction",
+            "maximum_dense_face_follow_zoom_correction",
+            "maximum_dense_follow_center_correction",
+            "maximum_dense_follow_zoom_step",
+            "maximum_dense_follow_center_step",
             "maximum_endpoint_center_disagreement",
             "maximum_endpoint_height_ratio",
             "target_events_per_minute",
@@ -512,6 +808,20 @@ class DirectMemberEditorialMotionConfig:
         # Reuse the confirmed-member configuration as the shared camera/schema
         # contract.  Dense-direct adds stricter continuity gates below.
         _shared_settings(self)
+        if not (
+            0.0
+            <= self.maximum_face_residual_position_mismatch
+            <= self.maximum_subject_residual_position_mismatch
+            <= 0.20
+        ):
+            raise ValueError("dense attention position residual gates are invalid")
+        if not (
+            0.0
+            <= self.maximum_face_residual_scale_mismatch
+            <= self.maximum_subject_residual_scale_mismatch
+            <= 0.20
+        ):
+            raise ValueError("dense attention scale residual gates are invalid")
         if not 0.0 <= self.maximum_dense_center_step <= 0.20:
             raise ValueError("dense face center-step gate is invalid")
         if not 1.0 <= self.maximum_dense_height_ratio <= 2.0:
@@ -545,8 +855,14 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("legacy face-only pan boundary is invalid")
         if not 0.0 <= self.minimum_widened_subject_confidence <= 1.0:
             raise ValueError("widened subject confidence gate is invalid")
-        if not 0.95 <= self.minimum_widened_subject_visible_fraction <= 1.0:
+        if not 0.90 <= self.minimum_widened_subject_visible_fraction <= 1.0:
             raise ValueError("widened subject containment gate is invalid")
+        if not (
+            0.95
+            <= self.minimum_widened_subject_vertical_visible_fraction
+            <= 1.0
+        ):
+            raise ValueError("widened subject vertical containment gate is invalid")
         if not (
             0.95
             <= self.minimum_dense_face_visible_fraction
@@ -566,6 +882,20 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("dense subject center-step gate is invalid")
         if not 1.0 <= self.maximum_dense_subject_height_ratio <= 2.0:
             raise ValueError("dense subject height-ratio gate is invalid")
+        if not 0.0 <= self.maximum_dense_follow_zoom_correction <= 0.10:
+            raise ValueError("dense follow zoom correction gate is invalid")
+        if not (
+            0.0
+            <= self.maximum_dense_face_follow_zoom_correction
+            <= self.maximum_dense_follow_zoom_correction
+        ):
+            raise ValueError("dense face-follow zoom correction gate is invalid")
+        if not 0.0 <= self.maximum_dense_follow_center_correction <= 0.16:
+            raise ValueError("dense follow center correction gate is invalid")
+        if not 0.0 <= self.maximum_dense_follow_zoom_step <= 0.05:
+            raise ValueError("dense follow zoom-step gate is invalid")
+        if not 0.0 <= self.maximum_dense_follow_center_step <= 0.08:
+            raise ValueError("dense follow center-step gate is invalid")
         if not 0.0 <= self.maximum_endpoint_center_disagreement <= 0.20:
             raise ValueError("dense endpoint center gate is invalid")
         if not 1.0 <= self.maximum_endpoint_height_ratio <= 2.0:
@@ -606,8 +936,65 @@ class _BoundaryCandidate:
     side: str
     state: _State
     alignment_geometry_basis: str
+    left_box: tuple[float, float, float, float]
+    right_box: tuple[float, float, float, float]
     alternative_states: tuple[_State, ...] = ()
+    paired_state: _State | None = None
     required: bool = False
+
+
+def _rendered_attention_mismatch(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    """Measure rendered center and visible subject-height continuity.
+
+    Uniform camera zoom can match height and center, but it cannot make a
+    profile face, extended arm, or changing full-body pose retain the same
+    bounding-box area.  Area therefore confounds choreography with camera
+    scale.  The dense planner itself optimizes subject height; persist that
+    same viewer-facing scale axis for the professional gate.
+    """
+
+    position = min(
+        1.0,
+        math.hypot(
+            _center(left)[0] - _center(right)[0],
+            _center(left)[1] - _center(right)[1],
+        )
+        / 0.42,
+    )
+    scale = min(
+        1.0,
+        abs(math.log(left[3] / right[3])) / math.log(3.2),
+    )
+    return (position, scale)
+
+
+def _visible_axis_fractions(
+    box: tuple[float, float, float, float],
+    state: _State,
+) -> tuple[float, float]:
+    """Return independent horizontal and vertical box containment."""
+
+    half = 0.5 / state.zoom
+    camera_left = state.center_x - half
+    camera_top = state.center_y - half
+    camera_right = state.center_x + half
+    camera_bottom = state.center_y + half
+    box_left, box_top, box_width, box_height = box
+    visible_width = max(
+        0.0,
+        min(camera_right, box_left + box_width) - max(camera_left, box_left),
+    )
+    visible_height = max(
+        0.0,
+        min(camera_bottom, box_top + box_height) - max(camera_top, box_top),
+    )
+    return (
+        min(1.0, visible_width / max(1e-9, box_width)),
+        min(1.0, visible_height / max(1e-9, box_height)),
+    )
 
 
 def _attention_alignment_geometry(
@@ -620,7 +1007,7 @@ def _attention_alignment_geometry(
     descriptor = getattr(sample, "descriptor", None)
     if descriptor is None:
         return None
-    if basis == _FACE_ATTENTION_BASIS:
+    if _is_face_alignment_basis(basis):
         if getattr(descriptor, "face_count", None) != 1:
             return None
     elif basis == "aggregate_human_silhouette":
@@ -1323,6 +1710,349 @@ def _reconstruct_dense_face_geometry(
     return resolved
 
 
+def _dense_tracking_camera_track(
+    *,
+    eligible_source_index: int,
+    segment: RenderSegment,
+    track: EditorialTransformTrack,
+    frame_count: int,
+    common_master_start: float,
+    geometry_provider: DirectMemberGeometryProvider,
+    fps: float,
+    config: DirectMemberEditorialMotionConfig,
+    source_frame_geometry: DirectMemberSourceFrameGeometry | None,
+    alignment_geometry_basis: str | None,
+    diagnostic_callback: Callable[[str], None] | None = None,
+) -> EditorialTransformTrack:
+    """Retarget an active boundary ramp to the verified moving performer.
+
+    A straight interpolation between two safe endpoint crops can still cut an
+    arm, foot, or face when the choreography crosses the frame during the
+    ramp.  Human editors keyframe the virtual camera through that motion.  Do
+    the same here, using only authenticated dense geometry: preserve every
+    authored endpoint exactly, then add the smallest per-frame zoom/pan change
+    that satisfies the same face and subject containment gates used by final
+    review.  The returned track is still re-reviewed independently below.
+    """
+
+    active_frame_indices = tuple(
+        frame_index
+        for frame_index in range(frame_count)
+        if not _neutral(track, frame_index / fps)
+    )
+    if not active_frame_indices:
+        return track
+
+    samples: list[DirectMemberFaceSample] = []
+    face_boxes: list[tuple[float, float, float, float] | None] = []
+    subject_boxes: list[tuple[float, float, float, float] | None] = []
+    for frame_index in active_frame_indices:
+        local_time = frame_index / fps
+        canonical_time = common_master_start + segment.master_start + local_time
+        sample = geometry_provider(eligible_source_index, canonical_time)
+        if sample is None:
+            if diagnostic_callback is not None:
+                diagnostic_callback(
+                    f"dense_follow_geometry_missing(frame={frame_index})"
+                )
+            return track
+        face_box = (
+            map_box_to_portrait_fill(
+                sample.bbox_xywh,
+                source_frame_geometry,
+            )
+            if source_frame_geometry is not None
+            else sample.bbox_xywh
+        )
+        subject_box = sample.subject_bbox_xywh
+        if subject_box is not None and source_frame_geometry is not None:
+            subject_box = map_box_to_portrait_fill(
+                subject_box,
+                source_frame_geometry,
+            )
+        samples.append(sample)
+        face_boxes.append(face_box if sample.face_count == 1 else None)
+        subject_boxes.append(subject_box)
+
+    if all(box is not None for box in subject_boxes):
+        subject_boxes = list(
+            _median_smooth_geometry(
+                active_frame_indices,
+                [box for box in subject_boxes if box is not None],
+                radius=config.dense_geometry_median_radius_frames,
+                preserve_run_endpoints=True,
+            )
+        )
+
+    resolved_basis = alignment_geometry_basis
+    if resolved_basis is None:
+        resolved_basis = (
+            _FACE_ATTENTION_BASIS
+            if sum(sample.face_count == 1 for sample in samples)
+            >= max(2, math.ceil(len(samples) / 2.0))
+            else "aggregate_human_silhouette"
+        )
+
+    centered_target_box = (0.45, 0.45, 0.10, 0.10)
+    shared = _shared_settings(config)
+
+    def state_is_contained(
+        *,
+        state: _State,
+        sample: DirectMemberFaceSample,
+        face_box: tuple[float, float, float, float] | None,
+        subject_box: tuple[float, float, float, float] | None,
+    ) -> bool:
+        if face_box is not None and (
+            _visible_fraction(face_box, state) + 1e-9
+            < config.minimum_dense_face_visible_fraction
+        ):
+            return False
+        # A short YuNet gap is reconstructed from the verified continuous
+        # subject track by final dense review.  Let the camera follower use
+        # that same subject evidence instead of abandoning the whole ramp at
+        # the first missing face frame; it still cannot certify a frame where
+        # both face and subject geometry are absent.
+        if (
+            _is_face_alignment_basis(resolved_basis)
+            and face_box is None
+            and subject_box is None
+        ):
+            return False
+        if subject_box is None:
+            return not (
+                state.zoom > config.legacy_face_only_maximum_zoom + 1e-9
+                or abs(state.center_x - 0.5)
+                > config.legacy_face_only_maximum_center_shift + 1e-9
+                or abs(state.center_y - 0.5)
+                > config.legacy_face_only_maximum_center_shift + 1e-9
+            )
+        minimum_subject_fraction = (
+            config.minimum_face_associated_subject_visible_fraction
+            if sample.face_count == 1
+            else config.minimum_widened_subject_visible_fraction
+        )
+        if (
+            _visible_fraction(subject_box, state) + 1e-9
+            < minimum_subject_fraction
+        ):
+            return False
+        if sample.face_count == 0:
+            _horizontal, vertical = _visible_axis_fractions(subject_box, state)
+            if (
+                vertical + 1e-9
+                < config.minimum_widened_subject_vertical_visible_fraction
+            ):
+                return False
+        return True
+
+    frame_points: list[tuple[float, _State]] = []
+    previous_state: _State | None = None
+    changed = False
+    for frame_index, sample, face_box, subject_box in zip(
+        active_frame_indices,
+        samples,
+        face_boxes,
+        subject_boxes,
+        strict=True,
+    ):
+        local_time = frame_index / fps
+        base_keyframe = track.evaluate(local_time)
+        base_state = _State(
+            base_keyframe.zoom,
+            base_keyframe.center_x,
+            base_keyframe.center_y,
+        )
+        if state_is_contained(
+            state=base_state,
+            sample=sample,
+            face_box=face_box,
+            subject_box=subject_box,
+        ):
+            selected_state = base_state
+        else:
+            focus_boxes = tuple(
+                box
+                for box in (subject_box, face_box)
+                if box is not None
+            )
+            candidates: list[_State] = []
+            seen: set[tuple[float, float, float]] = set()
+            zoom = base_state.zoom
+            zoom_values: list[float] = [zoom]
+            while zoom_values[-1] > 1.0 + 1e-9:
+                next_zoom = max(1.0, zoom_values[-1] - 0.01)
+                if abs(next_zoom - zoom_values[-1]) <= 1e-9:
+                    break
+                zoom_values.append(next_zoom)
+            for candidate_zoom in zoom_values:
+                focus_states: list[_State] = []
+                for focus_box in focus_boxes:
+                    focus_states.extend(
+                        _state_for_match(
+                            box=focus_box,
+                            target_box=centered_target_box,
+                            zoom=candidate_zoom,
+                            settings=shared,
+                        )
+                    )
+                focus_states.append(
+                    _State(
+                        candidate_zoom,
+                        base_state.center_x,
+                        base_state.center_y,
+                    )
+                )
+                for focus_state in focus_states:
+                    for alpha in (0.25, 0.50, 0.75, 1.0):
+                        state = _State(
+                            candidate_zoom,
+                            base_state.center_x
+                            + (focus_state.center_x - base_state.center_x) * alpha,
+                            base_state.center_y
+                            + (focus_state.center_y - base_state.center_y) * alpha,
+                        )
+                        key = (
+                            round(state.zoom, 9),
+                            round(state.center_x, 9),
+                            round(state.center_y, 9),
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        maximum_zoom_correction = (
+                            config.maximum_dense_face_follow_zoom_correction
+                            if _is_face_alignment_basis(resolved_basis)
+                            else config.maximum_dense_follow_zoom_correction
+                        )
+                        if (
+                            abs(state.zoom - base_state.zoom)
+                            > maximum_zoom_correction + 1e-9
+                            or math.hypot(
+                                state.center_x - base_state.center_x,
+                                state.center_y - base_state.center_y,
+                            )
+                            > config.maximum_dense_follow_center_correction + 1e-9
+                        ):
+                            continue
+                        try:
+                            EditorialTransformKeyframe(
+                                local_time,
+                                state.zoom,
+                                state.center_x,
+                                state.center_y,
+                                0.0,
+                            )
+                        except ValueError:
+                            continue
+                        if state_is_contained(
+                            state=state,
+                            sample=sample,
+                            face_box=face_box,
+                            subject_box=subject_box,
+                        ):
+                            if previous_state is not None and (
+                                abs(state.zoom - previous_state.zoom)
+                                > config.maximum_dense_follow_zoom_step + 1e-9
+                                or math.hypot(
+                                    state.center_x - previous_state.center_x,
+                                    state.center_y - previous_state.center_y,
+                                )
+                                > config.maximum_dense_follow_center_step + 1e-9
+                            ):
+                                continue
+                            candidates.append(state)
+            if not candidates:
+                if diagnostic_callback is not None:
+                    diagnostic_callback(
+                        "dense_follow_no_safe_state("
+                        f"frame={frame_index},basis={resolved_basis},"
+                        f"base_zoom={base_state.zoom:.6f},"
+                        f"base_center_x={base_state.center_x:.6f},"
+                        f"base_center_y={base_state.center_y:.6f},"
+                        "face_box="
+                        + (
+                            ",".join(f"{value:.6f}" for value in face_box)
+                            if face_box is not None
+                            else "none"
+                        )
+                        + ",subject_box="
+                        + (
+                            ",".join(f"{value:.6f}" for value in subject_box)
+                            if subject_box is not None
+                            else "none"
+                        )
+                        + ")"
+                    )
+                return track
+
+            def candidate_cost(state: _State) -> tuple[float, float, float]:
+                authored_change = (
+                    2.0 * abs(state.zoom - base_state.zoom)
+                    + math.hypot(
+                        state.center_x - base_state.center_x,
+                        state.center_y - base_state.center_y,
+                    )
+                )
+                temporal_change = (
+                    0.0
+                    if previous_state is None
+                    else 0.35
+                    * (
+                        abs(state.zoom - previous_state.zoom)
+                        + math.hypot(
+                            state.center_x - previous_state.center_x,
+                            state.center_y - previous_state.center_y,
+                        )
+                    )
+                )
+                return (
+                    authored_change + temporal_change,
+                    abs(state.zoom - base_state.zoom),
+                    math.hypot(
+                        state.center_x - base_state.center_x,
+                        state.center_y - base_state.center_y,
+                    ),
+                )
+
+            selected_state = min(candidates, key=candidate_cost)
+            changed = changed or selected_state != base_state
+        frame_points.append((local_time, selected_state))
+        previous_state = selected_state
+
+    if not changed:
+        return track
+    authored_points = [
+        (
+            keyframe.time_seconds,
+            _State(keyframe.zoom, keyframe.center_x, keyframe.center_y),
+        )
+        for keyframe in track.keyframes
+    ]
+    try:
+        return EditorialTransformTrack(
+            keyframes=tuple(
+                EditorialTransformKeyframe(
+                    time_seconds=time_value,
+                    zoom=state.zoom,
+                    center_x=state.center_x,
+                    center_y=state.center_y,
+                    roll_degrees=0.0,
+                )
+                for time_value, state in _dedupe_points(
+                    tuple(frame_points) + tuple(authored_points)
+                )
+            ),
+            reason=track.reason + "_dense_performer_follow",
+        )
+    except ValueError as exc:
+        if diagnostic_callback is not None:
+            diagnostic_callback(
+                "dense_follow_track_invalid(" + str(exc) + ")"
+            )
+        return track
+
+
 def _track_is_dense_face_safe(
     *,
     segment_index: int,
@@ -1414,7 +2144,7 @@ def _track_is_dense_face_safe(
             >= max(2, math.ceil(len(samples) / 2.0))
             else "aggregate_human_silhouette"
         )
-    if resolved_basis == _FACE_ATTENTION_BASIS:
+    if _is_face_alignment_basis(resolved_basis):
         if all(subject_box is not None for subject_box in subject_boxes):
             subject_boxes = _median_smooth_geometry(
                 ordered_frames,
@@ -1475,7 +2205,7 @@ def _track_is_dense_face_safe(
         return reject("dense_alignment_geometry_basis_invalid")
 
     if (
-        resolved_basis == _FACE_ATTENTION_BASIS
+        _is_face_alignment_basis(resolved_basis)
         and all(subject_box is not None for subject_box in subject_boxes)
     ):
         stabilized_subject_boxes = _stabilize_face_associated_subject_track(
@@ -1490,7 +2220,7 @@ def _track_is_dense_face_safe(
         subject_boxes = list(stabilized_subject_boxes)
 
     if (
-        resolved_basis != _FACE_ATTENTION_BASIS
+        not _is_face_alignment_basis(resolved_basis)
         and all(subject_box is not None for subject_box in subject_boxes)
     ):
         smoothed_subject_boxes = _median_smooth_geometry(
@@ -1631,7 +2361,7 @@ def _track_is_dense_face_safe(
             state_sample.center_x,
             state_sample.center_y,
         )
-        if resolved_basis == _FACE_ATTENTION_BASIS:
+        if _is_face_alignment_basis(resolved_basis):
             face_visible_fraction = _visible_fraction(box, state)
             if (
                 face_visible_fraction + 1e-9
@@ -1673,6 +2403,22 @@ def _track_is_dense_face_safe(
                 minimum_alignment_visible_fraction = (
                     config.minimum_widened_subject_visible_fraction
                 )
+                horizontal_visible_fraction, vertical_visible_fraction = (
+                    _visible_axis_fractions(box, state)
+                )
+                if (
+                    vertical_visible_fraction + 1e-9
+                    < config.minimum_widened_subject_vertical_visible_fraction
+                ):
+                    return reject(
+                        "dense_subject_vertical_crop_exceeds_visible_fraction",
+                        f"frame={frame_index},"
+                        f"horizontal={horizontal_visible_fraction:.6f},"
+                        f"vertical={vertical_visible_fraction:.6f},"
+                        "minimum_vertical="
+                        f"{config.minimum_widened_subject_vertical_visible_fraction:.6f},"
+                        f"zoom={state.zoom:.6f}",
+                    )
             alignment_visible_fraction = _visible_fraction(box, state)
             if (
                 alignment_visible_fraction + 1e-9
@@ -1737,6 +2483,23 @@ def _track_is_dense_face_safe(
                 if sample.face_count == 1
                 else config.minimum_widened_subject_visible_fraction
             )
+            if sample.face_count == 0:
+                horizontal_visible_fraction, vertical_visible_fraction = (
+                    _visible_axis_fractions(subject_box, state)
+                )
+                if (
+                    vertical_visible_fraction + 1e-9
+                    < config.minimum_widened_subject_vertical_visible_fraction
+                ):
+                    return reject(
+                        "dense_subject_vertical_crop_exceeds_visible_fraction",
+                        f"frame={frame_index},"
+                        f"horizontal={horizontal_visible_fraction:.6f},"
+                        f"vertical={vertical_visible_fraction:.6f},"
+                        "minimum_vertical="
+                        f"{config.minimum_widened_subject_vertical_visible_fraction:.6f},"
+                        f"zoom={state.zoom:.6f}",
+                    )
             subject_visible_fraction = _visible_fraction(subject_box, state)
             if (
                 subject_visible_fraction + 1e-9
@@ -1829,6 +2592,41 @@ def build_direct_member_editorial_motion_plan(
     for index, transition in enumerate(transition_items):
         if transition.kind.uses_overlap:
             blocked.update((index, index + 1))
+
+    def boundary_side_overlaps_effect(
+        boundary_index: int,
+        side: str,
+    ) -> bool:
+        """Reserve only the segment edge actually occupied by an effect."""
+
+        if transition_items[boundary_index].kind.uses_overlap:
+            return True
+        affected_index = (
+            boundary_index if side == "left" else boundary_index + 1
+        )
+        ramp = min(settings.ramp_seconds, last_frame_times[affected_index])
+        if side == "left":
+            adjacent_index = affected_index - 1
+            if adjacent_index < 0:
+                return False
+            adjacent = transition_items[adjacent_index]
+            if not adjacent.kind.uses_overlap:
+                return False
+            occupied_until = adjacent.frame_count / fps
+            ramp_starts = max(0.0, last_frame_times[affected_index] - ramp)
+            return occupied_until >= ramp_starts - 1e-9
+        adjacent_index = affected_index
+        if adjacent_index >= len(transition_items):
+            return False
+        adjacent = transition_items[adjacent_index]
+        if not adjacent.kind.uses_overlap:
+            return False
+        occupied_from = max(
+            0.0,
+            last_frame_times[affected_index] - adjacent.frame_count / fps,
+        )
+        return ramp >= occupied_from - 1e-9
+
     skipped: dict[str, int] = {}
     required_rejection_reasons: dict[int, set[str]] = {}
     required_rejection_context: dict[int, str] = {}
@@ -1839,6 +2637,14 @@ def build_direct_member_editorial_motion_plan(
     candidates: list[_BoundaryCandidate] = []
     required_boundary_indices: set[int] = set()
     naturally_satisfied_required_boundary_indices: set[int] = set()
+    natural_match_geometry: dict[
+        int,
+        tuple[
+            str,
+            tuple[float, float, float, float],
+            tuple[float, float, float, float],
+        ],
+    ] = {}
     for boundary_index, diagnostic in enumerate(boundaries):
         if getattr(diagnostic, "boundary_index", None) != boundary_index:
             raise ValueError("direct member boundary indices must be contiguous")
@@ -1853,7 +2659,19 @@ def build_direct_member_editorial_motion_plan(
             DirectMemberBoundaryTransformRepair,
         ):
             raise ValueError("direct member boundary transform repair is invalid")
-        required = repair is not None
+        required = bool(
+            (
+                repair is not None
+                or bool(
+                    getattr(
+                        mismatch,
+                        "dense_attention_validation_required",
+                        False,
+                    )
+                )
+            )
+            and not transition_items[boundary_index].kind.uses_overlap
+        )
         if required:
             required_boundary_indices.add(boundary_index)
 
@@ -1878,17 +2696,101 @@ def build_direct_member_editorial_motion_plan(
         audited_right_geometry = _attention_alignment_geometry(
             diagnostic.incoming_sample
         )
+        left_geometry = source_frame_geometries[left_source]
+        right_geometry = source_frame_geometries[right_source]
+        left_time = (
+            common_master_start
+            + renders[boundary_index].master_start
+            + last_frame_times[boundary_index]
+        )
+        right_time = common_master_start + renders[boundary_index + 1].master_start
+        paired_provider = getattr(geometry_provider, "paired_samples", None)
+        if callable(paired_provider):
+            left_sample, right_sample = paired_provider(
+                left_source,
+                left_time,
+                right_source,
+                right_time,
+            )
+        else:
+            left_sample = geometry_provider(left_source, left_time)
+            right_sample = geometry_provider(right_source, right_time)
+        if left_sample is None or right_sample is None:
+            reject_boundary("dense_boundary_face_missing")
+            continue
+        focal_face_pair = bool(
+            left_sample.alignment_geometry_basis == FOCAL_FACE_BASIS
+            and right_sample.alignment_geometry_basis == FOCAL_FACE_BASIS
+        )
+        dense_common_basis = (
+            left_sample.alignment_geometry_basis
+            if left_sample.alignment_geometry_basis
+            == right_sample.alignment_geometry_basis
+            else None
+        )
+        dense_common_subject_basis = None
         if (
+            left_sample.subject_bbox_xywh is not None
+            and right_sample.subject_bbox_xywh is not None
+            and left_sample.subject_geometry_basis
+            == right_sample.subject_geometry_basis
+            and left_sample.subject_confidence + 1e-9
+            >= settings.minimum_widened_subject_confidence
+            and right_sample.subject_confidence + 1e-9
+            >= settings.minimum_widened_subject_confidence
+        ):
+            dense_common_subject_basis = (
+                "aggregate_human_silhouette"
+                if left_sample.subject_geometry_basis
+                == "pphumanseg_full_subject_silhouette"
+                else "unambiguous_dominant_person_box_geometry_only"
+            )
+        dense_only_audit = False
+        if focal_face_pair:
+            # Metadata already binds both sources to the requested official
+            # member.  The transient SFace pair proves which two visible
+            # faces are the same focal performer, so the aggregate coarse
+            # silhouette must not override that more specific evidence.
+            audited_left = left_sample.bbox_xywh
+            audited_right = right_sample.bbox_xywh
+            audited_basis = FOCAL_FACE_BASIS
+            dense_only_audit = True
+            repair = None
+            if not transition_items[boundary_index].kind.uses_overlap:
+                required = True
+                required_boundary_indices.add(boundary_index)
+        elif (
             audited_left_geometry is None
             or audited_right_geometry is None
             or audited_left_geometry[1] != audited_right_geometry[1]
         ):
-            reject_boundary("no_unambiguous_face_pair")
-            continue
-        audited_left, audited_basis = audited_left_geometry
-        audited_right, _right_basis = audited_right_geometry
-        left_geometry = source_frame_geometries[left_source]
-        right_geometry = source_frame_geometries[right_source]
+            # A provisional coarse edge is deliberately allowed to ask the
+            # dense reviewer for evidence.  Requiring the same ambiguous
+            # coarse pair again defeats that contract.  When no precomputed
+            # repair is being replayed, two endpoint samples with one common
+            # verified basis can establish the audit directly.
+            if required and repair is None and (
+                dense_common_basis is not None
+                or dense_common_subject_basis is not None
+            ):
+                if dense_common_basis is not None:
+                    audited_left = left_sample.bbox_xywh
+                    audited_right = right_sample.bbox_xywh
+                    audited_basis = dense_common_basis
+                else:
+                    assert left_sample.subject_bbox_xywh is not None
+                    assert right_sample.subject_bbox_xywh is not None
+                    assert dense_common_subject_basis is not None
+                    audited_left = left_sample.subject_bbox_xywh
+                    audited_right = right_sample.subject_bbox_xywh
+                    audited_basis = dense_common_subject_basis
+                dense_only_audit = True
+            else:
+                reject_boundary("no_unambiguous_face_pair")
+                continue
+        else:
+            audited_left, audited_basis = audited_left_geometry
+            audited_right, _right_basis = audited_right_geometry
         audited_left = (
             map_box_to_portrait_fill(audited_left, left_geometry)
             if left_geometry is not None
@@ -1899,35 +2801,32 @@ def build_direct_member_editorial_motion_plan(
             if right_geometry is not None
             else audited_right
         )
-        left_time = (
-            common_master_start
-            + renders[boundary_index].master_start
-            + last_frame_times[boundary_index]
-        )
-        right_time = common_master_start + renders[boundary_index + 1].master_start
-        left_sample = geometry_provider(left_source, left_time)
-        right_sample = geometry_provider(right_source, right_time)
-        if left_sample is None or right_sample is None:
-            reject_boundary("dense_boundary_face_missing")
-            continue
-        if (
+        if not dense_only_audit and (
             left_sample.alignment_geometry_basis != audited_basis
             or right_sample.alignment_geometry_basis != audited_basis
         ):
             reject_boundary("dense_boundary_face_disagrees_with_audit")
             continue
         left_box = (
-            map_box_to_portrait_fill(left_sample.bbox_xywh, left_geometry)
+            audited_left
+            if dense_only_audit
+            else map_box_to_portrait_fill(left_sample.bbox_xywh, left_geometry)
             if left_geometry is not None
             else left_sample.bbox_xywh
         )
         right_box = (
-            map_box_to_portrait_fill(right_sample.bbox_xywh, right_geometry)
+            audited_right
+            if dense_only_audit
+            else map_box_to_portrait_fill(right_sample.bbox_xywh, right_geometry)
             if right_geometry is not None
             else right_sample.bbox_xywh
         )
-        if not _endpoint_agrees(left_box, audited_left, settings) or not _endpoint_agrees(
-            right_box, audited_right, settings
+        if (
+            not dense_only_audit
+            and (
+                not _endpoint_agrees(left_box, audited_left, settings)
+                or not _endpoint_agrees(right_box, audited_right, settings)
+            )
         ):
             reject_boundary("dense_boundary_face_disagrees_with_audit")
             continue
@@ -1971,6 +2870,33 @@ def build_direct_member_editorial_motion_plan(
             and right_sample.subject_bbox_xywh is not None
             else settings.minimum_mismatch_improvement_fraction
         )
+        professional_position_limit = (
+            settings.maximum_face_residual_position_mismatch
+            if _is_face_alignment_basis(audited_basis)
+            else settings.maximum_subject_residual_position_mismatch
+        )
+        professional_scale_limit = (
+            settings.maximum_face_residual_scale_mismatch
+            if _is_face_alignment_basis(audited_basis)
+            else settings.maximum_subject_residual_scale_mismatch
+        )
+        natural_position, natural_scale = _rendered_attention_mismatch(
+            left_box,
+            right_box,
+        )
+        if (
+            required
+            and natural_position <= professional_position_limit + 1e-9
+            and natural_scale <= professional_scale_limit + 1e-9
+        ):
+            naturally_satisfied_required_boundary_indices.add(boundary_index)
+            natural_match_geometry[boundary_index] = (
+                audited_basis,
+                left_box,
+                right_box,
+            )
+            skip("required_dense_natural_match")
+            continue
 
         def qualifying_for_side(
             candidate_side: str,
@@ -1984,7 +2910,10 @@ def build_direct_member_editorial_motion_plan(
                 if candidate_side == "left"
                 else boundary_index + 1
             )
-            if affected_index in blocked:
+            if boundary_side_overlaps_effect(
+                boundary_index,
+                candidate_side,
+            ):
                 return ([], None, "dissolve_adjacent")
             if last_frame_times[affected_index] < 0.55 - 1e-9:
                 return ([], None, "window_shorter_than_reference_ramp")
@@ -2090,9 +3019,14 @@ def build_direct_member_editorial_motion_plan(
                     if state_key in seen_states:
                         continue
                     seen_states.add(state_key)
+                    minimum_alignment_visible_fraction = (
+                        settings.minimum_dense_face_visible_fraction
+                        if _is_face_alignment_basis(audited_basis)
+                        else settings.minimum_widened_subject_visible_fraction
+                    )
                     if (
                         _visible_fraction(box, state) + 1e-9
-                        < settings.minimum_face_visible_fraction
+                        < minimum_alignment_visible_fraction
                     ):
                         continue
                     projected_left = (
@@ -2120,6 +3054,17 @@ def build_direct_member_editorial_motion_plan(
                         > settings.maximum_residual_center_distance + 1e-9
                     ):
                         continue
+                    residual_position, residual_scale = (
+                        _rendered_attention_mismatch(
+                            projected_left,
+                            projected_right,
+                        )
+                    )
+                    if (
+                        residual_position > professional_position_limit + 1e-9
+                        or residual_scale > professional_scale_limit + 1e-9
+                    ):
+                        continue
                     if transformed > baseline * (
                         1.0 - required_improvement_fraction
                     ) + 1e-9:
@@ -2143,22 +3088,200 @@ def build_direct_member_editorial_motion_plan(
                 (candidate_side, qualifying, maximum_zoom, failure)
             )
 
-        if not any(qualifying for _side, qualifying, _zoom, _failure in side_results):
-            if (
-                required
-                and baseline <= 0.10 + 1e-9
-                and center_distance <= 0.05 + 1e-9
-                and ratio <= 1.05 + 1e-9
+        bilateral_match: tuple[float, _State, _State] | None = None
+        bilateral_failure: str | None = None
+        if required and not any(
+            qualifying for _side, qualifying, _zoom, _failure in side_results
+        ):
+            if boundary_side_overlaps_effect(
+                boundary_index,
+                "left",
+            ) or boundary_side_overlaps_effect(boundary_index, "right"):
+                bilateral_failure = "bilateral_dissolve_adjacent"
+            elif (
+                last_frame_times[boundary_index] < 0.55 - 1e-9
+                or last_frame_times[boundary_index + 1] < 0.55 - 1e-9
             ):
-                naturally_satisfied_required_boundary_indices.add(
-                    boundary_index
+                bilateral_failure = "bilateral_window_shorter_than_reference_ramp"
+            elif left_geometry is None or right_geometry is None:
+                bilateral_failure = "bilateral_source_resolution_missing"
+            else:
+                left_zoom_limit = min(
+                    settings.maximum_boundary_zoom,
+                    left_geometry.lossless_zoom_capacity,
                 )
-                skip("required_dense_natural_match")
-                continue
+                right_zoom_limit = min(
+                    settings.maximum_boundary_zoom,
+                    right_geometry.lossless_zoom_capacity,
+                )
+                minimum_target_height = max(left_box[3], right_box[3])
+                maximum_target_height = min(
+                    left_box[3] * left_zoom_limit,
+                    right_box[3] * right_zoom_limit,
+                )
+                if maximum_target_height + 1e-9 < minimum_target_height:
+                    bilateral_failure = "bilateral_lossless_zoom_exceeded"
+                else:
+                    target_centers = (
+                        (0.50, 0.50),
+                        (0.42, 0.50),
+                        (0.58, 0.50),
+                        (0.50, 0.42),
+                        (0.50, 0.58),
+                        (0.42, 0.42),
+                        (0.42, 0.58),
+                        (0.58, 0.42),
+                        (0.58, 0.58),
+                    )
+                    minimum_alignment_visible_fraction = (
+                        settings.minimum_dense_face_visible_fraction
+                        if _is_face_alignment_basis(audited_basis)
+                        else settings.minimum_widened_subject_visible_fraction
+                    )
+                    options: list[
+                        tuple[float, float, _State, _State]
+                    ] = []
+                    height_span = maximum_target_height - minimum_target_height
+                    for step in range(33):
+                        target_height = (
+                            minimum_target_height
+                            if height_span <= 1e-12
+                            else minimum_target_height
+                            + height_span * step / 32.0
+                        )
+                        left_zoom = max(1.0, target_height / left_box[3])
+                        right_zoom = max(1.0, target_height / right_box[3])
+                        for target_x, target_y in target_centers:
+                            target_box = (
+                                target_x - 0.05,
+                                target_y - target_height / 2.0,
+                                0.10,
+                                target_height,
+                            )
+                            left_states = _state_for_match(
+                                box=left_box,
+                                target_box=target_box,
+                                zoom=left_zoom,
+                                settings=shared,
+                            )
+                            right_states = _state_for_match(
+                                box=right_box,
+                                target_box=target_box,
+                                zoom=right_zoom,
+                                settings=shared,
+                            )
+                            for left_state in left_states:
+                                if (
+                                    _visible_fraction(left_box, left_state) + 1e-9
+                                    < minimum_alignment_visible_fraction
+                                ):
+                                    continue
+                                for right_state in right_states:
+                                    if (
+                                        _visible_fraction(right_box, right_state)
+                                        + 1e-9
+                                        < minimum_alignment_visible_fraction
+                                    ):
+                                        continue
+                                    projected_left = _project(
+                                        left_box,
+                                        left_state,
+                                    )
+                                    projected_right = _project(
+                                        right_box,
+                                        right_state,
+                                    )
+                                    residual_position, residual_scale = (
+                                        _rendered_attention_mismatch(
+                                            projected_left,
+                                            projected_right,
+                                        )
+                                    )
+                                    residual_center = math.hypot(
+                                        _center(projected_left)[0]
+                                        - _center(projected_right)[0],
+                                        _center(projected_left)[1]
+                                        - _center(projected_right)[1],
+                                    )
+                                    transformed = _mismatch(
+                                        projected_left,
+                                        projected_right,
+                                    )
+                                    if (
+                                        residual_center
+                                        > settings.maximum_residual_center_distance
+                                        + 1e-9
+                                        or residual_position
+                                        > professional_position_limit + 1e-9
+                                        or residual_scale
+                                        > professional_scale_limit + 1e-9
+                                        or transformed
+                                        > baseline
+                                        * (1.0 - required_improvement_fraction)
+                                        + 1e-9
+                                    ):
+                                        continue
+                                    camera_effort = (
+                                        left_state.zoom
+                                        + right_state.zoom
+                                        - 2.0
+                                        + math.hypot(
+                                            left_state.center_x - 0.5,
+                                            left_state.center_y - 0.5,
+                                        )
+                                        + math.hypot(
+                                            right_state.center_x - 0.5,
+                                            right_state.center_y - 0.5,
+                                        )
+                                    )
+                                    options.append(
+                                        (
+                                            transformed,
+                                            camera_effort,
+                                            left_state,
+                                            right_state,
+                                        )
+                                    )
+                    if options:
+                        transformed, _effort, left_state, right_state = min(
+                            options,
+                            key=lambda item: (item[0], item[1]),
+                        )
+                        bilateral_match = (
+                            transformed,
+                            left_state,
+                            right_state,
+                        )
+                    else:
+                        bilateral_failure = (
+                            "bilateral_residual_or_improvement_failed"
+                        )
+
+        if bilateral_match is not None:
+            bilateral_score, left_state, right_state = bilateral_match
+            candidates.append(
+                _BoundaryCandidate(
+                    boundary_index=boundary_index,
+                    event_time=boundary_times[boundary_index],
+                    score=baseline - bilateral_score,
+                    side="both",
+                    state=left_state,
+                    paired_state=right_state,
+                    alignment_geometry_basis=audited_basis,
+                    left_box=left_box,
+                    right_box=right_box,
+                    required=required,
+                )
+            )
+            continue
+
+        if not any(qualifying for _side, qualifying, _zoom, _failure in side_results):
             failures = {
                 failure or "no_improving_contained_transform"
                 for _side, _qualifying, _zoom, failure in side_results
             }
+            if bilateral_failure is not None:
+                failures.add(bilateral_failure)
             for failure in sorted(failures):
                 reject_boundary(failure)
             if required:
@@ -2189,6 +3312,8 @@ def build_direct_member_editorial_motion_plan(
                     side=candidate_side,
                     state=best_state,
                     alignment_geometry_basis=audited_basis,
+                    left_box=left_box,
+                    right_box=right_box,
                     alternative_states=tuple(
                         state for _score, state in qualifying[1:]
                     ),
@@ -2231,6 +3356,108 @@ def build_direct_member_editorial_motion_plan(
         ):
             skip("event_spacing_cap")
             continue
+        if candidate.side == "both":
+            if candidate.paired_state is None:
+                raise ValueError("bilateral member camera is missing its paired state")
+            left_index = candidate.boundary_index
+            right_index = candidate.boundary_index + 1
+            previous_left_exit = exit_states[left_index]
+            previous_right_entry = entry_states[right_index]
+            previous_left_track = tracks[left_index]
+            previous_right_track = tracks[right_index]
+            previous_left_bases = set(segment_alignment_bases[left_index])
+            previous_right_bases = set(segment_alignment_bases[right_index])
+            exit_states[left_index] = candidate.state
+            entry_states[right_index] = candidate.paired_state
+            left_bases = set(previous_left_bases)
+            right_bases = set(previous_right_bases)
+            left_bases.add(candidate.alignment_geometry_basis)
+            right_bases.add(candidate.alignment_geometry_basis)
+            dense_rejection_reasons: set[str] = set()
+            dense_rejection_details: set[str] = set()
+
+            def bilateral_track(
+                index: int,
+                bases: set[str],
+            ) -> EditorialTransformTrack | None:
+                try:
+                    track = _track_for_states(
+                        entry=entry_states[index],
+                        exit=exit_states[index],
+                        last_frame_time=last_frame_times[index],
+                        settings=shared,
+                    )
+                except ValueError:
+                    return None
+                review_basis = (
+                    next(iter(bases)) if len(bases) == 1 else None
+                )
+                if track is None:
+                    return None
+                track = _dense_tracking_camera_track(
+                    eligible_source_index=source_path[index],
+                    segment=renders[index],
+                    track=track,
+                    frame_count=frame_counts[index],
+                    common_master_start=common_master_start,
+                    geometry_provider=geometry_provider,
+                    fps=fps,
+                    config=settings,
+                    source_frame_geometry=source_frame_geometries[
+                        source_path[index]
+                    ],
+                    alignment_geometry_basis=review_basis,
+                    diagnostic_callback=dense_rejection_details.add,
+                )
+                if not _track_is_dense_face_safe(
+                    segment_index=index,
+                    eligible_source_index=source_path[index],
+                    segment=renders[index],
+                    track=track,
+                    frame_count=frame_counts[index],
+                    common_master_start=common_master_start,
+                    geometry_provider=geometry_provider,
+                    fps=fps,
+                    config=settings,
+                    source_frame_geometry=source_frame_geometries[
+                        source_path[index]
+                    ],
+                    alignment_geometry_basis=review_basis,
+                    rejection_callback=dense_rejection_reasons.add,
+                    rejection_detail_callback=dense_rejection_details.add,
+                ):
+                    return None
+                return track
+
+            left_track = bilateral_track(left_index, left_bases)
+            right_track = bilateral_track(right_index, right_bases)
+            if left_track is None or right_track is None:
+                exit_states[left_index] = previous_left_exit
+                entry_states[right_index] = previous_right_entry
+                tracks[left_index] = previous_left_track
+                tracks[right_index] = previous_right_track
+                segment_alignment_bases[left_index] = previous_left_bases
+                segment_alignment_bases[right_index] = previous_right_bases
+                skip("dense_bilateral_containment_or_continuity_failed")
+                if candidate.required:
+                    required_rejection_reasons.setdefault(
+                        candidate.boundary_index,
+                        set(),
+                    ).update(
+                        dense_rejection_reasons
+                        or {"dense_bilateral_containment_or_continuity_failed"}
+                    )
+                    if dense_rejection_details:
+                        required_rejection_context[
+                            candidate.boundary_index
+                        ] = ";".join(sorted(dense_rejection_details))
+                continue
+            tracks[left_index] = left_track
+            tracks[right_index] = right_track
+            segment_alignment_bases[left_index] = left_bases
+            segment_alignment_bases[right_index] = right_bases
+            accepted.append(candidate)
+            continue
         affected_index = (
             candidate.boundary_index
             if candidate.side == "left"
@@ -2265,6 +3492,22 @@ def build_direct_member_editorial_motion_plan(
                 )
             except ValueError:
                 track = None
+            if track is not None:
+                track = _dense_tracking_camera_track(
+                    eligible_source_index=source_path[affected_index],
+                    segment=renders[affected_index],
+                    track=track,
+                    frame_count=frame_counts[affected_index],
+                    common_master_start=common_master_start,
+                    geometry_provider=geometry_provider,
+                    fps=fps,
+                    config=settings,
+                    source_frame_geometry=source_frame_geometries[
+                        source_path[affected_index]
+                    ],
+                    alignment_geometry_basis=review_alignment_basis,
+                    diagnostic_callback=dense_rejection_details.add,
+                )
             if track is not None and _track_is_dense_face_safe(
                 segment_index=affected_index,
                 eligible_source_index=source_path[affected_index],
@@ -2314,6 +3557,8 @@ def build_direct_member_editorial_motion_plan(
                 alignment_geometry_basis=(
                     candidate.alignment_geometry_basis
                 ),
+                left_box=candidate.left_box,
+                right_box=candidate.right_box,
                 required=candidate.required,
             )
         )
@@ -2408,6 +3653,18 @@ def build_direct_member_editorial_motion_plan(
                     "official_fancam_dense_subject_lossless_interior_zoom_pulse"
                 ),
             )
+            track = _dense_tracking_camera_track(
+                eligible_source_index=source_path[index],
+                segment=renders[index],
+                track=track,
+                frame_count=frame_counts[index],
+                common_master_start=common_master_start,
+                geometry_provider=geometry_provider,
+                fps=fps,
+                config=settings,
+                source_frame_geometry=source_geometry,
+                alignment_geometry_basis=None,
+            )
             if not _track_is_dense_face_safe(
                 segment_index=index,
                 eligible_source_index=source_path[index],
@@ -2435,6 +3692,26 @@ def build_direct_member_editorial_motion_plan(
             last_frame_time=last_frame_times[index],
             settings=shared,
         )
+        review_alignment_basis = (
+            next(iter(segment_alignment_bases[index]))
+            if len(segment_alignment_bases[index]) == 1
+            else None
+        )
+        if track is not None:
+            track = _dense_tracking_camera_track(
+                eligible_source_index=source_path[index],
+                segment=renders[index],
+                track=track,
+                frame_count=frame_counts[index],
+                common_master_start=common_master_start,
+                geometry_provider=geometry_provider,
+                fps=fps,
+                config=settings,
+                source_frame_geometry=source_frame_geometries[
+                    source_path[index]
+                ],
+                alignment_geometry_basis=review_alignment_basis,
+            )
         if track is None or not _track_is_dense_face_safe(
             segment_index=index,
             eligible_source_index=source_path[index],
@@ -2446,19 +3723,105 @@ def build_direct_member_editorial_motion_plan(
             fps=fps,
             config=settings,
             source_frame_geometry=source_frame_geometries[source_path[index]],
-            alignment_geometry_basis=(
-                next(iter(segment_alignment_bases[index]))
-                if len(segment_alignment_bases[index]) == 1
-                else None
-            ),
+            alignment_geometry_basis=review_alignment_basis,
         ):
             raise ValueError("accepted direct member camera failed final dense review")
         tracks[index] = track
 
-    accepted_segments = {
-        item.boundary_index if item.side == "left" else item.boundary_index + 1
-        for item in accepted
-    }
+    def final_track_state(
+        segment_index: int,
+        local_time: float,
+    ) -> _State:
+        track = tracks[segment_index]
+        if track is None:
+            return _State()
+        keyframe = track.evaluate(local_time)
+        return _State(
+            keyframe.zoom,
+            keyframe.center_x,
+            keyframe.center_y,
+        )
+
+    def final_boundary_residual(
+        boundary_index: int,
+        left_box: tuple[float, float, float, float],
+        right_box: tuple[float, float, float, float],
+    ) -> tuple[float, float]:
+        projected_left = _project(
+            left_box,
+            final_track_state(
+                boundary_index,
+                last_frame_times[boundary_index],
+            ),
+        )
+        projected_right = _project(
+            right_box,
+            final_track_state(boundary_index + 1, 0.0),
+        )
+        return _rendered_attention_mismatch(
+            projected_left,
+            projected_right,
+        )
+
+    final_boundary_residuals: dict[int, tuple[float, float]] = {}
+    final_residual_geometry_bases: dict[int, str] = {}
+    for item in accepted:
+        final_boundary_residuals[item.boundary_index] = (
+            final_boundary_residual(
+                item.boundary_index,
+                item.left_box,
+                item.right_box,
+            )
+        )
+        final_residual_geometry_bases[item.boundary_index] = (
+            item.alignment_geometry_basis
+        )
+    for boundary_index, (
+        geometry_basis,
+        left_box,
+        right_box,
+    ) in natural_match_geometry.items():
+        final_boundary_residuals[boundary_index] = final_boundary_residual(
+            boundary_index,
+            left_box,
+            right_box,
+        )
+        final_residual_geometry_bases[boundary_index] = geometry_basis
+
+    final_residual_failure_indices: set[int] = set()
+    for boundary_index, (position, scale) in final_boundary_residuals.items():
+        geometry_basis = final_residual_geometry_bases[boundary_index]
+        position_limit = (
+            settings.maximum_face_residual_position_mismatch
+            if _is_face_alignment_basis(geometry_basis)
+            else settings.maximum_subject_residual_position_mismatch
+        )
+        scale_limit = (
+            settings.maximum_face_residual_scale_mismatch
+            if _is_face_alignment_basis(geometry_basis)
+            else settings.maximum_subject_residual_scale_mismatch
+        )
+        if (
+            position <= position_limit + 1e-9
+            and scale <= scale_limit + 1e-9
+        ):
+            continue
+        final_residual_failure_indices.add(boundary_index)
+        required_rejection_reasons.setdefault(boundary_index, set()).add(
+            "final_rendered_attention_residual_exceeds_professional_limit"
+        )
+        required_rejection_context[boundary_index] = (
+            f"basis={geometry_basis},position={position:.6f},"
+            f"position_limit={position_limit:.6f},scale={scale:.6f},"
+            f"scale_limit={scale_limit:.6f}"
+        )
+
+    accepted_segments: set[int] = set()
+    for item in accepted:
+        if item.side in {"left", "both"}:
+            accepted_segments.add(item.boundary_index)
+        if item.side in {"right", "both"}:
+            accepted_segments.add(item.boundary_index + 1)
     accepted_boundary_indices = tuple(
         sorted(item.boundary_index for item in accepted)
     )
@@ -2467,6 +3830,7 @@ def build_direct_member_editorial_motion_plan(
             required_boundary_indices.difference(
                 accepted_boundary_indices
             ).difference(naturally_satisfied_required_boundary_indices)
+            .union(final_residual_failure_indices)
         )
     )
     if missing_required:
@@ -2499,7 +3863,7 @@ def build_direct_member_editorial_motion_plan(
             )
             for boundary_index in missing_required
         )
-        raise ValueError(
+        message = (
             "required direct member transform failed dense review at boundaries "
             + ",".join(str(index) for index in missing_required)
             + "; required rejection counts "
@@ -2507,6 +3871,13 @@ def build_direct_member_editorial_motion_plan(
             + "; required rejection details "
             + rejection_details
         )
+        raise DirectMemberEditorialMotionError(
+            message,
+            missing_boundary_indices=missing_required,
+            rejection_reasons=required_rejection_reasons,
+            rejection_context=required_rejection_context,
+        )
+
     return EditorialMotionPlan(
         segments=tuple(
             EditorialMotionSegment(
@@ -2530,10 +3901,22 @@ def build_direct_member_editorial_motion_plan(
             for index in range(len(renders))
         ),
         boundary_match_count=len(accepted),
-        zoom_event_count=len(accepted) + len(interior_pulse_segments),
+        zoom_event_count=sum(
+            2 if item.side == "both" else 1 for item in accepted
+        )
+        + len(interior_pulse_segments),
         pan_event_count=sum(
-            abs(item.state.center_x - 0.5) > 1e-6
-            or abs(item.state.center_y - 0.5) > 1e-6
+            int(
+                abs(item.state.center_x - 0.5) > 1e-6
+                or abs(item.state.center_y - 0.5) > 1e-6
+            )
+            + int(
+                item.paired_state is not None
+                and (
+                    abs(item.paired_state.center_x - 0.5) > 1e-6
+                    or abs(item.paired_state.center_y - 0.5) > 1e-6
+                )
+            )
             for item in accepted
         ),
         roll_event_count=0,
@@ -2543,11 +3926,18 @@ def build_direct_member_editorial_motion_plan(
         analysis_basis=(
             "official_target_fancam_face_or_verified_full_subject_dense_"
             "output_frame_boundary_anchored_subject_relative_face_track_"
-            "adaptive_review_v8"
+            "adaptive_review_v9"
         ),
         accepted_boundary_indices=accepted_boundary_indices,
         natural_match_boundary_indices=tuple(
             sorted(naturally_satisfied_required_boundary_indices)
+        ),
+        boundary_residual_attention_mismatches=tuple(
+            (
+                boundary_index,
+                *final_boundary_residuals[boundary_index],
+            )
+            for boundary_index in sorted(final_boundary_residuals)
         ),
     )
 

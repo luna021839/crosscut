@@ -47,6 +47,10 @@ DescriptorProvider = Callable[
 ]
 
 
+_DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS = 0.30
+_DENSE_RENDER_INFEASIBLE_EDGE_FLAG = "dense_render_camera_infeasible"
+
+
 _DIRECT_CONTENT_SAMPLE_COUNT = 6
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS = frozenset(
     {
@@ -60,7 +64,12 @@ _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS = frozenset(
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.65
-_DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT = 4
+_DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.24
+_DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.50
+_DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.56
+_DIRECT_MEMBER_PORTRAIT_BRIDGE_MINIMUM_BUDGET = 4
+_DIRECT_MEMBER_PORTRAIT_BRIDGE_SECONDS_PER_BUDGET = 10.0
+_DIRECT_MEMBER_LANDSCAPE_BRIDGE_BUDGET_PER_SOURCE = 2
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS = 3.0
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_COST_PENALTY = 8.0
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_NONPRIORITY_COST_PENALTY = 4.0
@@ -68,6 +77,10 @@ _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
 _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.48
 _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.52
 _DIRECT_MEMBER_HETEROGENEOUS_MAXIMUM_RUN_SECONDS = 7.75
+DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_SILHOUETTE_P95 = 0.35
+DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_MOTION_SPEED_P95 = 0.55
+DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE = 0.005
+DIRECT_MEMBER_PROFESSIONAL_DENSE_ATTENTION_REVIEW_PENALTY = 12.0
 _DIRECT_MEMBER_ROLE_LANDSCAPE_HIGHLIGHT_ONLY = True
 _DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MINIMUM_FRACTION = 0.45
 _DIRECT_MEMBER_ROLE_PORTRAIT_COUNT_MAXIMUM_FACTOR = 1.50
@@ -81,6 +94,59 @@ _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES = frozenset(
         "heterogeneous_role_aware_cinematic_v1",
     }
 )
+
+
+def _cinematic_bridge_count_budgets(
+    *,
+    boundary_count: int,
+    total_duration_seconds: float,
+    landscape_source_count: int,
+) -> tuple[int, int, int]:
+    """Return portrait, landscape, and combined effect-bridge ceilings.
+
+    Portrait-to-portrait bridges repair otherwise unusable pose-matched cuts;
+    they are not the same scarce resource as entering or leaving a landscape
+    close-up insert.  A fixed whole-song ceiling of four let the landscape
+    sources consume most of the effect budget and forced long portrait holds.
+    Keep both roles bounded independently while scaling the portrait allowance
+    with program duration.  The shared three-second spacing rule, bridge
+    evidence thresholds, transition planner, and decoded-pixel QA remain hard
+    requirements downstream.
+    """
+
+    if boundary_count < 0:
+        raise ValueError("boundary_count must be non-negative")
+    if (
+        not math.isfinite(total_duration_seconds)
+        or total_duration_seconds < 0.0
+    ):
+        raise ValueError("total_duration_seconds must be finite and non-negative")
+    if landscape_source_count < 0:
+        raise ValueError("landscape_source_count must be non-negative")
+    if boundary_count == 0:
+        return 0, 0, 0
+    portrait_budget = min(
+        boundary_count,
+        max(
+            _DIRECT_MEMBER_PORTRAIT_BRIDGE_MINIMUM_BUDGET,
+            int(
+                math.floor(
+                    total_duration_seconds
+                    / _DIRECT_MEMBER_PORTRAIT_BRIDGE_SECONDS_PER_BUDGET
+                )
+            ),
+        ),
+    )
+    landscape_budget = min(
+        boundary_count,
+        landscape_source_count
+        * _DIRECT_MEMBER_LANDSCAPE_BRIDGE_BUDGET_PER_SOURCE,
+    )
+    return (
+        portrait_budget,
+        landscape_budget,
+        min(boundary_count, portrait_budget + landscape_budget),
+    )
 
 
 class DirectMemberVisualSelectionError(RuntimeError):
@@ -176,7 +242,7 @@ class DirectMemberVisualConfig:
     static_structure_mismatch_maximum: float = 0.018
     static_color_mismatch_maximum: float = 0.018
     transform_repair_maximum_zoom: float = 1.50
-    transform_repair_maximum_center_shift: float = 0.120
+    transform_repair_maximum_center_shift: float = 0.160
     transform_repair_maximum_boundary_center_distance: float = 0.30
     transform_repair_maximum_residual_center_distance: float = 0.080
     transform_repair_minimum_improvement_fraction: float = 0.20
@@ -192,8 +258,13 @@ class DirectMemberVisualConfig:
     maximum_adaptive_beam_width: int = 192_000
     maximum_generated_beam_state_count: int = 500_000
     feasibility_lifeline_state_limit: int = 250_000
+    diagnose_cinematic_milp_infeasibility: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.diagnose_cinematic_milp_infeasibility, bool):
+            raise TypeError(
+                "diagnose_cinematic_milp_infeasibility must be boolean"
+            )
         finite = (
             self.sample_frame_step_seconds,
             self.early_interior_sample_seconds,
@@ -294,7 +365,7 @@ class DirectMemberVisualConfig:
             raise ValueError("maximum_same_source_run_seconds must be positive")
         if not 1.02 <= self.transform_repair_maximum_zoom <= 1.50:
             raise ValueError("direct member transform repair zoom is invalid")
-        if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.120:
+        if not 0.0 <= self.transform_repair_maximum_center_shift <= 0.160:
             raise ValueError("direct member transform repair pan is invalid")
         if not (
             0.0
@@ -1086,13 +1157,15 @@ class DirectSpanVisualDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class DirectMemberCinematicBridge:
-    """A required effect contract for a landscape-involved member boundary.
+    """A required effect contract for a pose-safe member boundary.
 
     This does not make the edge eligible for a hard cut.  It records that the
     target pose and silhouette are compatible while the remaining mismatch is
     confined to framing components that a short zoom/blur overlap is designed
-    to conceal.  The transition planner must independently bind the overlap to
-    exact source clocks and a content-valid outgoing handle.
+    to conceal. Landscape-involved edges may use zoom or horizontal blur;
+    portrait-to-portrait edges use only the stricter zoom contract. The
+    transition planner must independently bind the overlap to exact source
+    clocks and a content-valid outgoing handle.
     """
 
     style: str
@@ -1106,8 +1179,13 @@ class DirectMemberCinematicBridge:
     def __post_init__(self) -> None:
         if self.style not in {"zoom_in", "horizontal_blur"}:
             raise ValueError("direct member cinematic bridge style is invalid")
-        if not (self.outgoing_is_landscape or self.incoming_is_landscape):
-            raise ValueError("cinematic bridge requires a landscape source")
+        if (
+            self.style == "horizontal_blur"
+            and not self.outgoing_is_landscape
+        ):
+            raise ValueError(
+                "horizontal cinematic blur requires a landscape outgoing source"
+            )
         flags = frozenset(self.authorized_severe_flags)
         if not flags or not flags <= (
             _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
@@ -1123,10 +1201,13 @@ class DirectMemberCinematicBridge:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "contract": (
-                "official_member_landscape_portrait_pose_safe_effect_bridge_v1"
-            ),
+            "contract": "official_member_pose_safe_effect_bridge_v2",
             "style": self.style,
+            "geometry_scope": (
+                "landscape_involved"
+                if self.outgoing_is_landscape or self.incoming_is_landscape
+                else "portrait_to_portrait"
+            ),
             "outgoing_is_landscape": self.outgoing_is_landscape,
             "incoming_is_landscape": self.incoming_is_landscape,
             "authorized_severe_flags": list(self.authorized_severe_flags),
@@ -1154,6 +1235,8 @@ class DirectBoundaryMismatch:
     evidence_component_count: int
     warning_flags: tuple[str, ...]
     severe_flags: tuple[str, ...]
+    attention_geometry_basis: str | None = None
+    dense_attention_validation_required: bool = False
     motion_connection: DirectBoundaryMotionEvidence | None = None
     transform_repair: DirectMemberBoundaryTransformRepair | None = None
     member_context_softened_flags: tuple[str, ...] = ()
@@ -1184,6 +1267,10 @@ class DirectBoundaryMismatch:
             "evidence_component_count": self.evidence_component_count,
             "warning_flags": list(self.warning_flags),
             "severe_flags": list(self.severe_flags),
+            "attention_geometry_basis": self.attention_geometry_basis,
+            "dense_attention_validation_required": (
+                self.dense_attention_validation_required
+            ),
             "motion_connection": (
                 self.motion_connection.to_dict()
                 if self.motion_connection is not None
@@ -1274,7 +1361,14 @@ def _cinematic_bridge_from_verified_evidence(
         incoming_source_geometry.source_width
         > incoming_source_geometry.source_height
     )
-    if not (outgoing_is_landscape or incoming_is_landscape):
+    if not (outgoing_is_landscape or incoming_is_landscape) and (
+        pose_mismatch
+        > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
+        or silhouette_mismatch
+        > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+        or base_mismatch
+        > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+    ):
         return None
     return DirectMemberCinematicBridge(
         style=("horizontal_blur" if outgoing_is_landscape else "zoom_in"),
@@ -1310,6 +1404,49 @@ def _exceptional_nonpriority_cinematic_bridge(
         + 1e-9
         and bridge.base_mismatch
         <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
+    )
+
+
+def _professional_hard_cut_attention_is_repairable(
+    mismatch: DirectBoundaryMismatch,
+    config: DirectMemberVisualConfig,
+) -> bool:
+    """Reject hard-cut geometry that neither matches nor has a dense repair."""
+
+    if mismatch.transform_repair is not None:
+        return True
+    position = mismatch.attention_position_mismatch
+    scale = mismatch.attention_scale_mismatch
+    basis = mismatch.attention_geometry_basis
+    if position is None and scale is None and basis is None:
+        # Private solver unit fixtures and legacy all-scalar callers can carry
+        # an explicitly safe zero-evidence edge. Production descriptor paths
+        # populate at least one attention scalar or a severe missing-evidence
+        # flag, so this compatibility case cannot authorize an ambiguous real
+        # cut.
+        return not mismatch.severe_flags
+    if position is None or scale is None or basis is None:
+        return False
+    face_pair = basis == "unambiguous_dominant_face_bbox_geometry_only"
+    position_limit = (
+        config.transform_alignment_position_trigger
+        if face_pair
+        else config.transform_body_alignment_position_trigger
+    )
+    scale_limit = (
+        config.transform_alignment_scale_trigger
+        if face_pair
+        else config.transform_body_alignment_scale_trigger
+    )
+    return bool(
+        position
+        <= position_limit
+        + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+        + 1e-9
+        and scale
+        <= scale_limit
+        + DIRECT_MEMBER_PROFESSIONAL_ATTENTION_TRIGGER_TOLERANCE
+        + 1e-9
     )
 
 
@@ -1500,6 +1637,7 @@ def _joint_boundary_search_assignment(
     source_duration_targets: Sequence[float],
     source_duration_minimums: Sequence[float],
     source_duration_maximums: Sequence[float],
+    maximum_same_source_run_seconds: float,
     usage_policy: str,
     priority_boundary_indices: frozenset[int],
     config: DirectMemberVisualConfig,
@@ -1526,6 +1664,11 @@ def _joint_boundary_search_assignment(
         == source_count
     ):
         raise ValueError("boundary search duration bounds must match sources")
+    if (
+        not math.isfinite(maximum_same_source_run_seconds)
+        or maximum_same_source_run_seconds <= 0.0
+    ):
+        raise ValueError("boundary search run limit must be finite and positive")
 
     choices: list[
         tuple[tuple[_DirectBoundarySearchCandidate, DirectBoundaryMismatch], ...]
@@ -1575,37 +1718,6 @@ def _joint_boundary_search_assignment(
                 },
             )
         choices.append(scored)
-
-    if all(len(values) == 1 for values in choices):
-        selected = tuple(values[0] for values in choices)
-        offsets = tuple(item[0].offset_frames for item in selected)
-        return (
-            tuple(item[0] for item in selected),
-            tuple(item[1] for item in selected),
-            {
-                "contract": "near_beat_frame_offset_pose_motion_semimarkov_v1",
-                "enabled": config.boundary_search_radius_frames > 0,
-                "strategy": "single_admissible_state_per_boundary",
-                "candidate_state_count": sum(len(values) for values in choices),
-                "candidate_count_by_boundary": [
-                    len(values) for values in choices
-                ],
-                "selected_offset_frames": list(offsets),
-                "selected_nonzero_offset_count": sum(
-                    value != 0 for value in offsets
-                ),
-                "selected_absolute_offset_frames": sum(
-                    abs(value) for value in offsets
-                ),
-                "maximum_absolute_offset_frames": max(
-                    (abs(value) for value in offsets),
-                    default=0,
-                ),
-                "solver_invoked": False,
-                "duration_constraints_jointly_enforced": True,
-                "visual_gates_relaxed": False,
-            },
-        )
 
     flat: list[
         tuple[
@@ -1660,7 +1772,7 @@ def _joint_boundary_search_assignment(
             )
             for target_source in range(source_count)
         )
-        return all(
+        if not all(
             minimum - 1e-9 <= value <= maximum + 1e-9
             for value, minimum, maximum in zip(
                 actual,
@@ -1668,203 +1780,270 @@ def _joint_boundary_search_assignment(
                 source_duration_maximums,
                 strict=True,
             )
-        )
+        ):
+            return False
+        run_seconds = durations[0]
+        for position, source_index in enumerate(path[1:], start=1):
+            if source_index == path[position - 1]:
+                run_seconds += durations[position]
+            else:
+                run_seconds = durations[position]
+            if run_seconds > maximum_same_source_run_seconds + 1e-9:
+                return False
+        return True
 
-    greedy = tuple(
-        min(
-            values,
-            key=lambda item: (
-                item[1].cost,
-                abs(item[0].offset_frames),
-                item[0].offset_frames,
-            ),
-        )
-        for values in choices
-    )
-    if _assignment_is_valid(greedy):
-        selected = greedy
-        strategy = "independent_minimum_states_joint_constraints_already_met"
-        solver: dict[str, Any] = {"invoked": False, "success": True}
+    if all(len(values) == 1 for values in choices):
+        selected = tuple(values[0] for values in choices)
+        if not _assignment_is_valid(selected):
+            raise DirectMemberVisualSelectionError(
+                "single boundary state violates joint duration or run limits",
+                {
+                    "failure": "boundary_local_search_single_state_infeasible",
+                    "visual_gates_relaxed": False,
+                    "constraint_infeasibility_proven": True,
+                },
+            )
+        strategy = "single_admissible_state_per_boundary"
+        solver = {"invoked": False, "success": True, "backend": None}
     else:
-        try:
-            import numpy as np
-            from scipy.optimize import Bounds, LinearConstraint, milp
-            from scipy.sparse import coo_array
-        except (ImportError, OSError):
-            zero = tuple(
-                next(
-                    (
-                        item
-                        for item in values
-                        if item[0].offset_frames == 0
-                    ),
-                    values[0],
-                )
-                for values in choices
+        greedy = tuple(
+            min(
+                values,
+                key=lambda item: (
+                    item[1].cost,
+                    abs(item[0].offset_frames),
+                    item[0].offset_frames,
+                ),
             )
-            if not _assignment_is_valid(zero):
-                raise DirectMemberVisualSelectionError(
-                    "boundary local search duration assignment is unavailable",
-                    {
-                        "failure": "boundary_local_search_solver_unavailable",
-                        "visual_gates_relaxed": False,
-                        "constraint_infeasibility_proven": False,
-                    },
-                )
-            selected = zero
-            strategy = "zero_offset_duration_safe_fallback_without_scipy"
-            solver = {"invoked": False, "success": True, "backend": None}
+            for values in choices
+        )
+        if _assignment_is_valid(greedy):
+            selected = greedy
+            strategy = "independent_minimum_states_joint_constraints_already_met"
+            solver = {"invoked": False, "success": True}
         else:
-            variable_count = len(flat)
-            objective = np.asarray(
-                [
-                    mismatch.cost
-                    + abs(candidate.offset_frames) * 1e-9
-                    + index * 1e-12
-                    for index, (
-                        _boundary,
-                        _choice,
+            try:
+                import numpy as np
+                from scipy.optimize import Bounds, LinearConstraint, milp
+                from scipy.sparse import coo_array
+            except (ImportError, OSError):
+                zero = tuple(
+                    next(
+                        (
+                            item
+                            for item in values
+                            if item[0].offset_frames == 0
+                        ),
+                        values[0],
+                    )
+                    for values in choices
+                )
+                if not _assignment_is_valid(zero):
+                    raise DirectMemberVisualSelectionError(
+                        "boundary local search duration assignment is unavailable",
+                        {
+                            "failure": "boundary_local_search_solver_unavailable",
+                            "visual_gates_relaxed": False,
+                            "constraint_infeasibility_proven": False,
+                        },
+                    )
+                selected = zero
+                strategy = "zero_offset_duration_safe_fallback_without_scipy"
+                solver = {"invoked": False, "success": True, "backend": None}
+            else:
+                variable_count = len(flat)
+                objective = np.asarray(
+                    [
+                        mismatch.cost
+                        + abs(candidate.offset_frames) * 1e-9
+                        + index * 1e-12
+                        for index, (
+                            _boundary,
+                            _choice,
+                            candidate,
+                            mismatch,
+                        ) in enumerate(flat)
+                    ],
+                    dtype=np.float64,
+                )
+                rows: list[int] = []
+                columns: list[int] = []
+                coefficients: list[float] = []
+                lower: list[float] = []
+                upper: list[float] = []
+
+                def add_constraint(
+                    terms: Sequence[tuple[int, float]],
+                    minimum: float,
+                    maximum: float,
+                ) -> None:
+                    row = len(lower)
+                    for variable, coefficient in terms:
+                        rows.append(row)
+                        columns.append(variable)
+                        coefficients.append(float(coefficient))
+                    lower.append(float(minimum))
+                    upper.append(float(maximum))
+
+                for indices in variables_by_boundary:
+                    add_constraint(
+                        tuple((index, 1.0) for index in indices),
+                        1.0,
+                        1.0,
+                    )
+                for source_index in range(source_count):
+                    terms = []
+                    for variable, (
+                        boundary_index,
+                        _choice_index,
                         candidate,
-                        mismatch,
-                    ) in enumerate(flat)
-                ],
-                dtype=np.float64,
-            )
-            rows: list[int] = []
-            columns: list[int] = []
-            coefficients: list[float] = []
-            lower: list[float] = []
-            upper: list[float] = []
-
-            def add_constraint(
-                terms: Sequence[tuple[int, float]],
-                minimum: float,
-                maximum: float,
-            ) -> None:
-                row = len(lower)
-                for variable, coefficient in terms:
-                    rows.append(row)
-                    columns.append(variable)
-                    coefficients.append(float(coefficient))
-                lower.append(float(minimum))
-                upper.append(float(maximum))
-
-            for indices in variables_by_boundary:
-                add_constraint(
-                    tuple((index, 1.0) for index in indices),
-                    1.0,
-                    1.0,
-                )
-            for source_index in range(source_count):
-                terms = []
-                for variable, (
-                    boundary_index,
-                    _choice_index,
-                    candidate,
-                    _mismatch,
-                ) in enumerate(flat):
-                    left = path[boundary_index]
-                    right = path[boundary_index + 1]
-                    delta = (
-                        candidate.offset_frames
-                        * config.sample_frame_step_seconds
+                        _mismatch,
+                    ) in enumerate(flat):
+                        left = path[boundary_index]
+                        right = path[boundary_index + 1]
+                        delta = (
+                            candidate.offset_frames
+                            * config.sample_frame_step_seconds
+                        )
+                        coefficient = delta * (
+                            int(left == source_index) - int(right == source_index)
+                        )
+                        if abs(coefficient) > 1e-12:
+                            terms.append((variable, coefficient))
+                    add_constraint(
+                        tuple(terms),
+                        source_duration_minimums[source_index]
+                        - base_source_durations[source_index],
+                        source_duration_maximums[source_index]
+                        - base_source_durations[source_index],
                     )
-                    coefficient = delta * (
-                        int(left == source_index) - int(right == source_index)
+                minimum_span = 4.0 * config.sample_frame_step_seconds
+                for span_index, base_duration in enumerate(base_durations):
+                    terms = []
+                    for variable, (
+                        boundary_index,
+                        _choice_index,
+                        candidate,
+                        _mismatch,
+                    ) in enumerate(flat):
+                        coefficient = 0.0
+                        delta = (
+                            candidate.offset_frames
+                            * config.sample_frame_step_seconds
+                        )
+                        if boundary_index == span_index:
+                            coefficient += delta
+                        if boundary_index + 1 == span_index:
+                            coefficient -= delta
+                        if abs(coefficient) > 1e-12:
+                            terms.append((variable, coefficient))
+                    add_constraint(
+                        tuple(terms),
+                        minimum_span - base_duration,
+                        math.inf,
                     )
-                    if abs(coefficient) > 1e-12:
-                        terms.append((variable, coefficient))
-                add_constraint(
-                    tuple(terms),
-                    source_duration_minimums[source_index]
-                    - base_source_durations[source_index],
-                    source_duration_maximums[source_index]
-                    - base_source_durations[source_index],
-                )
-            minimum_span = 4.0 * config.sample_frame_step_seconds
-            for span_index, base_duration in enumerate(base_durations):
-                terms = []
-                for variable, (
-                    boundary_index,
-                    _choice_index,
-                    candidate,
-                    _mismatch,
-                ) in enumerate(flat):
-                    coefficient = 0.0
-                    delta = (
-                        candidate.offset_frames
-                        * config.sample_frame_step_seconds
+                run_start = 0
+                for run_end in range(1, len(path) + 1):
+                    if (
+                        run_end < len(path)
+                        and path[run_end] == path[run_start]
+                    ):
+                        continue
+                    base_run_seconds = sum(
+                        base_durations[run_start:run_end]
                     )
-                    if boundary_index == span_index:
-                        coefficient += delta
-                    if boundary_index + 1 == span_index:
-                        coefficient -= delta
-                    if abs(coefficient) > 1e-12:
-                        terms.append((variable, coefficient))
-                add_constraint(
-                    tuple(terms),
-                    minimum_span - base_duration,
-                    math.inf,
-                )
-            matrix = coo_array(
-                (
-                    np.asarray(coefficients, dtype=np.float64),
+                    terms = []
+                    for variable, (
+                        boundary_index,
+                        _choice_index,
+                        candidate,
+                        _mismatch,
+                    ) in enumerate(flat):
+                        coefficient = 0.0
+                        delta = (
+                            candidate.offset_frames
+                            * config.sample_frame_step_seconds
+                        )
+                        if (
+                            run_start > 0
+                            and boundary_index == run_start - 1
+                        ):
+                            coefficient -= delta
+                        if (
+                            run_end < len(path)
+                            and boundary_index == run_end - 1
+                        ):
+                            coefficient += delta
+                        if abs(coefficient) > 1e-12:
+                            terms.append((variable, coefficient))
+                    add_constraint(
+                        tuple(terms),
+                        -math.inf,
+                        maximum_same_source_run_seconds - base_run_seconds,
+                    )
+                    run_start = run_end
+                matrix = coo_array(
                     (
-                        np.asarray(rows, dtype=np.int32),
-                        np.asarray(columns, dtype=np.int32),
+                        np.asarray(coefficients, dtype=np.float64),
+                        (
+                            np.asarray(rows, dtype=np.int32),
+                            np.asarray(columns, dtype=np.int32),
+                        ),
                     ),
-                ),
-                shape=(len(lower), variable_count),
-            ).tocsr()
-            result = milp(
-                objective,
-                integrality=np.ones(variable_count, dtype=np.int32),
-                bounds=Bounds(
-                    np.zeros(variable_count, dtype=np.float64),
-                    np.ones(variable_count, dtype=np.float64),
-                ),
-                constraints=LinearConstraint(
-                    matrix,
-                    np.asarray(lower, dtype=np.float64),
-                    np.asarray(upper, dtype=np.float64),
-                ),
-                options={"disp": False, "presolve": True, "mip_rel_gap": 0.0},
-            )
-            solver = {
-                "invoked": True,
-                "backend": "scipy_optimize_milp_highs",
-                "status": int(result.status),
-                "message": str(result.message),
-                "success": bool(result.success),
-                "variable_count": variable_count,
-                "constraint_count": len(lower),
-            }
-            if not result.success or result.x is None:
-                raise DirectMemberVisualSelectionError(
-                    "boundary local search cannot satisfy duration constraints",
-                    {
-                        "failure": "boundary_local_search_duration_infeasible",
-                        "solver": solver,
-                        "visual_gates_relaxed": False,
-                        "constraint_infeasibility_proven": int(result.status) == 2,
-                    },
+                    shape=(len(lower), variable_count),
+                ).tocsr()
+                result = milp(
+                    objective,
+                    integrality=np.ones(variable_count, dtype=np.int32),
+                    bounds=Bounds(
+                        np.zeros(variable_count, dtype=np.float64),
+                        np.ones(variable_count, dtype=np.float64),
+                    ),
+                    constraints=LinearConstraint(
+                        matrix,
+                        np.asarray(lower, dtype=np.float64),
+                        np.asarray(upper, dtype=np.float64),
+                    ),
+                    options={"disp": False, "presolve": True, "mip_rel_gap": 0.0},
                 )
-            selected_values: list[
-                tuple[_DirectBoundarySearchCandidate, DirectBoundaryMismatch]
-            ] = []
-            for indices, values in zip(
-                variables_by_boundary,
-                choices,
-                strict=True,
-            ):
-                selected_index = max(indices, key=lambda index: result.x[index])
-                selected_values.append(values[flat[selected_index][1]])
-            selected = tuple(selected_values)
-            if not _assignment_is_valid(selected):
-                raise RuntimeError(
-                    "boundary local search solver result failed independent audit"
-                )
-            strategy = "scipy_highs_binary_boundary_state_semimarkov_v1"
+                solver = {
+                    "invoked": True,
+                    "backend": "scipy_optimize_milp_highs",
+                    "status": int(result.status),
+                    "message": str(result.message),
+                    "success": bool(result.success),
+                    "variable_count": variable_count,
+                    "constraint_count": len(lower),
+                }
+                if not result.success or result.x is None:
+                    raise DirectMemberVisualSelectionError(
+                        "boundary local search cannot satisfy joint constraints",
+                        {
+                            "failure": "boundary_local_search_duration_infeasible",
+                            "solver": solver,
+                            "visual_gates_relaxed": False,
+                            "constraint_infeasibility_proven": int(result.status) == 2,
+                        },
+                    )
+                selected_values: list[
+                    tuple[_DirectBoundarySearchCandidate, DirectBoundaryMismatch]
+                ] = []
+                for indices, values in zip(
+                    variables_by_boundary,
+                    choices,
+                    strict=True,
+                ):
+                    selected_index = max(
+                        indices,
+                        key=lambda index: result.x[index],
+                    )
+                    selected_values.append(values[flat[selected_index][1]])
+                selected = tuple(selected_values)
+                if not _assignment_is_valid(selected):
+                    raise RuntimeError(
+                        "boundary local search solver result failed independent audit"
+                    )
+                strategy = "scipy_highs_binary_boundary_state_semimarkov_v1"
 
     selected_candidates = tuple(item[0] for item in selected)
     selected_mismatches = tuple(item[1] for item in selected)
@@ -1886,6 +2065,10 @@ def _joint_boundary_search_assignment(
                 default=0,
             ),
             "duration_constraints_jointly_enforced": True,
+            "same_source_run_constraints_jointly_enforced": True,
+            "maximum_same_source_run_seconds": (
+                maximum_same_source_run_seconds
+            ),
             "source_duration_targets_seconds": list(source_duration_targets),
             "source_duration_minimums_seconds": list(source_duration_minimums),
             "source_duration_maximums_seconds": list(source_duration_maximums),
@@ -2102,8 +2285,39 @@ class DirectMemberVisualSelection:
             raise ValueError(
                 "cinematic bridge requires heterogeneous usage authority"
             )
-        if len(cinematic_bridges) > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT:
+        (
+            maximum_portrait_bridges,
+            maximum_landscape_bridges,
+            maximum_total_bridges,
+        ) = _cinematic_bridge_count_budgets(
+            boundary_count=len(self.boundaries),
+            total_duration_seconds=sum(self.source_durations_seconds),
+            landscape_source_count=sum(
+                geometry is not None
+                and geometry.source_width > geometry.source_height
+                for geometry in self.source_frame_geometries
+            ),
+        )
+        selected_portrait_bridges = sum(
+            bridge is not None
+            and not bridge.outgoing_is_landscape
+            and not bridge.incoming_is_landscape
+            for boundary in cinematic_bridges
+            if (bridge := boundary.mismatch.cinematic_bridge) is not None
+        )
+        selected_landscape_bridges = len(cinematic_bridges) - (
+            selected_portrait_bridges
+        )
+        if len(cinematic_bridges) > maximum_total_bridges:
             raise ValueError("direct member cinematic bridge budget exceeded")
+        if selected_portrait_bridges > maximum_portrait_bridges:
+            raise ValueError(
+                "direct member portrait cinematic bridge budget exceeded"
+            )
+        if selected_landscape_bridges > maximum_landscape_bridges:
+            raise ValueError(
+                "direct member landscape cinematic bridge budget exceeded"
+            )
         if self.source_frame_geometries and (
             len(self.source_frame_geometries) != len(self.source_counts)
         ):
@@ -2136,6 +2350,19 @@ class DirectMemberVisualSelection:
             bridge
             for boundary in self.boundaries
             if (bridge := boundary.mismatch.cinematic_bridge) is not None
+        )
+        (
+            maximum_portrait_bridges,
+            maximum_landscape_bridges,
+            maximum_total_bridges,
+        ) = _cinematic_bridge_count_budgets(
+            boundary_count=len(self.boundaries),
+            total_duration_seconds=sum(self.source_durations_seconds),
+            landscape_source_count=sum(
+                geometry is not None
+                and geometry.source_width > geometry.source_height
+                for geometry in self.source_frame_geometries
+            ),
         )
         softened_context: Counter[str] = Counter(
             flag
@@ -2224,8 +2451,12 @@ class DirectMemberVisualSelection:
                 "styles": dict(
                     sorted(Counter(item.style for item in cinematic_bridges).items())
                 ),
-                "maximum_authorized_count": (
-                    _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
+                "maximum_authorized_count": maximum_total_bridges,
+                "maximum_portrait_authorized_count": (
+                    maximum_portrait_bridges
+                ),
+                "maximum_landscape_authorized_count": (
+                    maximum_landscape_bridges
                 ),
                 "hard_cut_authorized": False,
                 "required_transition_effect": True,
@@ -2662,19 +2893,32 @@ class _VideoDescriptorProvider:
                 sampler.close()
 
 
-def _attention_geometry(
+_ATTENTION_FACE_BASIS = "unambiguous_dominant_face_bbox_geometry_only"
+_ATTENTION_SILHOUETTE_BASIS = "aggregate_human_silhouette"
+_ATTENTION_PERSON_BASIS = "unambiguous_dominant_person_box_geometry_only"
+
+
+def _attention_geometry_for_basis(
     descriptor: FrameVisualDescriptor | None,
+    basis: str,
+    *,
+    minimum_silhouette_confidence: float = 0.0,
 ) -> _AttentionGeometry | None:
     if descriptor is None:
         return None
-    if descriptor.primary_face_bbox is not None:
+    if basis == _ATTENTION_FACE_BASIS and descriptor.primary_face_bbox is not None:
         bbox = descriptor.primary_face_bbox
         return _AttentionGeometry(
             bbox_xywh=bbox,
             centroid_xy=(bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0),
-            basis="unambiguous_dominant_face_bbox_geometry_only",
+            basis=basis,
         )
-    if descriptor.silhouette_bbox_xywh is not None:
+    if (
+        basis == _ATTENTION_SILHOUETTE_BASIS
+        and descriptor.silhouette_bbox_xywh is not None
+        and descriptor.silhouette_confidence + 1e-9
+        >= minimum_silhouette_confidence
+    ):
         bbox = descriptor.silhouette_bbox_xywh
         centroid = descriptor.silhouette_centroid_xy or (
             bbox[0] + bbox[2] / 2.0,
@@ -2683,8 +2927,10 @@ def _attention_geometry(
         return _AttentionGeometry(
             bbox_xywh=bbox,
             centroid_xy=centroid,
-            basis="aggregate_human_silhouette",
+            basis=basis,
         )
+    if basis != _ATTENTION_PERSON_BASIS:
+        return None
     people = tuple(descriptor.formation_people)
     if not people:
         return None
@@ -2702,8 +2948,58 @@ def _attention_geometry(
     return _AttentionGeometry(
         bbox_xywh=largest.bbox_xywh,
         centroid_xy=largest.centroid_xy,
-        basis="unambiguous_dominant_person_box_geometry_only",
+        basis=basis,
     )
+
+
+def _attention_geometry(
+    descriptor: FrameVisualDescriptor | None,
+) -> _AttentionGeometry | None:
+    for basis in (
+        _ATTENTION_FACE_BASIS,
+        _ATTENTION_SILHOUETTE_BASIS,
+        _ATTENTION_PERSON_BASIS,
+    ):
+        attention = _attention_geometry_for_basis(descriptor, basis)
+        if attention is not None:
+            return attention
+    return None
+
+
+def _common_attention_geometries(
+    descriptors: Sequence[FrameVisualDescriptor | None],
+    *,
+    minimum_silhouette_confidence: float = 0.0,
+) -> tuple[_AttentionGeometry, ...] | None:
+    """Resolve one verified geometry basis for every frame in a comparison.
+
+    A face box and a full-body silhouette are not interchangeable coordinate
+    systems.  Comparing whichever detector happened to win independently on
+    each side turns detector availability changes into false camera jumps.
+    Resolve a single basis for the whole temporal window, preferring faces,
+    then verified silhouettes, then an unambiguous dominant person box.
+    """
+
+    if not descriptors:
+        return None
+    for basis in (
+        _ATTENTION_FACE_BASIS,
+        _ATTENTION_SILHOUETTE_BASIS,
+        _ATTENTION_PERSON_BASIS,
+    ):
+        geometries = tuple(
+            _attention_geometry_for_basis(
+                descriptor,
+                basis,
+                minimum_silhouette_confidence=minimum_silhouette_confidence,
+            )
+            for descriptor in descriptors
+        )
+        if all(geometry is not None for geometry in geometries):
+            return tuple(
+                geometry for geometry in geometries if geometry is not None
+            )
+    return None
 
 
 def _embedding_distance(
@@ -2717,6 +3013,116 @@ def _embedding_distance(
         for left_value, right_value in zip(left, right, strict=True)
     )
     return min(1.0, math.sqrt(squared / len(left)))
+
+
+def _canonical_silhouette_shape_embedding(
+    embedding: Sequence[float],
+    bbox_xywh: Sequence[float] | None,
+    area_ratio: float,
+) -> tuple[float, ...]:
+    """Return a stable translation/scale-free silhouette mass profile.
+
+    The persisted 12x8 mask is intentionally coarse.  Comparing its pixels
+    after bbox resampling magnifies one-cell segmentation jitter enough that
+    adjacent frames from the *same* fancam can look like a severe body-shape
+    cut.  A 3x3 low-pass followed by row/column mass profiles preserves the
+    vertical and horizontal outline distribution while discarding that grid
+    phase noise.  Normalized aspect and occupancy retain broad body-shape
+    evidence without reintroducing screen position or subject scale.
+    """
+
+    values = tuple(float(value) for value in embedding)
+    if len(values) != 121 or bbox_xywh is None:
+        return values
+    left, top, width, height = (float(value) for value in bbox_xywh)
+    if (
+        not all(math.isfinite(value) for value in (left, top, width, height))
+        or width <= 1e-9
+        or height <= 1e-9
+    ):
+        return values
+    coarse = values[:96]
+
+    def sample(x: float, y: float) -> float:
+        grid_x = min(11.0, max(0.0, x * 12.0 - 0.5))
+        grid_y = min(7.0, max(0.0, y * 8.0 - 0.5))
+        x0 = int(math.floor(grid_x))
+        y0 = int(math.floor(grid_y))
+        x1 = min(11, x0 + 1)
+        y1 = min(7, y0 + 1)
+        fraction_x = grid_x - x0
+        fraction_y = grid_y - y0
+        top_value = coarse[y0 * 12 + x0] * (1.0 - fraction_x) + coarse[
+            y0 * 12 + x1
+        ] * fraction_x
+        bottom_value = coarse[y1 * 12 + x0] * (1.0 - fraction_x) + coarse[
+            y1 * 12 + x1
+        ] * fraction_x
+        return top_value * (1.0 - fraction_y) + bottom_value * fraction_y
+
+    canonical = tuple(
+        sample(
+            left + (column + 0.5) * width / 12.0,
+            top + (row + 0.5) * height / 8.0,
+        )
+        for row in range(8)
+        for column in range(12)
+    )
+    peak = max(canonical, default=0.0)
+    if peak <= 1e-9:
+        return values
+    normalized = tuple(min(1.0, max(0.0, value / peak)) for value in canonical)
+    grid = tuple(
+        tuple(normalized[row * 12 + column] for column in range(12))
+        for row in range(8)
+    )
+    kernel = (1.0, 2.0, 1.0)
+    blurred = tuple(
+        tuple(
+            sum(
+                kernel[row_offset + 1]
+                * kernel[column_offset + 1]
+                * grid[
+                    min(7, max(0, row + row_offset))
+                ][min(11, max(0, column + column_offset))]
+                for row_offset in (-1, 0, 1)
+                for column_offset in (-1, 0, 1)
+            )
+            / 16.0
+            for column in range(12)
+        )
+        for row in range(8)
+    )
+    row_mass_profile = tuple(sum(row) / 12.0 for row in blurred)
+    column_mass_profile = tuple(
+        sum(blurred[row][column] for row in range(8)) / 8.0
+        for column in range(12)
+    )
+    box_area = max(1e-9, width * height)
+    occupancy = min(1.0, max(0.0, float(area_ratio) / box_area))
+    aspect = 0.5 + math.atan(math.log(max(1e-9, width / height))) / math.pi
+    shape_geometry = (min(1.0, max(0.0, aspect)), occupancy)
+    return row_mass_profile + column_mass_profile + shape_geometry
+
+
+def _silhouette_shape_mismatch(
+    left: FrameVisualDescriptor,
+    right: FrameVisualDescriptor,
+) -> float | None:
+    """Compare body outline independently of renderer-owned framing."""
+
+    return _embedding_distance(
+        _canonical_silhouette_shape_embedding(
+            left.silhouette_embedding,
+            left.silhouette_bbox_xywh,
+            left.silhouette_area_ratio,
+        ),
+        _canonical_silhouette_shape_embedding(
+            right.silhouette_embedding,
+            right.silhouette_bbox_xywh,
+            right.silhouette_area_ratio,
+        ),
+    )
 
 
 def _sample_has_human_evidence(
@@ -3773,10 +4179,7 @@ def _boundary_mismatch(
         right.formation_people,
     )
     silhouette = (
-        _embedding_distance(
-            left.silhouette_embedding,
-            right.silhouette_embedding,
-        )
+        _silhouette_shape_mismatch(left, right)
         if left.silhouette_confidence >= config.minimum_silhouette_confidence
         and right.silhouette_confidence >= config.minimum_silhouette_confidence
         else None
@@ -4213,7 +4616,7 @@ def _boundary_mismatch(
             + transform_repair.center_shift
             / max(1e-9, config.transform_repair_maximum_center_shift)
         )
-    return DirectBoundaryMismatch(
+    mismatch = DirectBoundaryMismatch(
         cost=cost,
         base_mismatch=base,
         attention_position_mismatch=attention_position,
@@ -4227,10 +4630,21 @@ def _boundary_mismatch(
         evidence_component_count=len(available),
         warning_flags=tuple(warning_flags),
         severe_flags=tuple(severe_flags),
+        attention_geometry_basis=alignment_geometry_basis,
         motion_connection=motion_connection,
         transform_repair=transform_repair,
         member_context_softened_flags=member_context_softened_flags,
         cinematic_bridge=cinematic_bridge,
+    )
+    return replace(
+        mismatch,
+        dense_attention_validation_required=bool(
+            cross_source_edge
+            and not _professional_hard_cut_attention_is_repairable(
+                mismatch,
+                config,
+            )
+        ),
     )
 
 
@@ -4532,6 +4946,7 @@ def _run_bounded_beam_attempt(
 _DIRECT_MEMBER_MILP_MINIMUM_SPAN_COUNT = 40
 _DIRECT_MEMBER_MILP_MINIMUM_SOURCE_COUNT = 6
 _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS = 45.0
+_DIRECT_MEMBER_MILP_INFEASIBILITY_PROBE_TIME_LIMIT_SECONDS = 4.0
 
 
 def _prefer_direct_member_milp(
@@ -7651,6 +8066,15 @@ def _heterogeneous_cinematic_visual_path(
     if sum(count_minimums) > span_count or sum(count_maximums) < span_count:
         return None
     total_duration = sum(durations)
+    (
+        maximum_portrait_bridge_count,
+        maximum_landscape_bridge_count,
+        maximum_cinematic_bridge_count,
+    ) = _cinematic_bridge_count_budgets(
+        boundary_count=boundary_count,
+        total_duration_seconds=total_duration,
+        landscape_source_count=len(geometric_landscape_sources),
+    )
     duration_targets = tuple(
         total_duration * target / span_count for target in count_targets
     )
@@ -7724,6 +8148,25 @@ def _heterogeneous_cinematic_visual_path(
             config.maximum_consecutive_same_source_holds
         ),
         "maximum_same_source_run_seconds": maximum_same_source_run_seconds,
+        "cinematic_bridge_budget": {
+            "contract": "role_separated_duration_scaled_bridge_budget_v1",
+            "maximum_portrait_bridge_count": (
+                maximum_portrait_bridge_count
+            ),
+            "maximum_landscape_bridge_count": (
+                maximum_landscape_bridge_count
+            ),
+            "maximum_total_bridge_count": maximum_cinematic_bridge_count,
+            "portrait_seconds_per_budget": (
+                _DIRECT_MEMBER_PORTRAIT_BRIDGE_SECONDS_PER_BUDGET
+            ),
+            "landscape_budget_per_source": (
+                _DIRECT_MEMBER_LANDSCAPE_BRIDGE_BUDGET_PER_SOURCE
+            ),
+            "minimum_bridge_separation_seconds": (
+                _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
+            ),
+        },
         "all_sources_minimum_usage_preserved": True,
         "severe_cross_source_edges_eligible": require_cinematic_bridge,
         "nonhighlight_landscape_requires_selected_incident_bridge": (
@@ -7772,6 +8215,7 @@ def _heterogeneous_cinematic_visual_path(
         return None
 
     edge_specs: list[tuple[int, int, int, bool, bool, float]] = []
+    professional_unrepairable_attention_edges: set[int] = set()
     edges_by_boundary: list[list[int]] = [[] for _ in range(boundary_count)]
     hold_edges_by_boundary: list[list[int]] = [
         [] for _ in range(boundary_count)
@@ -7779,6 +8223,9 @@ def _heterogeneous_cinematic_visual_path(
     bridge_edges_by_boundary: list[list[int]] = [
         [] for _ in range(boundary_count)
     ]
+    raw_bridge_candidate_count_by_boundary = [0] * boundary_count
+    raw_portrait_bridge_candidate_count_by_boundary = [0] * boundary_count
+    raw_landscape_bridge_candidate_count_by_boundary = [0] * boundary_count
     for boundary_index in range(boundary_count):
         bridge_candidates: list[tuple[float, int, int]] = []
         for left_source in range(source_count):
@@ -7804,14 +8251,33 @@ def _heterogeneous_cinematic_visual_path(
                     bridge_candidates.append(
                         (float(mismatch.cost), left_source, right_source)
                     )
+        raw_bridge_candidate_count_by_boundary[boundary_index] = len(
+            bridge_candidates
+        )
+        for _cost, left_source, right_source in bridge_candidates:
+            bridge = matrices[boundary_index][left_source][
+                right_source
+            ].cinematic_bridge
+            if bridge is None:
+                continue
+            if bridge.outgoing_is_landscape or bridge.incoming_is_landscape:
+                raw_landscape_bridge_candidate_count_by_boundary[
+                    boundary_index
+                ] += 1
+            else:
+                raw_portrait_bridge_candidate_count_by_boundary[
+                    boundary_index
+                ] += 1
         retained_bridges: set[tuple[int, int]] = set()
         grouped: dict[tuple[int, str], list[tuple[float, int, int]]] = {}
         for item in bridge_candidates:
             _cost, left_source, right_source = item
             if left_source in landscape_sources:
                 key = (left_source, "outgoing")
-            else:
+            elif right_source in landscape_sources:
                 key = (right_source, "incoming")
+            else:
+                key = (right_source, "portrait_incoming")
             grouped.setdefault(key, []).append(item)
         for values in grouped.values():
             for _cost, left_source, right_source in sorted(values)[:3]:
@@ -7836,6 +8302,14 @@ def _heterogeneous_cinematic_visual_path(
                 )
                 if not is_hold and mismatch.severe_flags and not is_bridge:
                     continue
+                attention_repairable = bool(
+                    is_hold
+                    or is_bridge
+                    or _professional_hard_cut_attention_is_repairable(
+                        mismatch,
+                        config,
+                    )
+                )
                 edge_index = len(edge_specs)
                 edge_specs.append(
                     (
@@ -7852,6 +8326,8 @@ def _heterogeneous_cinematic_visual_path(
                     hold_edges_by_boundary[boundary_index].append(edge_index)
                 if is_bridge:
                     bridge_edges_by_boundary[boundary_index].append(edge_index)
+                if not attention_repairable:
+                    professional_unrepairable_attention_edges.add(edge_index)
     empty_edge_boundaries = tuple(
         index for index, values in enumerate(edges_by_boundary) if not values
     )
@@ -7893,6 +8369,88 @@ def _heterogeneous_cinematic_visual_path(
                 },
             },
         )
+
+    professional_bad_silhouette_edges = tuple(
+        edge_index
+        for edge_index, (
+            boundary_index,
+            left_source,
+            right_source,
+            is_hold,
+            is_bridge,
+            _cost,
+        ) in enumerate(edge_specs)
+        if not is_hold
+        and not is_bridge
+        and matrices[boundary_index][left_source][right_source].silhouette_mismatch
+        is not None
+        and matrices[boundary_index][left_source][right_source].silhouette_mismatch
+        > DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_SILHOUETTE_P95 + 1e-9
+    )
+    professional_bad_motion_speed_edges = tuple(
+        edge_index
+        for edge_index, (
+            boundary_index,
+            left_source,
+            right_source,
+            is_hold,
+            is_bridge,
+            _cost,
+        ) in enumerate(edge_specs)
+        if not is_hold
+        and not is_bridge
+        and (
+            motion := matrices[boundary_index][left_source][
+                right_source
+            ].motion_connection
+        )
+        is not None
+        and motion.both_moving
+        and motion.motion_speed_ratio_mismatch is not None
+        and motion.motion_speed_ratio_mismatch
+        > DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_MOTION_SPEED_P95 + 1e-9
+    )
+    minimum_hard_cut_count = max(
+        1,
+        boundary_count
+        - maximum_hold_count
+        - (
+            maximum_cinematic_bridge_count
+            if require_cinematic_bridge
+            else 0
+        ),
+    )
+    maximum_professional_outlier_count = max(
+        0,
+        minimum_hard_cut_count
+        - math.ceil(0.95 * minimum_hard_cut_count),
+    )
+    role_constraint_diagnostics.update(
+        {
+            "professional_hard_cut_p95_constraints": {
+                "maximum_silhouette_mismatch": (
+                    DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_SILHOUETTE_P95
+                ),
+                "maximum_motion_speed_ratio_mismatch": (
+                    DIRECT_MEMBER_PROFESSIONAL_MAXIMUM_MOTION_SPEED_P95
+                ),
+                "maximum_outlier_count": maximum_professional_outlier_count,
+                "silhouette_selection_policy": (
+                    "lexicographic_minimum_then_professional_gate"
+                ),
+                "silhouette_hard_constraint_during_selection": False,
+                "silhouette_professional_gate_retained": True,
+                "attention_requires_match_or_dense_repair": True,
+                "dense_attention_review_candidate_edge_count": len(
+                    professional_unrepairable_attention_edges
+                ),
+                "dense_attention_review_penalty": (
+                    DIRECT_MEMBER_PROFESSIONAL_DENSE_ATTENTION_REVIEW_PENALTY
+                ),
+                "dense_attention_review_is_mandatory_before_render": True,
+            }
+        }
+    )
 
     edge_base = x_count
     ping_specs = tuple(
@@ -7938,6 +8496,11 @@ def _heterogeneous_cinematic_visual_path(
                 else 0.0
             )
             + (max(2.0, config.same_source_hold_penalty) if is_hold else 0.0)
+            + (
+                DIRECT_MEMBER_PROFESSIONAL_DENSE_ATTENTION_REVIEW_PENALTY
+                if edge_index in professional_unrepairable_attention_edges
+                else 0.0
+            )
             + order_rank[right] * 1e-8
         )
     for ping_index in range(len(ping_specs)):
@@ -7963,16 +8526,42 @@ def _heterogeneous_cinematic_visual_path(
         objective[positive] = weight
         objective[negative] = weight
 
+    # Silhouette is measured in crop/translation-normalized body-shape space.
+    # Some source sets cannot satisfy the professional p95 ceiling while also
+    # honoring source exposure and cadence contracts.  Making that ceiling a
+    # hard MILP row used to erase every path before dense endpoint geometry
+    # could validate it.  Give one silhouette outlier more cost than the
+    # complete attainable range of the secondary objective instead.  This is
+    # a single-pass lexicographic objective: first minimize silhouette
+    # outliers, then optimize continuity/exposure among equally good paths.
+    # The independent professional gate still rejects a witness above the p95
+    # ceiling, so an unattainable source set cannot silently reach rendering.
+    secondary_objective = objective.copy()
+    secondary_objective_upper_bound = float(
+        np.dot(np.maximum(secondary_objective, 0.0), upper_bounds)
+    )
+    silhouette_outlier_lexicographic_penalty = max(
+        1.0,
+        secondary_objective_upper_bound + 1.0,
+    )
+    for edge_index in professional_bad_silhouette_edges:
+        objective[edge_base + edge_index] += (
+            silhouette_outlier_lexicographic_penalty
+        )
+
     rows: list[int] = []
     columns: list[int] = []
     coefficients: list[float] = []
     constraint_lower: list[float] = []
     constraint_upper: list[float] = []
+    constraint_families: list[str] = []
 
     def add_constraint(
         terms: Sequence[tuple[int, float]],
         lower: float,
         upper: float,
+        *,
+        family: str,
     ) -> None:
         row = len(constraint_lower)
         for variable, coefficient in terms:
@@ -7981,6 +8570,7 @@ def _heterogeneous_cinematic_visual_path(
             coefficients.append(float(coefficient))
         constraint_lower.append(float(lower))
         constraint_upper.append(float(upper))
+        constraint_families.append(family)
 
     for position in range(span_count):
         add_constraint(
@@ -7990,6 +8580,7 @@ def _heterogeneous_cinematic_visual_path(
             ),
             1.0,
             1.0,
+            family="position_one_hot",
         )
     for source_index in range(source_count):
         count_terms = tuple(
@@ -8000,6 +8591,7 @@ def _heterogeneous_cinematic_visual_path(
             count_terms,
             float(count_minimums[source_index]),
             float(count_maximums[source_index]),
+            family="source_count_bounds",
         )
         count_positive = count_slack_base + 2 * source_index
         count_negative = count_positive + 1
@@ -8008,6 +8600,7 @@ def _heterogeneous_cinematic_visual_path(
             + ((count_positive, -1.0), (count_negative, 1.0)),
             float(count_targets[source_index]),
             float(count_targets[source_index]),
+            family="source_count_target_slack",
         )
         duration_terms = tuple(
             (
@@ -8020,6 +8613,7 @@ def _heterogeneous_cinematic_visual_path(
             duration_terms,
             duration_minimums[source_index],
             duration_maximums[source_index],
+            family="source_duration_bounds",
         )
         duration_positive = duration_slack_base + 2 * source_index
         duration_negative = duration_positive + 1
@@ -8028,12 +8622,14 @@ def _heterogeneous_cinematic_visual_path(
             + ((duration_positive, -1.0), (duration_negative, 1.0)),
             duration_targets[source_index],
             duration_targets[source_index],
+            family="source_duration_target_slack",
         )
     for boundary_index, edge_indices in enumerate(edges_by_boundary):
         add_constraint(
             tuple((edge_base + edge_index, 1.0) for edge_index in edge_indices),
             1.0,
             1.0,
+            family="edge_one_hot",
         )
         for edge_index in edge_indices:
             _boundary, left, right, _hold, _bridge, _cost = edge_specs[edge_index]
@@ -8045,6 +8641,7 @@ def _heterogeneous_cinematic_visual_path(
                 ),
                 -math.inf,
                 0.0,
+                family="edge_flow",
             )
             add_constraint(
                 (
@@ -8053,6 +8650,7 @@ def _heterogeneous_cinematic_visual_path(
                 ),
                 -math.inf,
                 0.0,
+                family="edge_flow",
             )
     # A landscape facecam outside an annotated highlight is available only as
     # a frame-proven effect insert.  Merely being adjacent to some exceptional
@@ -8096,6 +8694,7 @@ def _heterogeneous_cinematic_visual_path(
                     ),
                     -math.inf,
                     0.0,
+                    family="landscape_incident_bridge",
                 )
     for ping_index, (position, source_index) in enumerate(ping_specs):
         ping_variable = ping_base + ping_index
@@ -8106,16 +8705,19 @@ def _heterogeneous_cinematic_visual_path(
             ((ping_variable, 1.0), (current, -1.0)),
             -math.inf,
             0.0,
+            family="ping_pong_linearization",
         )
         add_constraint(
             ((ping_variable, 1.0), (previous_previous, -1.0)),
             -math.inf,
             0.0,
+            family="ping_pong_linearization",
         )
         add_constraint(
             ((ping_variable, 1.0), (middle, 1.0)),
             -math.inf,
             1.0,
+            family="ping_pong_linearization",
         )
         add_constraint(
             (
@@ -8126,6 +8728,7 @@ def _heterogeneous_cinematic_visual_path(
             ),
             -1.0,
             math.inf,
+            family="ping_pong_linearization",
         )
 
     hold_variables = tuple(
@@ -8133,7 +8736,22 @@ def _heterogeneous_cinematic_visual_path(
         for values in hold_edges_by_boundary
         for edge_index in values
     )
-    add_constraint(hold_variables, 0.0, float(maximum_hold_count))
+    add_constraint(
+        hold_variables,
+        0.0,
+        float(maximum_hold_count),
+        family="total_hold_budget",
+    )
+    if professional_bad_motion_speed_edges:
+        add_constraint(
+            tuple(
+                (edge_base + edge_index, 1.0)
+                for edge_index in professional_bad_motion_speed_edges
+            ),
+            0.0,
+            float(maximum_professional_outlier_count),
+            family="professional_motion_outlier_budget",
+        )
     priority_hold_variables = tuple(
         (edge_base + edge_index, 1.0)
         for boundary_index in priority_boundaries
@@ -8144,6 +8762,7 @@ def _heterogeneous_cinematic_visual_path(
             priority_hold_variables,
             0.0,
             float(maximum_priority_cut_hold_count),
+            family="priority_hold_budget",
         )
     consecutive_limit = config.maximum_consecutive_same_source_holds
     for start in range(max(0, boundary_count - consecutive_limit)):
@@ -8158,6 +8777,7 @@ def _heterogeneous_cinematic_visual_path(
             ),
             0.0,
             float(consecutive_limit),
+            family="consecutive_hold_budget",
         )
     for start in range(span_count - 1):
         run_seconds = durations[start]
@@ -8176,12 +8796,49 @@ def _heterogeneous_cinematic_visual_path(
                     ),
                     0.0,
                     float(end - start),
+                    family="maximum_run_seconds",
                 )
             break
     bridge_variables = tuple(
         (edge_base + edge_index, 1.0)
         for values in bridge_edges_by_boundary
         for edge_index in values
+    )
+    portrait_bridge_variables = tuple(
+        (edge_base + edge_index, 1.0)
+        for values in bridge_edges_by_boundary
+        for edge_index in values
+        if (
+            (
+                bridge := matrices[
+                    edge_specs[edge_index][0]
+                ][edge_specs[edge_index][1]][
+                    edge_specs[edge_index][2]
+                ].cinematic_bridge
+            )
+            is not None
+            and not bridge.outgoing_is_landscape
+            and not bridge.incoming_is_landscape
+        )
+    )
+    landscape_bridge_variables = tuple(
+        (edge_base + edge_index, 1.0)
+        for values in bridge_edges_by_boundary
+        for edge_index in values
+        if (
+            (
+                bridge := matrices[
+                    edge_specs[edge_index][0]
+                ][edge_specs[edge_index][1]][
+                    edge_specs[edge_index][2]
+                ].cinematic_bridge
+            )
+            is not None
+            and (
+                bridge.outgoing_is_landscape
+                or bridge.incoming_is_landscape
+            )
+        )
     )
     if require_cinematic_bridge and not bridge_variables:
         raise DirectMemberVisualSelectionError(
@@ -8203,7 +8860,22 @@ def _heterogeneous_cinematic_visual_path(
         add_constraint(
             bridge_variables,
             1.0 if require_cinematic_bridge else 0.0,
-            float(_DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT),
+            float(maximum_cinematic_bridge_count),
+            family="bridge_count",
+        )
+    if portrait_bridge_variables:
+        add_constraint(
+            portrait_bridge_variables,
+            0.0,
+            float(maximum_portrait_bridge_count),
+            family="bridge_count",
+        )
+    if landscape_bridge_variables:
+        add_constraint(
+            landscape_bridge_variables,
+            0.0,
+            float(maximum_landscape_bridge_count),
+            family="bridge_count",
         )
     boundary_master_offsets: list[float] = []
     elapsed_seconds = 0.0
@@ -8231,7 +8903,12 @@ def _heterogeneous_cinematic_visual_path(
                 for boundary_index in (left_boundary, right_boundary)
                 for edge_index in bridge_edges_by_boundary[boundary_index]
             )
-            add_constraint(pair, 0.0, 1.0)
+            add_constraint(
+                pair,
+                0.0,
+                1.0,
+                family="bridge_spacing",
+            )
 
     matrix = coo_array(
         (
@@ -8257,7 +8934,7 @@ def _heterogeneous_cinematic_visual_path(
             "presolve": True,
             "time_limit": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
             "node_limit": int(max(1, config.feasibility_lifeline_state_limit)),
-            "mip_rel_gap": 0.02,
+            "mip_rel_gap": 0.0,
         },
     )
     status = int(result.status)
@@ -8274,18 +8951,477 @@ def _heterogeneous_cinematic_visual_path(
         "bridge_candidate_edge_count": sum(
             len(values) for values in bridge_edges_by_boundary
         ),
+        "raw_bridge_candidate_edge_count": sum(
+            raw_bridge_candidate_count_by_boundary
+        ),
+        "raw_portrait_bridge_candidate_edge_count": sum(
+            raw_portrait_bridge_candidate_count_by_boundary
+        ),
+        "raw_landscape_bridge_candidate_edge_count": sum(
+            raw_landscape_bridge_candidate_count_by_boundary
+        ),
+        "bridge_edge_domain_by_boundary": [
+            {
+                "boundary_index": boundary_index,
+                "raw_candidate_count": (
+                    raw_bridge_candidate_count_by_boundary[boundary_index]
+                ),
+                "raw_portrait_candidate_count": (
+                    raw_portrait_bridge_candidate_count_by_boundary[
+                        boundary_index
+                    ]
+                ),
+                "raw_landscape_candidate_count": (
+                    raw_landscape_bridge_candidate_count_by_boundary[
+                        boundary_index
+                    ]
+                ),
+                "retained_candidate_count": len(
+                    bridge_edges_by_boundary[boundary_index]
+                ),
+                "hold_edge_count": len(
+                    hold_edges_by_boundary[boundary_index]
+                ),
+                "ordinary_cross_source_edge_count": sum(
+                    not edge_specs[edge_index][3]
+                    and not edge_specs[edge_index][4]
+                    for edge_index in edges_by_boundary[boundary_index]
+                ),
+                "cross_source_edge_count": sum(
+                    not edge_specs[edge_index][3]
+                    for edge_index in edges_by_boundary[boundary_index]
+                ),
+                "locally_forced_hold": bool(
+                    hold_edges_by_boundary[boundary_index]
+                    and all(
+                        edge_specs[edge_index][3]
+                        for edge_index in edges_by_boundary[boundary_index]
+                    )
+                ),
+            }
+            for boundary_index in range(boundary_count)
+        ],
+        "locally_forced_hold_boundary_indices": [
+            boundary_index
+            for boundary_index in range(boundary_count)
+            if hold_edges_by_boundary[boundary_index]
+            and all(
+                edge_specs[edge_index][3]
+                for edge_index in edges_by_boundary[boundary_index]
+            )
+        ],
+        "constraint_family_counts": dict(
+            sorted(Counter(constraint_families).items())
+        ),
         "mip_node_count": int(getattr(result, "mip_node_count", 0) or 0),
         "mip_gap": (
             float(result.mip_gap)
             if getattr(result, "mip_gap", None) is not None
             else None
         ),
-        "objective_value": (
+        "raw_lexicographic_objective_value": (
             float(result.fun) if getattr(result, "fun", None) is not None else None
         ),
+        "silhouette_outlier_lexicographic_penalty": (
+            silhouette_outlier_lexicographic_penalty
+        ),
+        "secondary_objective_upper_bound": secondary_objective_upper_bound,
         "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
         "postsolve_path_audit_required": True,
     }
+    if (
+        status == 2
+        and require_cinematic_bridge
+        and config.diagnose_cinematic_milp_infeasibility
+    ):
+        # scipy.optimize.milp does not expose a HiGHS IIS. Run bounded,
+        # named-family counterfactuals for one terminal candidate instead.
+        # A relaxed witness is diagnostic evidence only and never replaces the
+        # strict result or authorizes a render.
+        relaxation_specs = (
+            ("without_source_count_bounds", {"source_count_bounds"}),
+            (
+                "without_source_duration_bounds",
+                {"source_duration_bounds"},
+            ),
+            ("without_total_hold_budget", {"total_hold_budget"}),
+            ("without_priority_hold_budget", {"priority_hold_budget"}),
+            (
+                "without_consecutive_hold_budget",
+                {"consecutive_hold_budget"},
+            ),
+            ("without_maximum_run_seconds", {"maximum_run_seconds"}),
+            (
+                "without_professional_motion_outlier_budget",
+                {"professional_motion_outlier_budget"},
+            ),
+            (
+                "without_all_hold_shape_constraints",
+                {
+                    "total_hold_budget",
+                    "priority_hold_budget",
+                    "consecutive_hold_budget",
+                    "maximum_run_seconds",
+                },
+            ),
+            (
+                "with_only_total_hold_shape_constraint",
+                {
+                    "priority_hold_budget",
+                    "consecutive_hold_budget",
+                    "maximum_run_seconds",
+                },
+            ),
+            (
+                "with_only_priority_hold_shape_constraint",
+                {
+                    "total_hold_budget",
+                    "consecutive_hold_budget",
+                    "maximum_run_seconds",
+                },
+            ),
+            (
+                "with_only_consecutive_hold_shape_constraint",
+                {
+                    "total_hold_budget",
+                    "priority_hold_budget",
+                    "maximum_run_seconds",
+                },
+            ),
+            (
+                "with_only_maximum_run_hold_shape_constraint",
+                {
+                    "total_hold_budget",
+                    "priority_hold_budget",
+                    "consecutive_hold_budget",
+                },
+            ),
+            (
+                "without_role_exposure_constraints",
+                {
+                    "source_count_bounds",
+                    "source_duration_bounds",
+                    "landscape_incident_bridge",
+                },
+            ),
+            (
+                "without_bridge_contract_constraints",
+                {
+                    "landscape_incident_bridge",
+                    "bridge_count",
+                    "bridge_spacing",
+                },
+            ),
+            (
+                "connectivity_core_only",
+                {
+                    "source_count_bounds",
+                    "source_duration_bounds",
+                    "landscape_incident_bridge",
+                    "total_hold_budget",
+                    "professional_motion_outlier_budget",
+                    "priority_hold_budget",
+                    "consecutive_hold_budget",
+                    "maximum_run_seconds",
+                    "bridge_count",
+                    "bridge_spacing",
+                },
+            ),
+        )
+
+        def relaxed_witness(probe_solution: Any) -> dict[str, Any]:
+            selected_path = tuple(
+                max(
+                    range(source_count),
+                    key=lambda source_index: float(
+                        probe_solution[
+                            position * source_count + source_index
+                        ]
+                    ),
+                )
+                for position in range(span_count)
+            )
+            source_counts = tuple(
+                selected_path.count(source_index)
+                for source_index in range(source_count)
+            )
+            source_durations = tuple(
+                sum(
+                    durations[position]
+                    for position, selected_source in enumerate(selected_path)
+                    if selected_source == source_index
+                )
+                for source_index in range(source_count)
+            )
+            hold_boundary_indices = tuple(
+                boundary_index
+                for boundary_index in range(boundary_count)
+                if selected_path[boundary_index]
+                == selected_path[boundary_index + 1]
+            )
+            maximum_consecutive_holds = 0
+            current_consecutive_holds = 0
+            maximum_run_seconds = 0.0
+            run_start = 0
+            for position in range(1, span_count + 1):
+                if (
+                    position < span_count
+                    and selected_path[position] == selected_path[position - 1]
+                ):
+                    current_consecutive_holds += 1
+                    continue
+                maximum_consecutive_holds = max(
+                    maximum_consecutive_holds,
+                    current_consecutive_holds,
+                )
+                maximum_run_seconds = max(
+                    maximum_run_seconds,
+                    sum(durations[run_start:position]),
+                )
+                run_start = position
+                current_consecutive_holds = 0
+            selected_bridge_boundary_indices = tuple(
+                boundary_index
+                for edge_index, (
+                    boundary_index,
+                    _left,
+                    _right,
+                    _is_hold,
+                    is_bridge,
+                    _cost,
+                ) in enumerate(edge_specs)
+                if is_bridge
+                and float(probe_solution[edge_base + edge_index]) > 0.5
+            )
+            selected_motion_outlier_boundary_indices = tuple(
+                edge_specs[edge_index][0]
+                for edge_index in professional_bad_motion_speed_edges
+                if float(probe_solution[edge_base + edge_index]) > 0.5
+            )
+            return {
+                "source_indices": list(selected_path),
+                "source_counts": list(source_counts),
+                "source_durations_seconds": list(source_durations),
+                "source_count_bound_violation_indices": [
+                    source_index
+                    for source_index, count in enumerate(source_counts)
+                    if count < count_minimums[source_index]
+                    or count > count_maximums[source_index]
+                ],
+                "source_duration_bound_violation_indices": [
+                    source_index
+                    for source_index, duration in enumerate(source_durations)
+                    if duration + 1e-7 < duration_minimums[source_index]
+                    or duration - 1e-7 > duration_maximums[source_index]
+                ],
+                "same_source_hold_count": len(hold_boundary_indices),
+                "same_source_hold_boundary_indices": list(
+                    hold_boundary_indices
+                ),
+                "priority_same_source_hold_count": sum(
+                    boundary_index in priority_boundaries
+                    for boundary_index in hold_boundary_indices
+                ),
+                "maximum_consecutive_same_source_holds": (
+                    maximum_consecutive_holds
+                ),
+                "maximum_same_source_run_seconds": maximum_run_seconds,
+                "cinematic_bridge_count": len(
+                    selected_bridge_boundary_indices
+                ),
+                "cinematic_bridge_boundary_indices": list(
+                    selected_bridge_boundary_indices
+                ),
+                "professional_motion_outlier_count": len(
+                    selected_motion_outlier_boundary_indices
+                ),
+                "professional_motion_outlier_boundary_indices": list(
+                    selected_motion_outlier_boundary_indices
+                ),
+                "render_authorized": False,
+            }
+
+        relaxation_results: list[dict[str, Any]] = []
+        lower_array = np.asarray(constraint_lower, dtype=np.float64)
+        upper_array = np.asarray(constraint_upper, dtype=np.float64)
+        for probe_name, dropped_families in relaxation_specs:
+            kept_indices = np.asarray(
+                [
+                    index
+                    for index, family in enumerate(constraint_families)
+                    if family not in dropped_families
+                ],
+                dtype=np.int32,
+            )
+            probe_result = milp(
+                objective,
+                integrality=integrality,
+                bounds=Bounds(lower_bounds, upper_bounds),
+                constraints=LinearConstraint(
+                    matrix[kept_indices, :],
+                    lower_array[kept_indices],
+                    upper_array[kept_indices],
+                ),
+                options={
+                    "disp": False,
+                    "presolve": True,
+                    "time_limit": (
+                        _DIRECT_MEMBER_MILP_INFEASIBILITY_PROBE_TIME_LIMIT_SECONDS
+                    ),
+                    "node_limit": int(
+                        max(
+                            1,
+                            min(
+                                config.feasibility_lifeline_state_limit,
+                                50_000,
+                            ),
+                        )
+                    ),
+                    "mip_rel_gap": 0.0,
+                },
+            )
+            probe_solution = getattr(probe_result, "x", None)
+            probe_payload: dict[str, Any] = {
+                "probe": probe_name,
+                "dropped_constraint_families": sorted(dropped_families),
+                "dropped_constraint_count": sum(
+                    family in dropped_families
+                    for family in constraint_families
+                ),
+                "retained_constraint_count": len(kept_indices),
+                "status": int(probe_result.status),
+                "message": str(probe_result.message),
+                "success": bool(probe_result.success),
+                "mip_node_count": int(
+                    getattr(probe_result, "mip_node_count", 0) or 0
+                ),
+                "mip_gap": (
+                    float(probe_result.mip_gap)
+                    if getattr(probe_result, "mip_gap", None) is not None
+                    else None
+                ),
+                "render_authorized": False,
+            }
+            if probe_result.success and probe_solution is not None:
+                probe_payload["feasible_witness"] = relaxed_witness(
+                    probe_solution
+                )
+            relaxation_results.append(probe_payload)
+        hold_shape_families = {
+            "total_hold_budget",
+            "priority_hold_budget",
+            "consecutive_hold_budget",
+            "maximum_run_seconds",
+        }
+        minimum_hold_kept_indices = np.asarray(
+            [
+                index
+                for index, family in enumerate(constraint_families)
+                if family not in hold_shape_families
+            ],
+            dtype=np.int32,
+        )
+        minimum_hold_objective = objective.copy()
+        hold_lexicographic_penalty = max(
+            1.0,
+            float(
+                np.dot(
+                    np.abs(minimum_hold_objective),
+                    upper_bounds,
+                )
+            )
+            + 1.0,
+        )
+        for values in hold_edges_by_boundary:
+            for edge_index in values:
+                minimum_hold_objective[edge_base + edge_index] += (
+                    hold_lexicographic_penalty
+                )
+        minimum_hold_result = milp(
+            minimum_hold_objective,
+            integrality=integrality,
+            bounds=Bounds(lower_bounds, upper_bounds),
+            constraints=LinearConstraint(
+                matrix[minimum_hold_kept_indices, :],
+                lower_array[minimum_hold_kept_indices],
+                upper_array[minimum_hold_kept_indices],
+            ),
+            options={
+                "disp": False,
+                "presolve": True,
+                "time_limit": (
+                    _DIRECT_MEMBER_MILP_INFEASIBILITY_PROBE_TIME_LIMIT_SECONDS
+                ),
+                "node_limit": int(
+                    max(
+                        1,
+                        min(
+                            config.feasibility_lifeline_state_limit,
+                            50_000,
+                        ),
+                    )
+                ),
+                "mip_rel_gap": 0.0,
+            },
+        )
+        minimum_hold_solution = getattr(minimum_hold_result, "x", None)
+        minimum_hold_probe: dict[str, Any] = {
+            "contract": "lexicographic_minimum_hold_witness_v1",
+            "dropped_constraint_families": sorted(hold_shape_families),
+            "status": int(minimum_hold_result.status),
+            "message": str(minimum_hold_result.message),
+            "success": bool(minimum_hold_result.success),
+            "mip_node_count": int(
+                getattr(minimum_hold_result, "mip_node_count", 0) or 0
+            ),
+            "mip_gap": (
+                float(minimum_hold_result.mip_gap)
+                if getattr(minimum_hold_result, "mip_gap", None) is not None
+                else None
+            ),
+            "strict_maximum_same_source_hold_count": maximum_hold_count,
+            "lexicographic_hold_penalty": hold_lexicographic_penalty,
+            "minimum_proven": bool(minimum_hold_result.success),
+            "render_authorized": False,
+        }
+        if minimum_hold_result.success and minimum_hold_solution is not None:
+            minimum_hold_witness = relaxed_witness(minimum_hold_solution)
+            minimum_hold_probe.update(
+                {
+                    "minimum_same_source_hold_count": (
+                        minimum_hold_witness["same_source_hold_count"]
+                    ),
+                    "strict_total_hold_budget_feasible": (
+                        minimum_hold_witness["same_source_hold_count"]
+                        <= maximum_hold_count
+                    ),
+                    "feasible_witness": minimum_hold_witness,
+                }
+            )
+        solver_diagnostics["infeasibility_relaxation"] = {
+            "contract": (
+                "bounded_named_constraint_family_counterfactual_v1"
+            ),
+            "requested": True,
+            "baseline_status": status,
+            "baseline_constraint_count": len(constraint_lower),
+            "constraint_family_counts": dict(
+                sorted(Counter(constraint_families).items())
+            ),
+            "probe_time_limit_seconds": (
+                _DIRECT_MEMBER_MILP_INFEASIBILITY_PROBE_TIME_LIMIT_SECONDS
+            ),
+            "probes": relaxation_results,
+            "feasible_probe_names": [
+                item["probe"]
+                for item in relaxation_results
+                if item["success"]
+            ],
+            "minimum_hold_probe": minimum_hold_probe,
+            "evidence_only": True,
+            "visual_gates_relaxed_for_selection": False,
+            "witness_render_authorized": False,
+        }
     if status == 2:
         if not require_cinematic_bridge:
             raise DirectMemberVisualSelectionError(
@@ -8338,6 +9474,36 @@ def _heterogeneous_cinematic_visual_path(
             },
         )
 
+    secondary_objective_value = float(np.dot(secondary_objective, solution))
+    selected_bad_silhouette_edge_indices = tuple(
+        edge_index
+        for edge_index in professional_bad_silhouette_edges
+        if solution[edge_base + edge_index] > 0.5
+    )
+    selected_bad_silhouette_boundary_indices = tuple(
+        edge_specs[edge_index][0]
+        for edge_index in selected_bad_silhouette_edge_indices
+    )
+    solver_diagnostics.update(
+        {
+            "objective_value": secondary_objective_value,
+            "silhouette_outlier_count": len(
+                selected_bad_silhouette_edge_indices
+            ),
+            "silhouette_outlier_boundary_indices": list(
+                selected_bad_silhouette_boundary_indices
+            ),
+            "silhouette_outlier_maximum_for_professional_gate": (
+                maximum_professional_outlier_count
+            ),
+            "silhouette_outlier_minimum_proven": status == 0,
+            "silhouette_professional_gate_predicted_to_pass": (
+                len(selected_bad_silhouette_edge_indices)
+                <= maximum_professional_outlier_count
+            ),
+        }
+    )
+
     path = tuple(
         int(
             np.argmax(
@@ -8367,6 +9533,21 @@ def _heterogeneous_cinematic_visual_path(
         for boundary_index, (left, right) in enumerate(zip(path, path[1:]))
         if left != right
         and matrices[boundary_index][left][right].cinematic_bridge is not None
+    )
+    portrait_bridge_indices = tuple(
+        boundary_index
+        for boundary_index in bridge_indices
+        if not (
+            bridge := matrices[boundary_index][path[boundary_index]][
+                path[boundary_index + 1]
+            ].cinematic_bridge
+        ).outgoing_is_landscape
+        and not bridge.incoming_is_landscape
+    )
+    landscape_bridge_indices = tuple(
+        boundary_index
+        for boundary_index in bridge_indices
+        if boundary_index not in portrait_bridge_indices
     )
     audit_failures: list[str] = []
     if any(
@@ -8436,9 +9617,13 @@ def _heterogeneous_cinematic_visual_path(
         audit_failures.append("maximum_priority_cut_hold_count_exceeded")
     if require_cinematic_bridge:
         if not bridge_indices or len(bridge_indices) > (
-            _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
+            maximum_cinematic_bridge_count
         ):
             audit_failures.append("cinematic_bridge_count_invalid")
+        if len(portrait_bridge_indices) > maximum_portrait_bridge_count:
+            audit_failures.append("portrait_cinematic_bridge_count_invalid")
+        if len(landscape_bridge_indices) > maximum_landscape_bridge_count:
+            audit_failures.append("landscape_cinematic_bridge_count_invalid")
     elif bridge_indices:
         audit_failures.append("unexpected_cinematic_bridge")
     if any(
@@ -8492,7 +9677,7 @@ def _heterogeneous_cinematic_visual_path(
     )
     return (
         path,
-        float(result.fun),
+        secondary_objective_value,
         {
             "strategy": (
                 "scipy_highs_heterogeneous_cinematic_path_milp_v1"
@@ -8568,8 +9753,39 @@ def _heterogeneous_cinematic_visual_path(
             ),
             "cinematic_bridge_boundary_indices": list(bridge_indices),
             "cinematic_bridge_count": len(bridge_indices),
+            "portrait_cinematic_bridge_boundary_indices": list(
+                portrait_bridge_indices
+            ),
+            "portrait_cinematic_bridge_count": len(
+                portrait_bridge_indices
+            ),
+            "landscape_cinematic_bridge_boundary_indices": list(
+                landscape_bridge_indices
+            ),
+            "landscape_cinematic_bridge_count": len(
+                landscape_bridge_indices
+            ),
+            "selected_cinematic_bridges": [
+                {
+                    "boundary_index": boundary_index,
+                    **matrices[boundary_index][
+                        path[boundary_index]
+                    ][path[boundary_index + 1]].cinematic_bridge.to_dict(),
+                }
+                for boundary_index in bridge_indices
+                if matrices[boundary_index][
+                    path[boundary_index]
+                ][path[boundary_index + 1]].cinematic_bridge
+                is not None
+            ],
             "maximum_cinematic_bridge_count": (
-                _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_COUNT
+                maximum_cinematic_bridge_count
+            ),
+            "maximum_portrait_cinematic_bridge_count": (
+                maximum_portrait_bridge_count
+            ),
+            "maximum_landscape_cinematic_bridge_count": (
+                maximum_landscape_bridge_count
             ),
             "minimum_cinematic_bridge_separation_seconds": (
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
@@ -8577,6 +9793,7 @@ def _heterogeneous_cinematic_visual_path(
             "cinematic_bridge_hard_cut_authorized": False,
             "required_transition_effect": require_cinematic_bridge,
             "all_sources_used": all(count > 0 for count in counts),
+            "role_constraints": role_constraint_diagnostics,
             "visual_gates_relaxed": False,
             "search_capacity_exhausted": False,
             "constraint_infeasibility_proven": False,
@@ -9097,6 +10314,9 @@ def select_balanced_direct_member_sources(
     extra_quota_source_indices: Sequence[int] | None = None,
     priority_cut_boundary_indices: Sequence[int] = (),
     maximum_priority_cut_hold_count: int = 0,
+    render_infeasible_transition_edges: Sequence[
+        tuple[float, int, int]
+    ] = (),
     config: DirectMemberVisualConfig | None = None,
     descriptor_provider: DescriptorProvider | None = None,
 ) -> DirectMemberVisualSelection:
@@ -9123,6 +10343,10 @@ def select_balanced_direct_member_sources(
     for heterogeneous official fancams only after strict balanced and bounded
     no-cut paths are proven infeasible.  Its framing-only severe edges remain
     forbidden as hard cuts and must be materialized as audited effects.
+    ``render_infeasible_transition_edges`` carries dense-render certificates
+    from a prior motion solve.  A certified source pair is removed only near
+    its measured canonical boundary; the optimizer must choose another source
+    pair or a meaningfully different cut time instead of relaxing geometry.
     """
 
     resolved_sources = tuple(Path(source) for source in sources)
@@ -9281,6 +10505,28 @@ def select_balanced_direct_member_sources(
         )
         quota_assignment_basis = "explicit_extra_quota_source_set"
     resolved_config = config or DirectMemberVisualConfig()
+    render_infeasible_edges: tuple[tuple[float, int, int], ...] = tuple(
+        (
+            float(boundary_seconds),
+            int(outgoing_source_index),
+            int(incoming_source_index),
+        )
+        for boundary_seconds, outgoing_source_index, incoming_source_index
+        in render_infeasible_transition_edges
+    )
+    if any(
+        not math.isfinite(boundary_seconds)
+        or boundary_seconds < spans[0][0] - 1e-9
+        or boundary_seconds > spans[-1][1] + 1e-9
+        or not 0 <= outgoing_source_index < source_count
+        or not 0 <= incoming_source_index < source_count
+        or outgoing_source_index == incoming_source_index
+        for boundary_seconds, outgoing_source_index, incoming_source_index
+        in render_infeasible_edges
+    ):
+        raise ValueError("render-infeasible transition edge is invalid")
+    if len(set(render_infeasible_edges)) != len(render_infeasible_edges):
+        raise ValueError("render-infeasible transition edges must be unique")
     quotas = _balanced_quotas(len(spans), source_count, quota_order)
     heterogeneous_cinematic_authorized = bool(
         cinematic_bridge_enabled
@@ -9592,6 +10838,50 @@ def select_balanced_direct_member_sources(
                     )
                     for left_index in range(source_count)
                 )
+                if render_infeasible_edges:
+                    candidate_matrix = tuple(
+                        tuple(
+                            (
+                                replace(
+                                    mismatch,
+                                    cost=(
+                                        mismatch.cost
+                                        + resolved_config.missing_descriptor_cost
+                                    ),
+                                    warning_flags=tuple(
+                                        dict.fromkeys(
+                                            mismatch.warning_flags
+                                            + (_DENSE_RENDER_INFEASIBLE_EDGE_FLAG,)
+                                        )
+                                    ),
+                                    severe_flags=tuple(
+                                        dict.fromkeys(
+                                            mismatch.severe_flags
+                                            + (_DENSE_RENDER_INFEASIBLE_EDGE_FLAG,)
+                                        )
+                                    ),
+                                    dense_attention_validation_required=False,
+                                    transform_repair=None,
+                                    cinematic_bridge=None,
+                                )
+                                if any(
+                                    left_index == forbidden_left
+                                    and right_index == forbidden_right
+                                    and abs(boundary - forbidden_seconds)
+                                    <= _DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS
+                                    + 1e-9
+                                    for (
+                                        forbidden_seconds,
+                                        forbidden_left,
+                                        forbidden_right,
+                                    ) in render_infeasible_edges
+                                )
+                                else mismatch
+                            )
+                            for right_index, mismatch in enumerate(row)
+                        )
+                        for left_index, row in enumerate(candidate_matrix)
+                    )
                 candidates.append(
                     _DirectBoundarySearchCandidate(
                         offset_frames=offset_frames,
@@ -10157,6 +11447,25 @@ def select_balanced_direct_member_sources(
         joint_duration_targets = selected_duration_targets
         joint_duration_minimums = selected_duration_minimums
         joint_duration_maximums = selected_duration_maximums
+    base_maximum_selected_run_seconds = float(
+        optimizer_search_diagnostics.get(
+            "maximum_same_source_run_seconds",
+            resolved_config.maximum_same_source_run_seconds,
+        )
+    )
+    # The path MILP limits canonical spans.  The subsequent frame audition may
+    # move a cut by at most one configured search radius to land on the better
+    # action phase.  Budget that explicit, bounded extension here; otherwise a
+    # visually superior six-frame shift can be rejected by a few milliseconds
+    # even though the canonical path honored its cadence contract.
+    boundary_alignment_run_extension_seconds = (
+        resolved_config.boundary_search_radius_frames
+        * resolved_config.sample_frame_step_seconds
+    )
+    maximum_selected_run_seconds = (
+        base_maximum_selected_run_seconds
+        + boundary_alignment_run_extension_seconds
+    )
     (
         selected_boundary_candidates,
         selected_boundary_mismatches,
@@ -10168,6 +11477,7 @@ def select_balanced_direct_member_sources(
         source_duration_targets=joint_duration_targets,
         source_duration_minimums=joint_duration_minimums,
         source_duration_maximums=joint_duration_maximums,
+        maximum_same_source_run_seconds=maximum_selected_run_seconds,
         usage_policy=usage_policy,
         priority_boundary_indices=frozenset(priority_boundaries),
         config=resolved_config,
@@ -10200,21 +11510,46 @@ def select_balanced_direct_member_sources(
     optimizer_cost += local_search_cost_delta
     optimizer_search_diagnostics = {
         **optimizer_search_diagnostics,
+        "dense_render_path_feedback": {
+            "certificate_count": len(render_infeasible_edges),
+            "exclusion_radius_seconds": (
+                _DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS
+            ),
+            "certificates": [
+                {
+                    "canonical_boundary_seconds": boundary_seconds,
+                    "outgoing_eligible_source_index": outgoing_source_index,
+                    "incoming_eligible_source_index": incoming_source_index,
+                }
+                for (
+                    boundary_seconds,
+                    outgoing_source_index,
+                    incoming_source_index,
+                ) in render_infeasible_edges
+            ],
+            "effect": (
+                "hard_forbid_certified_source_pair_near_measured_boundary"
+            ),
+            "visual_thresholds_relaxed": False,
+        },
         "boundary_local_search": {
             **boundary_search_diagnostics,
             "selected_cost_delta_after_joint_duration_assignment": (
                 local_search_cost_delta
             ),
+            "base_path_maximum_same_source_run_seconds": (
+                base_maximum_selected_run_seconds
+            ),
+            "boundary_alignment_run_extension_seconds": (
+                boundary_alignment_run_extension_seconds
+            ),
+            "boundary_adjusted_maximum_same_source_run_seconds": (
+                maximum_selected_run_seconds
+            ),
         },
     }
     current_source = path[0]
     current_run_seconds = selected_span_durations[0]
-    maximum_selected_run_seconds = float(
-        optimizer_search_diagnostics.get(
-            "maximum_same_source_run_seconds",
-            resolved_config.maximum_same_source_run_seconds,
-        )
-    )
     for position, source_index in enumerate(path[1:], start=1):
         duration = selected_span_durations[position]
         if source_index == current_source:

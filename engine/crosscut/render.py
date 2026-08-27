@@ -275,8 +275,8 @@ class EditorialTransformKeyframe:
             raise ValueError("editorial transform zoom must be in [1.0, 1.50]")
         if not 0.0 <= self.center_x <= 1.0 or not 0.0 <= self.center_y <= 1.0:
             raise ValueError("editorial transform center must be normalized")
-        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.120 + 1e-9:
-            raise ValueError("editorial transform pan exceeds the twelve-percent cap")
+        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.160 + 1e-9:
+            raise ValueError("editorial transform pan exceeds the sixteen-percent cap")
         if abs(self.roll_degrees) > 1.60:
             raise ValueError("editorial transform roll exceeds the subtle-roll bound")
         if abs(self.roll_degrees) > 1e-9 and (
@@ -406,6 +406,46 @@ def _editorial_state_values(
         return (1.0, 0.5, 0.5, 0.0)
     item = track.evaluate(time_seconds)
     return (item.zoom, item.center_x, item.center_y, item.roll_degrees)
+
+
+def _overlap_transform_is_frame_neutral(
+    left: EditorialTransformTrack | None,
+    right: EditorialTransformTrack | None,
+    *,
+    overlap_frame_count: int,
+    fps: float,
+) -> bool:
+    """Prove that an overlap never sees a virtual-camera transform.
+
+    The outgoing picture is an extension handle held at the authored final
+    state.  The incoming picture starts at local time zero.  A transform
+    elsewhere in either segment is therefore safe when the outgoing handle
+    and every incoming overlap frame remain exactly identity.  Sampling the
+    inclusive end timestamp also prevents a transform from starting on the
+    effect's terminal frame because of FFmpeg time-base rounding.
+    """
+
+    identity = (1.0, 0.5, 0.5, 0.0)
+
+    def is_identity(values: tuple[float, float, float, float]) -> bool:
+        return all(
+            math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-9)
+            for value, expected in zip(values, identity, strict=True)
+        )
+
+    if left is not None and not is_identity(
+        (
+            left.final_keyframe.zoom,
+            left.final_keyframe.center_x,
+            left.final_keyframe.center_y,
+            left.final_keyframe.roll_degrees,
+        )
+    ):
+        return False
+    return all(
+        is_identity(_editorial_state_values(right, frame_index / fps))
+        for frame_index in range(overlap_frame_count + 1)
+    )
 
 
 def _tier_d_transform_is_frame_continuous(
@@ -1119,9 +1159,11 @@ class RenderPlan:
                 )
             if (
                 transition.kind.uses_overlap
-                and (
-                    self.segments[index].editorial_transform is not None
-                    or self.segments[index + 1].editorial_transform is not None
+                and not _overlap_transform_is_frame_neutral(
+                    self.segments[index].editorial_transform,
+                    self.segments[index + 1].editorial_transform,
+                    overlap_frame_count=transition.frame_count,
+                    fps=self.fps,
                 )
             ):
                 raise ValueError(
@@ -1585,13 +1627,6 @@ def _video_chain(
         f"[{source_index}:v]trim=start={source_start:.6f}:duration={source_duration:.6f}",
         setpts,
     ]
-    # Normalize the source look before any crop or scale so the adjustment is
-    # independent of output geometry and is also shared by dissolve handles.
-    chain.extend(_source_look_filters(look_adjustment))
-    # Boundary-local evidence is measured in the already-normalized domain.
-    # Applying this second, explicitly residual layer after the static source
-    # grade prevents the source-global correction from being counted twice.
-    chain.extend(_boundary_look_filters(boundary_look_track))
     if crop is not None:
         chain.append(
             "crop="
@@ -1633,6 +1668,14 @@ def _video_chain(
                 f"fps={fps:.6f}",
             ]
         )
+    # Source and boundary look operations are spatially uniform and do not
+    # alter geometry or cadence.  Apply them after crop/scale/zoompan so a
+    # 480px review does not run affine chroma ``geq`` over every 4K source
+    # pixel.  This also keeps proxy and delivery rendering on the same exact
+    # output-domain color path while reducing work by up to an order of
+    # magnitude.  The boundary residual remains after the source-global grade.
+    chain.extend(_source_look_filters(look_adjustment))
+    chain.extend(_boundary_look_filters(boundary_look_track))
     chain.extend(
         [
             "tpad=stop_mode=clone:stop_duration=1",
@@ -2045,7 +2088,19 @@ def render(
     *,
     ffmpeg: str = "ffmpeg",
     video_codec: str = "h264_videotoolbox",
+    video_bitrate: str = "24M",
+    video_maxrate: str = "36M",
+    video_buffer_size: str = "48M",
+    audio_bitrate: str = "320k",
 ) -> str:
+    for label, value in (
+        ("video_bitrate", video_bitrate),
+        ("video_maxrate", video_maxrate),
+        ("video_buffer_size", video_buffer_size),
+        ("audio_bitrate", audio_bitrate),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty FFmpeg rate")
     plan.output.parent.mkdir(parents=True, exist_ok=True)
     # Keep the temporary output on the destination volume so the final replace
     # is atomic even when the user renders to an external SSD.
@@ -2093,11 +2148,11 @@ def render(
                 command.extend(
                     (
                         "-b:v",
-                        "24M",
+                        video_bitrate,
                         "-maxrate",
-                        "36M",
+                        video_maxrate,
                         "-bufsize",
-                        "48M",
+                        video_buffer_size,
                         "-profile:v",
                         "high",
                     )
@@ -2109,7 +2164,7 @@ def render(
                     "-c:a",
                     "aac",
                     "-b:a",
-                    "320k",
+                    audio_bitrate,
                     "-movflags",
                     "+faststart",
                     str(temporary_output),

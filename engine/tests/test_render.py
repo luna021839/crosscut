@@ -31,6 +31,19 @@ class RenderTests(unittest.TestCase):
     def test_portrait_output_size(self) -> None:
         self.assertEqual(output_size(AspectRatio.PORTRAIT), (1080, 1920))
 
+    def test_render_rate_arguments_must_be_nonempty(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(RenderSegment(0, 0.0, 1.0, 0.0),),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+        )
+        from crosscut.render import render
+
+        with self.assertRaisesRegex(ValueError, "video_bitrate"):
+            render(plan, video_bitrate="")
+
     def test_filter_uses_continuous_reference_audio(self) -> None:
         plan = RenderPlan(
             sources=(Path("one.mp4"), Path("two.mp4")),
@@ -55,7 +68,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("setsar=1", graph)
         self.assertIn("concat=n=2", graph)
 
-    def test_bounded_source_look_filters_run_before_geometry_without_retiming(self) -> None:
+    def test_bounded_source_look_filters_run_after_geometry_without_retiming(self) -> None:
         adjustment = SourceLookAdjustment(
             brightness=0.02,
             contrast=1.04,
@@ -92,8 +105,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn(eq, graph)
         self.assertIn(chroma, graph)
         self.assertNotIn("colorbalance=", graph)
-        self.assertLess(graph.index(eq), graph.index("crop="))
-        self.assertLess(graph.index(chroma), graph.index("crop="))
+        self.assertLess(graph.index("crop="), graph.index(eq))
+        self.assertLess(graph.index("crop="), graph.index(chroma))
         self.assertEqual(plan.output_frame_count, 30)
         payload = plan.to_json()["segments"][0]  # type: ignore[index]
         self.assertEqual(
@@ -193,7 +206,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("if(lt(T,0.2000000000)", graph)
         self.assertLess(graph.index(global_filter), graph.index(":eval=frame"))
         self.assertLess(graph.index(":eval=frame"), graph.index("geq="))
-        self.assertLess(graph.index("geq="), graph.index("crop="))
+        self.assertLess(graph.index("crop="), graph.index(global_filter))
         payload = plan.to_json()["segments"][0]  # type: ignore[index]
         self.assertEqual(
             payload["boundary_look_track"]["reason"],
@@ -700,6 +713,10 @@ class RenderTests(unittest.TestCase):
         self.assertIs(plan.segments[0].editorial_transform, track)
 
     def test_group_transform_rejects_black_corner_roll_and_mixed_crop_modes(self) -> None:
+        widened_pan = EditorialTransformKeyframe(0.0, 1.50, 0.65, 0.50)
+        self.assertEqual(widened_pan.center_x, 0.65)
+        with self.assertRaisesRegex(ValueError, "sixteen-percent"):
+            EditorialTransformKeyframe(0.0, 1.50, 0.661, 0.50)
         with self.assertRaisesRegex(ValueError, "frame edges"):
             EditorialTransformKeyframe(0.0, 1.0, roll_degrees=1.0)
         track = EditorialTransformTrack((EditorialTransformKeyframe(0.0, 1.05),))
@@ -752,6 +769,98 @@ class RenderTests(unittest.TestCase):
                         TransitionKind.FACE_DISSOLVE,
                         11,
                         "safe_without_transform",
+                        tier="A",
+                    ),
+                ),
+            )
+
+    def test_frame_neutral_transform_is_allowed_outside_dissolve_overlap(
+        self,
+    ) -> None:
+        outgoing = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.06),
+                EditorialTransformKeyframe(0.5, 1.0),
+                EditorialTransformKeyframe(2.0, 1.0),
+            ),
+            reason="settled_before_overlap",
+        )
+        incoming = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0),
+                EditorialTransformKeyframe(0.5, 1.0),
+                EditorialTransformKeyframe(2.0, 1.06),
+            ),
+            reason="starts_after_overlap",
+        )
+
+        plan = RenderPlan(
+            sources=(Path("zero.mp4"), Path("one.mp4")),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    editorial_transform=outgoing,
+                ),
+                RenderSegment(
+                    1,
+                    2.0,
+                    2.0,
+                    2.0,
+                    editorial_transform=incoming,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(
+                    TransitionKind.FACE_DISSOLVE,
+                    11,
+                    "frame_neutral_overlap",
+                    tier="A",
+                ),
+            ),
+        )
+
+        self.assertIs(plan.segments[0].editorial_transform, outgoing)
+        self.assertIs(plan.segments[1].editorial_transform, incoming)
+
+    def test_incoming_transform_inside_dissolve_overlap_is_forbidden(self) -> None:
+        incoming = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0),
+                EditorialTransformKeyframe(0.2, 1.06),
+                EditorialTransformKeyframe(1.0, 1.06),
+            ),
+            reason="starts_inside_overlap",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unreviewed editorial"):
+            RenderPlan(
+                sources=(Path("zero.mp4"), Path("one.mp4")),
+                segments=(
+                    RenderSegment(0, 0.0, 1.0, 0.0),
+                    RenderSegment(
+                        1,
+                        1.0,
+                        1.0,
+                        1.0,
+                        editorial_transform=incoming,
+                    ),
+                ),
+                reference_source=0,
+                aspect_ratio=AspectRatio.LANDSCAPE,
+                output=Path("out.mp4"),
+                fps=30.0,
+                transitions=(
+                    RenderTransition(
+                        TransitionKind.FACE_DISSOLVE,
+                        11,
+                        "unsafe_incoming_transform",
                         tier="A",
                     ),
                 ),

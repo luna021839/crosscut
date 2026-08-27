@@ -70,6 +70,13 @@ _FILE_CONTENT_SHA256_CACHE: OrderedDict[
 _FILE_CONTENT_SHA256_CACHE_LOCK = threading.RLock()
 PROXY_LANDSCAPE_SIZE = (854, 480)
 PROXY_PORTRAIT_SIZE = (270, 480)
+# Direct-member review runs the same face, pose, and silhouette models as the
+# final 1080x1920 gate.  A generic 270-pixel-wide proxy is sufficient for
+# scalar group QA, but it erases small facial evidence that remains available
+# after the final gate's 480-pixel working-frame reduction.  Keep the exact
+# final analysis width for member plans while still rendering only one fifth
+# of the production pixel count.
+DIRECT_MEMBER_PROXY_PORTRAIT_SIZE = (480, 854)
 # Hard cuts compare the last two outgoing frames with the first two incoming
 # frames. Dissolves use a duration-aware schedule built from their frame count.
 BOUNDARY_FRAME_OFFSETS = (-2, -1, 0, 1)
@@ -892,8 +899,14 @@ def _boundary_review_domain(
     return NATIVE_SOURCE_CUT_DOMAIN
 
 
-def proxy_dimensions(aspect_ratio: AspectRatio) -> tuple[int, int]:
+def proxy_dimensions(
+    aspect_ratio: AspectRatio,
+    *,
+    direct_member: bool = False,
+) -> tuple[int, int]:
     ratio = AspectRatio(aspect_ratio)
+    if ratio is AspectRatio.PORTRAIT and direct_member:
+        return DIRECT_MEMBER_PROXY_PORTRAIT_SIZE
     return (
         PROXY_PORTRAIT_SIZE
         if ratio is AspectRatio.PORTRAIT
@@ -904,7 +917,18 @@ def proxy_dimensions(aspect_ratio: AspectRatio) -> tuple[int, int]:
 def derive_proxy_render_plan(plan: RenderPlan, output: Path) -> RenderPlan:
     """Clone the complete edit grammar at a deterministic 480-pixel height."""
 
-    width, height = proxy_dimensions(plan.aspect_ratio)
+    direct_member = any(
+        value is not None
+        for value in (
+            plan.member_pose_dissolve_requested,
+            plan.member_pose_dissolve_effective,
+            plan.member_pose_dissolve_count,
+        )
+    )
+    width, height = proxy_dimensions(
+        plan.aspect_ratio,
+        direct_member=direct_member,
+    )
     return RenderPlan(
         sources=plan.sources,
         segments=plan.segments,
@@ -916,6 +940,13 @@ def derive_proxy_render_plan(plan: RenderPlan, output: Path) -> RenderPlan:
         height=height,
         fps=plan.fps,
         transitions=plan.transitions,
+        member_pose_dissolve_requested=(
+            plan.member_pose_dissolve_requested
+        ),
+        member_pose_dissolve_effective=(
+            plan.member_pose_dissolve_effective
+        ),
+        member_pose_dissolve_count=plan.member_pose_dissolve_count,
     )
 
 
@@ -1344,6 +1375,7 @@ def _proxy_perceptual_source_admission(
         },
         "rapid_quality_alternation": {
             "source_run_count": len(run_medians),
+            "per_run": run_medians,
             "expected_rapid_source_switch_boundary_count": (
                 expected_rapid_boundary_count
             ),
@@ -2246,7 +2278,18 @@ def review_rendered_proxy(
     """Decode one already-rendered proxy and return scalar-only QA evidence."""
 
     settings = config or ProxyReviewConfig()
-    expected_width, expected_height = proxy_dimensions(plan.aspect_ratio)
+    direct_member = any(
+        value is not None
+        for value in (
+            plan.member_pose_dissolve_requested,
+            plan.member_pose_dissolve_effective,
+            plan.member_pose_dissolve_count,
+        )
+    )
+    expected_width, expected_height = proxy_dimensions(
+        plan.aspect_ratio,
+        direct_member=direct_member,
+    )
     if (plan.width, plan.height) != (expected_width, expected_height):
         raise ValueError("proxy review requires the fixed 480p RenderPlan size")
     source_content_sha256 = tuple(
@@ -2716,7 +2759,15 @@ def render_and_review_proxy(
     """Render a 480p derivative with production FFmpeg logic, then review it."""
 
     proxy_plan = derive_proxy_render_plan(plan, proxy_output)
-    codec = render(proxy_plan, ffmpeg=ffmpeg, video_codec=video_codec)
+    codec = render(
+        proxy_plan,
+        ffmpeg=ffmpeg,
+        video_codec=video_codec,
+        video_bitrate="8M",
+        video_maxrate="12M",
+        video_buffer_size="16M",
+        audio_bitrate="128k",
+    )
     review = review_rendered_proxy(
         proxy_plan,
         config=config,
@@ -2731,6 +2782,7 @@ __all__ = [
     "ANALYSIS_BASIS",
     "BOUNDARY_REVIEW_DOMAINS",
     "BOUNDARY_FRAME_OFFSETS",
+    "DIRECT_MEMBER_PROXY_PORTRAIT_SIZE",
     "HUMAN_REFERENCE_BOUNDARY_ANALYSIS_BASIS",
     "INTRODUCED_CROSS_SOURCE_DOMAIN",
     "NATIVE_SOURCE_CUT_DOMAIN",

@@ -26,6 +26,7 @@ from crosscut.render import (
 )
 from crosscut.rendered_proxy_review import (
     BOUNDARY_FRAME_OFFSETS,
+    DIRECT_MEMBER_PROXY_PORTRAIT_SIZE,
     INTRODUCED_CROSS_SOURCE_DOMAIN,
     NATIVE_SOURCE_CUT_DOMAIN,
     OutputSubjectGeometry,
@@ -263,6 +264,31 @@ class RenderedProxyReviewTests(unittest.TestCase):
         )
         self.assertEqual((proxy.width, proxy.height), PROXY_PORTRAIT_SIZE)
 
+    def test_direct_member_proxy_preserves_contract_and_analysis_width(self) -> None:
+        plan = RenderPlan(
+            sources=(Path("member.mp4"),),
+            segments=(RenderSegment(0, 0.0, 0.5, 0.0),),
+            reference_source=0,
+            aspect_ratio=AspectRatio.PORTRAIT,
+            output=Path("member-full.mp4"),
+            width=1080,
+            height=1920,
+            fps=30.0,
+            member_pose_dissolve_requested=True,
+            member_pose_dissolve_effective=False,
+            member_pose_dissolve_count=0,
+        )
+
+        proxy = derive_proxy_render_plan(plan, Path("member-proxy.mp4"))
+
+        self.assertEqual(
+            (proxy.width, proxy.height),
+            DIRECT_MEMBER_PROXY_PORTRAIT_SIZE,
+        )
+        self.assertTrue(proxy.member_pose_dissolve_requested)
+        self.assertFalse(proxy.member_pose_dissolve_effective)
+        self.assertEqual(proxy.member_pose_dissolve_count, 0)
+
     def test_configuration_and_geometry_validate_normalized_contract(self) -> None:
         with self.assertRaisesRegex(ValueError, "normalized"):
             ProxyReviewConfig(maximum_color_shock=1.1)
@@ -443,6 +469,9 @@ class RenderedProxyReviewTests(unittest.TestCase):
         self.assertTrue(rapid["gate_applicable"])
         self.assertEqual(rapid["observed_rapid_source_switch_boundary_count"], 4)
         self.assertEqual(rapid["high_quality_shock_count"], 0)
+        self.assertEqual(len(rapid["per_run"]), 5)
+        self.assertEqual(rapid["per_run"][0]["source_index"], 0)
+        self.assertIn("perceptual_luma", rapid["per_run"][0]["scalars"])
         self.assertEqual(
             review.payload["perceptual_source_admission_penalty_points"],
             0.0,

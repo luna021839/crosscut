@@ -12,14 +12,19 @@ from crosscut.direct_member_visual import (
     DirectMemberCinematicBridge,
     DirectMemberVisualConfig,
     DirectMemberVisualSelectionError,
+    _DirectBoundarySearchCandidate,
     _VideoDescriptorProvider,
     _balanced_visual_path,
     _bounded_same_source_hold_visual_path,
+    _canonical_silhouette_shape_embedding,
+    _cinematic_bridge_count_budgets,
     _cinematic_bridge_from_verified_evidence,
+    _embedding_distance,
     _exact_feasibility_lifeline,
     _hard_boundary_connectivity_diagnostics,
     _hard_boundary_forward_exhaustion_boundary,
     _heterogeneous_cinematic_visual_path,
+    _joint_boundary_search_assignment,
     _severe_transition_counterfactual_diagnostic,
     select_balanced_direct_member_sources,
 )
@@ -219,6 +224,112 @@ def _linear_timewarp(
 
 
 class DirectMemberVisualTests(unittest.TestCase):
+    def test_joint_boundary_search_preserves_same_source_run_limit(self) -> None:
+        expensive = _optimizer_mismatch(0.50)
+        preferred = _optimizer_mismatch(0.01)
+
+        def candidate(
+            *,
+            offset_frames: int,
+            cut_master_seconds: float,
+            mismatch: DirectBoundaryMismatch,
+        ) -> _DirectBoundarySearchCandidate:
+            matrix = ((mismatch, mismatch), (mismatch, mismatch))
+            return _DirectBoundarySearchCandidate(
+                offset_frames=offset_frames,
+                cut_master_seconds=cut_master_seconds,
+                outgoing_previous=(),
+                outgoing=(),
+                incoming=(),
+                incoming_next=(),
+                matrix=matrix,
+            )
+
+        selected, _mismatches, diagnostics = _joint_boundary_search_assignment(
+            candidates_by_boundary=(
+                (candidate(offset_frames=0, cut_master_seconds=3.8, mismatch=expensive),),
+                (
+                    candidate(
+                        offset_frames=0,
+                        cut_master_seconds=7.7,
+                        mismatch=expensive,
+                    ),
+                    candidate(
+                        offset_frames=2,
+                        cut_master_seconds=7.9,
+                        mismatch=preferred,
+                    ),
+                ),
+            ),
+            path=(0, 0, 1),
+            spans=((0.0, 3.8), (3.8, 7.7), (7.7, 9.7)),
+            source_duration_targets=(7.7, 2.0),
+            source_duration_minimums=(0.0, 0.0),
+            source_duration_maximums=(10.0, 10.0),
+            maximum_same_source_run_seconds=7.75,
+            usage_policy="heterogeneous_role_aware_safe_hold_v1",
+            priority_boundary_indices=frozenset(),
+            config=DirectMemberVisualConfig(
+                sample_frame_step_seconds=0.1,
+                boundary_search_radius_frames=2,
+                boundary_search_step_frames=2,
+            ),
+        )
+
+        self.assertEqual([item.offset_frames for item in selected], [0, 0])
+        self.assertTrue(
+            diagnostics["same_source_run_constraints_jointly_enforced"]
+        )
+
+    def test_canonical_silhouette_removes_screen_translation(self) -> None:
+        def embedding_for(
+            bbox: tuple[float, float, float, float],
+            *,
+            left_half_only: bool = False,
+        ) -> tuple[float, ...]:
+            left, top, width, height = bbox
+            coarse = tuple(
+                1.0
+                if (
+                    left <= (column + 0.5) / 12.0 <= left + width
+                    and top <= (row + 0.5) / 8.0 <= top + height
+                    and (
+                        not left_half_only
+                        or (column + 0.5) / 12.0 <= left + width / 2.0
+                    )
+                )
+                else 0.0
+                for row in range(8)
+                for column in range(12)
+            )
+            return coarse + (left, top, width, height, width * height) * 5
+
+        first_box = (2.0 / 12.0, 1.0 / 8.0, 6.0 / 12.0, 6.0 / 8.0)
+        shifted_box = (4.0 / 12.0, 1.0 / 8.0, 6.0 / 12.0, 6.0 / 8.0)
+        first = _canonical_silhouette_shape_embedding(
+            embedding_for(first_box),
+            first_box,
+            first_box[2] * first_box[3],
+        )
+        shifted = _canonical_silhouette_shape_embedding(
+            embedding_for(shifted_box),
+            shifted_box,
+            shifted_box[2] * shifted_box[3],
+        )
+        changed = _canonical_silhouette_shape_embedding(
+            embedding_for(shifted_box, left_half_only=True),
+            shifted_box,
+            shifted_box[2] * shifted_box[3] / 2.0,
+        )
+
+        translated_distance = _embedding_distance(first, shifted)
+        changed_distance = _embedding_distance(first, changed)
+        self.assertIsNotNone(translated_distance)
+        self.assertIsNotNone(changed_distance)
+        assert translated_distance is not None and changed_distance is not None
+        self.assertLess(translated_distance, 0.02)
+        self.assertGreater(changed_distance, translated_distance + 0.20)
+
     def test_cross_basis_pose_safe_fancam_edge_requires_effect_bridge(
         self,
     ) -> None:
@@ -285,7 +396,30 @@ class DirectMemberVisualTests(unittest.TestCase):
             timestamp_bound_adjacent=True,
             transform_repair=None,
         )
-        self.assertIsNone(portrait_only)
+        self.assertIsNotNone(portrait_only)
+        assert portrait_only is not None
+        self.assertEqual(portrait_only.style, "zoom_in")
+        self.assertFalse(portrait_only.outgoing_is_landscape)
+        self.assertFalse(portrait_only.incoming_is_landscape)
+        self.assertEqual(
+            portrait_only.to_dict()["geometry_scope"],
+            "portrait_to_portrait",
+        )
+
+        portrait_pose_too_far = _cinematic_bridge_from_verified_evidence(
+            severe_flags=("attention_scale",),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=True,
+            pose_mismatch=0.25,
+            silhouette_mismatch=0.25,
+            base_mismatch=0.35,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=portrait,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+        )
+        self.assertIsNone(portrait_pose_too_far)
 
         blocked = _cinematic_bridge_from_verified_evidence(
             severe_flags=("attention_scale", "pose_phase_discontinuity"),
@@ -352,6 +486,156 @@ class DirectMemberVisualTests(unittest.TestCase):
         path, _cost, diagnostics = result
         self.assertEqual(path, (0, 0, 1, 0))
         self.assertEqual(diagnostics["cinematic_bridge_boundary_indices"], [1])
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+
+    def test_cinematic_solver_can_bridge_two_portrait_fancams(self) -> None:
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.50, severe=True)
+        portrait_bridge = DirectMemberCinematicBridge(
+            style="zoom_in",
+            outgoing_is_landscape=False,
+            incoming_is_landscape=False,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.16,
+            silhouette_mismatch=0.24,
+            base_mismatch=0.35,
+        )
+        bridge_edge = replace(
+            severe,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=portrait_bridge,
+        )
+        matrices = (
+            tuple(tuple(safe for _right in range(3)) for _left in range(3)),
+            (
+                (safe, bridge_edge, safe),
+                (safe, safe, safe),
+                (safe, safe, safe),
+            ),
+            tuple(tuple(safe for _right in range(3)) for _left in range(3)),
+            tuple(tuple(safe for _right in range(3)) for _left in range(3)),
+        )
+        validity = (
+            (True, False, False),
+            (True, False, False),
+            (False, True, False),
+            (False, True, False),
+            (False, False, True),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2),
+            candidate_validity=validity,
+            span_durations=(1.0,) * 5,
+            source_geometries=(
+                direct_member_source_frame_geometry((2160, 3840)),
+                direct_member_source_frame_geometry((2160, 3840)),
+                direct_member_source_frame_geometry((3840, 2160)),
+            ),
+            priority_cut_boundary_indices=(1, 3),
+            maximum_priority_cut_hold_count=2,
+            config=DirectMemberVisualConfig(
+                maximum_same_source_hold_fraction=1.0,
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(path, (0, 0, 1, 1, 2))
+        self.assertEqual(diagnostics["cinematic_bridge_boundary_indices"], [1])
+        self.assertEqual(
+            diagnostics["selected_cinematic_bridges"][0]["geometry_scope"],
+            "portrait_to_portrait",
+        )
+
+    def test_cinematic_solver_separates_portrait_and_landscape_bridge_budgets(
+        self,
+    ) -> None:
+        portrait_budget, landscape_budget, total_budget = (
+            _cinematic_bridge_count_budgets(
+                boundary_count=12,
+                total_duration_seconds=52.0,
+                landscape_source_count=1,
+            )
+        )
+        self.assertEqual(
+            (portrait_budget, landscape_budget, total_budget),
+            (5, 2, 7),
+        )
+
+        safe = _optimizer_mismatch(0.04)
+
+        def mismatch(left: int, right: int) -> DirectBoundaryMismatch:
+            if left == right:
+                return safe
+            landscape_involved = left == 2 or right == 2
+            bridge = DirectMemberCinematicBridge(
+                style="horizontal_blur" if left == 2 else "zoom_in",
+                outgoing_is_landscape=left == 2,
+                incoming_is_landscape=right == 2,
+                authorized_severe_flags=("attention_scale",),
+                pose_mismatch=0.12,
+                silhouette_mismatch=0.20,
+                base_mismatch=0.32,
+            )
+            return replace(
+                _optimizer_mismatch(0.32, severe=True),
+                severe_flags=("attention_scale",),
+                cinematic_bridge=bridge,
+                warning_flags=(
+                    "landscape_effect_bridge_required"
+                    if landscape_involved
+                    else "portrait_effect_bridge_required"
+                ,),
+            )
+
+        source_count = 3
+        forced_path = (0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2)
+        matrices = tuple(
+            tuple(
+                tuple(
+                    mismatch(left, right)
+                    for right in range(source_count)
+                )
+                for left in range(source_count)
+            )
+            for _boundary_index in range(len(forced_path) - 1)
+        )
+        validity = tuple(
+            tuple(source_index == selected for source_index in range(source_count))
+            for selected in forced_path
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2),
+            candidate_validity=validity,
+            span_durations=(4.0,) * len(forced_path),
+            source_geometries=(
+                direct_member_source_frame_geometry((2160, 3840)),
+                direct_member_source_frame_geometry((2160, 3840)),
+                direct_member_source_frame_geometry((3840, 2160)),
+            ),
+            priority_cut_boundary_indices=(1, 3, 5, 7, 9, 11),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(
+                maximum_same_source_hold_count=12,
+                maximum_same_source_hold_fraction=1.0,
+                maximum_consecutive_same_source_holds=2,
+                maximum_same_source_run_seconds=12.0,
+            ),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(path, forced_path)
+        self.assertEqual(diagnostics["cinematic_bridge_count"], 6)
+        self.assertEqual(diagnostics["portrait_cinematic_bridge_count"], 5)
+        self.assertEqual(diagnostics["landscape_cinematic_bridge_count"], 1)
+        self.assertEqual(diagnostics["maximum_cinematic_bridge_count"], 7)
         self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
 
     def test_exceptional_nonpriority_bridges_use_elapsed_seconds(self) -> None:
@@ -441,11 +725,35 @@ class DirectMemberVisualTests(unittest.TestCase):
                 source_geometries=geometries,
                 priority_cut_boundary_indices=(),
                 maximum_priority_cut_hold_count=0,
-                config=DirectMemberVisualConfig(),
+                config=DirectMemberVisualConfig(
+                    diagnose_cinematic_milp_infeasibility=True,
+                ),
             )
         self.assertEqual(
             raised.exception.diagnostics["failure"],
             "cinematic_bridge_path_infeasible",
+        )
+        relaxation = raised.exception.diagnostics["search"]["solver"][
+            "infeasibility_relaxation"
+        ]
+        self.assertTrue(relaxation["evidence_only"])
+        self.assertFalse(relaxation["witness_render_authorized"])
+        self.assertIn(
+            "without_bridge_contract_constraints",
+            relaxation["feasible_probe_names"],
+        )
+        bridge_probe = next(
+            item
+            for item in relaxation["probes"]
+            if item["probe"] == "without_bridge_contract_constraints"
+        )
+        self.assertTrue(bridge_probe["success"])
+        self.assertFalse(
+            bridge_probe["feasible_witness"]["render_authorized"]
+        )
+        self.assertGreater(
+            relaxation["constraint_family_counts"]["bridge_spacing"],
+            0,
         )
 
     def test_heterogeneous_facecams_use_highlight_block_with_required_bridges(
@@ -710,6 +1018,60 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(diagnostics["landscape_source_indices"], [])
         self.assertEqual(diagnostics["carrier_source_indices"], [0, 1, 2])
         self.assertEqual(diagnostics["cinematic_bridge_count"], 0)
+
+    def test_role_path_minimizes_unavoidable_silhouette_outliers_for_gate(
+        self,
+    ) -> None:
+        source_count = 3
+        span_count = 9
+        safe = _optimizer_mismatch(0.04)
+        silhouette_outlier = replace(safe, silhouette_mismatch=0.60)
+        matrices = tuple(
+            tuple(
+                tuple(
+                    safe if left == right else silhouette_outlier
+                    for right in range(source_count)
+                )
+                for left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        geometries = tuple(
+            direct_member_source_frame_geometry((2160, 3840))
+            for _source_index in range(source_count)
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2),
+            candidate_validity=((True,) * source_count,) * span_count,
+            span_durations=(1.0,) * span_count,
+            source_geometries=geometries,
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+            require_cinematic_bridge=False,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        selected_switch_count = sum(
+            left != right for left, right in zip(path, path[1:])
+        )
+        solver = diagnostics["solver"]
+        self.assertEqual(
+            solver["silhouette_outlier_count"],
+            selected_switch_count,
+        )
+        self.assertTrue(solver["silhouette_outlier_minimum_proven"])
+        self.assertFalse(solver["silhouette_professional_gate_predicted_to_pass"])
+        self.assertEqual(
+            diagnostics["role_constraints"]
+            ["professional_hard_cut_p95_constraints"]
+            ["silhouette_selection_policy"],
+            "lexicographic_minimum_then_professional_gate",
+        )
 
     def test_role_aware_safe_hold_persists_proven_milp_failure(self) -> None:
         source_count = 3
@@ -4186,7 +4548,60 @@ class DirectMemberVisualTests(unittest.TestCase):
             2,
         )
 
+    def test_dense_render_certificate_forces_an_alternate_transition(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+        common = {
+            "sources": tuple(Path(f"{index}.mp4") for index in range(3)),
+            "canonical_spans": spans,
+            "audio_offsets": (0.0, 0.0, 0.0),
+            "config": DirectMemberVisualConfig(beam_width=4_096),
+            "descriptor_provider": (
+                lambda source_index, _source, _time: _descriptor(
+                    0.20 + source_index * 0.006
+                )
+            ),
+        }
+        initial = select_balanced_direct_member_sources(**common)
+        certificate = (
+            initial.selected_boundary_master_seconds[0],
+            initial.source_indices[0],
+            initial.source_indices[1],
+        )
+
+        retried = select_balanced_direct_member_sources(
+            **common,
+            render_infeasible_transition_edges=(certificate,),
+        )
+
+        self.assertNotEqual(
+            retried.source_indices[:2],
+            initial.source_indices[:2],
+        )
+        diagnostics = retried.optimizer_search_diagnostics[
+            "dense_render_path_feedback"
+        ]
+        self.assertEqual(diagnostics["certificate_count"], 1)
+        self.assertEqual(
+            diagnostics["effect"],
+            "hard_forbid_certified_source_pair_near_measured_boundary",
+        )
+        self.assertFalse(diagnostics["visual_thresholds_relaxed"])
+        self.assertEqual(
+            diagnostics["certificates"],
+            [
+                {
+                    "canonical_boundary_seconds": certificate[0],
+                    "outgoing_eligible_source_index": certificate[1],
+                    "incoming_eligible_source_index": certificate[2],
+                }
+            ],
+        )
+
     def test_invalid_configuration_and_noncontiguous_spans_are_rejected(self) -> None:
+        with self.assertRaisesRegex(TypeError, "must be boolean"):
+            DirectMemberVisualConfig(  # type: ignore[arg-type]
+                diagnose_cinematic_milp_infeasibility=1,
+            )
         with self.assertRaisesRegex(ValueError, "beam_width"):
             DirectMemberVisualConfig(beam_width=99)
         with self.assertRaisesRegex(ValueError, "maximum_adaptive_beam_width"):

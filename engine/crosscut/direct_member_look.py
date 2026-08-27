@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from statistics import median
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -50,6 +50,7 @@ class DirectMemberLookConfig:
     source_sharpness_log_span: float = 0.55
     source_luma_span: float = 0.18
     source_chroma_span: float = 0.12
+    gate_rapid_chroma: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -69,6 +70,7 @@ class DirectMemberLookConfig:
             if name not in {
                 "minimum_descriptor_samples_per_segment",
                 "graph_regularizations",
+                "gate_rapid_chroma",
             }
         )
         if any(not math.isfinite(value) or value <= 0.0 for value in finite):
@@ -89,6 +91,8 @@ class DirectMemberLookConfig:
             raise ValueError("member look source contrast bounds are invalid")
         if not 0.80 <= self.minimum_saturation <= self.maximum_saturation <= 1.20:
             raise ValueError("member look saturation bounds are invalid")
+        if not isinstance(self.gate_rapid_chroma, bool):
+            raise TypeError("member look rapid chroma policy must be boolean")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +174,8 @@ class DirectMemberLookPlan:
     predicted_source_spans: tuple[tuple[str, float | None], ...]
     diagnostics: tuple[dict[str, Any], ...]
     config: DirectMemberLookConfig
+    output_proxy_refinement_applied: bool = False
+    output_proxy_refinement_iteration: int = 0
 
     def __post_init__(self) -> None:
         if len(self.observations) != len(self.segment_adjustments):
@@ -178,6 +184,16 @@ class DirectMemberLookPlan:
             raise ValueError("member look plan cannot be empty")
         if not math.isfinite(self.selected_graph_regularization):
             raise ValueError("member look selected regularization is invalid")
+        if not isinstance(self.output_proxy_refinement_applied, bool):
+            raise TypeError("member look proxy refinement flag must be boolean")
+        if (
+            isinstance(self.output_proxy_refinement_iteration, bool)
+            or not isinstance(self.output_proxy_refinement_iteration, int)
+            or self.output_proxy_refinement_iteration < 0
+            or self.output_proxy_refinement_applied
+            != (self.output_proxy_refinement_iteration > 0)
+        ):
+            raise ValueError("member look proxy refinement iteration is invalid")
 
     def apply(
         self,
@@ -202,6 +218,12 @@ class DirectMemberLookPlan:
             "predicted_high_shock_count": self.predicted_high_shock_count,
             "predicted_high_shock_fraction": self.predicted_high_shock_fraction,
             "predicted_source_spans": dict(self.predicted_source_spans),
+            "output_proxy_refinement_applied": (
+                self.output_proxy_refinement_applied
+            ),
+            "output_proxy_refinement_iteration": (
+                self.output_proxy_refinement_iteration
+            ),
             "segment_adjustments": [
                 {
                     "segment_index": observation.segment_index,
@@ -229,8 +251,15 @@ class DirectMemberLookPlan:
                 "cached_descriptor_fields": (
                     "lab_mean_gray_mean_gray_contrast"
                 ),
-                "full_song_proxy_rendered": False,
-                "additional_source_frames_decoded": False,
+                "full_song_proxy_rendered": (
+                    self.output_proxy_refinement_applied
+                ),
+                "additional_source_frames_decoded": (
+                    self.output_proxy_refinement_applied
+                ),
+                "output_domain_residual_composed_with_cached_grade": (
+                    self.output_proxy_refinement_applied
+                ),
             },
             "privacy": {
                 "raw_frames_persisted": False,
@@ -314,8 +343,11 @@ def solve_direct_member_look_adjustments(
     observations: Sequence[DirectMemberLookObservation],
     *,
     config: DirectMemberLookConfig | None = None,
+    require_predicted_pass: bool = True,
 ) -> DirectMemberLookPlan:
     settings = config or DirectMemberLookConfig()
+    if not isinstance(require_predicted_pass, bool):
+        raise TypeError("member look predicted-pass policy must be boolean")
     items = tuple(observations)
     if len(items) < 2:
         raise ValueError("member look calibration needs at least two segments")
@@ -521,14 +553,16 @@ def solve_direct_member_look_adjustments(
                 "luma": float(luma_step / settings.luma_step),
                 "chroma": float(chroma_step / settings.chroma_step),
             }
-            # Global Lab chroma follows the stage LEDs and background much
-            # more strongly than the authenticated performer.  Treating that
-            # signal as a skin/look discontinuity asks the grade to cancel the
-            # production's lighting design and can introduce a visible tint
-            # flash of its own.  Keep chroma in the diagnostics and retain the
-            # conservative per-source median normalization, but gate rapid
-            # look shocks only on the reliable global axes: luma and detail.
-            normalized = float(max(axes["sharpness"], axes["luma"]))
+            # Cached source descriptors cannot distinguish an intentional LED
+            # cue from a camera-grade mismatch, so their first pass keeps
+            # chroma diagnostic-only.  Once an actual encoded proxy exists,
+            # ``gate_rapid_chroma`` aligns this same solver with the final
+            # perceptual gate and permits a bounded residual correction.
+            normalized = float(
+                max(axes.values())
+                if settings.gate_rapid_chroma
+                else max(axes["sharpness"], axes["luma"])
+            )
             above_threshold = bool(normalized > 1.0)
             high_count += int(above_threshold)
             diagnostics.append(
@@ -593,7 +627,9 @@ def solve_direct_member_look_adjustments(
         or (spans["luma"] or 0.0) > settings.source_luma_span + 1e-12
         or (spans["chroma"] or 0.0) > settings.source_chroma_span + 1e-12
     )
-    if rapid_policy_failed or source_policy_failed:
+    if require_predicted_pass and (
+        rapid_policy_failed or source_policy_failed
+    ):
         failed_policies = ",".join(
             name
             for name, failed in (
@@ -650,6 +686,209 @@ def solve_direct_member_look_adjustments(
         predicted_source_spans=tuple(sorted(spans.items())),
         diagnostics=diagnostics,
         config=settings,
+    )
+
+
+def _compose_source_look_adjustments(
+    base: SourceLookAdjustment,
+    residual: SourceLookAdjustment,
+    *,
+    config: DirectMemberLookConfig,
+) -> SourceLookAdjustment:
+    """Compose two output-domain FFmpeg look passes into one bounded pass."""
+
+    contrast = _clip(
+        base.contrast * residual.contrast,
+        config.minimum_contrast,
+        config.maximum_contrast,
+    )
+    brightness = _clip(
+        base.brightness * residual.contrast + residual.brightness,
+        -config.maximum_brightness,
+        config.maximum_brightness,
+    )
+    saturation = _clip(
+        base.saturation * residual.saturation,
+        config.minimum_saturation,
+        config.maximum_saturation,
+    )
+    # FFmpeg applies saturation before the affine Cb/Cr temperature+tint
+    # offsets.  A second pass therefore scales the first offset by the second
+    # saturation and then adds its own.  Solve the exact combined code-value
+    # offset back into the single-pass temperature/tint parameterization.
+    chroma_code_response = np.asarray(
+        ((-86.0, -64.0), (74.0, -80.0)),
+        dtype=np.float64,
+    )
+    base_offset = chroma_code_response @ np.asarray(
+        (base.temperature_balance, base.tint_balance),
+        dtype=np.float64,
+    )
+    residual_offset = chroma_code_response @ np.asarray(
+        (residual.temperature_balance, residual.tint_balance),
+        dtype=np.float64,
+    )
+    combined_parameters = np.linalg.solve(
+        chroma_code_response,
+        base_offset * residual.saturation + residual_offset,
+    )
+    return SourceLookAdjustment(
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        temperature_balance=_clip(
+            float(combined_parameters[0]),
+            -config.maximum_temperature_balance,
+            config.maximum_temperature_balance,
+        ),
+        tint_balance=_clip(
+            float(combined_parameters[1]),
+            -config.maximum_tint_balance,
+            config.maximum_tint_balance,
+        ),
+    )
+
+
+def refine_direct_member_look_plan_from_rendered_proxy(
+    base_plan: DirectMemberLookPlan,
+    *,
+    rendered_proxy_review: Mapping[str, Any],
+    eligible_request_source_indices: Sequence[int],
+) -> DirectMemberLookPlan:
+    """Fit one bounded residual from actual encoded per-run proxy scalars."""
+
+    request_indices = tuple(int(value) for value in eligible_request_source_indices)
+    if (
+        len(request_indices) < 2
+        or len(set(request_indices)) != len(request_indices)
+        or any(value < 0 for value in request_indices)
+    ):
+        raise ValueError("member proxy look source mapping is invalid")
+    admission = rendered_proxy_review.get("perceptual_source_admission")
+    if not isinstance(admission, Mapping):
+        raise ValueError("member proxy perceptual admission is missing")
+    rapid = admission.get("rapid_quality_alternation")
+    if not isinstance(rapid, Mapping):
+        raise ValueError("member proxy rapid-run evidence is missing")
+    raw_runs = rapid.get("per_run")
+    if not isinstance(raw_runs, list) or not raw_runs:
+        raise ValueError("member proxy per-run scalars are missing")
+    base_runs = _runs(base_plan.observations)
+    if len(raw_runs) != len(base_runs):
+        raise ValueError("member proxy run count does not match cached look plan")
+    request_to_eligible = {
+        request_index: eligible_index
+        for eligible_index, request_index in enumerate(request_indices)
+    }
+    output_observations: list[DirectMemberLookObservation | None] = [
+        None
+    ] * len(base_plan.observations)
+    for base_run, raw_run in zip(base_runs, raw_runs, strict=True):
+        if not isinstance(raw_run, Mapping):
+            raise ValueError("member proxy run evidence is malformed")
+        request_source_index = raw_run.get("source_index")
+        decoded_count = raw_run.get("decoded_output_frame_count")
+        duration_seconds = raw_run.get("duration_seconds")
+        scalars = raw_run.get("scalars")
+        if (
+            not isinstance(request_source_index, int)
+            or isinstance(request_source_index, bool)
+            or request_to_eligible.get(request_source_index)
+            != base_run.source_index
+            or not isinstance(decoded_count, int)
+            or isinstance(decoded_count, bool)
+            or decoded_count < 1
+            or not isinstance(duration_seconds, (int, float))
+            or abs(float(duration_seconds) - base_run.duration_seconds) > 1e-6
+            or not isinstance(scalars, Mapping)
+        ):
+            raise ValueError("member proxy run binding does not match look plan")
+        values = tuple(
+            scalars.get(name)
+            for name in (
+                "perceptual_luma",
+                "perceptual_chroma_a",
+                "perceptual_chroma_b",
+                "perceptual_detail",
+            )
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values
+        ):
+            raise ValueError("member proxy run scalars are invalid")
+        luma, chroma_a, chroma_b, detail = (
+            float(value) for value in values
+        )
+        for segment_index in base_run.segment_indices:
+            base_observation = base_plan.observations[segment_index]
+            output_observations[segment_index] = DirectMemberLookObservation(
+                segment_index=segment_index,
+                source_index=base_run.source_index,
+                duration_seconds=base_observation.duration_seconds,
+                luma=luma,
+                chroma_a=chroma_a,
+                chroma_b=chroma_b,
+                detail_proxy=max(1e-4, detail),
+                sample_count=decoded_count,
+            )
+    if any(value is None for value in output_observations):
+        raise ValueError("member proxy look refinement missed a segment")
+    checked_observations = tuple(
+        value for value in output_observations if value is not None
+    )
+    refinement_config = replace(
+        base_plan.config,
+        gate_rapid_chroma=True,
+    )
+    residual_plan = solve_direct_member_look_adjustments(
+        checked_observations,
+        config=refinement_config,
+        require_predicted_pass=False,
+    )
+    composed = tuple(
+        _compose_source_look_adjustments(
+            base,
+            residual,
+            config=refinement_config,
+        )
+        for base, residual in zip(
+            base_plan.segment_adjustments,
+            residual_plan.segment_adjustments,
+            strict=True,
+        )
+    )
+    return DirectMemberLookPlan(
+        observations=checked_observations,
+        segment_adjustments=composed,
+        selected_graph_regularization=(
+            residual_plan.selected_graph_regularization
+        ),
+        rapid_boundary_count=residual_plan.rapid_boundary_count,
+        predicted_high_shock_count=(
+            residual_plan.predicted_high_shock_count
+        ),
+        predicted_high_shock_fraction=(
+            residual_plan.predicted_high_shock_fraction
+        ),
+        predicted_source_spans=residual_plan.predicted_source_spans,
+        diagnostics=tuple(
+            {
+                **item,
+                "output_proxy_residual": True,
+                "refinement_iteration": (
+                    base_plan.output_proxy_refinement_iteration + 1
+                ),
+            }
+            for item in residual_plan.diagnostics
+        ),
+        config=refinement_config,
+        output_proxy_refinement_applied=True,
+        output_proxy_refinement_iteration=(
+            base_plan.output_proxy_refinement_iteration + 1
+        ),
     )
 
 
@@ -722,5 +961,6 @@ __all__ = [
     "DirectMemberLookObservation",
     "DirectMemberLookPlan",
     "build_direct_member_look_plan",
+    "refine_direct_member_look_plan_from_rendered_proxy",
     "solve_direct_member_look_adjustments",
 ]

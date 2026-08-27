@@ -5,6 +5,7 @@ import unittest
 
 from crosscut.direct_member_look import (
     DirectMemberLookObservation,
+    refine_direct_member_look_plan_from_rendered_proxy,
     solve_direct_member_look_adjustments,
 )
 
@@ -88,6 +89,64 @@ class DirectMemberLookTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "segment order"):
             solve_direct_member_look_adjustments(observations)
+
+    def test_encoded_proxy_scalars_produce_one_composed_residual_pass(self) -> None:
+        observations = tuple(
+            DirectMemberLookObservation(
+                segment_index=index,
+                source_index=index % 2,
+                duration_seconds=1.5,
+                luma=0.42 if index % 2 == 0 else 0.50,
+                chroma_a=0.10 if index % 2 == 0 else 0.03,
+                chroma_b=-0.08 if index % 2 == 0 else -0.16,
+                detail_proxy=0.13 if index % 2 == 0 else 0.17,
+                sample_count=6,
+            )
+            for index in range(6)
+        )
+        base = solve_direct_member_look_adjustments(observations)
+        per_run = [
+            {
+                "run_index": index,
+                "source_index": 4 if index % 2 == 0 else 7,
+                "duration_seconds": 1.5,
+                "decoded_output_frame_count": 45,
+                "incoming_boundary_index": None if index == 0 else index - 1,
+                "scalars": {
+                    "perceptual_detail": 0.10 if index % 2 == 0 else 0.20,
+                    "perceptual_luma": 0.36 if index % 2 == 0 else 0.54,
+                    "perceptual_chroma_a": 0.16 if index % 2 == 0 else 0.01,
+                    "perceptual_chroma_b": -0.04 if index % 2 == 0 else -0.20,
+                    "perceptual_contrast": 0.70,
+                },
+            }
+            for index in range(6)
+        ]
+
+        refined = refine_direct_member_look_plan_from_rendered_proxy(
+            base,
+            rendered_proxy_review={
+                "perceptual_source_admission": {
+                    "rapid_quality_alternation": {"per_run": per_run}
+                }
+            },
+            eligible_request_source_indices=(4, 7),
+        )
+
+        self.assertTrue(refined.output_proxy_refinement_applied)
+        self.assertEqual(refined.output_proxy_refinement_iteration, 1)
+        self.assertTrue(refined.config.gate_rapid_chroma)
+        self.assertNotEqual(
+            refined.segment_adjustments,
+            base.segment_adjustments,
+        )
+        payload = refined.to_dict()
+        self.assertTrue(payload["calibration"]["full_song_proxy_rendered"])
+        self.assertTrue(
+            payload["calibration"][
+                "output_domain_residual_composed_with_cached_grade"
+            ]
+        )
 
 
 if __name__ == "__main__":

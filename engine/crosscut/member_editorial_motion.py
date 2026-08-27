@@ -64,7 +64,7 @@ class MemberEditorialMotionConfig:
             raise ValueError("member editorial ramp is outside the reference window")
         if not 1.02 <= self.maximum_boundary_zoom <= 1.50:
             raise ValueError("member editorial zoom is outside the renderer bound")
-        if not 0.0 <= self.maximum_center_shift <= 0.12:
+        if not 0.0 <= self.maximum_center_shift <= 0.16:
             raise ValueError("member editorial pan exceeds the shared-camera bound")
         if not 0.0 <= self.maximum_boundary_center_distance <= 0.30:
             raise ValueError("member boundary center-distance gate is invalid")

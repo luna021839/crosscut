@@ -22,8 +22,16 @@ from .direct_member_visual import (
     _actual_pose_vector,
     _attention_geometry,
     _attention_mismatch,
+    _common_attention_geometries,
     _cut_adjacent_motion_evidence,
     _embedding_distance,
+)
+from .direct_member_target_face import (
+    FOCAL_FACE_BASIS,
+    FocalFaceCandidate,
+    detect_focal_face_candidates,
+    select_focal_face_matching_reference,
+    select_focal_face_pair,
 )
 from .visual_score import FrameVisualDescriptor, _VideoSampler
 
@@ -133,6 +141,9 @@ class _FinalVideoDescriptorProvider:
     def __init__(self, path: Path) -> None:
         self._sampler = _VideoSampler(path)
         self._cache: dict[object, FrameVisualDescriptor | None] = {}
+        self._focal_face_cache: dict[
+            object, tuple[FocalFaceCandidate, ...]
+        ] = {}
 
     def __call__(self, seconds: float) -> FrameVisualDescriptor | None:
         identity = self._sampler.frame_identity(seconds)
@@ -148,6 +159,24 @@ class _FinalVideoDescriptorProvider:
             descriptor = None
         self._cache[identity] = descriptor
         return descriptor
+
+    def focal_face_candidates(
+        self,
+        seconds: float,
+    ) -> tuple[FocalFaceCandidate, ...]:
+        identity = self._sampler.frame_identity(seconds)
+        if identity not in self._focal_face_cache:
+            try:
+                frame = self._sampler.frame_at(seconds)
+                candidates = (
+                    detect_focal_face_candidates(frame)
+                    if frame is not None
+                    else ()
+                )
+            except Exception:
+                candidates = ()
+            self._focal_face_cache[identity] = candidates
+        return self._focal_face_cache[identity]
 
     def close(self) -> None:
         self._sampler.close()
@@ -166,6 +195,76 @@ def _sample(
         source_local_seconds=seconds,
         descriptor=descriptor,
         attention=_attention_geometry(descriptor),
+    )
+
+
+def _samples_with_common_attention(
+    samples: Sequence[_BoundarySample],
+    *,
+    minimum_silhouette_confidence: float,
+) -> tuple[_BoundarySample, ...]:
+    geometries = _common_attention_geometries(
+        tuple(sample.descriptor for sample in samples),
+        minimum_silhouette_confidence=minimum_silhouette_confidence,
+    )
+    if geometries is None:
+        return tuple(replace(sample, attention=None) for sample in samples)
+    return tuple(
+        replace(sample, attention=geometry)
+        for sample, geometry in zip(samples, geometries, strict=True)
+    )
+
+
+def _sample_with_focal_face(
+    sample: _BoundarySample,
+    candidate: FocalFaceCandidate,
+) -> _BoundarySample:
+    box = candidate.bbox_xywh
+    return replace(
+        sample,
+        attention=_AttentionGeometry(
+            bbox_xywh=box,
+            centroid_xy=(
+                box[0] + box[2] / 2.0,
+                box[1] + box[3] / 2.0,
+            ),
+            basis=FOCAL_FACE_BASIS,
+        ),
+    )
+
+
+def _focal_face_window(
+    provider: RenderedDescriptorProvider,
+    *,
+    frame_indices: Sequence[int],
+    fps: float,
+) -> tuple[
+    tuple[FocalFaceCandidate | None, ...],
+    float,
+] | None:
+    """Resolve the same focal face at a hard cut and adjacent motion frames."""
+
+    candidate_provider = getattr(provider, "focal_face_candidates", None)
+    if not callable(candidate_provider) or len(frame_indices) != 4:
+        return None
+    candidates = tuple(
+        tuple(candidate_provider(frame_index / fps))
+        for frame_index in frame_indices
+    )
+    pair = select_focal_face_pair(candidates[1], candidates[2])
+    if pair is None:
+        return None
+    previous = select_focal_face_matching_reference(
+        candidates[0],
+        (pair.outgoing,),
+    )
+    following = select_focal_face_matching_reference(
+        candidates[3],
+        (pair.incoming,),
+    )
+    return (
+        (previous, pair.outgoing, pair.incoming, following),
+        pair.cosine_similarity,
     )
 
 
@@ -241,6 +340,8 @@ def evaluate_direct_member_rendered_continuity(
     effect_endpoint_pair_count = 0
     effect_endpoint_attention_count = 0
     effect_endpoint_pose_count = 0
+    focal_face_correspondence_count = 0
+    focal_face_motion_window_count = 0
 
     def fail(reason: str, boundary_index: int) -> None:
         failures_by_reason.setdefault(reason, []).append(boundary_index)
@@ -256,6 +357,12 @@ def evaluate_direct_member_rendered_continuity(
         nonlocal effect_endpoint_attention_count
         nonlocal effect_endpoint_pose_count
         effect_endpoint_pair_count += 1
+        left, right = _samples_with_common_attention(
+            (left, right),
+            minimum_silhouette_confidence=(
+                visual_config.minimum_silhouette_confidence
+            ),
+        )
         if left.descriptor is None or right.descriptor is None:
             fail("rendered_effect_endpoint_descriptor_missing", boundary_index)
         position, scale = _attention_mismatch(left.attention, right.attention)
@@ -440,9 +547,44 @@ def evaluate_direct_member_rendered_continuity(
             )
             if not descriptors_available:
                 fail("rendered_boundary_descriptor_missing", boundary_index)
+            focal_window = _focal_face_window(
+                provider,
+                frame_indices=(
+                    boundary_frame - 2,
+                    boundary_frame - 1,
+                    boundary_frame,
+                    boundary_frame + 1,
+                ),
+                fps=fps,
+            )
+            focal_similarity: float | None = None
+            if focal_window is not None:
+                focal_candidates, focal_similarity = focal_window
+                assert focal_candidates[1] is not None
+                assert focal_candidates[2] is not None
+                endpoint_samples = (
+                    _sample_with_focal_face(
+                        outgoing_endpoint,
+                        focal_candidates[1],
+                    ),
+                    _sample_with_focal_face(
+                        incoming_start,
+                        focal_candidates[2],
+                    ),
+                )
+                focal_face_correspondence_count += 1
+            else:
+                focal_candidates = (None, None, None, None)
+                endpoint_samples = _samples_with_common_attention(
+                    (outgoing_endpoint, incoming_start),
+                    minimum_silhouette_confidence=(
+                        visual_config.minimum_silhouette_confidence
+                    ),
+                )
+            endpoint_outgoing, endpoint_incoming = endpoint_samples
             position, scale = _attention_mismatch(
-                outgoing_endpoint.attention,
-                incoming_start.attention,
+                endpoint_outgoing.attention,
+                endpoint_incoming.attention,
             )
             if position is None or scale is None:
                 fail("rendered_boundary_attention_missing", boundary_index)
@@ -459,6 +601,7 @@ def evaluate_direct_member_rendered_continuity(
             right = incoming_start.descriptor
             pose_mismatch: float | None = None
             silhouette_mismatch: float | None = None
+            aggregate_silhouette_mismatch: float | None = None
             if left is not None and right is not None:
                 left_pose = _actual_pose_vector(left, visual_config)
                 right_pose = _actual_pose_vector(right, visual_config)
@@ -471,7 +614,7 @@ def evaluate_direct_member_rendered_continuity(
                     pose_values.append(pose_mismatch)
                     if pose_mismatch > settings.maximum_pose_mismatch + 1e-9:
                         fail("rendered_boundary_pose_discontinuity", boundary_index)
-                silhouette_mismatch = _embedding_distance(
+                aggregate_silhouette_mismatch = _embedding_distance(
                     left.silhouette_embedding
                     if left.silhouette_confidence
                     >= visual_config.minimum_silhouette_confidence
@@ -480,6 +623,15 @@ def evaluate_direct_member_rendered_continuity(
                     if right.silhouette_confidence
                     >= visual_config.minimum_silhouette_confidence
                     else (),
+                )
+                # A full-frame segmentation contains every visible dancer.
+                # Once the official-fancam focal face has been verified on
+                # both sides, that aggregate is not the target member's body
+                # outline and must not overrule focal geometry and pose.
+                silhouette_mismatch = (
+                    None
+                    if focal_window is not None
+                    else aggregate_silhouette_mismatch
                 )
                 if silhouette_mismatch is not None:
                     silhouette_values.append(silhouette_mismatch)
@@ -494,11 +646,29 @@ def evaluate_direct_member_rendered_continuity(
             if pose_mismatch is None and silhouette_mismatch is None:
                 fail("rendered_boundary_shape_evidence_missing", boundary_index)
 
+            if all(candidate is not None for candidate in focal_candidates):
+                motion_samples = tuple(
+                    _sample_with_focal_face(sample, candidate)
+                    for sample, candidate in zip(
+                        samples,
+                        focal_candidates,
+                        strict=True,
+                    )
+                    if candidate is not None
+                )
+                focal_face_motion_window_count += 1
+            else:
+                motion_samples = _samples_with_common_attention(
+                    samples,
+                    minimum_silhouette_confidence=(
+                        visual_config.minimum_silhouette_confidence
+                    ),
+                )
             motion = _cut_adjacent_motion_evidence(
-                outgoing_previous=outgoing_previous,
-                outgoing_endpoint=outgoing_endpoint,
-                incoming_start=incoming_start,
-                incoming_next=incoming_next,
+                outgoing_previous=motion_samples[0],
+                outgoing_endpoint=motion_samples[1],
+                incoming_start=motion_samples[2],
+                incoming_next=motion_samples[3],
                 config=visual_config,
                 output_space_subject_motion_used=True,
             )
@@ -538,13 +708,13 @@ def evaluate_direct_member_rendered_continuity(
                     "descriptors_available": descriptors_available,
                     "attention_basis": {
                         "outgoing": (
-                            outgoing_endpoint.attention.basis
-                            if outgoing_endpoint.attention is not None
+                            endpoint_outgoing.attention.basis
+                            if endpoint_outgoing.attention is not None
                             else None
                         ),
                         "incoming": (
-                            incoming_start.attention.basis
-                            if incoming_start.attention is not None
+                            endpoint_incoming.attention.basis
+                            if endpoint_incoming.attention is not None
                             else None
                         ),
                     },
@@ -552,6 +722,10 @@ def evaluate_direct_member_rendered_continuity(
                     "attention_scale_mismatch": scale,
                     "pose_mismatch": pose_mismatch,
                     "silhouette_mismatch": silhouette_mismatch,
+                    "aggregate_silhouette_mismatch_diagnostic_only": (
+                        aggregate_silhouette_mismatch
+                    ),
+                    "focal_face_correspondence_similarity": focal_similarity,
                     "motion": motion.to_dict(),
                     "raw_embeddings_persisted": False,
                 }
@@ -628,6 +802,10 @@ def evaluate_direct_member_rendered_continuity(
         "effect_endpoint_pair_count": effect_endpoint_pair_count,
         "effect_endpoint_attention_count": effect_endpoint_attention_count,
         "effect_endpoint_pose_count": effect_endpoint_pose_count,
+        "focal_face_correspondence_boundary_count": (
+            focal_face_correspondence_count
+        ),
+        "focal_face_motion_window_count": focal_face_motion_window_count,
         "actual_pose_boundary_count": actual_pose_count,
         "actual_pose_coverage_fraction": pose_coverage,
         "attention_boundary_count": attention_count,
