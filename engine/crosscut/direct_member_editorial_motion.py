@@ -1037,6 +1037,201 @@ def _stabilize_subject_relative_face_track(
     return output
 
 
+def _stabilize_face_associated_subject_track(
+    *,
+    frame_indices: Sequence[int],
+    subject_boxes: Sequence[tuple[float, float, float, float] | None],
+    face_boxes: Sequence[tuple[float, float, float, float]],
+    frame_count: int,
+    config: DirectMemberEditorialMotionConfig,
+) -> list[tuple[float, float, float, float]] | None:
+    """Smooth detector-only subject jumps from the audited boundary inward."""
+
+    if any(subject_box is None for subject_box in subject_boxes):
+        return None
+    output: list[tuple[float, float, float, float] | None] = list(
+        subject_boxes
+    )
+
+    def connected(left: int, right: int) -> bool:
+        left_box = output[left]
+        right_box = output[right]
+        if left_box is None or right_box is None:
+            return False
+        frame_gap = abs(frame_indices[right] - frame_indices[left])
+        if (
+            frame_gap <= 0
+            or frame_gap
+            > config.maximum_dense_face_interpolation_gap_frames + 1
+        ):
+            return False
+        center_distance = math.hypot(
+            _center(left_box)[0] - _center(right_box)[0],
+            _center(left_box)[1] - _center(right_box)[1],
+        )
+        maximum_center_distance = min(
+            0.35,
+            config.maximum_dense_subject_center_step
+            + 0.0075 * max(0, frame_gap - 1),
+        )
+        height_ratio = max(left_box[3], right_box[3]) / max(
+            1e-9,
+            min(left_box[3], right_box[3]),
+        )
+        maximum_height_ratio = min(
+            1.80,
+            config.maximum_dense_subject_height_ratio
+            + 0.025 * max(0, frame_gap - 1),
+        )
+        return (
+            center_distance <= maximum_center_distance + 1e-9
+            and height_ratio <= maximum_height_ratio + 1e-9
+        )
+
+    run_start = 0
+    while run_start < len(frame_indices):
+        run_end = run_start
+        while (
+            run_end + 1 < len(frame_indices)
+            and frame_indices[run_end] + 1 == frame_indices[run_end + 1]
+        ):
+            run_end += 1
+        detections = list(range(run_start, run_end + 1))
+        if frame_indices[run_start] == 0:
+            ordered = detections
+            anchored = True
+        elif frame_indices[run_end] == frame_count - 1:
+            ordered = list(reversed(detections))
+            anchored = True
+        else:
+            ordered = detections
+            anchored = False
+
+        scores = [float("-inf")] * len(ordered)
+        lengths = [0] * len(ordered)
+        predecessors: list[int | None] = [None] * len(ordered)
+        for position, current in enumerate(ordered):
+            if not anchored or position == 0:
+                scores[position] = 1.0
+                lengths[position] = 1
+            for previous_position in range(position):
+                if not math.isfinite(scores[previous_position]):
+                    continue
+                previous = ordered[previous_position]
+                if not connected(previous, current):
+                    continue
+                frame_gap = abs(
+                    frame_indices[current] - frame_indices[previous]
+                )
+                candidate_score = (
+                    scores[previous_position]
+                    + 1.0
+                    - 0.02 * max(0, frame_gap - 1)
+                )
+                candidate_length = lengths[previous_position] + 1
+                if (
+                    candidate_score > scores[position] + 1e-9
+                    or abs(candidate_score - scores[position]) <= 1e-9
+                    and candidate_length > lengths[position]
+                ):
+                    scores[position] = candidate_score
+                    lengths[position] = candidate_length
+                    predecessors[position] = previous_position
+        reachable = [
+            position
+            for position, score in enumerate(scores)
+            if math.isfinite(score)
+        ]
+        if not reachable:
+            return None
+        if anchored:
+            endpoint = max(
+                reachable,
+                key=lambda position: (
+                    abs(
+                        frame_indices[ordered[position]]
+                        - frame_indices[ordered[0]]
+                    ),
+                    scores[position],
+                    lengths[position],
+                ),
+            )
+        else:
+            endpoint = max(
+                reachable,
+                key=lambda position: (
+                    scores[position],
+                    lengths[position],
+                ),
+            )
+        kept: set[int] = set()
+        cursor: int | None = endpoint
+        while cursor is not None:
+            kept.add(ordered[cursor])
+            cursor = predecessors[cursor]
+        for index in detections:
+            if index not in kept:
+                output[index] = None
+
+        anchors = [
+            index
+            for index in detections
+            if output[index] is not None
+        ]
+        if not anchors:
+            return None
+        first_anchor = anchors[0]
+        last_anchor = anchors[-1]
+        if (
+            first_anchor - run_start
+            > config.maximum_dense_face_edge_extrapolation_frames
+            or run_end - last_anchor
+            > config.maximum_dense_face_edge_extrapolation_frames
+        ):
+            return None
+
+        def project_anchor(anchor: int, target: int):
+            anchor_subject = output[anchor]
+            assert anchor_subject is not None
+            relative = _relative_box(anchor_subject, face_boxes[anchor])
+            if relative is None:
+                return anchor_subject
+            return (
+                _box_from_relative(relative, face_boxes[target])
+                or anchor_subject
+            )
+
+        for index in range(run_start, first_anchor):
+            output[index] = project_anchor(first_anchor, index)
+        for index in range(last_anchor + 1, run_end + 1):
+            output[index] = project_anchor(last_anchor, index)
+        for left_anchor, right_anchor in zip(anchors, anchors[1:]):
+            gap = right_anchor - left_anchor - 1
+            if gap <= 0:
+                continue
+            if gap > config.maximum_dense_face_interpolation_gap_frames:
+                return None
+            left_box = output[left_anchor]
+            right_box = output[right_anchor]
+            assert left_box is not None and right_box is not None
+            for index in range(left_anchor + 1, right_anchor):
+                alpha = (index - left_anchor) / (
+                    right_anchor - left_anchor
+                )
+                output[index] = _linear_box(left_box, right_box, alpha)
+        run_start = run_end + 1
+
+    resolved = [box for box in output if box is not None]
+    if len(resolved) != len(output):
+        return None
+    return _median_smooth_geometry(
+        frame_indices,
+        resolved,
+        radius=config.dense_geometry_median_radius_frames,
+        preserve_run_endpoints=True,
+    )
+
+
 def _reconstruct_dense_face_geometry(
     *,
     frame_indices: Sequence[int],
@@ -1278,6 +1473,21 @@ def _track_is_dense_face_safe(
         )
     else:
         return reject("dense_alignment_geometry_basis_invalid")
+
+    if (
+        resolved_basis == _FACE_ATTENTION_BASIS
+        and all(subject_box is not None for subject_box in subject_boxes)
+    ):
+        stabilized_subject_boxes = _stabilize_face_associated_subject_track(
+            frame_indices=ordered_frames,
+            subject_boxes=subject_boxes,
+            face_boxes=boxes,
+            frame_count=frame_count,
+            config=config,
+        )
+        if stabilized_subject_boxes is None:
+            return reject("dense_subject_track_gap_unresolved")
+        subject_boxes = list(stabilized_subject_boxes)
 
     if (
         resolved_basis != _FACE_ATTENTION_BASIS
@@ -1719,9 +1929,8 @@ def build_direct_member_editorial_motion_plan(
         required_improvement_fraction = (
             min(settings.minimum_mismatch_improvement_fraction, 0.05)
             if required
-            and baseline <= 0.10 + 1e-9
-            and center_distance <= 0.05 + 1e-9
-            and ratio <= 1.05 + 1e-9
+            and left_sample.subject_bbox_xywh is not None
+            and right_sample.subject_bbox_xywh is not None
             else settings.minimum_mismatch_improvement_fraction
         )
 
