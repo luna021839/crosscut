@@ -1631,22 +1631,60 @@ def _track_is_dense_face_safe(
             state_sample.center_x,
             state_sample.center_y,
         )
-        face_visible_fraction = _visible_fraction(box, state)
-        if (
-            face_visible_fraction + 1e-9
-            < config.minimum_dense_face_visible_fraction
-        ):
-            raw_face_visible_fraction = _visible_fraction(raw_box, state)
-            return reject(
-                "dense_face_crop_exceeds_visible_fraction",
-                f"frame={frame_index},visible={face_visible_fraction:.6f},"
-                f"raw_visible={raw_face_visible_fraction:.6f},"
-                f"zoom={state.zoom:.6f},center_x={state.center_x:.6f},"
-                f"center_y={state.center_y:.6f},"
-                f"raw_box={','.join(f'{value:.6f}' for value in raw_box)},"
-                f"resolved_box={','.join(f'{value:.6f}' for value in box)},"
-                f"subject_basis={sample.subject_geometry_basis}",
-            )
+        if resolved_basis == _FACE_ATTENTION_BASIS:
+            face_visible_fraction = _visible_fraction(box, state)
+            if (
+                face_visible_fraction + 1e-9
+                < config.minimum_dense_face_visible_fraction
+            ):
+                raw_face_visible_fraction = _visible_fraction(raw_box, state)
+                return reject(
+                    "dense_face_crop_exceeds_visible_fraction",
+                    f"frame={frame_index},"
+                    f"visible={face_visible_fraction:.6f},"
+                    f"raw_visible={raw_face_visible_fraction:.6f},"
+                    f"zoom={state.zoom:.6f},center_x={state.center_x:.6f},"
+                    f"center_y={state.center_y:.6f},"
+                    f"raw_box={','.join(f'{value:.6f}' for value in raw_box)},"
+                    f"resolved_box="
+                    f"{','.join(f'{value:.6f}' for value in box)},"
+                    f"subject_basis={sample.subject_geometry_basis}",
+                )
+        else:
+            if sample.face_count == 1:
+                raw_face_visible_fraction = _visible_fraction(raw_box, state)
+                if (
+                    raw_face_visible_fraction + 1e-9
+                    < config.minimum_dense_face_visible_fraction
+                ):
+                    return reject(
+                        "dense_face_crop_exceeds_visible_fraction",
+                        f"frame={frame_index},"
+                        f"visible={raw_face_visible_fraction:.6f},"
+                        f"zoom={state.zoom:.6f},"
+                        f"center_x={state.center_x:.6f},"
+                        f"center_y={state.center_y:.6f},"
+                        "basis=face_inside_subject_alignment",
+                    )
+                minimum_alignment_visible_fraction = (
+                    config.minimum_face_associated_subject_visible_fraction
+                )
+            else:
+                minimum_alignment_visible_fraction = (
+                    config.minimum_widened_subject_visible_fraction
+                )
+            alignment_visible_fraction = _visible_fraction(box, state)
+            if (
+                alignment_visible_fraction + 1e-9
+                < minimum_alignment_visible_fraction
+            ):
+                return reject(
+                    "dense_subject_crop_exceeds_visible_fraction",
+                    f"frame={frame_index},"
+                    f"visible={alignment_visible_fraction:.6f},"
+                    f"minimum={minimum_alignment_visible_fraction:.6f},"
+                    f"zoom={state.zoom:.6f},basis={resolved_basis}",
+                )
         if widened_subject_proof_required:
             if (
                 subject_box is None
