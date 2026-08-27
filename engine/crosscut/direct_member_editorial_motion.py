@@ -329,16 +329,32 @@ class DirectMemberDenseFaceProvider:
             subject_box = None
             subject_confidence = 0.0
             subject_basis = "none"
-            if (
-                descriptor.silhouette_bbox_xywh is not None
+            face = descriptor.primary_face_bbox
+            silhouette_box = descriptor.silhouette_bbox_xywh
+            verified_silhouette = bool(
+                silhouette_box is not None
                 and descriptor.silhouette_confidence >= 0.30
                 and descriptor.silhouette_backend == SILHOUETTE_BACKEND
+            )
+            silhouette_contains_face = bool(
+                verified_silhouette
+                and face is not None
+                and silhouette_box is not None
+                and silhouette_box[0] - 1e-6
+                <= face[0] + face[2] / 2.0
+                <= silhouette_box[0] + silhouette_box[2] + 1e-6
+                and silhouette_box[1] - 1e-6
+                <= face[1] + face[3] / 2.0
+                <= silhouette_box[1] + silhouette_box[3] + 1e-6
+            )
+            if verified_silhouette and (
+                face is None or silhouette_contains_face
             ):
-                subject_box = descriptor.silhouette_bbox_xywh
+                assert silhouette_box is not None
+                subject_box = silhouette_box
                 subject_confidence = descriptor.silhouette_confidence
                 subject_basis = "pphumanseg_full_subject_silhouette"
-            elif descriptor.primary_face_bbox is not None:
-                face = descriptor.primary_face_bbox
+            elif face is not None:
                 face_center = (
                     face[0] + face[2] / 2.0,
                     face[1] + face[3] / 2.0,
@@ -1114,34 +1130,14 @@ def _reconstruct_dense_face_geometry(
             left_box = output[left_anchor]
             right_box = output[right_anchor]
             assert left_box is not None and right_box is not None
-            left_subject = subject_boxes[left_anchor]
-            right_subject = subject_boxes[right_anchor]
-            left_relative = (
-                _relative_box(left_box, left_subject)
-                if left_subject is not None
-                else None
-            )
-            right_relative = (
-                _relative_box(right_box, right_subject)
-                if right_subject is not None
-                else None
-            )
             for index in range(left_anchor + 1, right_anchor):
                 alpha = (index - left_anchor) / (right_anchor - left_anchor)
-                target_subject = subject_boxes[index]
-                reconstructed = None
-                if (
-                    left_relative is not None
-                    and right_relative is not None
-                    and target_subject is not None
-                ):
-                    reconstructed = _box_from_relative(
-                        _linear_box(left_relative, right_relative, alpha),
-                        target_subject,
-                    )
-                if reconstructed is None:
-                    reconstructed = _linear_box(left_box, right_box, alpha)
-                output[index] = reconstructed
+                # Identity association is solved in subject-relative space,
+                # but visible motion continuity is an output-screen contract.
+                # Reconstruct a rejected detector excursion directly between
+                # its verified screen-space anchors so a breathing silhouette
+                # cannot recreate the very jump that was removed above.
+                output[index] = _linear_box(left_box, right_box, alpha)
         if any(output[index] is None for index in range(run_start, run_end + 1)):
             return None
         run_start = run_end + 1
@@ -1149,39 +1145,6 @@ def _reconstruct_dense_face_geometry(
     if len(resolved) != len(output):
         return None
     if all(subject_box is not None for subject_box in subject_boxes):
-        resolved_subjects = [
-            subject_box
-            for subject_box in subject_boxes
-            if subject_box is not None
-        ]
-        relative_boxes = [
-            _relative_box(box, subject)
-            for box, subject in zip(
-                resolved,
-                resolved_subjects,
-                strict=True,
-            )
-        ]
-        if all(relative is not None for relative in relative_boxes):
-            smoothed_relative = _median_smooth_geometry(
-                frame_indices,
-                [
-                    relative
-                    for relative in relative_boxes
-                    if relative is not None
-                ],
-                radius=config.dense_geometry_median_radius_frames,
-            )
-            remapped = [
-                _box_from_relative(relative, subject)
-                for relative, subject in zip(
-                    smoothed_relative,
-                    resolved_subjects,
-                    strict=True,
-                )
-            ]
-            if all(box is not None for box in remapped):
-                return [box for box in remapped if box is not None]
         return _median_smooth_geometry(
             frame_indices,
             resolved,

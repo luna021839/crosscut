@@ -142,7 +142,8 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(
             plan.analysis_basis,
             "official_target_fancam_face_or_verified_full_subject_dense_"
-            "output_frame_subject_relative_face_track_adaptive_review_v7",
+            "output_frame_boundary_anchored_subject_relative_face_track_"
+            "adaptive_review_v8",
         )
 
     def test_verified_full_subject_match_is_accepted_without_face(self) -> None:
