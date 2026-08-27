@@ -10029,6 +10029,7 @@ def _select_direct_member_partition_profile(
         _DirectFullFramePartitionProfile,
         ...,
     ] = ()
+    partition_search_minimum_hold_feedback_evaluation_count = 0
     partition_search_strict_terminal_audition_limit_reached = False
     partition_search_strict_terminal_audition_pruned_profile_count = 0
     partition_search_post_feasible_cost_pruned_profile_count = 0
@@ -11742,19 +11743,28 @@ def _select_direct_member_partition_profile(
                             partition_search_signature_deduplication_count += 1
                             continue
                         seen_signatures.add(profile.unit_counts)
-                        queued.append(
-                            (
-                                _direct_partition_queue_priority(profile),
-                                queued_sequence,
-                                profile,
-                            )
-                        )
-                        queued_sequence += 1
                         partition_search_generated_profile_count += 1
                         admitted_hold_feedback_profiles.append(profile)
                     partition_search_minimum_hold_feedback_profiles = tuple(
                         admitted_hold_feedback_profiles
                     )
+                    minimum_hold_feedback_feasible_count = 0
+                    for profile in admitted_hold_feedback_profiles:
+                        error = _evaluate(profile)
+                        partition_search_minimum_hold_feedback_evaluation_count += 1
+                        partition_search_composed_profile_evaluation_count += 1
+                        evaluated_signatures.add(profile.unit_counts)
+                        if error is None:
+                            minimum_hold_feedback_feasible_count += 1
+                            break
+                        if _direct_partition_failure_is_proven(
+                            error.diagnostics
+                        ):
+                            _record_terminal_safe_hold_candidate(
+                                profile,
+                                error,
+                            )
+                            _enqueue_children(profile, error)
                     minimum_hold_probe = raw_diagnostic.get(
                         "minimum_hold_probe"
                     )
@@ -11762,14 +11772,22 @@ def _select_direct_member_partition_profile(
                         event=(
                             "direct_member_minimum_hold_feedback_partition"
                         ),
-                        phase="minimum_hold_feedback_queued",
+                        phase="minimum_hold_feedback_evaluated",
                         result=(
-                            "candidates_queued"
+                            "feasible"
+                            if minimum_hold_feedback_feasible_count
+                            else "all_candidates_infeasible"
                             if admitted_hold_feedback_profiles
                             else "no_novel_candidate"
                         ),
                         generated_profile_count=len(
                             admitted_hold_feedback_profiles
+                        ),
+                        evaluated_profile_count=(
+                            partition_search_minimum_hold_feedback_evaluation_count
+                        ),
+                        feasible_profile_count=(
+                            minimum_hold_feedback_feasible_count
                         ),
                         strict_maximum_same_source_hold_count=(
                             minimum_hold_probe.get(
@@ -11788,20 +11806,22 @@ def _select_direct_member_partition_profile(
                         full_selector_recheck_required=True,
                         visual_gates_relaxed=False,
                     )
-            hold_feedback_signatures = {
-                profile.unit_counts
-                for profile in partition_search_minimum_hold_feedback_profiles
-            }
-            partition_search_queued_frontier_profiles = (
-                *partition_search_minimum_hold_feedback_profiles,
-                *(
-                    item[2]
-                    for item in sorted(
-                        queued,
-                        key=lambda item: (item[0], item[1]),
-                    )
-                    if item[2].unit_counts not in hold_feedback_signatures
-                ),
+            partition_search_queued_frontier_profiles = tuple(
+                item[2]
+                for item in sorted(
+                    queued,
+                    key=lambda item: (
+                        0
+                        if any(
+                            shift.trigger
+                            == "lexicographic_minimum_hold_witness_cluster"
+                            for shift in item[2].boundary_shifts
+                        )
+                        else 1,
+                        item[0],
+                        item[1],
+                    ),
+                )
             )
         elif not feasible and base_error is not None:
             if _direct_partition_failure_is_proven(base_error.diagnostics):
@@ -11875,10 +11895,6 @@ def _select_direct_member_partition_profile(
             profile.unit_counts
             for profile in partition_search_queued_frontier_profiles
         }
-        minimum_hold_feedback_signatures = {
-            profile.unit_counts
-            for profile in partition_search_minimum_hold_feedback_profiles
-        }
         failure_frontier_persistence.update(
             {
                 "unevaluated_queue_profile_count": len(
@@ -11894,13 +11910,20 @@ def _select_direct_member_partition_profile(
                 "minimum_hold_feedback_profile_count": len(
                     partition_search_minimum_hold_feedback_profiles
                 ),
+                "minimum_hold_feedback_evaluation_count": (
+                    partition_search_minimum_hold_feedback_evaluation_count
+                ),
                 "selected_minimum_hold_feedback_profile_count": sum(
-                    profile.unit_counts in minimum_hold_feedback_signatures
+                    any(
+                        shift.trigger
+                        == "lexicographic_minimum_hold_witness_cluster"
+                        for shift in profile.boundary_shifts
+                    )
                     for profile in restart_frontier_candidates
                 ),
                 "selection_contract": (
-                    "minimum_hold_feedback_then_queue_first_strict_lineage_"
-                    "leaf_antichain_v2"
+                    "minimum_hold_feedback_immediate_evaluation_then_queue_"
+                    "first_strict_lineage_leaf_antichain_v3"
                 ),
             }
         )
