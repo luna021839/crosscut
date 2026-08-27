@@ -6623,6 +6623,71 @@ def _persist_direct_member_partition_failure_frontier_profiles(
     )
 
 
+def _direct_member_partition_restart_frontier_profiles(
+    queued_profiles: Sequence[_DirectFullFramePartitionProfile],
+    evaluated_profiles: Sequence[_DirectFullFramePartitionProfile],
+    *,
+    excluded_signatures: set[tuple[int, ...]],
+) -> tuple[_DirectFullFramePartitionProfile, ...]:
+    """Choose novel queue leaves before already-evaluated failure leaves.
+
+    The strict terminal budget can stop with a useful structural queue still
+    pending.  Those candidates must be checkpointed ahead of a chain of
+    already-evaluated ancestors; otherwise a restart spends its bounded warm
+    slots replaying the same branch and never reaches the pending siblings.
+    """
+
+    ordered: list[_DirectFullFramePartitionProfile] = []
+    seen_signatures = set(excluded_signatures)
+    for profile in (*tuple(queued_profiles), *tuple(evaluated_profiles)):
+        if profile.unit_counts in seen_signatures:
+            continue
+        if _direct_member_partition_failure_frontier_lineage(profile) is None:
+            continue
+        seen_signatures.add(profile.unit_counts)
+        ordered.append(profile)
+
+    def _lineage(
+        profile: _DirectFullFramePartitionProfile,
+    ) -> tuple[tuple[int, ...], tuple[tuple[str, Any], ...]]:
+        restored = (
+            _direct_member_partition_failure_frontier_operation_sequence(
+                profile
+            )
+        )
+        if restored is None:
+            raise RuntimeError("restart frontier lost its supported lineage")
+        return restored
+
+    lineages = {profile.unit_counts: _lineage(profile) for profile in ordered}
+
+    def _is_strict_ancestor(
+        ancestor: _DirectFullFramePartitionProfile,
+        descendant: _DirectFullFramePartitionProfile,
+    ) -> bool:
+        ancestor_root, ancestor_operations = lineages[ancestor.unit_counts]
+        descendant_root, descendant_operations = lineages[
+            descendant.unit_counts
+        ]
+        return bool(
+            ancestor_root == descendant_root
+            and len(ancestor_operations) < len(descendant_operations)
+            and ancestor_operations
+            == descendant_operations[: len(ancestor_operations)]
+        )
+
+    leaves = [
+        profile
+        for profile in ordered
+        if not any(
+            _is_strict_ancestor(profile, other)
+            for other in ordered
+            if other is not profile
+        )
+    ]
+    return tuple(leaves[:_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT])
+
+
 def _direct_partition_queue_signature_digest(
     profiles: Sequence[_DirectFullFramePartitionProfile],
 ) -> str:
@@ -9799,6 +9864,10 @@ def _select_direct_member_partition_profile(
             DirectMemberVisualSelectionError,
         ],
     ] = {}
+    partition_search_queued_frontier_profiles: tuple[
+        _DirectFullFramePartitionProfile,
+        ...,
+    ] = ()
 
     def _emit_progress(**payload: Any) -> None:
         if progress_callback is not None:
@@ -11452,6 +11521,13 @@ def _select_direct_member_partition_profile(
                 # not claim the still-queued structural profiles were globally
                 # infeasible merely because there was nothing valid to audition.
                 partition_search_cap_reached = True
+            partition_search_queued_frontier_profiles = tuple(
+                item[2]
+                for item in sorted(
+                    queued,
+                    key=lambda item: (item[0], item[1]),
+                )
+            )
         elif not feasible and base_error is not None:
             if _direct_partition_failure_is_proven(base_error.diagnostics):
                 bottlenecks = _direct_partition_failure_bottlenecks(
@@ -11482,7 +11558,7 @@ def _select_direct_member_partition_profile(
             base.unit_counts,
             *(profile.unit_counts for profile in warm_start_profiles),
         }
-        restart_frontier_candidates = tuple(
+        evaluated_restart_frontier_profiles = tuple(
             profile
             for profile, error in sorted(
                 partition_search_failure_frontier_candidates.values(),
@@ -11499,8 +11575,15 @@ def _select_direct_member_partition_profile(
             if profile.unit_counts not in initial_candidate_signatures
             and _direct_member_partition_failure_frontier_lineage(profile)
             is not None
-        )[:_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT]
-        warm_start_diagnostics["failure_frontier_persistence"] = (
+        )
+        restart_frontier_candidates = (
+            _direct_member_partition_restart_frontier_profiles(
+                partition_search_queued_frontier_profiles,
+                evaluated_restart_frontier_profiles,
+                excluded_signatures=initial_candidate_signatures,
+            )
+        )
+        failure_frontier_persistence = (
             _persist_direct_member_partition_failure_frontier_profiles(
                 feature_cache_directory,
                 base,
@@ -11512,6 +11595,30 @@ def _select_direct_member_partition_profile(
                 "persisted": False,
                 "status": "continuous_official_member_contract_required",
             }
+        )
+        queued_frontier_signatures = {
+            profile.unit_counts
+            for profile in partition_search_queued_frontier_profiles
+        }
+        failure_frontier_persistence.update(
+            {
+                "unevaluated_queue_profile_count": len(
+                    partition_search_queued_frontier_profiles
+                ),
+                "evaluated_failure_profile_count": len(
+                    evaluated_restart_frontier_profiles
+                ),
+                "selected_unevaluated_queue_profile_count": sum(
+                    profile.unit_counts in queued_frontier_signatures
+                    for profile in restart_frontier_candidates
+                ),
+                "selection_contract": (
+                    "queue_first_strict_lineage_leaf_antichain_v1"
+                ),
+            }
+        )
+        warm_start_diagnostics["failure_frontier_persistence"] = (
+            failure_frontier_persistence
         )
         latest_diagnostics = (
             dict(latest_failure_diagnostics)

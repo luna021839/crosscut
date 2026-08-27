@@ -12,6 +12,7 @@ from crosscut.pipeline import (
     _DirectFullFrameVisualFrontierSplit,
     _direct_member_dense_render_feedback_binding,
     _direct_member_render_feedback_partition_profiles,
+    _direct_member_partition_restart_frontier_profiles,
     _direct_partition_signature_sha256,
     _direct_partition_queue_priority,
     _direct_partition_terminal_audition_due,
@@ -390,6 +391,35 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             visual_frontier_splits=(visual_split,),
             latest_operation_kind="boundary_shift",
         )
+        first_profile = _DirectFullFramePartitionProfile(
+            profile_id="first-shift",
+            unit_counts=first_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing_segments,
+                first_counts,
+            ),
+            boundary_shifts=(first_shift,),
+            latest_operation_kind="boundary_shift",
+        )
+        split_profile = _DirectFullFramePartitionProfile(
+            profile_id="first-split",
+            unit_counts=split_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing_segments,
+                split_counts,
+            ),
+            boundary_shifts=(first_shift,),
+            visual_frontier_splits=(visual_split,),
+            latest_operation_kind="visual_frontier_split",
+        )
+        restart_frontier = (
+            _direct_member_partition_restart_frontier_profiles(
+                (candidate,),
+                (first_profile, split_profile),
+                excluded_signatures={base_counts},
+            )
+        )
+        self.assertEqual(restart_frontier, (candidate,))
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
