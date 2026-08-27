@@ -7,9 +7,12 @@ import unittest
 
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.pipeline import (
+    _DirectFullFrameBoundaryShift,
     _DirectFullFramePartitionProfile,
+    _DirectFullFrameVisualFrontierSplit,
     _direct_member_dense_render_feedback_binding,
     _direct_member_render_feedback_partition_profiles,
+    _direct_partition_signature_sha256,
     _direct_partition_queue_priority,
     _direct_partition_terminal_audition_due,
     _direct_partition_terminal_hold_failure_is_eligible,
@@ -231,6 +234,23 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                     source_count=2,
                 )
             )
+            cache_path = (
+                directory / "direct-member-partition-candidate-cache-v2.json"
+            )
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            lineage = payload["entries"][0]["search_lineage"]
+            payload["entries"][0]["search_lineage"] = {
+                "contract": "exact_proof_bound_boundary_shift_lineage_v1",
+                "latest_operation_kind": "boundary_shift",
+                "proof_directed_boundary_shifts": [
+                    item["operation"]
+                    for item in lineage["proof_operation_sequence"]
+                ],
+            }
+            cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
             loaded, diagnostics = (
                 _load_direct_member_partition_warm_start_profiles(
                     directory,
@@ -256,6 +276,153 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             restored.boundary_shifts[0].trigger,
             "dense_render_camera_infeasible_pair_cluster",
         )
+        self.assertFalse(diagnostics["visual_gates_relaxed"])
+
+    def test_failure_frontier_checkpoint_restores_interleaved_shift_split_lineage(
+        self,
+    ) -> None:
+        unit_seconds = 0.875
+        timing_segments = tuple(
+            DraftSegment(
+                segment_index=index,
+                source_index=index % 2,
+                canonical_master_start=index * unit_seconds,
+                canonical_master_end=(index + 1) * unit_seconds,
+                output_start_seconds=index * unit_seconds,
+                source_local_start=index * unit_seconds,
+                source_local_end=(index + 1) * unit_seconds,
+                audio_offset_seconds=0.0,
+                sync_score=0.9,
+                estimated_beat_count=2.0,
+                start_boundary_reasons=("beat",),
+                end_boundary_reasons=("beat",),
+            )
+            for index in range(32)
+        )
+        base_counts = (4,) * 8
+        base = _DirectFullFramePartitionProfile(
+            profile_id="base",
+            unit_counts=base_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing_segments,
+                base_counts,
+            ),
+        )
+        first_counts = (4, 5, 3, 4, 4, 4, 4, 4)
+        first_shift = _DirectFullFrameBoundaryShift(
+            boundary_index=1,
+            shift_units=1,
+            left_unit_count=5,
+            right_unit_count=3,
+            canonical_master_seconds=9 * unit_seconds,
+            boundary_reasons=("beat",),
+            trigger="test_proof_shift",
+            parent_profile_id="base",
+            parent_partition_signature_sha256=(
+                _direct_partition_signature_sha256(base_counts)
+            ),
+            proof_failure="boundary_connectivity_path_exhausted",
+            proof_failed_segment_index=1,
+            proof_forward_reachable_left_source_indices=(0,),
+            proof_left_valid_source_indices=(0,),
+            proof_right_valid_source_indices=(1,),
+            proof_local_nonsevere_edge_count=0,
+        )
+        split_counts = (4, 5, 3, 4, 2, 2, 4, 4, 4)
+        split_seconds = 18 * unit_seconds
+        visual_split = _DirectFullFrameVisualFrontierSplit(
+            parent_span_index=4,
+            split_unit_offset=2,
+            left_unit_count=2,
+            right_unit_count=2,
+            canonical_master_seconds=split_seconds,
+            boundary_reasons=("strong_beat",),
+            trigger="test_visual_frontier_split",
+            parent_profile_id="shifted",
+            parent_partition_signature_sha256=(
+                _direct_partition_signature_sha256(first_counts)
+            ),
+            proof_failure="boundary_connectivity_path_exhausted",
+            proof_failed_segment_index=4,
+            proof_frontier_boundary_index=4,
+            proof_forward_reachable_left_source_indices=(0,),
+            proof_right_valid_source_indices=(1,),
+            evidence_contract=(
+                "visual_bracket_bound_existing_timing_boundary_v1"
+            ),
+            evidence_kind="sample_hard_safety_change_bracket",
+            evidence_source_indices=(0, 1),
+            evidence_master_seconds=(split_seconds,),
+            evidence_bracket_master_seconds=(
+                split_seconds - 0.1,
+                split_seconds + 0.1,
+            ),
+        )
+        final_counts = (4, 5, 3, 4, 2, 2, 5, 3, 4)
+        second_shift = _DirectFullFrameBoundaryShift(
+            boundary_index=6,
+            shift_units=1,
+            left_unit_count=5,
+            right_unit_count=3,
+            canonical_master_seconds=25 * unit_seconds,
+            boundary_reasons=("beat",),
+            trigger="test_post_split_proof_shift",
+            parent_profile_id="split",
+            parent_partition_signature_sha256=(
+                _direct_partition_signature_sha256(split_counts)
+            ),
+            proof_failure="boundary_connectivity_path_exhausted",
+            proof_failed_segment_index=6,
+            proof_forward_reachable_left_source_indices=(0,),
+            proof_left_valid_source_indices=(0,),
+            proof_right_valid_source_indices=(1,),
+            proof_local_nonsevere_edge_count=0,
+        )
+        candidate = _DirectFullFramePartitionProfile(
+            profile_id="interleaved",
+            unit_counts=final_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing_segments,
+                final_counts,
+            ),
+            boundary_shifts=(first_shift, second_shift),
+            visual_frontier_splits=(visual_split,),
+            latest_operation_kind="boundary_shift",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write_acquisition_manifest(directory)
+            persisted = (
+                _persist_direct_member_partition_failure_frontier_profiles(
+                    directory,
+                    base,
+                    (candidate,),
+                    source_count=2,
+                )
+            )
+            loaded, diagnostics = (
+                _load_direct_member_partition_warm_start_profiles(
+                    directory,
+                    timing_segments,
+                    base,
+                    source_count=2,
+                )
+            )
+
+        self.assertTrue(persisted["persisted"])
+        self.assertEqual(persisted["persisted_candidate_count"], 1)
+        self.assertEqual(diagnostics["status"], "candidates_loaded")
+        self.assertEqual(len(loaded), 1)
+        restored = loaded[0]
+        self.assertEqual(restored.unit_counts, final_counts)
+        self.assertEqual(
+            restored.boundary_shifts,
+            (first_shift, second_shift),
+        )
+        self.assertEqual(restored.visual_frontier_splits, (visual_split,))
+        self.assertEqual(restored.latest_operation_kind, "boundary_shift")
+        self.assertEqual(restored.structural_change_count, 3)
         self.assertFalse(diagnostics["visual_gates_relaxed"])
 
     def test_reproved_shifted_boundary_refines_monotonically(self) -> None:

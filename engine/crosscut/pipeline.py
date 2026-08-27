@@ -413,8 +413,11 @@ _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT = 4
 _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_ORIGIN = (
     "proof_bound_boundary_shift_failure_frontier_v1"
 )
-_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT = (
+_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_V1_CONTRACT = (
     "exact_proof_bound_boundary_shift_lineage_v1"
+)
+_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT = (
+    "exact_proof_bound_partition_operation_sequence_v2"
 )
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_FILENAME = (
     "direct-member-rendered-path-feedback-v2.json"
@@ -5695,41 +5698,150 @@ def _direct_member_partition_warm_start_binding(
     return binding, diagnostics
 
 
-def _direct_member_partition_failure_frontier_lineage(
-    profile: _DirectFullFramePartitionProfile,
-) -> dict[str, Any] | None:
-    """Serialize only the proof lineage that can be restored without drift.
+def _direct_member_partition_failure_frontier_apply_operation(
+    parent_unit_counts: Sequence[int],
+    kind: str,
+    operation: Any,
+) -> tuple[int, ...] | None:
+    """Replay one exact proof operation against its signed parent partition."""
 
-    The expensive BLACKHOLE frontier currently consists of ordinary
-    proof-directed boundary shifts.  Persisting those exact operations keeps
-    their cumulative search budget and provenance on restart.  Mixed
-    split/merge/redistribution lineages are intentionally not flattened into
-    a lossy summary; they remain eligible for the normal in-process search.
-    """
+    counts = tuple(int(value) for value in parent_unit_counts)
+    if (
+        not counts
+        or any(value <= 0 for value in counts)
+        or operation.parent_partition_signature_sha256
+        != _direct_partition_signature_sha256(counts)
+    ):
+        return None
+    output = list(counts)
+    if kind == "boundary_shift" and isinstance(
+        operation,
+        _DirectFullFrameBoundaryShift,
+    ):
+        boundary_index = operation.boundary_index
+        if not 0 <= boundary_index < len(counts) - 1:
+            return None
+        old_left, old_right = counts[boundary_index : boundary_index + 2]
+        if not (
+            operation.left_unit_count > 0
+            and operation.right_unit_count > 0
+            and operation.left_unit_count + operation.right_unit_count
+            == old_left + old_right
+            and operation.left_unit_count - old_left
+            == operation.shift_units
+            and operation.right_unit_count - old_right
+            == -operation.shift_units
+        ):
+            return None
+        output[boundary_index : boundary_index + 2] = [
+            operation.left_unit_count,
+            operation.right_unit_count,
+        ]
+    elif kind == "visual_frontier_split" and isinstance(
+        operation,
+        _DirectFullFrameVisualFrontierSplit,
+    ):
+        span_index = operation.parent_span_index
+        if not 0 <= span_index < len(counts):
+            return None
+        if not (
+            operation.left_unit_count > 0
+            and operation.right_unit_count > 0
+            and operation.split_unit_offset == operation.left_unit_count
+            and operation.left_unit_count + operation.right_unit_count
+            == counts[span_index]
+        ):
+            return None
+        output[span_index : span_index + 1] = [
+            operation.left_unit_count,
+            operation.right_unit_count,
+        ]
+    else:
+        return None
+    return tuple(output)
+
+
+def _direct_member_partition_failure_frontier_operation_sequence(
+    profile: _DirectFullFramePartitionProfile,
+    base_unit_counts: Sequence[int],
+) -> tuple[tuple[str, Any], ...] | None:
+    """Recover the unique chronological shift/split lineage by parent hash."""
 
     if (
-        not profile.boundary_shifts
-        or profile.window_redistributions
-        or profile.visual_frontier_splits
+        profile.window_redistributions
         or profile.boundary_merges
-        or profile.latest_operation_kind != "boundary_shift"
+        or not (profile.boundary_shifts or profile.visual_frontier_splits)
     ):
+        return None
+    remaining: list[tuple[str, Any]] = [
+        *(("boundary_shift", item) for item in profile.boundary_shifts),
+        *(
+            ("visual_frontier_split", item)
+            for item in profile.visual_frontier_splits
+        ),
+    ]
+    current = tuple(int(value) for value in base_unit_counts)
+    ordered: list[tuple[str, Any]] = []
+    while remaining:
+        matches: list[tuple[int, str, Any, tuple[int, ...]]] = []
+        for index, (kind, operation) in enumerate(remaining):
+            output = _direct_member_partition_failure_frontier_apply_operation(
+                current,
+                kind,
+                operation,
+            )
+            if output is not None:
+                matches.append((index, kind, operation, output))
+        if len(matches) != 1:
+            return None
+        index, kind, operation, current = matches[0]
+        ordered.append((kind, operation))
+        remaining.pop(index)
+    if (
+        current != profile.unit_counts
+        or profile.latest_operation_kind is None
+        or profile.latest_operation_kind != ordered[-1][0]
+    ):
+        return None
+    return tuple(ordered)
+
+
+def _direct_member_partition_failure_frontier_lineage(
+    profile: _DirectFullFramePartitionProfile,
+    *,
+    base_unit_counts: Sequence[int],
+) -> dict[str, Any] | None:
+    """Serialize a lossless, replayable proof-shift/visual-split frontier."""
+
+    operations = _direct_member_partition_failure_frontier_operation_sequence(
+        profile,
+        base_unit_counts,
+    )
+    if operations is None:
         return None
     return {
         "contract": (
             _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT
         ),
-        "latest_operation_kind": "boundary_shift",
-        "proof_directed_boundary_shifts": [
-            shift.to_dict() for shift in profile.boundary_shifts
+        "latest_operation_kind": operations[-1][0],
+        "proof_operation_sequence": [
+            {"kind": kind, "operation": operation.to_dict()}
+            for kind, operation in operations
         ],
     }
 
 
 def _restore_direct_member_partition_failure_frontier_lineage(
     entry: Mapping[str, Any],
-) -> tuple[tuple[_DirectFullFrameBoundaryShift, ...], str | None]:
-    """Restore an exact, input-bound boundary-shift frontier lineage."""
+    *,
+    base_unit_counts: Sequence[int],
+    expected_unit_counts: Sequence[int],
+) -> tuple[
+    tuple[_DirectFullFrameBoundaryShift, ...],
+    tuple[_DirectFullFrameVisualFrontierSplit, ...],
+    str | None,
+]:
+    """Restore and replay an exact input-bound proof frontier lineage."""
 
     raw_lineage = entry.get("search_lineage")
     is_frontier = (
@@ -5739,25 +5851,8 @@ def _restore_direct_member_partition_failure_frontier_lineage(
     if raw_lineage is None:
         if is_frontier:
             raise ValueError("failure frontier cache entry lost its lineage")
-        return (), None
-    if not (
-        isinstance(raw_lineage, dict)
-        and set(raw_lineage)
-        == {
-            "contract",
-            "latest_operation_kind",
-            "proof_directed_boundary_shifts",
-        }
-        and raw_lineage.get("contract")
-        == _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT
-        and raw_lineage.get("latest_operation_kind") == "boundary_shift"
-        and isinstance(
-            raw_lineage.get("proof_directed_boundary_shifts"), list
-        )
-        and 1
-        <= len(raw_lineage["proof_directed_boundary_shifts"])
-        <= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
-    ):
+        return (), (), None
+    if not isinstance(raw_lineage, dict):
         raise ValueError("failure frontier lineage schema mismatch")
 
     def _integer(value: Any, *, minimum: int | None = None) -> int:
@@ -5795,8 +5890,16 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             raise ValueError("failure frontier lineage string list is invalid")
         return tuple(value)
 
-    restored: list[_DirectFullFrameBoundaryShift] = []
-    for raw_shift in raw_lineage["proof_directed_boundary_shifts"]:
+    def _digest(value: Any) -> str:
+        digest = _string(value)
+        assert digest is not None
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError("failure frontier parent signature is invalid")
+        return digest
+
+    def _restore_shift(raw_shift: Any) -> _DirectFullFrameBoundaryShift:
         if not isinstance(raw_shift, dict):
             raise ValueError("failure frontier shift is not an object")
         replacement = raw_shift.get("replacement_unit_counts")
@@ -5808,15 +5911,9 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             and proof.get("constraint_infeasibility_proven") is True
         ):
             raise ValueError("failure frontier shift schema mismatch")
-        parent_signature = _string(
+        parent_signature = _digest(
             raw_shift.get("parent_partition_signature_sha256")
         )
-        assert parent_signature is not None
-        if len(parent_signature) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in parent_signature
-        ):
-            raise ValueError("failure frontier parent signature is invalid")
         proof_failure = _string(proof.get("failure"), optional=True)
         proof_failed_segment_index = proof.get("failed_segment_index")
         if proof_failed_segment_index is not None:
@@ -5864,8 +5961,196 @@ def _restore_direct_member_partition_failure_frontier_lineage(
         )
         if operation.shift_units == 0 or operation.to_dict() != raw_shift:
             raise ValueError("failure frontier shift canonical form mismatch")
-        restored.append(operation)
-    return tuple(restored), "boundary_shift"
+        return operation
+
+    def _restore_split(raw_split: Any) -> _DirectFullFrameVisualFrontierSplit:
+        if not isinstance(raw_split, dict):
+            raise ValueError("failure frontier visual split is not an object")
+        replacement = raw_split.get("replacement_unit_counts")
+        proof = raw_split.get("proof")
+        evidence = raw_split.get("proposal_evidence")
+        if not (
+            isinstance(replacement, list)
+            and len(replacement) == 2
+            and isinstance(proof, dict)
+            and proof.get("constraint_infeasibility_proven") is True
+            and isinstance(evidence, dict)
+            and evidence.get("proposal_only_full_selector_recheck_required")
+            is True
+        ):
+            raise ValueError("failure frontier visual split schema mismatch")
+        proof_failure = _string(proof.get("failure"), optional=True)
+        proof_failed_segment_index = proof.get("failed_segment_index")
+        if proof_failed_segment_index is not None:
+            proof_failed_segment_index = _integer(
+                proof_failed_segment_index,
+                minimum=0,
+            )
+        evidence_master_seconds_raw = evidence.get("master_seconds")
+        if not isinstance(evidence_master_seconds_raw, list):
+            raise ValueError("failure frontier evidence times are invalid")
+        evidence_master_seconds = tuple(
+            _finite(value) for value in evidence_master_seconds_raw
+        )
+        evidence_bracket_raw = evidence.get("bracket_master_seconds")
+        evidence_bracket: tuple[float, float] | None
+        if evidence_bracket_raw is None:
+            evidence_bracket = None
+        elif isinstance(evidence_bracket_raw, list) and len(
+            evidence_bracket_raw
+        ) == 2:
+            evidence_bracket = (
+                _finite(evidence_bracket_raw[0]),
+                _finite(evidence_bracket_raw[1]),
+            )
+            if evidence_bracket[0] > evidence_bracket[1]:
+                raise ValueError("failure frontier evidence bracket is invalid")
+        else:
+            raise ValueError("failure frontier evidence bracket is invalid")
+        left_count = _integer(replacement[0], minimum=1)
+        right_count = _integer(replacement[1], minimum=1)
+        operation = _DirectFullFrameVisualFrontierSplit(
+            parent_span_index=_integer(
+                raw_split.get("parent_span_index"),
+                minimum=0,
+            ),
+            split_unit_offset=_integer(
+                raw_split.get("split_unit_offset"),
+                minimum=1,
+            ),
+            left_unit_count=left_count,
+            right_unit_count=right_count,
+            canonical_master_seconds=_finite(
+                raw_split.get("canonical_master_seconds")
+            ),
+            boundary_reasons=_string_tuple(
+                raw_split.get("boundary_reasons")
+            ),
+            trigger=str(_string(raw_split.get("trigger"))),
+            parent_profile_id=str(
+                _string(raw_split.get("parent_profile_id"))
+            ),
+            parent_partition_signature_sha256=_digest(
+                raw_split.get("parent_partition_signature_sha256")
+            ),
+            proof_failure=proof_failure,
+            proof_failed_segment_index=proof_failed_segment_index,
+            proof_frontier_boundary_index=_integer(
+                proof.get("frontier_boundary_index"),
+                minimum=0,
+            ),
+            proof_forward_reachable_left_source_indices=_integer_tuple(
+                proof.get("forward_reachable_left_source_indices")
+            ),
+            proof_right_valid_source_indices=_integer_tuple(
+                proof.get("right_valid_source_indices")
+            ),
+            evidence_contract=str(_string(evidence.get("contract"))),
+            evidence_kind=str(_string(evidence.get("kind"))),
+            evidence_source_indices=_integer_tuple(
+                evidence.get("eligible_source_indices")
+            ),
+            evidence_master_seconds=evidence_master_seconds,
+            evidence_bracket_master_seconds=evidence_bracket,
+        )
+        if operation.to_dict() != raw_split:
+            raise ValueError(
+                "failure frontier visual split canonical form mismatch"
+            )
+        return operation
+
+    contract = raw_lineage.get("contract")
+    sequence: list[tuple[str, Any]] = []
+    if contract == _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_V1_CONTRACT:
+        if not (
+            set(raw_lineage)
+            == {
+                "contract",
+                "latest_operation_kind",
+                "proof_directed_boundary_shifts",
+            }
+            and raw_lineage.get("latest_operation_kind") == "boundary_shift"
+            and isinstance(
+                raw_lineage.get("proof_directed_boundary_shifts"), list
+            )
+            and 1
+            <= len(raw_lineage["proof_directed_boundary_shifts"])
+            <= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        ):
+            raise ValueError("failure frontier lineage schema mismatch")
+        sequence.extend(
+            ("boundary_shift", _restore_shift(raw_shift))
+            for raw_shift in raw_lineage["proof_directed_boundary_shifts"]
+        )
+    elif contract == _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT:
+        raw_sequence = raw_lineage.get("proof_operation_sequence")
+        if not (
+            set(raw_lineage)
+            == {
+                "contract",
+                "latest_operation_kind",
+                "proof_operation_sequence",
+            }
+            and raw_lineage.get("latest_operation_kind")
+            in {"boundary_shift", "visual_frontier_split"}
+            and isinstance(raw_sequence, list)
+            and 1
+            <= len(raw_sequence)
+            <= (
+                _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+                + _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+            )
+        ):
+            raise ValueError("failure frontier lineage schema mismatch")
+        for raw_item in raw_sequence:
+            if not (
+                isinstance(raw_item, dict)
+                and set(raw_item) == {"kind", "operation"}
+                and raw_item.get("kind")
+                in {"boundary_shift", "visual_frontier_split"}
+            ):
+                raise ValueError("failure frontier operation schema mismatch")
+            kind = raw_item["kind"]
+            operation = (
+                _restore_shift(raw_item["operation"])
+                if kind == "boundary_shift"
+                else _restore_split(raw_item["operation"])
+            )
+            sequence.append((kind, operation))
+        if raw_lineage["latest_operation_kind"] != sequence[-1][0]:
+            raise ValueError("failure frontier latest operation mismatch")
+    else:
+        raise ValueError("failure frontier lineage contract mismatch")
+
+    shifts = tuple(
+        operation
+        for kind, operation in sequence
+        if kind == "boundary_shift"
+    )
+    splits = tuple(
+        operation
+        for kind, operation in sequence
+        if kind == "visual_frontier_split"
+    )
+    if (
+        len(shifts) > _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        or len(splits)
+        > _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
+    ):
+        raise ValueError("failure frontier operation count is invalid")
+    current = tuple(int(value) for value in base_unit_counts)
+    for kind, operation in sequence:
+        output = _direct_member_partition_failure_frontier_apply_operation(
+            current,
+            kind,
+            operation,
+        )
+        if output is None:
+            raise ValueError("failure frontier operation replay failed")
+        current = output
+    if current != tuple(int(value) for value in expected_unit_counts):
+        raise ValueError("failure frontier replayed partition mismatch")
+    return shifts, splits, sequence[-1][0]
 
 
 def _load_direct_member_partition_warm_start_profiles(
@@ -5984,9 +6269,15 @@ def _load_direct_member_partition_warm_start_profiles(
             _reject("timing_partition_mismatch")
             continue
         try:
-            boundary_shifts, latest_operation_kind = (
+            (
+                boundary_shifts,
+                visual_frontier_splits,
+                latest_operation_kind,
+            ) = (
                 _restore_direct_member_partition_failure_frontier_lineage(
-                    entry
+                    entry,
+                    base_unit_counts=base.unit_counts,
+                    expected_unit_counts=counts,
                 )
             )
         except ValueError:
@@ -6000,6 +6291,16 @@ def _load_direct_member_partition_warm_start_profiles(
                 < spans[-1].canonical_master_end
             )
             for shift in boundary_shifts
+        ):
+            _reject("failure_frontier_lineage_out_of_range")
+            continue
+        if any(
+            not (
+                spans[0].canonical_master_start
+                < split.canonical_master_seconds
+                < spans[-1].canonical_master_end
+            )
+            for split in visual_frontier_splits
         ):
             _reject("failure_frontier_lineage_out_of_range")
             continue
@@ -6029,6 +6330,7 @@ def _load_direct_member_partition_warm_start_profiles(
                 unit_counts=counts,
                 spans=spans,
                 boundary_shifts=boundary_shifts,
+                visual_frontier_splits=visual_frontier_splits,
                 latest_operation_kind=latest_operation_kind,
                 warm_start_binding_sha256=binding["binding_sha256"],
                 warm_start_cache_file_sha256=cache_fingerprint["sha256"],
@@ -6080,7 +6382,10 @@ def _persist_direct_member_partition_cache_candidates(
         if candidate.unit_counts in seen_signatures:
             continue
         search_lineage = (
-            _direct_member_partition_failure_frontier_lineage(candidate)
+            _direct_member_partition_failure_frontier_lineage(
+                candidate,
+                base_unit_counts=base.unit_counts,
+            )
             if preserve_failure_frontier_lineage
             else None
         )
@@ -11103,7 +11408,10 @@ def _select_direct_member_partition_profile(
                 ),
             )
             if profile.unit_counts not in initial_candidate_signatures
-            and _direct_member_partition_failure_frontier_lineage(profile)
+            and _direct_member_partition_failure_frontier_lineage(
+                profile,
+                base_unit_counts=base.unit_counts,
+            )
             is not None
         )[:_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT]
         warm_start_diagnostics["failure_frontier_persistence"] = (
