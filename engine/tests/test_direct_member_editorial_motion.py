@@ -205,7 +205,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(config.minimum_dense_face_visible_fraction, 0.98)
         self.assertEqual(config.minimum_widened_subject_visible_fraction, 0.95)
         self.assertEqual(config.maximum_dense_center_step, 0.15)
-        self.assertEqual(config.maximum_dense_subject_center_step, 0.18)
+        self.assertEqual(config.maximum_dense_subject_center_step, 0.20)
         self.assertEqual(
             config.minimum_face_associated_subject_visible_fraction,
             0.72,

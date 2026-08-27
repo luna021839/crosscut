@@ -464,7 +464,7 @@ class DirectMemberEditorialMotionConfig:
     minimum_widened_subject_confidence: float = 0.30
     minimum_widened_subject_visible_fraction: float = 0.950
     minimum_face_associated_subject_visible_fraction: float = 0.720
-    maximum_dense_subject_center_step: float = 0.18
+    maximum_dense_subject_center_step: float = 0.20
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.15
     maximum_dense_height_ratio: float = 1.35
@@ -1702,87 +1702,20 @@ def build_direct_member_editorial_motion_plan(
                 raise ValueError(
                     "required transform geometry basis disagrees with dense audit"
                 )
-            side = "left" if repair.transformed_side == "outgoing" else "right"
-            affected_index = (
-                boundary_index if side == "left" else boundary_index + 1
-            )
-            box, target_box = (
-                (left_box, right_box) if side == "left" else (right_box, left_box)
+            preferred_side = (
+                "left" if repair.transformed_side == "outgoing" else "right"
             )
             expected_source = (
-                left_source if side == "left" else right_source
+                left_source if preferred_side == "left" else right_source
             )
             if repair.transformed_source_index != expected_source:
                 raise ValueError(
                     "direct member required transform source disagrees with path"
                 )
         elif left_box[3] + 1e-9 < right_box[3]:
-            side = "left"
-            affected_index = boundary_index
-            box, target_box = left_box, right_box
+            preferred_side = "left"
         else:
-            side = "right"
-            affected_index = boundary_index + 1
-            box, target_box = right_box, left_box
-        if affected_index in blocked:
-            alternate_side = "right" if side == "left" else "left"
-            alternate_index = (
-                boundary_index
-                if alternate_side == "left"
-                else boundary_index + 1
-            )
-            if alternate_index in blocked:
-                reject_boundary("dissolve_adjacent")
-                continue
-            side = alternate_side
-            affected_index = alternate_index
-            box, target_box = (
-                (left_box, right_box)
-                if side == "left"
-                else (right_box, left_box)
-            )
-        if last_frame_times[affected_index] < 0.55 - 1e-9:
-            reject_boundary("window_shorter_than_reference_ramp")
-            continue
-        affected_source = source_path[affected_index]
-        affected_geometry = source_frame_geometries[affected_source]
-        lossless_zoom_limit = (
-            min(
-                settings.maximum_boundary_zoom,
-                affected_geometry.lossless_zoom_capacity,
-            )
-            if affected_geometry is not None
-            else settings.maximum_boundary_zoom
-        )
-        if required and affected_geometry is None:
-            reject_boundary("required_transform_source_resolution_missing")
-            continue
-        if lossless_zoom_limit <= 1.0 + 1e-9:
-            reject_boundary("source_resolution_has_no_lossless_transform_headroom")
-            continue
-        desired_center_shift = min(
-            settings.maximum_center_shift,
-            math.hypot(
-                _center(box)[0] - _center(target_box)[0],
-                _center(box)[1] - _center(target_box)[1],
-            ),
-        )
-        pan_headroom_zoom = 1.0 / max(
-            1e-9,
-            1.0 - 2.0 * desired_center_shift,
-        )
-        requested_zoom = max(
-            1.02,
-            target_box[3] / box[3],
-            pan_headroom_zoom,
-        )
-        maximum_candidate_zoom = min(lossless_zoom_limit, requested_zoom)
-        if required and repair is not None:
-            maximum_candidate_zoom = min(
-                lossless_zoom_limit,
-                max(maximum_candidate_zoom, repair.zoom),
-            )
-        qualifying: list[tuple[float, _State]] = []
+            preferred_side = "right"
         required_improvement_fraction = (
             min(settings.minimum_mismatch_improvement_fraction, 0.05)
             if required
@@ -1791,56 +1724,156 @@ def build_direct_member_editorial_motion_plan(
             and ratio <= 1.05 + 1e-9
             else settings.minimum_mismatch_improvement_fraction
         )
-        zoom_values = [maximum_candidate_zoom]
-        while zoom_values[-1] > 1.02 + 1e-9:
-            next_zoom = max(1.02, zoom_values[-1] - 0.02)
-            if abs(next_zoom - zoom_values[-1]) <= 1e-9:
-                break
-            zoom_values.append(next_zoom)
-        seen_states: set[tuple[float, float, float]] = set()
-        for zoom in zoom_values:
-            for state in _state_for_match(
-                box=box,
-                target_box=target_box,
-                zoom=zoom,
-                settings=shared,
+
+        def qualifying_for_side(
+            candidate_side: str,
+        ) -> tuple[
+            list[tuple[float, _State]],
+            float | None,
+            str | None,
+        ]:
+            affected_index = (
+                boundary_index
+                if candidate_side == "left"
+                else boundary_index + 1
+            )
+            if affected_index in blocked:
+                return ([], None, "dissolve_adjacent")
+            if last_frame_times[affected_index] < 0.55 - 1e-9:
+                return ([], None, "window_shorter_than_reference_ramp")
+            box, target_box = (
+                (left_box, right_box)
+                if candidate_side == "left"
+                else (right_box, left_box)
+            )
+            affected_source = source_path[affected_index]
+            affected_geometry = source_frame_geometries[affected_source]
+            if required and affected_geometry is None:
+                return (
+                    [],
+                    None,
+                    "required_transform_source_resolution_missing",
+                )
+            lossless_zoom_limit = (
+                min(
+                    settings.maximum_boundary_zoom,
+                    affected_geometry.lossless_zoom_capacity,
+                )
+                if affected_geometry is not None
+                else settings.maximum_boundary_zoom
+            )
+            if lossless_zoom_limit <= 1.0 + 1e-9:
+                return (
+                    [],
+                    lossless_zoom_limit,
+                    "source_resolution_has_no_lossless_transform_headroom",
+                )
+            desired_center_shift = min(
+                settings.maximum_center_shift,
+                math.hypot(
+                    _center(box)[0] - _center(target_box)[0],
+                    _center(box)[1] - _center(target_box)[1],
+                ),
+            )
+            pan_headroom_zoom = 1.0 / max(
+                1e-9,
+                1.0 - 2.0 * desired_center_shift,
+            )
+            requested_zoom = max(
+                1.02,
+                target_box[3] / box[3],
+                pan_headroom_zoom,
+            )
+            maximum_candidate_zoom = min(
+                lossless_zoom_limit,
+                requested_zoom,
+            )
+            if (
+                required
+                and repair is not None
+                and candidate_side == preferred_side
             ):
-                state_key = (
-                    round(state.zoom, 9),
-                    round(state.center_x, 9),
-                    round(state.center_y, 9),
+                maximum_candidate_zoom = min(
+                    lossless_zoom_limit,
+                    max(maximum_candidate_zoom, repair.zoom),
                 )
-                if state_key in seen_states:
-                    continue
-                seen_states.add(state_key)
-                if (
-                    _visible_fraction(box, state) + 1e-9
-                    < settings.minimum_face_visible_fraction
+            zoom_values = [maximum_candidate_zoom]
+            while zoom_values[-1] > 1.02 + 1e-9:
+                next_zoom = max(1.02, zoom_values[-1] - 0.02)
+                if abs(next_zoom - zoom_values[-1]) <= 1e-9:
+                    break
+                zoom_values.append(next_zoom)
+            qualifying: list[tuple[float, _State]] = []
+            seen_states: set[tuple[float, float, float]] = set()
+            for zoom in zoom_values:
+                for state in _state_for_match(
+                    box=box,
+                    target_box=target_box,
+                    zoom=zoom,
+                    settings=shared,
                 ):
-                    continue
-                projected_left = (
-                    _project(left_box, state) if side == "left" else left_box
-                )
-                projected_right = (
-                    _project(right_box, state) if side == "right" else right_box
-                )
-                transformed = _mismatch(projected_left, projected_right)
-                residual_center = math.hypot(
-                    _center(projected_left)[0] - _center(projected_right)[0],
-                    _center(projected_left)[1] - _center(projected_right)[1],
-                )
-                if (
-                    residual_center
-                    > settings.maximum_residual_center_distance + 1e-9
-                ):
-                    continue
-                if transformed > baseline * (
-                    1.0 - required_improvement_fraction
-                ) + 1e-9:
-                    continue
-                if transformed + 1e-4 < baseline:
-                    qualifying.append((transformed, state))
-        if not qualifying:
+                    state_key = (
+                        round(state.zoom, 9),
+                        round(state.center_x, 9),
+                        round(state.center_y, 9),
+                    )
+                    if state_key in seen_states:
+                        continue
+                    seen_states.add(state_key)
+                    if (
+                        _visible_fraction(box, state) + 1e-9
+                        < settings.minimum_face_visible_fraction
+                    ):
+                        continue
+                    projected_left = (
+                        _project(left_box, state)
+                        if candidate_side == "left"
+                        else left_box
+                    )
+                    projected_right = (
+                        _project(right_box, state)
+                        if candidate_side == "right"
+                        else right_box
+                    )
+                    transformed = _mismatch(
+                        projected_left,
+                        projected_right,
+                    )
+                    residual_center = math.hypot(
+                        _center(projected_left)[0]
+                        - _center(projected_right)[0],
+                        _center(projected_left)[1]
+                        - _center(projected_right)[1],
+                    )
+                    if (
+                        residual_center
+                        > settings.maximum_residual_center_distance + 1e-9
+                    ):
+                        continue
+                    if transformed > baseline * (
+                        1.0 - required_improvement_fraction
+                    ) + 1e-9:
+                        continue
+                    if transformed + 1e-4 < baseline:
+                        qualifying.append((transformed, state))
+            qualifying.sort(key=lambda item: item[0])
+            return (qualifying, maximum_candidate_zoom, None)
+
+        side_results: list[
+            tuple[str, list[tuple[float, _State]], float | None, str | None]
+        ] = []
+        for candidate_side in (
+            preferred_side,
+            "right" if preferred_side == "left" else "left",
+        ):
+            qualifying, maximum_zoom, failure = qualifying_for_side(
+                candidate_side
+            )
+            side_results.append(
+                (candidate_side, qualifying, maximum_zoom, failure)
+            )
+
+        if not any(qualifying for _side, qualifying, _zoom, _failure in side_results):
             if (
                 required
                 and baseline <= 0.10 + 1e-9
@@ -1852,28 +1885,46 @@ def build_direct_member_editorial_motion_plan(
                 )
                 skip("required_dense_natural_match")
                 continue
-            reject_boundary("no_improving_contained_transform")
+            failures = {
+                failure or "no_improving_contained_transform"
+                for _side, _qualifying, _zoom, failure in side_results
+            }
+            for failure in sorted(failures):
+                reject_boundary(failure)
             if required:
                 required_rejection_context[boundary_index] = (
                     f"baseline={baseline:.6f},center={center_distance:.6f},"
-                    f"height_ratio={ratio:.6f},side={side},"
-                    f"maximum_zoom={maximum_candidate_zoom:.6f}"
+                    f"height_ratio={ratio:.6f},sides="
+                    + ",".join(
+                        f"{candidate_side}:"
+                        + (
+                            f"{maximum_zoom:.6f}"
+                            if maximum_zoom is not None
+                            else "none"
+                        )
+                        for candidate_side, _states, maximum_zoom, _failure
+                        in side_results
+                    )
                 )
             continue
-        qualifying.sort(key=lambda item: item[0])
-        best_score, best_state = qualifying[0]
-        candidates.append(
-            _BoundaryCandidate(
-                boundary_index=boundary_index,
-                event_time=boundary_times[boundary_index],
-                score=baseline - best_score,
-                side=side,
-                state=best_state,
-                alignment_geometry_basis=audited_basis,
-                alternative_states=tuple(state for _score, state in qualifying[1:]),
-                required=required,
+        for candidate_side, qualifying, _maximum_zoom, _failure in side_results:
+            if not qualifying:
+                continue
+            best_score, best_state = qualifying[0]
+            candidates.append(
+                _BoundaryCandidate(
+                    boundary_index=boundary_index,
+                    event_time=boundary_times[boundary_index],
+                    score=baseline - best_score,
+                    side=candidate_side,
+                    state=best_state,
+                    alignment_geometry_basis=audited_basis,
+                    alternative_states=tuple(
+                        state for _score, state in qualifying[1:]
+                    ),
+                    required=required,
+                )
             )
-        )
 
     quantized_duration = sum(frame_counts) / fps
     maximum_events = int(math.floor(
@@ -1894,6 +1945,12 @@ def build_direct_member_editorial_motion_plan(
             item.event_time,
         ),
     ):
+        if any(
+            item.boundary_index == candidate.boundary_index
+            for item in accepted
+        ):
+            skip("alternate_side_boundary_already_satisfied")
+            continue
         if not candidate.required and len(accepted) >= maximum_events:
             skip("event_density_cap")
             continue
