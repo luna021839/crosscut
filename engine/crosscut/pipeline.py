@@ -5761,11 +5761,67 @@ def _direct_member_partition_failure_frontier_apply_operation(
     return tuple(output)
 
 
+def _direct_member_partition_failure_frontier_reverse_operation(
+    child_unit_counts: Sequence[int],
+    kind: str,
+    operation: Any,
+) -> tuple[int, ...] | None:
+    """Reverse one operation and verify its recorded parent signature."""
+
+    counts = tuple(int(value) for value in child_unit_counts)
+    if not counts or any(value <= 0 for value in counts):
+        return None
+    parent = list(counts)
+    if kind == "boundary_shift" and isinstance(
+        operation,
+        _DirectFullFrameBoundaryShift,
+    ):
+        boundary_index = operation.boundary_index
+        if not 0 <= boundary_index < len(counts) - 1:
+            return None
+        if counts[boundary_index : boundary_index + 2] != (
+            operation.left_unit_count,
+            operation.right_unit_count,
+        ):
+            return None
+        old_left = operation.left_unit_count - operation.shift_units
+        old_right = operation.right_unit_count + operation.shift_units
+        if old_left <= 0 or old_right <= 0:
+            return None
+        parent[boundary_index : boundary_index + 2] = [
+            old_left,
+            old_right,
+        ]
+    elif kind == "visual_frontier_split" and isinstance(
+        operation,
+        _DirectFullFrameVisualFrontierSplit,
+    ):
+        span_index = operation.parent_span_index
+        if not 0 <= span_index < len(counts) - 1:
+            return None
+        if counts[span_index : span_index + 2] != (
+            operation.left_unit_count,
+            operation.right_unit_count,
+        ):
+            return None
+        parent[span_index : span_index + 2] = [
+            operation.left_unit_count + operation.right_unit_count
+        ]
+    else:
+        return None
+    result = tuple(parent)
+    if (
+        operation.parent_partition_signature_sha256
+        != _direct_partition_signature_sha256(result)
+    ):
+        return None
+    return result
+
+
 def _direct_member_partition_failure_frontier_operation_sequence(
     profile: _DirectFullFramePartitionProfile,
-    base_unit_counts: Sequence[int],
-) -> tuple[tuple[str, Any], ...] | None:
-    """Recover the unique chronological shift/split lineage by parent hash."""
+) -> tuple[tuple[int, ...], tuple[tuple[str, Any], ...]] | None:
+    """Recover a unique chronological lineage and its input-bound root."""
 
     if (
         profile.window_redistributions
@@ -5780,53 +5836,52 @@ def _direct_member_partition_failure_frontier_operation_sequence(
             for item in profile.visual_frontier_splits
         ),
     ]
-    current = tuple(int(value) for value in base_unit_counts)
-    ordered: list[tuple[str, Any]] = []
+    current = profile.unit_counts
+    reverse_ordered: list[tuple[str, Any]] = []
     while remaining:
         matches: list[tuple[int, str, Any, tuple[int, ...]]] = []
         for index, (kind, operation) in enumerate(remaining):
-            output = _direct_member_partition_failure_frontier_apply_operation(
+            parent = _direct_member_partition_failure_frontier_reverse_operation(
                 current,
                 kind,
                 operation,
             )
-            if output is not None:
-                matches.append((index, kind, operation, output))
+            if parent is not None:
+                matches.append((index, kind, operation, parent))
         if len(matches) != 1:
             return None
         index, kind, operation, current = matches[0]
-        ordered.append((kind, operation))
+        reverse_ordered.append((kind, operation))
         remaining.pop(index)
+    ordered = tuple(reversed(reverse_ordered))
     if (
-        current != profile.unit_counts
-        or profile.latest_operation_kind is None
+        profile.latest_operation_kind is None
         or profile.latest_operation_kind != ordered[-1][0]
     ):
         return None
-    return tuple(ordered)
+    return current, ordered
 
 
 def _direct_member_partition_failure_frontier_lineage(
     profile: _DirectFullFramePartitionProfile,
-    *,
-    base_unit_counts: Sequence[int],
 ) -> dict[str, Any] | None:
     """Serialize a lossless, replayable proof-shift/visual-split frontier."""
 
     operations = _direct_member_partition_failure_frontier_operation_sequence(
         profile,
-        base_unit_counts,
     )
     if operations is None:
         return None
+    root_unit_counts, ordered_operations = operations
     return {
         "contract": (
             _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_CONTRACT
         ),
-        "latest_operation_kind": operations[-1][0],
+        "latest_operation_kind": ordered_operations[-1][0],
+        "lineage_root_partition_unit_counts": list(root_unit_counts),
         "proof_operation_sequence": [
             {"kind": kind, "operation": operation.to_dict()}
-            for kind, operation in operations
+            for kind, operation in ordered_operations
         ],
     }
 
@@ -6061,6 +6116,7 @@ def _restore_direct_member_partition_failure_frontier_lineage(
 
     contract = raw_lineage.get("contract")
     sequence: list[tuple[str, Any]] = []
+    root_unit_counts: tuple[int, ...] | None = None
     if contract == _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_LINEAGE_V1_CONTRACT:
         if not (
             set(raw_lineage)
@@ -6089,6 +6145,7 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             == {
                 "contract",
                 "latest_operation_kind",
+                "lineage_root_partition_unit_counts",
                 "proof_operation_sequence",
             }
             and raw_lineage.get("latest_operation_kind")
@@ -6102,6 +6159,21 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             )
         ):
             raise ValueError("failure frontier lineage schema mismatch")
+        raw_root_counts = raw_lineage[
+            "lineage_root_partition_unit_counts"
+        ]
+        if not (
+            isinstance(raw_root_counts, list)
+            and raw_root_counts
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in raw_root_counts
+            )
+        ):
+            raise ValueError("failure frontier lineage root is invalid")
+        root_unit_counts = tuple(raw_root_counts)
         for raw_item in raw_sequence:
             if not (
                 isinstance(raw_item, dict)
@@ -6138,7 +6210,27 @@ def _restore_direct_member_partition_failure_frontier_lineage(
         > _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
     ):
         raise ValueError("failure frontier operation count is invalid")
-    current = tuple(int(value) for value in base_unit_counts)
+    expected_counts = tuple(int(value) for value in expected_unit_counts)
+    if root_unit_counts is None:
+        current = expected_counts
+        for kind, operation in reversed(sequence):
+            parent = (
+                _direct_member_partition_failure_frontier_reverse_operation(
+                    current,
+                    kind,
+                    operation,
+                )
+            )
+            if parent is None:
+                raise ValueError("failure frontier legacy replay failed")
+            current = parent
+        root_unit_counts = current
+    if (
+        sum(root_unit_counts) != sum(int(value) for value in base_unit_counts)
+        or len(root_unit_counts) < 2
+    ):
+        raise ValueError("failure frontier lineage root timing mismatch")
+    current = root_unit_counts
     for kind, operation in sequence:
         output = _direct_member_partition_failure_frontier_apply_operation(
             current,
@@ -6148,7 +6240,7 @@ def _restore_direct_member_partition_failure_frontier_lineage(
         if output is None:
             raise ValueError("failure frontier operation replay failed")
         current = output
-    if current != tuple(int(value) for value in expected_unit_counts):
+    if current != expected_counts:
         raise ValueError("failure frontier replayed partition mismatch")
     return shifts, splits, sequence[-1][0]
 
@@ -6382,10 +6474,7 @@ def _persist_direct_member_partition_cache_candidates(
         if candidate.unit_counts in seen_signatures:
             continue
         search_lineage = (
-            _direct_member_partition_failure_frontier_lineage(
-                candidate,
-                base_unit_counts=base.unit_counts,
-            )
+            _direct_member_partition_failure_frontier_lineage(candidate)
             if preserve_failure_frontier_lineage
             else None
         )
@@ -11408,10 +11497,7 @@ def _select_direct_member_partition_profile(
                 ),
             )
             if profile.unit_counts not in initial_candidate_signatures
-            and _direct_member_partition_failure_frontier_lineage(
-                profile,
-                base_unit_counts=base.unit_counts,
-            )
+            and _direct_member_partition_failure_frontier_lineage(profile)
             is not None
         )[:_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT]
         warm_start_diagnostics["failure_frontier_persistence"] = (

@@ -308,18 +308,19 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 base_counts,
             ),
         )
-        first_counts = (4, 5, 3, 4, 4, 4, 4, 4)
+        lineage_root_counts = (5, 3, 4, 4, 4, 4, 4, 4)
+        first_counts = (5, 4, 3, 4, 4, 4, 4, 4)
         first_shift = _DirectFullFrameBoundaryShift(
             boundary_index=1,
             shift_units=1,
-            left_unit_count=5,
+            left_unit_count=4,
             right_unit_count=3,
             canonical_master_seconds=9 * unit_seconds,
             boundary_reasons=("beat",),
             trigger="test_proof_shift",
-            parent_profile_id="base",
+            parent_profile_id="input-bound-warm-start",
             parent_partition_signature_sha256=(
-                _direct_partition_signature_sha256(base_counts)
+                _direct_partition_signature_sha256(lineage_root_counts)
             ),
             proof_failure="boundary_connectivity_path_exhausted",
             proof_failed_segment_index=1,
@@ -328,7 +329,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             proof_right_valid_source_indices=(1,),
             proof_local_nonsevere_edge_count=0,
         )
-        split_counts = (4, 5, 3, 4, 2, 2, 4, 4, 4)
+        split_counts = (5, 4, 3, 4, 2, 2, 4, 4, 4)
         split_seconds = 18 * unit_seconds
         visual_split = _DirectFullFrameVisualFrontierSplit(
             parent_span_index=4,
@@ -358,7 +359,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 split_seconds + 0.1,
             ),
         )
-        final_counts = (4, 5, 3, 4, 2, 2, 5, 3, 4)
+        final_counts = (5, 4, 3, 4, 2, 2, 5, 3, 4)
         second_shift = _DirectFullFrameBoundaryShift(
             boundary_index=6,
             shift_units=1,
