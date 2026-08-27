@@ -368,6 +368,11 @@ _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
 _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT = 7
 _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE = 4
+_DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_BOUNDARY_SHIFT_COUNT = (
+    _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+    + _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
+)
+_DIRECT_MEMBER_MAX_MINIMUM_HOLD_FEEDBACK_PROFILE_COUNT = 4
 _DIRECT_MEMBER_COUNTERFACTUAL_SECONDARY_SPLIT_TRIGGER_COUNT = 1
 _DIRECT_MEMBER_MAX_COUNTERFACTUAL_SECONDARY_SPLIT_PROFILE_COUNT = 10
 # Audition only the strongest proof-progress representatives.  The terminal
@@ -6131,7 +6136,9 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             )
             and 1
             <= len(raw_lineage["proof_directed_boundary_shifts"])
-            <= _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+            <= (
+                _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_BOUNDARY_SHIFT_COUNT
+            )
         ):
             raise ValueError("failure frontier lineage schema mismatch")
         sequence.extend(
@@ -6154,7 +6161,7 @@ def _restore_direct_member_partition_failure_frontier_lineage(
             and 1
             <= len(raw_sequence)
             <= (
-                _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+                _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_BOUNDARY_SHIFT_COUNT
                 + _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
             )
         ):
@@ -6205,7 +6212,8 @@ def _restore_direct_member_partition_failure_frontier_lineage(
         if kind == "visual_frontier_split"
     )
     if (
-        len(shifts) > _DIRECT_MEMBER_MAX_SHIFTED_BOUNDARY_COUNT
+        len(shifts)
+        > _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_BOUNDARY_SHIFT_COUNT
         or len(splits)
         > _DIRECT_MEMBER_MAX_VISUAL_FRONTIER_SPLITS_PER_PROFILE
     ):
@@ -7202,6 +7210,179 @@ def _direct_member_render_feedback_partition_profiles(
             if (
                 len(profiles)
                 >= _DIRECT_MEMBER_MAX_DENSE_RENDER_FEEDBACK_PROFILE_COUNT
+            ):
+                return tuple(profiles)
+    return tuple(profiles)
+
+
+def _direct_member_minimum_hold_feedback_boundary_indices(
+    infeasibility_diagnostic: Mapping[str, Any],
+    *,
+    span_count: int,
+) -> tuple[int, ...]:
+    """Return representative clusters from a proved minimum-hold witness."""
+
+    probe = infeasibility_diagnostic.get("minimum_hold_probe")
+    if not isinstance(probe, Mapping):
+        return ()
+    strict_maximum = probe.get("strict_maximum_same_source_hold_count")
+    minimum_required = probe.get("minimum_same_source_hold_count")
+    witness = probe.get("feasible_witness")
+    if not (
+        probe.get("minimum_proven") is True
+        and probe.get("success") is True
+        and probe.get("strict_total_hold_budget_feasible") is False
+        and isinstance(strict_maximum, int)
+        and not isinstance(strict_maximum, bool)
+        and isinstance(minimum_required, int)
+        and not isinstance(minimum_required, bool)
+        and minimum_required > strict_maximum
+        and isinstance(witness, Mapping)
+    ):
+        return ()
+    raw_boundaries = witness.get("same_source_hold_boundary_indices")
+    if not isinstance(raw_boundaries, list):
+        return ()
+    boundaries = sorted(
+        {
+            value
+            for value in raw_boundaries
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value < span_count - 1
+        }
+    )
+    if not boundaries:
+        return ()
+    clusters: list[list[int]] = []
+    for boundary_index in boundaries:
+        if clusters and boundary_index == clusters[-1][-1] + 1:
+            clusters[-1].append(boundary_index)
+        else:
+            clusters.append([boundary_index])
+    clusters.sort(key=lambda cluster: (-len(cluster), cluster[0]))
+    return tuple(cluster[(len(cluster) - 1) // 2] for cluster in clusters)
+
+
+def _direct_member_minimum_hold_feedback_partition_profiles(
+    timing_segments: Sequence[DraftSegment],
+    parent: _DirectFullFramePartitionProfile,
+    infeasibility_diagnostic: Mapping[str, Any],
+) -> tuple[_DirectFullFramePartitionProfile, ...]:
+    """Propose cadence-preserving shifts at proved minimum-hold clusters.
+
+    The minimum-hold MILP is evidence for where the current partition forces
+    long same-source runs, not permission to weaken a visual edge.  Each
+    proposal therefore moves one existing timing-unit boundary and must pass
+    the complete unrelaxed selector on the next run.
+    """
+
+    if (
+        len(parent.boundary_shifts)
+        >= _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_BOUNDARY_SHIFT_COUNT
+    ):
+        return ()
+    boundary_indices = _direct_member_minimum_hold_feedback_boundary_indices(
+        infeasibility_diagnostic,
+        span_count=len(parent.spans),
+    )
+    if not boundary_indices:
+        return ()
+    items = tuple(timing_segments)
+    current_shifts = _direct_partition_current_shift_by_boundary(parent)
+    parent_signature = _direct_partition_signature_sha256(parent.unit_counts)
+    profiles: list[_DirectFullFramePartitionProfile] = []
+    seen_counts = {parent.unit_counts}
+    for boundary_index in boundary_indices:
+        previous_shift = current_shifts.get(boundary_index)
+        shift_directions = (
+            (1 if previous_shift.shift_units > 0 else -1,)
+            if previous_shift is not None
+            else (1, -1)
+        )
+        left_count = parent.unit_counts[boundary_index]
+        right_count = parent.unit_counts[boundary_index + 1]
+        for shift_units in shift_directions:
+            replacement_left = left_count + shift_units
+            replacement_right = right_count - shift_units
+            if replacement_left <= 0 or replacement_right <= 0:
+                continue
+            counts = list(parent.unit_counts)
+            counts[boundary_index : boundary_index + 2] = [
+                replacement_left,
+                replacement_right,
+            ]
+            signature = tuple(counts)
+            if signature in seen_counts:
+                continue
+            try:
+                spans = _direct_full_frame_spans_from_partition(
+                    items,
+                    signature,
+                )
+            except ValueError:
+                continue
+            duration = sum(span.duration_seconds for span in spans)
+            switches_per_minute = (len(spans) - 1) * 60.0 / duration
+            span_median = median(span.duration_seconds for span in spans)
+            if not (
+                _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+                <= switches_per_minute
+                <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
+                and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
+                <= span_median
+                <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                and max(span.duration_seconds for span in spans)
+                <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
+            ):
+                continue
+            new_boundary_unit_end = sum(signature[: boundary_index + 1])
+            shift = _DirectFullFrameBoundaryShift(
+                boundary_index=boundary_index,
+                shift_units=shift_units,
+                left_unit_count=replacement_left,
+                right_unit_count=replacement_right,
+                canonical_master_seconds=(
+                    spans[boundary_index].canonical_master_end
+                ),
+                boundary_reasons=items[
+                    new_boundary_unit_end - 1
+                ].end_boundary_reasons,
+                trigger="lexicographic_minimum_hold_witness_cluster",
+                parent_profile_id=parent.profile_id,
+                parent_partition_signature_sha256=parent_signature,
+                proof_failure="cinematic_bridge_path_infeasible",
+                proof_failed_segment_index=boundary_index + 1,
+                proof_forward_reachable_left_source_indices=(),
+                proof_left_valid_source_indices=(),
+                proof_right_valid_source_indices=(),
+                proof_local_nonsevere_edge_count=None,
+            )
+            profiles.append(
+                _DirectFullFramePartitionProfile(
+                    profile_id=(
+                        f"{parent.profile_id}__minimum-hold-{boundary_index}-"
+                        f"{replacement_left}-plus-{replacement_right}"
+                    ),
+                    unit_counts=signature,
+                    spans=spans,
+                    boundary_shifts=parent.boundary_shifts + (shift,),
+                    window_redistributions=parent.window_redistributions,
+                    visual_frontier_splits=parent.visual_frontier_splits,
+                    boundary_merges=parent.boundary_merges,
+                    latest_operation_kind="boundary_shift",
+                    warm_start_binding_sha256=(
+                        parent.warm_start_binding_sha256
+                    ),
+                    warm_start_cache_file_sha256=(
+                        parent.warm_start_cache_file_sha256
+                    ),
+                )
+            )
+            seen_counts.add(signature)
+            if (
+                len(profiles)
+                >= _DIRECT_MEMBER_MAX_MINIMUM_HOLD_FEEDBACK_PROFILE_COUNT
             ):
                 return tuple(profiles)
     return tuple(profiles)
@@ -9841,6 +10022,13 @@ def _select_direct_member_partition_profile(
     partition_search_cinematic_milp_infeasibility_diagnostic: (
         dict[str, Any] | None
     ) = None
+    partition_search_cinematic_milp_infeasibility_profile: (
+        _DirectFullFramePartitionProfile | None
+    ) = None
+    partition_search_minimum_hold_feedback_profiles: tuple[
+        _DirectFullFramePartitionProfile,
+        ...,
+    ] = ()
     partition_search_strict_terminal_audition_limit_reached = False
     partition_search_strict_terminal_audition_pruned_profile_count = 0
     partition_search_post_feasible_cost_pruned_profile_count = 0
@@ -11439,6 +11627,9 @@ def _select_direct_member_partition_profile(
                                     ),
                                     "diagnostic": dict(raw_diagnostic),
                                 }
+                                partition_search_cinematic_milp_infeasibility_profile = (
+                                    terminal_profile
+                                )
                     terminal_payload["result"] = (
                         "feasible"
                         if terminal_selection is not None
@@ -11521,12 +11712,96 @@ def _select_direct_member_partition_profile(
                 # not claim the still-queued structural profiles were globally
                 # infeasible merely because there was nothing valid to audition.
                 partition_search_cap_reached = True
-            partition_search_queued_frontier_profiles = tuple(
-                item[2]
-                for item in sorted(
-                    queued,
-                    key=lambda item: (item[0], item[1]),
+            if (
+                not feasible
+                and partition_search_cinematic_milp_infeasibility_profile
+                is not None
+                and isinstance(
+                    partition_search_cinematic_milp_infeasibility_diagnostic,
+                    Mapping,
                 )
+            ):
+                raw_diagnostic = (
+                    partition_search_cinematic_milp_infeasibility_diagnostic.get(
+                        "diagnostic"
+                    )
+                )
+                if isinstance(raw_diagnostic, Mapping):
+                    hold_feedback_profiles = (
+                        _direct_member_minimum_hold_feedback_partition_profiles(
+                            timing_draft.segments,
+                            partition_search_cinematic_milp_infeasibility_profile,
+                            raw_diagnostic,
+                        )
+                    )
+                    admitted_hold_feedback_profiles: list[
+                        _DirectFullFramePartitionProfile
+                    ] = []
+                    for profile in hold_feedback_profiles:
+                        if profile.unit_counts in seen_signatures:
+                            partition_search_signature_deduplication_count += 1
+                            continue
+                        seen_signatures.add(profile.unit_counts)
+                        queued.append(
+                            (
+                                _direct_partition_queue_priority(profile),
+                                queued_sequence,
+                                profile,
+                            )
+                        )
+                        queued_sequence += 1
+                        partition_search_generated_profile_count += 1
+                        admitted_hold_feedback_profiles.append(profile)
+                    partition_search_minimum_hold_feedback_profiles = tuple(
+                        admitted_hold_feedback_profiles
+                    )
+                    minimum_hold_probe = raw_diagnostic.get(
+                        "minimum_hold_probe"
+                    )
+                    _emit_progress(
+                        event=(
+                            "direct_member_minimum_hold_feedback_partition"
+                        ),
+                        phase="minimum_hold_feedback_queued",
+                        result=(
+                            "candidates_queued"
+                            if admitted_hold_feedback_profiles
+                            else "no_novel_candidate"
+                        ),
+                        generated_profile_count=len(
+                            admitted_hold_feedback_profiles
+                        ),
+                        strict_maximum_same_source_hold_count=(
+                            minimum_hold_probe.get(
+                                "strict_maximum_same_source_hold_count"
+                            )
+                            if isinstance(minimum_hold_probe, Mapping)
+                            else None
+                        ),
+                        minimum_same_source_hold_count=(
+                            minimum_hold_probe.get(
+                                "minimum_same_source_hold_count"
+                            )
+                            if isinstance(minimum_hold_probe, Mapping)
+                            else None
+                        ),
+                        full_selector_recheck_required=True,
+                        visual_gates_relaxed=False,
+                    )
+            hold_feedback_signatures = {
+                profile.unit_counts
+                for profile in partition_search_minimum_hold_feedback_profiles
+            }
+            partition_search_queued_frontier_profiles = (
+                *partition_search_minimum_hold_feedback_profiles,
+                *(
+                    item[2]
+                    for item in sorted(
+                        queued,
+                        key=lambda item: (item[0], item[1]),
+                    )
+                    if item[2].unit_counts not in hold_feedback_signatures
+                ),
             )
         elif not feasible and base_error is not None:
             if _direct_partition_failure_is_proven(base_error.diagnostics):
@@ -11600,6 +11875,10 @@ def _select_direct_member_partition_profile(
             profile.unit_counts
             for profile in partition_search_queued_frontier_profiles
         }
+        minimum_hold_feedback_signatures = {
+            profile.unit_counts
+            for profile in partition_search_minimum_hold_feedback_profiles
+        }
         failure_frontier_persistence.update(
             {
                 "unevaluated_queue_profile_count": len(
@@ -11612,8 +11891,16 @@ def _select_direct_member_partition_profile(
                     profile.unit_counts in queued_frontier_signatures
                     for profile in restart_frontier_candidates
                 ),
+                "minimum_hold_feedback_profile_count": len(
+                    partition_search_minimum_hold_feedback_profiles
+                ),
+                "selected_minimum_hold_feedback_profile_count": sum(
+                    profile.unit_counts in minimum_hold_feedback_signatures
+                    for profile in restart_frontier_candidates
+                ),
                 "selection_contract": (
-                    "queue_first_strict_lineage_leaf_antichain_v1"
+                    "minimum_hold_feedback_then_queue_first_strict_lineage_"
+                    "leaf_antichain_v2"
                 ),
             }
         )

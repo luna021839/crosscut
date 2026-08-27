@@ -11,6 +11,8 @@ from crosscut.pipeline import (
     _DirectFullFramePartitionProfile,
     _DirectFullFrameVisualFrontierSplit,
     _direct_member_dense_render_feedback_binding,
+    _direct_member_minimum_hold_feedback_boundary_indices,
+    _direct_member_minimum_hold_feedback_partition_profiles,
     _direct_member_render_feedback_partition_profiles,
     _direct_member_partition_restart_frontier_profiles,
     _direct_partition_signature_sha256,
@@ -420,6 +422,53 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             )
         )
         self.assertEqual(restart_frontier, (candidate,))
+        minimum_hold_diagnostic = {
+            "minimum_hold_probe": {
+                "minimum_proven": True,
+                "success": True,
+                "strict_total_hold_budget_feasible": False,
+                "strict_maximum_same_source_hold_count": 7,
+                "minimum_same_source_hold_count": 9,
+                "feasible_witness": {
+                    "same_source_hold_boundary_indices": [2, 3, 6, 7],
+                },
+            }
+        }
+        self.assertEqual(
+            _direct_member_minimum_hold_feedback_boundary_indices(
+                minimum_hold_diagnostic,
+                span_count=len(candidate.spans),
+            ),
+            (2, 6),
+        )
+        hold_feedback_profiles = (
+            _direct_member_minimum_hold_feedback_partition_profiles(
+                timing_segments,
+                candidate,
+                minimum_hold_diagnostic,
+            )
+        )
+        self.assertEqual(len(hold_feedback_profiles), 3)
+        self.assertEqual(
+            {
+                profile.boundary_shifts[-1].boundary_index
+                for profile in hold_feedback_profiles
+            },
+            {2, 6},
+        )
+        self.assertTrue(
+            all(
+                profile.boundary_shifts[-1].trigger
+                == "lexicographic_minimum_hold_witness_cluster"
+                for profile in hold_feedback_profiles
+            )
+        )
+        self.assertTrue(
+            all(
+                profile.latest_operation_kind == "boundary_shift"
+                for profile in hold_feedback_profiles
+            )
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
