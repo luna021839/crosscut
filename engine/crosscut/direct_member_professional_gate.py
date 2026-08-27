@@ -132,6 +132,7 @@ class DirectMemberProfessionalGateResult:
     failure_reasons: tuple[str, ...]
     failure_boundary_indices: Mapping[str, tuple[int, ...]]
     metrics: Mapping[str, Any]
+    boundary_diagnostics: tuple[Mapping[str, Any], ...]
     config: DirectMemberProfessionalGateConfig
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +145,9 @@ class DirectMemberProfessionalGateResult:
                 for key, value in sorted(self.failure_boundary_indices.items())
             },
             "metrics": dict(self.metrics),
+            "boundary_diagnostics": [
+                dict(item) for item in self.boundary_diagnostics
+            ],
             "thresholds": self.config.to_dict(),
             "authority": {
                 "scope": "automatic_official_target_member_fancam_only",
@@ -603,11 +607,93 @@ def evaluate_direct_member_professional_pre_render_gate(
             isinstance(highlight, Mapping) and highlight.get("passed") is True
         ),
     }
+    boundary_diagnostics = tuple(
+        {
+            "boundary_index": boundary.boundary_index,
+            "outgoing_source_index": getattr(
+                boundary,
+                "outgoing_eligible_source_index",
+                None,
+            ),
+            "incoming_source_index": getattr(
+                boundary,
+                "incoming_eligible_source_index",
+                None,
+            ),
+            "outgoing_attention_basis": (
+                boundary.outgoing_sample.attention.basis
+                if boundary.outgoing_sample.attention is not None
+                else None
+            ),
+            "incoming_attention_basis": (
+                boundary.incoming_sample.attention.basis
+                if boundary.incoming_sample.attention is not None
+                else None
+            ),
+            "pose_mismatch": boundary.mismatch.dominant_pose_mismatch,
+            "silhouette_mismatch": boundary.mismatch.silhouette_mismatch,
+            "raw_attention_position_mismatch": (
+                boundary.mismatch.attention_position_mismatch
+            ),
+            "raw_attention_scale_mismatch": (
+                boundary.mismatch.attention_scale_mismatch
+            ),
+            "effective_attention_position_mismatch": (
+                boundary.mismatch.transform_repair.residual_attention_position_mismatch
+                if boundary.mismatch.transform_repair is not None
+                else boundary.mismatch.attention_position_mismatch
+            ),
+            "effective_attention_scale_mismatch": (
+                boundary.mismatch.transform_repair.residual_attention_scale_mismatch
+                if boundary.mismatch.transform_repair is not None
+                else boundary.mismatch.attention_scale_mismatch
+            ),
+            "coarse_transform_repair_proposed": (
+                boundary.mismatch.transform_repair is not None
+            ),
+            "dense_transform_accepted": (
+                boundary.boundary_index in accepted_repairs
+            ),
+            "severe_flags": list(boundary.mismatch.severe_flags),
+            "motion_both_moving": bool(
+                boundary.mismatch.motion_connection is not None
+                and boundary.mismatch.motion_connection.both_moving
+            ),
+            "motion_direction_cosine": (
+                boundary.mismatch.motion_connection.direction_cosine_audit_only
+                if boundary.mismatch.motion_connection is not None
+                else None
+            ),
+            "motion_speed_ratio_mismatch": (
+                getattr(
+                    boundary.mismatch.motion_connection,
+                    "motion_speed_ratio_mismatch",
+                    None,
+                )
+                if boundary.mismatch.motion_connection is not None
+                else None
+            ),
+            "pose_phase_continuation_mismatch": (
+                getattr(
+                    boundary.mismatch.motion_connection,
+                    "pose_phase_continuation_mismatch",
+                    None,
+                )
+                if boundary.mismatch.motion_connection is not None
+                else None
+            ),
+            "transition_kind": transition_items[
+                boundary.boundary_index
+            ].kind.value,
+        }
+        for boundary in selected
+    )
     return DirectMemberProfessionalGateResult(
         passed=not failures,
         failure_reasons=tuple(failures),
         failure_boundary_indices=failure_indices,
         metrics=metrics,
+        boundary_diagnostics=boundary_diagnostics,
         config=cfg,
     )
 

@@ -22,7 +22,7 @@ from .render import RenderSegment, SourceLookAdjustment
 
 
 ANALYSIS_BASIS = (
-    "selected_span_cached_lab_gray_graph_regularized_member_look_v1"
+    "selected_span_cached_global_luma_detail_source_chroma_graph_member_look_v2"
 )
 
 
@@ -48,7 +48,7 @@ class DirectMemberLookConfig:
     luma_step: float = 0.065
     chroma_step: float = 0.055
     source_sharpness_log_span: float = 0.55
-    source_luma_span: float = 0.14
+    source_luma_span: float = 0.18
     source_chroma_span: float = 0.12
 
     def __post_init__(self) -> None:
@@ -521,7 +521,14 @@ def solve_direct_member_look_adjustments(
                 "luma": float(luma_step / settings.luma_step),
                 "chroma": float(chroma_step / settings.chroma_step),
             }
-            normalized = float(max(axes.values()))
+            # Global Lab chroma follows the stage LEDs and background much
+            # more strongly than the authenticated performer.  Treating that
+            # signal as a skin/look discontinuity asks the grade to cancel the
+            # production's lighting design and can introduce a visible tint
+            # flash of its own.  Keep chroma in the diagnostics and retain the
+            # conservative per-source median normalization, but gate rapid
+            # look shocks only on the reliable global axes: luma and detail.
+            normalized = float(max(axes["sharpness"], axes["luma"]))
             above_threshold = bool(normalized > 1.0)
             high_count += int(above_threshold)
             diagnostics.append(
@@ -595,9 +602,35 @@ def solve_direct_member_look_adjustments(
             )
             if failed
         )
+        candidate_summary = "; ".join(
+            (
+                f"lambda={candidate[0]:g},"
+                f"rapid={candidate[4] if candidate[4] is not None else 'none'},"
+                f"sharpness={candidate[5]['sharpness_log']},"
+                f"luma={candidate[5]['luma']},"
+                f"chroma={candidate[5]['chroma']}"
+            )
+            for candidate in candidates
+        )
+        worst_shocks = "; ".join(
+            (
+                f"{item['outgoing_run_index']}:{item['outgoing_source_index']}"
+                f"->{item['incoming_run_index']}:{item['incoming_source_index']}="
+                f"{item['normalized_shock']:.3f}"
+                f"(sharpness={item['normalized_axes']['sharpness']:.3f},"
+                f"luma={item['normalized_axes']['luma']:.3f},"
+                f"chroma={item['normalized_axes']['chroma']:.3f})"
+            )
+            for item in sorted(
+                diagnostics,
+                key=lambda value: value["normalized_shock"],
+                reverse=True,
+            )
+        )
         raise ValueError(
             "cached member look calibration cannot satisfy "
-            f"{failed_policies} policy"
+            f"{failed_policies} policy; rapid_edges={len(rapid_edges)}; "
+            f"candidates=[{candidate_summary}]; shocks=[{worst_shocks}]"
         )
     by_segment: list[SourceLookAdjustment | None] = [None] * len(items)
     for run, adjustment in zip(runs, run_adjustments, strict=True):

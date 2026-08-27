@@ -117,6 +117,11 @@ class DirectMemberProfessionalGateTests(unittest.TestCase):
         self.assertTrue(result.passed, result.to_dict())
         self.assertEqual(result.metrics["visible_switches_per_minute"], 15.0)
         self.assertEqual(result.failure_reasons, ())
+        self.assertEqual(len(result.boundary_diagnostics), 20)
+        self.assertEqual(
+            result.to_dict()["boundary_diagnostics"][0]["boundary_index"],
+            0,
+        )
 
     def test_missing_pose_and_opposed_motion_fail_closed(self) -> None:
         result = evaluate_direct_member_professional_pre_render_gate(

@@ -53,6 +53,33 @@ class DirectMemberLookTests(unittest.TestCase):
             )
         )
 
+    def test_rapid_global_stage_chroma_is_diagnostic_not_a_skin_grade_gate(self) -> None:
+        stage_chroma = (0.10, -0.10, -0.10, 0.10) * 3
+        observations = tuple(
+            DirectMemberLookObservation(
+                segment_index=index,
+                source_index=index % 2,
+                duration_seconds=1.0,
+                luma=0.45,
+                chroma_a=stage_chroma[index],
+                chroma_b=-stage_chroma[index],
+                detail_proxy=0.14,
+                sample_count=6,
+            )
+            for index in range(len(stage_chroma))
+        )
+
+        plan = solve_direct_member_look_adjustments(observations)
+
+        self.assertEqual(plan.predicted_high_shock_count, 0)
+        self.assertEqual(plan.predicted_high_shock_fraction, 0.0)
+        self.assertTrue(
+            any(
+                item["normalized_axes"]["chroma"] > 1.0
+                for item in plan.diagnostics
+            )
+        )
+
     def test_observations_must_retain_exact_segment_order(self) -> None:
         observations = (
             DirectMemberLookObservation(1, 0, 1.0, 0.4, 0.0, 0.0, 0.1, 3),
