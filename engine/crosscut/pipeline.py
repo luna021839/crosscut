@@ -4915,6 +4915,18 @@ def _direct_partition_terminal_hold_failure_is_eligible(
     )
 
 
+def _direct_partition_warm_terminal_audition_is_authorized(
+    diagnostics: Mapping[str, Any],
+    render_infeasible_transition_edges: Sequence[tuple[float, int, int]],
+) -> bool:
+    """Keep decoded-render repairs ahead of an early no-cut escape path."""
+
+    return bool(
+        not render_infeasible_transition_edges
+        and _direct_partition_terminal_hold_failure_is_eligible(diagnostics)
+    )
+
+
 def _direct_partition_aggregate_outcome(
     statuses: Sequence[str],
     *,
@@ -11462,15 +11474,11 @@ def _select_direct_member_partition_profile(
                         "strict_failure_not_terminal_authorized"
                     )
                     continue
-                # A render-feedback warm start is already a proved structural
-                # repair. Retain its strict failure as a search seed so a
-                # failed terminal audition can still compose another exact
-                # repair on top of it. The terminal selector now has a
-                # dedicated duration-scaled portrait effect-bridge budget, so
-                # auditioning it immediately no longer means replacing a
-                # render-proven cut with an arbitrary no-cut hold. Deferring
-                # every feedback profile forced the app through the entire
-                # structural queue before trying the already-bound candidate.
+                # Retain every proved warm-start failure as a structural seed.
+                # With decoded-render feedback present, its exact repair
+                # children must run before any no-cut terminal escape; an
+                # early hold can otherwise discard the requested visible cut
+                # and repeat the same dense-render failure on the next pass.
                 warm_start_strict_failures.append(
                     (warm_profile, warm_error)
                 )
@@ -11480,9 +11488,16 @@ def _select_direct_member_partition_profile(
                     )
                 )
 
-                if not _direct_partition_terminal_hold_failure_is_eligible(
-                    warm_error.diagnostics
+                if not _direct_partition_warm_terminal_audition_is_authorized(
+                    warm_error.diagnostics,
+                    render_infeasible_transition_edges,
                 ):
+                    render_feedback_defers_terminal = bool(
+                        render_infeasible_transition_edges
+                        and _direct_partition_terminal_hold_failure_is_eligible(
+                            warm_error.diagnostics
+                        )
+                    )
                     warm_evaluation.update(
                         {
                             "terminal_audition_authorized": False,
@@ -11490,10 +11505,17 @@ def _select_direct_member_partition_profile(
                                 warm_error.diagnostics.get("failure")
                             ),
                             "terminal_audition_ineligible_reason": (
-                                "same_source_hold_cannot_repair_content_or_"
-                                "quota_validity_failure"
+                                "decoded_render_feedback_requires_strict_"
+                                "structural_repair_first"
+                                if render_feedback_defers_terminal
+                                else "same_source_hold_cannot_repair_content_"
+                                "or_quota_validity_failure"
                             ),
-                            "result": "strict_failure_search_seed",
+                            "result": (
+                                "strict_failure_dense_feedback_search_seed"
+                                if render_feedback_defers_terminal
+                                else "strict_failure_search_seed"
+                            ),
                         }
                     )
                     continue

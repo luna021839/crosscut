@@ -19,6 +19,7 @@ from crosscut.pipeline import (
     _direct_partition_queue_priority,
     _direct_partition_terminal_audition_due,
     _direct_partition_terminal_hold_failure_is_eligible,
+    _direct_partition_warm_terminal_audition_is_authorized,
     _direct_full_frame_proof_directed_child_profiles,
     _direct_full_frame_spans_from_partition,
     _load_direct_member_dense_render_feedback_edges,
@@ -802,6 +803,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 }
             )
         )
+
         self.assertTrue(
             _direct_partition_terminal_hold_failure_is_eligible(
                 {
@@ -816,6 +818,24 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                     "failure": "search_capacity_exhausted",
                     "constraint_infeasibility_proven": False,
                 }
+            )
+        )
+
+    def test_render_feedback_defers_warm_terminal_hold_audition(self) -> None:
+        diagnostics = {
+            "failure": "boundary_connectivity_path_exhausted",
+            "constraint_infeasibility_proven": True,
+        }
+        self.assertTrue(
+            _direct_partition_warm_terminal_audition_is_authorized(
+                diagnostics,
+                (),
+            )
+        )
+        self.assertFalse(
+            _direct_partition_warm_terminal_audition_is_authorized(
+                diagnostics,
+                ((10.0, 0, 1),),
             )
         )
 
