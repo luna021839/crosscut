@@ -1082,24 +1082,27 @@ def _boundary_side_stability_allowed(
     )
 
 
-def _cross_source_transition_allowed(
+def _cross_source_transition_rejection_reasons(
     previous: TimelineCandidate,
     current: TimelineCandidate,
     config: TimelineConfig,
-) -> bool:
-    """Reject attention-jumping cross-source edges before Viterbi scoring."""
+) -> tuple[str, ...]:
+    """Return every hard-gate reason that rejects one cross-source edge."""
 
+    reasons: list[str] = []
     if not _boundary_side_stability_allowed(
         previous.exit_boundary_side_stability,
         config,
-    ) or not _boundary_side_stability_allowed(
+    ):
+        reasons.append("outgoing_boundary_side_instability")
+    if not _boundary_side_stability_allowed(
         current.entry_boundary_side_stability,
         config,
     ):
-        return False
+        reasons.append("incoming_boundary_side_instability")
     evidence_available = False
     if previous.exit_scene_cut_near or current.entry_scene_cut_near:
-        return False
+        reasons.append("source_local_camera_cut_near_boundary")
     previous_scale = (
         previous.exit_shot_scale
         if previous.exit_shot_scale is not None
@@ -1115,7 +1118,7 @@ def _cross_source_transition_allowed(
         config.maximum_cross_source_scale_delta is not None
         and scale_delta > config.maximum_cross_source_scale_delta
     ):
-        return False
+        reasons.append("scale_delta")
 
     # ``entry/exit_shot_scale`` doubles as a compatibility marker for callers
     # that provide full boundary descriptors.  Once that marker is present, a
@@ -1142,7 +1145,7 @@ def _cross_source_transition_allowed(
             config.maximum_cross_source_focus_mismatch is not None
             and focus_mismatch > config.maximum_cross_source_focus_mismatch
         ):
-            return False
+            reasons.append("focus_geometry")
 
     previous_identity = (
         previous.exit_face_identity_embedding
@@ -1170,7 +1173,7 @@ def _cross_source_transition_allowed(
             face_similarity is None
             or face_similarity < config.minimum_cross_source_face_similarity
         ):
-            return False
+            reasons.append("close_up_face_identity")
 
     layout_mismatch = cross_source_layout_mismatch(previous, current)
     if layout_mismatch is not None:
@@ -1179,7 +1182,7 @@ def _cross_source_transition_allowed(
             config.maximum_cross_source_layout_mismatch is not None
             and layout_mismatch > config.maximum_cross_source_layout_mismatch
         ):
-            return False
+            reasons.append("person_layout")
 
     previous_formation = (
         previous.exit_formation_people
@@ -1202,7 +1205,7 @@ def _cross_source_transition_allowed(
             and formation_mismatch
             > config.maximum_cross_source_formation_mismatch
         ):
-            return False
+            reasons.append("formation")
 
     previous_silhouette = (
         previous.exit_silhouette_embedding
@@ -1226,8 +1229,24 @@ def _cross_source_transition_allowed(
             and silhouette_mismatch
             > config.maximum_cross_source_silhouette_mismatch
         ):
-            return False
-    return evidence_available or not config.require_cross_source_visual_evidence
+            reasons.append("silhouette")
+    if not evidence_available and config.require_cross_source_visual_evidence:
+        reasons.append("missing_visual_evidence")
+    return tuple(reasons)
+
+
+def _cross_source_transition_allowed(
+    previous: TimelineCandidate,
+    current: TimelineCandidate,
+    config: TimelineConfig,
+) -> bool:
+    """Reject attention-jumping cross-source edges before Viterbi scoring."""
+
+    return not _cross_source_transition_rejection_reasons(
+        previous,
+        current,
+        config,
+    )
 
 
 def _transition_score(
@@ -1724,6 +1743,10 @@ def select_timeline(
         current_segment = segments[segment_position]
         previous_layer = layers[-1]
         current_layer: dict[tuple[int, int, int, int], _Node] = {}
+        rejection_counts: dict[str, int] = {}
+
+        def record_rejection(reason: str) -> None:
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
         for previous_state, previous_node in previous_layer.items():
             (
@@ -1747,6 +1770,12 @@ def select_timeline(
                     settings,
                 )
                 if transition_result is None:
+                    for reason in _cross_source_transition_rejection_reasons(
+                        previous_candidate,
+                        current_candidate,
+                        settings,
+                    ):
+                        record_rejection(reason)
                     continue
                 transition_score, shot_run = transition_result
                 source_run = (
@@ -1815,6 +1844,7 @@ def select_timeline(
                     and source_run > settings.maximum_same_source_hold_segments
                     and comparable_alternate_exists
                 ):
+                    record_rejection("same_source_segment_hold_cap")
                     continue
                 if (
                     same_source
@@ -1822,6 +1852,7 @@ def select_timeline(
                     and source_run_seconds
                     > settings.maximum_same_source_hold_seconds
                 ):
+                    record_rejection("same_source_duration_hold_cap")
                     continue
 
                 # Only edges already admitted by _transition_score reach this
@@ -1882,8 +1913,14 @@ def select_timeline(
                         used_fallback=used_fallback,
                     )
         if not current_layer:
+            rejection_summary = ",".join(
+                f"{reason}:{count}"
+                for reason, count in sorted(rejection_counts.items())
+            ) or "unknown:0"
             raise ValueError(
-                f"segment {current_segment[0].segment_index} has no cadence-safe candidate"
+                f"segment {current_segment[0].segment_index} has no "
+                "cadence-safe candidate; rejection_counts="
+                f"{rejection_summary}"
             )
         layers.append(current_layer)
 

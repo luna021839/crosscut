@@ -686,6 +686,38 @@ class TimelineOptimisationTests(unittest.TestCase):
                 ),
             )
 
+    def test_dead_end_reports_transition_and_hold_rejection_counts(self) -> None:
+        spans = ((0.0, 2.0), (2.0, 4.0))
+        segments = [
+            [
+                TimelineCandidate(
+                    segment_index=index,
+                    source_id=source,
+                    start_seconds=start,
+                    end_seconds=end,
+                    quality_score=1.0,
+                    shot_scale=scale,
+                )
+                for source, scale in (("A", 0.1), ("B", 0.9))
+            ]
+            for index, (start, end) in enumerate(spans)
+        ]
+
+        with self.assertRaises(ValueError) as raised:
+            select_timeline(
+                segments,
+                config=continuity_gate_config(
+                    preferred_max_source_hold_seconds=2.0,
+                    maximum_same_source_hold_seconds=2.0,
+                    maximum_cross_source_scale_delta=0.2,
+                ),
+            )
+
+        message = str(raised.exception)
+        self.assertIn("segment 1 has no cadence-safe candidate", message)
+        self.assertIn("same_source_duration_hold_cap:2", message)
+        self.assertIn("scale_delta:2", message)
+
     def test_ping_pong_penalty_avoids_immediate_source_return(self) -> None:
         qualities = (
             {"A": 1.0, "B": 0.8, "C": 0.8},
