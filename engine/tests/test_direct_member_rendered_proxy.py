@@ -519,6 +519,65 @@ class DirectMemberRenderedProxyTests(unittest.TestCase):
         outgoing.evaluate((frame_counts[0] - 1) / refined.fps)
         incoming.evaluate(0.0)
 
+    def test_camera_inverse_does_not_touch_non_repair_boundary(self) -> None:
+        original = RenderPlan(
+            sources=(
+                Path("one.mp4"),
+                Path("two.mp4"),
+                Path("three.mp4"),
+            ),
+            segments=(
+                RenderSegment(0, 0.0, 0.4, 0.0),
+                RenderSegment(1, 0.4, 0.4, 0.4),
+                RenderSegment(2, 0.8, 0.4, 0.8),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.PORTRAIT,
+            output=Path("full.mp4"),
+            width=1080,
+            height=1920,
+            fps=10.0,
+            transitions=(RenderTransition(), RenderTransition()),
+            member_pose_dissolve_requested=True,
+            member_pose_dissolve_effective=False,
+            member_pose_dissolve_count=0,
+        )
+        payload = dict(_camera_preflight().payload)
+        continuity = dict(payload["rendered_continuity"])
+        first_boundary = dict(continuity["boundaries"][0])
+        second_boundary = dict(first_boundary)
+        second_boundary.update(
+            {
+                "boundary_index": 1,
+                "outgoing_source_index": 1,
+                "incoming_source_index": 2,
+            }
+        )
+        continuity["boundaries"] = [first_boundary, second_boundary]
+        payload["rendered_continuity"] = continuity
+        refined, diagnostics = (
+            refine_direct_member_camera_plan_from_rendered_proxy(
+                original,
+                DirectMemberRenderedProxyPreflight(payload),
+                maximum_zoom_by_source_index={
+                    0: 1.50,
+                    1: 1.50,
+                    2: 1.50,
+                },
+                repair_boundary_indices=(1,),
+            )
+        )
+
+        self.assertIsNot(refined, original)
+        self.assertTrue(diagnostics["applied"])
+        self.assertEqual(diagnostics["repair_target_boundary_indices"], [1])
+        self.assertEqual(diagnostics["refined_boundary_indices"], [1])
+        self.assertEqual(
+            diagnostics["boundaries"][0]["status"],
+            "outside_repair_target",
+        )
+        self.assertEqual(original.segments[0], refined.segments[0])
+
     def test_refinement_respects_per_source_1080p_zoom_cap(self) -> None:
         refined, diagnostics = (
             refine_direct_member_camera_plan_from_rendered_proxy(

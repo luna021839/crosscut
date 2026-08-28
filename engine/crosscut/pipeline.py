@@ -5957,7 +5957,7 @@ def _direct_member_dense_render_feedback_binding(
     binding_evidence = {
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
         "feedback_application_policy": (
-            "dense_partial_camera_boundary_pair_diagnostics_proxy_v7"
+            "dense_partial_camera_boundary_pair_diagnostics_proxy_v8"
         ),
         "acquisition_source_identity_sha256": source_identity_sha256,
         "timing_draft": timing_draft.to_dict(),
@@ -24675,6 +24675,10 @@ def analyze(
                                 maximum_zoom_by_source_index=(
                                     candidate_camera_maximum_zoom_by_request_source
                                 ),
+                                repair_boundary_indices=(
+                                    member_proxy_preflight
+                                    .continuity_repair_target_boundary_indices
+                                ),
                                 allow_official_fancam_subject_geometry=True,
                             )
                         )
@@ -24826,6 +24830,10 @@ def analyze(
                                 member_proxy_preflight,
                                 maximum_zoom_by_source_index=(
                                     candidate_camera_maximum_zoom_by_request_source
+                                ),
+                                repair_boundary_indices=(
+                                    member_proxy_preflight
+                                    .continuity_repair_target_boundary_indices
                                 ),
                                 allow_official_fancam_subject_geometry=True,
                             )

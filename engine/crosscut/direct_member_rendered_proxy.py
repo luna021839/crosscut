@@ -112,6 +112,27 @@ class DirectMemberRenderedProxyPreflight:
             raise ValueError("member proxy repair targets are malformed")
         return tuple(int(value) for value in values)
 
+    @property
+    def continuity_repair_target_boundary_indices(self) -> tuple[int, ...]:
+        values = self.payload.get(
+            "continuity_repair_target_boundary_indices",
+            [],
+        )
+        if not isinstance(values, list):
+            raise ValueError(
+                "member proxy continuity repair targets are malformed"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in values
+        ):
+            raise ValueError(
+                "member proxy continuity repair targets are malformed"
+            )
+        return tuple(values)
+
     def write(self, path: Path) -> Path:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1601,6 +1622,7 @@ def refine_direct_member_camera_plan_from_rendered_proxy(
     preflight: DirectMemberRenderedProxyPreflight,
     *,
     maximum_zoom_by_source_index: Mapping[int, float],
+    repair_boundary_indices: Sequence[int] | None = None,
     target_margin_fraction: float = 0.80,
     ramp_seconds: float = 0.75,
     allow_official_fancam_subject_geometry: bool = False,
@@ -1625,6 +1647,22 @@ def refine_direct_member_camera_plan_from_rendered_proxy(
         raise TypeError("camera refinement needs a member proxy preflight")
     if not isinstance(allow_official_fancam_subject_geometry, bool):
         raise TypeError("official fancam subject geometry flag must be boolean")
+    repair_targets: frozenset[int] | None = None
+    if repair_boundary_indices is not None:
+        if isinstance(repair_boundary_indices, (str, bytes)):
+            raise TypeError("camera refinement repair targets are invalid")
+        parsed_repair_targets: set[int] = set()
+        for boundary_index in repair_boundary_indices:
+            if (
+                isinstance(boundary_index, bool)
+                or not isinstance(boundary_index, int)
+                or not 0 <= boundary_index < len(plan.segments) - 1
+            ):
+                raise ValueError(
+                    "camera refinement repair target is invalid"
+                )
+            parsed_repair_targets.add(boundary_index)
+        repair_targets = frozenset(parsed_repair_targets)
     if (
         not math.isfinite(target_margin_fraction)
         or not 0.50 <= target_margin_fraction <= 1.0
@@ -1678,6 +1716,9 @@ def refine_direct_member_camera_plan_from_rendered_proxy(
         "target_attention_scale_mismatch": target_scale,
         "target_margin_fraction": target_margin_fraction,
         "ramp_seconds": ramp_seconds,
+        "repair_target_boundary_indices": (
+            sorted(repair_targets) if repair_targets is not None else None
+        ),
         "refined_boundary_indices": [],
         "refined_overlap_boundary_indices": [],
         "unresolved_boundary_indices": [],
@@ -1745,6 +1786,12 @@ def refine_direct_member_camera_plan_from_rendered_proxy(
             ),
         }
         boundary_diagnostics[boundary_index] = record_diagnostics
+        if (
+            repair_targets is not None
+            and boundary_index not in repair_targets
+        ):
+            record_diagnostics["status"] = "outside_repair_target"
+            continue
         transition = plan.transitions[boundary_index]
         outgoing_segment = plan.segments[boundary_index]
         incoming_segment = plan.segments[boundary_index + 1]
