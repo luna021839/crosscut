@@ -16586,6 +16586,14 @@ def _post_repair_review_rejection_payload(
         ]
         if review is not None
         else [],
+        "post_repair_timeline_review": (
+            review.to_dict() if review is not None else None
+        ),
+        "boundary_repair": (
+            bundle.boundary_repairs.to_dict()
+            if bundle.boundary_repairs is not None
+            else None
+        ),
         "diagnostics": list(bundle.diagnostics),
     }
 
@@ -22081,7 +22089,7 @@ def analyze(
                     )
                     if repair_eligible_records:
                         reporter.log(
-                            "사전 초점 경계만 탈락한 후보를 디코딩 경계 수선 후 "
+                            "사전 초점·대형 경계만 탈락한 후보를 디코딩 경계 수선 후 "
                             "최종 구조 QA로 재검증"
                         )
                     for record in repair_eligible_records:

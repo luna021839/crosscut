@@ -37,9 +37,9 @@ from .timeline import (
     TimelineCandidate,
     TimelineConfig,
     TimelineResult,
+    comparable_group_formation_mismatch,
     cross_source_layout_mismatch,
     face_geometry_minimax_mismatch,
-    formation_assignment_mismatch,
     select_timeline_candidates,
 )
 from .timeline_review import TimelineReview, review_timeline
@@ -3424,9 +3424,15 @@ def materialize_visual_timeline_candidate(
                 previous,
                 choice,
             )
-            formation_transition_mismatch = formation_assignment_mismatch(
+            formation_transition_mismatch = comparable_group_formation_mismatch(
                 previous.exit_formation_people,
                 choice.entry_formation_people,
+                left_shot_type=(
+                    previous.exit_shot_type or previous.shot_type
+                ),
+                right_shot_type=(
+                    choice.entry_shot_type or choice.shot_type
+                ),
             )
         choices.append(
             VisualTimelineChoice(

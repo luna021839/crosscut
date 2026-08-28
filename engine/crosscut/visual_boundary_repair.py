@@ -30,7 +30,7 @@ from .timeline import (
     BoundarySideStability,
     ShotType,
     boundary_side_stability_exceeded,
-    formation_assignment_mismatch,
+    comparable_group_formation_mismatch,
     screen_layout_mismatch,
 )
 from .timeline_review import TimelineReview, TimelineReviewConfig, review_timeline
@@ -857,9 +857,11 @@ def _visual_evidence(
     temporal_pose_motion_thresholds: TemporalPoseMotionThresholds | None = None,
     temporal_pose_motion_preference_weight: float = 0.0,
 ) -> BoundaryVisualEvidence:
-    formation = formation_assignment_mismatch(
+    formation = comparable_group_formation_mismatch(
         outgoing.formation_people,
         incoming.formation_people,
+        left_shot_type=outgoing.shot_type,
+        right_shot_type=incoming.shot_type,
     )
     exact_pose_available = (
         _actual_pose_available(outgoing),
@@ -1686,6 +1688,7 @@ def repair_visual_timeline_boundaries(
                             "temporal_pose_motion": (
                                 item[0].temporal_pose_motion.to_dict()
                             ),
+                            "visual_evidence": item[0].to_dict(),
                         }
                         for frame_offset, item in sorted(
                             evidence_by_offset.items()

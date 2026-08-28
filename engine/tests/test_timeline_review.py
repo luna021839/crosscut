@@ -433,9 +433,13 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
             exit_shot_scale=0.10,
             exit_scene_cut_near=True,
             exit_focus_bbox_xywh=(0.05, 0.10, 0.20, 0.30),
+            exit_shot_type=ShotType.GROUP_WIDE,
             exit_person_layout_embedding=(0.0, 0.0),
             exit_silhouette_embedding=(0.0, 0.0),
-            exit_formation_people=(formation_person(0.20),),
+            exit_formation_people=(
+                formation_person(0.15),
+                formation_person(0.85),
+            ),
             exit_pose_embedding=(0.0, 0.0),
         )
         incoming = candidate(
@@ -445,9 +449,13 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
             5.0,
             entry_shot_scale=0.80,
             entry_focus_bbox_xywh=(0.70, 0.60, 0.20, 0.30),
+            entry_shot_type=ShotType.GROUP_WIDE,
             entry_person_layout_embedding=(1.0, 1.0),
             entry_silhouette_embedding=(1.0, 1.0),
-            entry_formation_people=(formation_person(0.80),),
+            entry_formation_people=(
+                formation_person(0.45),
+                formation_person(0.55),
+            ),
             entry_pose_embedding=(1.0, 1.0),
         )
 
@@ -465,6 +473,38 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
         self.assertIn("scene_cut_risk_boundary", hard_codes)
         for metric in boundary.available_metrics:
             self.assertIn(f"{metric}_mismatch_exceeded", hard_codes)
+
+    def test_non_group_boundary_does_not_apply_raw_formation_hard_gate(
+        self,
+    ) -> None:
+        review = review_timeline(
+            (
+                candidate(
+                    0,
+                    "A",
+                    0.0,
+                    2.5,
+                    exit_shot_type=ShotType.MEDIUM,
+                    exit_formation_people=(formation_person(0.20),),
+                ),
+                candidate(
+                    1,
+                    "B",
+                    2.5,
+                    5.0,
+                    entry_shot_type=ShotType.CLOSE_UP,
+                    entry_formation_people=(formation_person(0.80),),
+                ),
+            )
+        )
+
+        boundary = review.boundaries[0]
+        self.assertIsNone(boundary.formation_mismatch)
+        self.assertNotIn("formation", boundary.available_metrics)
+        self.assertNotIn(
+            "formation_mismatch_exceeded",
+            {failure.code for failure in review.hard_failures},
+        )
 
     def test_same_source_boundary_is_not_falsely_reviewed_as_cross_source(self) -> None:
         choices = (
@@ -531,6 +571,7 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
             0,
             0,
             exit_shot_scale=0.3,
+            exit_shot_type=ShotType.GROUP_WIDE,
             face_samples_xywh=(
                 (0.40, 0.20, 0.20, 0.30),
                 (0.40, 0.20, 0.20, 0.30),
@@ -547,6 +588,7 @@ class TimelineReviewBoundaryTests(unittest.TestCase):
             1,
             1,
             entry_shot_scale=0.35,
+            entry_shot_type=ShotType.GROUP_WIDE,
             face_samples_xywh=(
                 (0.42, 0.20, 0.20, 0.30),
                 (0.42, 0.20, 0.20, 0.30),

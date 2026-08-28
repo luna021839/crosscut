@@ -30,8 +30,9 @@ from .timeline import (
     BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH,
     BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH,
     BoundarySideStability,
+    ShotType,
     boundary_side_stability_exceeded,
-    formation_assignment_mismatch,
+    comparable_group_formation_mismatch,
     screen_layout_mismatch,
 )
 
@@ -844,6 +845,25 @@ def _silhouette_mismatch(outgoing: Any, incoming: Any) -> float | None:
 
 
 def _formation_mismatch(outgoing: Any, incoming: Any) -> float | None:
+    left_shot_type = _boundary_value(
+        outgoing,
+        boundary_name="exit_shot_type",
+        fallback_name="shot_type",
+    )
+    right_shot_type = _boundary_value(
+        incoming,
+        boundary_name="entry_shot_type",
+        fallback_name="shot_type",
+    )
+    try:
+        comparable_shot_types = (
+            ShotType(left_shot_type) is ShotType.GROUP_WIDE
+            and ShotType(right_shot_type) is ShotType.GROUP_WIDE
+        )
+    except (TypeError, ValueError):
+        comparable_shot_types = False
+    if not comparable_shot_types:
+        return None
     precomputed = _precomputed_mismatch(incoming, "formation")
     if precomputed is not None:
         return precomputed
@@ -861,7 +881,12 @@ def _formation_mismatch(outgoing: Any, incoming: Any) -> float | None:
             fallback_name="formation_people",
         )
     )
-    return formation_assignment_mismatch(left, right)
+    return comparable_group_formation_mismatch(
+        left,
+        right,
+        left_shot_type=left_shot_type,
+        right_shot_type=right_shot_type,
+    )
 
 
 def _pose_mismatch(outgoing: Any, incoming: Any) -> float | None:

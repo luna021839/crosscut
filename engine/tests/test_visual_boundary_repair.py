@@ -38,6 +38,7 @@ def _descriptor(center: float) -> FrameVisualDescriptor:
         shot_type=ShotType.MEDIUM,
         face_count=0,
         structure_embedding=(center, 1.0 - center),
+        silhouette_embedding=(center, 1.0 - center),
         person_layout_embedding=(center, 0.5, 0.2),
         formation_people=(person,),
         detected_person_count=1,

@@ -895,6 +895,129 @@ def formation_assignment_mismatch(
     return min(1.0, (matched_cost + unmatched_cost) / max(len(left), len(right)))
 
 
+def _relative_group_formation(
+    people: Sequence[FormationPersonDescriptor],
+) -> tuple[FormationPersonDescriptor, ...]:
+    """Remove one camera's global pan/zoom while retaining group geometry.
+
+    Broadcast cameras observe the same choreography with different framing.
+    The renderer can compensate one global translation and uniform scale, so
+    the production formation gate must compare the relative member layout and
+    upper-body pose rather than treating that correctable camera transform as
+    a choreography discontinuity.
+    """
+
+    if not people:
+        return ()
+    group_left = min(person.bbox_xywh[0] for person in people)
+    group_top = min(person.bbox_xywh[1] for person in people)
+    group_right = max(
+        person.bbox_xywh[0] + person.bbox_xywh[2] for person in people
+    )
+    group_bottom = max(
+        person.bbox_xywh[1] + person.bbox_xywh[3] for person in people
+    )
+    group_center_x = (group_left + group_right) / 2.0
+    group_center_y = (group_top + group_bottom) / 2.0
+    uniform_extent = max(
+        group_right - group_left,
+        group_bottom - group_top,
+        1e-6,
+    )
+
+    normalized: list[FormationPersonDescriptor] = []
+    for person in people:
+        left, top, width, height = person.bbox_xywh
+        relative_width = min(1.0, max(1e-6, width / uniform_extent))
+        relative_height = min(1.0, max(1e-6, height / uniform_extent))
+        relative_left = 0.5 + (left - group_center_x) / uniform_extent
+        relative_top = 0.5 + (top - group_center_y) / uniform_extent
+        relative_left = min(
+            max(0.0, relative_left),
+            1.0 - relative_width,
+        )
+        relative_top = min(
+            max(0.0, relative_top),
+            1.0 - relative_height,
+        )
+        relative_centroid = (
+            min(
+                1.0,
+                max(
+                    0.0,
+                    0.5
+                    + (person.centroid_xy[0] - group_center_x)
+                    / uniform_extent,
+                ),
+            ),
+            min(
+                1.0,
+                max(
+                    0.0,
+                    0.5
+                    + (person.centroid_xy[1] - group_center_y)
+                    / uniform_extent,
+                ),
+            ),
+        )
+        normalized.append(
+            FormationPersonDescriptor(
+                bbox_xywh=(
+                    relative_left,
+                    relative_top,
+                    relative_width,
+                    relative_height,
+                ),
+                centroid_xy=relative_centroid,
+                detection_confidence=person.detection_confidence,
+                upper_body_keypoints_xyc=person.upper_body_keypoints_xyc,
+            )
+        )
+    return tuple(normalized)
+
+
+def comparable_group_formation_mismatch(
+    left: Sequence[FormationPersonDescriptor],
+    right: Sequence[FormationPersonDescriptor],
+    *,
+    left_shot_type: ShotType | str,
+    right_shot_type: ShotType | str,
+) -> float | None:
+    """Return a hard-gate mismatch only for reliable group-wide evidence.
+
+    Close-up and medium-shot edits intentionally change visible person count
+    and framing. Their rendered continuity is reviewed through face, pose,
+    silhouette, and decoded-output geometry. Group formation is a separate
+    hard signal only when both boundary frames are classified group-wide and
+    expose the same multi-person cardinality.
+    """
+
+    try:
+        left_type = (
+            left_shot_type
+            if isinstance(left_shot_type, ShotType)
+            else ShotType(left_shot_type)
+        )
+        right_type = (
+            right_shot_type
+            if isinstance(right_shot_type, ShotType)
+            else ShotType(right_shot_type)
+        )
+    except (TypeError, ValueError):
+        return None
+    if (
+        left_type is not ShotType.GROUP_WIDE
+        or right_type is not ShotType.GROUP_WIDE
+    ):
+        return None
+    if len(left) < 2 or len(left) != len(right):
+        return None
+    return formation_assignment_mismatch(
+        _relative_group_formation(left),
+        _relative_group_formation(right),
+    )
+
+
 def _shot_type_mismatch(left: ShotType, right: ShotType) -> float:
     rank = {
         ShotType.GROUP_WIDE: 0,
@@ -1194,9 +1317,11 @@ def _cross_source_transition_rejection_reasons(
         if current_has_boundary_descriptor
         else current.formation_people
     )
-    formation_mismatch = formation_assignment_mismatch(
+    formation_mismatch = comparable_group_formation_mismatch(
         previous_formation,
         current_formation,
+        left_shot_type=previous_shot_type,
+        right_shot_type=current_shot_type,
     )
     if formation_mismatch is not None:
         evidence_available = True
@@ -1432,9 +1557,15 @@ def _transition_score(
             if current_has_boundary_descriptor
             else current.formation_people
         )
-        formation_mismatch = formation_assignment_mismatch(
+        formation_mismatch = comparable_group_formation_mismatch(
             previous_formation,
             current_formation,
+            left_shot_type=(
+                previous.exit_shot_type or previous.shot_type
+            ),
+            right_shot_type=(
+                current.entry_shot_type or current.shot_type
+            ),
         )
         if formation_mismatch is not None:
             score -= config.formation_transition_weight * formation_mismatch
@@ -2055,6 +2186,7 @@ __all__ = [
     "TimelineMode",
     "TimelineResult",
     "boundary_side_stability_exceeded",
+    "comparable_group_formation_mismatch",
     "cross_source_layout_mismatch",
     "face_geometry_minimax_mismatch",
     "formation_assignment_mismatch",

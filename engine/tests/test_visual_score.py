@@ -871,9 +871,8 @@ class VisualScoreTests(unittest.TestCase):
             plan.choices[1].layout_transition_mismatch_from_previous,
             0.0,
         )
-        self.assertEqual(
-            plan.choices[1].formation_transition_mismatch_from_previous,
-            0.0,
+        self.assertIsNone(
+            plan.choices[1].formation_transition_mismatch_from_previous
         )
         self.assertEqual(plan.choices[1].formation_person_counts, (1, 1, 1))
         self.assertEqual(

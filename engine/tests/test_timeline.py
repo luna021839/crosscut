@@ -12,6 +12,7 @@ from crosscut.timeline import (
     TimelineCandidate,
     TimelineConfig,
     TimelineMode,
+    comparable_group_formation_mismatch,
     cross_source_layout_mismatch,
     face_geometry_minimax_mismatch,
     formation_assignment_mismatch,
@@ -1422,6 +1423,51 @@ class TimelineOptimisationTests(unittest.TestCase):
         assert mismatch is not None
         self.assertGreaterEqual(mismatch, 2 * 0.82 / 6)
 
+    def test_group_formation_gate_ignores_one_global_camera_pan_and_zoom(
+        self,
+    ) -> None:
+        original = (
+            formation_person(0.27, raised_arms=False),
+            formation_person(0.73, raised_arms=True),
+        )
+
+        def camera_transform(
+            person: FormationPersonDescriptor,
+        ) -> FormationPersonDescriptor:
+            left, top, width, height = person.bbox_xywh
+            scale = 0.58
+            offset_x = 0.21
+            offset_y = 0.17
+            return FormationPersonDescriptor(
+                bbox_xywh=(
+                    offset_x + scale * left,
+                    offset_y + scale * top,
+                    scale * width,
+                    scale * height,
+                ),
+                centroid_xy=(
+                    offset_x + scale * person.centroid_xy[0],
+                    offset_y + scale * person.centroid_xy[1],
+                ),
+                detection_confidence=person.detection_confidence,
+                upper_body_keypoints_xyc=person.upper_body_keypoints_xyc,
+            )
+
+        reframed = tuple(camera_transform(person) for person in original)
+        raw = formation_assignment_mismatch(original, reframed)
+        relative = comparable_group_formation_mismatch(
+            original,
+            reframed,
+            left_shot_type=ShotType.GROUP_WIDE,
+            right_shot_type=ShotType.GROUP_WIDE,
+        )
+
+        self.assertIsNotNone(raw)
+        self.assertIsNotNone(relative)
+        assert raw is not None and relative is not None
+        self.assertGreater(raw, relative)
+        self.assertAlmostEqual(relative, 0.0, places=6)
+
     def test_formation_gate_blocks_cross_source_pose_exchange(self) -> None:
         original = (
             formation_person(0.27, raised_arms=False),
@@ -1438,6 +1484,8 @@ class TimelineOptimisationTests(unittest.TestCase):
                     "A",
                     0.5,
                     exit_formation_people=original,
+                    shot_type=ShotType.GROUP_WIDE,
+                    exit_shot_type=ShotType.GROUP_WIDE,
                     shot_id="A:shot-1",
                 )
             ],
@@ -1447,6 +1495,8 @@ class TimelineOptimisationTests(unittest.TestCase):
                     "A",
                     0.0,
                     entry_formation_people=original,
+                    shot_type=ShotType.GROUP_WIDE,
+                    entry_shot_type=ShotType.GROUP_WIDE,
                     shot_id="A:shot-2",
                 ),
                 candidate(
@@ -1454,6 +1504,8 @@ class TimelineOptimisationTests(unittest.TestCase):
                     "B",
                     1.0,
                     entry_formation_people=exchanged,
+                    shot_type=ShotType.GROUP_WIDE,
+                    entry_shot_type=ShotType.GROUP_WIDE,
                     shot_id="B:shot-1",
                 ),
             ],
@@ -1467,6 +1519,53 @@ class TimelineOptimisationTests(unittest.TestCase):
         )
 
         self.assertEqual([item.source_id for item in result.candidates], ["A", "A"])
+
+    def test_formation_hard_gate_does_not_ban_non_group_shot_change(self) -> None:
+        original = (
+            formation_person(0.27, raised_arms=False),
+            formation_person(0.73, raised_arms=True),
+        )
+        exchanged = (
+            formation_person(0.27, raised_arms=True),
+            formation_person(0.73, raised_arms=False),
+        )
+        result = select_timeline(
+            [
+                [
+                    candidate(
+                        0,
+                        "A",
+                        0.5,
+                        exit_formation_people=original,
+                        shot_type=ShotType.MEDIUM,
+                        shot_id="A:shot-1",
+                    )
+                ],
+                [
+                    candidate(
+                        1,
+                        "A",
+                        0.0,
+                        entry_formation_people=original,
+                        shot_type=ShotType.MEDIUM,
+                        shot_id="A:shot-2",
+                    ),
+                    candidate(
+                        1,
+                        "B",
+                        1.0,
+                        entry_formation_people=exchanged,
+                        shot_type=ShotType.CLOSE_UP,
+                        shot_id="B:shot-1",
+                    ),
+                ],
+            ],
+            config=continuity_gate_config(
+                maximum_cross_source_formation_mismatch=0.30,
+            ),
+        )
+
+        self.assertEqual([item.source_id for item in result.candidates], ["A", "B"])
 
     def test_pose_model_miss_uses_structure_fallback(self) -> None:
         segments = [
