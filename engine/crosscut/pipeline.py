@@ -69,6 +69,7 @@ from .direct_member_professional_gate import (
     evaluate_direct_member_professional_pre_render_gate,
 )
 from .direct_member_rendered_proxy import (
+    DirectMemberRenderedProxyPreflight,
     render_and_review_direct_member_proxy,
 )
 from .direct_member_look import (
@@ -10166,6 +10167,81 @@ def _direct_member_render_feedback_strict_composition_limit(
         _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
         if feedback_certificate_count
         else _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+    )
+
+
+def _direct_member_proxy_refinement_rank(
+    preflight: DirectMemberRenderedProxyPreflight,
+) -> tuple[int, int, int, int, float, float]:
+    """Rank materialized look attempts without changing feedback semantics."""
+
+    if not isinstance(preflight, DirectMemberRenderedProxyPreflight):
+        raise TypeError("member proxy refinement rank needs a preflight result")
+    payload = preflight.payload
+    quality_passed = bool(payload.get("member_output_quality_passed"))
+    continuity_passed = bool(
+        payload.get("direct_member_rendered_continuity_passed")
+    )
+    continuity = payload.get("rendered_continuity")
+    continuity_payload = continuity if isinstance(continuity, Mapping) else {}
+    metrics = continuity_payload.get("metrics")
+    metric_payload = metrics if isinstance(metrics, Mapping) else {}
+    thresholds = continuity_payload.get("thresholds")
+    threshold_payload = thresholds if isinstance(thresholds, Mapping) else {}
+
+    normalized_excess = 0.0
+    for metric_name, threshold_name in (
+        (
+            "attention_position_mismatch_p95",
+            "maximum_attention_position_mismatch_p95",
+        ),
+        (
+            "attention_scale_mismatch_p95",
+            "maximum_attention_scale_mismatch_p95",
+        ),
+        ("pose_mismatch_p95", "maximum_pose_mismatch_p95"),
+        (
+            "silhouette_mismatch_p95",
+            "maximum_silhouette_mismatch_p95",
+        ),
+    ):
+        value = metric_payload.get(metric_name)
+        maximum = threshold_payload.get(threshold_name)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isinstance(maximum, (int, float))
+            and not isinstance(maximum, bool)
+            and float(maximum) > 0.0
+        ):
+            normalized_excess += max(
+                0.0,
+                float(value) / float(maximum) - 1.0,
+            )
+
+    generic = payload.get("rendered_proxy_review")
+    generic_payload = generic if isinstance(generic, Mapping) else {}
+    weighted_score = generic_payload.get("weighted_score")
+    resolved_weighted_score = (
+        float(weighted_score)
+        if isinstance(weighted_score, (int, float))
+        and not isinstance(weighted_score, bool)
+        else float("-inf")
+    )
+    quality_failures = payload.get("member_output_quality_failure_reasons")
+    quality_failure_count = (
+        len(quality_failures) if isinstance(quality_failures, list) else 1
+    )
+    component_failure_count = int(not quality_passed) + int(
+        not continuity_passed
+    )
+    return (
+        int(not preflight.passed),
+        component_failure_count,
+        len(preflight.repair_target_boundary_indices),
+        quality_failure_count,
+        normalized_excess,
+        -resolved_weighted_score,
     )
 
 
@@ -22314,7 +22390,9 @@ def analyze(
                     ) = min(
                         enumerate(proxy_refinement_candidates),
                         key=lambda item: (
-                            item[1][3].refinement_rank(),
+                            _direct_member_proxy_refinement_rank(
+                                item[1][3]
+                            ),
                             item[0],
                         ),
                     )

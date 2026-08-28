@@ -12,6 +12,7 @@ from crosscut.direct_member_rendered_proxy import (
     render_and_review_direct_member_proxy,
 )
 from crosscut.ive import AspectRatio
+from crosscut.pipeline import _direct_member_proxy_refinement_rank
 from crosscut.render import RenderPlan, RenderSegment, RenderTransition
 from crosscut.rendered_proxy_review import (
     RenderedProxyReview,
@@ -132,7 +133,10 @@ class DirectMemberRenderedProxyTests(unittest.TestCase):
             weighted_score=64.0,
         )
 
-        self.assertLess(base.refinement_rank(), regressed.refinement_rank())
+        self.assertLess(
+            _direct_member_proxy_refinement_rank(base),
+            _direct_member_proxy_refinement_rank(regressed),
+        )
 
     def test_refinement_rank_prefers_a_completed_member_quality_gate(self) -> None:
         incomplete = self._refinement_result(
@@ -151,8 +155,8 @@ class DirectMemberRenderedProxyTests(unittest.TestCase):
         )
 
         self.assertLess(
-            quality_fixed.refinement_rank(),
-            incomplete.refinement_rank(),
+            _direct_member_proxy_refinement_rank(quality_fixed),
+            _direct_member_proxy_refinement_rank(incomplete),
         )
 
     def test_combines_generic_and_exact_member_gates(self) -> None:
