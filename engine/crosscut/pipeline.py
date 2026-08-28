@@ -10170,6 +10170,53 @@ def _direct_member_render_feedback_strict_composition_limit(
     )
 
 
+def _direct_member_feedback_source_diversity_candidates(
+    *,
+    minimum_required_source_count: int,
+    maximum_renderable_source_count: int,
+    feedback_certificate_count: int,
+) -> tuple[int, ...]:
+    """Expand a short proof's source pool after decoded-render rejection.
+
+    ``minimum_required_source_count`` is a floor, not a request to permanently
+    exclude every lower-ranked source. Before decoded-render feedback exists,
+    the bounded proof keeps its inexpensive minimum-size cohort. Once a dense
+    or decoded proxy check proves one or more selected transitions unusable,
+    retry the same hard visual gates with the largest renderable source pool
+    first, then descend to the original minimum. This gives omitted official
+    fancams a chance to replace a failed edge without ever admitting the
+    certified edge or lowering a visual threshold.
+    """
+
+    for name, value in (
+        ("minimum_required_source_count", minimum_required_source_count),
+        ("maximum_renderable_source_count", maximum_renderable_source_count),
+        ("feedback_certificate_count", feedback_certificate_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if minimum_required_source_count < 2:
+        raise ValueError("minimum required source count must be at least two")
+    if maximum_renderable_source_count < minimum_required_source_count:
+        raise ValueError(
+            "maximum renderable source count must cover the required minimum"
+        )
+    if feedback_certificate_count < 0:
+        raise ValueError("feedback certificate count must be non-negative")
+    if (
+        feedback_certificate_count == 0
+        or minimum_required_source_count == maximum_renderable_source_count
+    ):
+        return (minimum_required_source_count,)
+    return tuple(
+        range(
+            maximum_renderable_source_count,
+            minimum_required_source_count - 1,
+            -1,
+        )
+    )
+
+
 def _direct_member_proxy_refinement_rank(
     preflight: DirectMemberRenderedProxyPreflight,
 ) -> tuple[int, int, int, int, float, float]:
@@ -21761,44 +21808,181 @@ def analyze(
                 ] = (),
                 preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
-                return _official_target_fancam_direct_full_frame_segments(
-                    timing_draft=timing_draft,
-                    eligible_indices=eligible_indices,
-                    eligible_sources=eligible_direct_sources,
-                    eligible_source_aspect_ratios=direct_full_frame_ratios,
-                    eligible_source_frame_sizes=(
-                        eligible_direct_source_frame_sizes
-                    ),
-                    output_frame_size=direct_member_output_frame_size,
-                    common_master_start=member_common_start,
-                    source_timewarps=source_timewarps,
-                    scene_cut_times=scene_cut_times,
-                    feature_cache_directory=request.source_cache_directory,
-                    descriptor_provider=direct_visual_descriptor_provider,
-                    eligible_source_durations_seconds=(
-                        eligible_direct_source_durations_seconds
-                    ),
-                    source_metadata_contract=(
-                        OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
-                    ),
-                    highlight_intervals=direct_highlight_intervals,
-                    member_pose_dissolve_enabled=(
-                        direct_member_pose_dissolve_enabled
-                    ),
-                    required_distinct_source_count=(
-                        direct_required_distinct_source_count
-                    ),
-                    output_fps=29.97,
-                    render_infeasible_transition_edges=(
-                        render_infeasible_transition_edges
-                    ),
-                    preferred_partition_unit_counts=(
-                        preferred_partition_unit_counts
-                    ),
-                    partition_progress_callback=(
-                        _report_direct_partition_progress
+                maximum_renderable_source_count = min(
+                    len(eligible_indices),
+                    len(
+                        _direct_full_frame_base_partition_profile(
+                            timing_draft.segments,
+                            highlight_intervals=direct_highlight_intervals,
+                        ).spans
                     ),
                 )
+                diversity_candidates = (
+                    _direct_member_feedback_source_diversity_candidates(
+                        minimum_required_source_count=(
+                            direct_required_distinct_source_count
+                        ),
+                        maximum_renderable_source_count=(
+                            maximum_renderable_source_count
+                        ),
+                        feedback_certificate_count=len(
+                            render_infeasible_transition_edges
+                        ),
+                    )
+                )
+                diversity_attempts: list[dict[str, Any]] = []
+                final_error: DirectMemberVisualSelectionError | None = None
+                for diversity_index, represented_source_count in enumerate(
+                    diversity_candidates,
+                    start=1,
+                ):
+                    if len(diversity_candidates) > 1:
+                        reporter.status(
+                            "실렌더 실패 소스를 대체하도록 직캠 풀을 "
+                            f"{represented_source_count}개로 다시 푸는 중…"
+                        )
+                    try:
+                        result = (
+                            _official_target_fancam_direct_full_frame_segments(
+                                timing_draft=timing_draft,
+                                eligible_indices=eligible_indices,
+                                eligible_sources=eligible_direct_sources,
+                                eligible_source_aspect_ratios=(
+                                    direct_full_frame_ratios
+                                ),
+                                eligible_source_frame_sizes=(
+                                    eligible_direct_source_frame_sizes
+                                ),
+                                output_frame_size=(
+                                    direct_member_output_frame_size
+                                ),
+                                common_master_start=member_common_start,
+                                source_timewarps=source_timewarps,
+                                scene_cut_times=scene_cut_times,
+                                feature_cache_directory=(
+                                    request.source_cache_directory
+                                ),
+                                descriptor_provider=(
+                                    direct_visual_descriptor_provider
+                                ),
+                                eligible_source_durations_seconds=(
+                                    eligible_direct_source_durations_seconds
+                                ),
+                                source_metadata_contract=(
+                                    OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT
+                                ),
+                                highlight_intervals=(
+                                    direct_highlight_intervals
+                                ),
+                                member_pose_dissolve_enabled=(
+                                    direct_member_pose_dissolve_enabled
+                                ),
+                                required_distinct_source_count=(
+                                    represented_source_count
+                                ),
+                                output_fps=29.97,
+                                render_infeasible_transition_edges=(
+                                    render_infeasible_transition_edges
+                                ),
+                                preferred_partition_unit_counts=(
+                                    preferred_partition_unit_counts
+                                ),
+                                partition_progress_callback=(
+                                    _report_direct_partition_progress
+                                ),
+                            )
+                        )
+                    except DirectMemberVisualSelectionError as exc:
+                        final_error = exc
+                        diversity_attempts.append(
+                            {
+                                "represented_source_count": (
+                                    represented_source_count
+                                ),
+                                "result": "infeasible",
+                                "failure": exc.diagnostics.get("failure"),
+                                "constraint_infeasibility_proven": (
+                                    exc.diagnostics.get(
+                                        "constraint_infeasibility_proven"
+                                    )
+                                ),
+                            }
+                        )
+                        if diversity_index < len(diversity_candidates):
+                            reporter.log(
+                                "직캠 피드백 소스 풀 "
+                                f"{represented_source_count}개 불가 · "
+                                "시각 기준 유지한 채 다음 풀 재검증"
+                            )
+                        continue
+                    diversity_attempts.append(
+                        {
+                            "represented_source_count": (
+                                represented_source_count
+                            ),
+                            "result": "feasible",
+                            "failure": None,
+                            "constraint_infeasibility_proven": False,
+                        }
+                    )
+                    cadence = result[3]
+                    cadence["feedback_source_diversity_recovery"] = {
+                        "contract": (
+                            "decoded_feedback_maximum_diversity_first_v1"
+                        ),
+                        "minimum_required_source_count": (
+                            direct_required_distinct_source_count
+                        ),
+                        "maximum_renderable_source_count": (
+                            maximum_renderable_source_count
+                        ),
+                        "feedback_certificate_count": len(
+                            render_infeasible_transition_edges
+                        ),
+                        "candidate_source_counts": list(
+                            diversity_candidates
+                        ),
+                        "attempts": diversity_attempts,
+                        "selected_source_count": represented_source_count,
+                        "certified_edges_remain_forbidden": True,
+                        "visual_thresholds_relaxed": False,
+                    }
+                    if represented_source_count > (
+                        direct_required_distinct_source_count
+                    ):
+                        reporter.log(
+                            "직캠 실패 경계 대체 풀 확정 · "
+                            f"최소 {direct_required_distinct_source_count}개에서 "
+                            f"{represented_source_count}개로 확장 · "
+                            "실패 전환·시각 기준 그대로 유지"
+                        )
+                    return result
+                if final_error is None:
+                    raise RuntimeError(
+                        "direct-member diversity recovery had no candidates"
+                    )
+                final_error.diagnostics[
+                    "feedback_source_diversity_recovery"
+                ] = {
+                    "contract": (
+                        "decoded_feedback_maximum_diversity_first_v1"
+                    ),
+                    "minimum_required_source_count": (
+                        direct_required_distinct_source_count
+                    ),
+                    "maximum_renderable_source_count": (
+                        maximum_renderable_source_count
+                    ),
+                    "feedback_certificate_count": len(
+                        render_infeasible_transition_edges
+                    ),
+                    "candidate_source_counts": list(diversity_candidates),
+                    "attempts": diversity_attempts,
+                    "selected_source_count": None,
+                    "certified_edges_remain_forbidden": True,
+                    "visual_thresholds_relaxed": False,
+                }
+                raise final_error
 
             def _selected_partition_unit_counts_for_retry() -> tuple[int, ...]:
                 partition_search = direct_cadence.get("partition_search")
