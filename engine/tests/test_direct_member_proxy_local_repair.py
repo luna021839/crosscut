@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import unittest
 from pathlib import Path
+import unittest
 
 from crosscut.direct_member_visual import (
     DirectMemberVisualConfig,
     select_balanced_direct_member_sources,
-)
-from crosscut.pipeline import (
-    _accumulate_direct_member_proxy_feedback_penalties,
-    _direct_member_proxy_local_repair_anchor_penalties,
 )
 from crosscut.pose import FormationPersonDescriptor
 from crosscut.timeline import ShotType
@@ -51,11 +47,13 @@ def _descriptor(value: float) -> FrameVisualDescriptor:
 
 
 class DirectMemberProxyLocalRepairTests(unittest.TestCase):
-    def test_rejected_path_changes_locally_instead_of_wholesale(self) -> None:
-        spans = tuple((float(index), float(index + 1)) for index in range(6))
-        common = {
+    @staticmethod
+    def _common() -> dict[str, object]:
+        return {
             "sources": tuple(Path(f"{index}.mp4") for index in range(3)),
-            "canonical_spans": spans,
+            "canonical_spans": tuple(
+                (float(index), float(index + 1)) for index in range(6)
+            ),
             "audio_offsets": (0.0, 0.0, 0.0),
             "config": DirectMemberVisualConfig(beam_width=4_096),
             "descriptor_provider": (
@@ -64,6 +62,9 @@ class DirectMemberProxyLocalRepairTests(unittest.TestCase):
                 )
             ),
         }
+
+    def test_rejected_path_changes_locally_instead_of_wholesale(self) -> None:
+        common = self._common()
         initial = select_balanced_direct_member_sources(**common)
         measured_failure = (
             initial.selected_boundary_master_seconds[0],
@@ -76,26 +77,12 @@ class DirectMemberProxyLocalRepairTests(unittest.TestCase):
             render_penalized_transition_edges=(measured_failure,),
             forbidden_source_paths=(initial.source_indices,),
         )
-        anchors = _direct_member_proxy_local_repair_anchor_penalties(
-            initial.selected_boundary_master_seconds,
-            initial.source_indices,
-            (0,),
-            source_count=3,
-        )
-        local_retry_penalties = (
-            _accumulate_direct_member_proxy_feedback_penalties(
-                (measured_failure,),
-                anchors,
-                source_count=3,
-                range_start=0.0,
-                range_end=6.0,
-                maximum_count=512,
-            )
-        )
         local_retry = select_balanced_direct_member_sources(
             **common,
-            render_penalized_transition_edges=local_retry_penalties,
+            render_penalized_transition_edges=(measured_failure,),
             forbidden_source_paths=(initial.source_indices,),
+            decoded_proxy_preferred_source_path=initial.source_indices,
+            decoded_proxy_repair_target_boundary_indices=(0,),
         )
 
         plain_unchanged = sum(
@@ -116,95 +103,27 @@ class DirectMemberProxyLocalRepairTests(unittest.TestCase):
         )
         self.assertNotEqual(local_retry.source_indices, initial.source_indices)
         self.assertGreater(local_unchanged, plain_unchanged)
-        self.assertEqual(local_unchanged, 4)
+        diagnostics = local_retry.optimizer_search_diagnostics[
+            "decoded_proxy_local_path_repair"
+        ]
+        self.assertTrue(diagnostics["enabled"])
+        self.assertEqual(diagnostics["repair_window_span_indices"], [0, 1])
+        self.assertEqual(diagnostics["protected_span_indices"], [2, 3, 4, 5])
+        self.assertFalse(diagnostics["hard_locked"])
+        self.assertFalse(diagnostics["visual_thresholds_relaxed"])
 
-    def test_successful_boundaries_penalize_every_alternative_pair(self) -> None:
-        boundaries = (1.0, 2.0, 3.0, 4.0)
-        path = (0, 1, 2, 0, 1)
-
-        anchors = _direct_member_proxy_local_repair_anchor_penalties(
-            boundaries,
-            path,
-            (1,),
-            source_count=3,
-        )
-
-        self.assertEqual(len(anchors), 15)
-        self.assertNotIn(2.0, {item[0] for item in anchors})
-        for boundary_index in (0, 2, 3):
-            boundary_anchors = {
-                (left, right)
-                for boundary, left, right, _penalty in anchors
-                if boundary == boundaries[boundary_index]
-            }
-            self.assertEqual(len(boundary_anchors), 5)
-            self.assertNotIn(
-                (path[boundary_index], path[boundary_index + 1]),
-                boundary_anchors,
-            )
-            self.assertTrue(all(left != right for left, right in boundary_anchors))
-
-    def test_capacity_never_emits_a_partial_boundary_domain(self) -> None:
-        anchors = _direct_member_proxy_local_repair_anchor_penalties(
-            (1.0, 2.0, 3.0, 4.0),
-            (0, 1, 2, 0, 1),
-            (1,),
-            source_count=3,
-            maximum_count=7,
-        )
-
-        self.assertEqual(len(anchors), 5)
-        self.assertEqual({item[0] for item in anchors}, {4.0})
-
-    def test_transient_anchor_budget_can_exceed_persistent_limit(self) -> None:
-        boundaries = tuple(float(index) for index in range(1, 10))
-        path = (0, 1, 2, 3, 4, 5, 6, 7, 0, 1)
-        anchors = _direct_member_proxy_local_repair_anchor_penalties(
-            boundaries,
-            path,
-            (2, 5, 8),
-            source_count=8,
-        )
-
-        self.assertEqual(len(anchors), 330)
-        merged = _accumulate_direct_member_proxy_feedback_penalties(
-            (),
-            anchors,
-            source_count=8,
-            range_start=0.0,
-            range_end=10.0,
-            maximum_count=512,
-        )
-        self.assertEqual(len(merged), 330)
-        with self.assertRaisesRegex(ValueError, "penalty limit exceeded"):
-            _accumulate_direct_member_proxy_feedback_penalties(
-                (),
-                anchors,
-                source_count=8,
-                range_start=0.0,
-                range_end=10.0,
-            )
-
-    def test_zero_or_broad_failure_sets_disable_local_bias(self) -> None:
-        common = {
-            "boundary_master_seconds": (1.0, 2.0, 3.0, 4.0),
-            "source_path": (0, 1, 2, 0, 1),
-            "source_count": 3,
-        }
-        self.assertEqual(
-            _direct_member_proxy_local_repair_anchor_penalties(
+    def test_path_and_targets_must_be_supplied_together(self) -> None:
+        common = self._common()
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            select_balanced_direct_member_sources(
                 **common,
-                continuity_target_boundary_indices=(),
-            ),
-            (),
-        )
-        self.assertEqual(
-            _direct_member_proxy_local_repair_anchor_penalties(
+                decoded_proxy_repair_target_boundary_indices=(0,),
+            )
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            select_balanced_direct_member_sources(
                 **common,
-                continuity_target_boundary_indices=(0, 1, 2, 3),
-            ),
-            (),
-        )
+                decoded_proxy_preferred_source_path=(0, 1, 2, 0, 1, 2),
+            )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from dataclasses import replace
 from itertools import product
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -460,6 +461,68 @@ class DirectMemberVisualTests(unittest.TestCase):
             transform_repair=None,
         )
         self.assertIsNone(blocked)
+
+    def test_motion_matched_pose_fallback_requires_logistic_dissolve_bridge(
+        self,
+    ) -> None:
+        portrait = direct_member_source_frame_geometry((2160, 3840))
+        motion = SimpleNamespace(
+            timestamp_bound_adjacent=True,
+            both_moving=True,
+            endpoint_pose_shape_mismatch=0.21,
+            direction_cosine_audit_only=0.74,
+            motion_speed_ratio_mismatch=0.18,
+            pose_phase_continuation_mismatch=0.16,
+        )
+
+        bridge = _cinematic_bridge_from_verified_evidence(
+            severe_flags=(
+                "attention_scale",
+                "cross_source_actual_pose_missing",
+            ),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=False,
+            pose_mismatch=0.18,
+            silhouette_mismatch=0.27,
+            base_mismatch=0.34,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=portrait,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+            motion_connection=motion,
+        )
+
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertEqual(bridge.style, "pose_dissolve")
+        self.assertTrue(bridge.to_dict()["required_transition_effect"])
+
+        opposed = _cinematic_bridge_from_verified_evidence(
+            severe_flags=(
+                "attention_scale",
+                "cross_source_actual_pose_missing",
+            ),
+            continuous_official_portrait_fancam_contract=True,
+            cross_source_edge=True,
+            actual_pose=False,
+            pose_mismatch=0.18,
+            silhouette_mismatch=0.27,
+            base_mismatch=0.34,
+            outgoing_source_geometry=portrait,
+            incoming_source_geometry=portrait,
+            timestamp_bound_adjacent=True,
+            transform_repair=None,
+            motion_connection=SimpleNamespace(
+                timestamp_bound_adjacent=True,
+                both_moving=True,
+                endpoint_pose_shape_mismatch=0.21,
+                direction_cosine_audit_only=-0.2,
+                motion_speed_ratio_mismatch=0.18,
+                pose_phase_continuation_mismatch=0.16,
+            ),
+        )
+        self.assertIsNone(opposed)
 
     def test_cinematic_solver_uses_exact_handle_not_whole_future_span(
         self,
@@ -1124,6 +1187,48 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertFalse(diagnostics["required_transition_effect"])
         self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
 
+    def test_short_role_path_can_use_eight_sources_in_nine_spans(self) -> None:
+        source_count = 8
+        span_count = 9
+        safe = _optimizer_mismatch(0.04)
+        matrices = tuple(
+            tuple(
+                tuple(safe for _right in range(source_count))
+                for _left in range(source_count)
+            )
+            for _boundary in range(span_count - 1)
+        )
+        geometries = tuple(
+            direct_member_source_frame_geometry((2160, 3840))
+            for _source_index in range(source_count)
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=tuple(range(source_count)),
+            candidate_validity=((True,) * source_count,) * span_count,
+            span_durations=(3.0,) * span_count,
+            source_geometries=geometries,
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(
+                maximum_same_source_hold_count=1,
+            ),
+            require_cinematic_bridge=False,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(set(path), set(range(source_count)))
+        self.assertEqual(diagnostics["source_count_minimums"], [1] * 8)
+        self.assertTrue(
+            diagnostics["role_constraints"]
+            ["short_proof_all_source_single_span_minimum_applied"]
+        )
+        self.assertTrue(diagnostics["all_sources_used"])
+        self.assertFalse(diagnostics["visual_gates_relaxed"])
+
     def test_role_aware_safe_hold_supports_all_portrait_sources(self) -> None:
         source_count = 3
         span_count = 9
@@ -1376,6 +1481,38 @@ class DirectMemberVisualTests(unittest.TestCase):
         )
         self.assertFalse(diagnostics["visual_gates_relaxed"])
 
+    def test_bounded_hold_no_good_path_selects_the_other_safe_sequence(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrices = (
+            ((safe, safe), (safe, safe)),
+            ((safe, severe), (severe, safe)),
+            ((safe, safe), (safe, safe)),
+        )
+        common = {
+            "matrices": matrices,
+            "source_quotas": (2, 2),
+            "source_order": (0, 1),
+            "candidate_validity": ((True, True),) * 4,
+            "span_durations": (1.0,) * 4,
+            "config": DirectMemberVisualConfig(beam_width=200),
+        }
+        initial = _bounded_same_source_hold_visual_path(**common)
+        self.assertIsNotNone(initial)
+        assert initial is not None
+
+        retried = _bounded_same_source_hold_visual_path(
+            **common,
+            forbidden_source_paths=(initial[0],),
+        )
+
+        self.assertIsNotNone(retried)
+        assert retried is not None
+        self.assertNotEqual(retried[0], initial[0])
+        self.assertIn(retried[0], ((0, 1, 1, 0), (1, 0, 0, 1)))
+
     def test_bounded_hold_rejects_a_same_source_run_over_render_limit(
         self,
     ) -> None:
@@ -1446,6 +1583,31 @@ class DirectMemberVisualTests(unittest.TestCase):
         _path, _cost, diagnostics = result
         self.assertEqual(diagnostics["priority_cut_boundary_hold_count"], 1)
         self.assertEqual(diagnostics["maximum_priority_cut_hold_count"], 1)
+
+    def test_bounded_hold_cannot_use_exact_post_alignment_forbidden_cut(
+        self,
+    ) -> None:
+        safe = _optimizer_mismatch()
+        severe = _optimizer_mismatch(severe=True)
+        matrices = (
+            ((safe, safe), (safe, safe)),
+            ((safe, severe), (severe, safe)),
+            ((safe, safe), (safe, safe)),
+        )
+
+        result = _bounded_same_source_hold_visual_path(
+            matrices,
+            source_quotas=(2, 2),
+            source_order=(0, 1),
+            candidate_validity=((True, True),) * 4,
+            span_durations=(1.0,) * 4,
+            priority_cut_boundary_indices=(1,),
+            forbidden_same_source_hold_boundary_indices=(1,),
+            maximum_priority_cut_hold_count=1,
+            config=DirectMemberVisualConfig(beam_width=200),
+        )
+
+        self.assertIsNone(result)
 
     def test_selected_hold_is_reported_as_no_cut_not_visual_relaxation(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(4))
@@ -2843,6 +3005,52 @@ class DirectMemberVisualTests(unittest.TestCase):
             )
         )
 
+    def test_short_all_source_proof_keeps_exact_coverage_with_flexible_exposure(
+        self,
+    ) -> None:
+        durations = (2.5, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.5)
+        cursor = 0.0
+        spans: list[tuple[float, float]] = []
+        for duration in durations:
+            spans.append((cursor, cursor + duration))
+            cursor += duration
+
+        selection = select_balanced_direct_member_sources(
+            sources=tuple(Path(f"{index}.mp4") for index in range(8)),
+            canonical_spans=tuple(spans),
+            audio_offsets=(0.0,) * 8,
+            config=DirectMemberVisualConfig(beam_width=4_096),
+            descriptor_provider=lambda source_index, _source, _time: _descriptor(
+                0.20 + source_index * 0.006
+            ),
+        )
+
+        self.assertEqual(selection.source_quotas, (1,) * 8)
+        self.assertEqual(selection.source_counts, (1,) * 8)
+        self.assertEqual(len(set(selection.source_indices)), 8)
+        self.assertGreater(
+            max(selection.source_duration_relative_deviations),
+            0.08,
+        )
+        self.assertLessEqual(
+            max(selection.source_duration_relative_deviations),
+            0.45,
+        )
+        diagnostics = selection.optimizer_search_diagnostics
+        self.assertTrue(
+            diagnostics["short_proof_source_exposure_tolerance_applied"]
+        )
+        self.assertTrue(diagnostics["all_analyzed_sources_required"])
+        self.assertEqual(
+            diagnostics["source_quota_assignment"][
+                "source_duration_balance_policy"
+            ],
+            "short_proof_exact_count_flexible_exposure_v1",
+        )
+        self.assertFalse(
+            diagnostics["source_quota_assignment"]["visual_gates_relaxed"]
+        )
+
     def test_fifty_span_path_balances_eight_sources_by_floor_and_ceil_quota(
         self,
     ) -> None:
@@ -3020,7 +3228,7 @@ class DirectMemberVisualTests(unittest.TestCase):
         )
         self.assertEqual(
             diagnostics["maximum_allowed_relative_deviation"],
-            0.10,
+            0.45,
         )
         self.assertEqual(
             [item["target_duration_seconds"] for item in diagnostics["source_usage"]],
@@ -5064,6 +5272,78 @@ class DirectMemberVisualTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_decoded_proxy_penalty_prefers_an_alternate_without_hard_forbid(
+        self,
+    ) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+        common = {
+            "sources": tuple(Path(f"{index}.mp4") for index in range(3)),
+            "canonical_spans": spans,
+            "audio_offsets": (0.0, 0.0, 0.0),
+            "config": DirectMemberVisualConfig(beam_width=4_096),
+            "descriptor_provider": (
+                lambda source_index, _source, _time: _descriptor(
+                    0.20 + source_index * 0.006
+                )
+            ),
+        }
+        initial = select_balanced_direct_member_sources(**common)
+        penalty = (
+            initial.selected_boundary_master_seconds[0],
+            initial.source_indices[0],
+            initial.source_indices[1],
+            8.0,
+        )
+
+        retried = select_balanced_direct_member_sources(
+            **common,
+            render_penalized_transition_edges=(penalty,),
+        )
+
+        self.assertNotEqual(
+            retried.source_indices[:2],
+            initial.source_indices[:2],
+        )
+        diagnostics = retried.optimizer_search_diagnostics[
+            "decoded_proxy_path_feedback"
+        ]
+        self.assertEqual(diagnostics["penalized_edge_count"], 1)
+        self.assertEqual(diagnostics["total_penalty"], 8.0)
+        self.assertEqual(
+            diagnostics["effect"],
+            "finite_cost_preference_without_graph_disconnection",
+        )
+        self.assertFalse(diagnostics["visual_thresholds_relaxed"])
+
+    def test_decoded_proxy_rejected_exact_path_cannot_repeat(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+        common = {
+            "sources": tuple(Path(f"{index}.mp4") for index in range(3)),
+            "canonical_spans": spans,
+            "audio_offsets": (0.0, 0.0, 0.0),
+            "config": DirectMemberVisualConfig(beam_width=4_096),
+            "descriptor_provider": (
+                lambda source_index, _source, _time: _descriptor(
+                    0.20 + source_index * 0.006
+                )
+            ),
+        }
+        initial = select_balanced_direct_member_sources(**common)
+
+        retried = select_balanced_direct_member_sources(
+            **common,
+            forbidden_source_paths=(initial.source_indices,),
+        )
+
+        self.assertNotEqual(retried.source_indices, initial.source_indices)
+        no_good = retried.optimizer_search_diagnostics[
+            "decoded_proxy_path_no_good"
+        ]
+        self.assertEqual(no_good["forbidden_source_path_count"], 1)
+        self.assertTrue(no_good["complete_path_only"])
+        self.assertTrue(no_good["individual_edges_remain_eligible"])
+        self.assertFalse(no_good["visual_thresholds_relaxed"])
 
     def test_invalid_configuration_and_noncontiguous_spans_are_rejected(self) -> None:
         with self.assertRaisesRegex(TypeError, "must be boolean"):

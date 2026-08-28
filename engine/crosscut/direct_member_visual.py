@@ -49,6 +49,10 @@ DescriptorProvider = Callable[
 
 _DENSE_RENDER_INFEASIBLE_EDGE_EXCLUSION_RADIUS_SECONDS = 0.30
 _DENSE_RENDER_INFEASIBLE_EDGE_FLAG = "dense_render_camera_infeasible"
+_DECODED_PROXY_PENALTY_RADIUS_SECONDS = 0.30
+_DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY = 8.0
+_DECODED_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT = 3
+_DECODED_PROXY_LOCAL_REPAIR_SOURCE_DEVIATION_PENALTY = 2.0
 
 
 _DIRECT_CONTENT_SAMPLE_COUNT = 6
@@ -61,9 +65,24 @@ _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS = frozenset(
         "cross_source_silhouette_mismatch",
     }
 )
+_DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_ALLOWED_SEVERE_FLAGS = frozenset(
+    {
+        *_DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS,
+        "cross_source_actual_pose_missing",
+        "cross_source_pose_mismatch",
+        "cross_source_face_alignment_unrepaired",
+        "cross_source_body_alignment_unrepaired",
+        "motion_endpoint_shape_mismatch",
+        "total_mismatch",
+    }
+)
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.65
+_DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_ENDPOINT_SHAPE_MISMATCH = 0.38
+_DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MINIMUM_DIRECTION_COSINE = 0.12
+_DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_SPEED_RATIO_MISMATCH = 0.60
+_DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH = 0.34
 _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.24
 _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.50
 _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.56
@@ -120,6 +139,7 @@ _DIRECT_MEMBER_ZERO_EXPOSURE_USAGE_POLICIES = frozenset(
     }
 )
 _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_SOURCE_DURATION_RELATIVE_DEVIATION = 0.45
+_DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS = 45.0
 
 
 def _cinematic_bridge_count_budgets(
@@ -946,6 +966,11 @@ class _AttentionGeometry:
     bbox_xywh: tuple[float, float, float, float]
     centroid_xy: tuple[float, float]
     basis: str
+    # Face-detector boxes include hair, chin and confidence-dependent padding,
+    # so their area can jump after a color-only look change.  When a stable
+    # landmark distance is available, its squared normalized scale is the
+    # authoritative area proxy for cut-to-cut subject-size comparison.
+    scale_area_proxy: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,6 +996,11 @@ class _BoundarySample:
             ),
             "attention_centroid_xy": (
                 list(self.attention.centroid_xy)
+                if self.attention is not None
+                else None
+            ),
+            "attention_scale_area_proxy": (
+                self.attention.scale_area_proxy
                 if self.attention is not None
                 else None
             ),
@@ -1038,6 +1068,8 @@ class DirectBoundaryMotionEvidence:
     endpoint_pose_shape_compatibility: float | None
     direction_cosine_audit_only: float | None
     motion_speed_ratio_mismatch: float | None
+    subject_direction_cosine: float | None
+    subject_motion_speed_ratio_mismatch: float | None
     pose_phase_continuation_mismatch: float | None
     output_space_subject_motion_used: bool
     soft_preference_applied: float
@@ -1099,6 +1131,10 @@ class DirectBoundaryMotionEvidence:
             "direction_cosine_influenced_gate_or_bonus": True,
             "motion_speed_ratio_mismatch": (
                 self.motion_speed_ratio_mismatch
+            ),
+            "subject_direction_cosine": self.subject_direction_cosine,
+            "subject_motion_speed_ratio_mismatch": (
+                self.subject_motion_speed_ratio_mismatch
             ),
             "pose_phase_continuation_mismatch": (
                 self.pose_phase_continuation_mismatch
@@ -1219,11 +1255,11 @@ class DirectMemberCinematicBridge:
 
     This does not make the edge eligible for a hard cut.  It records that the
     target pose and silhouette are compatible while the remaining mismatch is
-    confined to framing components that a short zoom/blur overlap is designed
-    to conceal. Landscape-involved edges may use zoom or horizontal blur;
-    portrait-to-portrait edges use only the stricter zoom contract. The
-    transition planner must independently bind the overlap to exact source
-    clocks and a content-valid outgoing handle.
+    confined to components that a short verified overlap is designed to
+    conceal.  A moving, direction-compatible pose continuation uses a
+    duration-neutral logistic dissolve; other geometry-only repairs retain the
+    zoom/blur styles.  The transition planner must independently bind every
+    overlap to exact source clocks and a content-valid outgoing handle.
     """
 
     style: str
@@ -1235,7 +1271,7 @@ class DirectMemberCinematicBridge:
     base_mismatch: float
 
     def __post_init__(self) -> None:
-        if self.style not in {"zoom_in", "horizontal_blur"}:
+        if self.style not in {"pose_dissolve", "zoom_in", "horizontal_blur"}:
             raise ValueError("direct member cinematic bridge style is invalid")
         if (
             self.style == "horizontal_blur"
@@ -1245,9 +1281,12 @@ class DirectMemberCinematicBridge:
                 "horizontal cinematic blur requires a landscape outgoing source"
             )
         flags = frozenset(self.authorized_severe_flags)
-        if not flags or not flags <= (
-            _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
-        ):
+        allowed_flags = (
+            _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_ALLOWED_SEVERE_FLAGS
+            if self.style == "pose_dissolve"
+            else _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
+        )
+        if not flags or not flags <= allowed_flags:
             raise ValueError("cinematic bridge severe flags are invalid")
         for value in (
             self.pose_mismatch,
@@ -1259,7 +1298,7 @@ class DirectMemberCinematicBridge:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "contract": "official_member_pose_safe_effect_bridge_v2",
+            "contract": "official_member_pose_safe_effect_bridge_v3",
             "style": self.style,
             "geometry_scope": (
                 "landscape_involved"
@@ -1373,23 +1412,69 @@ def _cinematic_bridge_from_verified_evidence(
     incoming_source_geometry: DirectMemberSourceFrameGeometry | None,
     timestamp_bound_adjacent: bool,
     transform_repair: DirectMemberBoundaryTransformRepair | None,
+    motion_connection: DirectBoundaryMotionEvidence | None = None,
 ) -> DirectMemberCinematicBridge | None:
     """Authorize an effect-only bridge from scalar pose/body evidence.
 
     A face box on one side and a verified body/silhouette box on the other are
     not directly comparable enough for a hard cut or an affine repair.  They
     can still support a short zoom/blur bridge when the independently measured
-    pose and silhouette agree, every hard flag is effect-maskable framing, and
-    exact adjacent-frame motion evidence exists.  The downstream transition
-    planner and rendered-pixel QA remain mandatory.
+    pose and silhouette agree.  When exact adjacent-frame motion also proves a
+    direction-compatible pose continuation, a logistic dissolve may mask a
+    detector miss or residual framing jump.  The downstream transition planner
+    and rendered-pixel QA remain mandatory.
     """
 
     flags = frozenset(str(value) for value in severe_flags)
+    motion_pose_dissolve = bool(
+        motion_connection is not None
+        and motion_connection.timestamp_bound_adjacent
+        and motion_connection.both_moving
+        and motion_connection.endpoint_pose_shape_mismatch is not None
+        and motion_connection.endpoint_pose_shape_mismatch
+        <= (
+            _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_ENDPOINT_SHAPE_MISMATCH
+            + 1e-9
+        )
+        and motion_connection.direction_cosine_audit_only is not None
+        and motion_connection.direction_cosine_audit_only
+        >= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MINIMUM_DIRECTION_COSINE - 1e-9
+        and (
+            motion_connection.motion_speed_ratio_mismatch is None
+            or motion_connection.motion_speed_ratio_mismatch
+            <= (
+                _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_SPEED_RATIO_MISMATCH
+                + 1e-9
+            )
+        )
+        and (
+            motion_connection.pose_phase_continuation_mismatch is None
+            or motion_connection.pose_phase_continuation_mismatch
+            <= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH
+            + 1e-9
+        )
+    )
+    allowed_flags = (
+        _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_ALLOWED_SEVERE_FLAGS
+        if motion_pose_dissolve
+        else _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
+    )
+    bridge_trigger_flags = (
+        _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_ALLOWED_SEVERE_FLAGS
+        if motion_pose_dissolve
+        else frozenset(
+            {
+                "attention_position",
+                "attention_scale",
+                "cross_source_silhouette_mismatch",
+            }
+        )
+    )
     if (
         not flags
         or not continuous_official_portrait_fancam_contract
         or not cross_source_edge
-        or not actual_pose
+        or not (actual_pose or motion_pose_dissolve)
         or pose_mismatch is None
         or pose_mismatch
         > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
@@ -1398,13 +1483,8 @@ def _cinematic_bridge_from_verified_evidence(
         > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
         or base_mismatch
         > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
-        or not flags <= _DIRECT_MEMBER_CINEMATIC_BRIDGE_ALLOWED_SEVERE_FLAGS
-        or not flags
-        & {
-            "attention_position",
-            "attention_scale",
-            "cross_source_silhouette_mismatch",
-        }
+        or not flags <= allowed_flags
+        or not flags & bridge_trigger_flags
         or outgoing_source_geometry is None
         or incoming_source_geometry is None
         or not timestamp_bound_adjacent
@@ -1429,7 +1509,13 @@ def _cinematic_bridge_from_verified_evidence(
     ):
         return None
     return DirectMemberCinematicBridge(
-        style=("horizontal_blur" if outgoing_is_landscape else "zoom_in"),
+        style=(
+            "pose_dissolve"
+            if motion_pose_dissolve
+            else "horizontal_blur"
+            if outgoing_is_landscape
+            else "zoom_in"
+        ),
         outgoing_is_landscape=outgoing_is_landscape,
         incoming_is_landscape=incoming_is_landscape,
         authorized_severe_flags=tuple(severe_flags),
@@ -3070,6 +3156,12 @@ def _attention_geometry_for_basis(
             bbox_xywh=bbox,
             centroid_xy=(bbox[0] + bbox[2] / 2.0, bbox[1] + bbox[3] / 2.0),
             basis=basis,
+            scale_area_proxy=(
+                descriptor.primary_face_eye_scale**2
+                if descriptor.primary_face_eye_scale is not None
+                and descriptor.primary_face_eye_scale > 0.0
+                else None
+            ),
         )
     if (
         basis == _ATTENTION_SILHOUETTE_BASIS
@@ -3673,10 +3765,64 @@ def _attention_mismatch(
         )
         / 0.42,
     )
-    left_area = max(1e-6, left.bbox_xywh[2] * left.bbox_xywh[3])
-    right_area = max(1e-6, right.bbox_xywh[2] * right.bbox_xywh[3])
-    scale = min(1.0, abs(math.log(left_area / right_area)) / math.log(3.2))
+    _bbox_log, _landmark_log, _agreement, consensus_log = (
+        _scale_log_ratio_evidence(
+            left.bbox_xywh[2] * left.bbox_xywh[3],
+            right.bbox_xywh[2] * right.bbox_xywh[3],
+            left.scale_area_proxy,
+            right.scale_area_proxy,
+        )
+    )
+    scale = min(1.0, abs(consensus_log) / math.log(3.2))
     return (position, scale)
+
+
+def _scale_log_ratio_evidence(
+    left_bbox_area: float,
+    right_bbox_area: float,
+    left_landmark_area: float | None,
+    right_landmark_area: float | None,
+) -> tuple[float, float | None, bool | None, float]:
+    """Fuse two independent face-size cues without letting either overrule.
+
+    YuNet box padding is color/confidence sensitive, while landmark extent is
+    affected by head yaw and expression.  A hard size mismatch therefore
+    requires both cues to agree on which side is larger; its magnitude is the
+    smaller corroborated log ratio.  Missing landmark evidence retains the
+    established bbox behavior.
+    """
+
+    bbox_log = math.log(
+        max(1e-9, float(left_bbox_area))
+        / max(1e-9, float(right_bbox_area))
+    )
+    if (
+        left_landmark_area is None
+        or right_landmark_area is None
+        or not math.isfinite(float(left_landmark_area))
+        or not math.isfinite(float(right_landmark_area))
+        or left_landmark_area <= 0.0
+        or right_landmark_area <= 0.0
+    ):
+        return (bbox_log, None, None, bbox_log)
+    landmark_log = math.log(
+        float(left_landmark_area) / float(right_landmark_area)
+    )
+    direction_agreement = bbox_log * landmark_log > 0.0
+    consensus_log = (
+        math.copysign(
+            min(abs(bbox_log), abs(landmark_log)),
+            bbox_log,
+        )
+        if direction_agreement
+        else 0.0
+    )
+    return (
+        bbox_log,
+        landmark_log,
+        direction_agreement,
+        consensus_log,
+    )
 
 
 def _portrait_fill_attention(
@@ -3693,6 +3839,11 @@ def _portrait_fill_attention(
             mapped[1] + mapped[3] / 2.0,
         ),
         basis=attention.basis,
+        scale_area_proxy=(
+            attention.scale_area_proxy / geometry.fill_crop_xywh[3] ** 2
+            if attention.scale_area_proxy is not None
+            else None
+        ),
     )
 
 
@@ -3731,6 +3882,11 @@ def _sample_with_boundary_transform(
                 mapped[1] + mapped[3] / 2.0,
             ),
             basis=sample.attention.basis,
+            scale_area_proxy=(
+                sample.attention.scale_area_proxy * repair.zoom**2
+                if sample.attention.scale_area_proxy is not None
+                else None
+            ),
         ),
     )
 
@@ -4123,6 +4279,21 @@ def _cut_adjacent_motion_evidence(
         outgoing_components,
         incoming_components,
     )
+    outgoing_subject = outgoing_components.get("subject")
+    incoming_subject = incoming_components.get("subject")
+    subject_direction_cosine = (
+        _direction_cosine(outgoing_subject[1], incoming_subject[1])
+        if outgoing_subject is not None and incoming_subject is not None
+        else None
+    )
+    subject_speed_ratio_mismatch = (
+        _motion_speed_ratio_mismatch(
+            {"subject": outgoing_subject},
+            {"subject": incoming_subject},
+        )
+        if outgoing_subject is not None and incoming_subject is not None
+        else None
+    )
     pose_phase_mismatch = _pose_phase_continuation_mismatch(
         outgoing_previous,
         outgoing_endpoint,
@@ -4226,6 +4397,10 @@ def _cut_adjacent_motion_evidence(
         endpoint_pose_shape_compatibility=endpoint_compatibility,
         direction_cosine_audit_only=direction_cosine,
         motion_speed_ratio_mismatch=speed_ratio_mismatch,
+        subject_direction_cosine=subject_direction_cosine,
+        subject_motion_speed_ratio_mismatch=(
+            subject_speed_ratio_mismatch
+        ),
         pose_phase_continuation_mismatch=pose_phase_mismatch,
         output_space_subject_motion_used=output_space_subject_motion_used,
         soft_preference_applied=soft_preference,
@@ -4835,6 +5010,7 @@ def _boundary_mismatch(
             and motion_connection.timestamp_bound_adjacent
         ),
         transform_repair=transform_repair,
+        motion_connection=motion_connection,
     )
     if cinematic_bridge is not None:
         warning_flags.append("cinematic_effect_bridge_required")
@@ -4927,7 +5103,62 @@ _BeamStateKey = tuple[
     int,
     int,
     tuple[float, ...],
+    int,
 ]
+
+
+def _normalized_forbidden_source_paths(
+    paths: Sequence[Sequence[int]],
+    *,
+    span_count: int,
+    source_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Validate exact decoded-output paths that must not be rendered again."""
+
+    normalized: list[tuple[int, ...]] = []
+    for raw_path in paths:
+        if (
+            len(raw_path) != span_count
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value < source_count
+                for value in raw_path
+            )
+        ):
+            raise ValueError("forbidden direct-member source path is invalid")
+        path = tuple(raw_path)
+        if path not in normalized:
+            normalized.append(path)
+    return tuple(normalized)
+
+
+def _forbidden_prefix_match_mask(
+    prefix: Sequence[int],
+    forbidden_paths: Sequence[Sequence[int]],
+) -> int:
+    """Return the exact rejected paths still matched by a path prefix."""
+
+    prefix_tuple = tuple(prefix)
+    mask = 0
+    for path_index, path in enumerate(forbidden_paths):
+        if tuple(path[: len(prefix_tuple)]) == prefix_tuple:
+            mask |= 1 << path_index
+    return mask
+
+
+def _forbidden_suffix_match_mask(
+    suffix: Sequence[int],
+    forbidden_paths: Sequence[Sequence[int]],
+) -> int:
+    """Return the exact rejected paths still matched by a path suffix."""
+
+    suffix_tuple = tuple(suffix)
+    mask = 0
+    for path_index, path in enumerate(forbidden_paths):
+        if tuple(path[-len(suffix_tuple) :]) == suffix_tuple:
+            mask |= 1 << path_index
+    return mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -5060,6 +5291,7 @@ def _run_bounded_beam_attempt(
     beam_width: int,
     generated_state_limit: int,
     config: DirectMemberVisualConfig,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> _BeamAttemptResult:
     span_count = len(candidate_validity)
     source_count = len(source_quotas)
@@ -5083,6 +5315,10 @@ def _run_bounded_beam_attempt(
             source_index,
             -1,
             _duration_signature(duration_totals),
+            _forbidden_prefix_match_mask(
+                (source_index,),
+                forbidden_source_paths,
+            ),
         )
         states[key] = _BeamNode(cost, (source_index,), tuple(duration_totals))
 
@@ -5099,6 +5335,7 @@ def _run_bounded_beam_attempt(
             previous,
             previous_previous,
             _duration_state,
+            _forbidden_prefix_mask,
         ), node in states.items():
             for source_index in source_order:
                 if source_index == previous:
@@ -5155,6 +5392,10 @@ def _run_bounded_beam_attempt(
                     source_index,
                     previous,
                     _duration_signature(duration_totals),
+                    _forbidden_prefix_match_mask(
+                        path,
+                        forbidden_source_paths,
+                    ),
                 )
                 existing = next_states.get(key)
                 if existing is None and len(next_states) >= generated_state_limit:
@@ -5247,6 +5488,7 @@ def _milp_feasibility_lifeline(
     ) = None,
     minimum_severe_transition_count: int | None = None,
     maximum_severe_transition_count: int | None = None,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> _FeasibilityLifelineResult | None:
     """Solve the same hard path contract as a sparse binary MILP.
 
@@ -5268,6 +5510,11 @@ def _milp_feasibility_lifeline(
     source_count = len(source_quotas)
     if not span_count or source_count < 2:
         return None
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=span_count,
+        source_count=source_count,
+    )
     if severe_transition_budget_mask is not None and (
         maximum_severe_transition_count is None
     ):
@@ -5414,6 +5661,18 @@ def _milp_feasibility_lifeline(
             1.0,
             1.0,
         )
+    for forbidden_path in normalized_forbidden_paths:
+        add_constraint(
+            tuple(
+                (
+                    position * source_count + source_index,
+                    1.0,
+                )
+                for position, source_index in enumerate(forbidden_path)
+            ),
+            0.0,
+            float(span_count - 1),
+        )
     total_duration = float(sum(durations))
     for source_index in range(source_count):
         source_variables = tuple(
@@ -5558,6 +5817,9 @@ def _milp_feasibility_lifeline(
         "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
         "duration_state_quantization_applied": False,
         "postsolve_path_audit_required": True,
+        "forbidden_source_path_count": len(
+            normalized_forbidden_paths
+        ),
     }
     if status == 2:
         return _FeasibilityLifelineResult(
@@ -5609,6 +5871,19 @@ def _milp_feasibility_lifeline(
         )
         for position in range(span_count)
     )
+    if path in normalized_forbidden_paths:
+        raise DirectMemberVisualSelectionError(
+            "direct visual MILP returned a decoded-output rejected path",
+            {
+                "failure": "forbidden_source_path_selected",
+                "constraint_infeasibility_proven": False,
+                "visual_gates_relaxed": False,
+                "search": {
+                    "strategy": "scipy_highs_binary_path_milp_v1",
+                    "solver": solver_diagnostics,
+                },
+            },
+        )
     counts = tuple(path.count(source_index) for source_index in range(source_count))
     duration_totals = tuple(
         sum(
@@ -5728,6 +6003,7 @@ def _exact_feasibility_lifeline(
     ) = None,
     minimum_severe_transition_count: int | None = None,
     maximum_severe_transition_count: int | None = None,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> _FeasibilityLifelineResult:
     """Find one exact hard-feasible path without lossy beam pruning.
 
@@ -5767,6 +6043,11 @@ def _exact_feasibility_lifeline(
 
     span_count = len(candidate_validity)
     source_count = len(source_quotas)
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=span_count,
+        source_count=source_count,
+    )
     severe_budget_mask = (
         None
         if severe_transition_budget_mask is None
@@ -5798,6 +6079,7 @@ def _exact_feasibility_lifeline(
             severe_transition_budget_mask=severe_budget_mask,
             minimum_severe_transition_count=minimum_severe_transition_count,
             maximum_severe_transition_count=maximum_severe_transition_count,
+            forbidden_source_paths=normalized_forbidden_paths,
         )
         if milp_result is not None:
             return milp_result
@@ -5891,7 +6173,7 @@ def _exact_feasibility_lifeline(
     )
     order_rank = {source_index: rank for rank, source_index in enumerate(source_order)}
     failed_states: set[
-        tuple[int, tuple[int, ...], int, tuple[float, ...], int]
+        tuple[int, tuple[int, ...], int, tuple[float, ...], int, int]
     ] = set()
     explored_state_count = 0
     capacity_exhausted = False
@@ -6356,6 +6638,10 @@ def _exact_feasibility_lifeline(
             current_source,
             duration_totals,
             severe_transition_count,
+            _forbidden_suffix_match_mask(
+                suffix_path,
+                normalized_forbidden_paths,
+            ),
         )
         if key in failed_states:
             return None
@@ -6376,6 +6662,9 @@ def _exact_feasibility_lifeline(
             failed_states.add(key)
             return None
         if position == 0:
+            if tuple(suffix_path) in normalized_forbidden_paths:
+                failed_states.add(key)
+                return None
             if (
                 minimum_severe_transition_count is not None
                 and severe_transition_count
@@ -7297,9 +7586,11 @@ def _milp_bounded_same_source_hold_visual_path(
     durations: Sequence[float],
     duration_targets: Sequence[float],
     priority_boundaries: frozenset[int],
+    forbidden_hold_boundaries: frozenset[int],
     maximum_priority_cut_hold_count: int,
     maximum_hold_count: int,
     config: DirectMemberVisualConfig,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Solve the bounded no-cut fallback without an exponential beam.
 
@@ -7317,6 +7608,11 @@ def _milp_bounded_same_source_hold_visual_path(
 
     span_count = len(candidate_validity)
     source_count = len(source_quotas)
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=span_count,
+        source_count=source_count,
+    )
     boundary_count = span_count - 1
     x_count = span_count * source_count
     edge_specs: list[tuple[int, int, int, bool, float]] = []
@@ -7332,6 +7628,8 @@ def _milp_bounded_same_source_hold_visual_path(
                 if not candidate_validity[boundary_index + 1][right_source]:
                     continue
                 is_hold = left_source == right_source
+                if is_hold and boundary_index in forbidden_hold_boundaries:
+                    continue
                 mismatch = matrices[boundary_index][left_source][right_source]
                 if not is_hold and mismatch.severe_flags:
                     continue
@@ -7424,6 +7722,18 @@ def _milp_bounded_same_source_hold_visual_path(
             ),
             1.0,
             1.0,
+        )
+    for forbidden_path in normalized_forbidden_paths:
+        add_constraint(
+            tuple(
+                (
+                    position * source_count + source_index,
+                    1.0,
+                )
+                for position, source_index in enumerate(forbidden_path)
+            ),
+            0.0,
+            float(span_count - 1),
         )
     for source_index in range(source_count):
         source_variables = tuple(
@@ -7620,6 +7930,9 @@ def _milp_bounded_same_source_hold_visual_path(
         ),
         "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
         "postsolve_path_audit_required": True,
+        "forbidden_source_path_count": len(
+            normalized_forbidden_paths
+        ),
     }
     if status == 2:
         return None
@@ -7648,6 +7961,19 @@ def _milp_bounded_same_source_hold_visual_path(
         )
         for position in range(span_count)
     )
+    if path in normalized_forbidden_paths:
+        raise DirectMemberVisualSelectionError(
+            "direct visual safe-hold MILP returned a rejected path",
+            {
+                "failure": "forbidden_source_path_selected",
+                "constraint_infeasibility_proven": False,
+                "visual_gates_relaxed": False,
+                "search": {
+                    "strategy": "scipy_highs_bounded_safe_hold_milp_v1",
+                    "solver": solver_diagnostics,
+                },
+            },
+        )
     counts = tuple(path.count(source_index) for source_index in range(source_count))
     duration_totals = tuple(
         sum(
@@ -7683,6 +8009,8 @@ def _milp_bounded_same_source_hold_visual_path(
         audit_failures.append("maximum_same_source_hold_count_exceeded")
     if len(priority_hold_indices) > maximum_priority_cut_hold_count:
         audit_failures.append("maximum_priority_cut_hold_count_exceeded")
+    if any(index in forbidden_hold_boundaries for index in hold_indices):
+        audit_failures.append("forbidden_same_source_hold_selected")
     consecutive_holds = 0
     maximum_consecutive_holds = 0
     run_seconds = float(durations[0])
@@ -7776,6 +8104,9 @@ def _milp_bounded_same_source_hold_visual_path(
             ),
             "measured_maximum_same_source_run_seconds": maximum_run_seconds,
             "priority_cut_boundary_indices": sorted(priority_boundaries),
+            "forbidden_same_source_hold_boundary_indices": sorted(
+                forbidden_hold_boundaries
+            ),
             "priority_cut_boundary_hold_count": len(priority_hold_indices),
             "maximum_priority_cut_hold_count": maximum_priority_cut_hold_count,
             "cross_source_severe_edge_count_selected": 0,
@@ -7800,8 +8131,10 @@ def _bounded_same_source_hold_visual_path(
     candidate_validity: Sequence[Sequence[bool]],
     span_durations: Sequence[float],
     priority_cut_boundary_indices: Sequence[int] = (),
+    forbidden_same_source_hold_boundary_indices: Sequence[int] = (),
     maximum_priority_cut_hold_count: int = 0,
     config: DirectMemberVisualConfig,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Find a safe all-source path with a small number of no-cut holds.
 
@@ -7825,9 +8158,17 @@ def _bounded_same_source_hold_visual_path(
         or sum(int(value) for value in source_quotas) != span_count
     ):
         raise ValueError("same-source hold fallback shape is invalid")
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=span_count,
+        source_count=source_count,
+    )
     boundary_count = span_count - 1
     priority_boundaries = frozenset(
         int(value) for value in priority_cut_boundary_indices
+    )
+    forbidden_hold_boundaries = frozenset(
+        int(value) for value in forbidden_same_source_hold_boundary_indices
     )
     if any(
         isinstance(value, bool)
@@ -7836,6 +8177,13 @@ def _bounded_same_source_hold_visual_path(
         for value in priority_cut_boundary_indices
     ):
         raise ValueError("priority cut boundary indices are invalid")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < boundary_count
+        for value in forbidden_same_source_hold_boundary_indices
+    ):
+        raise ValueError("forbidden same-source hold boundaries are invalid")
     if (
         isinstance(maximum_priority_cut_hold_count, bool)
         or not isinstance(maximum_priority_cut_hold_count, int)
@@ -7869,9 +8217,11 @@ def _bounded_same_source_hold_visual_path(
             durations=durations,
             duration_targets=duration_targets,
             priority_boundaries=priority_boundaries,
+            forbidden_hold_boundaries=forbidden_hold_boundaries,
             maximum_priority_cut_hold_count=maximum_priority_cut_hold_count,
             maximum_hold_count=maximum_hold_count,
             config=config,
+            forbidden_source_paths=normalized_forbidden_paths,
         )
     future_valid_counts: list[tuple[int, ...]] = [
         (0,) * source_count for _ in range(span_count + 1)
@@ -7900,6 +8250,7 @@ def _bounded_same_source_hold_visual_path(
                 int,
                 int,
                 tuple[float, ...],
+                int,
             ],
             _BeamNode,
         ] = {}
@@ -7925,6 +8276,10 @@ def _bounded_same_source_hold_visual_path(
                     0,
                     0,
                     _duration_signature(duration_totals),
+                    _forbidden_prefix_match_mask(
+                        (source_index,),
+                        normalized_forbidden_paths,
+                    ),
                 )
             ] = _BeamNode(cost, (source_index,), tuple(duration_totals))
 
@@ -7942,6 +8297,7 @@ def _bounded_same_source_hold_visual_path(
                     int,
                     int,
                     tuple[float, ...],
+                    int,
                 ],
                 _BeamNode,
             ] = {}
@@ -7953,6 +8309,7 @@ def _bounded_same_source_hold_visual_path(
                 consecutive_hold_count,
                 priority_hold_count,
                 _duration_state,
+                _forbidden_prefix_mask,
             ), node in states.items():
                 for source_index in source_order:
                     if (
@@ -7961,6 +8318,8 @@ def _bounded_same_source_hold_visual_path(
                     ):
                         continue
                     is_hold = source_index == previous
+                    if is_hold and position - 1 in forbidden_hold_boundaries:
+                        continue
                     is_priority_hold = bool(
                         is_hold and position - 1 in priority_boundaries
                     )
@@ -8039,6 +8398,10 @@ def _bounded_same_source_hold_visual_path(
                         next_consecutive,
                         next_priority_hold_count,
                         _duration_signature(duration_totals),
+                        _forbidden_prefix_match_mask(
+                            path,
+                            normalized_forbidden_paths,
+                        ),
                     )
                     existing = next_states.get(key)
                     if existing is None or (cost, path) < (
@@ -8080,8 +8443,11 @@ def _bounded_same_source_hold_visual_path(
             _consecutive,
             priority_hold_count,
             _duration_state,
+            forbidden_prefix_mask,
         ), node in states.items():
             if counts != tuple(source_quotas):
+                continue
+            if forbidden_prefix_mask:
                 continue
             deviations = tuple(
                 _duration_relative_deviation(actual, target)
@@ -8138,6 +8504,9 @@ def _bounded_same_source_hold_visual_path(
                     "priority_cut_boundary_indices": sorted(
                         priority_boundaries
                     ),
+                    "forbidden_same_source_hold_boundary_indices": sorted(
+                        forbidden_hold_boundaries
+                    ),
                     "priority_cut_boundary_hold_count": priority_hold_count,
                     "maximum_priority_cut_hold_count": (
                         maximum_priority_cut_hold_count
@@ -8167,9 +8536,11 @@ def _heterogeneous_cinematic_visual_path(
     priority_cut_boundary_indices: Sequence[int],
     maximum_priority_cut_hold_count: int,
     config: DirectMemberVisualConfig,
+    forbidden_same_source_hold_boundary_indices: Sequence[int] = (),
     require_cinematic_bridge: bool = True,
     represented_source_indices: Sequence[int] | None = None,
     minimum_distinct_source_count: int | None = None,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Use heterogeneous fancams by role without authoring a bad hard cut.
 
@@ -8231,6 +8602,17 @@ def _heterogeneous_cinematic_visual_path(
         or len(durations) != span_count
     ):
         raise ValueError("heterogeneous cinematic path shape is invalid")
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=span_count,
+        source_count=source_count,
+    )
+    total_duration = sum(durations)
+    short_proof_all_source_usage = bool(
+        not flexible_subset_usage
+        and total_duration
+        <= _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS + 1e-9
+    )
     geometric_landscape_sources = tuple(
         index
         for index, geometry in enumerate(source_geometries)
@@ -8276,6 +8658,16 @@ def _heterogeneous_cinematic_visual_path(
     priority_boundaries = frozenset(
         int(value) for value in priority_cut_boundary_indices
     )
+    forbidden_hold_boundaries = frozenset(
+        int(value) for value in forbidden_same_source_hold_boundary_indices
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < boundary_count
+        for value in forbidden_same_source_hold_boundary_indices
+    ):
+        raise ValueError("forbidden same-source hold boundaries are invalid")
     exceptional_nonpriority_bridge_boundaries = (
         frozenset(
             boundary_index
@@ -8377,7 +8769,7 @@ def _heterogeneous_cinematic_visual_path(
             if source_index not in active_source_set
             or adaptive_minimum_diversity_usage
             else 1
-            if flexible_subset_usage
+            if flexible_subset_usage or short_proof_all_source_usage
             else 1
             if source_index in landscape_sources
             else max(
@@ -8415,7 +8807,6 @@ def _heterogeneous_cinematic_visual_path(
     )
     if sum(count_minimums) > span_count or sum(count_maximums) < span_count:
         return None
-    total_duration = sum(durations)
     (
         maximum_portrait_bridge_count,
         maximum_landscape_bridge_count,
@@ -8484,6 +8875,9 @@ def _heterogeneous_cinematic_visual_path(
         ),
         "carrier_source_indices": list(portrait_sources),
         "priority_cut_boundary_indices": sorted(priority_boundaries),
+        "forbidden_same_source_hold_boundary_indices": sorted(
+            forbidden_hold_boundaries
+        ),
         "exceptional_nonpriority_cinematic_bridge_boundary_indices": sorted(
             exceptional_nonpriority_bridge_boundaries
         ),
@@ -8527,6 +8921,13 @@ def _heterogeneous_cinematic_visual_path(
             ),
         },
         "all_sources_minimum_usage_preserved": not flexible_subset_usage,
+        "short_proof_all_source_single_span_minimum_applied": (
+            short_proof_all_source_usage
+        ),
+        "short_proof_maximum_duration_seconds": (
+            _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS
+        ),
+        "total_duration_seconds": total_duration,
         "all_represented_sources_minimum_usage_preserved": (
             not adaptive_minimum_diversity_usage
         ),
@@ -8687,6 +9088,8 @@ def _heterogeneous_cinematic_visual_path(
                     continue
                 mismatch = matrices[boundary_index][left_source][right_source]
                 is_hold = left_source == right_source
+                if is_hold and boundary_index in forbidden_hold_boundaries:
+                    continue
                 is_bridge = bool(
                     require_cinematic_bridge
                     and not is_hold
@@ -8984,6 +9387,19 @@ def _heterogeneous_cinematic_visual_path(
             1.0,
             1.0,
             family="position_one_hot",
+        )
+    for forbidden_path in normalized_forbidden_paths:
+        add_constraint(
+            tuple(
+                (
+                    position * source_count + source_index,
+                    1.0,
+                )
+                for position, source_index in enumerate(forbidden_path)
+            ),
+            0.0,
+            float(span_count - 1),
+            family="decoded_proxy_path_no_good",
         )
     for source_index in range(source_count):
         count_terms = tuple(
@@ -9459,6 +9875,9 @@ def _heterogeneous_cinematic_visual_path(
         "secondary_objective_upper_bound": secondary_objective_upper_bound,
         "time_limit_seconds": _DIRECT_MEMBER_MILP_TIME_LIMIT_SECONDS,
         "postsolve_path_audit_required": True,
+        "forbidden_source_path_count": len(
+            normalized_forbidden_paths
+        ),
     }
     if (
         status == 2
@@ -9945,6 +10364,23 @@ def _heterogeneous_cinematic_visual_path(
         )
         for position in range(span_count)
     )
+    if path in normalized_forbidden_paths:
+        raise DirectMemberVisualSelectionError(
+            "role-aware direct visual MILP returned a rejected path",
+            {
+                "failure": "forbidden_source_path_selected",
+                "constraint_infeasibility_proven": False,
+                "visual_gates_relaxed": False,
+                "search": {
+                    "strategy": (
+                        "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                        if require_cinematic_bridge
+                        else "scipy_highs_role_aware_safe_hold_path_milp_v1"
+                    ),
+                    "solver": solver_diagnostics,
+                },
+            },
+        )
     counts = tuple(path.count(source_index) for source_index in range(source_count))
     selected_source_indices = tuple(
         source_index
@@ -10054,6 +10490,8 @@ def _heterogeneous_cinematic_visual_path(
         )
     if len(hold_indices) > maximum_hold_count:
         audit_failures.append("maximum_same_source_hold_count_exceeded")
+    if any(index in forbidden_hold_boundaries for index in hold_indices):
+        audit_failures.append("forbidden_same_source_hold_selected")
     measured_maximum_run_seconds = max(
         sum(
             durations[position]
@@ -10313,6 +10751,7 @@ def _balanced_visual_path(
     candidate_validity: Sequence[Sequence[bool]],
     span_durations: Sequence[float],
     config: DirectMemberVisualConfig,
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
 ) -> tuple[tuple[int, ...], float, dict[str, Any]]:
     span_count = len(matrices) + 1
     source_count = len(source_quotas)
@@ -10355,6 +10794,7 @@ def _balanced_visual_path(
             duration_targets=duration_targets,
             state_limit=config.feasibility_lifeline_state_limit,
             config=config,
+            forbidden_source_paths=forbidden_source_paths,
         )
         search_diagnostics = {
             "strategy": "scipy_highs_binary_path_milp_with_counterfactual",
@@ -10447,6 +10887,7 @@ def _balanced_visual_path(
                 config.maximum_generated_beam_state_count,
             ),
             config=config,
+            forbidden_source_paths=forbidden_source_paths,
         )
         last_attempt = attempt
         attempt_payload = attempt.to_dict()
@@ -10457,8 +10898,10 @@ def _balanced_visual_path(
                 _last,
                 _previous,
                 _duration_state,
+                forbidden_prefix_mask,
             ), node in attempt.states.items()
             if counts == tuple(source_quotas)
+            and forbidden_prefix_mask == 0
         ]
         balanced: list[_BeamNode] = []
         complete_diagnostics: list[
@@ -10543,6 +10986,7 @@ def _balanced_visual_path(
         duration_targets=duration_targets,
         state_limit=config.feasibility_lifeline_state_limit,
         config=config,
+        forbidden_source_paths=forbidden_source_paths,
     )
     search_diagnostics = {
         "strategy": "bounded_adaptive_cost_beam_with_exact_lifeline",
@@ -10817,10 +11261,20 @@ def select_balanced_direct_member_sources(
     preferred_source_order: Sequence[int] | None = None,
     extra_quota_source_indices: Sequence[int] | None = None,
     priority_cut_boundary_indices: Sequence[int] = (),
+    forbidden_same_source_hold_boundary_indices: Sequence[int] = (),
     maximum_priority_cut_hold_count: int = 0,
     render_infeasible_transition_edges: Sequence[
         tuple[float, int, int]
     ] = (),
+    render_penalized_transition_edges: Sequence[
+        tuple[float, int, int, float]
+    ] = (),
+    forbidden_source_paths: Sequence[Sequence[int]] = (),
+    decoded_proxy_preferred_source_path: Sequence[int] | None = None,
+    decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
+    decoded_proxy_source_deviation_penalty: float = (
+        _DECODED_PROXY_LOCAL_REPAIR_SOURCE_DEVIATION_PENALTY
+    ),
     config: DirectMemberVisualConfig | None = None,
     descriptor_provider: DescriptorProvider | None = None,
 ) -> DirectMemberVisualSelection:
@@ -10840,6 +11294,10 @@ def select_balanced_direct_member_sources(
     ``priority_cut_boundary_indices`` identifies section-critical cuts whose
     no-cut continuations are separately capped by
     ``maximum_priority_cut_hold_count``.
+    ``forbidden_same_source_hold_boundary_indices`` carries exact failed
+    post-alignment cadence witnesses back into the path search. Only those
+    observed boundaries are forced to cut; the ordinary compensated-hold
+    budget remains available everywhere else.
     ``source_frame_sizes`` authorizes geometry repair only by proving that the
     post-portrait-fill working frame remains no larger than decoded source
     pixels. Missing sizes retain the historical no-repair hard gates.
@@ -10852,6 +11310,19 @@ def select_balanced_direct_member_sources(
     from a prior motion solve.  A certified source pair is removed only near
     its measured canonical boundary; the optimizer must choose another source
     pair or a meaningfully different cut time instead of relaxing geometry.
+    ``render_penalized_transition_edges`` carries decoded-output continuity
+    feedback.  Unlike a camera-solve failure, a visually poor decoded edge is
+    still renderable, so its bounded finite cost may steer the path without
+    disconnecting an otherwise viable source graph.
+    ``forbidden_source_paths`` contains exact source sequences already rendered
+    and rejected under this same musical partition.  Each no-good constraint
+    excludes only the complete repeated sequence; its individual sources and
+    transitions remain eligible in every other combination.
+    ``decoded_proxy_preferred_source_path`` supplies the last decoded path only
+    during a bounded continuity repair. Source positions adjacent to a failed
+    boundary remain free; changing any other position adds a finite Hamming
+    cost. This keeps successful editing decisions stable without hard-locking
+    the graph or weakening visual validity, cadence, or source-usage gates.
     ``required_distinct_source_count`` may be lower than the analyzed source
     count only for an explicitly bounded quality-proof render. Every source is
     still decoded and scored; the exact represented subset is selected from
@@ -10923,8 +11394,80 @@ def select_balanced_direct_member_sources(
             abs_tol=1e-7,
         ):
             raise ValueError("direct visual spans must be contiguous")
+    normalized_forbidden_paths = _normalized_forbidden_source_paths(
+        forbidden_source_paths,
+        span_count=len(spans),
+        source_count=source_count,
+    )
+    preferred_proxy_path = (
+        ()
+        if decoded_proxy_preferred_source_path is None
+        else tuple(decoded_proxy_preferred_source_path)
+    )
+    proxy_repair_targets = tuple(
+        decoded_proxy_repair_target_boundary_indices
+    )
+    if preferred_proxy_path and (
+        len(preferred_proxy_path) != len(spans)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < source_count
+            for value in preferred_proxy_path
+        )
+    ):
+        raise ValueError("decoded-proxy preferred source path is invalid")
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(spans) - 1
+            for value in proxy_repair_targets
+        )
+        or len(set(proxy_repair_targets)) != len(proxy_repair_targets)
+    ):
+        raise ValueError("decoded-proxy local repair targets are invalid")
+    if bool(preferred_proxy_path) != bool(proxy_repair_targets):
+        raise ValueError(
+            "decoded-proxy path and repair targets must be supplied together"
+        )
+    if (
+        len(proxy_repair_targets)
+        > _DECODED_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT
+    ):
+        raise ValueError("decoded-proxy local repair target limit exceeded")
+    if (
+        isinstance(decoded_proxy_source_deviation_penalty, bool)
+        or not isinstance(
+            decoded_proxy_source_deviation_penalty,
+            (int, float),
+        )
+        or not math.isfinite(float(decoded_proxy_source_deviation_penalty))
+        or not 0.0 < float(decoded_proxy_source_deviation_penalty)
+        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+    ):
+        raise ValueError("decoded-proxy source deviation penalty is invalid")
+    proxy_repair_span_indices = frozenset(
+        span_index
+        for boundary_index in proxy_repair_targets
+        for span_index in (boundary_index, boundary_index + 1)
+    )
+    proxy_protected_span_indices = frozenset(
+        span_index
+        for span_index in range(len(spans))
+        if span_index not in proxy_repair_span_indices
+    )
+    total_duration_seconds = spans[-1][1] - spans[0][0]
+    short_proof_source_exposure_tolerance_applied = bool(
+        represented_source_count < source_count
+        or total_duration_seconds
+        <= _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS + 1e-9
+    )
     priority_boundaries = tuple(
         int(value) for value in priority_cut_boundary_indices
+    )
+    forbidden_hold_boundaries = tuple(
+        int(value) for value in forbidden_same_source_hold_boundary_indices
     )
     if any(
         isinstance(value, bool)
@@ -10935,6 +11478,15 @@ def select_balanced_direct_member_sources(
         raise ValueError("priority cut boundary indices are invalid")
     if len(set(priority_boundaries)) != len(priority_boundaries):
         raise ValueError("priority cut boundary indices must be unique")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < len(spans) - 1
+        for value in forbidden_same_source_hold_boundary_indices
+    ):
+        raise ValueError("forbidden same-source hold boundaries are invalid")
+    if len(set(forbidden_hold_boundaries)) != len(forbidden_hold_boundaries):
+        raise ValueError("forbidden same-source hold boundaries must be unique")
     if (
         isinstance(maximum_priority_cut_hold_count, bool)
         or not isinstance(maximum_priority_cut_hold_count, int)
@@ -11050,7 +11602,7 @@ def select_balanced_direct_member_sources(
                 _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_SOURCE_DURATION_RELATIVE_DEVIATION,
             ),
         )
-        if represented_source_count < source_count
+        if short_proof_source_exposure_tolerance_applied
         else base_config
     )
     render_infeasible_edges: tuple[tuple[float, int, int], ...] = tuple(
@@ -11075,6 +11627,49 @@ def select_balanced_direct_member_sources(
         raise ValueError("render-infeasible transition edge is invalid")
     if len(set(render_infeasible_edges)) != len(render_infeasible_edges):
         raise ValueError("render-infeasible transition edges must be unique")
+    render_penalized_edges: tuple[tuple[float, int, int, float], ...] = tuple(
+        (
+            float(boundary_seconds),
+            int(outgoing_source_index),
+            int(incoming_source_index),
+            float(penalty),
+        )
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) in render_penalized_transition_edges
+    )
+    if any(
+        not math.isfinite(boundary_seconds)
+        or boundary_seconds < spans[0][0] - 1e-9
+        or boundary_seconds > spans[-1][1] + 1e-9
+        or not 0 <= outgoing_source_index < source_count
+        or not 0 <= incoming_source_index < source_count
+        or outgoing_source_index == incoming_source_index
+        or not math.isfinite(penalty)
+        or not 0.0 < penalty
+        <= _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) in render_penalized_edges
+    ):
+        raise ValueError("render-penalized transition edge is invalid")
+    render_penalized_keys = tuple(
+        (boundary_seconds, outgoing_source_index, incoming_source_index)
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            _penalty,
+        ) in render_penalized_edges
+    )
+    if len(set(render_penalized_keys)) != len(render_penalized_keys):
+        raise ValueError("render-penalized transition edges must be unique")
     quotas = (
         _balanced_quotas(len(spans), source_count, quota_order)
         if represented_source_count == source_count
@@ -11107,6 +11702,23 @@ def select_balanced_direct_member_sources(
         "all_analyzed_sources_required": (
             represented_source_count == source_count
         ),
+        "source_duration_balance_policy": (
+            "short_proof_exact_count_flexible_exposure_v1"
+            if short_proof_source_exposure_tolerance_applied
+            else "ordinary_full_song_exact_count_strict_exposure_v1"
+        ),
+        "short_proof_maximum_duration_seconds": (
+            _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS
+        ),
+        "total_duration_seconds": total_duration_seconds,
+        "maximum_source_duration_relative_deviation": (
+            resolved_config.maximum_source_duration_relative_deviation
+        ),
+        "ordinary_full_song_maximum_source_duration_relative_deviation": (
+            DirectMemberVisualConfig().maximum_source_duration_relative_deviation
+        ),
+        "visual_thresholds_changed": False,
+        "visual_gates_relaxed": False,
     }
 
     owned_provider: _VideoDescriptorProvider | None = None
@@ -11401,6 +12013,68 @@ def select_balanced_direct_member_sources(
                     )
                     for left_index in range(source_count)
                 )
+                if render_penalized_edges:
+                    candidate_matrix = tuple(
+                        tuple(
+                            replace(
+                                mismatch,
+                                cost=(
+                                    mismatch.cost
+                                    + sum(
+                                        penalty
+                                        for (
+                                            penalized_seconds,
+                                            penalized_left,
+                                            penalized_right,
+                                            penalty,
+                                        ) in render_penalized_edges
+                                        if left_index == penalized_left
+                                        and right_index == penalized_right
+                                        and abs(
+                                            boundary - penalized_seconds
+                                        )
+                                        <= _DECODED_PROXY_PENALTY_RADIUS_SECONDS
+                                        + 1e-9
+                                    )
+                                ),
+                            )
+                            for right_index, mismatch in enumerate(row)
+                        )
+                        for left_index, row in enumerate(candidate_matrix)
+                    )
+                if preferred_proxy_path:
+                    candidate_matrix = tuple(
+                        tuple(
+                            replace(
+                                mismatch,
+                                cost=(
+                                    mismatch.cost
+                                    + float(
+                                        decoded_proxy_source_deviation_penalty
+                                    )
+                                    * (
+                                        int(
+                                            boundary_index == 0
+                                            and 0
+                                            in proxy_protected_span_indices
+                                            and left_index
+                                            != preferred_proxy_path[0]
+                                        )
+                                        + int(
+                                            boundary_index + 1
+                                            in proxy_protected_span_indices
+                                            and right_index
+                                            != preferred_proxy_path[
+                                                boundary_index + 1
+                                            ]
+                                        )
+                                    )
+                                ),
+                            )
+                            for right_index, mismatch in enumerate(row)
+                        )
+                        for left_index, row in enumerate(candidate_matrix)
+                    )
                 if render_infeasible_edges:
                     candidate_matrix = tuple(
                         tuple(
@@ -11757,6 +12431,7 @@ def select_balanced_direct_member_sources(
                 candidate_validity=candidate_validity,
                 span_durations=tuple(end - start for start, end in spans),
                 config=resolved_config,
+                forbidden_source_paths=normalized_forbidden_paths,
             )
         )
     except DirectMemberVisualSelectionError as error:
@@ -11794,10 +12469,14 @@ def select_balanced_direct_member_sources(
                 candidate_validity=candidate_validity,
                 span_durations=tuple(end - start for start, end in spans),
                 priority_cut_boundary_indices=priority_boundaries,
+                forbidden_same_source_hold_boundary_indices=(
+                    forbidden_hold_boundaries
+                ),
                 maximum_priority_cut_hold_count=(
                     maximum_priority_cut_hold_count
                 ),
                 config=resolved_config,
+                forbidden_source_paths=normalized_forbidden_paths,
             )
             if hold_fallback_authorized
             else None
@@ -11888,6 +12567,9 @@ def select_balanced_direct_member_sources(
                             ),
                             source_geometries=source_frame_geometries,
                             priority_cut_boundary_indices=priority_boundaries,
+                            forbidden_same_source_hold_boundary_indices=(
+                                forbidden_hold_boundaries
+                            ),
                             maximum_priority_cut_hold_count=(
                                 maximum_priority_cut_hold_count
                             ),
@@ -11898,6 +12580,9 @@ def select_balanced_direct_member_sources(
                             ),
                             minimum_distinct_source_count=(
                                 role_aware_minimum_distinct_source_count
+                            ),
+                            forbidden_source_paths=(
+                                normalized_forbidden_paths
                             ),
                         )
                     )
@@ -11926,6 +12611,9 @@ def select_balanced_direct_member_sources(
                             ),
                             source_geometries=source_frame_geometries,
                             priority_cut_boundary_indices=priority_boundaries,
+                            forbidden_same_source_hold_boundary_indices=(
+                                forbidden_hold_boundaries
+                            ),
                             maximum_priority_cut_hold_count=(
                                 maximum_priority_cut_hold_count
                             ),
@@ -11935,6 +12623,9 @@ def select_balanced_direct_member_sources(
                             ),
                             minimum_distinct_source_count=(
                                 role_aware_minimum_distinct_source_count
+                            ),
+                            forbidden_source_paths=(
+                                normalized_forbidden_paths
                             ),
                         )
                     )
@@ -12205,7 +12896,7 @@ def select_balanced_direct_member_sources(
             represented_source_count == source_count
         ),
         "short_proof_source_exposure_tolerance_applied": (
-            represented_source_count < source_count
+            short_proof_source_exposure_tolerance_applied
         ),
         "maximum_source_duration_relative_deviation": (
             resolved_config.maximum_source_duration_relative_deviation
@@ -12214,8 +12905,23 @@ def select_balanced_direct_member_sources(
             heterogeneous_cinematic_authorized
         ),
         "priority_cut_boundary_indices": list(priority_boundaries),
+        "forbidden_same_source_hold_boundary_indices": list(
+            forbidden_hold_boundaries
+        ),
         "maximum_priority_cut_hold_count": maximum_priority_cut_hold_count,
+        "decoded_proxy_path_no_good": {
+            "forbidden_source_path_count": len(
+                normalized_forbidden_paths
+            ),
+            "complete_path_only": True,
+            "individual_edges_remain_eligible": True,
+            "visual_thresholds_relaxed": False,
+        },
     }
+    if tuple(path) in normalized_forbidden_paths:
+        raise RuntimeError(
+            "direct-member selector repeated a decoded-output rejected path"
+        )
     priority_hold_indices = tuple(
         boundary_index
         for boundary_index in priority_boundaries
@@ -12225,6 +12931,11 @@ def select_balanced_direct_member_sources(
         raise RuntimeError(
             "direct member visual path exceeded priority cut hold limit"
         )
+    if any(
+        path[index] == path[index + 1]
+        for index in forbidden_hold_boundaries
+    ):
+        raise RuntimeError("direct member visual path used a forbidden hold")
     base_span_durations = tuple(end - start for start, end in spans)
     if selected_duration_targets is None:
         _base_actual, joint_duration_targets, _base_deviations = (
@@ -12355,6 +13066,74 @@ def select_balanced_direct_member_sources(
             "effect": (
                 "hard_forbid_certified_source_pair_near_measured_boundary"
             ),
+            "visual_thresholds_relaxed": False,
+        },
+        "decoded_proxy_path_feedback": {
+            "penalized_edge_count": len(render_penalized_edges),
+            "penalty_radius_seconds": (
+                _DECODED_PROXY_PENALTY_RADIUS_SECONDS
+            ),
+            "maximum_accumulated_edge_penalty": (
+                _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+            ),
+            "total_penalty": sum(
+                penalty
+                for (
+                    _boundary_seconds,
+                    _outgoing_source_index,
+                    _incoming_source_index,
+                    penalty,
+                ) in render_penalized_edges
+            ),
+            "penalties": [
+                {
+                    "canonical_boundary_seconds": boundary_seconds,
+                    "outgoing_eligible_source_index": (
+                        outgoing_source_index
+                    ),
+                    "incoming_eligible_source_index": (
+                        incoming_source_index
+                    ),
+                    "accumulated_penalty": penalty,
+                }
+                for (
+                    boundary_seconds,
+                    outgoing_source_index,
+                    incoming_source_index,
+                    penalty,
+                ) in render_penalized_edges
+            ],
+            "effect": (
+                "finite_cost_preference_without_graph_disconnection"
+            ),
+            "visual_thresholds_relaxed": False,
+        },
+        "decoded_proxy_local_path_repair": {
+            "enabled": bool(preferred_proxy_path),
+            "preferred_source_path": list(preferred_proxy_path),
+            "repair_target_boundary_indices": list(proxy_repair_targets),
+            "repair_window_span_indices": sorted(
+                proxy_repair_span_indices
+            ),
+            "protected_span_indices": sorted(
+                proxy_protected_span_indices
+            ),
+            "source_deviation_penalty": (
+                float(decoded_proxy_source_deviation_penalty)
+                if preferred_proxy_path
+                else 0.0
+            ),
+            "selected_changed_span_indices": [
+                span_index
+                for span_index, (preferred, selected) in enumerate(
+                    zip(preferred_proxy_path, path, strict=True)
+                )
+                if preferred != selected
+            ] if preferred_proxy_path else [],
+            "effect": (
+                "finite_protected_span_hamming_cost_with_free_failure_windows"
+            ),
+            "hard_locked": False,
             "visual_thresholds_relaxed": False,
         },
         "boundary_local_search": {
