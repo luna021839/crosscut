@@ -19,6 +19,7 @@ from crosscut.pipeline import (
     _direct_full_frame_visual_frontier_split_child_profiles,
     _direct_member_highlight_partition_capacity_payload,
     _direct_member_highlight_cadence_payload,
+    _direct_member_highlight_hold_repair_boundary_indices,
     _direct_member_in_run_preferred_partition_profile,
     _direct_member_maximum_hold_count_for_global_cadence,
     _direct_member_render_feedback_seed_profiles,
@@ -863,6 +864,37 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
             caught.exception.diagnostics["highlight_cut_density"][
                 "failure_reasons"
             ],
+        )
+
+    def test_density_failure_feeds_observed_highlight_holds_back_as_cuts(
+        self,
+    ) -> None:
+        payload = {
+            "failure_reasons": [
+                "highlight_switch_density_below_minimum",
+                "highlight_density_lift_below_minimum",
+            ],
+            "highlight_no_cut_hold_boundary_indices": [3, 1, 3],
+        }
+
+        self.assertEqual(
+            _direct_member_highlight_hold_repair_boundary_indices(payload),
+            (1, 3),
+        )
+
+    def test_motion_only_failure_does_not_misuse_hold_density_repair(
+        self,
+    ) -> None:
+        payload = {
+            "failure_reasons": [
+                "highlight_moving_cut_fraction_below_minimum"
+            ],
+            "highlight_no_cut_hold_boundary_indices": [2],
+        }
+
+        self.assertEqual(
+            _direct_member_highlight_hold_repair_boundary_indices(payload),
+            (),
         )
 
     def test_compensated_highlight_holds_retain_the_section_audit(self) -> None:

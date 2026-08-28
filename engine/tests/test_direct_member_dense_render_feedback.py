@@ -224,8 +224,8 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             compatible = binding_diagnostics[
                 "compatible_predecessor_bindings"
             ]
-            self.assertEqual(len(compatible), 1)
-            predecessor_binding = compatible[0]["binding"]
+            self.assertEqual(len(compatible), 2)
+            predecessor_binding = compatible[-1]["binding"]
             edge = (1.0, 0, 1)
             persisted = _persist_direct_member_dense_render_feedback_edges(
                 directory,

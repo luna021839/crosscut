@@ -11839,18 +11839,23 @@ def select_balanced_direct_member_sources(
                 },
             }
         else:
-            role_aware_safe_hold_authorized = bool(
-                hold_fallback_authorized
-                and resolved_config.maximum_same_source_hold_count > 0
-                and all(
-                    geometry is not None
-                    for geometry in source_frame_geometries
-                )
+            complete_source_geometry = all(
+                geometry is not None
+                for geometry in source_frame_geometries
             )
             adaptive_minimum_diversity_authorized = bool(
-                role_aware_safe_hold_authorized
+                hold_fallback_authorized
                 and represented_source_count < source_count
                 and render_infeasible_edges
+                and complete_source_geometry
+            )
+            role_aware_safe_hold_authorized = bool(
+                hold_fallback_authorized
+                and complete_source_geometry
+                and (
+                    resolved_config.maximum_same_source_hold_count > 0
+                    or adaptive_minimum_diversity_authorized
+                )
             )
             role_aware_source_order = (
                 ranked_source_indices

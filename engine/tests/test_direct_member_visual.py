@@ -1875,6 +1875,103 @@ class DirectMemberVisualTests(unittest.TestCase):
             "validity_quota_path_exhausted",
         )
 
+    def test_feedback_adaptive_solver_runs_before_hold_fallback(self) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(4))
+        strict_failure = DirectMemberVisualSelectionError(
+            "strict fixed subset failed",
+            {
+                "failure": "validity_quota_path_exhausted",
+                "constraint_infeasibility_proven": True,
+                "search": {
+                    "exact_lifeline": {
+                        "strategy": "scipy_highs_binary_path_milp_v1",
+                        "path_found": False,
+                        "state_capacity_exhausted": False,
+                        "duration_state_quantization_applied": False,
+                    }
+                },
+            },
+        )
+        adaptive_path = (0, 1, 3, 0)
+        adaptive_result = (
+            adaptive_path,
+            0.2,
+            {
+                "strategy": (
+                    "scipy_highs_adaptive_minimum_diversity_safe_hold_milp_v1"
+                ),
+                "usage_policy": (
+                    "short_proof_feedback_adaptive_minimum_diversity_"
+                    "exposure_v1"
+                ),
+                "source_count_targets": [2, 1, 0, 1],
+                "source_count_minimums": [0, 0, 0, 0],
+                "source_count_maximums": [3, 2, 0, 2],
+                "source_duration_targets_seconds": [2.0, 1.0, 0.0, 1.0],
+                "source_duration_minimums_seconds": [0.0, 0.0, 0.0, 0.0],
+                "source_duration_maximums_seconds": [3.0, 2.0, 0.0, 2.0],
+                "represented_source_indices": [0, 1, 3],
+                "omitted_source_indices": [2],
+                "same_source_hold_count": 0,
+                "maximum_same_source_run_seconds": 7.2,
+                "visual_gates_relaxed": False,
+            },
+        )
+
+        def adaptive_search(*_args: object, **kwargs: object):
+            self.assertFalse(kwargs["require_cinematic_bridge"])
+            self.assertEqual(kwargs["minimum_distinct_source_count"], 3)
+            self.assertIsNone(kwargs["represented_source_indices"])
+            self.assertEqual(kwargs["config"].maximum_same_source_hold_count, 0)
+            return adaptive_result
+
+        with patch(
+            "crosscut.direct_member_visual._balanced_visual_path",
+            side_effect=strict_failure,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_bounded_same_source_hold_visual_path",
+            return_value=None,
+        ), patch(
+            "crosscut.direct_member_visual."
+            "_heterogeneous_cinematic_visual_path",
+            side_effect=adaptive_search,
+        ) as adaptive_solver:
+            selection = select_balanced_direct_member_sources(
+                sources=tuple(Path(f"source-{index}.mp4") for index in range(4)),
+                canonical_spans=spans,
+                audio_offsets=(0.0,) * 4,
+                source_frame_sizes=((2160, 3840),) * 4,
+                output_frame_size=(1080, 1920),
+                required_distinct_source_count=3,
+                render_infeasible_transition_edges=((1.0, 2, 3),),
+                config=DirectMemberVisualConfig(
+                    beam_width=200,
+                    maximum_same_source_hold_count=0,
+                ),
+                descriptor_provider=(
+                    lambda source_index, _source, _time: _descriptor(
+                        0.20 + source_index * 0.01
+                    )
+                ),
+            )
+
+        adaptive_solver.assert_called_once()
+        self.assertEqual(selection.source_indices, adaptive_path)
+        self.assertEqual(len(set(selection.source_indices)), 3)
+        self.assertEqual(selection.source_counts, (2, 1, 0, 1))
+        self.assertEqual(
+            selection.optimizer_search_diagnostics[
+                "source_quota_assignment"
+            ]["contract"],
+            "feedback_adaptive_minimum_diversity_usage_v1",
+        )
+        self.assertTrue(
+            selection.optimizer_search_diagnostics[
+                "source_quota_assignment"
+            ]["certified_render_edges_remain_forbidden"]
+        )
+
     def test_selector_persists_role_and_cinematic_milp_failures(self) -> None:
         strict_failure = DirectMemberVisualSelectionError(
             "strict path failed",

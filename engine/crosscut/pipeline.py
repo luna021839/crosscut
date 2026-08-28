@@ -354,6 +354,8 @@ _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES = frozenset(
         "heterogeneous_role_aware_cinematic_v1",
         "short_proof_quality_ranked_flexible_exposure_v1",
         "short_proof_quality_ranked_flexible_cinematic_v1",
+        "short_proof_feedback_adaptive_minimum_diversity_exposure_v1",
+        "short_proof_feedback_adaptive_minimum_diversity_cinematic_v1",
     }
 )
 _DIRECT_MEMBER_EXACT_SUBSET_SOURCE_USAGE_POLICIES = frozenset(
@@ -450,7 +452,8 @@ _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_CERTIFICATE_COUNT = 128
 # Both hashes are content hashes of direct_member_visual.py. Future edits fail
 # closed unless their exact transition is reviewed and added deliberately.
 _DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_HASH_TRANSITIONS = {
-    "b0fb377012dec79296b0aa8994106fc39d6a2472aa9bc9a45ba7f651fe0ca0f9": (
+    "bf12e6d95e31a21d2d811001ce661cd4b96d2b71b59f1f5886713e5a908bd2fa": (
+        "b0fb377012dec79296b0aa8994106fc39d6a2472aa9bc9a45ba7f651fe0ca0f9",
         "8d5ed6e48312b1fa120a25a71af1a87e20eee54cf76b9d83f7dc6d71348c6f03",
     ),
 }
@@ -9658,6 +9661,46 @@ def _enforce_direct_member_highlight_cadence_selection_gate(
     )
 
 
+def _direct_member_highlight_hold_repair_boundary_indices(
+    payload: Mapping[str, Any],
+) -> tuple[int, ...]:
+    """Return exact post-alignment holds that can repair a density miss.
+
+    The source-path solver budgets highlight holds on canonical musical
+    boundaries, while the later pose/action audition may move an actual cut a
+    few frames across a section edge. That can invalidate the compensation
+    assumed by the canonical budget. Feed only the observed highlight holds
+    back as forced-cut constraints; motion-only failures need a different
+    repair and must remain fail-closed here.
+    """
+
+    raw_reasons = payload.get("failure_reasons", ())
+    reasons = (
+        frozenset(value for value in raw_reasons if isinstance(value, str))
+        if isinstance(raw_reasons, (list, tuple))
+        else frozenset()
+    )
+    if not reasons.intersection(
+        {
+            "highlight_switch_density_below_minimum",
+            "highlight_density_lift_below_minimum",
+        }
+    ):
+        return ()
+    raw_indices = payload.get("highlight_no_cut_hold_boundary_indices", ())
+    if not isinstance(raw_indices, (list, tuple)):
+        return ()
+    return tuple(
+        sorted(
+            {
+                int(value)
+                for value in raw_indices
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+        )
+    )
+
+
 def _direct_member_visual_payload(
     selection: DirectMemberVisualSelection,
     *,
@@ -10064,6 +10107,18 @@ def _compact_direct_partition_failure(
                 raw_snapshot if isinstance(raw_snapshot, dict) else None
             ),
         }
+    raw_highlight_cut_density = diagnostics.get("highlight_cut_density")
+    highlight_cut_density = (
+        dict(raw_highlight_cut_density)
+        if isinstance(raw_highlight_cut_density, Mapping)
+        else None
+    )
+    raw_highlight_hold_repair = diagnostics.get("highlight_hold_repair")
+    highlight_hold_repair = (
+        dict(raw_highlight_hold_repair)
+        if isinstance(raw_highlight_hold_repair, Mapping)
+        else None
+    )
     return {
         "storage_contract": "hash_bound_scalar_partition_failure_v1",
         "full_diagnostics_persisted": False,
@@ -10111,6 +10166,8 @@ def _compact_direct_partition_failure(
         # otherwise scalar failure ledger grow quadratically with search depth.
         "valid_count_by_source": compact_valid_counts,
         "boundary_local_search": boundary_local_search,
+        "highlight_cut_density": highlight_cut_density,
+        "highlight_hold_repair": highlight_hold_repair,
     }
 
 
@@ -11092,61 +11149,176 @@ def _select_direct_member_partition_profile(
                 - minimum_required_highlight_cut_count,
             ),
         )
-        selection = select_balanced_direct_member_sources(
-            sources=eligible_sources,
-            canonical_spans=tuple(
-                (span.canonical_master_start, span.canonical_master_end)
-                for span in profile.spans
-            ),
-            audio_offsets=timing_draft.audio_offsets,
-            source_timewarps=compact_timewarps,
-            source_scene_cut_times=scene_cut_times,
-            source_frame_sizes=eligible_source_frame_sizes,
-            output_frame_size=output_frame_size,
-            continuous_official_portrait_fancam_contract=(
-                continuous_official_portrait_fancam_contract
-            ),
-            cinematic_bridge_enabled=bool(
-                allow_safe_hold_search and cinematic_bridge_enabled
-            ),
-            required_distinct_source_count=represented_source_count,
-            preferred_source_order=source_cycle,
-            extra_quota_source_indices=extra_quota_source_indices,
-            priority_cut_boundary_indices=priority_cut_boundary_indices,
-            maximum_priority_cut_hold_count=maximum_priority_cut_hold_count,
-            render_infeasible_transition_edges=(
-                render_infeasible_transition_edges
-            ),
-            config=effective_config,
-            descriptor_provider=provider,
-        )
-        selection.optimizer_search_diagnostics[
-            "global_visible_cut_cadence"
-        ] = {
-            "minimum_switches_per_minute": (
-                _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
-            ),
-            "profile_boundary_count": max(0, len(profile.spans) - 1),
-            "profile_duration_seconds": profile_duration_seconds,
-            "maximum_same_source_hold_count": global_cadence_hold_limit,
-            "enforced_during_path_optimization": True,
-        }
-        selection.optimizer_search_diagnostics[
-            "highlight_partition_capacity"
-        ] = highlight_partition_capacity
-        cadence_spans = _materialize_direct_member_local_cut_times(
-            profile.spans,
-            selection,
-        )
-        selection.optimizer_search_diagnostics[
-            "highlight_cadence_span_basis"
-        ] = "selected_boundary_master_seconds_v1"
-        _enforce_direct_member_highlight_cadence_selection_gate(
-            spans=cadence_spans,
-            visual_selection=selection,
-            highlight_intervals=normalized_highlight_intervals,
-        )
-        return selection
+        forced_highlight_cut_boundaries: set[int] = set()
+        highlight_hold_repair_attempts: list[dict[str, Any]] = []
+        maximum_repair_attempt_count = max(1, len(profile.spans) - 1)
+        while True:
+            effective_priority_boundaries = tuple(
+                sorted(
+                    set(priority_cut_boundary_indices).union(
+                        forced_highlight_cut_boundaries
+                    )
+                )
+            )
+            effective_priority_hold_limit = (
+                0
+                if forced_highlight_cut_boundaries
+                else maximum_priority_cut_hold_count
+            )
+            try:
+                selection = select_balanced_direct_member_sources(
+                    sources=eligible_sources,
+                    canonical_spans=tuple(
+                        (span.canonical_master_start, span.canonical_master_end)
+                        for span in profile.spans
+                    ),
+                    audio_offsets=timing_draft.audio_offsets,
+                    source_timewarps=compact_timewarps,
+                    source_scene_cut_times=scene_cut_times,
+                    source_frame_sizes=eligible_source_frame_sizes,
+                    output_frame_size=output_frame_size,
+                    continuous_official_portrait_fancam_contract=(
+                        continuous_official_portrait_fancam_contract
+                    ),
+                    cinematic_bridge_enabled=bool(
+                        allow_safe_hold_search and cinematic_bridge_enabled
+                    ),
+                    required_distinct_source_count=represented_source_count,
+                    preferred_source_order=source_cycle,
+                    extra_quota_source_indices=extra_quota_source_indices,
+                    priority_cut_boundary_indices=(
+                        effective_priority_boundaries
+                    ),
+                    maximum_priority_cut_hold_count=(
+                        effective_priority_hold_limit
+                    ),
+                    render_infeasible_transition_edges=(
+                        render_infeasible_transition_edges
+                    ),
+                    config=effective_config,
+                    descriptor_provider=provider,
+                )
+            except DirectMemberVisualSelectionError as error:
+                if highlight_hold_repair_attempts:
+                    error.diagnostics["highlight_hold_repair"] = {
+                        "contract": (
+                            "post_alignment_density_constraint_generation_v1"
+                        ),
+                        "attempted": True,
+                        "attempt_count": len(highlight_hold_repair_attempts),
+                        "forced_cut_boundary_indices": sorted(
+                            forced_highlight_cut_boundaries
+                        ),
+                        "attempts": highlight_hold_repair_attempts,
+                        "result": "repair_selection_infeasible",
+                        "visual_gates_relaxed": False,
+                    }
+                raise
+            selection.optimizer_search_diagnostics[
+                "global_visible_cut_cadence"
+            ] = {
+                "minimum_switches_per_minute": (
+                    _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+                ),
+                "profile_boundary_count": max(0, len(profile.spans) - 1),
+                "profile_duration_seconds": profile_duration_seconds,
+                "maximum_same_source_hold_count": global_cadence_hold_limit,
+                "enforced_during_path_optimization": True,
+            }
+            selection.optimizer_search_diagnostics[
+                "highlight_partition_capacity"
+            ] = highlight_partition_capacity
+            cadence_spans = _materialize_direct_member_local_cut_times(
+                profile.spans,
+                selection,
+            )
+            selection.optimizer_search_diagnostics[
+                "highlight_cadence_span_basis"
+            ] = "selected_boundary_master_seconds_v1"
+            try:
+                _enforce_direct_member_highlight_cadence_selection_gate(
+                    spans=cadence_spans,
+                    visual_selection=selection,
+                    highlight_intervals=normalized_highlight_intervals,
+                )
+            except DirectMemberVisualSelectionError as error:
+                highlight_payload = error.diagnostics.get(
+                    "highlight_cut_density"
+                )
+                repair_boundaries = (
+                    _direct_member_highlight_hold_repair_boundary_indices(
+                        highlight_payload
+                    )
+                    if isinstance(highlight_payload, Mapping)
+                    else ()
+                )
+                newly_forced = tuple(
+                    index
+                    for index in repair_boundaries
+                    if index not in forced_highlight_cut_boundaries
+                )
+                repair_authorized = bool(
+                    allow_safe_hold_search
+                    and newly_forced
+                    and len(highlight_hold_repair_attempts)
+                    < maximum_repair_attempt_count
+                )
+                if not repair_authorized:
+                    if highlight_hold_repair_attempts:
+                        error.diagnostics["highlight_hold_repair"] = {
+                            "contract": (
+                                "post_alignment_density_constraint_generation_v1"
+                            ),
+                            "attempted": True,
+                            "attempt_count": len(
+                                highlight_hold_repair_attempts
+                            ),
+                            "forced_cut_boundary_indices": sorted(
+                                forced_highlight_cut_boundaries
+                            ),
+                            "attempts": highlight_hold_repair_attempts,
+                            "result": "repair_exhausted",
+                            "visual_gates_relaxed": False,
+                        }
+                    raise
+                forced_highlight_cut_boundaries.update(newly_forced)
+                highlight_hold_repair_attempts.append(
+                    {
+                        "attempt_index": len(highlight_hold_repair_attempts) + 1,
+                        "trigger_failure_reasons": list(
+                            highlight_payload.get("failure_reasons", ())
+                        ),
+                        "observed_highlight_hold_boundary_indices": list(
+                            repair_boundaries
+                        ),
+                        "new_forced_cut_boundary_indices": list(newly_forced),
+                        "next_priority_cut_boundary_indices": sorted(
+                            set(priority_cut_boundary_indices).union(
+                                forced_highlight_cut_boundaries
+                            )
+                        ),
+                        "next_maximum_priority_cut_hold_count": 0,
+                    }
+                )
+                continue
+            selection.optimizer_search_diagnostics[
+                "highlight_hold_repair"
+            ] = {
+                "contract": (
+                    "post_alignment_density_constraint_generation_v1"
+                ),
+                "attempted": bool(highlight_hold_repair_attempts),
+                "attempt_count": len(highlight_hold_repair_attempts),
+                "forced_cut_boundary_indices": sorted(
+                    forced_highlight_cut_boundaries
+                ),
+                "attempts": highlight_hold_repair_attempts,
+                "result": (
+                    "repaired" if highlight_hold_repair_attempts else "not_needed"
+                ),
+                "visual_gates_relaxed": False,
+            }
+            return selection
 
     def _evaluate(
         profile: _DirectFullFramePartitionProfile,
