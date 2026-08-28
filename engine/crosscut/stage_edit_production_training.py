@@ -3447,7 +3447,16 @@ def train_production_stage_edit(
                 if selectable_candidates
                 else None
             )
-            retention_authorized = selected_candidate is not None
+            initial_selection_score = _finite_metric(
+                initial_selection.get("score")
+            )
+            initial_retention_authorized = bool(
+                initial_selection.get("selectable") is True
+                and initial_selection_score is not None
+            )
+            retention_authorized = bool(
+                selected_candidate is not None or initial_retention_authorized
+            )
             if selected_candidate is not None:
                 (
                     _selected_score,
@@ -3458,11 +3467,15 @@ def train_production_stage_edit(
                 ) = selected_candidate
                 selected_candidate_origin = "trained_prior_candidate"
             else:
-                selected_candidate_step = None
+                selected_candidate_step = 0
                 selected_candidate_snapshot = (
                     dynamic_crop_v3_prior_initial_snapshot
                 )
-                selected_candidate_origin = "initial_dynamic_head_fallback"
+                selected_candidate_origin = (
+                    "validated_initial_dynamic_head"
+                    if initial_retention_authorized
+                    else "unvalidated_initial_dynamic_head_fallback"
+                )
                 warmup_selection = dict(initial_selection)
                 warmup_validation_metrics = dict(initial_validation_metrics)
             _assign_dynamic_crop_v3_prior_head_snapshot(
@@ -3503,13 +3516,10 @@ def train_production_stage_edit(
                 ]
                 != after_digests["dynamic_head_parameter_tree_sha256"]
             )
-            if (
-                not invariant
-                or retention_authorized
-                and not dynamic_head_changed
-                or not retention_authorized
-                and dynamic_head_changed
-            ):
+            trained_candidate_selected = (
+                selected_candidate_origin == "trained_prior_candidate"
+            )
+            if not invariant or trained_candidate_selected != dynamic_head_changed:
                 raise RuntimeError(
                     "Dynamic Crop v3 prior warmup parameter scope drifted"
                 )
@@ -3608,6 +3618,9 @@ def train_production_stage_edit(
                 "selection": dict(warmup_selection),
                 "validation_metrics": warmup_validation_metrics,
                 "retention_authorized": retention_authorized,
+                "initial_retention_authorized": (
+                    initial_retention_authorized
+                ),
                 "checkpoint_written_before_joint_finetuning": False,
                 "checkpoint_write_requires_existing_finetune_burn_in": True,
                 "retention_finetune_steps": (
@@ -3956,7 +3969,14 @@ def train_production_stage_edit(
                     ),
                     "training_song_reference_validation_improved": improved,
                     "dynamic_crop_v3_checkpoint_candidate_origin": (
-                        "training_only_dynamic_head_prior_retained_to_burn_in"
+                        (
+                            "training_only_dynamic_head_prior_retained_to_burn_in"
+                            if dynamic_crop_v3_prior_candidate_selection.get(
+                                "selected_candidate_origin"
+                            )
+                            == "trained_prior_candidate"
+                            else "validated_initial_dynamic_head_retained_to_burn_in"
+                        )
                         if improved
                         and dynamic_crop_v3_prior_candidate_selection
                         and dynamic_crop_v3_prior_candidate_selection.get(
@@ -3983,7 +4003,14 @@ def train_production_stage_edit(
                 best_step = optimizer_steps
                 best_finetune_optimizer_step = finetune_optimizer_steps
                 best_checkpoint_origin = (
-                    "training_only_dynamic_head_prior_retained_to_burn_in"
+                    (
+                        "training_only_dynamic_head_prior_retained_to_burn_in"
+                        if dynamic_crop_v3_prior_candidate_selection.get(
+                            "selected_candidate_origin"
+                        )
+                        == "trained_prior_candidate"
+                        else "validated_initial_dynamic_head_retained_to_burn_in"
+                    )
                     if dynamic_crop_v3_prior_candidate_selection
                     and dynamic_crop_v3_prior_candidate_selection.get(
                         "retention_authorized"
@@ -4323,7 +4350,10 @@ def train_production_stage_edit(
                 ),
                 "dynamic_crop_v3_prior_candidate_retained_to_burn_in": (
                     best_checkpoint_origin
-                    == "training_only_dynamic_head_prior_retained_to_burn_in"
+                    in {
+                        "training_only_dynamic_head_prior_retained_to_burn_in",
+                        "validated_initial_dynamic_head_retained_to_burn_in",
+                    }
                 ),
                 "dynamic_crop_v3_prior_selected_candidate_step": (
                     dynamic_crop_v3_prior_candidate_selection.get(

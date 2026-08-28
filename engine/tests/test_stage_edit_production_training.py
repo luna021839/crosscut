@@ -1131,6 +1131,7 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 report["optimization"]["best_checkpoint_origin"],
                 {
                     "training_only_dynamic_head_prior_retained_to_burn_in",
+                    "validated_initial_dynamic_head_retained_to_burn_in",
                     "joint_finetuning",
                 },
             )
