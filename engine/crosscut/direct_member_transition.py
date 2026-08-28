@@ -1139,18 +1139,58 @@ def _safe_candidate(
         reasons.append("static_pose_connection_not_strong_enough")
 
     spans = tuple(getattr(visual_selection, "span_validity", ()))
-    next_span = spans[boundary_index + 1] if len(spans) > boundary_index + 1 else None
-    outgoing_future = _span_source(next_span, left_source) if next_span is not None else None
-    incoming_future = _span_source(next_span, right_source) if next_span is not None else None
-    if outgoing_future is None or incoming_future is None:
-        reasons.append("outgoing_handle_future_evidence_missing")
-        future_pairs: tuple[tuple[Any, Any], ...] = ()
+    next_span = (
+        spans[boundary_index + 1]
+        if len(spans) > boundary_index + 1
+        else None
+    )
+    outgoing_future = (
+        _span_source(next_span, left_source)
+        if next_span is not None
+        else None
+    )
+    incoming_future = (
+        _span_source(next_span, right_source)
+        if next_span is not None
+        else None
+    )
+    exact_outgoing_handle = tuple(
+        getattr(diagnostic, "outgoing_handle_samples", ())
+    )
+    exact_incoming_handle = tuple(
+        getattr(diagnostic, "incoming_handle_samples", ())
+    )
+    if len(exact_outgoing_handle) == len(exact_incoming_handle) == 2:
+        # Local beat audition may move the selected cut by several frames.
+        # Bind the effect handle to samples decoded from that selected cut,
+        # not to the original coarse span's +1-frame/+0.20s samples.
+        future_pairs = tuple(
+            zip(
+                exact_outgoing_handle,
+                exact_incoming_handle,
+                strict=True,
+            )
+        )
     else:
-        outgoing_samples = tuple(getattr(outgoing_future, "samples", ()))
-        incoming_samples = tuple(getattr(incoming_future, "samples", ()))
-        future_pairs = tuple(zip(outgoing_samples[:2], incoming_samples[:2], strict=False))
-        if len(future_pairs) != 2:
-            reasons.append("outgoing_handle_future_evidence_incomplete")
+        if outgoing_future is None or incoming_future is None:
+            reasons.append("outgoing_handle_future_evidence_missing")
+            future_pairs = ()
+        else:
+            outgoing_samples = tuple(
+                getattr(outgoing_future, "samples", ())
+            )
+            incoming_samples = tuple(
+                getattr(incoming_future, "samples", ())
+            )
+            future_pairs = tuple(
+                zip(
+                    outgoing_samples[:2],
+                    incoming_samples[:2],
+                    strict=False,
+                )
+            )
+            if len(future_pairs) != 2:
+                reasons.append("outgoing_handle_future_evidence_incomplete")
 
     future_positions: list[float] = []
     future_scales: list[float] = []

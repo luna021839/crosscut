@@ -106,6 +106,8 @@ class AnalysisRequest:
     source_cache_directory: Path | None = None
     catalog_cache_directory: Path | None = None
     acquire_only: bool = False
+    render_range_start_seconds: float | None = None
+    render_range_end_seconds: float | None = None
     professional_reference_profile: Path | None = None
     professional_reference_cadence_profile: Path | None = None
     stage_edit_checkpoint_directory: Path | None = None
@@ -136,6 +138,46 @@ class AnalysisRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.member_pose_dissolve_enabled, bool):
             raise ValueError("member_pose_dissolve_enabled must be a boolean")
+        render_range = (
+            self.render_range_start_seconds,
+            self.render_range_end_seconds,
+        )
+        if (render_range[0] is None) != (render_range[1] is None):
+            raise ValueError(
+                "render_range_start_seconds and render_range_end_seconds "
+                "must be supplied together"
+            )
+        if render_range[0] is not None and render_range[1] is not None:
+            start, end = render_range
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in (start, end)
+            ):
+                raise ValueError("render range seconds must be finite numbers")
+            start = float(start)
+            end = float(end)
+            if start < 0 or end <= start:
+                raise ValueError(
+                    "render range must have a non-negative start and a later end"
+                )
+            if end - start < 8.0:
+                raise ValueError("render range must be at least 8 seconds")
+            if (
+                self.source_mode is not SourceMode.AUTOMATIC
+                or self.edit_mode is not EditMode.MEMBER
+            ):
+                raise ValueError(
+                    "bounded render ranges are available only for automatic "
+                    "member quality-proof renders"
+                )
+            if self.acquire_only:
+                raise ValueError(
+                    "bounded render ranges cannot be used with acquire_only"
+                )
+            object.__setattr__(self, "render_range_start_seconds", start)
+            object.__setattr__(self, "render_range_end_seconds", end)
         if self.professional_reference_profile is not None:
             profile_path = Path(self.professional_reference_profile).expanduser()
             if not profile_path.is_file():
@@ -574,6 +616,9 @@ class AnalysisRequest:
         if raw_acquire_only and source_mode is not SourceMode.AUTOMATIC:
             raise ValueError("acquire_only is available only in automatic source mode")
 
+        raw_render_range_start = payload.get("render_range_start_seconds")
+        raw_render_range_end = payload.get("render_range_end_seconds")
+
         raw_professional_profile = payload.get("professional_reference_profile")
         if raw_professional_profile is not None and (
             not isinstance(raw_professional_profile, str)
@@ -782,6 +827,8 @@ class AnalysisRequest:
             source_cache_directory=source_cache_directory,
             catalog_cache_directory=catalog_cache_directory,
             acquire_only=raw_acquire_only,
+            render_range_start_seconds=raw_render_range_start,
+            render_range_end_seconds=raw_render_range_end,
             professional_reference_profile=professional_reference_profile,
             professional_reference_cadence_profile=(
                 professional_reference_cadence_profile
@@ -848,6 +895,11 @@ class AnalysisRequest:
             payload["catalog_cache_directory"] = str(
                 self.catalog_cache_directory
             )
+        if self.render_range_start_seconds is not None:
+            payload["render_range_start_seconds"] = (
+                self.render_range_start_seconds
+            )
+            payload["render_range_end_seconds"] = self.render_range_end_seconds
         # Preserve the exact legacy request schema unless learned inference is
         # explicitly activated.  This also makes accidental activation visible
         # in every persisted request manifest.

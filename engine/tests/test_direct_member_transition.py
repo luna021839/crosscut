@@ -550,6 +550,38 @@ class DirectMemberTransitionTests(unittest.TestCase):
             clock_plan.decisions[0].rejection_reasons,
         )
 
+    def test_selected_cut_exact_handles_override_stale_coarse_span_samples(
+        self,
+    ) -> None:
+        source_path = (0, 1)
+        selection = _selection(source_path)
+        boundary = selection.boundaries[0]
+        boundary.outgoing_handle_samples = (
+            _sample(4.0 + 1.0 / 30.0, 0.10),
+            _sample(4.20, 0.11),
+        )
+        boundary.incoming_handle_samples = (
+            _sample(4.0 + 1.0 / 30.0, 0.11),
+            _sample(4.20, 0.12),
+        )
+        for source in selection.span_validity[1].sources:
+            source.samples = (
+                _sample(3.80, 20.0),
+                _sample(4.00, 20.0),
+            )
+
+        plan = _plan(source_path, selection=selection)
+
+        self.assertEqual(plan.selected_count, 1)
+        self.assertNotIn(
+            "outgoing_handle_future_timestamps_not_exact",
+            plan.decisions[0].rejection_reasons,
+        )
+        self.assertNotIn(
+            "outgoing_handle_future_not_render_source_clock_bound",
+            plan.decisions[0].rejection_reasons,
+        )
+
     def test_hidden_same_source_cut_at_handle_entry_fails_closed(self) -> None:
         source_path = (0, 1)
         selection = _selection(source_path)

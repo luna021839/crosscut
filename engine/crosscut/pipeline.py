@@ -351,10 +351,16 @@ _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES = frozenset(
     {
         "heterogeneous_role_aware_safe_hold_v1",
         "heterogeneous_role_aware_cinematic_v1",
+        "short_proof_quality_ranked_flexible_exposure_v1",
+        "short_proof_quality_ranked_flexible_cinematic_v1",
     }
+)
+_DIRECT_MEMBER_EXACT_SUBSET_SOURCE_USAGE_POLICIES = frozenset(
+    {"short_proof_quality_ranked_subset_quota_v1"}
 )
 _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS = 2.25
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS = 1.8
+_DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS = 45.0
 _DIRECT_MEMBER_HIGHLIGHT_DENSE_SWITCHES_PER_MINUTE = 19.3
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE = 18.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_DENSITY_LIFT_PER_MINUTE = 2.0
@@ -444,6 +450,37 @@ _DIRECT_MEMBER_FAILURE_DIAGNOSTIC_FINGERPRINT_CONTRACT = (
 _DIRECT_MEMBER_FAILURE_REPORT_STORAGE_CONTRACT = (
     "bounded_direct_member_failure_report_v1"
 )
+
+
+def _direct_member_median_run_bounds(
+    duration_seconds: float,
+) -> tuple[float, float]:
+    """Use section-level cadence for a bounded quality-proof render.
+
+    A short excerpt can consist almost entirely of a chorus/build interval.
+    Requiring the full-song 3.5-second median there contradicts the existing
+    1.8-second highlight shot floor and can erase every proof-directed cut
+    repair. Switch density, maximum hold, source balance, content validity,
+    and transition continuity remain independently enforced.
+    """
+
+    if duration_seconds <= _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS:
+        return (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS,
+            _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS,
+        )
+    return (
+        _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS,
+        _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS,
+    )
+
+
+def _direct_member_median_run_is_valid(
+    duration_seconds: float,
+    median_run_seconds: float,
+) -> bool:
+    minimum, maximum = _direct_member_median_run_bounds(duration_seconds)
+    return minimum <= median_run_seconds <= maximum
 
 
 def _direct_member_editorial_motion_config_from_visual_config(
@@ -4723,6 +4760,54 @@ def _direct_full_frame_base_partition_profile(
     )
 
 
+def _direct_member_in_run_preferred_partition_profile(
+    timing_segments: Sequence[DraftSegment],
+    unit_counts: Sequence[int] | None,
+) -> _DirectFullFramePartitionProfile | None:
+    """Rebuild the last selected cadence for a path-only feedback retry.
+
+    Dense camera and decoded-proxy feedback usually invalidates one selected
+    source pair, not the musical partition that surrounded it.  Rebuilding the
+    exact in-memory partition lets the full visual selector replace that pair
+    before the much larger proof-directed partition search is restarted.
+    Every ordinary cadence gate is rechecked; this is only a search-order hint,
+    never a relaxation or a reuse of the previous source path.
+    """
+
+    if unit_counts is None:
+        return None
+    items = tuple(timing_segments)
+    counts = tuple(unit_counts)
+    if not counts or any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        for value in counts
+    ):
+        raise ValueError("preferred direct partition counts must be positive integers")
+    if sum(counts) != len(items):
+        raise ValueError("preferred direct partition does not cover timing segments")
+    spans = _direct_full_frame_spans_from_partition(items, counts)
+    duration = sum(span.duration_seconds for span in spans)
+    switches_per_minute = (len(spans) - 1) * 60.0 / duration
+    span_median = median(span.duration_seconds for span in spans)
+    if not (
+        _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+        <= switches_per_minute
+        <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
+        and _direct_member_median_run_is_valid(duration, span_median)
+        and max(span.duration_seconds for span in spans)
+        <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
+    ):
+        raise ValueError("preferred direct partition fails cadence gates")
+    signature = _direct_partition_signature_sha256(counts)
+    return _DirectFullFramePartitionProfile(
+        profile_id=f"in-run-path-retry-{signature[:16]}",
+        unit_counts=counts,
+        spans=spans,
+    )
+
+
 def _direct_partition_failure_bottlenecks(
     diagnostics: dict[str, Any],
     *,
@@ -6411,9 +6496,7 @@ def _load_direct_member_partition_warm_start_profiles(
             _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
             <= switches_per_minute
             <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-            and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-            <= span_median
-            <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+            and _direct_member_median_run_is_valid(duration, span_median)
             and max(span.duration_seconds for span in spans)
             <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
         ):
@@ -6970,9 +7053,7 @@ def _direct_full_frame_shifted_partition_profiles(
                 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
                 <= switches_per_minute
                 <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-                and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-                <= span_median
-                <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                and _direct_member_median_run_is_valid(duration, span_median)
             ):
                 continue
             new_boundary_unit_end = sum(signature[: boundary_index + 1])
@@ -7148,9 +7229,7 @@ def _direct_member_render_feedback_partition_profiles(
                 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
                 <= switches_per_minute
                 <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-                and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-                <= span_median
-                <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                and _direct_member_median_run_is_valid(duration, span_median)
                 and max(span.duration_seconds for span in spans)
                 <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
             ):
@@ -7329,9 +7408,7 @@ def _direct_member_minimum_hold_feedback_partition_profiles(
                 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
                 <= switches_per_minute
                 <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-                and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-                <= span_median
-                <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                and _direct_member_median_run_is_valid(duration, span_median)
                 and max(span.duration_seconds for span in spans)
                 <= _DIRECT_MEMBER_MAX_RUN_SECONDS + 1e-9
             ):
@@ -7554,9 +7631,7 @@ def _direct_full_frame_proof_directed_child_profiles(
                 _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
                 <= switches_per_minute
                 <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-                and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-                <= span_median
-                <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                and _direct_member_median_run_is_valid(duration, span_median)
             ):
                 continue
             new_boundary_unit_end = sum(signature[: boundary_index + 1])
@@ -7674,9 +7749,7 @@ def _direct_full_frame_proof_directed_merge_profiles(
             _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
             <= switches_per_minute
             <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-            and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-            <= span_median
-            <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+            and _direct_member_median_run_is_valid(duration, span_median)
         ):
             continue
         boundary_unit_end = sum(parent.unit_counts[: boundary_index + 1])
@@ -7846,9 +7919,10 @@ def _direct_full_frame_proof_directed_window_profiles(
                         _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
                         <= switches_per_minute
                         <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-                        and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-                        <= span_median
-                        <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+                        and _direct_member_median_run_is_valid(
+                            duration,
+                            span_median,
+                        )
                     ):
                         continue
                     first_unit_end = sum(signature[: window_start + 1])
@@ -8521,6 +8595,15 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
         ):
             left_count = split_offset
             right_count = unit_count - split_offset
+            if (
+                min(
+                    boundary_seconds - span.canonical_master_start,
+                    span.canonical_master_end - boundary_seconds,
+                )
+                + 1e-9
+                < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+            ):
+                continue
             one_unit_penalty = int(min(left_count, right_count) < 2)
             reason_penalty = _boundary_reason_penalty(reasons)
             native_matches = [
@@ -8657,6 +8740,15 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
         spans = _direct_full_frame_spans_from_partition(items, signature)
     except ValueError:
         return ()
+    if (
+        min(
+            spans[span_index].duration_seconds,
+            spans[span_index + 1].duration_seconds,
+        )
+        + 1e-9
+        < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+    ):
+        return ()
     duration = sum(span.duration_seconds for span in spans)
     switches_per_minute = (len(spans) - 1) * 60.0 / duration
     span_median = median(span.duration_seconds for span in spans)
@@ -8664,9 +8756,7 @@ def _direct_full_frame_visual_frontier_split_child_profiles(
         _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
         <= switches_per_minute
         <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-        and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-        <= span_median
-        <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+        and _direct_member_median_run_is_valid(duration, span_median)
     ):
         return ()
     split = _DirectFullFrameVisualFrontierSplit(
@@ -8728,13 +8818,12 @@ def _direct_full_frame_proof_directed_repair_profiles(
 ) -> tuple[_DirectFullFramePartitionProfile, ...]:
     """Continue an exact frontier repair without leaving a dead-end gap.
 
-    Boundary shifts remain the least structural repair and a merge remains the
-    fallback for an immovable minimum-duration cut.  If every two-span
-    placement is exhausted, a global frontier may redistribute both cuts in
-    the surrounding three-span window while preserving duration and cut count.
-    Only after those fixed-count repairs fail may the same exact proof add one
-    evidence-bound musical micro-boundary.  Every returned child is fully
-    reselected by the caller.
+    Boundary shifts remain the least structural repair. If every two-span
+    placement is exhausted, an evidence-bound musical boundary is more local
+    than redistributing unrelated neighboring cuts and is tried next. A wider
+    fixed-count redistribution follows, while a merge is terminal because it
+    removes a visible cut and can violate the final density contract. Every
+    returned child is fully reselected by the caller.
     """
 
     children = _direct_full_frame_proof_directed_child_profiles(
@@ -8743,10 +8832,11 @@ def _direct_full_frame_proof_directed_repair_profiles(
         diagnostics,
     )
     if not children:
-        children = _direct_full_frame_proof_directed_merge_profiles(
+        children = _direct_full_frame_visual_frontier_split_child_profiles(
             timing_segments,
             parent,
             diagnostics,
+            config=config,
         )
     if not children:
         children = _direct_full_frame_proof_directed_window_profiles(
@@ -8755,11 +8845,10 @@ def _direct_full_frame_proof_directed_repair_profiles(
             diagnostics,
         )
     if not children:
-        children = _direct_full_frame_visual_frontier_split_child_profiles(
+        children = _direct_full_frame_proof_directed_merge_profiles(
             timing_segments,
             parent,
             diagnostics,
-            config=config,
         )
     return children
 
@@ -8783,6 +8872,7 @@ def _render_cadence_payload(
         current_duration += item.duration
     run_durations.append(current_duration)
     duration = sum(item.duration for item in items)
+    median_run_bounds = _direct_member_median_run_bounds(duration)
     return {
         "source_switch_count": switch_count,
         "source_switches_per_minute": switch_count * 60.0 / duration,
@@ -8794,11 +8884,38 @@ def _render_cadence_payload(
             _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE,
         ],
         "target_source_run_median_seconds": [
-            _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS,
-            _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS,
+            median_run_bounds[0],
+            median_run_bounds[1],
         ],
         "maximum_source_run_seconds": _DIRECT_MEMBER_MAX_RUN_SECONDS,
     }
+
+
+def _direct_member_maximum_hold_count_for_global_cadence(
+    *,
+    boundary_count: int,
+    total_duration_seconds: float,
+) -> int:
+    """Return the no-cut budget that still meets the final visible-cut gate."""
+
+    if (
+        isinstance(boundary_count, bool)
+        or not isinstance(boundary_count, int)
+        or boundary_count < 0
+    ):
+        raise ValueError("direct member boundary count is invalid")
+    if (
+        not math.isfinite(total_duration_seconds)
+        or total_duration_seconds <= 0.0
+    ):
+        raise ValueError("direct member cadence duration is invalid")
+    minimum_visible_switch_count = math.ceil(
+        _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+        * total_duration_seconds
+        / 60.0
+        - 1e-9
+    )
+    return max(0, boundary_count - minimum_visible_switch_count)
 
 
 def _direct_member_highlight_cadence_payload(
@@ -8850,12 +8967,20 @@ def _direct_member_highlight_cadence_payload(
     highlight_moving_cut_indices = tuple(
         index
         for index in highlight_cut_indices
-        if (
-            visual_selection.boundaries[index].mismatch.motion_connection
-            is not None
-            and visual_selection.boundaries[
-                index
-            ].mismatch.motion_connection.both_moving
+        if bool(
+            getattr(
+                getattr(
+                    getattr(
+                        visual_selection.boundaries[index],
+                        "mismatch",
+                        None,
+                    ),
+                    "motion_connection",
+                    None,
+                ),
+                "both_moving",
+                False,
+            )
         )
     )
     non_highlight_cut_indices = tuple(
@@ -9423,6 +9548,20 @@ def _compact_direct_partition_failure(
                     scalar[key] = value
             if scalar:
                 compact_valid_counts.append(scalar)
+    boundary_local_search: dict[str, Any] | None = None
+    if diagnostics.get("failure") in {
+        "boundary_local_search_duration_infeasible",
+        "boundary_local_search_single_state_infeasible",
+        "boundary_local_search_solver_unavailable",
+    }:
+        raw_solver = diagnostics.get("solver")
+        raw_snapshot = diagnostics.get("constraint_snapshot")
+        boundary_local_search = {
+            "solver": raw_solver if isinstance(raw_solver, dict) else None,
+            "constraint_snapshot": (
+                raw_snapshot if isinstance(raw_snapshot, dict) else None
+            ),
+        }
     return {
         "storage_contract": "hash_bound_scalar_partition_failure_v1",
         "full_diagnostics_persisted": False,
@@ -9469,6 +9608,7 @@ def _compact_direct_partition_failure(
         # diagnostic.  Repeating them for every attempted profile made an
         # otherwise scalar failure ledger grow quadratically with search depth.
         "valid_count_by_source": compact_valid_counts,
+        "boundary_local_search": boundary_local_search,
     }
 
 
@@ -9827,6 +9967,7 @@ def _select_direct_member_partition_profile(
     highlight_intervals: Sequence[tuple[float, float]] = (),
     continuous_official_portrait_fancam_contract: bool = False,
     cinematic_bridge_enabled: bool = False,
+    required_distinct_source_count: int | None = None,
     eligible_source_frame_sizes: Sequence[tuple[int, int]] | None = None,
     output_frame_size: tuple[int, int] = (1080, 1920),
     feature_cache_directory: Path | None = None,
@@ -9834,6 +9975,7 @@ def _select_direct_member_partition_profile(
     render_infeasible_transition_edges: Sequence[
         tuple[float, int, int]
     ] = (),
+    preferred_partition_unit_counts: Sequence[int] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
     _DirectFullFramePartitionProfile,
@@ -9868,8 +10010,23 @@ def _select_direct_member_partition_profile(
         timing_draft.segments,
         highlight_intervals=normalized_highlight_intervals,
     )
-    if len(base.spans) < len(source_cycle):
-        raise RuntimeError("coarse direct cadence cannot show every eligible source")
+    in_run_preferred_profile = (
+        _direct_member_in_run_preferred_partition_profile(
+            timing_draft.segments,
+            preferred_partition_unit_counts,
+        )
+    )
+    represented_source_count = (
+        len(source_cycle)
+        if required_distinct_source_count is None
+        else int(required_distinct_source_count)
+    )
+    if not 2 <= represented_source_count <= len(source_cycle):
+        raise ValueError("direct member represented source count is invalid")
+    if len(base.spans) < represented_source_count:
+        raise RuntimeError(
+            "coarse direct cadence cannot show every required source"
+        )
     if continuous_official_portrait_fancam_contract:
         warm_start_profiles, warm_start_diagnostics = (
             _load_direct_member_partition_warm_start_profiles(
@@ -9889,14 +10046,33 @@ def _select_direct_member_partition_profile(
             "full_selector_recheck_required": True,
             "visual_gates_relaxed": False,
         }
-    persisted_warm_start_profiles = warm_start_profiles
+    in_run_preferred_profiles = (
+        (in_run_preferred_profile,)
+        if in_run_preferred_profile is not None
+        and in_run_preferred_profile.unit_counts != base.unit_counts
+        else ()
+    )
+    preferred_signatures = (
+        {in_run_preferred_profile.unit_counts}
+        if in_run_preferred_profile is not None
+        else set()
+    )
+    persisted_warm_start_profiles = tuple(
+        profile
+        for profile in warm_start_profiles
+        if profile.unit_counts not in preferred_signatures
+    )
+    feedback_seed_profiles = (
+        *((in_run_preferred_profile,) if in_run_preferred_profile is not None else ()),
+        *persisted_warm_start_profiles,
+    )
     render_feedback_profiles: list[_DirectFullFramePartitionProfile] = []
     render_feedback_seen_signatures = {
         base.unit_counts,
-        *(profile.unit_counts for profile in persisted_warm_start_profiles),
+        *(profile.unit_counts for profile in feedback_seed_profiles),
     }
     if render_infeasible_transition_edges:
-        for warm_profile in persisted_warm_start_profiles:
+        for warm_profile in feedback_seed_profiles:
             for feedback_profile in (
                 _direct_member_render_feedback_partition_profiles(
                     timing_draft.segments,
@@ -9921,6 +10097,7 @@ def _select_direct_member_partition_profile(
             ):
                 break
     warm_start_profiles = (
+        *in_run_preferred_profiles,
         *persisted_warm_start_profiles,
         *render_feedback_profiles,
     )
@@ -9931,6 +10108,25 @@ def _select_direct_member_partition_profile(
     )
     warm_start_diagnostics.update(
         {
+            "in_run_preferred_partition_requested": (
+                preferred_partition_unit_counts is not None
+            ),
+            "in_run_preferred_partition_matches_base": bool(
+                in_run_preferred_profile is not None
+                and in_run_preferred_profile.unit_counts == base.unit_counts
+            ),
+            "in_run_preferred_partition_candidate_count": len(
+                in_run_preferred_profiles
+            ),
+            "in_run_preferred_partition_signature_sha256": (
+                _direct_partition_signature_sha256(
+                    in_run_preferred_profile.unit_counts
+                )
+                if in_run_preferred_profile is not None
+                else None
+            ),
+            "in_run_preferred_partition_full_selector_recheck_required": True,
+            "in_run_preferred_partition_visual_gates_relaxed": False,
             "dense_render_feedback_certificate_count": len(
                 render_infeasible_transition_edges
             ),
@@ -10175,10 +10371,25 @@ def _select_direct_member_partition_profile(
             continuous_official_portrait_fancam_contract
             and not allow_safe_hold_search
         )
-        effective_config = (
-            replace(config, maximum_same_source_hold_count=0)
-            if defer_safe_hold_search
-            else config
+        profile_duration_seconds = sum(
+            span.duration_seconds for span in profile.spans
+        )
+        global_cadence_hold_limit = (
+            _direct_member_maximum_hold_count_for_global_cadence(
+                boundary_count=max(0, len(profile.spans) - 1),
+                total_duration_seconds=profile_duration_seconds,
+            )
+        )
+        effective_config = replace(
+            config,
+            maximum_same_source_hold_count=(
+                0
+                if defer_safe_hold_search
+                else min(
+                    config.maximum_same_source_hold_count,
+                    global_cadence_hold_limit,
+                )
+            ),
         )
         priority_cut_boundary_indices = (
             _direct_member_highlight_priority_boundary_indices(
@@ -10202,7 +10413,7 @@ def _select_direct_member_partition_profile(
                 - minimum_required_highlight_cut_count,
             ),
         )
-        return select_balanced_direct_member_sources(
+        selection = select_balanced_direct_member_sources(
             sources=eligible_sources,
             canonical_spans=tuple(
                 (span.canonical_master_start, span.canonical_master_end)
@@ -10219,6 +10430,7 @@ def _select_direct_member_partition_profile(
             cinematic_bridge_enabled=bool(
                 allow_safe_hold_search and cinematic_bridge_enabled
             ),
+            required_distinct_source_count=represented_source_count,
             preferred_source_order=source_cycle,
             extra_quota_source_indices=extra_quota_source_indices,
             priority_cut_boundary_indices=priority_cut_boundary_indices,
@@ -10229,6 +10441,18 @@ def _select_direct_member_partition_profile(
             config=effective_config,
             descriptor_provider=provider,
         )
+        selection.optimizer_search_diagnostics[
+            "global_visible_cut_cadence"
+        ] = {
+            "minimum_switches_per_minute": (
+                _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
+            ),
+            "profile_boundary_count": max(0, len(profile.spans) - 1),
+            "profile_duration_seconds": profile_duration_seconds,
+            "maximum_same_source_hold_count": global_cadence_hold_limit,
+            "enforced_during_path_optimization": True,
+        }
+        return selection
 
     def _evaluate(
         profile: _DirectFullFramePartitionProfile,
@@ -10365,6 +10589,7 @@ def _select_direct_member_partition_profile(
             )
         if (
             error is not None
+            and represented_source_count == len(eligible_sources)
             and exact_lifeline_retry is not None
             and exact_lifeline_retry.get("result") == "hard_infeasible"
             and error.diagnostics.get("failure")
@@ -12779,7 +13004,9 @@ def _official_target_fancam_direct_full_frame_segments(
     source_metadata_contract: str | None = None,
     highlight_intervals: Sequence[tuple[float, float]] = (),
     member_pose_dissolve_enabled: bool = True,
+    required_distinct_source_count: int | None = None,
     output_fps: float = 29.97,
+    preferred_partition_unit_counts: Sequence[int] | None = None,
     partition_progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
     tuple[RenderSegment, ...],
@@ -12788,7 +13015,7 @@ def _official_target_fancam_direct_full_frame_segments(
     dict[str, Any],
     DirectMemberVisualSelection,
 ]:
-    """Build a visually selected, all-source portrait render."""
+    """Build a visually selected portrait render with audited source diversity."""
 
     eligible = tuple(int(index) for index in eligible_indices)
     if len(eligible) < MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT:
@@ -12798,6 +13025,17 @@ def _official_target_fancam_direct_full_frame_segments(
         )
     if len(eligible_sources) != len(eligible):
         raise ValueError("direct eligible_sources must match eligible indices")
+    represented_source_count = (
+        len(eligible)
+        if required_distinct_source_count is None
+        else int(required_distinct_source_count)
+    )
+    if not (
+        MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
+        <= represented_source_count
+        <= len(eligible)
+    ):
+        raise ValueError("direct required source diversity is invalid")
     source_aspect_ratios = (
         tuple(9.0 / 16.0 for _ in eligible)
         if eligible_source_aspect_ratios is None
@@ -12849,12 +13087,16 @@ def _official_target_fancam_direct_full_frame_segments(
                 continuous_official_portrait_fancam_contract
             ),
             cinematic_bridge_enabled=member_pose_dissolve_enabled,
+            required_distinct_source_count=represented_source_count,
             eligible_source_frame_sizes=eligible_source_frame_sizes,
             output_frame_size=output_frame_size,
             feature_cache_directory=feature_cache_directory,
             descriptor_provider=descriptor_provider,
             render_infeasible_transition_edges=(
                 render_infeasible_transition_edges
+            ),
+            preferred_partition_unit_counts=(
+                preferred_partition_unit_counts
             ),
             progress_callback=partition_progress_callback,
         )
@@ -12965,20 +13207,38 @@ def _official_target_fancam_direct_full_frame_segments(
     for segment in resolved:
         counts[segment.source_index] += 1
     used = {source for source, count in counts.items() if count > 0}
-    if (
-        len(used) < MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT
-        or used != set(eligible)
-    ):
-        raise RuntimeError("direct full-frame render failed all-source coverage")
     source_usage_policy = getattr(
         visual_selection,
         "usage_policy",
         "exact_balanced_quota_v1",
     )
+    if len(used) < represented_source_count:
+        raise RuntimeError(
+            "direct full-frame render missed required source diversity"
+        )
     if source_usage_policy == "exact_balanced_quota_v1":
+        if used != set(eligible):
+            raise RuntimeError(
+                "full-song direct member render failed all-source coverage"
+            )
         if max(counts.values()) - min(counts.values()) > 1:
             raise RuntimeError(
                 "direct full-frame render failed balanced visual selection"
+            )
+    elif (
+        source_usage_policy
+        in _DIRECT_MEMBER_EXACT_SUBSET_SOURCE_USAGE_POLICIES
+    ):
+        if len(used) != represented_source_count:
+            raise RuntimeError(
+                "quality-proof render used a different source count than audited"
+            )
+        represented_counts = tuple(
+            count for count in counts.values() if count > 0
+        )
+        if max(represented_counts) - min(represented_counts) > 1:
+            raise RuntimeError(
+                "quality-proof render failed represented-source balance"
             )
     elif source_usage_policy in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES:
         rendered_counts = tuple(counts[source] for source in eligible)
@@ -13039,7 +13299,13 @@ def _official_target_fancam_direct_full_frame_segments(
         duration_minimums = ()
         duration_maximums = ()
     duration_deviations = tuple(
-        abs(actual - target) / target
+        (
+            abs(actual - target) / target
+            if target > 0.0
+            else 0.0
+            if abs(actual) <= 1e-9
+            else math.inf
+        )
         for actual, target in zip(duration_totals, duration_targets)
     )
     default_duration_threshold = (
@@ -13052,7 +13318,11 @@ def _official_target_fancam_direct_full_frame_segments(
         default_duration_threshold,
     )
     if (
-        source_usage_policy == "exact_balanced_quota_v1"
+        source_usage_policy
+        in {
+            "exact_balanced_quota_v1",
+            *_DIRECT_MEMBER_EXACT_SUBSET_SOURCE_USAGE_POLICIES,
+        }
         and max(duration_deviations) > maximum_duration_deviation + 1e-9
     ):
         raise RuntimeError(
@@ -13105,13 +13375,14 @@ def _official_target_fancam_direct_full_frame_segments(
             0.0,
         )
     )
+    minimum_median_run, maximum_median_run = cadence[
+        "target_source_run_median_seconds"
+    ]
     if not (
         _DIRECT_MEMBER_MIN_SWITCHES_PER_MINUTE
         <= switches_per_minute
         <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE
-        and _DIRECT_MEMBER_MIN_MEDIAN_RUN_SECONDS
-        <= median_run
-        <= _DIRECT_MEMBER_MAX_MEDIAN_RUN_SECONDS
+        and minimum_median_run <= median_run <= maximum_median_run
         and longest_run <= maximum_allowed_run_seconds
     ):
         raise RuntimeError(
@@ -13138,6 +13409,9 @@ def _official_target_fancam_direct_full_frame_segments(
             "heterogeneous_role_soft_target_with_hard_exposure_bounds"
             if source_usage_policy
             in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES
+            else "quality_ranked_exact_subset_quota"
+            if source_usage_policy
+            in _DIRECT_MEMBER_EXACT_SUBSET_SOURCE_USAGE_POLICIES
             else "total_duration_times_source_quota_divided_by_span_count"
         ),
         "source_usage_policy": source_usage_policy,
@@ -13153,6 +13427,10 @@ def _official_target_fancam_direct_full_frame_segments(
             in _DIRECT_MEMBER_ROLE_AWARE_SOURCE_USAGE_POLICIES
             else maximum_duration_deviation
         ),
+        "required_distinct_source_count": represented_source_count,
+        "selected_request_source_indices": sorted(used),
+        "omitted_request_source_indices": sorted(set(eligible) - used),
+        "all_sources_analyzed": True,
         "enforced_from_render_segments": True,
     }
     cadence["policy"] = (
@@ -18530,6 +18808,48 @@ def analyze(
         finally:
             decoded_pcm_by_source.clear()
 
+    requested_render_range_payload: dict[str, Any] | None = None
+    if (
+        request.render_range_start_seconds is not None
+        and request.render_range_end_seconds is not None
+    ):
+        safe_start = common_start
+        safe_end = common_end
+        requested_start = float(request.render_range_start_seconds)
+        requested_end = float(request.render_range_end_seconds)
+        range_tolerance_seconds = 1.0 / 29.97
+        if (
+            requested_start < safe_start - range_tolerance_seconds
+            or requested_end > safe_end + range_tolerance_seconds
+        ):
+            raise ValueError(
+                "requested render range lies outside the synchronized common "
+                f"range {safe_start:.3f}-{safe_end:.3f} seconds"
+            )
+        common_start = max(safe_start, requested_start)
+        common_end = min(safe_end, requested_end)
+        if common_end - common_start < 8.0 - 1e-6:
+            raise ValueError(
+                "synchronized bounded render range must remain at least 8 seconds"
+            )
+        requested_render_range_payload = {
+            "analysis_basis": "explicit_automatic_member_quality_proof_range_v1",
+            "requested_start_seconds": requested_start,
+            "requested_end_seconds": requested_end,
+            "effective_start_seconds": common_start,
+            "effective_end_seconds": common_end,
+            "duration_seconds": common_end - common_start,
+            "synchronized_safe_range": {
+                "start_seconds": safe_start,
+                "end_seconds": safe_end,
+            },
+            "full_song_delivery": False,
+        }
+        reporter.log(
+            "멤버 품질 증명 구간을 "
+            f"{common_start:.3f}-{common_end:.3f}초로 제한"
+        )
+
     member_tracking_results: dict[int, MemberTrackingResult] = {}
     member_tracking_payloads: list[dict[str, Any]] = []
     # Retained as an empty schema field for older analysis readers. Automatic
@@ -20809,6 +21129,18 @@ def analyze(
                 )
                 for index in eligible_indices
             )
+            direct_required_distinct_source_count = len(eligible_indices)
+            if request.render_range_start_seconds is not None:
+                direct_required_distinct_source_count = max(
+                    MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT,
+                    math.ceil(len(eligible_indices) * 0.75),
+                )
+                reporter.log(
+                    "직캠 품질 증명 구간 소스 정책 · "
+                    f"전체 {len(eligible_indices)}개 분석 · "
+                    f"실제 편집 최소 {direct_required_distinct_source_count}개 · "
+                    "유효성·화질·비심각 전환 연결성으로 자동 선택"
+                )
             direct_member_pose_dissolve_enabled = bool(
                 getattr(
                     request,
@@ -20869,6 +21201,7 @@ def analyze(
                 render_infeasible_transition_edges: Sequence[
                     tuple[float, int, int]
                 ] = (),
+                preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
                 return _official_target_fancam_direct_full_frame_segments(
                     timing_draft=timing_draft,
@@ -20893,14 +21226,45 @@ def analyze(
                     member_pose_dissolve_enabled=(
                         direct_member_pose_dissolve_enabled
                     ),
+                    required_distinct_source_count=(
+                        direct_required_distinct_source_count
+                    ),
                     output_fps=29.97,
                     render_infeasible_transition_edges=(
                         render_infeasible_transition_edges
+                    ),
+                    preferred_partition_unit_counts=(
+                        preferred_partition_unit_counts
                     ),
                     partition_progress_callback=(
                         _report_direct_partition_progress
                     ),
                 )
+
+            def _selected_partition_unit_counts_for_retry() -> tuple[int, ...]:
+                partition_search = direct_cadence.get("partition_search")
+                if not isinstance(partition_search, Mapping):
+                    raise RuntimeError(
+                        "direct-member retry lost partition search evidence"
+                    )
+                raw_counts = partition_search.get(
+                    "selected_partition_unit_counts"
+                )
+                if not isinstance(raw_counts, list) or not raw_counts:
+                    raise RuntimeError(
+                        "direct-member retry lost selected partition counts"
+                    )
+                counts = tuple(raw_counts)
+                if any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                    for value in counts
+                ):
+                    raise RuntimeError(
+                        "direct-member retry partition counts are invalid"
+                    )
+                return counts
 
             try:
                 (
@@ -20940,6 +21304,26 @@ def analyze(
                 "동작 연결 "
                 f"{dissolve_payload['selected_both_moving_count']}개"
             )
+            if not dissolve_payload["eligible_candidate_count"]:
+                rejection_counts = dissolve_payload.get(
+                    "rejection_reason_counts",
+                    {},
+                )
+                if isinstance(rejection_counts, Mapping) and rejection_counts:
+                    ranked_rejections = sorted(
+                        (
+                            (str(reason), int(count))
+                            for reason, count in rejection_counts.items()
+                        ),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                    reporter.log(
+                        "직캠 디졸브 안전 후보 0개 사유 · "
+                        + " · ".join(
+                            f"{reason} {count}개"
+                            for reason, count in ranked_rejections[:8]
+                        )
+                    )
             dense_face_provider: DirectMemberDenseFaceProvider | None = None
             direct_motion_error: str | None = None
             untouched_direct_segments = segments
@@ -21108,6 +21492,26 @@ def analyze(
                             )
                         )
                     except DirectMemberEditorialMotionError as exc:
+                        rejection_counts: dict[str, int] = {}
+                        for reasons in exc.rejection_reasons.values():
+                            for reason in reasons:
+                                rejection_counts[reason] = (
+                                    rejection_counts.get(reason, 0) + 1
+                                )
+                        reporter.log(
+                            "직캠 밀집 렌더 경계 탈락 사유 · "
+                            + (
+                                " · ".join(
+                                    f"{reason} {count}개"
+                                    for reason, count in sorted(
+                                        rejection_counts.items(),
+                                        key=lambda item: (-item[1], item[0]),
+                                    )[:10]
+                                )
+                                if rejection_counts
+                                else "구조화된 사유 없음"
+                            )
+                        )
                         if (
                             dense_render_attempt
                             >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
@@ -21208,7 +21612,10 @@ def analyze(
                                 direct_cadence,
                                 direct_visual_selection,
                             ) = _select_direct_member_render_path(
-                                tuple(render_infeasible_transition_edges)
+                                tuple(render_infeasible_transition_edges),
+                                preferred_partition_unit_counts=(
+                                    _selected_partition_unit_counts_for_retry()
+                                ),
                             )
                         except DirectMemberVisualSelectionError as selection_exc:
                             raise _report_direct_member_selection_failure(
@@ -21510,7 +21917,10 @@ def analyze(
                                 direct_cadence,
                                 direct_visual_selection,
                             ) = _select_direct_member_render_path(
-                                tuple(render_infeasible_transition_edges)
+                                tuple(render_infeasible_transition_edges),
+                                preferred_partition_unit_counts=(
+                                    _selected_partition_unit_counts_for_retry()
+                                ),
                             )
                         except DirectMemberVisualSelectionError as selection_exc:
                             raise _report_direct_member_selection_failure(
@@ -22077,6 +22487,7 @@ def analyze(
         "alignment_eligibility": alignment_eligibility,
         "local_timewarps": list(local_timewarp_payloads),
         "performance_range_trim": performance_range_trim_payload,
+        "requested_render_range": requested_render_range_payload,
         "common_master_range": {
             "start_seconds": common_start,
             "end_seconds": common_end,

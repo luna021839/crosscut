@@ -9,6 +9,78 @@ from crosscut.request import AnalysisRequest, MemberAnchorRequest
 
 
 class RequestTests(unittest.TestCase):
+    def test_automatic_member_render_range_round_trips_and_materializes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            request = AnalysisRequest.from_dict(
+                {
+                    "song": "BLACKHOLE",
+                    "edit_mode": "member",
+                    "aspect_ratio": "9:16",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "target_member": "가을",
+                    "output_directory": str(root / "out"),
+                    "render_range_start_seconds": 69.27675292586152,
+                    "render_range_end_seconds": 95.94578214834262,
+                }
+            )
+
+            self.assertEqual(
+                request.render_range_start_seconds,
+                69.27675292586152,
+            )
+            self.assertEqual(
+                request.render_range_end_seconds,
+                95.94578214834262,
+            )
+            restored = AnalysisRequest.from_dict(request.as_dict())
+            self.assertEqual(
+                restored.render_range_start_seconds,
+                request.render_range_start_seconds,
+            )
+            sources = tuple(root / f"source-{index}.mp4" for index in range(8))
+            for source in sources:
+                source.touch()
+            materialized = request.with_materialized_sources(sources)
+            self.assertEqual(
+                materialized.render_range_end_seconds,
+                request.render_range_end_seconds,
+            )
+
+    def test_automatic_member_render_range_fails_closed(self) -> None:
+        common = {
+            "song": "BLACKHOLE",
+            "edit_mode": "member",
+            "aspect_ratio": "9:16",
+            "source_mode": "automatic",
+            "sources": [],
+            "target_member": "가을",
+        }
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            AnalysisRequest.from_dict(
+                {**common, "render_range_start_seconds": 69.0}
+            )
+        with self.assertRaisesRegex(ValueError, "at least 8 seconds"):
+            AnalysisRequest.from_dict(
+                {
+                    **common,
+                    "render_range_start_seconds": 69.0,
+                    "render_range_end_seconds": 75.0,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "automatic member"):
+            AnalysisRequest.from_dict(
+                {
+                    **common,
+                    "edit_mode": "group",
+                    "aspect_ratio": "16:9",
+                    "target_member": None,
+                    "render_range_start_seconds": 69.0,
+                    "render_range_end_seconds": 95.0,
+                }
+            )
+
     def test_stage_edit_production_inference_request_is_explicit_and_round_trips(
         self,
     ) -> None:

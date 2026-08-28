@@ -2577,7 +2577,24 @@ def build_direct_member_editorial_motion_plan(
         raise ValueError("direct member editorial fps is invalid")
     settings = config or DirectMemberEditorialMotionConfig()
     shared = _shared_settings(settings)
-    source_count = max(source_path) + 1
+    # A bounded quality proof may intentionally represent only a ranked subset
+    # while retaining geometry for every analyzed source. `max(path) + 1`
+    # silently truncates trailing omitted slots (for example active 0..5 out
+    # of eight analyzed sources) and then rejects the correctly stored
+    # eight-source geometry tuple. Resolve the complete declared universe and
+    # still let `_resolved_source_frame_geometries` reject inconsistent sizes.
+    stored_source_geometries = tuple(
+        getattr(visual_selection, "source_frame_geometries", ())
+    )
+    declared_source_counts = tuple(
+        getattr(visual_selection, "source_counts", ())
+    )
+    source_count = max(
+        max(source_path) + 1,
+        len(stored_source_geometries),
+        len(declared_source_counts),
+        len(source_frame_sizes) if source_frame_sizes is not None else 0,
+    )
     source_frame_geometries = _resolved_source_frame_geometries(
         visual_selection,
         source_count=source_count,

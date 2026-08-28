@@ -15,6 +15,8 @@ from crosscut.direct_member_visual import (
     _DirectBoundarySearchCandidate,
     _VideoDescriptorProvider,
     _balanced_visual_path,
+    _best_boundary_search_edge,
+    _boundary_alignment_duration_bounds,
     _bounded_same_source_hold_visual_path,
     _canonical_silhouette_shape_embedding,
     _cinematic_bridge_count_budgets,
@@ -224,6 +226,29 @@ def _linear_timewarp(
 
 
 class DirectMemberVisualTests(unittest.TestCase):
+    def test_boundary_alignment_exposure_tolerance_preserves_omitted_sources(
+        self,
+    ) -> None:
+        minimums, maximums = _boundary_alignment_duration_bounds(
+            source_duration_targets=(5.9, 2.9, 0.0),
+            source_duration_minimums=(2.66, 1.33, 0.0),
+            source_duration_maximums=(9.77, 4.88, 0.0),
+            tolerance_seconds=0.20,
+        )
+
+        for actual, expected in zip(
+            minimums,
+            (2.46, 1.13, 0.0),
+            strict=True,
+        ):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(
+            maximums,
+            (9.97, 5.08, 0.0),
+            strict=True,
+        ):
+            self.assertAlmostEqual(actual, expected)
+
     def test_joint_boundary_search_preserves_same_source_run_limit(self) -> None:
         expensive = _optimizer_mismatch(0.50)
         preferred = _optimizer_mismatch(0.01)
@@ -549,6 +574,123 @@ class DirectMemberVisualTests(unittest.TestCase):
             diagnostics["selected_cinematic_bridges"][0]["geometry_scope"],
             "portrait_to_portrait",
         )
+
+    def test_cinematic_solver_supports_all_portrait_proof_subset(self) -> None:
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.50, severe=True)
+        portrait_bridge = DirectMemberCinematicBridge(
+            style="zoom_in",
+            outgoing_is_landscape=False,
+            incoming_is_landscape=False,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.16,
+            silhouette_mismatch=0.24,
+            base_mismatch=0.35,
+        )
+        bridge_edge = replace(
+            severe,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=portrait_bridge,
+        )
+        source_count = 4
+        matrices = []
+        for boundary_index in range(5):
+            matrix = [
+                [safe for _right in range(source_count)]
+                for _left in range(source_count)
+            ]
+            if boundary_index == 1:
+                matrix[0][1] = bridge_edge
+            elif boundary_index == 3:
+                matrix[1][2] = bridge_edge
+            matrices.append(tuple(tuple(row) for row in matrix))
+        validity = (
+            (True, False, False, False),
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, True, False, False),
+            (False, False, True, False),
+            (False, False, True, False),
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            tuple(matrices),
+            source_order=(0, 1, 2, 3),
+            candidate_validity=validity,
+            span_durations=(2.0,) * 6,
+            source_geometries=tuple(
+                direct_member_source_frame_geometry((2160, 3840))
+                for _source_index in range(source_count)
+            ),
+            priority_cut_boundary_indices=(1, 3),
+            maximum_priority_cut_hold_count=3,
+            config=DirectMemberVisualConfig(
+                maximum_same_source_hold_fraction=1.0,
+            ),
+            represented_source_indices=(0, 1, 2),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(path, (0, 0, 1, 1, 2, 2))
+        self.assertEqual(
+            diagnostics["usage_policy"],
+            "short_proof_quality_ranked_flexible_cinematic_v1",
+        )
+        self.assertEqual(
+            diagnostics["portrait_cinematic_bridge_boundary_indices"],
+            [1, 3],
+        )
+        self.assertEqual(diagnostics["landscape_source_indices"], [])
+        self.assertNotIn(3, path)
+
+    def test_boundary_search_preserves_effect_repairable_candidate(self) -> None:
+        severe = _optimizer_mismatch(0.20, severe=True)
+        portrait_bridge = DirectMemberCinematicBridge(
+            style="zoom_in",
+            outgoing_is_landscape=False,
+            incoming_is_landscape=False,
+            authorized_severe_flags=("attention_scale",),
+            pose_mismatch=0.16,
+            silhouette_mismatch=0.24,
+            base_mismatch=0.35,
+        )
+        bridge_edge = replace(
+            severe,
+            cost=0.80,
+            severe_flags=("attention_scale",),
+            cinematic_bridge=portrait_bridge,
+        )
+        uncontracted = replace(
+            severe,
+            cost=0.10,
+            severe_flags=("cross_source_actual_pose_missing",),
+            cinematic_bridge=None,
+        )
+
+        def candidate(offset_frames: int, mismatch: DirectBoundaryMismatch):
+            matrix = ((severe, mismatch), (severe, severe))
+            return _DirectBoundarySearchCandidate(
+                offset_frames=offset_frames,
+                cut_master_seconds=10.0 + offset_frames / 30.0,
+                outgoing=(),
+                outgoing_previous=(),
+                incoming=(),
+                incoming_next=(),
+                matrix=matrix,
+            )
+
+        selected, mismatch = _best_boundary_search_edge(
+            (candidate(0, uncontracted), candidate(2, bridge_edge)),
+            outgoing_source_index=0,
+            incoming_source_index=1,
+            priority_boundary=True,
+            config=DirectMemberVisualConfig(boundary_search_radius_frames=2),
+        )
+
+        self.assertEqual(selected.offset_frames, 2)
+        self.assertIsNotNone(mismatch.cinematic_bridge)
 
     def test_cinematic_solver_separates_portrait_and_landscape_bridge_budgets(
         self,
@@ -1372,6 +1514,95 @@ class DirectMemberVisualTests(unittest.TestCase):
             selection.optimizer_search_diagnostics["visual_gates_relaxed"]
         )
 
+    def test_short_proof_analyzes_all_sources_but_omits_ranked_invalid_source(
+        self,
+    ) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(6))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return _descriptor(
+                0.20 + source_index * 0.01,
+                quality_score=0.05 if source_index == 3 else 1.0,
+            )
+
+        selection = select_balanced_direct_member_sources(
+            sources=tuple(Path(f"source-{index}.mp4") for index in range(4)),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0, 0.0, 0.0),
+            required_distinct_source_count=3,
+            config=DirectMemberVisualConfig(beam_width=200),
+            descriptor_provider=provider,
+        )
+
+        self.assertEqual(
+            selection.usage_policy,
+            "short_proof_quality_ranked_subset_quota_v1",
+        )
+        self.assertEqual(selection.source_quotas, (2, 2, 2, 0))
+        self.assertEqual(selection.source_counts, (2, 2, 2, 0))
+        self.assertEqual(len(set(selection.source_indices)), 3)
+        self.assertEqual(
+            selection.config.maximum_source_duration_relative_deviation,
+            0.45,
+        )
+        provenance = selection.optimizer_search_diagnostics[
+            "source_quota_assignment"
+        ]
+        self.assertEqual(provenance["represented_source_indices"], [0, 1, 2])
+        self.assertEqual(provenance["omitted_source_indices"], [3])
+        self.assertTrue(provenance["all_sources_decoded_and_scored"])
+        self.assertFalse(provenance["visual_thresholds_changed"])
+        self.assertFalse(provenance["visual_gates_relaxed"])
+
+    def test_short_proof_flexible_exposure_keeps_minimum_diversity(self) -> None:
+        source_count = 4
+        span_count = 6
+        safe = _optimizer_mismatch()
+        matrices = tuple(
+            tuple(
+                tuple(safe for _ in range(source_count))
+                for _ in range(source_count)
+            )
+            for _ in range(span_count - 1)
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2, 3),
+            candidate_validity=((True,) * source_count,) * span_count,
+            span_durations=(1.0,) * span_count,
+            source_geometries=tuple(
+                direct_member_source_frame_geometry(
+                    (2160, 3840),
+                    output_size=(1080, 1920),
+                )
+                for _ in range(source_count)
+            ),
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+            require_cinematic_bridge=False,
+            represented_source_indices=(0, 1, 2),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(set(path), {0, 1, 2})
+        self.assertNotIn(3, path)
+        self.assertEqual(
+            diagnostics["usage_policy"],
+            "short_proof_quality_ranked_flexible_exposure_v1",
+        )
+        self.assertEqual(diagnostics["source_count_minimums"], [1, 1, 1, 0])
+        self.assertEqual(diagnostics["source_count_maximums"], [3, 3, 3, 0])
+        self.assertTrue(diagnostics["all_represented_sources_used"])
+        self.assertFalse(diagnostics["visual_gates_relaxed"])
+
     def test_exact_structural_no_repeat_failure_can_authorize_safe_hold(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(4))
 
@@ -1879,7 +2110,10 @@ class DirectMemberVisualTests(unittest.TestCase):
                 boundary.minimum_pair_cost,
                 boundary.mismatch.cost,
             )
-        self.assertEqual(selection.sample_count, 168)
+        # Every boundary candidate now includes an exact +0.20s future handle
+        # sample for each source, so dissolve review is bound to the locally
+        # selected cut instead of a stale coarse-span timestamp.
+        self.assertEqual(selection.sample_count, 183)
         self.assertEqual(selection.failed_sample_count, 0)
         payload = selection.to_dict()
         self.assertEqual(payload["distinct_source_count"], 3)
@@ -2113,6 +2347,20 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertEqual(boundary.mismatch.boundary_search_offset_frames, 2)
         self.assertEqual(boundary.mismatch.boundary_search_candidate_count, 3)
         self.assertFalse(boundary.mismatch.severe_flags)
+        self.assertEqual(
+            tuple(
+                round(sample.master_seconds, 1)
+                for sample in boundary.outgoing_handle_samples
+            ),
+            (4.3, 4.4),
+        )
+        self.assertEqual(
+            tuple(
+                round(sample.master_seconds, 1)
+                for sample in boundary.incoming_handle_samples
+            ),
+            (4.3, 4.4),
+        )
         assert boundary.mismatch.motion_connection is not None
         self.assertGreater(
             float(

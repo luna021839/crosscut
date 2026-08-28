@@ -191,6 +191,27 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertAlmostEqual(position, 0.0, places=7)
         self.assertAlmostEqual(scale, 0.0, places=7)
 
+    def test_stored_geometry_keeps_omitted_trailing_source_slots(self) -> None:
+        selection, renders, boxes = self._basic_inputs()
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_counts = (1, 1, 0)
+        selection.source_frame_geometries = (
+            geometry,
+            geometry,
+            geometry,
+        )
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.boundary_match_count, 1)
+
     def test_paired_focal_face_provider_overrides_coarse_person_geometry(self) -> None:
         coarse_boxes = (
             (0.10, 0.10, 0.70, 0.80),
