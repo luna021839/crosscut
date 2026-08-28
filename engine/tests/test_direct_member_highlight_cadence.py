@@ -24,6 +24,9 @@ from crosscut.pipeline import (
     _direct_member_maximum_hold_count_for_global_cadence,
     _direct_member_render_feedback_seed_profiles,
     _direct_member_render_feedback_strict_composition_limit,
+    _direct_member_short_proof_capacity_expansion_profiles,
+    _direct_strict_extra_quota_assignment_candidates,
+    _direct_strict_extra_quota_assignment_search_is_authorized,
     _direct_partition_queue_priority,
     _direct_partition_structural_search_cost,
     _enforce_direct_member_highlight_cadence_selection_gate,
@@ -52,6 +55,190 @@ def _timing_segments(count: int) -> tuple[DraftSegment, ...]:
 
 
 class DirectMemberHighlightCadenceTests(unittest.TestCase):
+    def test_short_highlight_proof_uses_last_professional_cadence_slot(
+        self,
+    ) -> None:
+        unit_seconds = 0.952465329374325
+        timing = tuple(
+            DraftSegment(
+                segment_index=index,
+                source_index=index % 8,
+                canonical_master_start=index * unit_seconds,
+                canonical_master_end=(index + 1) * unit_seconds,
+                output_start_seconds=index * unit_seconds,
+                source_local_start=index * unit_seconds,
+                source_local_end=(index + 1) * unit_seconds,
+                audio_offset_seconds=0.0,
+                sync_score=1.0,
+                estimated_beat_count=1.0,
+                start_boundary_reasons=("strong_beat",),
+                end_boundary_reasons=("strong_beat",),
+            )
+            for index in range(28)
+        )
+        baseline = _coarsen_direct_full_frame_spans(timing)
+
+        dense = _densify_direct_full_frame_highlights(
+            timing,
+            baseline,
+            ((timing[0].canonical_master_start, timing[-1].canonical_master_end),),
+            minimum_span_count=10,
+        )
+
+        duration = timing[-1].canonical_master_end
+        self.assertEqual(len(dense), 10)
+        self.assertLessEqual(
+            (len(dense) - 1) * 60.0 / duration,
+            21.0,
+        )
+        self.assertGreaterEqual(
+            min(span.duration_seconds for span in dense),
+            1.8,
+        )
+        ordinary = _densify_direct_full_frame_highlights(
+            timing,
+            baseline,
+            ((timing[0].canonical_master_start, timing[-1].canonical_master_end),),
+        )
+        self.assertEqual(len(ordinary), 9)
+
+    def test_short_proof_expands_cached_sparse_cadences_at_other_beats(
+        self,
+    ) -> None:
+        unit_seconds = 0.952465329374325
+        timing = tuple(
+            DraftSegment(
+                segment_index=index,
+                source_index=index % 8,
+                canonical_master_start=index * unit_seconds,
+                canonical_master_end=(index + 1) * unit_seconds,
+                output_start_seconds=index * unit_seconds,
+                source_local_start=index * unit_seconds,
+                source_local_end=(index + 1) * unit_seconds,
+                audio_offset_seconds=0.0,
+                sync_score=1.0,
+                estimated_beat_count=1.0,
+                start_boundary_reasons=("strong_beat",),
+                end_boundary_reasons=("strong_beat",),
+            )
+            for index in range(28)
+        )
+        ordinary_counts = (4, 2, 2, 2, 2, 4, 4, 4, 4)
+        cached_counts = (4, 2, 2, 4, 2, 2, 4, 4, 4)
+        ordinary = _DirectFullFramePartitionProfile(
+            profile_id="ordinary",
+            unit_counts=ordinary_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing,
+                ordinary_counts,
+            ),
+        )
+        cached = _DirectFullFramePartitionProfile(
+            profile_id="cached",
+            unit_counts=cached_counts,
+            spans=_direct_full_frame_spans_from_partition(
+                timing,
+                cached_counts,
+            ),
+        )
+        failed_dense_counts = (4, 2, 2, 2, 2, 2, 2, 4, 4, 4)
+
+        profiles = _direct_member_short_proof_capacity_expansion_profiles(
+            timing,
+            (ordinary, cached),
+            minimum_span_count=10,
+            highlight_intervals=((4 * unit_seconds, 16 * unit_seconds),),
+            excluded_unit_counts=(failed_dense_counts,),
+        )
+
+        self.assertEqual(len(profiles), 8)
+        self.assertNotIn(
+            failed_dense_counts,
+            {profile.unit_counts for profile in profiles},
+        )
+        self.assertIn(
+            (2, 2, 2, 2, 4, 2, 2, 4, 4, 4),
+            {profile.unit_counts for profile in profiles},
+        )
+        self.assertTrue(all(len(profile.spans) == 10 for profile in profiles))
+        self.assertTrue(
+            all(
+                min(span.duration_seconds for span in profile.spans) >= 1.8
+                for profile in profiles
+            )
+        )
+
+    def test_exact_quota_failure_searches_every_balanced_remainder_owner(
+        self,
+    ) -> None:
+        diagnostics = {
+            "failure": "validity_quota_path_exhausted",
+            "constraint_infeasibility_proven": True,
+            "valid_count_by_source": [
+                {
+                    "eligible_source_index": source_index,
+                    "valid_span_count": 9 - int(source_index == 6),
+                }
+                for source_index in range(8)
+            ],
+            "search": {
+                "exact_lifeline": {
+                    "invoked": True,
+                    "state_capacity_exhausted": False,
+                    "duration_state_quantization_applied": False,
+                }
+            },
+        }
+
+        self.assertTrue(
+            _direct_strict_extra_quota_assignment_search_is_authorized(
+                represented_source_count=8,
+                source_count=8,
+                qualified_profile_count=0,
+                diagnostics=diagnostics,
+            )
+        )
+        self.assertFalse(
+            _direct_strict_extra_quota_assignment_search_is_authorized(
+                represented_source_count=8,
+                source_count=8,
+                qualified_profile_count=1,
+                diagnostics=diagnostics,
+                duplicate_certificate_saturated=True,
+            )
+        )
+        assignments = _direct_strict_extra_quota_assignment_candidates(
+            span_count=9,
+            source_count=8,
+            source_order=tuple(range(8)),
+            diagnostics=diagnostics,
+        )
+        self.assertEqual(len(assignments), 7)
+        self.assertNotIn((0,), assignments)
+        self.assertEqual(set(assignments), {(index,) for index in range(1, 8)})
+        ten_span_assignments = (
+            _direct_strict_extra_quota_assignment_candidates(
+                span_count=10,
+                source_count=8,
+                source_order=tuple(range(8)),
+                diagnostics=diagnostics,
+            )
+        )
+        self.assertEqual(len(ten_span_assignments), 27)
+        self.assertNotIn((0, 1), ten_span_assignments)
+
+        diagnostics["search"]["exact_lifeline"][
+            "state_capacity_exhausted"
+        ] = True
+        self.assertFalse(
+            _direct_strict_extra_quota_assignment_search_is_authorized(
+                represented_source_count=8,
+                source_count=8,
+                qualified_profile_count=0,
+                diagnostics=diagnostics,
+            )
+        )
+
     def test_restarted_render_feedback_keeps_base_partition_as_repair_root(
         self,
     ) -> None:
@@ -331,6 +518,83 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
                 >= 1.8
                 for child in children
             )
+        )
+
+    def test_post_alignment_highlight_failure_moves_only_forced_hold_cut(
+        self,
+    ) -> None:
+        unit_seconds = 0.952465329374325
+        unit_counts = (5, 1, 4, 4, 2, 5, 2, 3, 2)
+        timing = tuple(
+            DraftSegment(
+                segment_index=index,
+                source_index=index % 8,
+                canonical_master_start=index * unit_seconds,
+                canonical_master_end=(index + 1) * unit_seconds,
+                output_start_seconds=index * unit_seconds,
+                source_local_start=index * unit_seconds,
+                source_local_end=(index + 1) * unit_seconds,
+                audio_offset_seconds=0.0,
+                sync_score=1.0,
+                estimated_beat_count=1.0,
+                start_boundary_reasons=("strong_beat",),
+                end_boundary_reasons=("strong_beat",),
+            )
+            for index in range(sum(unit_counts))
+        )
+        parent = _DirectFullFramePartitionProfile(
+            profile_id="post-alignment-parent",
+            unit_counts=unit_counts,
+            spans=_direct_full_frame_spans_from_partition(timing, unit_counts),
+        )
+        diagnostics = {
+            "failure": "cinematic_bridge_path_infeasible",
+            "constraint_infeasibility_proven": True,
+            "hard_boundary_connectivity": {
+                "analysis_basis": (
+                    "content_valid_nonsevere_no_repeat_reachability_v1"
+                ),
+                "boundaries": [
+                    {
+                        "boundary_index": index,
+                        "left_valid_source_indices": list(range(8)),
+                        "right_valid_source_indices": list(range(8)),
+                        "forward_reachable_left_source_indices": list(range(8)),
+                        "nonsevere_cross_source_edge_count": 1,
+                    }
+                    for index in range(len(unit_counts) - 1)
+                ],
+                "zero_local_nonsevere_transition_boundary_indices": [],
+            },
+            "highlight_hold_repair": {
+                "contract": (
+                    "post_alignment_density_constraint_generation_v1"
+                ),
+                "attempted": True,
+                "attempt_count": 1,
+                "forced_cut_boundary_indices": [1],
+                "result": "repair_selection_infeasible",
+                "visual_gates_relaxed": False,
+            },
+        }
+
+        children = _direct_full_frame_proof_directed_child_profiles(
+            timing,
+            parent,
+            diagnostics,
+        )
+
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual(child.unit_counts[1:3], (2, 3))
+        self.assertEqual(child.boundary_shifts[-1].boundary_index, 1)
+        self.assertEqual(
+            child.boundary_shifts[-1].trigger,
+            "post_alignment_highlight_forced_cut_infeasible",
+        )
+        self.assertEqual(
+            child.boundary_shifts[-1].proof_failed_segment_index,
+            2,
         )
 
     def test_proven_unmovable_minimum_boundary_can_merge_without_flash_cut(

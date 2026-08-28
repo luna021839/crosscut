@@ -70,8 +70,12 @@ from .direct_member_professional_gate import (
 )
 from .direct_member_rendered_proxy import (
     DirectMemberRenderedProxyPreflight,
+    demote_failed_direct_member_pose_dissolves_from_rendered_proxy,
+    promote_direct_member_pose_dissolves_from_rendered_proxy,
+    refine_direct_member_camera_plan_from_rendered_proxy,
     render_and_review_direct_member_proxy,
 )
+from .direct_member_target_face import FocalFaceCandidate
 from .direct_member_look import (
     DirectMemberLookPlan,
     build_direct_member_look_plan,
@@ -148,6 +152,7 @@ from .professional_motion_cut_profile import (
     load_professional_motion_cut_profile,
 )
 from .render import (
+    EDITORIAL_TRANSFORM_MAXIMUM_ZOOM,
     NormalizedCrop,
     RENDER_PLAN_SOURCE_INDEX_DOMAIN,
     RenderPlan,
@@ -371,7 +376,14 @@ _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUT_FRACTION = 0.30
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_MOVING_CUTS_PER_MINUTE = 5.0
 _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS = 8.0
 _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT = 4
-_DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS = 4
+_DIRECT_MEMBER_MINIMUM_ALL_SOURCE_REUSE_SPAN_COUNT = 2
+_DIRECT_MEMBER_MAXIMUM_SHORT_PROOF_CAPACITY_SEED_PROFILE_COUNT = 8
+_DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS = 6
+_DIRECT_MEMBER_MAXIMUM_DENSE_FEEDBACK_CONSTRAINTS_PER_RESELECTION = 1
+_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS = 3
+_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS = 4
+_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS = 5
+_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS_PER_PATH = 2
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT = 64
 _DIRECT_MEMBER_MAX_PARTITION_PROFILE_UPPER_BOUND = 4_163
 _DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT = 2
@@ -407,6 +419,7 @@ _DIRECT_MEMBER_TERMINAL_HOLD_REPAIRABLE_FAILURES = frozenset(
         "boundary_connectivity_path_exhausted",
         "validity_quota_path_exhausted",
         "boundary_diagnostic_eligible_pair_exhausted",
+        "role_aware_safe_hold_path_infeasible",
     }
 )
 _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME = (
@@ -444,6 +457,17 @@ _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT = (
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_BYTES = 512 * 1024
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_ENTRY_COUNT = 16
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_CERTIFICATE_COUNT = 128
+_DIRECT_MEMBER_PROXY_FEEDBACK_FILENAME = (
+    "direct-member-decoded-proxy-penalties-v1.json"
+)
+_DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT = (
+    "input_and_implementation_bound_decoded_proxy_path_penalties_v1"
+)
+_DIRECT_MEMBER_PROXY_FEEDBACK_MAX_BYTES = 512 * 1024
+_DIRECT_MEMBER_PROXY_FEEDBACK_MAX_ENTRY_COUNT = 16
+_DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT = 128
+_DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY = 8.0
+_DIRECT_MEMBER_PROXY_FEEDBACK_MAX_REJECTED_PATH_COUNT = 8
 # Dense failure certificates describe decoded boundary geometry, not source
 # exposure quotas. Permit one exact, audited selector-only implementation
 # transition to reuse those certificates: the edge measurement and every
@@ -452,7 +476,8 @@ _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_CERTIFICATE_COUNT = 128
 # Both hashes are content hashes of direct_member_visual.py. Future edits fail
 # closed unless their exact transition is reviewed and added deliberately.
 _DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_HASH_TRANSITIONS = {
-    "bf12e6d95e31a21d2d811001ce661cd4b96d2b71b59f1f5886713e5a908bd2fa": (
+    "7ec3b2e19b51aef68a689936e742f3bd82bf5e4febc3ce447a92ea76b7abfd76": (
+        "bf12e6d95e31a21d2d811001ce661cd4b96d2b71b59f1f5886713e5a908bd2fa",
         "b0fb377012dec79296b0aa8994106fc39d6a2472aa9bc9a45ba7f651fe0ca0f9",
         "8d5ed6e48312b1fa120a25a71af1a87e20eee54cf76b9d83f7dc6d71348c6f03",
     ),
@@ -462,8 +487,11 @@ _DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_MIGRATION_REASON = (
 )
 _DIRECT_MEMBER_MAX_DENSE_RENDER_FEEDBACK_PROFILE_COUNT = 6
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
-_DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
-_DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 20
+_DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 4
+# Eight-source member proofs need C(8, 2)=28 assignments after one extra
+# musical split, and can peak at C(8, 4)=70. Keep that complete finite domain
+# instead of silently skipping the exact all-source repair at the old cap 20.
+_DIRECT_MEMBER_MAX_EXTRA_QUOTA_ASSIGNMENT_COUNT = 70
 _DIRECT_MEMBER_FAILURE_REPORT_MAX_BYTES = 64 * 1024 * 1024
 _DIRECT_MEMBER_FAILURE_DIAGNOSTIC_FINGERPRINT_CONTRACT = (
     "canonical_json_sha256_v1"
@@ -538,7 +566,79 @@ def _direct_member_editorial_motion_config_from_visual_config(
             visual_config.transform_repair_minimum_subject_confidence
         ),
         enable_interior_zoom_pulses=True,
+        allow_partial_required_boundary_matches=True,
     )
+
+
+def _direct_member_required_transform_resolution(
+    required_boundary_indices: Sequence[int],
+    accepted_boundary_indices: Sequence[int],
+    natural_match_boundary_indices: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Split required camera candidates without changing cut feasibility."""
+
+    required = set(required_boundary_indices)
+    resolved = required.intersection(accepted_boundary_indices).union(
+        required.intersection(natural_match_boundary_indices)
+    )
+    return tuple(sorted(resolved)), tuple(sorted(required.difference(resolved)))
+
+
+def _direct_member_focal_boundary_reference_mapping(
+    source_indices: Sequence[int],
+    captured_references: Sequence[
+        tuple[
+            int,
+            int,
+            FocalFaceCandidate | None,
+            FocalFaceCandidate | None,
+        ]
+    ],
+) -> dict[int, tuple[FocalFaceCandidate, FocalFaceCandidate]]:
+    """Bind each transient dense face pair to its exact edit boundary."""
+
+    source_path = tuple(int(value) for value in source_indices)
+    cross_source_boundary_indices = tuple(
+        boundary_index
+        for boundary_index, (left, right) in enumerate(
+            zip(source_path, source_path[1:])
+        )
+        if left != right
+    )
+    captures = tuple(captured_references)
+    if len(captures) != len(cross_source_boundary_indices):
+        raise ValueError(
+            "dense focal boundary capture does not cover the selected source path"
+        )
+    resolved: dict[int, tuple[FocalFaceCandidate, FocalFaceCandidate]] = {}
+    for boundary_index, captured in zip(
+        cross_source_boundary_indices,
+        captures,
+        strict=True,
+    ):
+        (
+            captured_left_source,
+            captured_right_source,
+            captured_left_reference,
+            captured_right_reference,
+        ) = captured
+        if (
+            captured_left_source != source_path[boundary_index]
+            or captured_right_source != source_path[boundary_index + 1]
+        ):
+            raise ValueError(
+                "dense focal boundary capture source path disagrees with the "
+                "selected edit"
+            )
+        if (
+            captured_left_reference is not None
+            and captured_right_reference is not None
+        ):
+            resolved[boundary_index] = (
+                captured_left_reference,
+                captured_right_reference,
+            )
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -1324,6 +1424,11 @@ def _enforce_automatic_member_post_render_qa(
     manifest: dict[str, Any],
     manifest_path: Path,
     reporter: EventReporter,
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ]
+    | None = None,
 ) -> Path | None:
     """Promote an automatic direct-member MP4 only after final pixel QA.
 
@@ -1373,7 +1478,12 @@ def _enforce_automatic_member_post_render_qa(
         "컷 위치·포즈·동작 연결성을 검증하는 중…"
     )
     report, report_path = (
-        evaluate_and_write_automatic_member_post_render_qa(artifacts)
+        evaluate_and_write_automatic_member_post_render_qa(
+            artifacts,
+            focal_reference_candidates_by_boundary_index=(
+                focal_reference_candidates_by_boundary_index
+            ),
+        )
     )
     report_payload = report.to_dict()
     try:
@@ -4627,6 +4737,8 @@ def _densify_direct_full_frame_highlights(
     timing_segments: Sequence[DraftSegment],
     base_spans: Sequence[_DirectFullFrameSpan],
     highlight_intervals: Sequence[tuple[float, float]],
+    *,
+    minimum_span_count: int | None = None,
 ) -> tuple[_DirectFullFrameSpan, ...]:
     """Add musically bound highlight cuts without weakening visual gates.
 
@@ -4652,6 +4764,19 @@ def _densify_direct_full_frame_highlights(
     total_duration = (
         items[-1].canonical_master_end - items[0].canonical_master_start
     )
+    if minimum_span_count is not None and (
+        isinstance(minimum_span_count, bool)
+        or not isinstance(minimum_span_count, int)
+        or minimum_span_count < 1
+    ):
+        raise ValueError("direct member minimum span count is invalid")
+    hard_maximum_span_count = (
+        math.floor(
+            total_duration * _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE / 60.0
+            + 1e-9
+        )
+        + 1
+    )
     target_span_count = min(
         math.floor(
             total_duration
@@ -4669,6 +4794,15 @@ def _densify_direct_full_frame_highlights(
             + 1,
         ),
     )
+    if minimum_span_count is not None:
+        # Sparse all-source proofs need two reusable carrier slots so the
+        # portrait performance sources can bridge the landscape inserts. Use
+        # the last cadence slot only when that diversity contract needs it;
+        # ordinary short excerpts retain the calmer 19.5/minute seed.
+        target_span_count = max(
+            target_span_count,
+            min(minimum_span_count, hard_maximum_span_count),
+        )
     counts = [span.timing_segment_count for span in baseline]
     while len(counts) < target_span_count:
         candidates: list[
@@ -4763,22 +4897,199 @@ def _direct_full_frame_base_partition_profile(
     timing_segments: Sequence[DraftSegment],
     *,
     highlight_intervals: Sequence[tuple[float, float]] = (),
+    minimum_span_count: int | None = None,
 ) -> _DirectFullFramePartitionProfile:
     baseline = _coarsen_direct_full_frame_spans(timing_segments)
     spans = _densify_direct_full_frame_highlights(
         timing_segments,
         baseline,
         highlight_intervals,
+        minimum_span_count=minimum_span_count,
     )
     return _DirectFullFramePartitionProfile(
         profile_id=(
-            "highlight-dense-reference-coarsening-v1"
+            "all-source-capacity-highlight-dense-v1"
+            if minimum_span_count is not None
+            and len(spans) >= minimum_span_count
+            and len(spans) > len(baseline)
+            else "highlight-dense-reference-coarsening-v1"
             if len(spans) > len(baseline)
             else "base-reference-coarsening"
         ),
         unit_counts=tuple(span.timing_segment_count for span in spans),
         spans=spans,
     )
+
+
+def _direct_member_short_proof_capacity_expansion_profiles(
+    timing_segments: Sequence[DraftSegment],
+    seed_profiles: Sequence[_DirectFullFramePartitionProfile],
+    *,
+    minimum_span_count: int,
+    highlight_intervals: Sequence[tuple[float, float]] = (),
+    excluded_unit_counts: Sequence[Sequence[int]] = (),
+) -> tuple[_DirectFullFramePartitionProfile, ...]:
+    """Add one musical carrier slot to proven sparse short-proof cadences.
+
+    The ordinary highlight seed deliberately leaves headroom for a later
+    repair.  With eight required fancams, however, a nine-span seed provides
+    only one reusable carrier slot and can force the two landscape inserts
+    through the same locally disconnected boundary.  Expand every exact
+    input-bound nine-span seed at an existing musical boundary, keep the
+    1.8-second flash-shot floor and 21/minute ceiling, and let the full visual
+    selector prove each resulting path.  No cached source assignment or
+    transition decision is reused.
+    """
+
+    items = tuple(timing_segments)
+    seeds = tuple(seed_profiles)
+    if not items or not seeds:
+        return ()
+    if (
+        isinstance(minimum_span_count, bool)
+        or not isinstance(minimum_span_count, int)
+        or minimum_span_count < 2
+    ):
+        raise ValueError("short-proof capacity minimum span count is invalid")
+    total_duration = (
+        items[-1].canonical_master_end - items[0].canonical_master_start
+    )
+    if (
+        total_duration <= 0.0
+        or total_duration
+        > _DIRECT_MEMBER_SHORT_PROOF_MAXIMUM_DURATION_SECONDS + 1e-9
+    ):
+        return ()
+    hard_maximum_span_count = (
+        math.floor(
+            total_duration * _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE / 60.0
+            + 1e-9
+        )
+        + 1
+    )
+    target_span_count = min(minimum_span_count, hard_maximum_span_count)
+    normalized_highlights = (
+        _normalized_direct_member_highlight_intervals(
+            highlight_intervals,
+            range_start=items[0].canonical_master_start,
+            range_end=items[-1].canonical_master_end,
+        )
+        if highlight_intervals
+        else ()
+    )
+    excluded = {
+        tuple(int(value) for value in values)
+        for values in excluded_unit_counts
+    }
+    ranked: list[
+        tuple[
+            tuple[int, int, float, float, int, int, int],
+            tuple[int, ...],
+            tuple[_DirectFullFrameSpan, ...],
+        ]
+    ] = []
+    seen = set(excluded)
+    for seed_index, seed in enumerate(seeds):
+        if len(seed.spans) != target_span_count - 1:
+            continue
+        unit_start = 0
+        for span_index, unit_count in enumerate(seed.unit_counts):
+            group_start = items[unit_start].canonical_master_start
+            group_end = items[unit_start + unit_count - 1].canonical_master_end
+            for split_offset in range(1, unit_count):
+                boundary_unit = items[unit_start + split_offset - 1]
+                boundary_seconds = boundary_unit.canonical_master_end
+                left_duration = boundary_seconds - group_start
+                right_duration = group_end - boundary_seconds
+                if (
+                    min(left_duration, right_duration) + 1e-9
+                    < _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+                ):
+                    continue
+                counts = list(seed.unit_counts)
+                counts[span_index : span_index + 1] = [
+                    split_offset,
+                    unit_count - split_offset,
+                ]
+                signature = tuple(counts)
+                if signature in seen:
+                    continue
+                try:
+                    spans = _direct_full_frame_spans_from_partition(
+                        items,
+                        signature,
+                    )
+                except ValueError:
+                    continue
+                switches_per_minute = (
+                    (len(spans) - 1) * 60.0 / total_duration
+                )
+                span_median = median(
+                    span.duration_seconds for span in spans
+                )
+                if not (
+                    switches_per_minute
+                    <= _DIRECT_MEMBER_MAX_SWITCHES_PER_MINUTE + 1e-9
+                    and _direct_member_median_run_is_valid(
+                        total_duration,
+                        span_median,
+                    )
+                ):
+                    continue
+                reasons = set(boundary_unit.end_boundary_reasons)
+                musical_penalty = (
+                    0
+                    if "phrase" in reasons
+                    else 1
+                    if "strong_beat" in reasons
+                    else 2
+                    if "beat" in reasons
+                    else 3
+                )
+                inside_highlight = _direct_member_boundary_is_highlight(
+                    boundary_seconds,
+                    normalized_highlights,
+                )
+                target_run = (
+                    _DIRECT_MEMBER_HIGHLIGHT_TARGET_RUN_SECONDS
+                    if inside_highlight
+                    else _DIRECT_MEMBER_TARGET_RUN_SECONDS
+                )
+                ranked.append(
+                    (
+                        (
+                            0 if inside_highlight else 1,
+                            musical_penalty,
+                            abs(left_duration - target_run)
+                            + abs(right_duration - target_run),
+                            abs(left_duration - right_duration),
+                            seed_index,
+                            span_index,
+                            split_offset,
+                        ),
+                        signature,
+                        spans,
+                    )
+                )
+                seen.add(signature)
+            unit_start += unit_count
+    profiles: list[_DirectFullFramePartitionProfile] = []
+    for _rank, counts, spans in sorted(ranked):
+        signature = _direct_partition_signature_sha256(counts)
+        profiles.append(
+            _DirectFullFramePartitionProfile(
+                profile_id=(
+                    f"short-proof-all-source-capacity-{signature[:16]}"
+                ),
+                unit_counts=counts,
+                spans=spans,
+            )
+        )
+        if len(profiles) >= (
+            _DIRECT_MEMBER_MAXIMUM_SHORT_PROOF_CAPACITY_SEED_PROFILE_COUNT
+        ):
+            break
+    return tuple(profiles)
 
 
 def _direct_member_in_run_preferred_partition_profile(
@@ -4927,11 +5238,19 @@ def _direct_partition_terminal_hold_failure_is_eligible(
     """
 
     values = dict(diagnostics)
-    return bool(
+    failure = values.get("failure")
+    if not (
         _direct_partition_failure_is_proven(values)
-        and values.get("failure")
-        in _DIRECT_MEMBER_TERMINAL_HOLD_REPAIRABLE_FAILURES
-    )
+        and failure in _DIRECT_MEMBER_TERMINAL_HOLD_REPAIRABLE_FAILURES
+    ):
+        return False
+    if failure == "role_aware_safe_hold_path_infeasible":
+        role_constraints = values.get("role_constraints")
+        return bool(
+            isinstance(role_constraints, Mapping)
+            and role_constraints.get("maximum_same_source_hold_count") == 0
+        )
+    return True
 
 
 def _direct_partition_warm_terminal_audition_is_authorized(
@@ -5081,6 +5400,23 @@ def _direct_partition_exact_boundary_proof(
             span_count=span_count,
         ) != boundary_index:
             return None
+    elif trigger == "post_alignment_highlight_forced_cut_infeasible":
+        repair = diagnostics.get("highlight_hold_repair")
+        forced = (
+            repair.get("forced_cut_boundary_indices")
+            if isinstance(repair, Mapping)
+            else None
+        )
+        if not (
+            isinstance(repair, Mapping)
+            and repair.get("contract")
+            == "post_alignment_density_constraint_generation_v1"
+            and repair.get("attempted") is True
+            and repair.get("result") == "repair_selection_infeasible"
+            and isinstance(forced, list)
+            and boundary_index in forced
+        ):
+            return None
     else:
         return None
     return _DirectPartitionBoundaryProof(
@@ -5092,7 +5428,9 @@ def _direct_partition_exact_boundary_proof(
             else None
         ),
         failed_segment_index=(
-            int(diagnostics["failed_at_segment_index"])
+            boundary_index + 1
+            if trigger == "post_alignment_highlight_forced_cut_infeasible"
+            else int(diagnostics["failed_at_segment_index"])
             if isinstance(diagnostics.get("failed_at_segment_index"), int)
             else None
         ),
@@ -5113,6 +5451,48 @@ def _direct_partition_exact_shift_proofs(
     connectivity = diagnostics.get("hard_boundary_connectivity")
     if not isinstance(connectivity, dict):
         return ()
+    repair = diagnostics.get("highlight_hold_repair")
+    raw_forced = (
+        repair.get("forced_cut_boundary_indices")
+        if isinstance(repair, Mapping)
+        and repair.get("contract")
+        == "post_alignment_density_constraint_generation_v1"
+        and repair.get("attempted") is True
+        and repair.get("result") == "repair_selection_infeasible"
+        else None
+    )
+    forced_indices = (
+        sorted(
+            {
+                int(value)
+                for value in raw_forced
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value < span_count - 1
+            }
+        )
+        if isinstance(raw_forced, list)
+        else []
+    )
+    repair_proofs = tuple(
+        proof
+        for boundary_index in forced_indices
+        if (
+            proof := _direct_partition_exact_boundary_proof(
+                diagnostics,
+                boundary_index=boundary_index,
+                trigger=(
+                    "post_alignment_highlight_forced_cut_infeasible"
+                ),
+                span_count=span_count,
+            )
+        )
+        is not None
+    )
+    if repair_proofs:
+        return repair_proofs[
+            :_DIRECT_MEMBER_MAX_BOTTLENECK_BOUNDARY_COUNT
+        ]
     raw_zero = connectivity.get(
         "zero_local_nonsevere_transition_boundary_indices"
     )
@@ -5299,6 +5679,182 @@ def _normalize_direct_member_dense_render_feedback_edges(
     return tuple(normalized)
 
 
+def _normalize_direct_member_proxy_feedback_penalties(
+    edges: Sequence[tuple[float, int, int, float]],
+    *,
+    source_count: int,
+    range_start: float,
+    range_end: float,
+) -> tuple[tuple[float, int, int, float], ...]:
+    """Validate unique finite decoded-proxy edge penalties."""
+
+    if (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 2
+    ):
+        raise ValueError("decoded-proxy feedback source count is invalid")
+    if not (
+        math.isfinite(range_start)
+        and math.isfinite(range_end)
+        and range_start < range_end
+    ):
+        raise ValueError("decoded-proxy feedback range is invalid")
+    normalized: list[tuple[float, int, int, float]] = []
+    seen_keys: set[tuple[float, int, int]] = set()
+    for raw in edges:
+        if not isinstance(raw, (tuple, list)) or len(raw) != 4:
+            raise ValueError("decoded-proxy feedback edge is invalid")
+        (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) = raw
+        if (
+            isinstance(boundary_seconds, bool)
+            or not isinstance(boundary_seconds, (int, float))
+            or not math.isfinite(float(boundary_seconds))
+            or not range_start - 1e-9
+            <= float(boundary_seconds)
+            <= range_end + 1e-9
+            or isinstance(outgoing_source_index, bool)
+            or not isinstance(outgoing_source_index, int)
+            or isinstance(incoming_source_index, bool)
+            or not isinstance(incoming_source_index, int)
+            or not 0 <= outgoing_source_index < source_count
+            or not 0 <= incoming_source_index < source_count
+            or outgoing_source_index == incoming_source_index
+            or isinstance(penalty, bool)
+            or not isinstance(penalty, (int, float))
+            or not math.isfinite(float(penalty))
+            or not 0.0 < float(penalty)
+            <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+        ):
+            raise ValueError("decoded-proxy feedback edge is invalid")
+        key = (
+            float(boundary_seconds),
+            outgoing_source_index,
+            incoming_source_index,
+        )
+        if key in seen_keys:
+            raise ValueError("decoded-proxy feedback edges must be unique")
+        seen_keys.add(key)
+        normalized.append((*key, float(penalty)))
+    if len(normalized) > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT:
+        raise ValueError("decoded-proxy feedback penalty limit exceeded")
+    return tuple(normalized)
+
+
+def _accumulate_direct_member_proxy_feedback_penalties(
+    existing: Sequence[tuple[float, int, int, float]],
+    updates: Sequence[tuple[float, int, int, float]],
+    *,
+    source_count: int,
+    range_start: float,
+    range_end: float,
+) -> tuple[tuple[float, int, int, float], ...]:
+    """Add bounded observations without turning them into hard exclusions."""
+
+    normalized_existing = _normalize_direct_member_proxy_feedback_penalties(
+        existing,
+        source_count=source_count,
+        range_start=range_start,
+        range_end=range_end,
+    )
+    normalized_updates = _normalize_direct_member_proxy_feedback_penalties(
+        updates,
+        source_count=source_count,
+        range_start=range_start,
+        range_end=range_end,
+    )
+    penalties: dict[tuple[float, int, int], float] = {
+        (boundary_seconds, outgoing_source_index, incoming_source_index): penalty
+        for (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+            penalty,
+        ) in normalized_existing
+    }
+    for (
+        boundary_seconds,
+        outgoing_source_index,
+        incoming_source_index,
+        penalty,
+    ) in normalized_updates:
+        key = (
+            boundary_seconds,
+            outgoing_source_index,
+            incoming_source_index,
+        )
+        penalties[key] = min(
+            _DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY,
+            penalties.get(key, 0.0) + penalty,
+        )
+    if len(penalties) > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT:
+        raise ValueError("decoded-proxy feedback penalty limit exceeded")
+    return tuple(
+        (*key, penalty)
+        for key, penalty in sorted(penalties.items())
+    )
+
+
+def _normalize_direct_member_proxy_rejected_paths(
+    rejected_paths_by_partition: Mapping[
+        Sequence[int], Sequence[Sequence[int]]
+    ],
+    *,
+    source_count: int,
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    """Validate bounded exact path no-goods scoped to one beat partition."""
+
+    if (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 2
+    ):
+        raise ValueError("decoded-proxy rejected-path source count is invalid")
+    normalized: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    for raw_unit_counts, raw_paths in rejected_paths_by_partition.items():
+        unit_counts = tuple(raw_unit_counts)
+        if (
+            not unit_counts
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in unit_counts
+            )
+        ):
+            raise ValueError(
+                "decoded-proxy rejected-path partition is invalid"
+            )
+        for raw_path in raw_paths:
+            path = tuple(raw_path)
+            if (
+                len(path) != len(unit_counts)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value < source_count
+                    for value in path
+                )
+            ):
+                raise ValueError(
+                    "decoded-proxy rejected source path is invalid"
+                )
+            item = (unit_counts, path)
+            if item not in normalized:
+                normalized.append(item)
+    if (
+        len(normalized)
+        > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_REJECTED_PATH_COUNT
+    ):
+        raise ValueError("decoded-proxy rejected path limit exceeded")
+    return tuple(normalized)
+
+
 def _direct_member_dense_render_feedback_binding(
     feature_cache_directory: Path | None,
     *,
@@ -5399,6 +5955,9 @@ def _direct_member_dense_render_feedback_binding(
     )
     binding_evidence = {
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
+        "feedback_application_policy": (
+            "dense_partial_camera_boundary_pair_diagnostics_proxy_v5"
+        ),
         "acquisition_source_identity_sha256": source_identity_sha256,
         "timing_draft": timing_draft.to_dict(),
         "eligible_request_source_indices": list(eligible),
@@ -5923,7 +6482,7 @@ def _persist_direct_member_dense_render_feedback_edges(
                 "outgoing_eligible_source_index": outgoing_source_index,
                 "incoming_eligible_source_index": incoming_source_index,
                 "origin": (
-                    "failed_dense_camera_or_decoded_output_continuity_solve"
+                    "failed_dense_camera_solve"
                 ),
                 "visual_thresholds_relaxed": False,
             }
@@ -5980,6 +6539,292 @@ def _persist_direct_member_dense_render_feedback_edges(
                 if normalized_preferred_counts is not None
                 else None
             ),
+        }
+    )
+    return diagnostics
+
+
+def _load_direct_member_proxy_feedback_penalties(
+    feature_cache_directory: Path | None,
+    binding: Mapping[str, Any] | None,
+) -> tuple[tuple[tuple[float, int, int, float], ...], dict[str, Any]]:
+    """Restore only finite decoded-proxy preferences for an exact binding."""
+
+    diagnostics: dict[str, Any] = {
+        "contract": _DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT,
+        "requested": feature_cache_directory is not None,
+        "cache_filename": _DIRECT_MEMBER_PROXY_FEEDBACK_FILENAME,
+        "loaded_penalty_count": 0,
+        "loaded_rejected_path_count": 0,
+        "rejected_source_paths_by_partition_unit_counts": [],
+        "hard_exclusions_added": False,
+        "visual_thresholds_relaxed": False,
+    }
+    if feature_cache_directory is None or binding is None:
+        diagnostics["status"] = "binding_unavailable"
+        return (), diagnostics
+    cache_path = (
+        Path(feature_cache_directory)
+        / _DIRECT_MEMBER_PROXY_FEEDBACK_FILENAME
+    )
+    if not cache_path.exists():
+        diagnostics["status"] = "cache_missing"
+        return (), diagnostics
+    try:
+        encoded, fingerprint = _read_stable_regular_file(cache_path)
+        if len(encoded) > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_BYTES:
+            raise ValueError("decoded-proxy feedback cache is too large")
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": type(exc).__name__}
+        )
+        return (), diagnostics
+    if not (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == 1
+        and payload.get("contract")
+        == _DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT
+        and isinstance(payload.get("entries"), list)
+        and len(payload["entries"])
+        <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_ENTRY_COUNT
+    ):
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": "schema_mismatch"}
+        )
+        return (), diagnostics
+    matching_entry = next(
+        (
+            entry
+            for entry in payload["entries"]
+            if isinstance(entry, dict)
+            and all(entry.get(key) == value for key, value in binding.items())
+        ),
+        None,
+    )
+    if matching_entry is None:
+        diagnostics.update(
+            {
+                "status": "no_matching_binding",
+                "cache_file_sha256": fingerprint["sha256"],
+            }
+        )
+        return (), diagnostics
+    raw_penalties = matching_entry.get("penalties")
+    if not (
+        isinstance(raw_penalties, list)
+        and len(raw_penalties)
+        <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT
+    ):
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": "penalty_schema"}
+        )
+        return (), diagnostics
+    raw_rejected_paths = matching_entry.get("rejected_paths", [])
+    if not (
+        isinstance(raw_rejected_paths, list)
+        and len(raw_rejected_paths)
+        <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_REJECTED_PATH_COUNT
+    ):
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": "rejected_path_schema"}
+        )
+        return (), diagnostics
+    raw_edges: list[tuple[float, int, int, float]] = []
+    for item in raw_penalties:
+        if not isinstance(item, dict):
+            diagnostics.update(
+                {"status": "cache_rejected", "rejection": "penalty_schema"}
+            )
+            return (), diagnostics
+        raw_edges.append(
+            (
+                item.get("canonical_boundary_seconds"),
+                item.get("outgoing_eligible_source_index"),
+                item.get("incoming_eligible_source_index"),
+                item.get("accumulated_penalty"),
+            )
+        )
+    try:
+        penalties = _normalize_direct_member_proxy_feedback_penalties(
+            raw_edges,
+            source_count=int(binding["source_count"]),
+            range_start=float(binding["range_start_seconds"]),
+            range_end=float(binding["range_end_seconds"]),
+        )
+        rejected_paths_mapping: dict[
+            tuple[int, ...], list[tuple[int, ...]]
+        ] = {}
+        for item in raw_rejected_paths:
+            if not isinstance(item, dict):
+                raise ValueError("decoded-proxy rejected path schema mismatch")
+            unit_counts = tuple(item.get("partition_unit_counts", ()))
+            source_indices = tuple(item.get("source_indices", ()))
+            rejected_paths_mapping.setdefault(unit_counts, []).append(
+                source_indices
+            )
+        rejected_paths = _normalize_direct_member_proxy_rejected_paths(
+            rejected_paths_mapping,
+            source_count=int(binding["source_count"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        diagnostics.update(
+            {"status": "cache_rejected", "rejection": type(exc).__name__}
+        )
+        return (), diagnostics
+    diagnostics.update(
+        {
+            "status": "penalties_loaded",
+            "cache_file_sha256": fingerprint["sha256"],
+            "loaded_penalty_count": len(penalties),
+            "loaded_total_penalty": sum(item[3] for item in penalties),
+            "loaded_rejected_path_count": len(rejected_paths),
+            "rejected_source_paths_by_partition_unit_counts": [
+                {
+                    "partition_unit_counts": list(unit_counts),
+                    "source_indices": list(source_indices),
+                }
+                for unit_counts, source_indices in rejected_paths
+            ],
+        }
+    )
+    return penalties, diagnostics
+
+
+def _persist_direct_member_proxy_feedback_penalties(
+    feature_cache_directory: Path | None,
+    binding: Mapping[str, Any] | None,
+    penalties: Sequence[tuple[float, int, int, float]],
+    *,
+    rejected_source_paths_by_partition_unit_counts: Mapping[
+        Sequence[int], Sequence[Sequence[int]]
+    ] | None = None,
+) -> dict[str, Any]:
+    """Persist finite edge costs and exact whole-path no-good constraints."""
+
+    diagnostics: dict[str, Any] = {
+        "contract": _DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT,
+        "persisted": False,
+        "hard_exclusions_added": False,
+        "visual_thresholds_relaxed": False,
+    }
+    if feature_cache_directory is None or binding is None:
+        diagnostics["status"] = "binding_unavailable"
+        return diagnostics
+    try:
+        normalized = _normalize_direct_member_proxy_feedback_penalties(
+            penalties,
+            source_count=int(binding["source_count"]),
+            range_start=float(binding["range_start_seconds"]),
+            range_end=float(binding["range_end_seconds"]),
+        )
+        normalized_rejected_paths = (
+            _normalize_direct_member_proxy_rejected_paths(
+                rejected_source_paths_by_partition_unit_counts or {},
+                source_count=int(binding["source_count"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        diagnostics.update(
+            {"status": "input_rejected", "rejection": type(exc).__name__}
+        )
+        return diagnostics
+    cache_path = (
+        Path(feature_cache_directory)
+        / _DIRECT_MEMBER_PROXY_FEEDBACK_FILENAME
+    )
+    entries: list[dict[str, Any]] = []
+    existing_cache_replaced = False
+    if cache_path.exists():
+        try:
+            encoded, _fingerprint = _read_stable_regular_file(cache_path)
+            existing = json.loads(encoded.decode("utf-8"))
+            if not (
+                len(encoded) <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_BYTES
+                and isinstance(existing, dict)
+                and existing.get("schema_version") == 1
+                and existing.get("contract")
+                == _DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT
+                and isinstance(existing.get("entries"), list)
+                and len(existing["entries"])
+                <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_ENTRY_COUNT
+            ):
+                raise ValueError("decoded-proxy feedback cache schema mismatch")
+            entries = [
+                item for item in existing["entries"] if isinstance(item, dict)
+            ]
+        except (
+            OSError,
+            ValueError,
+            UnicodeError,
+            json.JSONDecodeError,
+        ):
+            entries = []
+            existing_cache_replaced = True
+    entries = [
+        item
+        for item in entries
+        if not all(item.get(key) == value for key, value in binding.items())
+    ]
+    entries.insert(
+        0,
+        {
+            **binding,
+            "penalty_count": len(normalized),
+            "total_penalty": sum(item[3] for item in normalized),
+            "rejected_path_count": len(normalized_rejected_paths),
+            "rejected_paths": [
+                {
+                    "partition_unit_counts": list(unit_counts),
+                    "source_indices": list(source_indices),
+                    "origin": "decoded_output_candidate_rejected",
+                    "scope": "complete_path_only",
+                    "individual_edges_hard_excluded": False,
+                    "visual_thresholds_relaxed": False,
+                }
+                for unit_counts, source_indices in normalized_rejected_paths
+            ],
+            "penalties": [
+                {
+                    "canonical_boundary_seconds": boundary_seconds,
+                    "outgoing_eligible_source_index": outgoing_source_index,
+                    "incoming_eligible_source_index": incoming_source_index,
+                    "accumulated_penalty": penalty,
+                    "origin": "decoded_output_continuity_quality_feedback",
+                    "hard_exclusion": False,
+                    "visual_thresholds_relaxed": False,
+                }
+                for (
+                    boundary_seconds,
+                    outgoing_source_index,
+                    incoming_source_index,
+                    penalty,
+                ) in normalized
+            ],
+        },
+    )
+    payload = {
+        "schema_version": 1,
+        "contract": _DIRECT_MEMBER_PROXY_FEEDBACK_CONTRACT,
+        "entries": entries[:_DIRECT_MEMBER_PROXY_FEEDBACK_MAX_ENTRY_COUNT],
+    }
+    try:
+        _write_analysis_manifest_atomically(cache_path, payload)
+        _persisted, fingerprint = _read_stable_regular_file(cache_path)
+    except (OSError, ValueError) as exc:
+        diagnostics.update(
+            {"status": "persistence_failed", "rejection": type(exc).__name__}
+        )
+        return diagnostics
+    diagnostics.update(
+        {
+            "status": "persisted",
+            "persisted": True,
+            "penalty_count": len(normalized),
+            "total_penalty": sum(item[3] for item in normalized),
+            "rejected_path_count": len(normalized_rejected_paths),
+            "cache_file_sha256": fingerprint["sha256"],
+            "existing_cache_replaced": existing_cache_replaced,
         }
     )
     return diagnostics
@@ -10406,8 +11251,8 @@ def _direct_member_feedback_source_diversity_candidates(
 
 def _direct_member_proxy_refinement_rank(
     preflight: DirectMemberRenderedProxyPreflight,
-) -> tuple[int, int, int, int, float, float]:
-    """Rank materialized look attempts without changing feedback semantics."""
+) -> tuple[int, int, int, float, int, int, float]:
+    """Rank materialized attempts by member continuity before broad look noise."""
 
     if not isinstance(preflight, DirectMemberRenderedProxyPreflight):
         raise TypeError("member proxy refinement rank needs a preflight result")
@@ -10466,16 +11311,150 @@ def _direct_member_proxy_refinement_rank(
     quality_failure_count = (
         len(quality_failures) if isinstance(quality_failures, list) else 1
     )
+    all_repair_targets = preflight.repair_target_boundary_indices
+    raw_continuity_targets = payload.get(
+        "continuity_repair_target_boundary_indices"
+    )
+    continuity_repair_count = (
+        len(raw_continuity_targets)
+        if isinstance(raw_continuity_targets, list)
+        else len(all_repair_targets)
+    )
+    raw_generic_targets = payload.get("generic_repair_target_boundary_indices")
+    generic_repair_count = (
+        len(raw_generic_targets)
+        if isinstance(raw_generic_targets, list)
+        else len(all_repair_targets)
+    )
     component_failure_count = int(not quality_passed) + int(
         not continuity_passed
     )
     return (
         int(not preflight.passed),
         component_failure_count,
-        len(preflight.repair_target_boundary_indices),
-        quality_failure_count,
+        continuity_repair_count,
         normalized_excess,
+        quality_failure_count,
+        generic_repair_count,
         -resolved_weighted_score,
+    )
+
+
+def _direct_member_dense_motion_feedback_boundary_indices(
+    error: DirectMemberEditorialMotionError,
+    *,
+    maximum_count: int = (
+        _DIRECT_MEMBER_MAXIMUM_DENSE_FEEDBACK_CONSTRAINTS_PER_RESELECTION
+    ),
+) -> tuple[int, ...]:
+    """Choose the smallest strongest lazy constraint set for one retry.
+
+    Dense review can expose several violations on one selected path. Forbidding
+    all of them before re-optimizing overconstrains the graph and caused the
+    26-second proof to expand into dozens of unrelated cadence profiles. One
+    strongest violated edge is sufficient for a cutting-plane iteration; the
+    complete dense review runs again on the replacement path.
+    """
+
+    if not isinstance(error, DirectMemberEditorialMotionError):
+        raise TypeError("dense motion feedback needs a structured error")
+    if (
+        isinstance(maximum_count, bool)
+        or not isinstance(maximum_count, int)
+        or maximum_count < 1
+    ):
+        raise ValueError("dense motion feedback count must be positive")
+
+    def reason_weight(reason: str) -> int:
+        if any(
+            token in reason
+            for token in (
+                "identity",
+                "geometry_jump",
+                "disagrees_with_audit",
+            )
+        ):
+            return 4
+        if any(
+            token in reason
+            for token in (
+                "bounded_upscale",
+                "transform_bound",
+                "contain",
+                "no_improving",
+            )
+        ):
+            return 3
+        if any(
+            token in reason
+            for token in (
+                "track_gap",
+                "evidence_missing",
+            )
+        ):
+            return 2
+        return 1
+
+    ranked = sorted(
+        set(error.missing_boundary_indices),
+        key=lambda boundary_index: (
+            -sum(
+                reason_weight(reason)
+                for reason in error.rejection_reasons.get(
+                    boundary_index,
+                    ("required_candidate_missing_without_reason",),
+                )
+            ),
+            -len(error.rejection_reasons.get(boundary_index, ())),
+            boundary_index,
+        ),
+    )
+    return tuple(ranked[:maximum_count])
+
+
+def _direct_member_proxy_look_refinement_is_eligible(
+    payload: Mapping[str, Any],
+) -> bool:
+    """Refine color only after rendered geometry already passes.
+
+    Look normalization cannot repair a bad pose, position, scale, or motion
+    boundary. Re-encoding the same failed cut path before feeding those exact
+    boundaries back to the selector only burns time and obscures the causal
+    result.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("member proxy look refinement needs a mapping")
+    return bool(
+        payload.get("direct_member_rendered_continuity_passed")
+    ) and not bool(payload.get("member_output_quality_passed"))
+
+
+def _direct_member_proxy_look_refinement_can_share_camera_iteration(
+    payload: Mapping[str, Any],
+) -> bool:
+    """Use an already-required camera rerender to repair output look too.
+
+    This does not authorize a color-only rerender while geometry is bad.  It
+    only composes a bounded residual look onto a second decoded-output camera
+    correction that is already going to consume the final proxy slot.  Keep
+    technical-integrity and low-overall-quality failures out of this shortcut.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("member proxy shared look refinement needs a mapping")
+    if bool(payload.get("member_output_quality_passed")):
+        return False
+    raw_failures = payload.get("member_output_quality_failure_reasons")
+    if not isinstance(raw_failures, list) or not raw_failures:
+        return False
+    repairable = {
+        "member_proxy_source_quality_median_span",
+        "member_proxy_perceptual_source_admission",
+    }
+    return all(
+        isinstance(reason, str) and reason in repairable
+        for reason in raw_failures
     )
 
 
@@ -10671,6 +11650,44 @@ def _direct_strict_extra_quota_assignment_failure_is_proven(
     )
 
 
+def _direct_strict_extra_quota_assignment_search_is_authorized(
+    *,
+    represented_source_count: int,
+    source_count: int,
+    qualified_profile_count: int,
+    diagnostics: Mapping[str, Any],
+    duplicate_certificate_saturated: bool = False,
+) -> bool:
+    """Allow remainder-owner search from any exact hard proof.
+
+    The base selector already runs its exact lifeline before reporting a hard
+    quota failure. Requiring a *second* capacity-triggered lifeline retry made
+    the alternate balanced-quota search unreachable for ordinary exact
+    failures, even though changing only the one repeated source can restore a
+    valid all-source path.
+    """
+
+    for name, value in (
+        ("represented_source_count", represented_source_count),
+        ("source_count", source_count),
+        ("qualified_profile_count", qualified_profile_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+    if not isinstance(duplicate_certificate_saturated, bool):
+        raise TypeError("duplicate certificate saturation must be boolean")
+    return bool(
+        source_count >= 2
+        and represented_source_count == source_count
+        and not duplicate_certificate_saturated
+        and qualified_profile_count
+        < _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT
+        and _direct_strict_extra_quota_assignment_failure_is_proven(
+            diagnostics
+        )
+    )
+
+
 def _select_direct_member_partition_profile(
     *,
     timing_draft: GroupDraftTimeline,
@@ -10690,6 +11707,12 @@ def _select_direct_member_partition_profile(
     render_infeasible_transition_edges: Sequence[
         tuple[float, int, int]
     ] = (),
+    render_penalized_transition_edges: Sequence[
+        tuple[float, int, int, float]
+    ] = (),
+    forbidden_source_paths_by_partition_unit_counts: Mapping[
+        tuple[int, ...], Sequence[Sequence[int]]
+    ] | None = None,
     preferred_partition_unit_counts: Sequence[int] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[
@@ -10721,16 +11744,6 @@ def _select_direct_member_partition_profile(
         boundary_search_radius_frames=6,
         boundary_search_step_frames=2,
     )
-    base = _direct_full_frame_base_partition_profile(
-        timing_draft.segments,
-        highlight_intervals=normalized_highlight_intervals,
-    )
-    in_run_preferred_profile = (
-        _direct_member_in_run_preferred_partition_profile(
-            timing_draft.segments,
-            preferred_partition_unit_counts,
-        )
-    )
     represented_source_count = (
         len(source_cycle)
         if required_distinct_source_count is None
@@ -10738,6 +11751,42 @@ def _select_direct_member_partition_profile(
     )
     if not 2 <= represented_source_count <= len(source_cycle):
         raise ValueError("direct member represented source count is invalid")
+    forbidden_paths_by_partition = {
+        tuple(unit_counts): tuple(tuple(path) for path in paths)
+        for unit_counts, paths in (
+            forbidden_source_paths_by_partition_unit_counts or {}
+        ).items()
+    }
+    if any(
+        not unit_counts
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in unit_counts
+        )
+        for unit_counts in forbidden_paths_by_partition
+    ):
+        raise ValueError("direct member forbidden partition key is invalid")
+    ordinary_base = _direct_full_frame_base_partition_profile(
+        timing_draft.segments,
+        highlight_intervals=normalized_highlight_intervals,
+    )
+    minimum_all_source_span_count = (
+        represented_source_count
+        + _DIRECT_MEMBER_MINIMUM_ALL_SOURCE_REUSE_SPAN_COUNT
+    )
+    base = _direct_full_frame_base_partition_profile(
+        timing_draft.segments,
+        highlight_intervals=normalized_highlight_intervals,
+        minimum_span_count=minimum_all_source_span_count,
+    )
+    in_run_preferred_profile = (
+        _direct_member_in_run_preferred_partition_profile(
+            timing_draft.segments,
+            preferred_partition_unit_counts,
+        )
+    )
     if len(base.spans) < represented_source_count:
         raise RuntimeError(
             "coarse direct cadence cannot show every required source"
@@ -10751,8 +11800,40 @@ def _select_direct_member_partition_profile(
                 source_count=len(eligible_sources),
             )
         )
+        if ordinary_base.unit_counts != base.unit_counts:
+            (
+                ordinary_warm_start_profiles,
+                ordinary_warm_start_diagnostics,
+            ) = _load_direct_member_partition_warm_start_profiles(
+                feature_cache_directory,
+                timing_draft.segments,
+                ordinary_base,
+                source_count=len(eligible_sources),
+            )
+            capacity_seed_profiles = (
+                _direct_member_short_proof_capacity_expansion_profiles(
+                    timing_draft.segments,
+                    (ordinary_base, *ordinary_warm_start_profiles),
+                    minimum_span_count=minimum_all_source_span_count,
+                    highlight_intervals=normalized_highlight_intervals,
+                    excluded_unit_counts=(base.unit_counts,),
+                )
+            )
+        else:
+            ordinary_warm_start_profiles = ()
+            ordinary_warm_start_diagnostics = {
+                "status": "base_already_has_all_source_capacity",
+                "loaded_candidate_count": 0,
+            }
+            capacity_seed_profiles = ()
     else:
         warm_start_profiles = ()
+        ordinary_warm_start_profiles = ()
+        capacity_seed_profiles = ()
+        ordinary_warm_start_diagnostics = {
+            "status": "continuous_official_member_contract_required",
+            "loaded_candidate_count": 0,
+        }
         warm_start_diagnostics = {
             "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
             "requested": False,
@@ -10772,15 +11853,19 @@ def _select_direct_member_partition_profile(
         if in_run_preferred_profile is not None
         else set()
     )
+    capacity_signatures = {
+        profile.unit_counts for profile in capacity_seed_profiles
+    }
     persisted_warm_start_profiles = tuple(
         profile
         for profile in warm_start_profiles
         if profile.unit_counts not in preferred_signatures
+        and profile.unit_counts not in capacity_signatures
     )
     feedback_seed_profiles = _direct_member_render_feedback_seed_profiles(
         base,
         in_run_preferred_profile,
-        persisted_warm_start_profiles,
+        (*capacity_seed_profiles, *persisted_warm_start_profiles),
     )
     render_feedback_profiles: list[_DirectFullFramePartitionProfile] = []
     render_feedback_seen_signatures = {
@@ -10813,6 +11898,7 @@ def _select_direct_member_partition_profile(
                 break
     warm_start_profiles = (
         *in_run_preferred_profiles,
+        *capacity_seed_profiles,
         *persisted_warm_start_profiles,
         *render_feedback_profiles,
     )
@@ -10842,6 +11928,35 @@ def _select_direct_member_partition_profile(
             ),
             "in_run_preferred_partition_full_selector_recheck_required": True,
             "in_run_preferred_partition_visual_gates_relaxed": False,
+            "short_proof_all_source_capacity": {
+                "contract": (
+                    "input_bound_musical_carrier_slot_expansion_v1"
+                ),
+                "minimum_span_count": minimum_all_source_span_count,
+                "ordinary_base_span_count": len(ordinary_base.spans),
+                "capacity_base_span_count": len(base.spans),
+                "ordinary_cache_status": (
+                    ordinary_warm_start_diagnostics.get("status")
+                ),
+                "ordinary_cached_seed_count": len(
+                    ordinary_warm_start_profiles
+                ),
+                "generated_candidate_count": len(capacity_seed_profiles),
+                "generated_partition_signatures_sha256": [
+                    _direct_partition_signature_sha256(profile.unit_counts)
+                    for profile in capacity_seed_profiles
+                ],
+                "maximum_candidate_count": (
+                    _DIRECT_MEMBER_MAXIMUM_SHORT_PROOF_CAPACITY_SEED_PROFILE_COUNT
+                ),
+                "existing_musical_boundaries_only": True,
+                "minimum_child_duration_seconds": (
+                    _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_RUN_SECONDS
+                ),
+                "full_selector_recheck_required": True,
+                "cached_source_assignment_reused": False,
+                "visual_gates_relaxed": False,
+            },
             "dense_render_feedback_certificate_count": len(
                 render_infeasible_transition_edges
             ),
@@ -10917,6 +12032,9 @@ def _select_direct_member_partition_profile(
     partition_search_extra_quota_feasible_profile_count = 0
     partition_search_extra_quota_exhausted_profile_count = 0
     partition_search_extra_quota_capacity_exhausted_profile_count = 0
+    partition_search_extra_quota_duplicate_certificate_count = 0
+    partition_search_extra_quota_duplicate_certificate_saturated = False
+    partition_search_extra_quota_exhausted_certificates: set[str] = set()
     partition_search_counterfactual_qualified_parent_count = 0
     partition_search_counterfactual_generated_profile_count = 0
     partition_search_counterfactual_evaluation_count = 0
@@ -11153,18 +12271,6 @@ def _select_direct_member_partition_profile(
         highlight_hold_repair_attempts: list[dict[str, Any]] = []
         maximum_repair_attempt_count = max(1, len(profile.spans) - 1)
         while True:
-            effective_priority_boundaries = tuple(
-                sorted(
-                    set(priority_cut_boundary_indices).union(
-                        forced_highlight_cut_boundaries
-                    )
-                )
-            )
-            effective_priority_hold_limit = (
-                0
-                if forced_highlight_cut_boundaries
-                else maximum_priority_cut_hold_count
-            )
             try:
                 selection = select_balanced_direct_member_sources(
                     sources=eligible_sources,
@@ -11187,13 +12293,25 @@ def _select_direct_member_partition_profile(
                     preferred_source_order=source_cycle,
                     extra_quota_source_indices=extra_quota_source_indices,
                     priority_cut_boundary_indices=(
-                        effective_priority_boundaries
+                        priority_cut_boundary_indices
+                    ),
+                    forbidden_same_source_hold_boundary_indices=tuple(
+                        sorted(forced_highlight_cut_boundaries)
                     ),
                     maximum_priority_cut_hold_count=(
-                        effective_priority_hold_limit
+                        maximum_priority_cut_hold_count
                     ),
                     render_infeasible_transition_edges=(
                         render_infeasible_transition_edges
+                    ),
+                    render_penalized_transition_edges=(
+                        render_penalized_transition_edges
+                    ),
+                    forbidden_source_paths=(
+                        forbidden_paths_by_partition.get(
+                            profile.unit_counts,
+                            (),
+                        )
                     ),
                     config=effective_config,
                     descriptor_provider=provider,
@@ -11293,11 +12411,14 @@ def _select_direct_member_partition_profile(
                         ),
                         "new_forced_cut_boundary_indices": list(newly_forced),
                         "next_priority_cut_boundary_indices": sorted(
-                            set(priority_cut_boundary_indices).union(
-                                forced_highlight_cut_boundaries
-                            )
+                            priority_cut_boundary_indices
                         ),
-                        "next_maximum_priority_cut_hold_count": 0,
+                        "next_forbidden_same_source_hold_boundary_indices": (
+                            sorted(forced_highlight_cut_boundaries)
+                        ),
+                        "next_maximum_priority_cut_hold_count": (
+                            maximum_priority_cut_hold_count
+                        ),
                     }
                 )
                 continue
@@ -11334,6 +12455,8 @@ def _select_direct_member_partition_profile(
         nonlocal partition_search_extra_quota_feasible_profile_count
         nonlocal partition_search_extra_quota_exhausted_profile_count
         nonlocal partition_search_extra_quota_capacity_exhausted_profile_count
+        nonlocal partition_search_extra_quota_duplicate_certificate_count
+        nonlocal partition_search_extra_quota_duplicate_certificate_saturated
         evaluation_index = len(attempted) + 1
         progress_payload = _profile_progress_payload(
             profile,
@@ -11455,20 +12578,24 @@ def _select_direct_member_partition_profile(
             )
         if (
             error is not None
-            and represented_source_count == len(eligible_sources)
-            and exact_lifeline_retry is not None
-            and exact_lifeline_retry.get("result") == "hard_infeasible"
-            and error.diagnostics.get("failure")
-            == "validity_quota_path_exhausted"
-            and error.diagnostics.get("constraint_infeasibility_proven") is True
-            and exact_lifeline_retry.get("final_state_capacity_exhausted") is False
-            and exact_lifeline_retry.get(
-                "final_duration_state_quantization_applied"
-            ) is False
-            and exact_lifeline_retry.get("visual_gates_relaxed") is False
-            and partition_search_extra_quota_profile_count
-            < _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT
+            and _direct_strict_extra_quota_assignment_search_is_authorized(
+                represented_source_count=represented_source_count,
+                source_count=len(eligible_sources),
+                qualified_profile_count=(
+                    partition_search_extra_quota_profile_count
+                ),
+                diagnostics=error.diagnostics,
+                duplicate_certificate_saturated=(
+                    partition_search_extra_quota_duplicate_certificate_saturated
+                ),
+            )
         ):
+            quota_assignment_config = (
+                retry_config
+                if exact_lifeline_retry is not None
+                and exact_lifeline_retry.get("result") == "hard_infeasible"
+                else selection_config
+            )
             extra_quota_assignments = (
                 _direct_strict_extra_quota_assignment_candidates(
                     span_count=len(profile.spans),
@@ -11524,7 +12651,7 @@ def _select_direct_member_partition_profile(
                     try:
                         alternate_selection = _select_profile_with_config(
                             profile,
-                            retry_config,
+                            quota_assignment_config,
                             extra_quota_source_indices=assignment,
                         )
                     except DirectMemberVisualSelectionError as caught:
@@ -11648,18 +12775,47 @@ def _select_direct_member_partition_profile(
                     ),
                     "alternative_assignments": assignment_results,
                 }
+                assignment_certificate_sha256 = hashlib.sha256(
+                    json.dumps(
+                        certificate_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                all_alternatives_proven_hard_infeasible = bool(
+                    assignment_domain_complete
+                    and not feasible_assignments
+                    and len(proven_errors) == len(extra_quota_assignments)
+                )
+                duplicate_exhausted_certificate = bool(
+                    all_alternatives_proven_hard_infeasible
+                    and assignment_certificate_sha256
+                    in partition_search_extra_quota_exhausted_certificates
+                )
+                if all_alternatives_proven_hard_infeasible:
+                    partition_search_extra_quota_exhausted_certificates.add(
+                        assignment_certificate_sha256
+                    )
+                if duplicate_exhausted_certificate:
+                    partition_search_extra_quota_duplicate_certificate_count += 1
+                    partition_search_extra_quota_duplicate_certificate_saturated = (
+                        True
+                    )
                 strict_extra_quota_assignment_search = {
                     "contract": (
                         "strict_balanced_extra_quota_assignment_search_v1"
                     ),
                     "trigger": (
-                        "retry_qualified_visual_split_default_quota_"
-                        "hard_infeasible"
+                        "exact_default_quota_assignment_hard_infeasible"
                     ),
                     "state_limit": (
-                        _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT
+                        quota_assignment_config.feasibility_lifeline_state_limit
                     ),
-                    "state_limit_expanded": False,
+                    "state_limit_expanded": bool(
+                        quota_assignment_config.feasibility_lifeline_state_limit
+                        > selection_config.feasibility_lifeline_state_limit
+                    ),
                     "source_search_order": list(source_cycle),
                     "source_search_order_changed": False,
                     "base_quota": _base_quota,
@@ -11685,9 +12841,13 @@ def _select_direct_member_partition_profile(
                     ),
                     "default_assignment_proven_hard_infeasible": True,
                     "all_alternatives_proven_hard_infeasible": bool(
-                        assignment_domain_complete
-                        and not feasible_assignments
-                        and len(proven_errors) == len(extra_quota_assignments)
+                        all_alternatives_proven_hard_infeasible
+                    ),
+                    "duplicate_exhausted_assignment_certificate": (
+                        duplicate_exhausted_certificate
+                    ),
+                    "further_profile_search_saturated": (
+                        partition_search_extra_quota_duplicate_certificate_saturated
                     ),
                     "capacity_exhausted": bool(capacity_errors),
                     "feasible_assignment_count": len(feasible_assignments),
@@ -11696,14 +12856,9 @@ def _select_direct_member_partition_profile(
                         if selected_assignment is not None
                         else None
                     ),
-                    "assignment_certificate_sha256": hashlib.sha256(
-                        json.dumps(
-                            certificate_payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest(),
+                    "assignment_certificate_sha256": (
+                        assignment_certificate_sha256
+                    ),
                     "counts_differ_by_at_most_one": True,
                     "visual_gates_relaxed": False,
                 }
@@ -11746,6 +12901,12 @@ def _select_direct_member_partition_profile(
                         strict_extra_quota_assignment_search[
                             "assignment_certificate_sha256"
                         ]
+                    ),
+                    duplicate_exhausted_assignment_certificate=(
+                        duplicate_exhausted_certificate
+                    ),
+                    further_profile_search_saturated=(
+                        partition_search_extra_quota_duplicate_certificate_saturated
                     ),
                     visual_gates_relaxed=False,
                     **progress_payload,
@@ -12582,7 +13743,7 @@ def _select_direct_member_partition_profile(
                     _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
                     - partition_search_terminal_safe_hold_evaluation_count,
                 )
-                terminal_candidates = tuple(
+                terminal_candidates = list(
                     sorted(
                         (
                             item
@@ -12800,6 +13961,110 @@ def _select_direct_member_partition_profile(
                                 span_count=len(terminal_profile.spans),
                             )
                         )
+                        repair_child_evaluations: list[dict[str, Any]] = []
+                        if len(terminal_candidates) < (
+                            remaining_terminal_evaluation_limit
+                        ):
+                            repair_children = (
+                                _direct_full_frame_proof_directed_child_profiles(
+                                    timing_draft.segments,
+                                    terminal_profile,
+                                    terminal_hold_error.diagnostics,
+                                )
+                            )
+                            for child in repair_children:
+                                if len(terminal_candidates) >= (
+                                    remaining_terminal_evaluation_limit
+                                ):
+                                    break
+                                child_signature = (
+                                    _direct_partition_signature_sha256(
+                                        child.unit_counts
+                                    )
+                                )
+                                if child.unit_counts in seen_signatures:
+                                    partition_search_signature_deduplication_count += 1
+                                    repair_child_evaluations.append(
+                                        {
+                                            "profile_id": child.profile_id,
+                                            "partition_signature_sha256": (
+                                                child_signature
+                                            ),
+                                            "result": "duplicate",
+                                        }
+                                    )
+                                    continue
+                                seen_signatures.add(child.unit_counts)
+                                partition_search_generated_profile_count += 1
+                                partition_search_composed_profile_evaluation_count += 1
+                                child_error = _evaluate(child)
+                                evaluated_signatures.add(child.unit_counts)
+                                child_result = (
+                                    "strict_feasible"
+                                    if child_error is None
+                                    else "strict_infeasible"
+                                )
+                                child_evaluation = {
+                                    "profile_id": child.profile_id,
+                                    "partition_signature_sha256": (
+                                        child_signature
+                                    ),
+                                    "result": child_result,
+                                    "terminal_audition_queued": False,
+                                    "full_selector_recheck_completed": True,
+                                    "visual_gates_relaxed": False,
+                                }
+                                repair_child_evaluations.append(
+                                    child_evaluation
+                                )
+                                _emit_progress(
+                                    event=(
+                                        "direct_member_post_alignment_"
+                                        "highlight_repair"
+                                    ),
+                                    phase="repair_child_evaluated",
+                                    result=child_result,
+                                    parent_profile_id=(
+                                        terminal_profile.profile_id
+                                    ),
+                                    profile_id=child.profile_id,
+                                    partition_signature_sha256=(
+                                        child_signature
+                                    ),
+                                    full_selector_recheck_completed=True,
+                                    visual_gates_relaxed=False,
+                                )
+                                if child_error is None:
+                                    continue
+                                if not (
+                                    _direct_partition_failure_is_proven(
+                                        child_error.diagnostics
+                                    )
+                                    and _direct_partition_terminal_hold_failure_is_eligible(
+                                        child_error.diagnostics
+                                    )
+                                ):
+                                    child_evaluation["result"] = (
+                                        "strict_failure_not_terminal_authorized"
+                                    )
+                                    continue
+                                terminal_safe_hold_candidates[
+                                    child.unit_counts
+                                ] = (child, child_error)
+                                terminal_candidates.append(
+                                    (child, child_error)
+                                )
+                                partition_search_terminal_safe_hold_candidate_count = max(
+                                    partition_search_terminal_safe_hold_candidate_count,
+                                    len(terminal_safe_hold_candidates),
+                                )
+                                child_evaluation[
+                                    "terminal_audition_queued"
+                                ] = True
+                        if repair_child_evaluations:
+                            attempted_item[
+                                "post_alignment_highlight_repair_children"
+                            ] = repair_child_evaluations
                     _emit_progress(
                         event="direct_member_last_resort_safe_hold_search",
                         phase="last_resort_safe_hold_completed",
@@ -13201,6 +14466,12 @@ def _select_direct_member_partition_profile(
                     "capacity_exhausted_profile_count": (
                         partition_search_extra_quota_capacity_exhausted_profile_count
                     ),
+                    "duplicate_exhausted_certificate_count": (
+                        partition_search_extra_quota_duplicate_certificate_count
+                    ),
+                    "duplicate_certificate_saturated": (
+                        partition_search_extra_quota_duplicate_certificate_saturated
+                    ),
                     "source_search_order_changed": False,
                     "counts_differ_by_at_most_one": True,
                     "state_limit_expanded": False,
@@ -13541,6 +14812,12 @@ def _select_direct_member_partition_profile(
             ),
             "capacity_exhausted_profile_count": (
                 partition_search_extra_quota_capacity_exhausted_profile_count
+            ),
+            "duplicate_exhausted_certificate_count": (
+                partition_search_extra_quota_duplicate_certificate_count
+            ),
+            "duplicate_certificate_saturated": (
+                partition_search_extra_quota_duplicate_certificate_saturated
             ),
             "source_search_order_changed": False,
             "counts_differ_by_at_most_one": True,
@@ -13887,6 +15164,12 @@ def _official_target_fancam_direct_full_frame_segments(
     render_infeasible_transition_edges: Sequence[
         tuple[float, int, int]
     ] = (),
+    render_penalized_transition_edges: Sequence[
+        tuple[float, int, int, float]
+    ] = (),
+    forbidden_source_paths_by_partition_unit_counts: Mapping[
+        tuple[int, ...], Sequence[Sequence[int]]
+    ] | None = None,
     eligible_source_durations_seconds: Sequence[float] | None = None,
     source_metadata_contract: str | None = None,
     highlight_intervals: Sequence[tuple[float, float]] = (),
@@ -13981,6 +15264,12 @@ def _official_target_fancam_direct_full_frame_segments(
             descriptor_provider=descriptor_provider,
             render_infeasible_transition_edges=(
                 render_infeasible_transition_edges
+            ),
+            render_penalized_transition_edges=(
+                render_penalized_transition_edges
+            ),
+            forbidden_source_paths_by_partition_unit_counts=(
+                forbidden_source_paths_by_partition_unit_counts
             ),
             preferred_partition_unit_counts=(
                 preferred_partition_unit_counts
@@ -14384,7 +15673,9 @@ def _official_target_fancam_direct_full_frame_segments(
             boundary_index
         ].mismatch.cinematic_bridge
         expected_kind = (
-            TransitionKind.MEMBER_ZOOM_BRIDGE
+            TransitionKind.FACE_DISSOLVE
+            if bridge is not None and bridge.style == "pose_dissolve"
+            else TransitionKind.MEMBER_ZOOM_BRIDGE
             if bridge is not None and bridge.style == "zoom_in"
             else TransitionKind.MEMBER_BLUR_BRIDGE
         )
@@ -19752,6 +21043,10 @@ def analyze(
     member_direct_dense_face_review_payload: dict[str, Any] | None = None
     member_direct_professional_pre_render_payload: dict[str, Any] | None = None
     member_look_plan: DirectMemberLookPlan | None = None
+    member_final_focal_reference_candidates_by_boundary_index: dict[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ] | None = None
     used_automatic_member_anchors = False
     member_common_start = common_start
     member_anchor_trim_payload: dict[str, Any] | None = None
@@ -22018,15 +23313,11 @@ def analyze(
             )
             direct_required_distinct_source_count = len(eligible_indices)
             if request.render_range_start_seconds is not None:
-                direct_required_distinct_source_count = max(
-                    MINIMUM_AUTOMATIC_MEMBER_SOURCE_COUNT,
-                    math.ceil(len(eligible_indices) * 0.75),
-                )
                 reporter.log(
                     "직캠 품질 증명 구간 소스 정책 · "
                     f"전체 {len(eligible_indices)}개 분석 · "
-                    f"실제 편집 최소 {direct_required_distinct_source_count}개 · "
-                    "유효성·화질·비심각 전환 연결성으로 자동 선택"
+                    f"실제 편집도 {direct_required_distinct_source_count}개 전부 필수 · "
+                    "유효성·화질·비심각 전환 연결성 기준 유지"
                 )
             direct_member_pose_dissolve_enabled = bool(
                 getattr(
@@ -22081,7 +23372,41 @@ def analyze(
             render_infeasible_transition_edges: list[
                 tuple[float, int, int]
             ] = list(loaded_render_infeasible_transition_edges)
+            (
+                loaded_proxy_feedback_penalties,
+                proxy_feedback_load_diagnostics,
+            ) = _load_direct_member_proxy_feedback_penalties(
+                request.source_cache_directory,
+                dense_render_feedback_binding,
+            )
+            render_penalized_transition_edges: list[
+                tuple[float, int, int, float]
+            ] = list(loaded_proxy_feedback_penalties)
+            decoded_proxy_rejected_source_paths_by_partition: dict[
+                tuple[int, ...], list[tuple[int, ...]]
+            ] = {}
+            for rejected_path_item in proxy_feedback_load_diagnostics.get(
+                "rejected_source_paths_by_partition_unit_counts",
+                [],
+            ):
+                if not isinstance(rejected_path_item, Mapping):
+                    raise RuntimeError(
+                        "decoded-proxy rejected-path diagnostics are invalid"
+                    )
+                rejected_partition = tuple(
+                    rejected_path_item["partition_unit_counts"]
+                )
+                rejected_source_path = tuple(
+                    rejected_path_item["source_indices"]
+                )
+                decoded_proxy_rejected_source_paths_by_partition.setdefault(
+                    rejected_partition,
+                    [],
+                ).append(rejected_source_path)
             dense_render_feedback_persistence_diagnostics: dict[
+                str, Any
+            ] | None = None
+            proxy_feedback_persistence_diagnostics: dict[
                 str, Any
             ] | None = None
             reporter.log(
@@ -22101,10 +23426,17 @@ def analyze(
                     f"{dense_render_feedback_load_diagnostics.get('preferred_partition_status', 'unavailable')} · "
                     "전체 선택·렌더 게이트 재검증"
                 )
-            # Dense and decoded-output retries only add exclusion evidence.
-            # Keep the decoded descriptor session alive across those retries;
-            # rebuilding it discarded the in-memory canonical-frame cache and
-            # made a 26-second proof repeatedly pay full feature-loading cost.
+            reporter.log(
+                "직캠 실렌더 품질 패널티 체크포인트 "
+                f"{proxy_feedback_load_diagnostics.get('status')} · "
+                f"복원 {len(render_penalized_transition_edges)}개 · "
+                "경로 전체 no-good 복원 "
+                f"{sum(len(paths) for paths in decoded_proxy_rejected_source_paths_by_partition.values())}개 · "
+                "하드 제외 0개"
+            )
+            # Dense retries add hard camera-solve exclusions. Decoded-output
+            # retries add only finite visual costs. Keep the descriptor session
+            # alive across both so a 26-second proof does not repay feature IO.
             direct_visual_descriptor_provider = _VideoDescriptorProvider(
                 eligible_direct_sources,
                 feature_cache_directory=request.source_cache_directory,
@@ -22113,6 +23445,9 @@ def analyze(
             def _select_direct_member_render_path(
                 render_infeasible_transition_edges: Sequence[
                     tuple[float, int, int]
+                ] = (),
+                render_penalized_transition_edges: Sequence[
+                    tuple[float, int, int, float]
                 ] = (),
                 preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
@@ -22145,6 +23480,11 @@ def analyze(
                         "실렌더 실패 전환을 제외하고 전체 직캠 풀에서 "
                         f"최소 {direct_required_distinct_source_count}개를 "
                         "동시에 다시 푸는 중…"
+                    )
+                elif render_penalized_transition_edges:
+                    reporter.status(
+                        "실렌더 위치·크기·동작 실패 비용을 반영해 "
+                        "같은 분할에서 다른 직캠 경로를 푸는 중…"
                     )
                 for diversity_index, represented_source_count in enumerate(
                     diversity_candidates,
@@ -22197,6 +23537,12 @@ def analyze(
                                 output_fps=29.97,
                                 render_infeasible_transition_edges=(
                                     render_infeasible_transition_edges
+                                ),
+                                render_penalized_transition_edges=(
+                                    render_penalized_transition_edges
+                                ),
+                                forbidden_source_paths_by_partition_unit_counts=(
+                                    decoded_proxy_rejected_source_paths_by_partition
                                 ),
                                 preferred_partition_unit_counts=(
                                     preferred_partition_unit_counts
@@ -22256,6 +23602,13 @@ def analyze(
                         "feedback_certificate_count": len(
                             render_infeasible_transition_edges
                         ),
+                        "decoded_proxy_penalized_edge_count": len(
+                            render_penalized_transition_edges
+                        ),
+                        "decoded_proxy_total_penalty": sum(
+                            item[3]
+                            for item in render_penalized_transition_edges
+                        ),
                         "candidate_source_counts": list(
                             diversity_candidates
                         ),
@@ -22297,6 +23650,13 @@ def analyze(
                     ),
                     "feedback_certificate_count": len(
                         render_infeasible_transition_edges
+                    ),
+                    "decoded_proxy_penalized_edge_count": len(
+                        render_penalized_transition_edges
+                    ),
+                    "decoded_proxy_total_penalty": sum(
+                        item[3]
+                        for item in render_penalized_transition_edges
                     ),
                     "candidate_source_counts": list(diversity_candidates),
                     "attempts": diversity_attempts,
@@ -22343,6 +23703,9 @@ def analyze(
                     direct_visual_selection,
                 ) = _select_direct_member_render_path(
                     tuple(render_infeasible_transition_edges),
+                    render_penalized_transition_edges=tuple(
+                        render_penalized_transition_edges
+                    ),
                     preferred_partition_unit_counts=(
                         loaded_feedback_partition_unit_counts
                     ),
@@ -22400,7 +23763,18 @@ def analyze(
             direct_motion_error: str | None = None
             untouched_direct_segments = segments
             required_transform_boundary_indices: tuple[int, ...] = ()
+            resolved_required_transform_boundary_indices: tuple[int, ...] = ()
+            unresolved_required_transform_boundary_indices: tuple[int, ...] = ()
+            candidate_focal_reference_candidates_by_boundary_index: dict[
+                int,
+                tuple[FocalFaceCandidate, FocalFaceCandidate],
+            ] = {}
             dense_render_path_reselection_count = 0
+            dense_camera_reselection_count = 0
+            decoded_proxy_path_audition_count = 0
+            decoded_proxy_render_count = 0
+            decoded_proxy_camera_refinement_count = 0
+            accepted_rendered_proxy_preflight_payload: dict[str, Any] | None = None
             try:
                 dense_face_provider = DirectMemberDenseFaceProvider(
                     tuple(request.sources[index] for index in eligible_indices),
@@ -22490,11 +23864,29 @@ def analyze(
 
                 def review_direct_member_candidate_proxy(
                     candidate_plan: RenderPlan,
+                    candidate_motion_plan: EditorialMotionPlan,
+                    *,
+                    proxy_render_index: int,
+                    camera_refinement_diagnostics: Mapping[str, Any]
+                    | None = None,
+                    effect_promotion_diagnostics: Mapping[str, Any]
+                    | None = None,
+                    effect_demotion_diagnostics: Mapping[str, Any]
+                    | None = None,
                 ):
+                    if (
+                        isinstance(proxy_render_index, bool)
+                        or not isinstance(proxy_render_index, int)
+                        or proxy_render_index < 1
+                    ):
+                        raise ValueError(
+                            "member proxy render index must be positive"
+                        )
                     reporter.status(
                         "멤버 후보를 480px 실제 출력으로 렌더해 "
                         "포즈·동작·색 품질을 검수하는 중…"
                     )
+                    assert dense_face_provider is not None
                     with tempfile.TemporaryDirectory(
                         prefix=".ive-crosscut-member-proxy-",
                         dir=request.output_directory,
@@ -22504,9 +23896,114 @@ def analyze(
                                 candidate_plan,
                                 Path(temporary_directory)
                                 / "member-candidate.mp4",
+                                focal_reference_candidates_by_boundary_index=(
+                                    candidate_focal_reference_candidates_by_boundary_index
+                                ),
                             )
                         )
                     payload = deepcopy(dict(preflight.payload))
+                    payload["proxy_render_index"] = proxy_render_index
+                    payload["candidate_camera_diagnostics"] = {
+                        "motion_plan": candidate_motion_plan.to_dict(),
+                        "boundary_focal_reference_geometry": [
+                            {
+                                "boundary_index": boundary_index,
+                                "outgoing_bbox_xywh": list(
+                                    pair[0].bbox_xywh
+                                ),
+                                "incoming_bbox_xywh": list(
+                                    pair[1].bbox_xywh
+                                ),
+                            }
+                            for boundary_index, pair in sorted(
+                                candidate_focal_reference_candidates_by_boundary_index.items()
+                            )
+                        ],
+                        "render_segments": [
+                            {
+                                "segment_index": segment_index,
+                                "request_source_index": segment.source_index,
+                                "duration_seconds": segment.duration,
+                                "source_start_seconds": segment.source_start,
+                                "source_duration_seconds": (
+                                    segment.effective_source_duration
+                                ),
+                                "static_crop": (
+                                    asdict(segment.crop)
+                                    if segment.crop is not None
+                                    else None
+                                ),
+                                "editorial_transform_keyframes": (
+                                    [
+                                        asdict(keyframe)
+                                        for keyframe in (
+                                            segment.editorial_transform.keyframes
+                                        )
+                                    ]
+                                    if segment.editorial_transform is not None
+                                    else []
+                                ),
+                            }
+                            for segment_index, segment in enumerate(
+                                candidate_plan.segments
+                            )
+                        ],
+                        "privacy": {
+                            "normalized_geometry_only": True,
+                            "face_embeddings_persisted": False,
+                            "raw_frames_persisted": False,
+                        },
+                    }
+                    if camera_refinement_diagnostics is not None:
+                        payload["candidate_camera_diagnostics"][
+                            "decoded_output_inverse_refinement"
+                        ] = deepcopy(dict(camera_refinement_diagnostics))
+                    if effect_promotion_diagnostics is not None:
+                        promotion_payload = deepcopy(
+                            dict(effect_promotion_diagnostics)
+                        )
+                        promotion_payload["effect_proxy_revalidation"] = {
+                            "performed": True,
+                            "passed": preflight.passed,
+                            "proxy_render_index": proxy_render_index,
+                            "member_output_quality_passed": bool(
+                                payload.get("member_output_quality_passed")
+                            ),
+                            "direct_member_rendered_continuity_passed": bool(
+                                payload.get(
+                                    "direct_member_rendered_continuity_passed"
+                                )
+                            ),
+                            "repair_target_boundary_indices": list(
+                                preflight.repair_target_boundary_indices
+                            ),
+                        }
+                        payload[
+                            "output_verified_dissolve_promotion"
+                        ] = promotion_payload
+                    if effect_demotion_diagnostics is not None:
+                        demotion_payload = deepcopy(
+                            dict(effect_demotion_diagnostics)
+                        )
+                        demotion_payload["effect_proxy_revalidation"] = {
+                            "performed": True,
+                            "passed": preflight.passed,
+                            "proxy_render_index": proxy_render_index,
+                            "member_output_quality_passed": bool(
+                                payload.get("member_output_quality_passed")
+                            ),
+                            "direct_member_rendered_continuity_passed": bool(
+                                payload.get(
+                                    "direct_member_rendered_continuity_passed"
+                                )
+                            ),
+                            "repair_target_boundary_indices": list(
+                                preflight.repair_target_boundary_indices
+                            ),
+                        }
+                        payload[
+                            "output_verified_dissolve_demotion"
+                        ] = demotion_payload
                     generic_payload = payload.get(
                         "rendered_proxy_review"
                     )
@@ -22526,11 +24023,26 @@ def analyze(
                         report_path,
                         payload,
                     )
+                    _write_analysis_manifest_atomically(
+                        request.output_directory
+                        / (
+                            f"{base_filename}-"
+                            f"{_safe_slug(request.target_member.value)}-"
+                            "member-rendered-proxy-preflight-"
+                            f"r{proxy_render_index:02d}.json"
+                        ),
+                        payload,
+                    )
                     return preflight, payload, report_path
 
-                for dense_render_attempt in range(
-                    _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS + 1
+                maximum_path_selection_attempt_count = (
+                    _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
+                    + _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                )
+                for _path_selection_attempt in range(
+                    maximum_path_selection_attempt_count
                 ):
+                    current_path_proxy_render_count = 0
                     untouched_direct_segments = segments
                     required_transform_boundary_indices = tuple(
                         boundary.boundary_index
@@ -22545,6 +24057,12 @@ def analyze(
                         ].kind.uses_overlap
                     )
                     direct_visual_config = direct_visual_selection.config
+                    candidate_member_motion_config = (
+                        _direct_member_editorial_motion_config_from_visual_config(
+                            direct_visual_config
+                        )
+                    )
+                    dense_face_provider.begin_focal_boundary_reference_capture()
                     try:
                         candidate_member_motion_plan = (
                             build_direct_member_editorial_motion_plan(
@@ -22556,13 +24074,97 @@ def analyze(
                                     direct_member_geometry_provider
                                 ),
                                 fps=29.97,
-                                config=(
-                                    _direct_member_editorial_motion_config_from_visual_config(
-                                        direct_visual_config
-                                    )
-                                ),
+                                config=candidate_member_motion_config,
                             )
                         )
+                        focal_capture = (
+                            dense_face_provider.focal_boundary_reference_capture()
+                        )
+                        candidate_focal_reference_candidates_by_boundary_index = (
+                            _direct_member_focal_boundary_reference_mapping(
+                                direct_visual_selection.source_indices,
+                                focal_capture,
+                            )
+                        )
+                        recovered_focal_boundary_indices: list[int] = []
+                        for boundary_index, (
+                            outgoing_eligible_source,
+                            incoming_eligible_source,
+                        ) in enumerate(
+                            zip(
+                                direct_visual_selection.source_indices,
+                                direct_visual_selection.source_indices[1:],
+                            )
+                        ):
+                            if (
+                                outgoing_eligible_source
+                                == incoming_eligible_source
+                                or boundary_index
+                                in candidate_focal_reference_candidates_by_boundary_index
+                            ):
+                                continue
+                            boundary_master_seconds = (
+                                direct_visual_selection
+                                .selected_boundary_master_seconds[
+                                    boundary_index
+                                ]
+                            )
+
+                            def exact_source_local_seconds(
+                                eligible_source_index: int,
+                                canonical_master_seconds: float,
+                            ) -> float:
+                                request_source_index = eligible_indices[
+                                    eligible_source_index
+                                ]
+                                timewarp = source_timewarps[
+                                    request_source_index
+                                ]
+                                return (
+                                    timewarp.master_to_source(
+                                        canonical_master_seconds
+                                    )
+                                    if timewarp is not None
+                                    else canonical_master_seconds
+                                    + offsets[eligible_source_index]
+                                )
+
+                            recovered_pair = (
+                                dense_face_provider
+                                .recover_exact_focal_pair_from_registered_references(
+                                    outgoing_eligible_source,
+                                    exact_source_local_seconds(
+                                        outgoing_eligible_source,
+                                        max(
+                                            member_common_start,
+                                            boundary_master_seconds
+                                            - 1.0 / 29.97,
+                                        ),
+                                    ),
+                                    incoming_eligible_source,
+                                    exact_source_local_seconds(
+                                        incoming_eligible_source,
+                                        boundary_master_seconds,
+                                    ),
+                                )
+                            )
+                            if recovered_pair is None:
+                                continue
+                            candidate_focal_reference_candidates_by_boundary_index[
+                                boundary_index
+                            ] = recovered_pair
+                            recovered_focal_boundary_indices.append(
+                                boundary_index
+                            )
+                        if recovered_focal_boundary_indices:
+                            reporter.log(
+                                "직캠 동일 소스 시간축으로 모호한 얼굴 경계 "
+                                "복구 · "
+                                + ",".join(
+                                    str(value)
+                                    for value in recovered_focal_boundary_indices
+                                )
+                            )
                     except DirectMemberEditorialMotionError as exc:
                         rejection_counts: dict[str, int] = {}
                         for reasons in exc.rejection_reasons.values():
@@ -22584,14 +24186,19 @@ def analyze(
                                 else "구조화된 사유 없음"
                             )
                         )
+                        feedback_boundary_indices = (
+                            _direct_member_dense_motion_feedback_boundary_indices(
+                                exc
+                            )
+                        )
                         reselection_limit_reached = bool(
-                            dense_render_attempt
+                            dense_camera_reselection_count
                             >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
                         )
                         new_certificates: list[
                             tuple[float, int, int]
                         ] = []
-                        for boundary_index in exc.missing_boundary_indices:
+                        for boundary_index in feedback_boundary_indices:
                             if not (
                                 0 <= boundary_index
                                 < len(
@@ -22678,12 +24285,17 @@ def analyze(
                         )
                         reporter.log(
                             "직캠 밀집 렌더 피드백 재선택 "
-                            f"{dense_render_attempt + 1}/"
+                            f"{dense_camera_reselection_count + 1}/"
                             f"{_DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS} · "
                             "실패 경계 "
                             + ",".join(
                                 str(value)
                                 for value in exc.missing_boundary_indices
+                            )
+                            + " · 이번 제약 "
+                            + ",".join(
+                                str(value)
+                                for value in feedback_boundary_indices
                             )
                             + " · 누적 제외 전환 "
                             f"{len(render_infeasible_transition_edges)}개"
@@ -22697,6 +24309,9 @@ def analyze(
                                 direct_visual_selection,
                             ) = _select_direct_member_render_path(
                                 tuple(render_infeasible_transition_edges),
+                                render_penalized_transition_edges=tuple(
+                                    render_penalized_transition_edges
+                                ),
                                 preferred_partition_unit_counts=(
                                     retry_partition_unit_counts
                                 ),
@@ -22710,6 +24325,7 @@ def analyze(
                                 eligible_indices=eligible_indices,
                                 reporter=reporter,
                             ) from selection_exc
+                        dense_camera_reselection_count += 1
                         dense_render_path_reselection_count += 1
                         retry_aggregate = (
                             direct_visual_selection.to_dict()["aggregate"]
@@ -22722,18 +24338,46 @@ def analyze(
                             f"{direct_cadence['source_switch_count']}개"
                         )
                         continue
-                    if not set(required_transform_boundary_indices).issubset(
-                        set(
-                            candidate_member_motion_plan.
-                            accepted_boundary_indices
-                        ).union(
-                            candidate_member_motion_plan.
-                            natural_match_boundary_indices
+                    if (
+                        not candidate_member_motion_config
+                        .allow_partial_required_boundary_matches
+                        and not set(required_transform_boundary_indices).issubset(
+                            set(
+                                candidate_member_motion_plan
+                                .accepted_boundary_indices
+                            ).union(
+                                candidate_member_motion_plan
+                                .natural_match_boundary_indices
+                            )
                         )
                     ):
                         raise ValueError(
                             "required direct-member transform was not densely "
                             "accepted"
+                        )
+                    (
+                        resolved_required_transform_boundary_indices,
+                        unresolved_required_transform_boundary_indices,
+                    ) = _direct_member_required_transform_resolution(
+                        required_transform_boundary_indices,
+                        candidate_member_motion_plan.accepted_boundary_indices,
+                        candidate_member_motion_plan
+                        .natural_match_boundary_indices,
+                    )
+                    if unresolved_required_transform_boundary_indices:
+                        reporter.log(
+                            "직캠 부분 카메라 플랜 · 필수 후보 "
+                            f"{len(required_transform_boundary_indices)}개 중 "
+                            "밀집 안전 적용 "
+                            f"{len(resolved_required_transform_boundary_indices)}개 · "
+                            "미적용 경계 "
+                            + ",".join(
+                                str(value)
+                                for value in (
+                                    unresolved_required_transform_boundary_indices
+                                )
+                            )
+                            + " · 실제 출력 프록시 QA가 최종 판단"
                         )
                     attached_segments = (
                         _attach_direct_member_editorial_motion_tracks(
@@ -22792,16 +24436,59 @@ def analyze(
                             direct_cadence["member_pose_dissolve_count"]
                         ),
                     )
+                    source_frame_geometries = tuple(
+                        direct_visual_selection.source_frame_geometries
+                    )
+                    candidate_camera_maximum_zoom_by_request_source = {
+                        request_source_index: (
+                            min(
+                                EDITORIAL_TRANSFORM_MAXIMUM_ZOOM,
+                                geometry.lossless_zoom_capacity
+                                * candidate_member_motion_config
+                                .maximum_boundary_upscale_ratio,
+                            )
+                            if eligible_source_index
+                            < len(source_frame_geometries)
+                            and (
+                                geometry := source_frame_geometries[
+                                    eligible_source_index
+                                ]
+                            )
+                            is not None
+                            else 1.0
+                        )
+                        for eligible_source_index, request_source_index
+                        in enumerate(eligible_indices)
+                    }
+                    if (
+                        decoded_proxy_render_count
+                        >= _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                    ):
+                        raise RuntimeError(
+                            "direct-member decoded proxy render budget was "
+                            "exhausted before the next path"
+                        )
+                    decoded_proxy_path_audition_count += 1
+                    decoded_proxy_render_count += 1
+                    current_path_proxy_render_count += 1
                     (
                         member_proxy_preflight,
                         rendered_proxy_review_payload,
                         rendered_proxy_review_path,
-                    ) = review_direct_member_candidate_proxy(candidate_plan)
+                    ) = review_direct_member_candidate_proxy(
+                        candidate_plan,
+                        candidate_member_motion_plan,
+                        proxy_render_index=decoded_proxy_render_count,
+                    )
                     continuity_metrics = rendered_proxy_review_payload[
                         "rendered_continuity"
                     ]["metrics"]
                     reporter.log(
                         "멤버 실렌더 프록시 검수 · "
+                        f"경로 {decoded_proxy_path_audition_count}/"
+                        f"{_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS} · "
+                        f"렌더 {decoded_proxy_render_count}/"
+                        f"{_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS} · "
                         f"통과 {member_proxy_preflight.passed} · "
                         "출력 포즈 p95 "
                         f"{continuity_metrics['pose_mismatch_p95']} · "
@@ -22817,14 +24504,474 @@ def analyze(
                             candidate_member_look_plan,
                             member_proxy_preflight,
                             rendered_proxy_review_payload,
+                            None,
                         )
                     ]
-                    for look_refinement_iteration in range(1, 3):
-                        if bool(
+                    candidate_effect_demotion_diagnostics: (
+                        dict[str, Any] | None
+                    ) = None
+                    candidate_camera_refinement_diagnostics: (
+                        dict[str, Any] | None
+                    ) = None
+                    if (
+                        not bool(
                             rendered_proxy_review_payload.get(
-                                "member_output_quality_passed"
+                                "direct_member_rendered_continuity_passed"
+                            )
+                        )
+                        and current_path_proxy_render_count
+                        < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS_PER_PATH
+                        and decoded_proxy_render_count
+                        < (
+                            _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                            - int(
+                                decoded_proxy_path_audition_count
+                                < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                            )
+                        )
+                    ):
+                        (
+                            camera_refined_plan,
+                            camera_refinement_diagnostics,
+                        ) = (
+                            refine_direct_member_camera_plan_from_rendered_proxy(
+                                candidate_plan,
+                                member_proxy_preflight,
+                                maximum_zoom_by_source_index=(
+                                    candidate_camera_maximum_zoom_by_request_source
+                                ),
+                                allow_official_fancam_subject_geometry=True,
+                            )
+                        )
+                        if bool(camera_refinement_diagnostics["applied"]):
+                            candidate_camera_refinement_diagnostics = dict(
+                                camera_refinement_diagnostics
+                            )
+                            decoded_proxy_camera_refinement_count += 1
+                            decoded_proxy_render_count += 1
+                            current_path_proxy_render_count += 1
+                            candidate_plan = camera_refined_plan
+                            candidate_segments = candidate_plan.segments
+                            shared_look_refinement = False
+                            if (
+                                _direct_member_proxy_look_refinement_can_share_camera_iteration(
+                                    rendered_proxy_review_payload
+                                )
+                            ):
+                                live_generic_proxy_payload = (
+                                    member_proxy_preflight.payload.get(
+                                        "rendered_proxy_review"
+                                    )
+                                )
+                                if not isinstance(
+                                    live_generic_proxy_payload,
+                                    Mapping,
+                                ):
+                                    raise RuntimeError(
+                                        "member decoded proxy lacks shared "
+                                        "output look refinement evidence"
+                                    )
+                                candidate_member_look_plan = (
+                                    refine_direct_member_look_plan_from_rendered_proxy(
+                                        candidate_member_look_plan,
+                                        rendered_proxy_review=(
+                                            live_generic_proxy_payload
+                                        ),
+                                        eligible_request_source_indices=(
+                                            eligible_indices
+                                        ),
+                                    )
+                                )
+                                candidate_segments = (
+                                    candidate_member_look_plan.apply(
+                                        candidate_segments
+                                    )
+                                )
+                                candidate_plan = replace(
+                                    candidate_plan,
+                                    segments=candidate_segments,
+                                )
+                                shared_look_refinement = True
+                                candidate_camera_refinement_diagnostics[
+                                    "shared_output_look_refinement"
+                                ] = {
+                                    "applied": True,
+                                    "iteration": (
+                                        candidate_member_look_plan
+                                        .output_proxy_refinement_iteration
+                                    ),
+                                    "reason": (
+                                        "repairable_look_failure_on_required_"
+                                        "camera_rerender"
+                                    ),
+                                    "detail_equalization_enabled": True,
+                                }
+                            reporter.status(
+                                "실제 출력 얼굴 좌표로 같은 컷의 "
+                                "확대·이동을 역보정하는 중…"
+                            )
+                            reporter.log(
+                                "직캠 출력공간 카메라 역보정 · 경계 "
+                                + ",".join(
+                                    str(value)
+                                    for value in camera_refinement_diagnostics[
+                                        "refined_boundary_indices"
+                                    ]
+                                )
+                                + " · 소스·컷시각 유지"
+                                + (
+                                    " · 출력 룩·선명도 잔차 동시 보정"
+                                    if shared_look_refinement
+                                    else ""
+                                )
+                                + " · 프록시 렌더 "
+                                f"{decoded_proxy_render_count}/"
+                                f"{_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS}"
+                            )
+                            (
+                                member_proxy_preflight,
+                                rendered_proxy_review_payload,
+                                rendered_proxy_review_path,
+                            ) = review_direct_member_candidate_proxy(
+                                candidate_plan,
+                                candidate_member_motion_plan,
+                                proxy_render_index=(
+                                    decoded_proxy_render_count
+                                ),
+                                camera_refinement_diagnostics=(
+                                    candidate_camera_refinement_diagnostics
+                                ),
+                            )
+                            continuity_metrics = (
+                                rendered_proxy_review_payload[
+                                    "rendered_continuity"
+                                ]["metrics"]
+                            )
+                            reporter.log(
+                                "직캠 카메라 역보정 실렌더 프록시 · "
+                                f"통과 {member_proxy_preflight.passed} · "
+                                "출력 위치 p95 "
+                                f"{continuity_metrics['attention_position_mismatch_p95']} · "
+                                "출력 크기 p95 "
+                                f"{continuity_metrics['attention_scale_mismatch_p95']}"
+                            )
+                            proxy_refinement_candidates.append(
+                                (
+                                    candidate_plan,
+                                    candidate_segments,
+                                    candidate_member_look_plan,
+                                    member_proxy_preflight,
+                                    rendered_proxy_review_payload,
+                                    None,
+                                )
+                            )
+                    if (
+                        not bool(
+                            rendered_proxy_review_payload.get(
+                                "direct_member_rendered_continuity_passed"
+                            )
+                        )
+                        and current_path_proxy_render_count
+                        < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS_PER_PATH
+                        and decoded_proxy_render_count
+                        < (
+                            _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                            - int(
+                                decoded_proxy_path_audition_count
+                                < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                            )
+                        )
+                    ):
+                        (
+                            second_camera_refined_plan,
+                            second_camera_refinement_diagnostics,
+                        ) = (
+                            refine_direct_member_camera_plan_from_rendered_proxy(
+                                candidate_plan,
+                                member_proxy_preflight,
+                                maximum_zoom_by_source_index=(
+                                    candidate_camera_maximum_zoom_by_request_source
+                                ),
+                                allow_official_fancam_subject_geometry=True,
+                            )
+                        )
+                        if bool(
+                            second_camera_refinement_diagnostics["applied"]
+                        ):
+                            second_camera_diagnostics_payload = dict(
+                                second_camera_refinement_diagnostics
+                            )
+                            if candidate_camera_refinement_diagnostics is not None:
+                                second_camera_diagnostics_payload[
+                                    "previous_refinement"
+                                ] = deepcopy(
+                                    candidate_camera_refinement_diagnostics
+                                )
+                            candidate_plan = second_camera_refined_plan
+                            candidate_segments = candidate_plan.segments
+                            shared_look_refinement = False
+                            if (
+                                _direct_member_proxy_look_refinement_can_share_camera_iteration(
+                                    rendered_proxy_review_payload
+                                )
+                            ):
+                                live_generic_proxy_payload = (
+                                    member_proxy_preflight.payload.get(
+                                        "rendered_proxy_review"
+                                    )
+                                )
+                                if not isinstance(
+                                    live_generic_proxy_payload,
+                                    Mapping,
+                                ):
+                                    raise RuntimeError(
+                                        "member decoded proxy lacks shared "
+                                        "output look refinement evidence"
+                                    )
+                                candidate_member_look_plan = (
+                                    refine_direct_member_look_plan_from_rendered_proxy(
+                                        candidate_member_look_plan,
+                                        rendered_proxy_review=(
+                                            live_generic_proxy_payload
+                                        ),
+                                        eligible_request_source_indices=(
+                                            eligible_indices
+                                        ),
+                                    )
+                                )
+                                candidate_segments = (
+                                    candidate_member_look_plan.apply(
+                                        candidate_segments
+                                    )
+                                )
+                                candidate_plan = replace(
+                                    candidate_plan,
+                                    segments=candidate_segments,
+                                )
+                                shared_look_refinement = True
+                                second_camera_diagnostics_payload[
+                                    "shared_output_look_refinement"
+                                ] = {
+                                    "applied": True,
+                                    "iteration": (
+                                        candidate_member_look_plan
+                                        .output_proxy_refinement_iteration
+                                    ),
+                                    "reason": (
+                                        "repairable_look_failure_on_required_"
+                                        "camera_rerender"
+                                    ),
+                                }
+                            candidate_camera_refinement_diagnostics = (
+                                second_camera_diagnostics_payload
+                            )
+                            decoded_proxy_camera_refinement_count += 1
+                            decoded_proxy_render_count += 1
+                            current_path_proxy_render_count += 1
+                            reporter.status(
+                                "남은 실제 출력 얼굴 오차를 같은 컷에서 "
+                                "한 번 더 보정하는 중…"
+                            )
+                            reporter.log(
+                                "직캠 출력공간 2차 카메라 역보정 · 경계 "
+                                + ",".join(
+                                    str(value)
+                                    for value in (
+                                        second_camera_refinement_diagnostics[
+                                            "refined_boundary_indices"
+                                        ]
+                                    )
+                                )
+                                + " · 소스·컷시각 유지"
+                                + (
+                                    " · 출력 룩 잔차 동시 보정"
+                                    if shared_look_refinement
+                                    else ""
+                                )
+                                + " · 프록시 렌더 "
+                                f"{decoded_proxy_render_count}/"
+                                f"{_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS}"
+                            )
+                            (
+                                member_proxy_preflight,
+                                rendered_proxy_review_payload,
+                                rendered_proxy_review_path,
+                            ) = review_direct_member_candidate_proxy(
+                                candidate_plan,
+                                candidate_member_motion_plan,
+                                proxy_render_index=(
+                                    decoded_proxy_render_count
+                                ),
+                                camera_refinement_diagnostics=(
+                                    second_camera_diagnostics_payload
+                                ),
+                            )
+                            continuity_metrics = (
+                                rendered_proxy_review_payload[
+                                    "rendered_continuity"
+                                ]["metrics"]
+                            )
+                            reporter.log(
+                                "직캠 2차 카메라 역보정 실렌더 프록시 · "
+                                f"통과 {member_proxy_preflight.passed} · "
+                                "출력 위치 p95 "
+                                f"{continuity_metrics['attention_position_mismatch_p95']} · "
+                                "출력 크기 p95 "
+                                f"{continuity_metrics['attention_scale_mismatch_p95']} · "
+                                "출력 품질 통과 "
+                                f"{rendered_proxy_review_payload['member_output_quality_passed']}"
+                            )
+                            proxy_refinement_candidates.append(
+                                (
+                                    candidate_plan,
+                                    candidate_segments,
+                                    candidate_member_look_plan,
+                                    member_proxy_preflight,
+                                    rendered_proxy_review_payload,
+                                    None,
+                                )
+                            )
+                    if (
+                        not bool(
+                            rendered_proxy_review_payload.get(
+                                "direct_member_rendered_continuity_passed"
+                            )
+                        )
+                        and int(
+                            candidate_plan.member_pose_dissolve_count or 0
+                        )
+                        > 1
+                        and decoded_proxy_render_count
+                        < (
+                            _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                            - int(
+                                decoded_proxy_path_audition_count
+                                < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                            )
+                        )
+                    ):
+                        (
+                            selectively_demoted_plan,
+                            selective_demotion_diagnostics,
+                        ) = (
+                            demote_failed_direct_member_pose_dissolves_from_rendered_proxy(
+                                candidate_plan,
+                                member_proxy_preflight,
+                            )
+                        )
+                        if bool(
+                            selective_demotion_diagnostics.get("applied")
+                        ):
+                            candidate_effect_demotion_diagnostics = dict(
+                                selective_demotion_diagnostics
+                            )
+                            decoded_proxy_render_count += 1
+                            current_path_proxy_render_count += 1
+                            candidate_plan = selectively_demoted_plan
+                            candidate_segments = candidate_plan.segments
+                            reporter.status(
+                                "입·출구가 깨진 리졸브만 하드컷으로 내리고 "
+                                "통과 효과를 다시 검수하는 중…"
+                            )
+                            reporter.log(
+                                "직캠 리졸브 선택 강등 · 제외 경계 "
+                                + ",".join(
+                                    str(value)
+                                    for value in (
+                                        selective_demotion_diagnostics[
+                                            "demoted_boundary_indices"
+                                        ]
+                                    )
+                                )
+                                + " · 유지 경계 "
+                                + ",".join(
+                                    str(value)
+                                    for value in (
+                                        selective_demotion_diagnostics[
+                                            "retained_boundary_indices"
+                                        ]
+                                    )
+                                )
+                                + " · 소스·컷·카메라·룩 유지 · 프록시 렌더 "
+                                f"{decoded_proxy_render_count}/"
+                                f"{_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS}"
+                            )
+                            (
+                                member_proxy_preflight,
+                                rendered_proxy_review_payload,
+                                rendered_proxy_review_path,
+                            ) = review_direct_member_candidate_proxy(
+                                candidate_plan,
+                                candidate_member_motion_plan,
+                                proxy_render_index=(
+                                    decoded_proxy_render_count
+                                ),
+                                camera_refinement_diagnostics=(
+                                    candidate_camera_refinement_diagnostics
+                                ),
+                                effect_demotion_diagnostics=(
+                                    candidate_effect_demotion_diagnostics
+                                ),
+                            )
+                            reporter.log(
+                                "직캠 리졸브 선택 강등 실렌더 프록시 · "
+                                f"효과 {candidate_plan.member_pose_dissolve_count}개 · "
+                                f"통과 {member_proxy_preflight.passed} · "
+                                "재선택 대상 "
+                                f"{len(member_proxy_preflight.repair_target_boundary_indices)}개"
+                            )
+                            proxy_refinement_candidates.append(
+                                (
+                                    candidate_plan,
+                                    candidate_segments,
+                                    candidate_member_look_plan,
+                                    member_proxy_preflight,
+                                    rendered_proxy_review_payload,
+                                    candidate_effect_demotion_diagnostics,
+                                )
+                            )
+                    for look_refinement_iteration in range(1, 3):
+                        if not _direct_member_proxy_look_refinement_is_eligible(
+                            rendered_proxy_review_payload
+                        ):
+                            if not bool(
+                                rendered_proxy_review_payload.get(
+                                    "direct_member_rendered_continuity_passed"
+                                )
+                            ):
+                                reporter.log(
+                                    "직캠 실렌더 연속성 실패 · 색·명암만 "
+                                    "바꾸는 룩 재렌더를 생략하고 경로를 "
+                                    "즉시 재선택"
+                                )
+                            break
+                        if (
+                            current_path_proxy_render_count
+                            >= _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS_PER_PATH
+                            or decoded_proxy_render_count
+                            >= (
+                                _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                                - int(
+                                    decoded_proxy_path_audition_count
+                                    < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                                )
                             )
                         ):
+                            reporter.log(
+                                "직캠 현재 경로 프록시 보정 상한 도달 · "
+                                "다음 경로 검수 1회를 보존하고 추가 룩 재렌더 생략"
+                            )
+                            break
+                        if (
+                            decoded_proxy_render_count
+                            >= _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                        ):
+                            reporter.log(
+                                "직캠 하드컷 실렌더 프록시 "
+                                f"총 {_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS}회 "
+                                "상한 도달 · "
+                                "추가 룩 재렌더 생략"
+                            )
                             break
                         live_generic_proxy_payload = (
                             member_proxy_preflight.payload.get(
@@ -22864,12 +25011,19 @@ def analyze(
                             f"{look_refinement_iteration}/2 · "
                             "색 교대도 최종 QA 기준에 포함"
                         )
+                        decoded_proxy_render_count += 1
+                        current_path_proxy_render_count += 1
                         (
                             member_proxy_preflight,
                             rendered_proxy_review_payload,
                             rendered_proxy_review_path,
                         ) = review_direct_member_candidate_proxy(
-                            candidate_plan
+                            candidate_plan,
+                            candidate_member_motion_plan,
+                            proxy_render_index=decoded_proxy_render_count,
+                            camera_refinement_diagnostics=(
+                                candidate_camera_refinement_diagnostics
+                            ),
                         )
                         continuity_metrics = (
                             rendered_proxy_review_payload[
@@ -22891,6 +25045,7 @@ def analyze(
                                 candidate_member_look_plan,
                                 member_proxy_preflight,
                                 rendered_proxy_review_payload,
+                                candidate_effect_demotion_diagnostics,
                             )
                         )
                     (
@@ -22911,6 +25066,7 @@ def analyze(
                         candidate_member_look_plan,
                         member_proxy_preflight,
                         rendered_proxy_review_payload,
+                        candidate_effect_demotion_diagnostics,
                     ) = best_proxy_candidate
                     if best_proxy_candidate_index != (
                         len(proxy_refinement_candidates) - 1
@@ -22924,25 +25080,418 @@ def analyze(
                             f"프록시 후보 {best_proxy_candidate_index}/"
                             f"{len(proxy_refinement_candidates) - 1} 채택"
                         )
+                    if (
+                        member_proxy_preflight.passed
+                        and candidate_plan.member_pose_dissolve_requested
+                        is True
+                        and candidate_plan.member_pose_dissolve_count == 0
+                    ):
+                        hardcut_candidate_plan = candidate_plan
+                        hardcut_candidate_preflight = member_proxy_preflight
+                        source_durations_by_request_index = dict(
+                            zip(
+                                eligible_indices,
+                                eligible_direct_source_durations_seconds,
+                                strict=True,
+                            )
+                        )
+                        excluded_effect_boundary_indices: set[int] = set()
+                        effect_promotion_attempts: list[dict[str, Any]] = []
+                        while True:
+                            (
+                                promoted_effect_plan,
+                                effect_promotion_diagnostics,
+                            ) = (
+                                promote_direct_member_pose_dissolves_from_rendered_proxy(
+                                    hardcut_candidate_plan,
+                                    hardcut_candidate_preflight,
+                                    source_durations_by_index=(
+                                        source_durations_by_request_index
+                                    ),
+                                    highlight_intervals=(
+                                        direct_highlight_intervals
+                                    ),
+                                    excluded_boundary_indices=tuple(
+                                        sorted(
+                                            excluded_effect_boundary_indices
+                                        )
+                                    ),
+                                )
+                            )
+                            if not bool(
+                                effect_promotion_diagnostics.get("applied")
+                            ):
+                                rendered_proxy_review_payload[
+                                    "output_verified_dissolve_promotion"
+                                ] = deepcopy(effect_promotion_diagnostics)
+                                _write_analysis_manifest_atomically(
+                                    rendered_proxy_review_path,
+                                    rendered_proxy_review_payload,
+                                )
+                                raise RuntimeError(
+                                    "member pose dissolve was enabled but no "
+                                    "decoded-output candidate survived effect "
+                                    "promotion; status="
+                                    + str(
+                                        effect_promotion_diagnostics.get(
+                                            "status", "unknown"
+                                        )
+                                    )
+                                    + f"; report={rendered_proxy_review_path}"
+                                )
+                            if (
+                                decoded_proxy_render_count
+                                >= _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS
+                            ):
+                                raise RuntimeError(
+                                    "member pose dissolve effect proxy could "
+                                    "not run within the decoded render budget; "
+                                    f"report={rendered_proxy_review_path}"
+                                )
+                            selected_effect_boundary_indices = tuple(
+                                int(value)
+                                for value in effect_promotion_diagnostics[
+                                    "selected_boundary_indices"
+                                ]
+                            )
+                            decoded_proxy_render_count += 1
+                            reporter.status(
+                                "출력에서 맞은 동작 경계에 리졸브를 넣고 "
+                                "효과 입·출구 프레임을 다시 검수하는 중…"
+                            )
+                            reporter.log(
+                                "직캠 출력검증 리졸브 승격 · 경계 "
+                                + ",".join(
+                                    str(value)
+                                    for value in (
+                                        selected_effect_boundary_indices
+                                    )
+                                )
+                                + " · 소스·컷·카메라·룩 유지 · 프록시 렌더 "
+                                f"{decoded_proxy_render_count}/"
+                                f"{_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS}"
+                            )
+                            (
+                                member_proxy_preflight,
+                                rendered_proxy_review_payload,
+                                rendered_proxy_review_path,
+                            ) = review_direct_member_candidate_proxy(
+                                promoted_effect_plan,
+                                candidate_member_motion_plan,
+                                proxy_render_index=decoded_proxy_render_count,
+                                camera_refinement_diagnostics=(
+                                    candidate_camera_refinement_diagnostics
+                                ),
+                                effect_promotion_diagnostics=(
+                                    effect_promotion_diagnostics
+                                ),
+                            )
+                            persisted_effect_promotion = (
+                                rendered_proxy_review_payload.get(
+                                    "output_verified_dissolve_promotion"
+                                )
+                            )
+                            if not isinstance(
+                                persisted_effect_promotion,
+                                Mapping,
+                            ):
+                                raise RuntimeError(
+                                    "member effect proxy lost its promotion "
+                                    "provenance"
+                                )
+                            effect_promotion_attempts.append(
+                                deepcopy(dict(persisted_effect_promotion))
+                            )
+                            reporter.log(
+                                "직캠 리졸브 실렌더 프록시 · "
+                                f"효과 {len(selected_effect_boundary_indices)}개 · "
+                                f"통과 {member_proxy_preflight.passed} · "
+                                "효과 입·출구 포함 재선택 대상 "
+                                f"{len(member_proxy_preflight.repair_target_boundary_indices)}개"
+                            )
+                            if member_proxy_preflight.passed:
+                                candidate_plan = promoted_effect_plan
+                                candidate_segments = candidate_plan.segments
+                                break
+                            failed_effect_boundary_indices = set(
+                                member_proxy_preflight.
+                                repair_target_boundary_indices
+                            ).intersection(
+                                selected_effect_boundary_indices
+                            )
+                            if not failed_effect_boundary_indices:
+                                raise RuntimeError(
+                                    "member effect proxy failed outside the "
+                                    "promoted dissolve boundaries and cannot "
+                                    "be safely downgraded; report="
+                                    f"{rendered_proxy_review_path}"
+                                )
+                            excluded_effect_boundary_indices.update(
+                                failed_effect_boundary_indices
+                            )
+                            if (
+                                decoded_proxy_render_count
+                                >= _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS
+                            ):
+                                raise RuntimeError(
+                                    "member effect proxy revalidation exhausted "
+                                    "after rejecting dissolve boundaries "
+                                    + ",".join(
+                                        str(value)
+                                        for value in sorted(
+                                            failed_effect_boundary_indices
+                                        )
+                                    )
+                                    + f"; report={rendered_proxy_review_path}"
+                                )
+                            reporter.log(
+                                "직캠 리졸브 효과 프록시 실패 경계만 제외하고 "
+                                "다음 출력검증 후보를 재승격 · 제외 "
+                                + ",".join(
+                                    str(value)
+                                    for value in sorted(
+                                        excluded_effect_boundary_indices
+                                    )
+                                )
+                            )
+                        pose_dissolve_payload = deepcopy(
+                            dict(direct_cadence["pose_matched_dissolves"])
+                        )
+                        pose_dissolve_payload[
+                            "source_domain_planner_result"
+                        ] = deepcopy(pose_dissolve_payload)
+                        final_effect_promotion = effect_promotion_attempts[-1]
+                        effect_count = int(
+                            candidate_plan.member_pose_dissolve_count or 0
+                        )
+                        duration_minutes = candidate_plan.duration / 60.0
+                        eligible_effect_count = max(
+                            int(
+                                attempt.get("eligible_candidate_count", 0)
+                            )
+                            for attempt in effect_promotion_attempts
+                        )
+                        pose_dissolve_payload.update(
+                            {
+                                "analysis_basis": final_effect_promotion.get(
+                                    "analysis"
+                                ),
+                                "member_pose_dissolve_requested": True,
+                                "member_pose_dissolve_effective": bool(
+                                    effect_count
+                                ),
+                                "member_pose_dissolve_count": effect_count,
+                                "eligible_candidate_count": (
+                                    eligible_effect_count
+                                ),
+                                "eligible_candidates_per_minute": (
+                                    eligible_effect_count / duration_minutes
+                                    if duration_minutes > 1e-9
+                                    else None
+                                ),
+                                "selected_dissolve_count": effect_count,
+                                "selected_dissolves_per_minute": (
+                                    effect_count / duration_minutes
+                                    if duration_minutes > 1e-9
+                                    else None
+                                ),
+                                "hard_cut_count": sum(
+                                    transition.kind
+                                    is TransitionKind.HARD_CUT
+                                    for transition in (
+                                        candidate_plan.transitions
+                                    )
+                                ),
+                                "selected_highlight_count": int(
+                                    final_effect_promotion.get(
+                                        "selected_highlight_count", 0
+                                    )
+                                ),
+                                "selected_both_moving_count": int(
+                                    final_effect_promotion.get(
+                                        "selected_both_moving_count", 0
+                                    )
+                                ),
+                                "selected_face_attention_count": (
+                                    effect_count
+                                ),
+                                "selected_duration_seconds": [
+                                    transition.duration_seconds(
+                                        candidate_plan.fps
+                                    )
+                                    for transition in (
+                                        candidate_plan.transitions
+                                    )
+                                    if transition.kind
+                                    is TransitionKind.FACE_DISSOLVE
+                                ],
+                                "rejection_reason_counts": deepcopy(
+                                    final_effect_promotion.get(
+                                        "rejection_reason_counts", {}
+                                    )
+                                ),
+                                "output_verified_refinement": {
+                                    "applied": True,
+                                    "effect_proxy_revalidated": True,
+                                    "attempt_count": len(
+                                        effect_promotion_attempts
+                                    ),
+                                    "attempts": effect_promotion_attempts,
+                                    "final_selected_boundary_indices": list(
+                                        final_effect_promotion.get(
+                                            "selected_boundary_indices", []
+                                        )
+                                    ),
+                                },
+                            }
+                        )
+                        direct_cadence[
+                            "pose_matched_dissolves"
+                        ] = pose_dissolve_payload
+                        direct_cadence[
+                            "member_pose_dissolve_effective"
+                        ] = bool(effect_count)
+                        direct_cadence[
+                            "member_pose_dissolve_count"
+                        ] = effect_count
+                        member_transitions = candidate_plan.transitions
+                        for segment_index, detail in enumerate(
+                            direct_segment_details
+                        ):
+                            detail["outgoing_transition"] = (
+                                member_transitions[
+                                    segment_index
+                                ].to_dict(candidate_plan.fps)
+                                if segment_index < len(member_transitions)
+                                else None
+                            )
+                    if (
+                        member_proxy_preflight.passed
+                        and candidate_effect_demotion_diagnostics is not None
+                    ):
+                        persisted_effect_demotion = (
+                            rendered_proxy_review_payload.get(
+                                "output_verified_dissolve_demotion"
+                            )
+                        )
+                        if not isinstance(
+                            persisted_effect_demotion,
+                            Mapping,
+                        ):
+                            raise RuntimeError(
+                                "member selective effect demotion lost its "
+                                "decoded-output provenance"
+                            )
+                        effect_count = int(
+                            candidate_plan.member_pose_dissolve_count or 0
+                        )
+                        duration_minutes = candidate_plan.duration / 60.0
+                        pose_dissolve_payload = deepcopy(
+                            dict(direct_cadence["pose_matched_dissolves"])
+                        )
+                        pose_dissolve_payload[
+                            "source_domain_planner_result"
+                        ] = deepcopy(pose_dissolve_payload)
+                        pose_dissolve_payload.update(
+                            {
+                                "analysis_basis": (
+                                    persisted_effect_demotion.get("analysis")
+                                ),
+                                "member_pose_dissolve_requested": True,
+                                "member_pose_dissolve_effective": True,
+                                "member_pose_dissolve_count": effect_count,
+                                "selected_dissolve_count": effect_count,
+                                "selected_dissolves_per_minute": (
+                                    effect_count / duration_minutes
+                                    if duration_minutes > 1e-9
+                                    else None
+                                ),
+                                "hard_cut_count": sum(
+                                    transition.kind
+                                    is TransitionKind.HARD_CUT
+                                    for transition in candidate_plan.transitions
+                                ),
+                                "selected_duration_seconds": [
+                                    transition.duration_seconds(
+                                        candidate_plan.fps
+                                    )
+                                    for transition in candidate_plan.transitions
+                                    if transition.kind
+                                    is TransitionKind.FACE_DISSOLVE
+                                ],
+                                "output_verified_refinement": {
+                                    "applied": True,
+                                    "effect_proxy_revalidated": True,
+                                    "mode": (
+                                        "selective_failed_effect_demotion"
+                                    ),
+                                    "demoted_boundary_indices": list(
+                                        persisted_effect_demotion.get(
+                                            "demoted_boundary_indices", []
+                                        )
+                                    ),
+                                    "final_selected_boundary_indices": list(
+                                        persisted_effect_demotion.get(
+                                            "retained_boundary_indices", []
+                                        )
+                                    ),
+                                    "revalidation": deepcopy(
+                                        persisted_effect_demotion.get(
+                                            "effect_proxy_revalidation", {}
+                                        )
+                                    ),
+                                },
+                            }
+                        )
+                        direct_cadence[
+                            "pose_matched_dissolves"
+                        ] = pose_dissolve_payload
+                        direct_cadence[
+                            "member_pose_dissolve_effective"
+                        ] = True
+                        direct_cadence[
+                            "member_pose_dissolve_count"
+                        ] = effect_count
+                        member_transitions = candidate_plan.transitions
+                        for segment_index, detail in enumerate(
+                            direct_segment_details
+                        ):
+                            detail["outgoing_transition"] = (
+                                member_transitions[
+                                    segment_index
+                                ].to_dict(candidate_plan.fps)
+                                if segment_index < len(member_transitions)
+                                else None
+                            )
                     if not member_proxy_preflight.passed:
                         reselection_limit_reached = bool(
-                            dense_render_attempt
-                            >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
+                            decoded_proxy_path_audition_count
+                            >= _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                            or
+                            decoded_proxy_render_count
+                            >= _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
                         )
-                        proxy_failure_indices = (
+                        ranked_proxy_penalties = (
                             member_proxy_preflight.
-                            ranked_reselection_boundary_indices(
+                            ranked_reselection_boundary_penalties(
                                 maximum_count=4
                             )
                         )
-                        new_certificates = []
+                        proxy_failure_indices = tuple(
+                            boundary_index
+                            for boundary_index, _penalty
+                            in ranked_proxy_penalties
+                        )
+                        penalty_updates: list[
+                            tuple[float, int, int, float]
+                        ] = []
                         request_to_eligible = {
                             request_index: eligible_index
                             for eligible_index, request_index in enumerate(
                                 eligible_indices
                             )
                         }
-                        for boundary_index in proxy_failure_indices:
+                        for boundary_index, penalty in ranked_proxy_penalties:
                             if not (
                                 0 <= boundary_index
                                 < len(
@@ -22973,44 +25522,65 @@ def analyze(
                                 == incoming_eligible_source
                             ):
                                 continue
-                            certificate = (
+                            penalty_update = (
                                 direct_visual_selection.
                                 selected_boundary_master_seconds[
                                     boundary_index
                                 ],
                                 outgoing_eligible_source,
                                 incoming_eligible_source,
+                                penalty,
                             )
-                            if (
-                                certificate
-                                not in render_infeasible_transition_edges
-                                and certificate not in new_certificates
-                            ):
-                                new_certificates.append(certificate)
-                        if not new_certificates:
+                            penalty_updates.append(penalty_update)
+                        if not penalty_updates:
                             raise RuntimeError(
                                 "direct-member decoded proxy failed without "
-                                "a new continuity reselection certificate; "
+                                "a continuity penalty update; "
                                 f"report={rendered_proxy_review_path}"
                             )
-                        render_infeasible_transition_edges.extend(
-                            new_certificates
+                        render_penalized_transition_edges = list(
+                            _accumulate_direct_member_proxy_feedback_penalties(
+                                render_penalized_transition_edges,
+                                penalty_updates,
+                                source_count=len(eligible_indices),
+                                range_start=(
+                                    timing_draft.common_master_start
+                                ),
+                                range_end=timing_draft.common_master_end,
+                            )
                         )
                         retry_partition_unit_counts = (
                             _selected_partition_unit_counts_for_retry()
                         )
-                        dense_render_feedback_persistence_diagnostics = (
-                            _persist_direct_member_dense_render_feedback_edges(
+                        rejected_source_path = tuple(
+                            direct_visual_selection.source_indices
+                        )
+                        rejected_paths_for_partition = (
+                            decoded_proxy_rejected_source_paths_by_partition
+                            .setdefault(
+                                retry_partition_unit_counts,
+                                [],
+                            )
+                        )
+                        if (
+                            rejected_source_path
+                            not in rejected_paths_for_partition
+                        ):
+                            rejected_paths_for_partition.append(
+                                rejected_source_path
+                            )
+                        proxy_feedback_persistence_diagnostics = (
+                            _persist_direct_member_proxy_feedback_penalties(
                                 request.source_cache_directory,
                                 dense_render_feedback_binding,
-                                render_infeasible_transition_edges,
-                                preferred_partition_unit_counts=(
-                                    retry_partition_unit_counts
+                                render_penalized_transition_edges,
+                                rejected_source_paths_by_partition_unit_counts=(
+                                    decoded_proxy_rejected_source_paths_by_partition
                                 ),
                             )
                         )
                         if not bool(
-                            dense_render_feedback_persistence_diagnostics.get(
+                            proxy_feedback_persistence_diagnostics.get(
                                 "persisted",
                                 False,
                             )
@@ -23019,10 +25589,10 @@ def analyze(
                                 "log",
                                 level="warning",
                                 message=(
-                                    "직캠 실렌더 프록시 실패 체크포인트를 "
+                                    "직캠 실렌더 품질 패널티 체크포인트를 "
                                     "저장하지 못해 현재 실행에서만 누적합니다: "
                                     + str(
-                                        dense_render_feedback_persistence_diagnostics.
+                                        proxy_feedback_persistence_diagnostics.
                                         get("status", "unknown")
                                     )
                                 ),
@@ -23030,30 +25600,37 @@ def analyze(
                         if reselection_limit_reached:
                             reporter.log(
                                 "직캠 실렌더 프록시 재선택 상한 도달 · "
-                                f"마지막 실패 {len(new_certificates)}개도 "
-                                "체크포인트에 저장"
+                                f"마지막 실패 {len(penalty_updates)}개도 "
+                                "유한 패널티로 저장 · 하드 제외 추가 없음"
                             )
                             raise RuntimeError(
                                 "direct-member decoded proxy reselection "
                                 "exhausted after persisting the final "
-                                "continuity certificates; report="
+                                "finite continuity penalties; report="
                                 f"{rendered_proxy_review_path}"
                             )
                         reporter.status(
-                            "실제 출력에서 불연속인 직캠 전환을 제외하고 "
-                            "다른 소스·시점을 다시 선택하는 중…"
+                            "실제 출력의 위치·크기·동작 불일치 비용을 "
+                            "반영해 다른 직캠 경로를 선택하는 중…"
                         )
                         reporter.log(
                             "직캠 실렌더 프록시 피드백 재선택 "
-                            f"{dense_render_attempt + 1}/"
-                            f"{_DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS} · "
+                            f"경로 {decoded_proxy_path_audition_count}/"
+                            f"{_DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS} · "
+                            f"렌더 {decoded_proxy_render_count}/"
+                            f"{_DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS} · "
                             "실패 경계 "
                             + ",".join(
                                 str(value)
                                 for value in proxy_failure_indices
                             )
-                            + " · 누적 제외 전환 "
-                            f"{len(render_infeasible_transition_edges)}개"
+                            + " · 누적 품질 패널티 전환 "
+                            f"{len(render_penalized_transition_edges)}개 · "
+                            "누적 패널티 "
+                            f"{sum(item[3] for item in render_penalized_transition_edges):.3f} · "
+                            "경로 전체 no-good "
+                            f"{sum(len(paths) for paths in decoded_proxy_rejected_source_paths_by_partition.values())}개 · "
+                            "개별 전환 하드 제외 추가 0개"
                         )
                         try:
                             (
@@ -23064,6 +25641,9 @@ def analyze(
                                 direct_visual_selection,
                             ) = _select_direct_member_render_path(
                                 tuple(render_infeasible_transition_edges),
+                                render_penalized_transition_edges=tuple(
+                                    render_penalized_transition_edges
+                                ),
                                 preferred_partition_unit_counts=(
                                     retry_partition_unit_counts
                                 ),
@@ -23084,17 +25664,34 @@ def analyze(
                     member_editorial_motion_plan = (
                         candidate_member_motion_plan
                     )
+                    accepted_rendered_proxy_preflight_payload = deepcopy(
+                        rendered_proxy_review_payload
+                    )
+                    member_final_focal_reference_candidates_by_boundary_index = (
+                        dict(
+                            candidate_focal_reference_candidates_by_boundary_index
+                        )
+                    )
                     break
                 else:
                     raise RuntimeError(
                         "direct-member dense-render path reselection exhausted"
                     )
+                bounded_upscale_segment_count = sum(
+                    int(
+                        "official_fancam_dense_subject_bounded_"
+                        "perceptual_upscale_match" in segment.reasons
+                    )
+                    for segment in member_editorial_motion_plan.segments
+                )
                 reporter.log(
                     "직캠 편집 카메라 "
                     f"{member_editorial_motion_plan.applied_count}개 세그먼트 · "
                     f"크기맞춤 {member_editorial_motion_plan.boundary_match_count}개 · "
                     f"줌 {member_editorial_motion_plan.zoom_event_count}회 · "
                     f"팬 {member_editorial_motion_plan.pan_event_count}회 · "
+                    "제한 업스케일 "
+                    f"{bounded_upscale_segment_count}개 · "
                     "무손실 내부 펄스 "
                     f"{member_editorial_motion_plan.interior_zoom_pulse_count}회"
                 )
@@ -23165,6 +25762,35 @@ def analyze(
                     "dense_render_path_reselection_count": (
                         dense_render_path_reselection_count
                     ),
+                    "dense_camera_reselection_count": (
+                        dense_camera_reselection_count
+                    ),
+                    "decoded_proxy_path_audition_count": (
+                        decoded_proxy_path_audition_count
+                    ),
+                    "decoded_proxy_render_count": decoded_proxy_render_count,
+                    "decoded_proxy_camera_refinement_count": (
+                        decoded_proxy_camera_refinement_count
+                    ),
+                    "decoded_proxy_render_budget": (
+                        _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS
+                    ),
+                    "decoded_hardcut_proxy_render_budget": (
+                        _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                    ),
+                    "required_transform_boundary_indices": list(
+                        required_transform_boundary_indices
+                    ),
+                    "resolved_required_transform_boundary_indices": list(
+                        resolved_required_transform_boundary_indices
+                    ),
+                    "unresolved_required_transform_boundary_indices": list(
+                        unresolved_required_transform_boundary_indices
+                    ),
+                    "partial_camera_plan_authorized": True,
+                    "partial_camera_plan_authority": (
+                        "decoded_output_proxy_continuity_qa"
+                    ),
                     "dense_render_path_feedback_checkpoint": {
                         "binding": (
                             dense_render_feedback_binding_diagnostics
@@ -23189,6 +25815,31 @@ def analyze(
                             outgoing_source_index,
                             incoming_source_index,
                         ) in render_infeasible_transition_edges
+                    ],
+                    "decoded_proxy_path_feedback_checkpoint": {
+                        "load": proxy_feedback_load_diagnostics,
+                        "last_persistence": (
+                            proxy_feedback_persistence_diagnostics
+                        ),
+                        "hard_exclusions_added": False,
+                    },
+                    "render_penalized_transition_edges": [
+                        {
+                            "canonical_boundary_seconds": boundary_seconds,
+                            "outgoing_eligible_source_index": (
+                                outgoing_source_index
+                            ),
+                            "incoming_eligible_source_index": (
+                                incoming_source_index
+                            ),
+                            "accumulated_penalty": penalty,
+                        }
+                        for (
+                            boundary_seconds,
+                            outgoing_source_index,
+                            incoming_source_index,
+                            penalty,
+                        ) in render_penalized_transition_edges
                     ],
                     "error": direct_motion_error,
                     "applied_segment_count": (
@@ -23220,6 +25871,19 @@ def analyze(
                 f"{base_filename}-{_safe_slug(request.target_member.value)}-"
                 "member-pre-render-quality.json"
             )
+            materialized_editorial_transform_segment_count = sum(
+                int(
+                    segment.editorial_transform is not None
+                    and any(
+                        abs(keyframe.zoom - 1.0) > 1e-9
+                        or abs(keyframe.center_x - 0.5) > 1e-9
+                        or abs(keyframe.center_y - 0.5) > 1e-9
+                        or abs(keyframe.roll_degrees) > 1e-9
+                        for keyframe in segment.editorial_transform.keyframes
+                    )
+                )
+                for segment in segments
+            )
             professional_gate_result = (
                 evaluate_direct_member_professional_pre_render_gate(
                     visual_selection=direct_visual_selection,
@@ -23231,6 +25895,12 @@ def analyze(
                         member_direct_dense_face_review_payload is not None
                         and member_direct_dense_face_review_payload.get("completed")
                         is True
+                    ),
+                    decoded_proxy_preflight=(
+                        accepted_rendered_proxy_preflight_payload
+                    ),
+                    materialized_editorial_transform_segment_count=(
+                        materialized_editorial_transform_segment_count
                     ),
                 )
             )
@@ -23890,6 +26560,9 @@ def analyze(
             manifest=manifest,
             manifest_path=manifest_path,
             reporter=reporter,
+            focal_reference_candidates_by_boundary_index=(
+                member_final_focal_reference_candidates_by_boundary_index
+            ),
         )
     )
     mandatory_post_render_qa_path = (
