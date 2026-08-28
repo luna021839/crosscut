@@ -196,6 +196,86 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                     range_end=2.0,
                 )
 
+    def test_selector_only_hash_transition_reuses_exact_edge_certificates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write_acquisition_manifest(directory)
+            current_binding, binding_diagnostics = (
+                _direct_member_dense_render_feedback_binding(
+                    directory,
+                    timing_draft=self._timeline(),
+                    eligible_indices=(0, 1),
+                    source_timewarps=None,
+                    scene_cut_times=((), ()),
+                    eligible_source_frame_sizes=(
+                        (2160, 3840),
+                        (2160, 3840),
+                    ),
+                    output_frame_size=(1080, 1920),
+                    output_fps=29.97,
+                    highlight_intervals=((0.5, 1.5),),
+                    member_pose_dissolve_enabled=True,
+                )
+            )
+            self.assertIsNotNone(current_binding)
+            assert current_binding is not None
+            compatible = binding_diagnostics[
+                "compatible_predecessor_bindings"
+            ]
+            self.assertEqual(len(compatible), 1)
+            predecessor_binding = compatible[0]["binding"]
+            edge = (1.0, 0, 1)
+            persisted = _persist_direct_member_dense_render_feedback_edges(
+                directory,
+                predecessor_binding,
+                (edge,),
+                preferred_partition_unit_counts=(1, 1),
+            )
+
+            without_migration, without_diagnostics = (
+                _load_direct_member_dense_render_feedback_edges(
+                    directory,
+                    current_binding,
+                )
+            )
+            loaded, diagnostics = (
+                _load_direct_member_dense_render_feedback_edges(
+                    directory,
+                    current_binding,
+                    compatible_predecessor_bindings=compatible,
+                )
+            )
+
+        self.assertTrue(persisted["persisted"])
+        self.assertEqual(without_migration, ())
+        self.assertEqual(
+            without_diagnostics["status"],
+            "no_matching_binding",
+        )
+        self.assertEqual(loaded, (edge,))
+        self.assertEqual(
+            diagnostics["status"],
+            "certificates_loaded_via_selector_only_migration",
+        )
+        self.assertEqual(
+            diagnostics["migrated_from_binding_sha256"],
+            predecessor_binding["binding_sha256"],
+        )
+        self.assertEqual(
+            diagnostics["migrated_to_binding_sha256"],
+            current_binding["binding_sha256"],
+        )
+        self.assertTrue(
+            diagnostics[
+                "edge_measurement_implementation_hashes_unchanged"
+            ]
+        )
+        self.assertTrue(diagnostics["full_selector_recheck_required"])
+        self.assertTrue(diagnostics["certified_edges_remain_forbidden"])
+        self.assertFalse(diagnostics["visual_thresholds_relaxed"])
+
     def test_failure_frontier_checkpoint_restores_exact_shift_lineage(
         self,
     ) -> None:

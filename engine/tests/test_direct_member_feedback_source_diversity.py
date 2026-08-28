@@ -18,14 +18,14 @@ class DirectMemberFeedbackSourceDiversityTests(unittest.TestCase):
             (6,),
         )
 
-    def test_feedback_expands_pool_before_returning_to_minimum(self) -> None:
+    def test_feedback_uses_one_joint_minimum_diversity_solve(self) -> None:
         self.assertEqual(
             _direct_member_feedback_source_diversity_candidates(
                 minimum_required_source_count=6,
                 maximum_renderable_source_count=8,
                 feedback_certificate_count=3,
             ),
-            (8, 7, 6),
+            (6,),
         )
 
     def test_full_source_request_does_not_duplicate_candidate(self) -> None:

@@ -92,12 +92,15 @@ _DIRECT_MEMBER_FLEXIBLE_SUBSET_USAGE_POLICIES = frozenset(
     {
         "short_proof_quality_ranked_flexible_exposure_v1",
         "short_proof_quality_ranked_flexible_cinematic_v1",
+        "short_proof_feedback_adaptive_minimum_diversity_exposure_v1",
+        "short_proof_feedback_adaptive_minimum_diversity_cinematic_v1",
     }
 )
 _DIRECT_MEMBER_CINEMATIC_USAGE_POLICIES = frozenset(
     {
         "heterogeneous_role_aware_cinematic_v1",
         "short_proof_quality_ranked_flexible_cinematic_v1",
+        "short_proof_feedback_adaptive_minimum_diversity_cinematic_v1",
     }
 )
 _DIRECT_MEMBER_ROLE_AWARE_USAGE_POLICIES = frozenset(
@@ -8166,6 +8169,7 @@ def _heterogeneous_cinematic_visual_path(
     config: DirectMemberVisualConfig,
     require_cinematic_bridge: bool = True,
     represented_source_indices: Sequence[int] | None = None,
+    minimum_distinct_source_count: int | None = None,
 ) -> tuple[tuple[int, ...], float, dict[str, Any]] | None:
     """Use heterogeneous fancams by role without authoring a bad hard cut.
 
@@ -8204,7 +8208,19 @@ def _heterogeneous_cinematic_visual_path(
     ):
         raise ValueError("role-aware represented source subset is invalid")
     active_source_set = frozenset(active_sources)
-    flexible_subset_usage = len(active_sources) < source_count
+    adaptive_minimum_diversity_usage = (
+        minimum_distinct_source_count is not None
+    )
+    if adaptive_minimum_diversity_usage and (
+        isinstance(minimum_distinct_source_count, bool)
+        or not isinstance(minimum_distinct_source_count, int)
+        or not 2 <= minimum_distinct_source_count <= len(active_sources)
+    ):
+        raise ValueError("adaptive minimum source diversity is invalid")
+    flexible_subset_usage = bool(
+        len(active_sources) < source_count
+        or adaptive_minimum_diversity_usage
+    )
     boundary_count = span_count - 1
     durations = tuple(float(value) for value in span_durations)
     if (
@@ -8359,6 +8375,7 @@ def _heterogeneous_cinematic_visual_path(
         (
             0
             if source_index not in active_source_set
+            or adaptive_minimum_diversity_usage
             else 1
             if flexible_subset_usage
             else 1
@@ -8412,11 +8429,16 @@ def _heterogeneous_cinematic_visual_path(
         total_duration * target / span_count for target in count_targets
     )
     duration_minimums = tuple(
-        target
-        * (
-            _DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MINIMUM_FRACTION
-            if source_index in landscape_sources
-            else _DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MINIMUM_FRACTION
+        (
+            0.0
+            if source_index not in active_source_set
+            or adaptive_minimum_diversity_usage
+            else target
+            * (
+                _DIRECT_MEMBER_ROLE_LANDSCAPE_DURATION_MINIMUM_FRACTION
+                if source_index in landscape_sources
+                else _DIRECT_MEMBER_ROLE_PORTRAIT_DURATION_MINIMUM_FRACTION
+            )
         )
         for source_index, target in enumerate(duration_targets)
     )
@@ -8505,7 +8527,17 @@ def _heterogeneous_cinematic_visual_path(
             ),
         },
         "all_sources_minimum_usage_preserved": not flexible_subset_usage,
-        "all_represented_sources_minimum_usage_preserved": True,
+        "all_represented_sources_minimum_usage_preserved": (
+            not adaptive_minimum_diversity_usage
+        ),
+        "adaptive_minimum_diversity_usage": (
+            adaptive_minimum_diversity_usage
+        ),
+        "minimum_distinct_source_count": (
+            minimum_distinct_source_count
+            if adaptive_minimum_diversity_usage
+            else len(active_sources)
+        ),
         "severe_cross_source_edges_eligible": require_cinematic_bridge,
         "nonhighlight_landscape_requires_selected_incident_bridge": (
             require_cinematic_bridge
@@ -8552,6 +8584,28 @@ def _heterogeneous_cinematic_visual_path(
                 },
             )
         return None
+    if adaptive_minimum_diversity_usage and sum(
+        any(
+            upper_x[position * source_count + source_index] > 0.5
+            for position in range(span_count)
+        )
+        for source_index in active_sources
+    ) < int(minimum_distinct_source_count):
+        raise DirectMemberVisualSelectionError(
+            "adaptive source pool cannot satisfy minimum diversity",
+            {
+                "failure": "adaptive_minimum_diversity_availability_exhausted",
+                "constraint_infeasibility_proven": True,
+                "visual_gates_relaxed": False,
+                "role_constraints": role_constraint_diagnostics,
+                "search": {
+                    "strategy": (
+                        "scipy_highs_adaptive_minimum_diversity_path_milp_v1"
+                    ),
+                    "solver_invoked": False,
+                },
+            },
+        )
 
     edge_specs: list[tuple[int, int, int, bool, bool, float]] = []
     professional_unrepairable_attention_edges: set[int] = set()
@@ -8798,7 +8852,11 @@ def _heterogeneous_cinematic_visual_path(
         for source_index in range(source_count)
     )
     ping_base = edge_base + len(edge_specs)
-    count_slack_base = ping_base + len(ping_specs)
+    used_source_base = ping_base + len(ping_specs)
+    used_source_variable_count = (
+        source_count if adaptive_minimum_diversity_usage else 0
+    )
+    count_slack_base = used_source_base + used_source_variable_count
     duration_slack_base = count_slack_base + 2 * source_count
     variable_count = duration_slack_base + 2 * source_count
     objective = np.zeros(variable_count, dtype=np.float64)
@@ -8844,6 +8902,12 @@ def _heterogeneous_cinematic_visual_path(
         )
     for ping_index in range(len(ping_specs)):
         objective[ping_base + ping_index] = config.ping_pong_penalty
+    if adaptive_minimum_diversity_usage:
+        for source_index in range(source_count):
+            used_variable = used_source_base + source_index
+            if source_index not in active_source_set:
+                upper_bounds[used_variable] = 0.0
+            objective[used_variable] = order_rank[source_index] * 1e-7
     for source_index, target in enumerate(count_targets):
         positive = count_slack_base + 2 * source_index
         negative = positive + 1
@@ -8962,6 +9026,31 @@ def _heterogeneous_cinematic_visual_path(
             duration_targets[source_index],
             duration_targets[source_index],
             family="source_duration_target_slack",
+        )
+        if adaptive_minimum_diversity_usage:
+            used_variable = used_source_base + source_index
+            add_constraint(
+                count_terms + ((used_variable, -1.0),),
+                0.0,
+                math.inf,
+                family="source_usage_link",
+            )
+            add_constraint(
+                count_terms
+                + ((used_variable, -float(span_count)),),
+                -math.inf,
+                0.0,
+                family="source_usage_link",
+            )
+    if adaptive_minimum_diversity_usage:
+        add_constraint(
+            tuple(
+                (used_source_base + source_index, 1.0)
+                for source_index in active_sources
+            ),
+            float(minimum_distinct_source_count),
+            float(len(active_sources)),
+            family="minimum_distinct_source_count",
         )
     for boundary_index, edge_indices in enumerate(edges_by_boundary):
         add_constraint(
@@ -9285,6 +9374,9 @@ def _heterogeneous_cinematic_visual_path(
         "message": str(result.message),
         "success": bool(result.success),
         "variable_count": variable_count,
+        "source_usage_binary_variable_count": (
+            used_source_variable_count
+        ),
         "constraint_count": len(constraint_lower),
         "edge_variable_count": len(edge_specs),
         "bridge_candidate_edge_count": sum(
@@ -9854,6 +9946,30 @@ def _heterogeneous_cinematic_visual_path(
         for position in range(span_count)
     )
     counts = tuple(path.count(source_index) for source_index in range(source_count))
+    selected_source_indices = tuple(
+        source_index
+        for source_index in source_order
+        if counts[source_index] > 0
+    )
+    omitted_source_indices = tuple(
+        source_index
+        for source_index in range(source_count)
+        if counts[source_index] == 0
+    )
+    if adaptive_minimum_diversity_usage:
+        role_constraint_diagnostics.update(
+            {
+                "candidate_source_indices": list(active_sources),
+                "represented_source_indices": list(
+                    selected_source_indices
+                ),
+                "omitted_source_indices": list(omitted_source_indices),
+                "selected_distinct_source_count": len(
+                    selected_source_indices
+                ),
+                "all_represented_sources_minimum_usage_preserved": True,
+            }
+        )
     duration_totals = tuple(
         sum(
             durations[position]
@@ -9889,6 +10005,11 @@ def _heterogeneous_cinematic_visual_path(
         if boundary_index not in portrait_bridge_indices
     )
     audit_failures: list[str] = []
+    if (
+        adaptive_minimum_diversity_usage
+        and len(selected_source_indices) < int(minimum_distinct_source_count)
+    ):
+        audit_failures.append("minimum_distinct_source_count_missed")
     if any(
         not minimum <= actual <= maximum
         for actual, minimum, maximum in zip(
@@ -9993,6 +10114,12 @@ def _heterogeneous_cinematic_visual_path(
     solver_diagnostics["postsolve_path_audit_passed"] = not audit_failures
     solver_diagnostics["postsolve_path_audit_failures"] = audit_failures
     solver_diagnostics["postsolve_witness_path"] = list(path)
+    solver_diagnostics["selected_distinct_source_count"] = len(
+        selected_source_indices
+    )
+    solver_diagnostics["selected_source_indices"] = list(
+        selected_source_indices
+    )
     if audit_failures:
         raise DirectMemberVisualSelectionError(
             "role-aware direct member MILP witness failed independent audit",
@@ -10019,19 +10146,31 @@ def _heterogeneous_cinematic_visual_path(
         secondary_objective_value,
         {
             "strategy": (
-                "scipy_highs_heterogeneous_cinematic_path_milp_v1"
+                "scipy_highs_adaptive_minimum_diversity_cinematic_milp_v1"
+                if adaptive_minimum_diversity_usage
+                and require_cinematic_bridge
+                else "scipy_highs_adaptive_minimum_diversity_safe_hold_milp_v1"
+                if adaptive_minimum_diversity_usage
+                else "scipy_highs_heterogeneous_cinematic_path_milp_v1"
                 if require_cinematic_bridge
                 else "scipy_highs_role_aware_safe_hold_path_milp_v1"
             ),
             "selection_basis": (
-                "quality_ranked_subset_flexible_nonsevere_cut_and_bounded_hold"
+                "feedback_adaptive_minimum_diversity_source_usage_and_path"
+                if adaptive_minimum_diversity_usage
+                else "quality_ranked_subset_flexible_nonsevere_cut_and_bounded_hold"
                 if flexible_subset_usage
                 else "all_source_role_aware_musical_or_verified_effect_bridge"
                 if require_cinematic_bridge
                 else "all_source_role_aware_nonsevere_cut_and_bounded_hold"
             ),
             "usage_policy": (
-                "short_proof_quality_ranked_flexible_cinematic_v1"
+                "short_proof_feedback_adaptive_minimum_diversity_cinematic_v1"
+                if adaptive_minimum_diversity_usage
+                and require_cinematic_bridge
+                else "short_proof_feedback_adaptive_minimum_diversity_exposure_v1"
+                if adaptive_minimum_diversity_usage
+                else "short_proof_quality_ranked_flexible_cinematic_v1"
                 if flexible_subset_usage and require_cinematic_bridge
                 else "short_proof_quality_ranked_flexible_exposure_v1"
                 if flexible_subset_usage
@@ -10065,7 +10204,9 @@ def _heterogeneous_cinematic_visual_path(
                 "all_sources_minimum_usage_preserved": (
                     not flexible_subset_usage
                 ),
-                "all_represented_sources_minimum_usage_preserved": True,
+                "all_represented_sources_minimum_usage_preserved": (
+                    not adaptive_minimum_diversity_usage
+                ),
             },
             "landscape_highlight_only": bool(
                 highlight_only_landscape_sources
@@ -10141,15 +10282,20 @@ def _heterogeneous_cinematic_visual_path(
             "cinematic_bridge_hard_cut_authorized": False,
             "required_transition_effect": require_cinematic_bridge,
             "all_sources_used": all(count > 0 for count in counts),
-            "represented_source_indices": list(active_sources),
-            "omitted_source_indices": [
-                index
-                for index in range(source_count)
-                if index not in active_source_set
-            ],
+            "represented_source_indices": list(selected_source_indices),
+            "omitted_source_indices": list(omitted_source_indices),
             "all_represented_sources_used": all(
-                counts[index] > 0 for index in active_sources
+                counts[index] > 0 for index in selected_source_indices
             ),
+            "adaptive_minimum_diversity_usage": (
+                adaptive_minimum_diversity_usage
+            ),
+            "minimum_distinct_source_count": (
+                minimum_distinct_source_count
+                if adaptive_minimum_diversity_usage
+                else len(active_sources)
+            ),
+            "selected_distinct_source_count": len(selected_source_indices),
             "role_constraints": role_constraint_diagnostics,
             "visual_gates_relaxed": False,
             "search_capacity_exhausted": False,
@@ -11354,6 +11500,7 @@ def select_balanced_direct_member_sources(
     )
     represented_source_indices = tuple(range(source_count))
     omitted_source_indices: tuple[int, ...] = ()
+    ranked_source_indices = order
     if represented_source_count < source_count:
         order_rank = {
             source_index: rank
@@ -11700,6 +11847,26 @@ def select_balanced_direct_member_sources(
                     for geometry in source_frame_geometries
                 )
             )
+            adaptive_minimum_diversity_authorized = bool(
+                role_aware_safe_hold_authorized
+                and represented_source_count < source_count
+                and render_infeasible_edges
+            )
+            role_aware_source_order = (
+                ranked_source_indices
+                if adaptive_minimum_diversity_authorized
+                else order
+            )
+            role_aware_represented_source_indices = (
+                None
+                if adaptive_minimum_diversity_authorized
+                else represented_source_indices
+            )
+            role_aware_minimum_distinct_source_count = (
+                represented_source_count
+                if adaptive_minimum_diversity_authorized
+                else None
+            )
             role_aware_safe_hold_fallback = None
             role_aware_safe_hold_error: (
                 DirectMemberVisualSelectionError | None
@@ -11709,7 +11876,7 @@ def select_balanced_direct_member_sources(
                     role_aware_safe_hold_fallback = (
                         _heterogeneous_cinematic_visual_path(
                             matrices,
-                            source_order=order,
+                            source_order=role_aware_source_order,
                             candidate_validity=candidate_validity,
                             span_durations=tuple(
                                 end - start for start, end in spans
@@ -11722,7 +11889,10 @@ def select_balanced_direct_member_sources(
                             config=resolved_config,
                             require_cinematic_bridge=False,
                             represented_source_indices=(
-                                represented_source_indices
+                                role_aware_represented_source_indices
+                            ),
+                            minimum_distinct_source_count=(
+                                role_aware_minimum_distinct_source_count
                             ),
                         )
                     )
@@ -11744,7 +11914,7 @@ def select_balanced_direct_member_sources(
                     heterogeneous_fallback = (
                         _heterogeneous_cinematic_visual_path(
                             matrices,
-                            source_order=order,
+                            source_order=role_aware_source_order,
                             candidate_validity=candidate_validity,
                             span_durations=tuple(
                                 end - start for start, end in spans
@@ -11756,7 +11926,10 @@ def select_balanced_direct_member_sources(
                             ),
                             config=resolved_config,
                             represented_source_indices=(
-                                represented_source_indices
+                                role_aware_represented_source_indices
+                            ),
+                            minimum_distinct_source_count=(
+                                role_aware_minimum_distinct_source_count
                             ),
                         )
                     )
@@ -11816,12 +11989,57 @@ def select_balanced_direct_member_sources(
                         "source_duration_maximums_seconds"
                     ]
                 )
+                if adaptive_minimum_diversity_authorized:
+                    adaptive_represented_sources = tuple(
+                        int(value)
+                        for value in optimizer_search_diagnostics[
+                            "represented_source_indices"
+                        ]
+                    )
+                    adaptive_represented_set = frozenset(
+                        adaptive_represented_sources
+                    )
+                    quota_assignment_provenance = {
+                        **quota_assignment_provenance,
+                        "contract": (
+                            "feedback_adaptive_minimum_diversity_usage_v1"
+                        ),
+                        "basis": (
+                            "joint_binary_source_usage_and_visual_path_after_"
+                            "decoded_render_failure_certificates"
+                        ),
+                        "preselected_exact_subset_superseded": True,
+                        "preselected_represented_source_indices": list(
+                            represented_source_indices
+                        ),
+                        "represented_source_indices": list(
+                            adaptive_represented_sources
+                        ),
+                        "omitted_source_indices": [
+                            source_index
+                            for source_index in range(source_count)
+                            if source_index not in adaptive_represented_set
+                        ],
+                        "minimum_required_distinct_source_count": (
+                            represented_source_count
+                        ),
+                        "selected_distinct_source_count": len(
+                            adaptive_represented_sources
+                        ),
+                        "all_sources_decoded_and_scored": True,
+                        "certified_render_edges_remain_forbidden": True,
+                        "visual_thresholds_changed": False,
+                        "visual_gates_relaxed": False,
+                    }
                 optimizer_search_diagnostics = {
                     **optimizer_search_diagnostics,
                     "strict_cross_source_failure": {
                         **strict_failure_summary,
                         "authorization_basis": (
-                            "proven_exact_subset_infeasibility_then_quality_"
+                            "proven_feedback_certified_exact_subset_"
+                            "infeasibility_then_joint_source_usage_and_path_v1"
+                            if adaptive_minimum_diversity_authorized
+                            else "proven_exact_subset_infeasibility_then_quality_"
                             "ranked_minimum_diversity_flexible_exposure_v1"
                             if usage_policy
                             in _DIRECT_MEMBER_FLEXIBLE_SUBSET_USAGE_POLICIES

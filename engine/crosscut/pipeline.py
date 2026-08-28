@@ -442,6 +442,21 @@ _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT = (
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_BYTES = 512 * 1024
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_ENTRY_COUNT = 16
 _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_MAX_CERTIFICATE_COUNT = 128
+# Dense failure certificates describe decoded boundary geometry, not source
+# exposure quotas. Permit one exact, audited selector-only implementation
+# transition to reuse those certificates: the edge measurement and every
+# render/proxy/geometry implementation hash remain unchanged, while the member
+# selector replaces a fixed pre-ranked cohort with a joint source-usage MILP.
+# Both hashes are content hashes of direct_member_visual.py. Future edits fail
+# closed unless their exact transition is reviewed and added deliberately.
+_DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_HASH_TRANSITIONS = {
+    "b0fb377012dec79296b0aa8994106fc39d6a2472aa9bc9a45ba7f651fe0ca0f9": (
+        "8d5ed6e48312b1fa120a25a71af1a87e20eee54cf76b9d83f7dc6d71348c6f03",
+    ),
+}
+_DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_MIGRATION_REASON = (
+    "fixed_ranked_cohort_to_joint_minimum_diversity_source_usage_v1"
+)
 _DIRECT_MEMBER_MAX_DENSE_RENDER_FEEDBACK_PROFILE_COUNT = 6
 _DIRECT_MEMBER_VISUAL_SPLIT_EXACT_LIFELINE_RETRY_STATE_LIMIT = 1_000_000
 _DIRECT_MEMBER_MAX_EXTRA_QUOTA_PROFILE_COUNT = 10
@@ -5440,6 +5455,68 @@ def _direct_member_dense_render_feedback_binding(
         ).encode("utf-8")
     ).hexdigest()
     binding["binding_sha256"] = binding_sha256
+    compatible_predecessor_bindings: list[dict[str, Any]] = []
+    current_selector_sha256 = implementation_sha256[
+        "direct_member_visual.py"
+    ]
+    for predecessor_selector_sha256 in (
+        _DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_HASH_TRANSITIONS.get(
+            current_selector_sha256,
+            (),
+        )
+    ):
+        predecessor_implementation_sha256 = {
+            **implementation_sha256,
+            "direct_member_visual.py": predecessor_selector_sha256,
+        }
+        predecessor_evidence = {
+            **binding_evidence,
+            "implementation_sha256": predecessor_implementation_sha256,
+        }
+        predecessor_evidence_sha256 = hashlib.sha256(
+            json.dumps(
+                predecessor_evidence,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        predecessor_binding = {
+            "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
+            "binding_evidence_sha256": predecessor_evidence_sha256,
+            "acquisition_source_identity_sha256": source_identity_sha256,
+            "source_count": len(eligible),
+            "range_start_seconds": float(
+                timing_draft.common_master_start
+            ),
+            "range_end_seconds": float(timing_draft.common_master_end),
+        }
+        predecessor_binding["binding_sha256"] = hashlib.sha256(
+            json.dumps(
+                predecessor_binding,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        compatible_predecessor_bindings.append(
+            {
+                "binding": predecessor_binding,
+                "migration_reason": (
+                    _DIRECT_MEMBER_DENSE_FEEDBACK_SELECTOR_ONLY_MIGRATION_REASON
+                ),
+                "predecessor_direct_member_visual_sha256": (
+                    predecessor_selector_sha256
+                ),
+                "current_direct_member_visual_sha256": (
+                    current_selector_sha256
+                ),
+                "edge_measurement_implementation_hashes_unchanged": True,
+                "visual_thresholds_relaxed": False,
+            }
+        )
     diagnostics.update(
         {
             "status": "binding_ready",
@@ -5449,6 +5526,9 @@ def _direct_member_dense_render_feedback_binding(
                 manifest_fingerprint["sha256"]
             ),
             "acquisition_source_identity_sha256": source_identity_sha256,
+            "compatible_predecessor_bindings": (
+                compatible_predecessor_bindings
+            ),
         }
     )
     return binding, diagnostics
@@ -5457,6 +5537,8 @@ def _direct_member_dense_render_feedback_binding(
 def _load_direct_member_dense_render_feedback_edges(
     feature_cache_directory: Path | None,
     binding: Mapping[str, Any] | None,
+    *,
+    compatible_predecessor_bindings: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[tuple[tuple[float, int, int], ...], dict[str, Any]]:
     """Restore only certificates whose complete production binding matches."""
 
@@ -5521,6 +5603,37 @@ def _load_direct_member_dense_render_feedback_edges(
         ),
         None,
     )
+    compatible_predecessor_match: Mapping[str, Any] | None = None
+    if matching_entry is None:
+        if len(compatible_predecessor_bindings) > 4:
+            diagnostics.update(
+                {
+                    "status": "cache_rejected",
+                    "rejection": "compatible_predecessor_limit_exceeded",
+                }
+            )
+            return (), diagnostics
+        for candidate in compatible_predecessor_bindings:
+            candidate_binding = candidate.get("binding")
+            if not isinstance(candidate_binding, Mapping):
+                continue
+            predecessor_entry = next(
+                (
+                    entry
+                    for entry in payload["entries"]
+                    if isinstance(entry, dict)
+                    and all(
+                        entry.get(key) == value
+                        for key, value in candidate_binding.items()
+                    )
+                ),
+                None,
+            )
+            if predecessor_entry is None:
+                continue
+            matching_entry = predecessor_entry
+            compatible_predecessor_match = candidate
+            break
     if matching_entry is None:
         diagnostics.update(
             {
@@ -5612,11 +5725,40 @@ def _load_direct_member_dense_render_feedback_edges(
         )
     diagnostics.update(
         {
-            "status": "certificates_loaded",
+            "status": (
+                "certificates_loaded_via_selector_only_migration"
+                if compatible_predecessor_match is not None
+                else "certificates_loaded"
+            ),
             "cache_file_sha256": fingerprint["sha256"],
             "loaded_certificate_count": len(edges),
         }
     )
+    if compatible_predecessor_match is not None:
+        predecessor_binding = compatible_predecessor_match["binding"]
+        diagnostics.update(
+            {
+                "migrated_from_binding_sha256": (
+                    predecessor_binding.get("binding_sha256")
+                ),
+                "migrated_to_binding_sha256": binding.get(
+                    "binding_sha256"
+                ),
+                "binding_migration_reason": (
+                    compatible_predecessor_match.get(
+                        "migration_reason"
+                    )
+                ),
+                "edge_measurement_implementation_hashes_unchanged": (
+                    compatible_predecessor_match.get(
+                        "edge_measurement_implementation_hashes_unchanged"
+                    )
+                    is True
+                ),
+                "full_selector_recheck_required": True,
+                "certified_edges_remain_forbidden": True,
+            }
+        )
     return edges, diagnostics
 
 
@@ -10176,16 +10318,15 @@ def _direct_member_feedback_source_diversity_candidates(
     maximum_renderable_source_count: int,
     feedback_certificate_count: int,
 ) -> tuple[int, ...]:
-    """Expand a short proof's source pool after decoded-render rejection.
+    """Return the diversity floor for one joint feedback-aware solve.
 
     ``minimum_required_source_count`` is a floor, not a request to permanently
     exclude every lower-ranked source. Before decoded-render feedback exists,
-    the bounded proof keeps its inexpensive minimum-size cohort. Once a dense
-    or decoded proxy check proves one or more selected transitions unusable,
-    retry the same hard visual gates with the largest renderable source pool
-    first, then descend to the original minimum. This gives omitted official
-    fancams a chance to replace a failed edge without ever admitting the
-    certified edge or lowering a visual threshold.
+    the bounded proof keeps its inexpensive minimum-size cohort. Once feedback
+    exists, the selector treats this value as a hard lower bound while its MILP
+    jointly chooses any source usage pattern from the complete renderable pool.
+    Re-running exact 8, 7, and 6-source cohorts would repeat nearly identical
+    partition searches and still miss cross-cohort source combinations.
     """
 
     for name, value in (
@@ -10203,18 +10344,7 @@ def _direct_member_feedback_source_diversity_candidates(
         )
     if feedback_certificate_count < 0:
         raise ValueError("feedback certificate count must be non-negative")
-    if (
-        feedback_certificate_count == 0
-        or minimum_required_source_count == maximum_renderable_source_count
-    ):
-        return (minimum_required_source_count,)
-    return tuple(
-        range(
-            maximum_renderable_source_count,
-            minimum_required_source_count - 1,
-            -1,
-        )
-    )
+    return (minimum_required_source_count,)
 
 
 def _direct_member_proxy_refinement_rank(
@@ -21759,6 +21889,12 @@ def analyze(
             ) = _load_direct_member_dense_render_feedback_edges(
                 request.source_cache_directory,
                 dense_render_feedback_binding,
+                compatible_predecessor_bindings=(
+                    dense_render_feedback_binding_diagnostics.get(
+                        "compatible_predecessor_bindings",
+                        (),
+                    )
+                ),
             )
             raw_loaded_feedback_partition = (
                 dense_render_feedback_load_diagnostics.get(
@@ -21832,6 +21968,12 @@ def analyze(
                 )
                 diversity_attempts: list[dict[str, Any]] = []
                 final_error: DirectMemberVisualSelectionError | None = None
+                if render_infeasible_transition_edges:
+                    reporter.status(
+                        "실렌더 실패 전환을 제외하고 전체 직캠 풀에서 "
+                        f"최소 {direct_required_distinct_source_count}개를 "
+                        "동시에 다시 푸는 중…"
+                    )
                 for diversity_index, represented_source_count in enumerate(
                     diversity_candidates,
                     start=1,
@@ -21926,9 +22068,12 @@ def analyze(
                         }
                     )
                     cadence = result[3]
+                    selected_distinct_source_count = len(
+                        set(result[4].source_indices)
+                    )
                     cadence["feedback_source_diversity_recovery"] = {
                         "contract": (
-                            "decoded_feedback_maximum_diversity_first_v1"
+                            "decoded_feedback_joint_minimum_diversity_v2"
                         ),
                         "minimum_required_source_count": (
                             direct_required_distinct_source_count
@@ -21943,17 +22088,22 @@ def analyze(
                             diversity_candidates
                         ),
                         "attempts": diversity_attempts,
-                        "selected_source_count": represented_source_count,
+                        "selected_source_count": (
+                            selected_distinct_source_count
+                        ),
+                        "joint_source_usage_binary_optimization": bool(
+                            render_infeasible_transition_edges
+                        ),
                         "certified_edges_remain_forbidden": True,
                         "visual_thresholds_relaxed": False,
                     }
-                    if represented_source_count > (
+                    if selected_distinct_source_count > (
                         direct_required_distinct_source_count
                     ):
                         reporter.log(
-                            "직캠 실패 경계 대체 풀 확정 · "
-                            f"최소 {direct_required_distinct_source_count}개에서 "
-                            f"{represented_source_count}개로 확장 · "
+                            "직캠 실패 경계 대체 조합 확정 · "
+                            f"최소 {direct_required_distinct_source_count}개 중 "
+                            f"실제 {selected_distinct_source_count}개 사용 · "
                             "실패 전환·시각 기준 그대로 유지"
                         )
                     return result
@@ -21965,7 +22115,7 @@ def analyze(
                     "feedback_source_diversity_recovery"
                 ] = {
                     "contract": (
-                        "decoded_feedback_maximum_diversity_first_v1"
+                        "decoded_feedback_joint_minimum_diversity_v2"
                     ),
                     "minimum_required_source_count": (
                         direct_required_distinct_source_count
@@ -21979,6 +22129,9 @@ def analyze(
                     "candidate_source_counts": list(diversity_candidates),
                     "attempts": diversity_attempts,
                     "selected_source_count": None,
+                    "joint_source_usage_binary_optimization": bool(
+                        render_infeasible_transition_edges
+                    ),
                     "certified_edges_remain_forbidden": True,
                     "visual_thresholds_relaxed": False,
                 }

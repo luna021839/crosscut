@@ -1603,6 +1603,60 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertTrue(diagnostics["all_represented_sources_used"])
         self.assertFalse(diagnostics["visual_gates_relaxed"])
 
+    def test_feedback_adaptive_solver_chooses_sources_and_path_jointly(
+        self,
+    ) -> None:
+        source_count = 4
+        span_count = 6
+        safe = _optimizer_mismatch()
+        matrices = tuple(
+            tuple(
+                tuple(safe for _ in range(source_count))
+                for _ in range(source_count)
+            )
+            for _ in range(span_count - 1)
+        )
+        validity = tuple(
+            (True, True, False, True)
+            for _ in range(span_count)
+        )
+
+        result = _heterogeneous_cinematic_visual_path(
+            matrices,
+            source_order=(0, 1, 2, 3),
+            candidate_validity=validity,
+            span_durations=(1.0,) * span_count,
+            source_geometries=tuple(
+                direct_member_source_frame_geometry(
+                    (2160, 3840),
+                    output_size=(1080, 1920),
+                )
+                for _ in range(source_count)
+            ),
+            priority_cut_boundary_indices=(),
+            maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+            require_cinematic_bridge=False,
+            minimum_distinct_source_count=3,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        path, _cost, diagnostics = result
+        self.assertEqual(set(path), {0, 1, 3})
+        self.assertNotIn(2, path)
+        self.assertEqual(
+            diagnostics["usage_policy"],
+            "short_proof_feedback_adaptive_minimum_diversity_exposure_v1",
+        )
+        self.assertEqual(diagnostics["source_count_minimums"], [0, 0, 0, 0])
+        self.assertEqual(diagnostics["minimum_distinct_source_count"], 3)
+        self.assertEqual(diagnostics["selected_distinct_source_count"], 3)
+        self.assertEqual(diagnostics["represented_source_indices"], [0, 1, 3])
+        self.assertEqual(diagnostics["omitted_source_indices"], [2])
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+        self.assertFalse(diagnostics["visual_gates_relaxed"])
+
     def test_exact_structural_no_repeat_failure_can_authorize_safe_hold(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(4))
 
