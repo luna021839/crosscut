@@ -136,6 +136,7 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
                 directory,
                 binding,
                 (edge, edge),
+                preferred_partition_unit_counts=(1, 1),
             )
             loaded, diagnostics = (
                 _load_direct_member_dense_render_feedback_edges(
@@ -148,6 +149,15 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             self.assertEqual(persisted["certificate_count"], 1)
             self.assertEqual(loaded, (edge,))
             self.assertEqual(diagnostics["status"], "certificates_loaded")
+            self.assertEqual(
+                diagnostics["preferred_partition_status"],
+                "loaded",
+            )
+            self.assertEqual(
+                diagnostics["preferred_partition_unit_counts"],
+                [1, 1],
+            )
+            self.assertTrue(persisted["preferred_partition_persisted"])
             self.assertFalse(diagnostics["visual_thresholds_relaxed"])
 
             changed_binding = self._binding(

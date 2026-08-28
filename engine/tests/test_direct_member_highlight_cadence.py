@@ -73,13 +73,22 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
 
         seeds = _direct_member_render_feedback_seed_profiles(
             base,
-            duplicate_base,
+            None,
             (persisted,),
         )
 
         self.assertEqual(
             tuple(profile.profile_id for profile in seeds),
-            ("base", "persisted-frontier"),
+            ("persisted-frontier", "base"),
+        )
+        in_run_seeds = _direct_member_render_feedback_seed_profiles(
+            base,
+            duplicate_base,
+            (persisted,),
+        )
+        self.assertEqual(
+            tuple(profile.profile_id for profile in in_run_seeds),
+            ("duplicate-base", "persisted-frontier"),
         )
 
     def test_render_feedback_extends_instead_of_shrinking_strict_cohort(

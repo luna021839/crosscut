@@ -193,6 +193,87 @@ class DirectMemberPartitionWarmStartTests(unittest.TestCase):
                 {"input_binding_mismatch": 1},
             )
 
+    def test_fully_selected_partition_is_loaded_before_newer_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_directory = Path(temporary_directory)
+            self._write_manifest(cache_directory)
+            binding, _diagnostics = (
+                _direct_member_partition_warm_start_binding(
+                    cache_directory,
+                    self.base,
+                    source_count=8,
+                )
+            )
+            assert binding is not None
+            generic_counts = (
+                (1, 3, *((4,) * 18)),
+                (2, 2, *((4,) * 18)),
+                (3, 1, *((4,) * 18)),
+                (1, 1, 2, *((4,) * 18)),
+            )
+            selected_counts = (2, 1, 1, *((4,) * 18))
+            entries = []
+            for counts in generic_counts:
+                entries.append(
+                    {
+                        **binding,
+                        "candidate_partition_signature_sha256": (
+                            _direct_partition_signature_sha256(counts)
+                        ),
+                        "partition_unit_counts": list(counts),
+                        "origin": "proof_bound_test_frontier",
+                    }
+                )
+            entries.append(
+                {
+                    **binding,
+                    "candidate_partition_signature_sha256": (
+                        _direct_partition_signature_sha256(selected_counts)
+                    ),
+                    "partition_unit_counts": list(selected_counts),
+                    "origin": "full_visual_selector_feasible",
+                }
+            )
+            (
+                cache_directory
+                / _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME
+            ).write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "contract": (
+                            _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT
+                        ),
+                        "entries": entries,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            profiles, diagnostics = (
+                _load_direct_member_partition_warm_start_profiles(
+                    cache_directory,
+                    self.segments,
+                    self.base,
+                    source_count=8,
+                )
+            )
+
+            self.assertEqual(len(profiles), 4)
+            self.assertEqual(profiles[0].unit_counts, selected_counts)
+            self.assertTrue(
+                profiles[0].profile_id.startswith("input-bound-warm-start-")
+            )
+            self.assertEqual(diagnostics["fully_selected_entry_count"], 1)
+            self.assertEqual(
+                diagnostics["entry_order_contract"],
+                "fully_selected_profile_before_failure_frontier_then_cache_order_v1",
+            )
+
     def test_persisted_candidate_is_reloaded_for_full_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             cache_directory = Path(temporary_directory)

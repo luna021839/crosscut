@@ -5557,6 +5557,46 @@ def _load_direct_member_dense_render_feedback_edges(
             {"status": "cache_rejected", "rejection": "duplicate_certificate"}
         )
         return (), diagnostics
+    raw_preferred_counts = matching_entry.get(
+        "preferred_partition_unit_counts"
+    )
+    raw_preferred_signature = matching_entry.get(
+        "preferred_partition_signature_sha256"
+    )
+    try:
+        preferred_counts = (
+            _normalize_direct_member_dense_feedback_partition_unit_counts(
+                raw_preferred_counts,
+                source_count=int(binding["source_count"]),
+            )
+        )
+        if preferred_counts is None:
+            if raw_preferred_signature is not None:
+                raise ValueError("partition signature has no counts")
+            diagnostics["preferred_partition_status"] = "unavailable"
+        elif raw_preferred_signature != _direct_partition_signature_sha256(
+            preferred_counts
+        ):
+            raise ValueError("preferred partition signature mismatch")
+        else:
+            diagnostics.update(
+                {
+                    "preferred_partition_status": "loaded",
+                    "preferred_partition_unit_counts": list(
+                        preferred_counts
+                    ),
+                    "preferred_partition_signature_sha256": (
+                        raw_preferred_signature
+                    ),
+                }
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        diagnostics.update(
+            {
+                "preferred_partition_status": "rejected",
+                "preferred_partition_rejection": type(exc).__name__,
+            }
+        )
     diagnostics.update(
         {
             "status": "certificates_loaded",
@@ -5567,10 +5607,38 @@ def _load_direct_member_dense_render_feedback_edges(
     return edges, diagnostics
 
 
+def _normalize_direct_member_dense_feedback_partition_unit_counts(
+    raw_counts: Sequence[int] | None,
+    *,
+    source_count: int,
+) -> tuple[int, ...] | None:
+    """Validate an exact selected partition stored with render certificates."""
+
+    if raw_counts is None:
+        return None
+    if (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 2
+        or not isinstance(raw_counts, (list, tuple))
+        or len(raw_counts) < source_count
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in raw_counts
+        )
+    ):
+        raise ValueError("dense-render preferred partition is invalid")
+    return tuple(raw_counts)
+
+
 def _persist_direct_member_dense_render_feedback_edges(
     feature_cache_directory: Path | None,
     binding: Mapping[str, Any] | None,
     edges: Sequence[tuple[float, int, int]],
+    *,
+    preferred_partition_unit_counts: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Atomically checkpoint accumulated dense-render failure certificates."""
 
@@ -5588,6 +5656,12 @@ def _persist_direct_member_dense_render_feedback_edges(
             source_count=int(binding["source_count"]),
             range_start=float(binding["range_start_seconds"]),
             range_end=float(binding["range_end_seconds"]),
+        )
+        normalized_preferred_counts = (
+            _normalize_direct_member_dense_feedback_partition_unit_counts(
+                preferred_partition_unit_counts,
+                source_count=int(binding["source_count"]),
+            )
         )
     except (KeyError, TypeError, ValueError) as exc:
         diagnostics.update(
@@ -5658,34 +5732,64 @@ def _persist_direct_member_dense_render_feedback_edges(
                 )
             except (KeyError, TypeError, ValueError):
                 existing_cache_replaced = True
+        if normalized_preferred_counts is None:
+            try:
+                previous_counts = (
+                    _normalize_direct_member_dense_feedback_partition_unit_counts(
+                        previous_matching.get(
+                            "preferred_partition_unit_counts"
+                        ),
+                        source_count=int(binding["source_count"]),
+                    )
+                )
+                previous_signature = previous_matching.get(
+                    "preferred_partition_signature_sha256"
+                )
+                if previous_counts is not None and previous_signature == (
+                    _direct_partition_signature_sha256(previous_counts)
+                ):
+                    normalized_preferred_counts = previous_counts
+            except (KeyError, TypeError, ValueError):
+                existing_cache_replaced = True
     entries = [
         item
         for item in entries
         if not all(item.get(key) == value for key, value in binding.items())
     ]
-    entries.insert(
-        0,
-        {
-            **binding,
-            "certificate_count": len(normalized),
-            "certificates": [
-                {
-                    "canonical_boundary_seconds": boundary_seconds,
-                    "outgoing_eligible_source_index": outgoing_source_index,
-                    "incoming_eligible_source_index": incoming_source_index,
-                    "origin": (
-                        "failed_dense_camera_or_decoded_output_continuity_solve"
-                    ),
-                    "visual_thresholds_relaxed": False,
-                }
-                for (
-                    boundary_seconds,
-                    outgoing_source_index,
-                    incoming_source_index,
-                ) in normalized
-            ],
-        },
-    )
+    new_entry = {
+        **binding,
+        "certificate_count": len(normalized),
+        "certificates": [
+            {
+                "canonical_boundary_seconds": boundary_seconds,
+                "outgoing_eligible_source_index": outgoing_source_index,
+                "incoming_eligible_source_index": incoming_source_index,
+                "origin": (
+                    "failed_dense_camera_or_decoded_output_continuity_solve"
+                ),
+                "visual_thresholds_relaxed": False,
+            }
+            for (
+                boundary_seconds,
+                outgoing_source_index,
+                incoming_source_index,
+            ) in normalized
+        ],
+    }
+    if normalized_preferred_counts is not None:
+        new_entry.update(
+            {
+                "preferred_partition_unit_counts": list(
+                    normalized_preferred_counts
+                ),
+                "preferred_partition_signature_sha256": (
+                    _direct_partition_signature_sha256(
+                        normalized_preferred_counts
+                    )
+                ),
+            }
+        )
+    entries.insert(0, new_entry)
     payload = {
         "schema_version": 1,
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
@@ -5708,6 +5812,16 @@ def _persist_direct_member_dense_render_feedback_edges(
             "certificate_count": len(normalized),
             "cache_file_sha256": fingerprint["sha256"],
             "existing_cache_replaced": existing_cache_replaced,
+            "preferred_partition_persisted": (
+                normalized_preferred_counts is not None
+            ),
+            "preferred_partition_signature_sha256": (
+                _direct_partition_signature_sha256(
+                    normalized_preferred_counts
+                )
+                if normalized_preferred_counts is not None
+                else None
+            ),
         }
     )
     return diagnostics
@@ -6426,7 +6540,30 @@ def _load_direct_member_partition_warm_start_profiles(
         return (), diagnostics
 
     entries = payload["entries"]
+    ordered_entries = tuple(
+        entry
+        for _index, entry in sorted(
+            enumerate(entries),
+            key=lambda item: (
+                not (
+                    isinstance(item[1], dict)
+                    and item[1].get("origin")
+                    == "full_visual_selector_feasible"
+                ),
+                item[0],
+            ),
+        )
+    )
     diagnostics["entry_count"] = len(entries)
+    diagnostics["entry_order_contract"] = (
+        "fully_selected_profile_before_failure_frontier_then_cache_order_v1"
+    )
+    diagnostics["fully_selected_entry_count"] = sum(
+        1
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("origin") == "full_visual_selector_feasible"
+    )
     rejection_reasons: dict[str, int] = {}
 
     def _reject(reason: str) -> None:
@@ -6435,7 +6572,7 @@ def _load_direct_member_partition_warm_start_profiles(
     items = tuple(timing_segments)
     candidates: list[_DirectFullFramePartitionProfile] = []
     seen_signatures = {base.unit_counts}
-    for entry in entries:
+    for entry in ordered_entries:
         if not isinstance(entry, dict):
             _reject("entry_not_object")
             continue
@@ -9906,9 +10043,9 @@ def _direct_member_render_feedback_seed_profiles(
     profiles: list[_DirectFullFramePartitionProfile] = []
     seen_signatures: set[tuple[int, ...]] = set()
     for profile in (
-        base,
         *((in_run_preferred_profile,) if in_run_preferred_profile else ()),
         *persisted_warm_start_profiles,
+        base,
     ):
         if profile.unit_counts in seen_signatures:
             continue
@@ -21306,6 +21443,16 @@ def analyze(
                 request.source_cache_directory,
                 dense_render_feedback_binding,
             )
+            raw_loaded_feedback_partition = (
+                dense_render_feedback_load_diagnostics.get(
+                    "preferred_partition_unit_counts"
+                )
+            )
+            loaded_feedback_partition_unit_counts = (
+                tuple(raw_loaded_feedback_partition)
+                if isinstance(raw_loaded_feedback_partition, list)
+                else None
+            )
             render_infeasible_transition_edges: list[
                 tuple[float, int, int]
             ] = list(loaded_render_infeasible_transition_edges)
@@ -21325,6 +21472,8 @@ def analyze(
                 reporter.log(
                     "직캠 밀집 렌더 체크포인트 복원 · "
                     f"불가능 전환 {len(render_infeasible_transition_edges)}개 · "
+                    "기준 분할 "
+                    f"{dense_render_feedback_load_diagnostics.get('preferred_partition_status', 'unavailable')} · "
                     "전체 선택·렌더 게이트 재검증"
                 )
 
@@ -21405,7 +21554,10 @@ def analyze(
                     direct_cadence,
                     direct_visual_selection,
                 ) = _select_direct_member_render_path(
-                    tuple(render_infeasible_transition_edges)
+                    tuple(render_infeasible_transition_edges),
+                    preferred_partition_unit_counts=(
+                        loaded_feedback_partition_unit_counts
+                    ),
                 )
             except DirectMemberVisualSelectionError as exc:
                 raise _report_direct_member_selection_failure(
@@ -21694,11 +21846,17 @@ def analyze(
                         render_infeasible_transition_edges.extend(
                             new_certificates
                         )
+                        retry_partition_unit_counts = (
+                            _selected_partition_unit_counts_for_retry()
+                        )
                         dense_render_feedback_persistence_diagnostics = (
                             _persist_direct_member_dense_render_feedback_edges(
                                 request.source_cache_directory,
                                 dense_render_feedback_binding,
                                 render_infeasible_transition_edges,
+                                preferred_partition_unit_counts=(
+                                    retry_partition_unit_counts
+                                ),
                             )
                         )
                         if not bool(
@@ -21745,7 +21903,7 @@ def analyze(
                             ) = _select_direct_member_render_path(
                                 tuple(render_infeasible_transition_edges),
                                 preferred_partition_unit_counts=(
-                                    _selected_partition_unit_counts_for_retry()
+                                    retry_partition_unit_counts
                                 ),
                             )
                         except DirectMemberVisualSelectionError as selection_exc:
@@ -21999,11 +22157,17 @@ def analyze(
                         render_infeasible_transition_edges.extend(
                             new_certificates
                         )
+                        retry_partition_unit_counts = (
+                            _selected_partition_unit_counts_for_retry()
+                        )
                         dense_render_feedback_persistence_diagnostics = (
                             _persist_direct_member_dense_render_feedback_edges(
                                 request.source_cache_directory,
                                 dense_render_feedback_binding,
                                 render_infeasible_transition_edges,
+                                preferred_partition_unit_counts=(
+                                    retry_partition_unit_counts
+                                ),
                             )
                         )
                         if not bool(
@@ -22050,7 +22214,7 @@ def analyze(
                             ) = _select_direct_member_render_path(
                                 tuple(render_infeasible_transition_edges),
                                 preferred_partition_unit_counts=(
-                                    _selected_partition_unit_counts_for_retry()
+                                    retry_partition_unit_counts
                                 ),
                             )
                         except DirectMemberVisualSelectionError as selection_exc:
