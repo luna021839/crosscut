@@ -53,7 +53,7 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
         )
         self.assertEqual(
             _direct_member_render_feedback_strict_composition_limit(6),
-            36,
+            64,
         )
         self.assertEqual(
             _direct_member_render_feedback_strict_composition_limit(100),

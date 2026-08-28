@@ -394,12 +394,11 @@ _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = 12
 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
     2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
 )
-# Each decoded-render repair seed can expose two useful descendants before a
-# second structural operation is needed.  Extend the ordinary strict cohort by
-# that bounded amount instead of replacing it with a smaller fixed cohort: a
-# fixed thirteen-candidate budget previously discarded already-generated
-# repairs even while the global sixty-four-profile budget remained available.
-_DIRECT_MEMBER_RENDER_FEEDBACK_STRICT_COMPOSITIONS_PER_SEED = 2
+# A decoded-render failure is stronger evidence than selector-only failure.
+# Once such evidence exists, exhaust the ordinary global first cohort before
+# transferring candidates to the hold/effect terminal audition.  A smaller
+# inner cap can otherwise discard a generated repair while global capacity is
+# still available.
 _DIRECT_MEMBER_TERMINAL_HOLD_REPAIRABLE_FAILURES = frozenset(
     {
         "boundary_connectivity_path_exhausted",
@@ -9888,13 +9887,10 @@ def _direct_member_render_feedback_strict_composition_limit(
         or feedback_profile_count < 0
     ):
         raise ValueError("feedback_profile_count must be a non-negative integer")
-    return min(
-        _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
-        _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
-        + (
-            feedback_profile_count
-            * _DIRECT_MEMBER_RENDER_FEEDBACK_STRICT_COMPOSITIONS_PER_SEED
-        ),
+    return (
+        _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
+        if feedback_profile_count
+        else _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
     )
 
 
@@ -10251,7 +10247,7 @@ def _select_direct_member_partition_profile(
                 partition_search_strict_terminal_audition_limit
             ),
             "strict_composition_limit_basis": (
-                "decoded_render_feedback_seed_scaled_extra_cohort"
+                "decoded_render_feedback_global_first_cohort"
                 if render_feedback_profiles
                 else "default_bounded_terminal_cohort"
             ),
