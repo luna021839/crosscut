@@ -159,8 +159,8 @@ DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS = (50, 100, 200, 300, 400, 500)
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT = (
     "predeclared_train_only_detached_structured_low_rank_adapter_milestones_"
-    "existing_exact_validation_highest_score_lower_step_tiebreak_"
-    "initial_head_fallback_v4"
+    "existing_exact_validation_structured_metric_gate_highest_score_"
+    "lower_step_tiebreak_initial_head_fallback_v5"
 )
 DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
     "frozen_post_source_pretraining_context_and_exact_source_embedding_v1"
@@ -168,10 +168,13 @@ DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
 DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT = (
     "only_dynamic_crop_count_time_motion_low_rank_residual_mutable_v3"
 )
-DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 8
+DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 16
 DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
-    "fixed_deterministic_random_projection_separate_context_source_"
-    "linear_structured_residual_v1"
+    "standardized_fixed_deterministic_random_projection_separate_"
+    "context_source_linear_structured_residual_v2"
+)
+DYNAMIC_CROP_V3_PRIOR_STRUCTURED_SELECTION_CONTRACT = (
+    "validation_count_macro_recall_coverage_time_motion_nonregression_v1"
 )
 PRODUCTION_TRAINING_FAILURE_REPORT_FILENAME = (
     "stageedit-production-training-failure-report.json"
@@ -369,6 +372,134 @@ def _stage_edit_validation_selection_with_dynamic_crop_v3(
             "dynamic_crop_v3_aggregate_normalized_improvement_over_static_prior"
         ),
         "dynamic_crop_v3_selection_gate": dynamic_evidence,
+        "heldout_metrics_consumed": False,
+    }
+
+
+def _dynamic_crop_v3_prior_structured_selection_evidence(
+    candidate_metrics: Mapping[str, Any],
+    initial_metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject prior candidates that collapse structured renderer outputs."""
+
+    def structured(metrics: Mapping[str, Any]) -> dict[str, Any]:
+        trajectory = metrics.get("trajectory")
+        trajectory = trajectory if isinstance(trajectory, Mapping) else {}
+        count = trajectory.get("count")
+        count = count if isinstance(count, Mapping) else {}
+        target_histogram = count.get("target_histogram_1_to_8")
+        predicted_histogram = count.get("predicted_histogram_1_to_8")
+        confusion = count.get("confusion_target_rows_predicted_columns")
+        target_histogram = (
+            list(target_histogram)
+            if isinstance(target_histogram, list)
+            else []
+        )
+        predicted_histogram = (
+            list(predicted_histogram)
+            if isinstance(predicted_histogram, list)
+            else []
+        )
+        confusion = list(confusion) if isinstance(confusion, list) else []
+        recalls: list[float] = []
+        for index, row in enumerate(confusion):
+            if not isinstance(row, list):
+                continue
+            row_total = sum(
+                int(value)
+                for value in row
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
+            if row_total > 0 and index < len(row):
+                diagonal = row[index]
+                if isinstance(diagonal, int) and not isinstance(diagonal, bool):
+                    recalls.append(float(diagonal / row_total))
+        return {
+            "target_observed_class_count": sum(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in target_histogram
+            ),
+            "predicted_observed_class_count": sum(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in predicted_histogram
+            ),
+            "count_exact_accuracy": _finite_metric(count.get("exact_accuracy")),
+            "count_macro_recall": (
+                float(sum(recalls) / len(recalls)) if recalls else None
+            ),
+            "normalized_time_mae": _finite_metric(
+                trajectory.get("teacher_forced_count_normalized_time_mae")
+            ),
+            "motion_balanced_accuracy": _finite_metric(
+                (
+                    trajectory.get("motion", {}).get("balanced_accuracy")
+                    if isinstance(trajectory.get("motion"), Mapping)
+                    else None
+                )
+            ),
+        }
+
+    candidate = structured(candidate_metrics)
+    initial = structured(initial_metrics)
+    reasons: list[str] = []
+    required_numbers = (
+        "count_exact_accuracy",
+        "count_macro_recall",
+        "normalized_time_mae",
+        "motion_balanced_accuracy",
+    )
+    if any(candidate[key] is None or initial[key] is None for key in required_numbers):
+        reasons.append("dynamic_crop_v3_prior_structured_metrics_missing")
+    target_class_count = int(candidate["target_observed_class_count"])
+    minimum_predicted_class_count = min(3, target_class_count)
+    if (
+        target_class_count < 2
+        or int(candidate["predicted_observed_class_count"])
+        < minimum_predicted_class_count
+    ):
+        reasons.append("dynamic_crop_v3_prior_count_prediction_collapsed")
+
+    score_component: float | None = None
+    if not any(candidate[key] is None or initial[key] is None for key in required_numbers):
+        count_macro_delta = float(candidate["count_macro_recall"]) - float(
+            initial["count_macro_recall"]
+        )
+        count_accuracy_delta = float(candidate["count_exact_accuracy"]) - float(
+            initial["count_exact_accuracy"]
+        )
+        time_improvement = float(initial["normalized_time_mae"]) - float(
+            candidate["normalized_time_mae"]
+        )
+        motion_delta = float(candidate["motion_balanced_accuracy"]) - float(
+            initial["motion_balanced_accuracy"]
+        )
+        if count_macro_delta <= 0.0:
+            reasons.append("dynamic_crop_v3_prior_count_macro_recall_not_improved")
+        if time_improvement < -0.005:
+            reasons.append("dynamic_crop_v3_prior_time_mae_regressed")
+        if motion_delta < -0.02:
+            reasons.append("dynamic_crop_v3_prior_motion_regressed")
+        score_component = (
+            0.60 * count_macro_delta
+            + 0.20 * count_accuracy_delta
+            + 0.10 * time_improvement
+            + 0.10 * motion_delta
+        )
+        if score_component <= 0.0:
+            reasons.append("dynamic_crop_v3_prior_structured_score_not_improved")
+    return {
+        "contract": DYNAMIC_CROP_V3_PRIOR_STRUCTURED_SELECTION_CONTRACT,
+        "selectable": not reasons,
+        "reasons": reasons,
+        "score_component": score_component,
+        "candidate": candidate,
+        "initial": initial,
+        "minimum_predicted_class_count": minimum_predicted_class_count,
+        "validation_gradients_computed": False,
         "heldout_metrics_consumed": False,
     }
 
@@ -1973,11 +2104,109 @@ def _dynamic_crop_v3_structured_prior_projections(
     return context_projection, source_projection
 
 
+@dataclass(frozen=True, slots=True)
+class _DynamicCropV3PriorProjectionNormalizer:
+    context_mean: Any
+    context_scale: Any
+    source_mean: Any
+    source_scale: Any
+    evidence: Mapping[str, Any]
+
+
+def _dynamic_crop_v3_structured_prior_projection_normalizer(
+    inventory: _DynamicCropV3PriorInventory,
+    context_projection_matrix: Any,
+    source_projection_matrix: Any,
+) -> _DynamicCropV3PriorProjectionNormalizer:
+    """Fit train-only feature scaling before low-rank prior optimization."""
+
+    context_matrix = np.asarray(context_projection_matrix, dtype=np.float64)
+    source_matrix = np.asarray(source_projection_matrix, dtype=np.float64)
+    context_embeddings = np.stack(
+        [
+            np.asarray(track.context_embedding, dtype=np.float64)
+            for track in inventory.tracks
+            if track.context_embedding is not None
+        ],
+        axis=0,
+    )
+    source_embeddings = np.stack(
+        [
+            np.asarray(track.source_embedding, dtype=np.float64)
+            for track in inventory.tracks
+            if track.source_embedding is not None
+        ],
+        axis=0,
+    )
+    if (
+        context_embeddings.shape[0] != len(inventory.tracks)
+        or source_embeddings.shape[0] != len(inventory.tracks)
+    ):
+        raise RuntimeError(
+            "Dynamic Crop v3 prior projection normalization needs all features"
+        )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        projected_context = context_embeddings @ context_matrix.T
+        projected_source = source_embeddings @ source_matrix.T
+    if (
+        not np.isfinite(projected_context).all()
+        or not np.isfinite(projected_source).all()
+    ):
+        raise RuntimeError(
+            "Dynamic Crop v3 prior projected features are not finite"
+        )
+    context_mean_np = projected_context.mean(axis=0).astype(np.float32)
+    source_mean_np = projected_source.mean(axis=0).astype(np.float32)
+    context_scale_np = np.maximum(
+        projected_context.std(axis=0),
+        1.0e-3,
+    ).astype(np.float32)
+    source_scale_np = np.maximum(
+        projected_source.std(axis=0),
+        1.0e-3,
+    ).astype(np.float32)
+    context_mean = mx.array(context_mean_np)
+    context_scale = mx.array(context_scale_np)
+    source_mean = mx.array(source_mean_np)
+    source_scale = mx.array(source_scale_np)
+    mx.eval(context_mean, context_scale, source_mean, source_scale)
+    evidence = {
+        "contract": "training_track_projection_zscore_floor_1e_3_v1",
+        "track_count": len(inventory.tracks),
+        "context_mean_sha256": _parameter_tree_sha256(
+            {"mean": context_mean}
+        ),
+        "context_scale_sha256": _parameter_tree_sha256(
+            {"scale": context_scale}
+        ),
+        "source_mean_sha256": _parameter_tree_sha256(
+            {"mean": source_mean}
+        ),
+        "source_scale_sha256": _parameter_tree_sha256(
+            {"scale": source_scale}
+        ),
+        "context_scale_min": float(context_scale_np.min()),
+        "context_scale_max": float(context_scale_np.max()),
+        "source_scale_min": float(source_scale_np.min()),
+        "source_scale_max": float(source_scale_np.max()),
+        "validation_labels_consumed": False,
+        "heldout_labels_consumed": False,
+    }
+    return _DynamicCropV3PriorProjectionNormalizer(
+        context_mean=context_mean,
+        context_scale=context_scale,
+        source_mean=source_mean,
+        source_scale=source_scale,
+        evidence=evidence,
+    )
+
+
 def _dynamic_crop_v3_structured_prior_raw(
     module: _DynamicCropV3StructuredPriorAdapterModule,
     initial_snapshot: Mapping[str, Any],
     context_projection_matrix: Any,
     source_projection_matrix: Any,
+    projection_normalizer: _DynamicCropV3PriorProjectionNormalizer,
     context_embedding: Any,
     source_embedding: Any,
 ) -> Any:
@@ -1987,14 +2216,14 @@ def _dynamic_crop_v3_structured_prior_raw(
         + initial_snapshot["context_bias"]
         + mx.matmul(initial_snapshot["source_weight"], source_embedding)
     )
-    context_projection = mx.matmul(
-        context_projection_matrix,
-        context_embedding,
-    )
-    source_projection = mx.matmul(
-        source_projection_matrix,
-        source_embedding,
-    )
+    context_projection = (
+        mx.matmul(context_projection_matrix, context_embedding)
+        - projection_normalizer.context_mean
+    ) / projection_normalizer.context_scale
+    source_projection = (
+        mx.matmul(source_projection_matrix, source_embedding)
+        - projection_normalizer.source_mean
+    ) / projection_normalizer.source_scale
     structured_residual = module(
         context_projection,
         source_projection,
@@ -2012,17 +2241,33 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
     initial_snapshot: Mapping[str, Any],
     context_projection_matrix: Any,
     source_projection_matrix: Any,
+    projection_normalizer: _DynamicCropV3PriorProjectionNormalizer,
 ) -> dict[str, Any]:
     """Merge the low-rank structured residual into a full renderer head."""
 
     values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     context_delta = mx.matmul(
-        module.context_adapter.weight,
+        module.context_adapter.weight
+        / projection_normalizer.context_scale[None, :],
         context_projection_matrix,
     )
     source_delta = mx.matmul(
-        module.source_adapter.weight,
+        module.source_adapter.weight
+        / projection_normalizer.source_scale[None, :],
         source_projection_matrix,
+    )
+    structured_bias_delta = (
+        module.context_adapter.bias
+        - mx.matmul(
+            module.context_adapter.weight,
+            projection_normalizer.context_mean
+            / projection_normalizer.context_scale,
+        )
+        - mx.matmul(
+            module.source_adapter.weight,
+            projection_normalizer.source_mean
+            / projection_normalizer.source_scale,
+        )
     )
     snapshot = {
         "context_weight": mx.concatenate(
@@ -2037,7 +2282,7 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
             (
                 initial_snapshot["context_bias"][:values_stop],
                 initial_snapshot["context_bias"][values_stop:]
-                + module.context_adapter.bias,
+                + structured_bias_delta,
             ),
             axis=0,
         ),
@@ -2197,6 +2442,8 @@ def _dynamic_crop_v3_prior_loss(
     motion_target: float,
     motion_supervised: bool,
     contract: DynamicCropV3LossContract,
+    count_sample_weight: float = 1.0,
+    motion_sample_weight: float = 1.0,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Train every v3 component without allowing gradients into the base."""
 
@@ -2209,6 +2456,8 @@ def _dynamic_crop_v3_prior_loss(
         motion_target,
         motion_supervised,
         contract,
+        count_sample_weight,
+        motion_sample_weight,
     )
 
 
@@ -2220,6 +2469,8 @@ def _dynamic_crop_v3_prior_loss_from_raw(
     motion_target: float,
     motion_supervised: bool,
     contract: DynamicCropV3LossContract,
+    count_sample_weight: float = 1.0,
+    motion_sample_weight: float = 1.0,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Evaluate the exact v3 renderer loss for an already-composed head."""
 
@@ -2235,7 +2486,7 @@ def _dynamic_crop_v3_prior_loss_from_raw(
     value_loss = nn.losses.smooth_l1_loss(
         predicted_values[:count], normalized_targets, reduction="mean"
     )
-    count_loss = nn.losses.cross_entropy(
+    count_loss = float(count_sample_weight) * nn.losses.cross_entropy(
         raw[None, values_stop:count_stop],
         mx.array((count - 1,), dtype=mx.int32),
         reduction="mean",
@@ -2246,7 +2497,7 @@ def _dynamic_crop_v3_prior_loss_from_raw(
         selected_times, target_times, reduction="mean"
     )
     motion_loss = (
-        nn.losses.binary_cross_entropy(
+        float(motion_sample_weight) * nn.losses.binary_cross_entropy(
             raw[time_stop],
             mx.array(motion_target, dtype=raw.dtype),
             with_logits=True,
@@ -2414,6 +2665,41 @@ def _dynamic_crop_v3_prior_component_scale_evidence(
             weighted_count / weighted_value if weighted_value > 0.0 else None
         ),
         "base_loss_weight": contract.base_loss_weight,
+        "validation_labels_consumed": False,
+        "heldout_labels_consumed": False,
+    }
+
+
+def _dynamic_crop_v3_prior_class_balance_evidence(
+    inventory: _DynamicCropV3PriorInventory,
+) -> dict[str, Any]:
+    """Derive train-only inverse-frequency weights for structured labels."""
+
+    count_histogram = [0] * DYNAMIC_CROP_V3_MAX_KEYFRAMES
+    motion_histogram = [0, 0]
+    for track in inventory.tracks:
+        count_histogram[len(track.values) - 1] += 1
+        if not track.motion_label_loss_masked:
+            motion_histogram[int(track.motion_label == "dynamic")] += 1
+
+    def inverse_frequency(histogram: Sequence[int]) -> list[float]:
+        total = sum(histogram)
+        observed = sum(value > 0 for value in histogram)
+        if total < 1 or observed < 1:
+            raise ValueError("Dynamic Crop v3 prior class labels are empty")
+        return [
+            float(total / (observed * value)) if value > 0 else 0.0
+            for value in histogram
+        ]
+
+    return {
+        "contract": "training_only_inverse_frequency_expected_weight_one_v1",
+        "count_histogram_1_to_8": count_histogram,
+        "count_class_weights_1_to_8": inverse_frequency(count_histogram),
+        "motion_histogram_static_dynamic": motion_histogram,
+        "motion_class_weights_static_dynamic": inverse_frequency(
+            motion_histogram
+        ),
         "validation_labels_consumed": False,
         "heldout_labels_consumed": False,
     }
@@ -3211,6 +3497,13 @@ def train_production_stage_edit(
                 seed=seed,
                 requested_rank=projection_rank,
             )
+            prior_projection_normalizer = (
+                _dynamic_crop_v3_structured_prior_projection_normalizer(
+                    prior_inventory,
+                    prior_context_projection,
+                    prior_source_projection,
+                )
+            )
             prior_adapter = _DynamicCropV3StructuredPriorAdapterModule(
                 projection_rank
             )
@@ -3227,6 +3520,11 @@ def train_production_stage_edit(
                     prior_inventory,
                     np.asarray(initial_values_mx, dtype=np.float64),
                     effective_dynamic_crop_v3_loss_contract,
+                )
+            )
+            prior_class_balance_evidence = (
+                _dynamic_crop_v3_prior_class_balance_evidence(
+                    prior_inventory
                 )
             )
             prior_schedule = _warmup_cosine_schedule(
@@ -3264,6 +3562,7 @@ def train_production_stage_edit(
                     dynamic_crop_v3_prior_initial_snapshot,
                     prior_context_projection,
                     prior_source_projection,
+                    prior_projection_normalizer,
                     context_embedding,
                     source_embedding,
                 )
@@ -3275,6 +3574,12 @@ def train_production_stage_edit(
                     motion_target,
                     motion_supervised,
                     effective_dynamic_crop_v3_loss_contract,
+                    prior_class_balance_evidence[
+                        "count_class_weights_1_to_8"
+                    ][count_target - 1],
+                    prior_class_balance_evidence[
+                        "motion_class_weights_static_dynamic"
+                    ][int(motion_target)],
                 )[0]
 
             prior_loss_and_grad = nn.value_and_grad(
@@ -3323,6 +3628,7 @@ def train_production_stage_edit(
                     dynamic_crop_v3_prior_initial_snapshot,
                     prior_context_projection,
                     prior_source_projection,
+                    prior_projection_normalizer,
                     context_embedding,
                     source_embedding,
                 )
@@ -3334,6 +3640,12 @@ def train_production_stage_edit(
                     motion_target,
                     motion_supervised,
                     effective_dynamic_crop_v3_loss_contract,
+                    prior_class_balance_evidence[
+                        "count_class_weights_1_to_8"
+                    ][count_target - 1],
+                    prior_class_balance_evidence[
+                        "motion_class_weights_static_dynamic"
+                    ][int(motion_target)],
                 )
                 optimizer_steps += 1
                 dynamic_crop_v3_prior_pretraining_optimizer_steps += 1
@@ -3353,6 +3665,7 @@ def train_production_stage_edit(
                             dynamic_crop_v3_prior_initial_snapshot,
                             prior_context_projection,
                             prior_source_projection,
+                            prior_projection_normalizer,
                         )
                     )
                     dynamic_crop_v3_prior_candidate_snapshots[prior_step] = (
@@ -3444,6 +3757,9 @@ def train_production_stage_edit(
                 ),
                 "source_projection_sha256": _parameter_tree_sha256(
                     {"projection": prior_source_projection}
+                ),
+                "projection_normalization": dict(
+                    prior_projection_normalizer.evidence
                 ),
                 "detached_feature_content_sha256": (
                     prior_inventory.detached_feature_content_sha256
@@ -3640,12 +3956,52 @@ def train_production_stage_edit(
                 warmup_base_selection = stage_edit_validation_selection_score(
                     warmup_validation_metrics
                 )
-                warmup_selection = (
+                renderer_selection = (
                     _stage_edit_validation_selection_with_dynamic_crop_v3(
                         warmup_base_selection,
                         warmup_validation_dynamic,
                     )
                 )
+                structured_selection = (
+                    _dynamic_crop_v3_prior_structured_selection_evidence(
+                        warmup_validation_dynamic,
+                        initial_validation_dynamic,
+                    )
+                )
+                renderer_selection_score = _finite_metric(
+                    renderer_selection.get("score")
+                )
+                structured_selection_score = _finite_metric(
+                    structured_selection.get("score_component")
+                )
+                structured_selectable = bool(
+                    renderer_selection.get("selectable") is True
+                    and structured_selection.get("selectable") is True
+                    and renderer_selection_score is not None
+                    and structured_selection_score is not None
+                )
+                warmup_selection = {
+                    **dict(renderer_selection),
+                    "selectable": structured_selectable,
+                    "score": (
+                        renderer_selection_score + structured_selection_score
+                        if structured_selectable
+                        else None
+                    ),
+                    "components": {
+                        **dict(renderer_selection.get("components", {})),
+                        "dynamic_crop_v3_prior_structured_improvement": (
+                            structured_selection_score
+                        ),
+                    },
+                    "formula": (
+                        f"{renderer_selection.get('formula')} + "
+                        "dynamic_crop_v3_prior_structured_improvement"
+                    ),
+                    "dynamic_crop_v3_prior_structured_selection_gate": (
+                        structured_selection
+                    ),
+                }
                 warmup_selection_score = _finite_metric(
                     warmup_selection.get("score")
                 )
@@ -3880,9 +4236,9 @@ def train_production_stage_edit(
                     DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
                 ),
                 "selection_rule": (
-                    "highest_finite_selectable_existing_validation_score_"
-                    "then_lower_candidate_step_on_exact_tie_else_restore_"
-                    "initial_dynamic_head"
+                    "renderer_safe_and_structured_noncollapsed_highest_"
+                    "finite_existing_validation_score_then_lower_candidate_"
+                    "step_on_exact_tie_else_restore_initial_dynamic_head"
                 ),
                 "training_partition_only_gradients": True,
                 "validation_reference_ids": [
@@ -4965,8 +5321,8 @@ def train_production_stage_edit(
             "learning_rate": learning_rate,
             "learning_rate_schedule": {
                 "contract": (
-                    "independent_warmup_cosine_cut_source_v3_structured_"
-                    "prior_and_joint_with_retained_selection_burn_in_v5"
+                    "independent_warmup_cosine_cut_source_v3_balanced_"
+                    "standardized_structured_prior_and_joint_retention_v6"
                     if dynamic_crop_v3_prior_pretrain_steps
                     else "independent_warmup_cosine_cut_source_and_joint_"
                     "with_step_floor_v3"
@@ -5069,6 +5425,7 @@ def train_production_stage_edit(
                     "component_scale": (
                         dynamic_crop_v3_prior_component_scale_evidence
                     ),
+                    "class_balance": prior_class_balance_evidence,
                     "parameter_invariance": (
                         dynamic_crop_v3_prior_parameter_invariance
                     ),
@@ -5263,8 +5620,12 @@ def train_production_stage_edit(
 
 
 __all__ = [
+    "DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT",
     "DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT",
     "DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS",
+    "DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT",
+    "DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK",
+    "DYNAMIC_CROP_V3_PRIOR_STRUCTURED_SELECTION_CONTRACT",
     "DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT",
     "PRODUCTION_TRAINING_REPORT_SCHEMA_VERSION",
     "STAGE_EDIT_SELECTION_FREEZE_FILENAME",

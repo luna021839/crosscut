@@ -51,11 +51,13 @@ from crosscut.stage_edit_production_training import (
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
     _HierarchicalSourceWindowSampler,
     _HierarchicalDynamicCropV3PriorSampler,
+    _DynamicCropV3PriorProjectionNormalizer,
     _DynamicCropV3StructuredPriorAdapterModule,
     _balanced_cut_windows,
     _cut_only_pretraining_loss_contract,
     _dynamic_crop_v3_validation_selection_evidence,
     _dynamic_crop_v3_prior_inventory,
+    _dynamic_crop_v3_prior_structured_selection_evidence,
     _dynamic_crop_v3_structured_prior_head_snapshot,
     _dynamic_crop_v3_structured_prior_projections,
     _require_unambiguous_checkpoint_namespace,
@@ -281,6 +283,76 @@ class StageEditProductionQualityTests(unittest.TestCase):
                 )
                 self.assertFalse(rejected["selectable"])
                 self.assertIn(expected_reason, rejected["reasons"])
+
+    def test_dynamic_crop_v3_prior_rejects_single_class_count_collapse(
+        self,
+    ) -> None:
+        def metrics(
+            predicted_histogram: list[int],
+            confusion: list[list[int]],
+            *,
+            count_accuracy: float,
+            time_mae: float,
+            motion_balanced_accuracy: float,
+        ) -> dict:
+            padded_confusion = [
+                row + [0] * (8 - len(row)) for row in confusion
+            ] + [[0] * 8 for _ in range(8 - len(confusion))]
+            return {
+                "trajectory": {
+                    "count": {
+                        "exact_accuracy": count_accuracy,
+                        "target_histogram_1_to_8": [2, 2, 2, 0, 0, 0, 0, 0],
+                        "predicted_histogram_1_to_8": (
+                            predicted_histogram + [0] * (8 - len(predicted_histogram))
+                        ),
+                        "confusion_target_rows_predicted_columns": (
+                            padded_confusion
+                        ),
+                    },
+                    "teacher_forced_count_normalized_time_mae": time_mae,
+                    "motion": {
+                        "balanced_accuracy": motion_balanced_accuracy
+                    },
+                }
+            }
+
+        initial = metrics(
+            [6, 0, 0],
+            [[2, 0, 0], [2, 0, 0], [2, 0, 0]],
+            count_accuracy=1.0 / 3.0,
+            time_mae=0.18,
+            motion_balanced_accuracy=0.5,
+        )
+        improved = metrics(
+            [2, 2, 2],
+            [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            count_accuracy=1.0,
+            time_mae=0.15,
+            motion_balanced_accuracy=0.55,
+        )
+        accepted = _dynamic_crop_v3_prior_structured_selection_evidence(
+            improved,
+            initial,
+        )
+        self.assertTrue(accepted["selectable"])
+        self.assertGreater(accepted["score_component"], 0.0)
+
+        collapsed = _dynamic_crop_v3_prior_structured_selection_evidence(
+            metrics(
+                [0, 6, 0],
+                [[0, 2, 0], [0, 2, 0], [0, 2, 0]],
+                count_accuracy=1.0 / 3.0,
+                time_mae=0.14,
+                motion_balanced_accuracy=0.55,
+            ),
+            initial,
+        )
+        self.assertFalse(collapsed["selectable"])
+        self.assertIn(
+            "dynamic_crop_v3_prior_count_prediction_collapsed",
+            collapsed["reasons"],
+        )
 
     def test_dynamic_crop_v3_quality_uses_count_and_exact_renderer_schema(
         self,
@@ -889,11 +961,19 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
         adapter.source_adapter.weight = mx.ones_like(
             adapter.source_adapter.weight
         )
+        normalizer = _DynamicCropV3PriorProjectionNormalizer(
+            context_mean=mx.zeros((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            context_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            source_mean=mx.zeros((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            source_scale=mx.ones((DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,)),
+            evidence={},
+        )
         snapshot = _dynamic_crop_v3_structured_prior_head_snapshot(
             adapter,
             initial,
             context_projection,
             source_projection,
+            normalizer,
         )
 
         for name in ("context_weight", "source_weight"):

@@ -610,6 +610,13 @@ def train_dynamic_crop_v3_final_fit(
             seed=int(schedule["seed"]),
             requested_rank=projection_rank,
         )
+        prior_projection_normalizer = (
+            production._dynamic_crop_v3_structured_prior_projection_normalizer(
+                prior_inventory,
+                prior_context_projection,
+                prior_source_projection,
+            )
+        )
         prior_adapter = production._DynamicCropV3StructuredPriorAdapterModule(
             projection_rank
         )
@@ -621,6 +628,9 @@ def train_dynamic_crop_v3_final_fit(
             prior_inventory,
             np.asarray(initial_values_mx, dtype=np.float64),
             effective_dynamic_loss,
+        )
+        class_balance = production._dynamic_crop_v3_prior_class_balance_evidence(
+            prior_inventory
         )
         prior_schedule = production._warmup_cosine_schedule(
             peak_learning_rate=float(
@@ -664,6 +674,7 @@ def train_dynamic_crop_v3_final_fit(
                 initial_prior_snapshot,
                 prior_context_projection,
                 prior_source_projection,
+                prior_projection_normalizer,
                 context_embedding,
                 source_embedding,
             )
@@ -675,6 +686,10 @@ def train_dynamic_crop_v3_final_fit(
                 motion_target,
                 motion_supervised,
                 effective_dynamic_loss,
+                class_balance["count_class_weights_1_to_8"][count_target - 1],
+                class_balance["motion_class_weights_static_dynamic"][
+                    int(motion_target)
+                ],
             )[0]
 
         prior_loss_and_grad = production.nn.value_and_grad(
@@ -728,6 +743,7 @@ def train_dynamic_crop_v3_final_fit(
                 initial_prior_snapshot,
                 prior_context_projection,
                 prior_source_projection,
+                prior_projection_normalizer,
                 context_embedding,
                 source_embedding,
             )
@@ -739,6 +755,10 @@ def train_dynamic_crop_v3_final_fit(
                 motion_target,
                 motion_supervised,
                 effective_dynamic_loss,
+                class_balance["count_class_weights_1_to_8"][count_target - 1],
+                class_balance["motion_class_weights_static_dynamic"][
+                    int(motion_target)
+                ],
             )
             optimizer_steps += 1
             prior_steps += 1
@@ -758,6 +778,7 @@ def train_dynamic_crop_v3_final_fit(
                         initial_prior_snapshot,
                         prior_context_projection,
                         prior_source_projection,
+                        prior_projection_normalizer,
                     )
                 )
                 prior_candidate_snapshots[phase_step] = snapshot
@@ -894,8 +915,9 @@ def train_dynamic_crop_v3_final_fit(
             raise RuntimeError("final-fit frozen v3 prior digest drifted")
         prior_evidence = {
             "contract": (
-                "all_reference_predeclared_structured_low_rank_adapter_"
-                "milestones_frozen_loso_candidate_no_reselection_v3"
+                "all_reference_predeclared_balanced_standardized_structured_"
+                "low_rank_adapter_milestones_frozen_loso_candidate_no_"
+                "reselection_v4"
             ),
             "partition": "all_references_fixed_after_loso_selection",
             "objective": (
@@ -970,6 +992,9 @@ def train_dynamic_crop_v3_final_fit(
                         {"projection": prior_source_projection}
                     )
                 ),
+                "projection_normalization": dict(
+                    prior_projection_normalizer.evidence
+                ),
                 "detached_feature_content_sha256": (
                     prior_inventory.detached_feature_content_sha256
                 ),
@@ -990,6 +1015,7 @@ def train_dynamic_crop_v3_final_fit(
                 ),
             },
             "component_scale": component_scale,
+            "class_balance": class_balance,
             "parameter_invariance": {
                 "before": before_prior_digests,
                 "after": after_prior_digests,
@@ -1612,7 +1638,12 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         "all_reference_predeclared_detached_feature_head_milestones_"
         "frozen_loso_candidate_no_reselection_v2"
     )
-    structured_adapter_prior = prior_contract == (
+    standardized_structured_adapter_prior = prior_contract == (
+        "all_reference_predeclared_balanced_standardized_structured_"
+        "low_rank_adapter_milestones_frozen_loso_candidate_no_"
+        "reselection_v4"
+    )
+    structured_adapter_prior = standardized_structured_adapter_prior or prior_contract == (
         "all_reference_predeclared_structured_low_rank_adapter_"
         "milestones_frozen_loso_candidate_no_reselection_v3"
     )
@@ -1757,6 +1788,136 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         raise DynamicCropV3FinalFitError(
             "final-fit optimizer or checkpoint contract differs"
         )
+    if standardized_structured_adapter_prior:
+        normalization = sampling.get("projection_normalization")
+        class_balance = prior.get("class_balance")
+        projection_rank = sampling.get("projection_rank")
+        structured_dimension = (
+            production.DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
+            - production.DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+        )
+        expected_parameter_count = (
+            structured_dimension * (2 * int(projection_rank) + 1)
+            if isinstance(projection_rank, int)
+            and not isinstance(projection_rank, bool)
+            and projection_rank > 0
+            else None
+        )
+        normalization_hash_keys = (
+            "context_mean_sha256",
+            "context_scale_sha256",
+            "source_mean_sha256",
+            "source_scale_sha256",
+        )
+        normalization_scale_keys = (
+            "context_scale_min",
+            "context_scale_max",
+            "source_scale_min",
+            "source_scale_max",
+        )
+        count_histogram = (
+            class_balance.get("count_histogram_1_to_8", [])
+            if isinstance(class_balance, Mapping)
+            else []
+        )
+        count_weights = (
+            class_balance.get("count_class_weights_1_to_8", [])
+            if isinstance(class_balance, Mapping)
+            else []
+        )
+        motion_histogram = (
+            class_balance.get("motion_histogram_static_dynamic", [])
+            if isinstance(class_balance, Mapping)
+            else []
+        )
+        motion_weights = (
+            class_balance.get("motion_class_weights_static_dynamic", [])
+            if isinstance(class_balance, Mapping)
+            else []
+        )
+
+        def valid_histogram(values: object, length: int) -> bool:
+            return bool(
+                isinstance(values, list)
+                and len(values) == length
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in values
+                )
+            )
+
+        def valid_weights(values: object, length: int) -> bool:
+            return bool(
+                isinstance(values, list)
+                and len(values) == length
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and float(value) >= 0.0
+                    for value in values
+                )
+            )
+
+        count_histogram_valid = valid_histogram(count_histogram, 8)
+        motion_histogram_valid = valid_histogram(motion_histogram, 2)
+        count_total = sum(count_histogram) if count_histogram_valid else -1
+        motion_total = sum(motion_histogram) if motion_histogram_valid else -1
+        if (
+            prior.get("mutable_parameter_scope")
+            != production.DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
+            or sampling.get("adapter_contract")
+            != production.DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT
+            or not isinstance(projection_rank, int)
+            or isinstance(projection_rank, bool)
+            or not 1 <= projection_rank <= production.DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK
+            or sampling.get("trainable_parameter_count")
+            != expected_parameter_count
+            or not _is_sha256(sampling.get("context_projection_sha256"))
+            or not _is_sha256(sampling.get("source_projection_sha256"))
+            or not isinstance(normalization, Mapping)
+            or normalization.get("contract")
+            != "training_track_projection_zscore_floor_1e_3_v1"
+            or normalization.get("track_count") != count_total
+            or any(
+                not _is_sha256(normalization.get(key))
+                for key in normalization_hash_keys
+            )
+            or any(
+                not isinstance(normalization.get(key), (int, float))
+                or isinstance(normalization.get(key), bool)
+                or not math.isfinite(float(normalization[key]))
+                or float(normalization[key]) <= 0.0
+                for key in normalization_scale_keys
+            )
+            or normalization.get("validation_labels_consumed") is not False
+            or normalization.get("heldout_labels_consumed") is not False
+            or not isinstance(class_balance, Mapping)
+            or class_balance.get("contract")
+            != "training_only_inverse_frequency_expected_weight_one_v1"
+            or not count_histogram_valid
+            or not valid_weights(count_weights, 8)
+            or not motion_histogram_valid
+            or not valid_weights(motion_weights, 2)
+            or count_total < 1
+            or motion_total < 1
+            or class_balance.get("validation_labels_consumed") is not False
+            or class_balance.get("heldout_labels_consumed") is not False
+            or invariance.get("context_value_weight_changed") is not False
+            or invariance.get("source_value_weight_changed") is not False
+            or invariance.get("context_structured_weight_changed") is not True
+            or invariance.get("source_structured_weight_changed") is not True
+            or invariance.get("value_row_gradients_computed") is not False
+            or invariance.get(
+                "structured_low_rank_adapter_gradients_computed"
+            )
+            is not True
+        ):
+            raise DynamicCropV3FinalFitError(
+                "final-fit standardized structured prior evidence differs"
+            )
     invariant_parameter_groups = (
         (
             "base_parameter_tree_sha256",
