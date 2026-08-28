@@ -8,6 +8,9 @@ from crosscut.direct_member_visual import (
     select_balanced_direct_member_sources,
 )
 from crosscut.pose import FormationPersonDescriptor
+from crosscut.pipeline import (
+    _direct_member_proxy_reserved_render_camera_refinement_is_authorized,
+)
 from crosscut.timeline import ShotType
 from crosscut.visual_score import FrameVisualDescriptor
 
@@ -124,6 +127,44 @@ class DirectMemberProxyLocalRepairTests(unittest.TestCase):
                 **common,
                 decoded_proxy_preferred_source_path=(0, 1, 2, 0, 1, 2),
             )
+
+    def test_final_reserved_render_prefers_geometry_only_near_pass(self) -> None:
+        payload = {
+            "direct_member_rendered_continuity_passed": False,
+            "continuity_repair_target_boundary_indices": [2, 5, 8],
+            "rendered_continuity": {
+                "failure_boundary_indices": {
+                    "rendered_boundary_scale_discontinuity": [2],
+                    "rendered_effect_endpoint_position_discontinuity": [5, 8],
+                    "rendered_effect_endpoint_scale_discontinuity": [8],
+                }
+            },
+        }
+
+        self.assertTrue(
+            _direct_member_proxy_reserved_render_camera_refinement_is_authorized(
+                payload,
+                decoded_proxy_path_audition_count=2,
+                decoded_proxy_render_count=3,
+            )
+        )
+        self.assertFalse(
+            _direct_member_proxy_reserved_render_camera_refinement_is_authorized(
+                payload,
+                decoded_proxy_path_audition_count=1,
+                decoded_proxy_render_count=3,
+            )
+        )
+        payload["rendered_continuity"]["failure_boundary_indices"][
+            "rendered_effect_endpoint_pose_discontinuity"
+        ] = [8]
+        self.assertFalse(
+            _direct_member_proxy_reserved_render_camera_refinement_is_authorized(
+                payload,
+                decoded_proxy_path_audition_count=2,
+                decoded_proxy_render_count=3,
+            )
+        )
 
 
 if __name__ == "__main__":

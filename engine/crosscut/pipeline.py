@@ -5957,7 +5957,7 @@ def _direct_member_dense_render_feedback_binding(
     binding_evidence = {
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
         "feedback_application_policy": (
-            "dense_partial_camera_boundary_pair_diagnostics_proxy_v6"
+            "dense_partial_camera_boundary_pair_diagnostics_proxy_v7"
         ),
         "acquisition_source_identity_sha256": source_identity_sha256,
         "timing_draft": timing_draft.to_dict(),
@@ -11338,6 +11338,83 @@ def _direct_member_proxy_refinement_rank(
         quality_failure_count,
         generic_repair_count,
         -resolved_weighted_score,
+    )
+
+
+def _direct_member_proxy_reserved_render_camera_refinement_is_authorized(
+    payload: Mapping[str, Any],
+    *,
+    decoded_proxy_path_audition_count: int,
+    decoded_proxy_render_count: int,
+) -> bool:
+    """Spend the final hard-cut proxy on a near-pass camera repair.
+
+    The ordinary budget preserves one render for another source path. Once a
+    second path has reached at most three geometry-only continuity failures,
+    another global path is lower-value than correcting that decoded candidate
+    in output space. Pose or technical-integrity failures remain ineligible.
+    """
+
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (
+            decoded_proxy_path_audition_count,
+            decoded_proxy_render_count,
+        )
+    ):
+        raise TypeError("decoded proxy budget counters must be integers")
+    if not (
+        2
+        <= decoded_proxy_path_audition_count
+        < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+        and decoded_proxy_render_count
+        == _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS - 1
+        and not bool(
+            payload.get("direct_member_rendered_continuity_passed")
+        )
+    ):
+        return False
+    raw_targets = payload.get(
+        "continuity_repair_target_boundary_indices"
+    )
+    if not (
+        isinstance(raw_targets, list)
+        and 1 <= len(raw_targets) <= 3
+        and all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            for value in raw_targets
+        )
+        and len(set(raw_targets)) == len(raw_targets)
+    ):
+        return False
+    continuity = payload.get("rendered_continuity")
+    continuity_payload = (
+        continuity if isinstance(continuity, Mapping) else {}
+    )
+    failures = continuity_payload.get("failure_boundary_indices")
+    if not isinstance(failures, Mapping) or not failures:
+        return False
+    geometry_only_failure_reasons = {
+        "rendered_boundary_position_discontinuity",
+        "rendered_boundary_scale_discontinuity",
+        "rendered_effect_endpoint_position_discontinuity",
+        "rendered_effect_endpoint_scale_discontinuity",
+    }
+    return bool(
+        set(str(reason) for reason in failures)
+        <= geometry_only_failure_reasons
+        and all(
+            isinstance(indices, list)
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in indices
+            )
+            for indices in failures.values()
+        )
     )
 
 
@@ -24550,6 +24627,17 @@ def analyze(
                     candidate_camera_refinement_diagnostics: (
                         dict[str, Any] | None
                     ) = None
+                    reserved_path_render_camera_refinement_authorized = (
+                        _direct_member_proxy_reserved_render_camera_refinement_is_authorized(
+                            rendered_proxy_review_payload,
+                            decoded_proxy_path_audition_count=(
+                                decoded_proxy_path_audition_count
+                            ),
+                            decoded_proxy_render_count=(
+                                decoded_proxy_render_count
+                            ),
+                        )
+                    )
                     if (
                         not bool(
                             rendered_proxy_review_payload.get(
@@ -24559,14 +24647,24 @@ def analyze(
                         and current_path_proxy_render_count
                         < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_RENDERS_PER_PATH
                         and decoded_proxy_render_count
-                        < (
-                            _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
-                            - int(
-                                decoded_proxy_path_audition_count
-                                < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                        < _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                        and (
+                            decoded_proxy_render_count
+                            < (
+                                _DIRECT_MEMBER_MAXIMUM_DECODED_HARDCUT_PROXY_RENDERS
+                                - int(
+                                    decoded_proxy_path_audition_count
+                                    < _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
+                                )
                             )
+                            or reserved_path_render_camera_refinement_authorized
                         )
                     ):
+                        if reserved_path_render_camera_refinement_authorized:
+                            reporter.log(
+                                "직캠 근접 통과 경로 우선 · 다음 전체 경로 "
+                                "렌더 1회를 출력공간 위치·크기 보정에 재배정"
+                            )
                         (
                             camera_refined_plan,
                             camera_refinement_diagnostics,
