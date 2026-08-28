@@ -45,6 +45,89 @@ class DirectMemberRenderedProxyPreflight:
             raise ValueError("member proxy repair targets are malformed")
         return tuple(int(value) for value in values)
 
+    def refinement_rank(self) -> tuple[int, int, int, int, float, float]:
+        """Rank proxy look attempts without accepting a visual regression.
+
+        Look refinement is allowed to improve encoded color consistency, but
+        its changed pixels can also make the decoded geometry detectors less
+        stable.  Keep the best fully materialized attempt instead of blindly
+        retaining the final iteration.  Lower tuples are better.
+        """
+
+        quality_passed = bool(
+            self.payload.get("member_output_quality_passed")
+        )
+        continuity_passed = bool(
+            self.payload.get("direct_member_rendered_continuity_passed")
+        )
+        continuity = self.payload.get("rendered_continuity")
+        continuity_payload = (
+            continuity if isinstance(continuity, Mapping) else {}
+        )
+        metrics = continuity_payload.get("metrics")
+        metric_payload = metrics if isinstance(metrics, Mapping) else {}
+        thresholds = continuity_payload.get("thresholds")
+        threshold_payload = (
+            thresholds if isinstance(thresholds, Mapping) else {}
+        )
+
+        normalized_excess = 0.0
+        for metric_name, threshold_name in (
+            (
+                "attention_position_mismatch_p95",
+                "maximum_attention_position_mismatch_p95",
+            ),
+            (
+                "attention_scale_mismatch_p95",
+                "maximum_attention_scale_mismatch_p95",
+            ),
+            ("pose_mismatch_p95", "maximum_pose_mismatch_p95"),
+            (
+                "silhouette_mismatch_p95",
+                "maximum_silhouette_mismatch_p95",
+            ),
+        ):
+            value = metric_payload.get(metric_name)
+            maximum = threshold_payload.get(threshold_name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and isinstance(maximum, (int, float))
+                and not isinstance(maximum, bool)
+                and float(maximum) > 0.0
+            ):
+                normalized_excess += max(
+                    0.0,
+                    float(value) / float(maximum) - 1.0,
+                )
+
+        generic = self.payload.get("rendered_proxy_review")
+        generic_payload = generic if isinstance(generic, Mapping) else {}
+        weighted_score = generic_payload.get("weighted_score")
+        resolved_weighted_score = (
+            float(weighted_score)
+            if isinstance(weighted_score, (int, float))
+            and not isinstance(weighted_score, bool)
+            else float("-inf")
+        )
+        quality_failures = self.payload.get(
+            "member_output_quality_failure_reasons"
+        )
+        quality_failure_count = (
+            len(quality_failures) if isinstance(quality_failures, list) else 1
+        )
+        component_failure_count = int(not quality_passed) + int(
+            not continuity_passed
+        )
+        return (
+            int(not self.passed),
+            component_failure_count,
+            len(self.repair_target_boundary_indices),
+            quality_failure_count,
+            normalized_excess,
+            -resolved_weighted_score,
+        )
+
     def write(self, path: Path) -> Path:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)

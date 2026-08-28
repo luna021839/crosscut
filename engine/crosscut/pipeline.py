@@ -21670,6 +21670,14 @@ def analyze(
                     f"{dense_render_feedback_load_diagnostics.get('preferred_partition_status', 'unavailable')} · "
                     "전체 선택·렌더 게이트 재검증"
                 )
+            # Dense and decoded-output retries only add exclusion evidence.
+            # Keep the decoded descriptor session alive across those retries;
+            # rebuilding it discarded the in-memory canonical-frame cache and
+            # made a 26-second proof repeatedly pay full feature-loading cost.
+            direct_visual_descriptor_provider = _VideoDescriptorProvider(
+                eligible_direct_sources,
+                feature_cache_directory=request.source_cache_directory,
+            )
 
             def _select_direct_member_render_path(
                 render_infeasible_transition_edges: Sequence[
@@ -21690,6 +21698,7 @@ def analyze(
                     source_timewarps=source_timewarps,
                     scene_cut_times=scene_cut_times,
                     feature_cache_directory=request.source_cache_directory,
+                    descriptor_provider=direct_visual_descriptor_provider,
                     eligible_source_durations_seconds=(
                         eligible_direct_source_durations_seconds
                     ),
@@ -21754,6 +21763,7 @@ def analyze(
                     ),
                 )
             except DirectMemberVisualSelectionError as exc:
+                direct_visual_descriptor_provider.close()
                 raise _report_direct_member_selection_failure(
                     exc,
                     output_directory=request.output_directory,
@@ -21989,11 +21999,10 @@ def analyze(
                                 else "구조화된 사유 없음"
                             )
                         )
-                        if (
+                        reselection_limit_reached = bool(
                             dense_render_attempt
                             >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
-                        ):
-                            raise
+                        )
                         new_certificates: list[
                             tuple[float, int, int]
                         ] = []
@@ -22071,6 +22080,13 @@ def analyze(
                                     )
                                 ),
                             )
+                        if reselection_limit_reached:
+                            reporter.log(
+                                "직캠 밀집 렌더 재선택 상한 도달 · 마지막 "
+                                f"실패 {len(new_certificates)}개도 체크포인트에 "
+                                "저장"
+                            )
+                            raise
                         reporter.status(
                             "밀집 렌더에서 불가능한 직캠 전환을 제외하고 "
                             "다른 소스·시점을 다시 선택하는 중…"
@@ -22209,6 +22225,15 @@ def analyze(
                         "재선택 대상 "
                         f"{len(member_proxy_preflight.repair_target_boundary_indices)}개"
                     )
+                    proxy_refinement_candidates = [
+                        (
+                            candidate_plan,
+                            candidate_segments,
+                            candidate_member_look_plan,
+                            member_proxy_preflight,
+                            rendered_proxy_review_payload,
+                        )
+                    ]
                     for look_refinement_iteration in range(1, 3):
                         if bool(
                             rendered_proxy_review_payload.get(
@@ -22274,16 +22299,49 @@ def analyze(
                             "출력 품질 통과 "
                             f"{rendered_proxy_review_payload['member_output_quality_passed']}"
                         )
+                        proxy_refinement_candidates.append(
+                            (
+                                candidate_plan,
+                                candidate_segments,
+                                candidate_member_look_plan,
+                                member_proxy_preflight,
+                                rendered_proxy_review_payload,
+                            )
+                        )
+                    (
+                        best_proxy_candidate_index,
+                        best_proxy_candidate,
+                    ) = min(
+                        enumerate(proxy_refinement_candidates),
+                        key=lambda item: (
+                            item[1][3].refinement_rank(),
+                            item[0],
+                        ),
+                    )
+                    (
+                        candidate_plan,
+                        candidate_segments,
+                        candidate_member_look_plan,
+                        member_proxy_preflight,
+                        rendered_proxy_review_payload,
+                    ) = best_proxy_candidate
+                    if best_proxy_candidate_index != (
+                        len(proxy_refinement_candidates) - 1
+                    ):
+                        _write_analysis_manifest_atomically(
+                            rendered_proxy_review_path,
+                            rendered_proxy_review_payload,
+                        )
+                        reporter.log(
+                            "직캠 룩 재보정 회귀 방지 · 마지막 시도 대신 "
+                            f"프록시 후보 {best_proxy_candidate_index}/"
+                            f"{len(proxy_refinement_candidates) - 1} 채택"
+                        )
                     if not member_proxy_preflight.passed:
-                        if (
+                        reselection_limit_reached = bool(
                             dense_render_attempt
                             >= _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
-                        ):
-                            raise RuntimeError(
-                                "direct-member decoded proxy reselection "
-                                "exhausted; report="
-                                f"{rendered_proxy_review_path}"
-                            )
+                        )
                         proxy_failure_indices = (
                             member_proxy_preflight.
                             ranked_reselection_boundary_indices(
@@ -22381,6 +22439,18 @@ def analyze(
                                         get("status", "unknown")
                                     )
                                 ),
+                            )
+                        if reselection_limit_reached:
+                            reporter.log(
+                                "직캠 실렌더 프록시 재선택 상한 도달 · "
+                                f"마지막 실패 {len(new_certificates)}개도 "
+                                "체크포인트에 저장"
+                            )
+                            raise RuntimeError(
+                                "direct-member decoded proxy reselection "
+                                "exhausted after persisting the final "
+                                "continuity certificates; report="
+                                f"{rendered_proxy_review_path}"
                             )
                         reporter.status(
                             "실제 출력에서 불연속인 직캠 전환을 제외하고 "
@@ -22542,6 +22612,7 @@ def analyze(
                 }
                 if dense_face_provider is not None:
                     dense_face_provider.close()
+                direct_visual_descriptor_provider.close()
             assert member_look_plan is not None
             reporter.log(
                 "저장된 직캠 특징으로 최종 컷 룩 보정 · "

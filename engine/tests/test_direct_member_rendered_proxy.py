@@ -8,6 +8,7 @@ from crosscut.direct_member_rendered_continuity import (
     DirectMemberRenderedContinuityResult,
 )
 from crosscut.direct_member_rendered_proxy import (
+    DirectMemberRenderedProxyPreflight,
     render_and_review_direct_member_proxy,
 )
 from crosscut.ive import AspectRatio
@@ -81,6 +82,79 @@ def _generic_payload(*, passed: bool, perceptual_targets=()):
 
 
 class DirectMemberRenderedProxyTests(unittest.TestCase):
+    @staticmethod
+    def _refinement_result(
+        *,
+        quality_passed: bool,
+        continuity_passed: bool,
+        repair_targets: tuple[int, ...],
+        position_p95: float,
+        weighted_score: float,
+    ) -> DirectMemberRenderedProxyPreflight:
+        return DirectMemberRenderedProxyPreflight(
+            {
+                "passed": quality_passed and continuity_passed,
+                "member_output_quality_passed": quality_passed,
+                "member_output_quality_failure_reasons": (
+                    [] if quality_passed else ["rapid_quality_alternation"]
+                ),
+                "direct_member_rendered_continuity_passed": (
+                    continuity_passed
+                ),
+                "repair_target_boundary_indices": list(repair_targets),
+                "rendered_proxy_review": {
+                    "weighted_score": weighted_score,
+                },
+                "rendered_continuity": {
+                    "metrics": {
+                        "attention_position_mismatch_p95": position_p95,
+                    },
+                    "thresholds": {
+                        "maximum_attention_position_mismatch_p95": 0.12,
+                    },
+                },
+            }
+        )
+
+    def test_refinement_rank_rejects_a_later_visual_regression(self) -> None:
+        base = self._refinement_result(
+            quality_passed=False,
+            continuity_passed=False,
+            repair_targets=(0,),
+            position_p95=0.14,
+            weighted_score=62.0,
+        )
+        regressed = self._refinement_result(
+            quality_passed=False,
+            continuity_passed=False,
+            repair_targets=(0, 1),
+            position_p95=0.40,
+            weighted_score=64.0,
+        )
+
+        self.assertLess(base.refinement_rank(), regressed.refinement_rank())
+
+    def test_refinement_rank_prefers_a_completed_member_quality_gate(self) -> None:
+        incomplete = self._refinement_result(
+            quality_passed=False,
+            continuity_passed=False,
+            repair_targets=(0, 1),
+            position_p95=0.20,
+            weighted_score=61.0,
+        )
+        quality_fixed = self._refinement_result(
+            quality_passed=True,
+            continuity_passed=False,
+            repair_targets=(0, 1),
+            position_p95=0.20,
+            weighted_score=61.0,
+        )
+
+        self.assertLess(
+            quality_fixed.refinement_rank(),
+            incomplete.refinement_rank(),
+        )
+
     def test_combines_generic_and_exact_member_gates(self) -> None:
         def render_review(plan, output, **kwargs):
             self.assertEqual(kwargs["video_codec"], "h264_videotoolbox")
