@@ -344,6 +344,9 @@ _MEMBER_PEER_CONSENSUS_OFFSET_TOLERANCE_SECONDS = 1.5 / 29.97
 AUTOMATIC_STAGE_EDIT_POST_RENDER_QA_CONTRACT = (
     "automatic_ive_group_stage_edit_mandatory_post_render_qa_v2"
 )
+AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT = (
+    "automatic_ive_group_editorial_authority_v1"
+)
 DEFAULT_IVE_PROFESSIONAL_MONTAGE_PROFILE_PATH = Path(
     "/Volumes/CrossCutMedia/CrossCut-Training/release/profiles/"
     "ive-professional-montage-grammar-v2.json"
@@ -20655,29 +20658,68 @@ def _materialize_registered_stage_edit_preflight(
 def _enforce_automatic_group_stage_edit_requirement(
     request: AnalysisRequest,
     registered_bundle: RegisteredStageEditProductionBundle | None,
-) -> None:
-    """Keep the simple automatic product path from silently using baseline."""
+    *,
+    review_rendered_proxies: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve an explicit authority for every automatic IVE GROUP render.
+
+    A missing learned bundle is not permission to claim learned editing, but it
+    also must not prevent the independently decoded eight-candidate visual
+    pipeline from producing a QA-gated result.  The deterministic path is a
+    declared primary authority, never a post-failure fallback from StageEdit.
+    """
 
     requires_professional_generation = bool(
         getattr(request, "source_mode", None) is SourceMode.AUTOMATIC
         and getattr(request, "edit_mode", None) is EditMode.GROUP
         and not bool(getattr(request, "acquire_only", False))
     )
-    if (
-        requires_professional_generation
-        and registered_bundle is None
-        and getattr(
-            request,
-            "stage_edit_generation_checkpoint_directory",
-            None,
-        )
-        is None
-    ):
+    if not requires_professional_generation:
+        return None
+    explicit_checkpoint = getattr(
+        request,
+        "stage_edit_generation_checkpoint_directory",
+        None,
+    )
+    if registered_bundle is not None:
+        return {
+            "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
+            "mode": "registered_stage_edit_production",
+            "transformer_authority": True,
+            "candidate_pool": "registered_stage_edit_generation",
+            "decoded_proxy_candidate_count_required": 8,
+            "decoded_proxy_review_required": True,
+            "final_post_render_qa_required": True,
+            "silent_fallback_allowed": False,
+        }
+    if explicit_checkpoint is not None:
+        return {
+            "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
+            "mode": "explicit_stage_edit_request",
+            "transformer_authority": True,
+            "candidate_pool": "explicit_stage_edit_generation",
+            "decoded_proxy_candidate_count_required": 8,
+            "decoded_proxy_review_required": True,
+            "final_post_render_qa_required": True,
+            "silent_fallback_allowed": False,
+        }
+    if not review_rendered_proxies:
         raise RuntimeError(
-            "automatic IVE group editing requires a verified registered "
-            "StageEdit production bundle; the ordinary visual baseline is "
-            "not an allowed fallback"
+            "automatic IVE group deterministic production requires decoded "
+            "review of eight complete visual candidates"
         )
+    return {
+        "contract": AUTOMATIC_GROUP_EDITORIAL_AUTHORITY_CONTRACT,
+        "mode": "deterministic_professional_visual",
+        "transformer_authority": False,
+        "transformer_status": "inactive_no_verified_production_bundle",
+        "candidate_pool": "ordinary_visual_primary",
+        "ordinary_visual_candidate_is_primary_not_fallback": True,
+        "decoded_proxy_candidate_count_required": 8,
+        "decoded_proxy_review_required": True,
+        "final_post_render_qa_required": True,
+        "silent_fallback_allowed": False,
+    }
 
 
 def analyze(
@@ -20712,9 +20754,12 @@ def analyze(
             registered_stage_edit_bundle
         )
     )
-    _enforce_automatic_group_stage_edit_requirement(
-        request,
-        registered_stage_edit_bundle,
+    automatic_group_editorial_authority = (
+        _enforce_automatic_group_stage_edit_requirement(
+            request,
+            registered_stage_edit_bundle,
+            review_rendered_proxies=review_rendered_proxies,
+        )
     )
     if (
         (
@@ -20876,6 +20921,12 @@ def analyze(
             f"registry {registered_stage_edit_bundle.registry_sha256[:12]} · "
             "현재 동기화 원본에서 feature snapshot을 새로 생성한 뒤 "
             "후보 8개 전수 시각·프록시 QA를 적용"
+        )
+    elif automatic_group_editorial_authority is not None:
+        reporter.log(
+            "검증된 Transformer production bundle 없음 · "
+            "일반 시각 최적화 후보 8개를 primary authority로 전수 렌더·"
+            "디코딩하고 최종 MP4 post-render QA까지 통과해야 결과 노출"
         )
 
     reporter.status("영상 메타데이터를 읽는 중…")
@@ -26719,6 +26770,11 @@ def analyze(
         "schema_version": 1,
         "created_at": timestamp.isoformat(),
         "request": request.as_dict(),
+        "automatic_group_editorial_authority": (
+            deepcopy(automatic_group_editorial_authority)
+            if automatic_group_editorial_authority is not None
+            else None
+        ),
         "source_index_mapping": _source_index_mapping(
             request.sources,
             eligible_indices,

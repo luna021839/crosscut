@@ -12,6 +12,7 @@ from unittest.mock import create_autospec, patch
 from crosscut.ive import AspectRatio, EditMode, SourceMode
 from crosscut.pipeline import (
     _discover_automatic_stage_edit_production_bundle,
+    _enforce_automatic_group_stage_edit_requirement,
     _load_stage_edit_generation_preflight,
     _materialize_registered_stage_edit_preflight,
     _stage_edit_continuity_config_identity,
@@ -2378,7 +2379,7 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                 )
             discover.assert_not_called()
 
-    def test_automatic_group_refuses_unregistered_visual_baseline(self):
+    def test_automatic_group_declares_unregistered_visual_primary_authority(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             request = AnalysisRequest.from_dict(
@@ -2392,19 +2393,28 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                     "output_directory": str(root / "output"),
                 }
             )
-            with patch(
-                "crosscut.pipeline.discover_registered_stage_edit_production_bundle",
-                return_value=None,
-            ):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "requires a verified registered StageEdit production bundle",
-                ):
-                    analyze(
-                        request,
-                        SimpleNamespace(),
-                        review_rendered_proxies=True,
-                    )
+            authority = _enforce_automatic_group_stage_edit_requirement(
+                request,
+                None,
+                review_rendered_proxies=True,
+            )
+            self.assertEqual(
+                "deterministic_professional_visual",
+                authority["mode"],
+            )
+            self.assertEqual("ordinary_visual_primary", authority["candidate_pool"])
+            self.assertFalse(authority["transformer_authority"])
+            self.assertTrue(
+                authority["ordinary_visual_candidate_is_primary_not_fallback"]
+            )
+            self.assertTrue(authority["final_post_render_qa_required"])
+            self.assertFalse(authority["silent_fallback_allowed"])
+            with self.assertRaisesRegex(RuntimeError, "decoded review"):
+                _enforce_automatic_group_stage_edit_requirement(
+                    request,
+                    None,
+                    review_rendered_proxies=False,
+                )
             self.assertFalse((root / "output").exists())
 
     def test_registered_bundle_materializes_current_media_before_preflight(self):
