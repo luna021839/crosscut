@@ -3,7 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from crosscut.direct_member_visual import DirectMemberVisualConfig
+from crosscut.direct_member_visual import (
+    DirectMemberVisualConfig,
+    DirectMemberVisualSelectionError,
+)
 from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
     _DirectFullFramePartitionProfile,
@@ -14,6 +17,7 @@ from crosscut.pipeline import (
     _direct_full_frame_proof_directed_repair_profiles,
     _direct_full_frame_spans_from_partition,
     _direct_full_frame_visual_frontier_split_child_profiles,
+    _direct_member_highlight_partition_capacity_payload,
     _direct_member_highlight_cadence_payload,
     _direct_member_in_run_preferred_partition_profile,
     _direct_member_maximum_hold_count_for_global_cadence,
@@ -21,6 +25,7 @@ from crosscut.pipeline import (
     _direct_member_render_feedback_strict_composition_limit,
     _direct_partition_queue_priority,
     _direct_partition_structural_search_cost,
+    _enforce_direct_member_highlight_cadence_selection_gate,
 )
 
 
@@ -787,6 +792,28 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
         self.assertGreaterEqual(payload["density_lift_per_minute"], 2.0)
         self.assertEqual(payload["highlight_no_cut_hold_count"], 0)
 
+    def test_partition_capacity_rejects_too_few_possible_highlight_cuts(
+        self,
+    ) -> None:
+        timing = _timing_segments(12)
+        spans = _coarsen_direct_full_frame_spans(timing)
+
+        payload = _direct_member_highlight_partition_capacity_payload(
+            spans=spans,
+            highlight_intervals=((0.0, 12.0),),
+        )
+
+        self.assertTrue(payload["audit_required"])
+        self.assertFalse(payload["passed"])
+        self.assertEqual(
+            payload["failure"],
+            "highlight_partition_cut_capacity_exhausted",
+        )
+        self.assertLess(
+            payload["planned_highlight_boundary_count"],
+            payload["minimum_required_highlight_cut_count"],
+        )
+
     def test_compensated_highlight_holds_retain_the_section_audit(self) -> None:
         timing = _timing_segments(64)
         dense = _densify_direct_full_frame_highlights(
@@ -803,6 +830,7 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
         cut_flags[highlight_boundary_index] = False
         selection = SimpleNamespace(
             source_indices=tuple(index % 8 for index in range(len(dense))),
+            optimizer_search_diagnostics={},
             boundaries=tuple(
                 SimpleNamespace(
                     cut_applied=value,
@@ -848,6 +876,7 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
             cut_flags[boundary_index] = False
         selection = SimpleNamespace(
             source_indices=tuple(index % 8 for index in range(len(dense))),
+            optimizer_search_diagnostics={},
             boundaries=tuple(
                 SimpleNamespace(
                     cut_applied=value,
@@ -873,6 +902,23 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
         self.assertIn(
             "compensated_highlight_hold_budget_exceeded",
             payload["failure_reasons"],
+        )
+        with self.assertRaises(DirectMemberVisualSelectionError) as caught:
+            _enforce_direct_member_highlight_cadence_selection_gate(
+                spans=dense,
+                visual_selection=selection,
+                highlight_intervals=((16.0, 48.0),),
+            )
+        self.assertEqual(
+            caught.exception.diagnostics["failure"],
+            "highlight_cadence_gate_failed",
+        )
+        self.assertFalse(
+            caught.exception.diagnostics["constraint_infeasibility_proven"]
+        )
+        self.assertEqual(
+            selection.optimizer_search_diagnostics["highlight_cut_density"],
+            payload,
         )
 
 

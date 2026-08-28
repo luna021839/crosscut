@@ -9379,6 +9379,117 @@ def _direct_member_highlight_cadence_payload(
     }
 
 
+def _direct_member_highlight_partition_capacity_payload(
+    *,
+    spans: Sequence[_DirectFullFrameSpan],
+    highlight_intervals: Sequence[tuple[float, float]],
+) -> dict[str, Any]:
+    """Prove whether a fixed partition can supply the minimum active cuts."""
+
+    items = tuple(spans)
+    if not items:
+        raise ValueError("highlight partition capacity needs direct-member spans")
+    normalized = (
+        _normalized_direct_member_highlight_intervals(
+            highlight_intervals,
+            range_start=items[0].canonical_master_start,
+            range_end=items[-1].canonical_master_end,
+        )
+        if highlight_intervals
+        else ()
+    )
+    highlight_duration_seconds = sum(end - start for start, end in normalized)
+    audit_required = (
+        highlight_duration_seconds
+        >= _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_AUDIT_DURATION_SECONDS
+    )
+    priority_boundary_indices = (
+        _direct_member_highlight_priority_boundary_indices(items, normalized)
+    )
+    minimum_required_cut_count = (
+        math.ceil(
+            highlight_duration_seconds
+            * _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+            / 60.0
+            - 1e-9
+        )
+        if audit_required
+        else 0
+    )
+    maximum_switches_per_minute = (
+        len(priority_boundary_indices) * 60.0 / highlight_duration_seconds
+        if highlight_duration_seconds > 1e-9
+        else 0.0
+    )
+    passed = bool(
+        not audit_required
+        or len(priority_boundary_indices) >= minimum_required_cut_count
+    )
+    return {
+        "contract": "fixed_partition_highlight_cut_capacity_v1",
+        "audit_required": audit_required,
+        "passed": passed,
+        "failure": (
+            None if passed else "highlight_partition_cut_capacity_exhausted"
+        ),
+        "highlight_intervals": [list(value) for value in normalized],
+        "highlight_duration_seconds": highlight_duration_seconds,
+        "priority_cut_boundary_indices": list(priority_boundary_indices),
+        "planned_highlight_boundary_count": len(priority_boundary_indices),
+        "minimum_required_highlight_cut_count": minimum_required_cut_count,
+        "maximum_possible_highlight_switches_per_minute": (
+            maximum_switches_per_minute
+        ),
+        "minimum_highlight_source_switches_per_minute": (
+            _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
+        ),
+        "assignment_independent": True,
+        "partition_change_required_when_failed": True,
+        "visual_gates_relaxed": False,
+    }
+
+
+def _enforce_direct_member_highlight_cadence_selection_gate(
+    *,
+    spans: Sequence[_DirectFullFrameSpan],
+    visual_selection: DirectMemberVisualSelection,
+    highlight_intervals: Sequence[tuple[float, float]],
+) -> dict[str, Any]:
+    """Reject a selected path before it can escape to the final render audit."""
+
+    payload = _direct_member_highlight_cadence_payload(
+        spans=spans,
+        visual_selection=visual_selection,
+        highlight_intervals=highlight_intervals,
+    )
+    visual_selection.optimizer_search_diagnostics[
+        "highlight_cut_density"
+    ] = payload
+    if payload["passed"]:
+        return payload
+    hold_indices = tuple(payload["highlight_no_cut_hold_boundary_indices"])
+    raise DirectMemberVisualSelectionError(
+        "direct member selected path missed human-like highlight cadence",
+        {
+            "failure": "highlight_cadence_gate_failed",
+            # This audit rejects the exact selected path. Moving-cut evidence
+            # and the placement of terminal holds are assignment-dependent,
+            # so it must not be mislabeled as proof that the whole partition
+            # has no feasible path.
+            "constraint_infeasibility_proven": False,
+            "failed_at_segment_index": (
+                int(hold_indices[0]) + 1 if hold_indices else None
+            ),
+            "highlight_cut_density": payload,
+            "selection_candidate_rejected": True,
+            "selection_gate_matches_final_render_audit": True,
+            "full_selector_recheck_completed": True,
+            "render_started": False,
+            "visual_gates_relaxed": False,
+        },
+    )
+
+
 def _direct_member_visual_payload(
     selection: DirectMemberVisualSelection,
     *,
@@ -10659,20 +10770,37 @@ def _select_direct_member_partition_profile(
                 )
             ),
         )
-        priority_cut_boundary_indices = (
-            _direct_member_highlight_priority_boundary_indices(
-                profile.spans,
-                normalized_highlight_intervals,
+        highlight_partition_capacity = (
+            _direct_member_highlight_partition_capacity_payload(
+                spans=profile.spans,
+                highlight_intervals=normalized_highlight_intervals,
             )
         )
-        highlight_duration_seconds = sum(
-            end - start for start, end in normalized_highlight_intervals
+        priority_cut_boundary_indices = tuple(
+            highlight_partition_capacity["priority_cut_boundary_indices"]
         )
-        minimum_required_highlight_cut_count = math.ceil(
-            highlight_duration_seconds
-            * _DIRECT_MEMBER_HIGHLIGHT_MINIMUM_SWITCHES_PER_MINUTE
-            / 60.0
+        minimum_required_highlight_cut_count = int(
+            highlight_partition_capacity[
+                "minimum_required_highlight_cut_count"
+            ]
         )
+        if not highlight_partition_capacity["passed"]:
+            raise DirectMemberVisualSelectionError(
+                "direct member partition cannot supply minimum highlight cuts",
+                {
+                    "failure": "highlight_partition_cut_capacity_exhausted",
+                    "constraint_infeasibility_proven": True,
+                    "failed_at_segment_index": None,
+                    "highlight_partition_capacity": (
+                        highlight_partition_capacity
+                    ),
+                    "assignment_independent": True,
+                    "partition_change_required": True,
+                    "full_selector_recheck_completed": True,
+                    "render_started": False,
+                    "visual_gates_relaxed": False,
+                },
+            )
         maximum_priority_cut_hold_count = min(
             _DIRECT_MEMBER_MAXIMUM_COMPENSATED_HIGHLIGHT_HOLD_COUNT,
             max(
@@ -10720,6 +10848,14 @@ def _select_direct_member_partition_profile(
             "maximum_same_source_hold_count": global_cadence_hold_limit,
             "enforced_during_path_optimization": True,
         }
+        selection.optimizer_search_diagnostics[
+            "highlight_partition_capacity"
+        ] = highlight_partition_capacity
+        _enforce_direct_member_highlight_cadence_selection_gate(
+            spans=profile.spans,
+            visual_selection=selection,
+            highlight_intervals=normalized_highlight_intervals,
+        )
         return selection
 
     def _evaluate(
