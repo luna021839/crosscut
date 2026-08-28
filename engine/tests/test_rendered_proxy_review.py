@@ -988,7 +988,7 @@ class RenderedProxyReviewTests(unittest.TestCase):
                     minimum_source_look_output_frames=6,
                     maximum_source_sharpness_log_median_span=5.0,
                     maximum_source_luma_median_span=1.0,
-                    maximum_source_chroma_median_span=1.0,
+                    maximum_source_chroma_median_span=0.001,
                 ),
             )
 
@@ -1001,7 +1001,71 @@ class RenderedProxyReviewTests(unittest.TestCase):
             review.payload["visible_boundary_score"]["selection_gate"]
         )
         self.assertTrue(review.payload["professional_reference_gate"]["passed"])
+        raw_admission = review.payload["perceptual_source_admission"][
+            "admission"
+        ]
+        self.assertFalse(raw_admission["passed"])
+        self.assertIn(
+            "perceptual_source_chroma_median_span",
+            raw_admission["reason_codes"],
+        )
+        effective_admission = review.payload[
+            "effective_perceptual_source_admission"
+        ]
+        self.assertTrue(effective_admission["passed"])
+        self.assertIn(
+            "perceptual_source_chroma_median_span",
+            effective_admission["overridden_reason_codes"],
+        )
+        self.assertEqual(effective_admission["remaining_reason_codes"], [])
         self.assertTrue(review.passed)
+
+    def test_professional_gate_never_overrides_source_scalar_coverage(self) -> None:
+        plan = self._source_run_plan((18, 6), (0, 1))
+        frames = self._textured_frames(18, color=(60, 60, 60))
+        frames.extend(
+            self._textured_frames(
+                6,
+                color=(62, 62, 62),
+                start_shift=18,
+            )
+        )
+        profile = ProfessionalReferenceProfile(
+            profile_path=Path("profile.json"),
+            profile_sha256="0" * 64,
+            artist="IVE",
+            song="SYNTHETIC",
+            references=(),
+            payload={},
+        )
+        relative_pass = ProfessionalReferenceGateResult(
+            {
+                "passed": True,
+                "technical_integrity": {"passed": True},
+            }
+        )
+
+        with patch(
+            "crosscut.professional_reference_gate."
+            "evaluate_professional_reference_gate",
+            return_value=relative_pass,
+        ):
+            review = self._review_frames(
+                plan,
+                frames,
+                professional_reference_profile=profile,
+            )
+
+        effective_admission = review.payload[
+            "effective_perceptual_source_admission"
+        ]
+        self.assertFalse(effective_admission["passed"])
+        self.assertEqual(effective_admission["overridden_reason_codes"], [])
+        self.assertIn(
+            "perceptual_source_scalar_coverage_incomplete",
+            effective_admission["remaining_reason_codes"],
+        )
+        self.assertFalse(review.passed)
 
     def test_domain_summaries_use_only_introduced_cross_source_denominator(self) -> None:
         frame_duration = 6.0 / 30.0

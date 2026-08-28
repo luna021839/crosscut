@@ -28,6 +28,7 @@ PROFILE_ANALYSIS_BASIS = (
 GATE_ANALYSIS_BASIS = "professional_reference_visible_cut_relative_gate_v1"
 EXPECTED_REFERENCE_COUNT = 5
 MINIMUM_CANDIDATE_VISIBLE_CUT_COUNT = 10
+MINIMUM_COMPONENT_TAIL_CHECK_PASS_COUNT = 2
 
 DISCONTINUITY_COMPONENTS = (
     "sharpness_discontinuity",
@@ -692,8 +693,16 @@ def evaluate_professional_reference_gate(
         )
         # Preserve the reviewer's explicit not-comparable policy.  Missing
         # face/silhouette/motion evidence is not invented as maximum mismatch.
+        tail_check_results = (p90_passed, p95_passed, severe_passed)
+        passed_tail_check_count = sum(tail_check_results)
+        # These three tail statistics are deliberately correlated views of the
+        # same small reference sample.  Requiring all three rejects a real
+        # human edit when only one unstable quantile falls outside the
+        # four-reference prediction envelope.  A two-of-three consensus keeps
+        # a single noisy estimate from becoming a false hard failure while a
+        # broadly degraded component still fails closed.
         component_passed = (
-            p90_passed and p95_passed and severe_passed
+            passed_tail_check_count >= MINIMUM_COMPONENT_TAIL_CHECK_PASS_COUNT
             if comparable
             else True
         )
@@ -721,6 +730,17 @@ def evaluate_professional_reference_gate(
                 "reference_fractions": reference_severe_fractions,
                 "fraction_ceiling": severe_fraction_ceiling,
                 "passed": severe_passed if comparable else None,
+            },
+            "tail_check_consensus": {
+                "passed_check_count": (
+                    passed_tail_check_count if comparable else None
+                ),
+                "required_pass_count": (
+                    MINIMUM_COMPONENT_TAIL_CHECK_PASS_COUNT
+                ),
+                "total_check_count": len(tail_check_results),
+                "policy": "two_of_three_correlated_tail_checks",
+                "passed": component_passed,
             },
             "passed": component_passed,
         }
@@ -765,6 +785,9 @@ def evaluate_professional_reference_gate(
                     "candidate_p95_below_human_prediction_ceiling",
                     "candidate_severe_outlier_fraction_below_human_envelope",
                 ],
+                "component_gate_consensus": (
+                    "two_of_three_correlated_tail_checks"
+                ),
                 "quantile_prediction_range_multiplier": (
                     QUANTILE_PREDICTION_RANGE_MULTIPLIER
                 ),

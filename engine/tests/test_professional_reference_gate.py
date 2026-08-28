@@ -154,6 +154,11 @@ class ProfessionalReferenceGateTests(unittest.TestCase):
                         ],
                         4,
                     )
+                    for component in result.payload["components"].values():
+                        consensus = component["tail_check_consensus"]
+                        self.assertEqual(consensus["required_pass_count"], 2)
+                        self.assertEqual(consensus["total_check_count"], 3)
+                        self.assertTrue(consensus["passed"])
 
     def test_synthetically_worsened_candidate_fails_distribution_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1414,6 +1414,72 @@ def _proxy_perceptual_source_admission(
     }
 
 
+_PROFESSIONAL_REFERENCE_OVERRIDABLE_SOURCE_REASON_CODES = frozenset(
+    {
+        "perceptual_source_sharpness_log_median_span",
+        "perceptual_source_luma_median_span",
+        "perceptual_source_chroma_median_span",
+    }
+)
+
+
+def _effective_perceptual_source_admission(
+    admission: Mapping[str, Any],
+    professional_gate: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve global source-look warnings after visible-cut calibration.
+
+    Source-wide medians compare every used broadcast with every other one,
+    including pairs that are never adjacent in the edit.  They remain useful
+    ranking and repair diagnostics, but must not veto a candidate whose actual
+    visible transitions pass the same-song human reference distribution.
+    Coverage gaps and rapid output alternation are never overridden.
+    """
+
+    raw_admission_value = admission.get("admission")
+    if not isinstance(raw_admission_value, Mapping):
+        raise ValueError("source admission must be an object")
+    raw_admission = raw_admission_value
+    raw_reason_values = raw_admission.get("reason_codes")
+    if not isinstance(raw_reason_values, list):
+        raise ValueError("source admission reason_codes must be an array")
+    raw_reason_codes = tuple(
+        str(reason)
+        for reason in raw_reason_values
+    )
+    professional_gate_passed = bool(
+        professional_gate is not None and professional_gate.get("passed") is True
+    )
+    overridden_reason_codes = tuple(
+        reason
+        for reason in raw_reason_codes
+        if professional_gate_passed
+        and reason in _PROFESSIONAL_REFERENCE_OVERRIDABLE_SOURCE_REASON_CODES
+    )
+    remaining_reason_codes = tuple(
+        reason
+        for reason in raw_reason_codes
+        if reason not in overridden_reason_codes
+    )
+    return {
+        "analysis_basis": (
+            "professional_reference_effective_perceptual_source_admission_v1"
+        ),
+        "raw_passed": bool(raw_admission.get("passed")),
+        "professional_reference_gate_present": professional_gate is not None,
+        "professional_reference_gate_passed": professional_gate_passed,
+        "overridden_reason_codes": list(overridden_reason_codes),
+        "remaining_reason_codes": list(remaining_reason_codes),
+        "override_policy": (
+            "only_global_source_median_spans_after_same_song_visible_cut_gate"
+        ),
+        "non_overridable_policy": (
+            "coverage_rapid_alternation_and_technical_integrity_remain_strict"
+        ),
+        "passed": not remaining_reason_codes,
+    }
+
+
 def _structure_shock(left: np.ndarray, right: np.ndarray) -> float:
     def edges(frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -2641,6 +2707,12 @@ def review_rendered_proxy(
             checked_profile,
             technical_issue_reasons=introduced_technical_reasons,
         ).payload
+    effective_perceptual_source_admission = (
+        _effective_perceptual_source_admission(
+            perceptual_source_admission,
+            professional_gate_payload,
+        )
+    )
     editorial_gate_passed = (
         bool(professional_gate_payload["passed"])
         if professional_gate_payload is not None
@@ -2654,7 +2726,7 @@ def review_rendered_proxy(
     passed = (
         quality_p10 >= settings.minimum_overall_quality_p10
         and median_span <= settings.maximum_source_quality_median_span
-        and bool(perceptual_source_admission["admission"]["passed"])
+        and bool(effective_perceptual_source_admission["passed"])
         and editorial_gate_passed
         and bool(domain_summaries[TIER_D_CONTINUITY_DOMAIN]["passed"])
         and bool(domain_summaries[NATIVE_SOURCE_CUT_DOMAIN]["passed"])
@@ -2687,6 +2759,9 @@ def review_rendered_proxy(
             ),
         },
         "perceptual_source_admission": perceptual_source_admission,
+        "effective_perceptual_source_admission": (
+            effective_perceptual_source_admission
+        ),
         "transition_count": len(boundary_windows),
         "reviewed_boundary_count": len(boundary_reviews),
         "hard_cut_count": hard_cut_count,
