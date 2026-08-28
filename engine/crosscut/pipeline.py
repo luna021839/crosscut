@@ -468,6 +468,9 @@ _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_ENTRY_COUNT = 16
 _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT = 128
 _DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY = 8.0
 _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_REJECTED_PATH_COUNT = 8
+_DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT = 3
+_DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TRANSIENT_PENALTY_COUNT = 512
+_DIRECT_MEMBER_PROXY_LOCAL_REPAIR_EDGE_DEVIATION_PENALTY = 2.0
 # Dense failure certificates describe decoded boundary geometry, not source
 # exposure quotas. Permit one exact, audited selector-only implementation
 # transition to reuse those certificates: the edge measurement and every
@@ -5685,6 +5688,7 @@ def _normalize_direct_member_proxy_feedback_penalties(
     source_count: int,
     range_start: float,
     range_end: float,
+    maximum_count: int = _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT,
 ) -> tuple[tuple[float, int, int, float], ...]:
     """Validate unique finite decoded-proxy edge penalties."""
 
@@ -5700,6 +5704,12 @@ def _normalize_direct_member_proxy_feedback_penalties(
         and range_start < range_end
     ):
         raise ValueError("decoded-proxy feedback range is invalid")
+    if (
+        isinstance(maximum_count, bool)
+        or not isinstance(maximum_count, int)
+        or maximum_count < 1
+    ):
+        raise ValueError("decoded-proxy feedback penalty limit is invalid")
     normalized: list[tuple[float, int, int, float]] = []
     seen_keys: set[tuple[float, int, int]] = set()
     for raw in edges:
@@ -5741,7 +5751,7 @@ def _normalize_direct_member_proxy_feedback_penalties(
             raise ValueError("decoded-proxy feedback edges must be unique")
         seen_keys.add(key)
         normalized.append((*key, float(penalty)))
-    if len(normalized) > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT:
+    if len(normalized) > maximum_count:
         raise ValueError("decoded-proxy feedback penalty limit exceeded")
     return tuple(normalized)
 
@@ -5753,6 +5763,7 @@ def _accumulate_direct_member_proxy_feedback_penalties(
     source_count: int,
     range_start: float,
     range_end: float,
+    maximum_count: int = _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT,
 ) -> tuple[tuple[float, int, int, float], ...]:
     """Add bounded observations without turning them into hard exclusions."""
 
@@ -5761,12 +5772,14 @@ def _accumulate_direct_member_proxy_feedback_penalties(
         source_count=source_count,
         range_start=range_start,
         range_end=range_end,
+        maximum_count=maximum_count,
     )
     normalized_updates = _normalize_direct_member_proxy_feedback_penalties(
         updates,
         source_count=source_count,
         range_start=range_start,
         range_end=range_end,
+        maximum_count=maximum_count,
     )
     penalties: dict[tuple[float, int, int], float] = {
         (boundary_seconds, outgoing_source_index, incoming_source_index): penalty
@@ -5792,12 +5805,127 @@ def _accumulate_direct_member_proxy_feedback_penalties(
             _DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY,
             penalties.get(key, 0.0) + penalty,
         )
-    if len(penalties) > _DIRECT_MEMBER_PROXY_FEEDBACK_MAX_PENALTY_COUNT:
+    if len(penalties) > maximum_count:
         raise ValueError("decoded-proxy feedback penalty limit exceeded")
     return tuple(
         (*key, penalty)
         for key, penalty in sorted(penalties.items())
     )
+
+
+def _direct_member_proxy_local_repair_anchor_penalties(
+    boundary_master_seconds: Sequence[float],
+    source_path: Sequence[int],
+    continuity_target_boundary_indices: Sequence[int],
+    *,
+    source_count: int,
+    penalty: float = _DIRECT_MEMBER_PROXY_LOCAL_REPAIR_EDGE_DEVIATION_PENALTY,
+    maximum_count: int = (
+        _DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TRANSIENT_PENALTY_COUNT
+    ),
+) -> tuple[tuple[float, int, int, float], ...]:
+    """Prefer repairing only failed decoded boundaries without hard-locking.
+
+    A rejected exact source path must change somewhere, but the decoded proxy
+    has already proved that its non-target boundaries are visually useful.
+    At each such boundary, assign the same finite cost to every alternative
+    cross-source pair while leaving the proved pair free. Therefore a local
+    substitution pays at most its neighboring anchors, whereas replacing the
+    whole path pays repeatedly. Complete boundary domains are emitted or
+    omitted as a unit so a capacity cap cannot bias only a subset of sources.
+    These anchors are transient and must never be persisted as observations.
+    """
+
+    boundaries = tuple(boundary_master_seconds)
+    path = tuple(source_path)
+    targets = tuple(continuity_target_boundary_indices)
+    if (
+        isinstance(source_count, bool)
+        or not isinstance(source_count, int)
+        or source_count < 2
+    ):
+        raise ValueError("decoded-proxy local repair source count is invalid")
+    if (
+        len(path) != len(boundaries) + 1
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < source_count
+            for value in path
+        )
+    ):
+        raise ValueError("decoded-proxy local repair source path is invalid")
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in boundaries
+        )
+        or any(
+            float(left) >= float(right)
+            for left, right in zip(boundaries, boundaries[1:])
+        )
+    ):
+        raise ValueError("decoded-proxy local repair boundaries are invalid")
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value < len(boundaries)
+            for value in targets
+        )
+        or len(set(targets)) != len(targets)
+    ):
+        raise ValueError("decoded-proxy local repair targets are invalid")
+    if (
+        isinstance(penalty, bool)
+        or not isinstance(penalty, (int, float))
+        or not math.isfinite(float(penalty))
+        or not 0.0 < float(penalty)
+        <= _DIRECT_MEMBER_PROXY_FEEDBACK_MAXIMUM_ACCUMULATED_EDGE_PENALTY
+    ):
+        raise ValueError("decoded-proxy local repair penalty is invalid")
+    if (
+        isinstance(maximum_count, bool)
+        or not isinstance(maximum_count, int)
+        or maximum_count < 0
+    ):
+        raise ValueError("decoded-proxy local repair limit is invalid")
+    if not (
+        1
+        <= len(targets)
+        <= _DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT
+    ) or maximum_count == 0:
+        return ()
+
+    target_set = set(targets)
+    anchor_boundaries = sorted(
+        (index for index in range(len(boundaries)) if index not in target_set),
+        key=lambda index: (
+            -min(abs(index - target) for target in targets),
+            index,
+        ),
+    )
+    anchors: list[tuple[float, int, int, float]] = []
+    for boundary_index in anchor_boundaries:
+        preferred_pair = (path[boundary_index], path[boundary_index + 1])
+        complete_boundary_domain = tuple(
+            (
+                float(boundaries[boundary_index]),
+                outgoing_source_index,
+                incoming_source_index,
+                float(penalty),
+            )
+            for outgoing_source_index in range(source_count)
+            for incoming_source_index in range(source_count)
+            if outgoing_source_index != incoming_source_index
+            and (outgoing_source_index, incoming_source_index) != preferred_pair
+        )
+        if len(anchors) + len(complete_boundary_domain) > maximum_count:
+            continue
+        anchors.extend(complete_boundary_domain)
+    return tuple(anchors)
 
 
 def _normalize_direct_member_proxy_rejected_paths(
@@ -5956,7 +6084,7 @@ def _direct_member_dense_render_feedback_binding(
     binding_evidence = {
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
         "feedback_application_policy": (
-            "dense_partial_camera_boundary_pair_diagnostics_proxy_v5"
+            "dense_partial_camera_boundary_pair_diagnostics_proxy_v6"
         ),
         "acquisition_source_identity_sha256": source_identity_sha256,
         "timing_draft": timing_draft.to_dict(),
@@ -25609,6 +25737,51 @@ def analyze(
                                 "finite continuity penalties; report="
                                 f"{rendered_proxy_review_path}"
                             )
+                        raw_continuity_repair_targets = (
+                            member_proxy_preflight.payload.get(
+                                "continuity_repair_target_boundary_indices"
+                            )
+                        )
+                        if not isinstance(
+                            raw_continuity_repair_targets,
+                            list,
+                        ):
+                            raise RuntimeError(
+                                "direct-member decoded proxy continuity "
+                                "repair targets are malformed"
+                            )
+                        continuity_repair_targets = tuple(
+                            raw_continuity_repair_targets
+                        )
+                        transient_anchor_capacity = max(
+                            0,
+                            _DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TRANSIENT_PENALTY_COUNT
+                            - len(render_penalized_transition_edges),
+                        )
+                        transient_local_repair_anchors = (
+                            _direct_member_proxy_local_repair_anchor_penalties(
+                                direct_visual_selection.
+                                selected_boundary_master_seconds,
+                                direct_visual_selection.source_indices,
+                                continuity_repair_targets,
+                                source_count=len(eligible_indices),
+                                maximum_count=transient_anchor_capacity,
+                            )
+                        )
+                        selection_penalized_transition_edges = (
+                            _accumulate_direct_member_proxy_feedback_penalties(
+                                render_penalized_transition_edges,
+                                transient_local_repair_anchors,
+                                source_count=len(eligible_indices),
+                                range_start=(
+                                    timing_draft.common_master_start
+                                ),
+                                range_end=timing_draft.common_master_end,
+                                maximum_count=(
+                                    _DIRECT_MEMBER_PROXY_LOCAL_REPAIR_MAXIMUM_TRANSIENT_PENALTY_COUNT
+                                ),
+                            )
+                        )
                         reporter.status(
                             "실제 출력의 위치·크기·동작 불일치 비용을 "
                             "반영해 다른 직캠 경로를 선택하는 중…"
@@ -25630,6 +25803,19 @@ def analyze(
                             f"{sum(item[3] for item in render_penalized_transition_edges):.3f} · "
                             "경로 전체 no-good "
                             f"{sum(len(paths) for paths in decoded_proxy_rejected_source_paths_by_partition.values())}개 · "
+                            "성공 경계 국소 보존 앵커 "
+                            f"{len(transient_local_repair_anchors)}개/"
+                            f"{len(set(item[0] for item in transient_local_repair_anchors))}경계 · "
+                            "연속성 복구 대상 "
+                            + (
+                                ",".join(
+                                    str(value)
+                                    for value in continuity_repair_targets
+                                )
+                                if continuity_repair_targets
+                                else "없음"
+                            )
+                            + " · "
                             "개별 전환 하드 제외 추가 0개"
                         )
                         try:
@@ -25642,7 +25828,7 @@ def analyze(
                             ) = _select_direct_member_render_path(
                                 tuple(render_infeasible_transition_edges),
                                 render_penalized_transition_edges=tuple(
-                                    render_penalized_transition_edges
+                                    selection_penalized_transition_edges
                                 ),
                                 preferred_partition_unit_counts=(
                                     retry_partition_unit_counts
