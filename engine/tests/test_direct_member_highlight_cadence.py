@@ -17,6 +17,7 @@ from crosscut.pipeline import (
     _direct_member_highlight_cadence_payload,
     _direct_member_in_run_preferred_partition_profile,
     _direct_member_maximum_hold_count_for_global_cadence,
+    _direct_member_render_feedback_strict_composition_limit,
     _direct_partition_queue_priority,
     _direct_partition_structural_search_cost,
 )
@@ -43,6 +44,24 @@ def _timing_segments(count: int) -> tuple[DraftSegment, ...]:
 
 
 class DirectMemberHighlightCadenceTests(unittest.TestCase):
+    def test_render_feedback_extends_instead_of_shrinking_strict_cohort(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _direct_member_render_feedback_strict_composition_limit(0),
+            24,
+        )
+        self.assertEqual(
+            _direct_member_render_feedback_strict_composition_limit(6),
+            36,
+        )
+        self.assertEqual(
+            _direct_member_render_feedback_strict_composition_limit(100),
+            64,
+        )
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            _direct_member_render_feedback_strict_composition_limit(-1)
+
     def test_in_run_feedback_retry_rebuilds_exact_partition_before_repartitioning(
         self,
     ) -> None:

@@ -394,15 +394,12 @@ _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT = 12
 _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT = (
     2 * _DIRECT_MEMBER_MAX_SAFE_HOLD_PROFILE_COUNT
 )
-# Decoded-render feedback can prove several independent bad source pairs in
-# one song.  Feedback-bound warm starts now receive the independently audited
-# hold/effect selector immediately, before structural composition.  If those
-# fail, thirteen best-first compositions are enough to reach the first
-# observed two-bottleneck Cartesian frontier (including the next local repair)
-# without replaying a forty-profile queue before the same terminal audition.
-# Every candidate still runs the original visual, balance, cadence, and
-# transition gates; this only bounds ordering and latency.
-_DIRECT_MEMBER_MAX_RENDER_FEEDBACK_STRICT_COMPOSITION_COUNT = 13
+# Each decoded-render repair seed can expose two useful descendants before a
+# second structural operation is needed.  Extend the ordinary strict cohort by
+# that bounded amount instead of replacing it with a smaller fixed cohort: a
+# fixed thirteen-candidate budget previously discarded already-generated
+# repairs even while the global sixty-four-profile budget remained available.
+_DIRECT_MEMBER_RENDER_FEEDBACK_STRICT_COMPOSITIONS_PER_SEED = 2
 _DIRECT_MEMBER_TERMINAL_HOLD_REPAIRABLE_FAILURES = frozenset(
     {
         "boundary_connectivity_path_exhausted",
@@ -418,6 +415,12 @@ _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT = (
     "recheck_candidate_cache_v2"
 )
 _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES = 256 * 1024
+# A cache written by an older build may have obeyed the entry-count bound but
+# exceeded the byte bound.  Admit one bounded legacy window so useful current-
+# binding entries can be loaded and the next persistence pass can compact it.
+_DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES = 2 * (
+    _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES
+)
 _DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT = 32
 _DIRECT_MEMBER_PARTITION_WARM_START_MAX_MATCH_COUNT = 4
 _DIRECT_MEMBER_PARTITION_FAILURE_FRONTIER_MAX_COUNT = 4
@@ -6380,11 +6383,25 @@ def _load_direct_member_partition_warm_start_profiles(
             }
         )
         return (), diagnostics
-    if len(encoded) > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES:
+    diagnostics.update(
+        {
+            "cache_file_size_bytes": len(encoded),
+            "cache_write_size_limit_bytes": (
+                _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES
+            ),
+            "cache_read_size_limit_bytes": (
+                _DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES
+            ),
+            "cache_compaction_required": (
+                len(encoded) > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES
+            ),
+        }
+    )
+    if len(encoded) > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES:
         diagnostics.update(
             {
                 "status": "cache_rejected",
-                "rejection": "cache_size_limit_exceeded",
+                "rejection": "cache_read_size_limit_exceeded",
             }
         )
         return (), diagnostics
@@ -6538,6 +6555,40 @@ def _load_direct_member_partition_warm_start_profiles(
     return tuple(candidates), diagnostics
 
 
+def _bounded_direct_member_partition_cache_payload(
+    entries: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Keep newest cache entries while enforcing count and serialized bytes."""
+
+    retained_entries = [
+        dict(entry)
+        for entry in entries[:_DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT]
+    ]
+    dropped_entry_count = max(0, len(entries) - len(retained_entries))
+    while True:
+        payload = {
+            "schema_version": 1,
+            "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
+            "entries": retained_entries,
+        }
+        encoded, fingerprint = _bounded_pretty_json_bytes(
+            payload,
+            maximum_bytes=_DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES,
+        )
+        if encoded is not None:
+            return payload, {
+                "retained_entry_count": len(retained_entries),
+                "dropped_entry_count": dropped_entry_count,
+                "serialized_size_bytes": int(
+                    fingerprint["serialized_size_bytes"]
+                ),
+            }
+        if not retained_entries:
+            raise ValueError("partition cache envelope exceeds its byte bound")
+        retained_entries.pop()
+        dropped_entry_count += 1
+
+
 def _persist_direct_member_partition_cache_candidates(
     feature_cache_directory: Path | None,
     base: _DirectFullFramePartitionProfile,
@@ -6589,6 +6640,11 @@ def _persist_direct_member_partition_cache_candidates(
     if cache_path.exists():
         try:
             encoded, _fingerprint = _read_stable_regular_file(cache_path)
+            if (
+                len(encoded)
+                > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES
+            ):
+                raise ValueError("cache_read_size_limit_exceeded")
             existing = json.loads(encoded.decode("utf-8"))
         except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
             diagnostics.update(
@@ -6598,6 +6654,15 @@ def _persist_direct_member_partition_cache_candidates(
                 }
             )
             return diagnostics
+        diagnostics.update(
+            {
+                "existing_cache_size_bytes": len(encoded),
+                "existing_cache_compaction_required": (
+                    len(encoded)
+                    > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES
+                ),
+            }
+        )
         if not (
             isinstance(existing, dict)
             and existing.get("schema_version") == 1
@@ -6647,26 +6712,48 @@ def _persist_direct_member_partition_cache_candidates(
             entry["search_lineage"] = search_lineage
         new_entries.append(entry)
     entries = [*new_entries, *entries]
-    payload = {
-        "schema_version": 1,
-        "contract": _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
-        "entries": entries[:_DIRECT_MEMBER_PARTITION_WARM_START_MAX_ENTRY_COUNT],
-    }
+    payload, payload_diagnostics = (
+        _bounded_direct_member_partition_cache_payload(entries)
+    )
+    retained_new_entry_count = min(
+        len(new_entries),
+        payload_diagnostics["retained_entry_count"],
+    )
+    if retained_new_entry_count < 1:
+        diagnostics.update(
+            {
+                "status": "persistence_failed",
+                "rejection": "new_candidate_exceeds_cache_size_limit",
+                **payload_diagnostics,
+            }
+        )
+        return diagnostics
     try:
         _write_analysis_manifest_atomically(cache_path, payload)
-        _persisted, fingerprint = _read_stable_regular_file(cache_path)
+        persisted_bytes, fingerprint = _read_stable_regular_file(cache_path)
     except (OSError, ValueError) as exc:
         diagnostics.update(
             {"status": "persistence_failed", "rejection": type(exc).__name__}
         )
         return diagnostics
+    if len(persisted_bytes) > _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES:
+        raise RuntimeError("persisted partition cache exceeded its byte bound")
+    persisted_candidate_signatures = candidate_signatures[
+        :retained_new_entry_count
+    ]
     diagnostics.update(
         {
             "status": "persisted",
             "persisted": True,
-            "persisted_candidate_count": len(new_entries),
-            "candidate_partition_signatures_sha256": candidate_signatures,
+            "persisted_candidate_count": retained_new_entry_count,
+            "candidate_partition_signatures_sha256": (
+                persisted_candidate_signatures
+            ),
+            "requested_candidate_partition_signatures_sha256": (
+                candidate_signatures
+            ),
             "cache_file_sha256": fingerprint["sha256"],
+            **payload_diagnostics,
         }
     )
     return diagnostics
@@ -9790,6 +9877,27 @@ def _direct_partition_queue_priority(
     )
 
 
+def _direct_member_render_feedback_strict_composition_limit(
+    feedback_profile_count: int,
+) -> int:
+    """Scale strict repair search without exceeding the global first cohort."""
+
+    if (
+        isinstance(feedback_profile_count, bool)
+        or not isinstance(feedback_profile_count, int)
+        or feedback_profile_count < 0
+    ):
+        raise ValueError("feedback_profile_count must be a non-negative integer")
+    return min(
+        _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT,
+        _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+        + (
+            feedback_profile_count
+            * _DIRECT_MEMBER_RENDER_FEEDBACK_STRICT_COMPOSITIONS_PER_SEED
+        ),
+    )
+
+
 def _direct_partition_terminal_audition_due(
     *,
     evaluated_profile_count: int,
@@ -10102,9 +10210,9 @@ def _select_direct_member_partition_profile(
         *render_feedback_profiles,
     )
     partition_search_strict_terminal_audition_limit = (
-        _DIRECT_MEMBER_MAX_RENDER_FEEDBACK_STRICT_COMPOSITION_COUNT
-        if render_feedback_profiles
-        else _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
+        _direct_member_render_feedback_strict_composition_limit(
+            len(render_feedback_profiles)
+        )
     )
     warm_start_diagnostics.update(
         {
@@ -10143,7 +10251,7 @@ def _select_direct_member_partition_profile(
                 partition_search_strict_terminal_audition_limit
             ),
             "strict_composition_limit_basis": (
-                "decoded_render_feedback_bounded_extra_cohort"
+                "decoded_render_feedback_seed_scaled_extra_cohort"
                 if render_feedback_profiles
                 else "default_bounded_terminal_cohort"
             ),

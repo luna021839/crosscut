@@ -9,6 +9,8 @@ from crosscut.draft import DraftSegment
 from crosscut.pipeline import (
     _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT,
     _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME,
+    _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES,
+    _DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES,
     _DirectFullFramePartitionProfile,
     _direct_full_frame_spans_from_partition,
     _direct_member_partition_warm_start_binding,
@@ -225,6 +227,88 @@ class DirectMemberPartitionWarmStartTests(unittest.TestCase):
             self.assertEqual(
                 payload["entries"][0]["origin"],
                 "full_visual_selector_feasible",
+            )
+
+    def test_legacy_oversized_cache_loads_then_compacts_on_persistence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_directory = Path(temporary_directory)
+            self._write_manifest(cache_directory)
+            initial = _persist_direct_member_partition_warm_start_profile(
+                cache_directory,
+                self.base,
+                self.candidate,
+                source_count=8,
+            )
+            self.assertTrue(initial["persisted"])
+            cache_path = (
+                cache_directory
+                / _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME
+            )
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            padded_entry = {
+                **payload["entries"][0],
+                "legacy_padding": "x" * 9_000,
+            }
+            payload["entries"] = [dict(padded_entry) for _index in range(32)]
+            cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            oversized_size = cache_path.stat().st_size
+            self.assertGreater(
+                oversized_size,
+                _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES,
+            )
+            self.assertLessEqual(
+                oversized_size,
+                _DIRECT_MEMBER_PARTITION_WARM_START_MAX_READ_BYTES,
+            )
+
+            loaded, load_diagnostics = (
+                _load_direct_member_partition_warm_start_profiles(
+                    cache_directory,
+                    self.segments,
+                    self.base,
+                    source_count=8,
+                )
+            )
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(
+                loaded[0].unit_counts,
+                self.candidate.unit_counts,
+            )
+            self.assertTrue(load_diagnostics["cache_compaction_required"])
+
+            second_candidate = _profile(
+                "second-candidate",
+                (1, 3, *((4,) * 18)),
+            )
+            persistence = _persist_direct_member_partition_warm_start_profile(
+                cache_directory,
+                self.base,
+                second_candidate,
+                source_count=8,
+            )
+
+            self.assertTrue(persistence["persisted"])
+            self.assertTrue(
+                persistence["existing_cache_compaction_required"]
+            )
+            self.assertGreater(persistence["dropped_entry_count"], 0)
+            self.assertLessEqual(
+                cache_path.stat().st_size,
+                _DIRECT_MEMBER_PARTITION_WARM_START_MAX_BYTES,
+            )
+            compacted = json.loads(cache_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                compacted["entries"][0][
+                    "candidate_partition_signature_sha256"
+                ],
+                _direct_partition_signature_sha256(
+                    second_candidate.unit_counts
+                ),
             )
 
     def test_missing_cache_is_a_nonfatal_optimization_miss(self) -> None:
