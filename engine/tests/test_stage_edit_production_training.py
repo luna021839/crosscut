@@ -1044,6 +1044,27 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             self.assertTrue(
                 prior["parameter_invariance"]["context_value_bias_changed"]
             )
+            self.assertTrue(
+                prior["parameter_invariance"][
+                    "dynamic_head_parameter_tree_changed"
+                ]
+            )
+            self.assertTrue(
+                prior["parameter_invariance"][
+                    "context_non_value_bias_changed"
+                ]
+            )
+            self.assertTrue(
+                prior["parameter_invariance"]["context_weight_changed"]
+            )
+            self.assertTrue(
+                prior["parameter_invariance"]["source_head_changed"]
+            )
+            self.assertTrue(
+                prior["parameter_invariance"][
+                    "count_time_motion_bias_gradients_computed"
+                ]
+            )
             candidate = prior["candidate_selection"]
             self.assertEqual(
                 [50, 100, 200, 300, 400, 500],
@@ -1069,6 +1090,10 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             self.assertEqual(
                 expected_selected["value_bias_sha256"],
                 candidate["selected_candidate_value_bias_sha256"],
+            )
+            self.assertEqual(
+                expected_selected["head_parameter_sha256"],
+                candidate["selected_candidate_head_parameter_sha256"],
             )
             candidate_gate = candidate["selection"][
                 "dynamic_crop_v3_selection_gate"
@@ -1105,7 +1130,7 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
             self.assertIn(
                 report["optimization"]["best_checkpoint_origin"],
                 {
-                    "training_only_bias_prior_retained_to_burn_in",
+                    "training_only_dynamic_head_prior_retained_to_burn_in",
                     "joint_finetuning",
                 },
             )

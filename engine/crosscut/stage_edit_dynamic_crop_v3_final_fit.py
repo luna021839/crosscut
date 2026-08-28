@@ -574,6 +574,14 @@ def train_dynamic_crop_v3_final_fit(
         prior_inventory = production._dynamic_crop_v3_prior_inventory(
             examples, dynamic_crop_corpus
         )
+        prior_inventory = production._materialize_dynamic_crop_v3_prior_features(
+            model,
+            examples,
+            prior_inventory,
+            schema=DEFAULT_STAGE_EDIT_SCHEMA,
+            config=model_config,
+            device=active_device,
+        )
         prior_sampler = production._HierarchicalDynamicCropV3PriorSampler(
             prior_inventory.tracks,
             seed=int(schedule["seed"]) ^ 0xD1A5C0,
@@ -582,11 +590,13 @@ def train_dynamic_crop_v3_final_fit(
         before_prior_digests = (
             production._dynamic_crop_v3_prior_parameter_digests(model)
         )
-        prior_module = production._DynamicCropV3PriorBiasModule(
-            model.dynamic_crop_context_head.bias[:values_stop]
+        prior_module = production._DynamicCropV3PriorHeadModule(
+            model.dynamic_crop_context_head.weight,
+            model.dynamic_crop_context_head.bias,
+            model.dynamic_crop_source_head.weight,
         )
         initial_values_mx = renderer_safe_values_from_raw_v3(
-            prior_module.value_bias
+            prior_module.context_head.bias[:values_stop].reshape((8, 4))
         )
         production.mx.eval(initial_values_mx)
         component_scale = production._dynamic_crop_v3_prior_component_scale_evidence(
@@ -621,26 +631,66 @@ def train_dynamic_crop_v3_final_fit(
                 "fresh final-fit v3 prior optimizer did not start at zero"
             )
 
-        def prior_loss(trained_prior: Any, target_values: Any) -> Any:
-            return production._dynamic_crop_v3_prior_normalized_mae(
-                trained_prior, target_values
-            )
+        def prior_loss(
+            trained_prior: Any,
+            context_embedding: Any,
+            source_embedding: Any,
+            target_values: Any,
+            target_times: Any,
+            count_target: int,
+            motion_target: float,
+            motion_supervised: bool,
+        ) -> Any:
+            return production._dynamic_crop_v3_prior_loss(
+                trained_prior,
+                context_embedding,
+                source_embedding,
+                target_values,
+                target_times,
+                count_target,
+                motion_target,
+                motion_supervised,
+                effective_dynamic_loss,
+            )[0]
 
         prior_loss_and_grad = production.nn.value_and_grad(
             prior_module, prior_loss
         )
         prior_candidate_snapshots: dict[int, Any] = {}
-        prior_candidate_digests: dict[int, str] = {}
+        prior_candidate_value_digests: dict[int, str] = {}
+        prior_candidate_head_digests: dict[int, str] = {}
         for phase_step in range(
             1,
             int(schedule["dynamic_crop_v3_prior_pretraining_steps"]) + 1,
         ):
             track = prior_sampler.sample()
+            if (
+                track.context_embedding is None
+                or track.source_embedding is None
+            ):
+                raise RuntimeError(
+                    "final-fit v3 prior sampled an unmaterialized feature"
+                )
+            context_embedding = production.mx.array(track.context_embedding)
+            source_embedding = production.mx.array(track.source_embedding)
             target_values = production.mx.array(
                 np.asarray(track.values, dtype=np.float32)
             )
+            target_times = production.mx.array(
+                np.asarray(track.normalized_times, dtype=np.float32)
+            )
+            count_target = len(track.values)
+            motion_target = float(track.motion_label == "dynamic")
+            motion_supervised = not track.motion_label_loss_masked
             loss, gradients = prior_loss_and_grad(
-                prior_module, target_values
+                prior_module,
+                context_embedding,
+                source_embedding,
+                target_values,
+                target_times,
+                count_target,
+                motion_target,
+                motion_supervised,
             )
             if clipping_supported:
                 gradients, gradient_norm = production.optim.clip_grad_norm(
@@ -649,25 +699,47 @@ def train_dynamic_crop_v3_final_fit(
             else:
                 gradient_norm = production.mx.array(float("nan"))
             prior_optimizer.update(prior_module, gradients)
+            _, prior_components = production._dynamic_crop_v3_prior_loss(
+                prior_module,
+                context_embedding,
+                source_embedding,
+                target_values,
+                target_times,
+                count_target,
+                motion_target,
+                motion_supervised,
+                effective_dynamic_loss,
+            )
             optimizer_steps += 1
             prior_steps += 1
             production.mx.eval(
                 loss,
                 gradient_norm,
+                *prior_components.values(),
                 prior_module.parameters(),
                 prior_optimizer.state,
             )
-            candidate_digest = None
+            candidate_value_digest = None
+            candidate_head_digest = None
             if phase_step in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
-                snapshot = production.mx.array(
-                    np.array(prior_module.value_bias, copy=True)
+                snapshot = production._dynamic_crop_v3_prior_head_snapshot(
+                    prior_module
                 )
-                production.mx.eval(snapshot)
                 prior_candidate_snapshots[phase_step] = snapshot
-                candidate_digest = production._parameter_tree_sha256(
-                    {"bias": snapshot.reshape((values_stop,))}
+                candidate_value_digest = (
+                    production._dynamic_crop_v3_prior_value_bias_digest(
+                        snapshot
+                    )
                 )
-                prior_candidate_digests[phase_step] = candidate_digest
+                candidate_head_digest = production._parameter_tree_sha256(
+                    snapshot
+                )
+                prior_candidate_value_digests[
+                    phase_step
+                ] = candidate_value_digest
+                prior_candidate_head_digests[
+                    phase_step
+                ] = candidate_head_digest
             prior_history.append(
                 {
                     "phase_step": phase_step,
@@ -679,10 +751,24 @@ def train_dynamic_crop_v3_final_fit(
                     "reference_id": track.reference_id,
                     "sequence_id": track.sequence_id,
                     "token_index": track.token_index,
+                    "source_id": track.source_id,
                     "keyframe_count": len(track.values),
                     "gate_aligned_normalized_coordinate_mae": float(
-                        loss.item()
+                        prior_components["values_normalized"].item()
                     ),
+                    "prior_total_loss": float(
+                        prior_components["total"].item()
+                    ),
+                    "prior_count_loss": float(
+                        prior_components["count"].item()
+                    ),
+                    "prior_time_loss": float(
+                        prior_components["times"].item()
+                    ),
+                    "prior_motion_loss": float(
+                        prior_components["motion"].item()
+                    ),
+                    "motion_label_supervised": motion_supervised,
                     "gradient_norm_before_clip": float(
                         gradient_norm.item()
                     ),
@@ -691,7 +777,12 @@ def train_dynamic_crop_v3_final_fit(
                         phase_step
                         in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
                     ),
-                    "candidate_value_bias_sha256": candidate_digest,
+                    "candidate_value_bias_sha256": (
+                        candidate_value_digest
+                    ),
+                    "candidate_head_parameter_sha256": (
+                        candidate_head_digest
+                    ),
                     "validation_labels_consumed": False,
                     "heldout_labels_consumed": False,
                 }
@@ -702,26 +793,16 @@ def train_dynamic_crop_v3_final_fit(
             production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
         ):
             raise RuntimeError("final-fit v3 prior candidate snapshots differ")
-        retained_non_value_bias = model.dynamic_crop_context_head.bias[
-            values_stop:
+        selected_prior_snapshot = prior_candidate_snapshots[
+            prior_candidate_step
         ]
-        selected_prior_bias = prior_candidate_snapshots[prior_candidate_step]
-        model.dynamic_crop_context_head.bias = production.mx.concatenate(
-            (
-                selected_prior_bias.reshape((values_stop,)),
-                retained_non_value_bias,
-            )
+        production._assign_dynamic_crop_v3_prior_head_snapshot(
+            model, selected_prior_snapshot
         )
-        production.mx.eval(model.dynamic_crop_context_head.bias)
         after_prior_digests = (
             production._dynamic_crop_v3_prior_parameter_digests(model)
         )
-        invariant_keys = (
-            "base_parameter_tree_sha256",
-            "context_weight_sha256",
-            "source_head_parameter_tree_sha256",
-            "context_non_value_bias_sha256",
-        )
+        invariant_keys = ("base_parameter_tree_sha256",)
         invariant = all(
             before_prior_digests[key] == after_prior_digests[key]
             for key in invariant_keys
@@ -730,22 +811,46 @@ def train_dynamic_crop_v3_final_fit(
             before_prior_digests["context_value_bias_sha256"]
             != after_prior_digests["context_value_bias_sha256"]
         )
-        if not invariant or not value_changed:
+        non_value_bias_changed = (
+            before_prior_digests["context_non_value_bias_sha256"]
+            != after_prior_digests["context_non_value_bias_sha256"]
+        )
+        context_weight_changed = (
+            before_prior_digests["context_weight_sha256"]
+            != after_prior_digests["context_weight_sha256"]
+        )
+        source_head_changed = (
+            before_prior_digests["source_head_parameter_tree_sha256"]
+            != after_prior_digests["source_head_parameter_tree_sha256"]
+        )
+        dynamic_head_changed = (
+            before_prior_digests["dynamic_head_parameter_tree_sha256"]
+            != after_prior_digests["dynamic_head_parameter_tree_sha256"]
+        )
+        if not invariant or not dynamic_head_changed:
             raise RuntimeError("final-fit v3 prior parameter scope drifted")
         if (
             after_prior_digests["context_value_bias_sha256"]
-            != prior_candidate_digests[prior_candidate_step]
+            != prior_candidate_value_digests[prior_candidate_step]
+            or after_prior_digests["dynamic_head_parameter_tree_sha256"]
+            != prior_candidate_head_digests[prior_candidate_step]
         ):
             raise RuntimeError("final-fit frozen v3 prior digest drifted")
         prior_evidence = {
             "contract": (
-                "all_reference_predeclared_bias_milestones_frozen_loso_"
-                "candidate_no_reselection_v1"
+                "all_reference_predeclared_detached_feature_head_milestones_"
+                "frozen_loso_candidate_no_reselection_v2"
             ),
             "partition": "all_references_fixed_after_loso_selection",
             "objective": (
-                "renderer_range_normalized_coordinate_mae_exactly_aligned_"
-                "with_loso_gate_v1"
+                "detached_context_and_source_conditioned_renderer_values_"
+                "count_times_motion_joint_loss_v2"
+            ),
+            "feature_contract": (
+                production.DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT
+            ),
+            "mutable_parameter_scope": (
+                production.DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT
             ),
             "optimizer_weight_decay": 0.0,
             "optimizer_initial_step": 0,
@@ -762,19 +867,33 @@ def train_dynamic_crop_v3_final_fit(
             "candidate_snapshots": [
                 {
                     "candidate_step": step,
-                    "value_bias_sha256": prior_candidate_digests[step],
+                    "value_bias_sha256": (
+                        prior_candidate_value_digests[step]
+                    ),
+                    "head_parameter_sha256": (
+                        prior_candidate_head_digests[step]
+                    ),
                     "training_only_updates": True,
                 }
                 for step in production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
             ],
             "frozen_selected_candidate_step": prior_candidate_step,
             "frozen_selected_candidate_value_bias_sha256": (
-                prior_candidate_digests[prior_candidate_step]
+                prior_candidate_value_digests[prior_candidate_step]
+            ),
+            "frozen_selected_candidate_head_parameter_sha256": (
+                prior_candidate_head_digests[prior_candidate_step]
             ),
             "final_fit_data_used_for_candidate_selection": False,
             "sampling": {
                 "contract": (
                     "deterministic_song_reference_trajectory_round_robin_v1"
+                ),
+                "feature_contract": (
+                    production.DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT
+                ),
+                "detached_feature_content_sha256": (
+                    prior_inventory.detached_feature_content_sha256
                 ),
                 "per_song_sampled_counts": (
                     prior_sampler.per_song_sampled_counts
@@ -798,8 +917,16 @@ def train_dynamic_crop_v3_final_fit(
                 "after": after_prior_digests,
                 "invariant_parameter_groups": list(invariant_keys),
                 "all_declared_invariant_groups_byte_identical": invariant,
+                "dynamic_head_parameter_tree_changed": dynamic_head_changed,
                 "context_value_bias_changed": value_changed,
+                "context_non_value_bias_changed": non_value_bias_changed,
+                "context_weight_changed": context_weight_changed,
+                "source_head_changed": source_head_changed,
                 "context_value_bias_row_count": values_stop,
+                "base_parameter_gradients_computed": False,
+                "source_head_gradients_computed": True,
+                "context_weight_gradients_computed": True,
+                "count_time_motion_bias_gradients_computed": True,
             },
         }
         retained_context_weight = production.mx.array(
@@ -1389,6 +1516,23 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         raise DynamicCropV3FinalFitError(
             "final-fit v3 prior evidence is missing"
         )
+    prior_contract = prior.get("contract")
+    full_head_prior = prior_contract == (
+        "all_reference_predeclared_detached_feature_head_milestones_"
+        "frozen_loso_candidate_no_reselection_v2"
+    )
+    if (
+        not full_head_prior
+        and prior_contract is not None
+        and prior_contract
+        != (
+            "all_reference_predeclared_bias_milestones_frozen_loso_"
+            "candidate_no_reselection_v1"
+        )
+    ):
+        raise DynamicCropV3FinalFitError(
+            "final-fit v3 prior contract differs"
+        )
     sampling = prior.get("sampling")
     invariance = prior.get("parameter_invariance")
     retention = prior.get("retention")
@@ -1400,6 +1544,7 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         for reference_id in references_by_song[song_id]
     }
     candidate_digest_by_step: dict[int, str] = {}
+    candidate_head_digest_by_step: dict[int, str] = {}
     if not isinstance(candidate_snapshots, list) or len(candidate_snapshots) != len(
         production.DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
     ):
@@ -1416,15 +1561,20 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
                 "final-fit v3 prior candidate snapshot is invalid"
             )
         digest = raw_candidate.get("value_bias_sha256")
+        head_digest = raw_candidate.get("head_parameter_sha256")
         if (
             raw_candidate.get("candidate_step") != expected_step
             or raw_candidate.get("training_only_updates") is not True
             or not _is_sha256(digest)
+            or full_head_prior
+            and not _is_sha256(head_digest)
         ):
             raise DynamicCropV3FinalFitError(
                 "final-fit v3 prior candidate snapshot differs"
             )
         candidate_digest_by_step[expected_step] = str(digest)
+        if full_head_prior:
+            candidate_head_digest_by_step[expected_step] = str(head_digest)
     if (
         training.get("cut_pretraining_optimizer_steps") != cut_steps
         or training.get("source_pretraining_optimizer_steps") != source_steps
@@ -1450,15 +1600,25 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         or prior.get("frozen_selected_candidate_step") != frozen_prior_step
         or prior.get("frozen_selected_candidate_value_bias_sha256")
         != candidate_digest_by_step.get(frozen_prior_step)
+        or full_head_prior
+        and prior.get("frozen_selected_candidate_head_parameter_sha256")
+        != candidate_head_digest_by_step.get(frozen_prior_step)
         or prior.get("final_fit_data_used_for_candidate_selection") is not False
         or not isinstance(sampling, Mapping)
         or not isinstance(invariance, Mapping)
         or invariance.get("all_declared_invariant_groups_byte_identical")
         is not True
         or invariance.get("context_value_bias_changed") is not True
+        or full_head_prior
+        and invariance.get("dynamic_head_parameter_tree_changed") is not True
         or not isinstance(invariance.get("after"), Mapping)
         or invariance.get("after", {}).get("context_value_bias_sha256")
         != candidate_digest_by_step.get(frozen_prior_step)
+        or full_head_prior
+        and invariance.get("after", {}).get(
+            "dynamic_head_parameter_tree_sha256"
+        )
+        != candidate_head_digest_by_step.get(frozen_prior_step)
         or not isinstance(retention, Mapping)
         or retention.get("retention_finetune_step_count")
         != PROBE_TRAINING_SCHEDULE[
@@ -1498,14 +1658,30 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
             "final-fit optimizer or checkpoint contract differs"
         )
     invariant_parameter_groups = (
-        "base_parameter_tree_sha256",
-        "context_weight_sha256",
-        "source_head_parameter_tree_sha256",
-        "context_non_value_bias_sha256",
+        ("base_parameter_tree_sha256",)
+        if full_head_prior
+        else (
+            "base_parameter_tree_sha256",
+            "context_weight_sha256",
+            "source_head_parameter_tree_sha256",
+            "context_non_value_bias_sha256",
+        )
     )
     all_prior_parameter_groups = (
-        *invariant_parameter_groups,
-        "context_value_bias_sha256",
+        (
+            "base_parameter_tree_sha256",
+            "context_weight_sha256",
+            "source_head_parameter_tree_sha256",
+            "dynamic_head_parameter_tree_sha256",
+            "context_bias_sha256",
+            "context_non_value_bias_sha256",
+            "context_value_bias_sha256",
+        )
+        if full_head_prior
+        else (
+            *invariant_parameter_groups,
+            "context_value_bias_sha256",
+        )
     )
     invariance_before = invariance.get("before")
     invariance_after = invariance.get("after")
@@ -1529,6 +1705,12 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         == invariance_after.get("context_value_bias_sha256")
         or invariance_after.get("context_value_bias_sha256")
         != candidate_digest_by_step.get(frozen_prior_step)
+        or full_head_prior
+        and invariance_before.get("dynamic_head_parameter_tree_sha256")
+        == invariance_after.get("dynamic_head_parameter_tree_sha256")
+        or full_head_prior
+        and invariance_after.get("dynamic_head_parameter_tree_sha256")
+        != candidate_head_digest_by_step.get(frozen_prior_step)
     ):
         raise DynamicCropV3FinalFitError(
             "final-fit v3 prior parameter digests differ"
@@ -1595,6 +1777,14 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
                 if is_candidate
                 else raw_record.get("candidate_value_bias_sha256") is not None
             )
+            or full_head_prior
+            and (
+                raw_record.get("candidate_head_parameter_sha256")
+                != candidate_head_digest_by_step[step]
+                if is_candidate
+                else raw_record.get("candidate_head_parameter_sha256")
+                is not None
+            )
             or not song_id
             or not reference_id
             or expected_reference_song_ids.get(reference_id) != song_id
@@ -1625,6 +1815,11 @@ def load_dynamic_crop_v3_final_fit_report(path: Path) -> dict[str, Any]:
         != sampling.get("per_reference_sampled_counts")
         or sampling.get("reference_song_ids")
         != expected_reference_song_ids
+        or full_head_prior
+        and sampling.get("feature_contract")
+        != production.DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT
+        or full_head_prior
+        and not _is_sha256(sampling.get("detached_feature_content_sha256"))
         or max(observed_song_samples.values())
         - min(observed_song_samples.values())
         > 1
