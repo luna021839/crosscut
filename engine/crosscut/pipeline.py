@@ -16527,7 +16527,10 @@ def _refresh_stage_edit_dynamic_crop_motion_evidence_v3(
 
 
 _BOUNDARY_REPAIR_ELIGIBLE_PRE_REVIEW_FAILURES = frozenset(
-    {"focus_mismatch_exceeded"}
+    {
+        "focus_mismatch_exceeded",
+        "formation_mismatch_exceeded",
+    }
 )
 
 
@@ -16544,15 +16547,16 @@ def _pre_review_hard_failure_codes(
     )
 
 
-def _is_focus_only_boundary_repair_candidate(
+def _is_boundary_repair_candidate(
     candidate: Any,
 ) -> bool:
-    """Admit only candidates whose complete pre-review failure is repairable.
+    """Admit only candidates whose complete pre-review failures are repairable.
 
     The decoded boundary repair is specifically allowed to move a source-switch
-    timestamp by a few frames to restore focal-subject continuity.  Cadence,
-    source-density, duration, and other structural failures are not repairable
-    by that operation and therefore remain excluded from proxy candidacy.
+    timestamp by a few frames to restore focal-subject and formation continuity.
+    Cadence, source-density, duration, and other structural failures are not
+    repairable by that operation and therefore remain excluded from proxy
+    candidacy.
     """
 
     record = getattr(candidate, "candidate_record", candidate)
@@ -22070,7 +22074,7 @@ def analyze(
                         record
                         for record in recovery_record_order
                         if record.candidate_index not in attempted_candidate_indices
-                        and _is_focus_only_boundary_repair_candidate(record)
+                        and _is_boundary_repair_candidate(record)
                     )
                     repair_eligible_candidate_count = len(
                         repair_eligible_records

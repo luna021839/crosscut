@@ -22,6 +22,7 @@ from crosscut.timeline import (
 from crosscut.timeline_review import review_timeline
 from crosscut.visual_score import (
     FrameVisualDescriptor,
+    PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS,
     VisualDiversityConfig,
     YUNET_EXPECTED_SHA256,
     _DissolveEvidence,
@@ -100,14 +101,20 @@ class VisualScoreTests(unittest.TestCase):
             ["balanced", "reference", "dense_safe"],
         )
         expected = {
-            "balanced": (0.30, 0.22, 0.48, 4.2, 7.2, 0.22, 0.20, 0.42, 0.65),
-            "reference": (0.18, 0.18, 0.38, 3.8, 7.2, 0.32, 0.48, 0.52, 0.75),
-            "dense_safe": (0.12, 0.14, 0.30, 3.2, 6.5, 0.44, 0.85, 0.68, 0.90),
+            "balanced": (0.30, 0.22, 0.48, 4.2, 5.2, 0.22, 0.20, 0.42, 0.65),
+            "reference": (0.18, 0.18, 0.38, 3.8, 5.2, 0.32, 0.48, 0.52, 0.75),
+            "dense_safe": (0.12, 0.14, 0.30, 3.2, 5.2, 0.44, 0.85, 0.68, 0.90),
         }
         for profile in profiles:
             config = profile.config
             self.assertEqual(config.quality_soft_floor, 0.84)
             self.assertEqual(config.quality_soft_floor_penalty, 0.65)
+            self.assertEqual(
+                config.maximum_same_source_hold_seconds,
+                PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS,
+            )
+            self.assertIsNone(config.maximum_cross_source_formation_mismatch)
+            self.assertGreater(config.formation_transition_weight, 0.0)
             self.assertEqual(
                 (
                     config.continuity_bonus,

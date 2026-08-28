@@ -152,6 +152,11 @@ class _CadenceProfile:
 # untouched; this remains a soft score penalty, never a source rejection.
 PROFESSIONAL_QUALITY_SOFT_FLOOR = 0.84
 PROFESSIONAL_QUALITY_SOFT_FLOOR_PENALTY = 0.65
+# Keep selector cadence inside the independent production review envelope.
+# At the current decision-span quantization, 5.2 seconds yields a 4.90-second
+# observed run ceiling and 12.8--14.1 switches/minute on the XOXZ holdout,
+# versus the reviewer's 12.5 hard minimum and 13.5--17.5 preferred band.
+PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS = 5.2
 
 
 def _quality_soft_floor_policy() -> dict[str, Any]:
@@ -202,7 +207,11 @@ def _safe_cadence_profiles(
         maximum_cross_source_scale_delta=0.20,
         maximum_cross_source_focus_mismatch=0.24,
         maximum_cross_source_layout_mismatch=0.32,
-        maximum_cross_source_formation_mismatch=0.30,
+        # Screen-space formation is strongly perspective-dependent across
+        # broadcasters. Keep its 2.45 transition penalty, then require the
+        # decoded +/-3-frame repair and final reviewer to satisfy the unchanged
+        # 0.30 gate instead of disconnecting the selector graph prematurely.
+        maximum_cross_source_formation_mismatch=None,
         maximum_cross_source_silhouette_mismatch=0.36,
         minimum_cross_source_face_similarity=0.36,
         require_cross_source_visual_evidence=True,
@@ -220,7 +229,9 @@ def _safe_cadence_profiles(
         preferred_max_source_hold_segments=5,
         maximum_same_source_hold_segments=6,
         preferred_max_source_hold_seconds=4.2,
-        maximum_same_source_hold_seconds=7.2,
+        maximum_same_source_hold_seconds=(
+            PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS
+        ),
         source_hold_penalty=0.22,
         source_switch_bonus=0.20,
         ping_pong_penalty=0.42,
@@ -254,7 +265,6 @@ def _safe_cadence_profiles(
                 cut_penalty=0.14,
                 early_cut_penalty=0.30,
                 preferred_max_source_hold_seconds=3.2,
-                maximum_same_source_hold_seconds=6.5,
                 source_hold_penalty=0.44,
                 source_switch_bonus=0.85,
                 ping_pong_penalty=0.68,

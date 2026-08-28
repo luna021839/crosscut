@@ -13,6 +13,7 @@ from crosscut.ive import AspectRatio, EditMode, SourceMode
 from crosscut.pipeline import (
     _discover_automatic_stage_edit_production_bundle,
     _enforce_automatic_group_stage_edit_requirement,
+    _is_boundary_repair_candidate,
     _load_stage_edit_generation_preflight,
     _materialize_registered_stage_edit_preflight,
     _stage_edit_continuity_config_identity,
@@ -2416,6 +2417,31 @@ class StageEditGenerationRequestTests(unittest.TestCase):
                     review_rendered_proxies=False,
                 )
             self.assertFalse((root / "output").exists())
+
+    def test_boundary_repair_admits_only_local_geometry_failures(self):
+        repairable = SimpleNamespace(
+            review=SimpleNamespace(
+                passed=False,
+                hard_failures=(
+                    SimpleNamespace(code="focus_mismatch_exceeded"),
+                    SimpleNamespace(code="formation_mismatch_exceeded"),
+                ),
+            )
+        )
+        structural = SimpleNamespace(
+            review=SimpleNamespace(
+                passed=False,
+                hard_failures=(
+                    SimpleNamespace(code="formation_mismatch_exceeded"),
+                    SimpleNamespace(
+                        code="source_switch_density_below_hard_minimum"
+                    ),
+                ),
+            )
+        )
+
+        self.assertTrue(_is_boundary_repair_candidate(repairable))
+        self.assertFalse(_is_boundary_repair_candidate(structural))
 
     def test_registered_bundle_materializes_current_media_before_preflight(self):
         with tempfile.TemporaryDirectory() as raw:
