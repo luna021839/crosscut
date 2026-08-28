@@ -9877,21 +9877,44 @@ def _direct_partition_queue_priority(
 
 
 def _direct_member_render_feedback_strict_composition_limit(
-    feedback_profile_count: int,
+    feedback_certificate_count: int,
 ) -> int:
     """Scale strict repair search without exceeding the global first cohort."""
 
     if (
-        isinstance(feedback_profile_count, bool)
-        or not isinstance(feedback_profile_count, int)
-        or feedback_profile_count < 0
+        isinstance(feedback_certificate_count, bool)
+        or not isinstance(feedback_certificate_count, int)
+        or feedback_certificate_count < 0
     ):
-        raise ValueError("feedback_profile_count must be a non-negative integer")
+        raise ValueError(
+            "feedback_certificate_count must be a non-negative integer"
+        )
     return (
         _DIRECT_MEMBER_MAX_PARTITION_PROFILE_COUNT
-        if feedback_profile_count
+        if feedback_certificate_count
         else _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
     )
+
+
+def _direct_member_render_feedback_seed_profiles(
+    base: _DirectFullFramePartitionProfile,
+    in_run_preferred_profile: _DirectFullFramePartitionProfile | None,
+    persisted_warm_start_profiles: Sequence[_DirectFullFramePartitionProfile],
+) -> tuple[_DirectFullFramePartitionProfile, ...]:
+    """Retain the base repair root across both in-run and restarted retries."""
+
+    profiles: list[_DirectFullFramePartitionProfile] = []
+    seen_signatures: set[tuple[int, ...]] = set()
+    for profile in (
+        base,
+        *((in_run_preferred_profile,) if in_run_preferred_profile else ()),
+        *persisted_warm_start_profiles,
+    ):
+        if profile.unit_counts in seen_signatures:
+            continue
+        seen_signatures.add(profile.unit_counts)
+        profiles.append(profile)
+    return tuple(profiles)
 
 
 def _direct_partition_terminal_audition_due(
@@ -10166,13 +10189,13 @@ def _select_direct_member_partition_profile(
         for profile in warm_start_profiles
         if profile.unit_counts not in preferred_signatures
     )
-    feedback_seed_profiles = (
-        *((in_run_preferred_profile,) if in_run_preferred_profile is not None else ()),
-        *persisted_warm_start_profiles,
+    feedback_seed_profiles = _direct_member_render_feedback_seed_profiles(
+        base,
+        in_run_preferred_profile,
+        persisted_warm_start_profiles,
     )
     render_feedback_profiles: list[_DirectFullFramePartitionProfile] = []
     render_feedback_seen_signatures = {
-        base.unit_counts,
         *(profile.unit_counts for profile in feedback_seed_profiles),
     }
     if render_infeasible_transition_edges:
@@ -10207,7 +10230,7 @@ def _select_direct_member_partition_profile(
     )
     partition_search_strict_terminal_audition_limit = (
         _direct_member_render_feedback_strict_composition_limit(
-            len(render_feedback_profiles)
+            len(render_infeasible_transition_edges)
         )
     )
     warm_start_diagnostics.update(
@@ -10234,6 +10257,10 @@ def _select_direct_member_partition_profile(
             "dense_render_feedback_certificate_count": len(
                 render_infeasible_transition_edges
             ),
+            "dense_render_feedback_seed_profile_count": len(
+                feedback_seed_profiles
+            ),
+            "dense_render_feedback_base_seed_included": True,
             "dense_render_feedback_guided_candidate_count": len(
                 render_feedback_profiles
             ),
@@ -10248,7 +10275,7 @@ def _select_direct_member_partition_profile(
             ),
             "strict_composition_limit_basis": (
                 "decoded_render_feedback_global_first_cohort"
-                if render_feedback_profiles
+                if render_infeasible_transition_edges
                 else "default_bounded_terminal_cohort"
             ),
         }

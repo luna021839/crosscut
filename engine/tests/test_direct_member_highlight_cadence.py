@@ -17,6 +17,7 @@ from crosscut.pipeline import (
     _direct_member_highlight_cadence_payload,
     _direct_member_in_run_preferred_partition_profile,
     _direct_member_maximum_hold_count_for_global_cadence,
+    _direct_member_render_feedback_seed_profiles,
     _direct_member_render_feedback_strict_composition_limit,
     _direct_partition_queue_priority,
     _direct_partition_structural_search_cost,
@@ -44,6 +45,43 @@ def _timing_segments(count: int) -> tuple[DraftSegment, ...]:
 
 
 class DirectMemberHighlightCadenceTests(unittest.TestCase):
+    def test_restarted_render_feedback_keeps_base_partition_as_repair_root(
+        self,
+    ) -> None:
+        timing = _timing_segments(12)
+        base = _DirectFullFramePartitionProfile(
+            profile_id="base",
+            unit_counts=(3, 3, 3, 3),
+            spans=_direct_full_frame_spans_from_partition(
+                timing,
+                (3, 3, 3, 3),
+            ),
+        )
+        duplicate_base = _DirectFullFramePartitionProfile(
+            profile_id="duplicate-base",
+            unit_counts=base.unit_counts,
+            spans=base.spans,
+        )
+        persisted = _DirectFullFramePartitionProfile(
+            profile_id="persisted-frontier",
+            unit_counts=(2, 4, 3, 3),
+            spans=_direct_full_frame_spans_from_partition(
+                timing,
+                (2, 4, 3, 3),
+            ),
+        )
+
+        seeds = _direct_member_render_feedback_seed_profiles(
+            base,
+            duplicate_base,
+            (persisted,),
+        )
+
+        self.assertEqual(
+            tuple(profile.profile_id for profile in seeds),
+            ("base", "persisted-frontier"),
+        )
+
     def test_render_feedback_extends_instead_of_shrinking_strict_cohort(
         self,
     ) -> None:
