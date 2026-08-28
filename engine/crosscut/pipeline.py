@@ -10851,8 +10851,15 @@ def _select_direct_member_partition_profile(
         selection.optimizer_search_diagnostics[
             "highlight_partition_capacity"
         ] = highlight_partition_capacity
+        cadence_spans = _materialize_direct_member_local_cut_times(
+            profile.spans,
+            selection,
+        )
+        selection.optimizer_search_diagnostics[
+            "highlight_cadence_span_basis"
+        ] = "selected_boundary_master_seconds_v1"
         _enforce_direct_member_highlight_cadence_selection_gate(
-            spans=profile.spans,
+            spans=cadence_spans,
             visual_selection=selection,
             highlight_intervals=normalized_highlight_intervals,
         )

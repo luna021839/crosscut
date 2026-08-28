@@ -26,6 +26,7 @@ from crosscut.pipeline import (
     _direct_partition_queue_priority,
     _direct_partition_structural_search_cost,
     _enforce_direct_member_highlight_cadence_selection_gate,
+    _materialize_direct_member_local_cut_times,
 )
 
 
@@ -812,6 +813,56 @@ class DirectMemberHighlightCadenceTests(unittest.TestCase):
         self.assertLess(
             payload["planned_highlight_boundary_count"],
             payload["minimum_required_highlight_cut_count"],
+        )
+
+    def test_selected_local_cut_shift_is_used_by_highlight_gate(self) -> None:
+        timing = _timing_segments(40)
+        spans = _direct_full_frame_spans_from_partition(
+            timing,
+            (4, 4, 4, 4, 4, 4, 4, 4, 4, 4),
+        )
+        selected_boundaries = [
+            span.canonical_master_end for span in spans[:-1]
+        ]
+        selected_boundaries[1] = 7.9
+        selection = SimpleNamespace(
+            source_indices=tuple(index % 8 for index in range(len(spans))),
+            selected_boundary_master_seconds=tuple(selected_boundaries),
+            config=DirectMemberVisualConfig(boundary_search_radius_frames=6),
+            optimizer_search_diagnostics={},
+            boundaries=tuple(
+                SimpleNamespace(
+                    cut_applied=True,
+                    mismatch=SimpleNamespace(
+                        motion_connection=SimpleNamespace(both_moving=True)
+                    ),
+                )
+                for _ in range(len(spans) - 1)
+            ),
+        )
+
+        canonical_payload = _direct_member_highlight_cadence_payload(
+            spans=spans,
+            visual_selection=selection,
+            highlight_intervals=((8.0, 28.0),),
+        )
+        materialized = _materialize_direct_member_local_cut_times(
+            spans,
+            selection,
+        )
+
+        self.assertTrue(canonical_payload["passed"])
+        with self.assertRaises(DirectMemberVisualSelectionError) as caught:
+            _enforce_direct_member_highlight_cadence_selection_gate(
+                spans=materialized,
+                visual_selection=selection,
+                highlight_intervals=((8.0, 28.0),),
+            )
+        self.assertIn(
+            "highlight_switch_density_below_minimum",
+            caught.exception.diagnostics["highlight_cut_density"][
+                "failure_reasons"
+            ],
         )
 
     def test_compensated_highlight_holds_retain_the_section_audit(self) -> None:
