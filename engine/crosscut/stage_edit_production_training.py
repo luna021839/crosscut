@@ -159,13 +159,17 @@ DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS = (50, 100, 200, 300, 400, 500)
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT = (
     "predeclared_train_only_detached_feature_head_optimizer_milestones_"
-    "existing_exact_validation_highest_score_lower_step_tiebreak_v2"
+    "existing_exact_validation_highest_score_lower_step_tiebreak_"
+    "initial_head_fallback_v3"
 )
 DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
     "frozen_post_source_pretraining_context_and_exact_source_embedding_v1"
 )
 DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT = (
     "only_dynamic_crop_context_and_source_head_parameters_mutable_v2"
+)
+PRODUCTION_TRAINING_FAILURE_REPORT_FILENAME = (
+    "stageedit-production-training-failure-report.json"
 )
 
 
@@ -1446,6 +1450,31 @@ def _canonical_digest(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _write_training_failure_report(
+    checkpoint_root: Path,
+    payload: Mapping[str, Any],
+) -> Path:
+    """Persist non-authoritative diagnostics when no checkpoint can be selected."""
+
+    path = checkpoint_root / PRODUCTION_TRAINING_FAILURE_REPORT_FILENAME
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"refusing to overwrite training failure report: {path}")
+    unsigned = dict(payload)
+    unsigned["artifact_content_sha256"] = None
+    content_sha256 = _canonical_digest(unsigned)
+    report = {**unsigned, "artifact_content_sha256": content_sha256}
+    encoded = json.dumps(
+        report,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encoded)
+    return path
+
+
 def _write_selection_freeze(
     checkpoint_root: Path,
     payload: Mapping[str, Any],
@@ -2667,6 +2696,7 @@ def train_production_stage_edit(
     dynamic_crop_v3_prior_optimizer_state_final_step = 0
     dynamic_crop_v3_prior_candidate_selection: dict[str, Any] | None = None
     dynamic_crop_v3_prior_candidate_snapshots: dict[int, Any] = {}
+    dynamic_crop_v3_prior_initial_snapshot: dict[str, Any] | None = None
     dynamic_crop_v3_prior_before_digests: dict[str, str] | None = None
     dynamic_crop_v3_prior_values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     dynamic_crop_v3_prior_component_scale_evidence: dict[str, Any] | None = None
@@ -2975,6 +3005,9 @@ def train_production_stage_edit(
                 model.dynamic_crop_context_head.weight,
                 model.dynamic_crop_context_head.bias,
                 model.dynamic_crop_source_head.weight,
+            )
+            dynamic_crop_v3_prior_initial_snapshot = (
+                _dynamic_crop_v3_prior_head_snapshot(prior_module)
             )
             initial_values_mx = renderer_safe_values_from_raw_v3(
                 prior_module.context_head.bias[:values_stop].reshape(
@@ -3301,6 +3334,45 @@ def train_production_stage_edit(
             selectable_candidates: list[
                 tuple[float, int, Any, dict[str, Any], dict[str, Any]]
             ] = []
+            assert dynamic_crop_v3_prior_initial_snapshot is not None
+            initial_validation_dynamic = evaluate_stage_edit_dynamic_crop_v3(
+                model,
+                validation_batch,
+                validation_supervision,
+                validation_dynamic_supervision,
+                contract=effective_dynamic_crop_v3_loss_contract,
+            )
+            initial_validation_metrics = {
+                **warmup_validation_base,
+                "total_loss": initial_validation_dynamic["total_loss"],
+                "dynamic_crop_v3": initial_validation_dynamic,
+            }
+            initial_base_selection = stage_edit_validation_selection_score(
+                initial_validation_metrics
+            )
+            initial_selection = (
+                _stage_edit_validation_selection_with_dynamic_crop_v3(
+                    initial_base_selection,
+                    initial_validation_dynamic,
+                )
+            )
+            initial_candidate_evaluation = {
+                "candidate_step": 0,
+                "candidate_origin": "initial_dynamic_head",
+                "value_bias_sha256": (
+                    _dynamic_crop_v3_prior_value_bias_digest(
+                        dynamic_crop_v3_prior_initial_snapshot
+                    )
+                ),
+                "head_parameter_sha256": _parameter_tree_sha256(
+                    dynamic_crop_v3_prior_initial_snapshot
+                ),
+                "training_partition_only_updates": False,
+                "validation_gradients_computed": False,
+                "heldout_forward_performed": False,
+                "selection": dict(initial_selection),
+                "validation_metrics": initial_validation_metrics,
+            }
             for candidate_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
                 candidate_snapshot = dynamic_crop_v3_prior_candidate_snapshots[
                     candidate_step
@@ -3384,24 +3456,15 @@ def train_production_stage_edit(
                     warmup_selection,
                     warmup_validation_metrics,
                 ) = selected_candidate
+                selected_candidate_origin = "trained_prior_candidate"
             else:
-                selected_candidate_step = max(
-                    DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS
-                )
+                selected_candidate_step = None
                 selected_candidate_snapshot = (
-                    dynamic_crop_v3_prior_candidate_snapshots[
-                        selected_candidate_step
-                    ]
+                    dynamic_crop_v3_prior_initial_snapshot
                 )
-                failed_record = next(
-                    record
-                    for record in candidate_evaluations
-                    if record["candidate_step"] == selected_candidate_step
-                )
-                warmup_selection = dict(failed_record["selection"])
-                warmup_validation_metrics = dict(
-                    failed_record["validation_metrics"]
-                )
+                selected_candidate_origin = "initial_dynamic_head_fallback"
+                warmup_selection = dict(initial_selection)
+                warmup_validation_metrics = dict(initial_validation_metrics)
             _assign_dynamic_crop_v3_prior_head_snapshot(
                 model, selected_candidate_snapshot
             )
@@ -3440,7 +3503,13 @@ def train_production_stage_edit(
                 ]
                 != after_digests["dynamic_head_parameter_tree_sha256"]
             )
-            if not invariant or not dynamic_head_changed:
+            if (
+                not invariant
+                or retention_authorized
+                and not dynamic_head_changed
+                or not retention_authorized
+                and dynamic_head_changed
+            ):
                 raise RuntimeError(
                     "Dynamic Crop v3 prior warmup parameter scope drifted"
                 )
@@ -3517,7 +3586,8 @@ def train_production_stage_edit(
                 ),
                 "selection_rule": (
                     "highest_finite_selectable_existing_validation_score_"
-                    "then_lower_candidate_step_on_exact_tie"
+                    "then_lower_candidate_step_on_exact_tie_else_restore_"
+                    "initial_dynamic_head"
                 ),
                 "training_partition_only_gradients": True,
                 "validation_reference_ids": [
@@ -3526,7 +3596,9 @@ def train_production_stage_edit(
                 "validation_gradients_computed": False,
                 "heldout_forward_performed": False,
                 "candidate_evaluations": candidate_evaluations,
+                "initial_candidate_evaluation": initial_candidate_evaluation,
                 "selected_candidate_step": selected_candidate_step,
+                "selected_candidate_origin": selected_candidate_origin,
                 "selected_candidate_value_bias_sha256": (
                     selected_candidate_value_digest
                 ),
@@ -4042,9 +4114,69 @@ def train_production_stage_edit(
         or best_step < 1
         or best_validation_selection_evidence is None
     ):
+        failure_reason = (
+            "no_finite_training_song_reference_validation_composite_improvement"
+        )
+        failure_report_path = _write_training_failure_report(
+            checkpoint_root,
+            {
+                "schema_version": 1,
+                "run_kind": "stage_edit_production_training_failure",
+                "created_at": datetime.now(UTC).isoformat(),
+                "failure_reason": failure_reason,
+                "production_ready": False,
+                "production_activation_authorized": False,
+                "checkpoint_written": False,
+                "dynamic_crop_version": dynamic_crop_version,
+                "model_config": config.to_dict(),
+                "training_song_ids": list(split.training_song_ids),
+                "held_out_song_ids": list(split.held_out_song_ids),
+                "training_reference_ids": [
+                    example.reference_id for example in split.train
+                ],
+                "validation_reference_ids": [
+                    example.reference_id for example in split.validation
+                ],
+                "optimizer_steps": optimizer_steps,
+                "cut_pretraining_optimizer_steps": (
+                    cut_pretraining_optimizer_steps
+                ),
+                "source_pretraining_optimizer_steps": (
+                    source_pretraining_optimizer_steps
+                ),
+                "dynamic_crop_v3_prior_pretraining_optimizer_steps": (
+                    dynamic_crop_v3_prior_pretraining_optimizer_steps
+                ),
+                "finetune_optimizer_steps": finetune_optimizer_steps,
+                "best_epoch": best_epoch,
+                "best_training_step": best_step,
+                "best_validation_selection_evidence": (
+                    dict(best_validation_selection_evidence)
+                    if best_validation_selection_evidence is not None
+                    else None
+                ),
+                "dynamic_crop_v3_prior_candidate_selection": (
+                    dynamic_crop_v3_prior_candidate_selection
+                ),
+                "dynamic_crop_v3_prior_parameter_invariance": (
+                    dynamic_crop_v3_prior_parameter_invariance
+                ),
+                "dynamic_crop_v3_prior_sampling": (
+                    dynamic_crop_v3_prior_sampling_evidence
+                ),
+                "cut_pretraining_history": cut_pretraining_history,
+                "source_pretraining_history": source_pretraining_history,
+                "dynamic_crop_v3_prior_pretraining_history": (
+                    dynamic_crop_v3_prior_pretraining_history
+                ),
+                "finetune_history": history,
+                "artifact_content_sha256": None,
+            },
+        )
         raise RuntimeError(
             "no finite training-song reference-validation composite improvement; "
-            "no checkpoint was saved"
+            "no checkpoint was saved; failure report: "
+            f"{failure_report_path}"
         )
 
     with mx.stream(active_device):
