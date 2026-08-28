@@ -77,12 +77,15 @@ class PipelineDynamicCropV3MotionContractTests(unittest.TestCase):
 
     def _fixture(
         self,
+        *,
+        model_motion_index: int = 0,
+        deterministic_geometry_override_index: int | None = None,
     ) -> tuple[_GroupRenderCandidateBundle, StageEditMaterializedVisualCandidate]:
         shots: list[StageShot] = []
         render_segments: list[RenderSegment] = []
         for index in range(10):
             source_index = index % 2
-            track = self._track(moving=index == 0)
+            track = self._track(moving=index == model_motion_index)
             segment = RenderSegment(
                 source_index=source_index,
                 source_start=0.0,
@@ -115,12 +118,28 @@ class PipelineDynamicCropV3MotionContractTests(unittest.TestCase):
                     dynamic_crop_decode_v3=decode,
                 )
             )
+            deterministic_track = (
+                EditorialTransformTrack(
+                    (
+                        EditorialTransformKeyframe(
+                            0.0, 1.08, 0.49, 0.5, 0.0
+                        ),
+                        EditorialTransformKeyframe(
+                            0.8, 1.00, 0.5, 0.5, 0.0
+                        ),
+                    ),
+                    reason="boundary_local_exact_subject_alignment_b0",
+                )
+                if index == deterministic_geometry_override_index
+                else None
+            )
             render_segments.append(
                 RenderSegment(
                     source_index=source_index,
                     source_start=0.0,
                     duration=1.0,
                     master_start=float(index),
+                    editorial_transform=deterministic_track,
                 )
             )
         plan = RenderPlan(
@@ -189,6 +208,38 @@ class PipelineDynamicCropV3MotionContractTests(unittest.TestCase):
             "strictly replayed production motion authority",
         ):
             _apply_stage_edit_candidate_render_contract(bundle, materialized)
+
+    def test_v3_pipeline_preserves_verified_geometry_before_model_crop(self) -> None:
+        bundle, materialized = self._fixture(
+            model_motion_index=1,
+            deterministic_geometry_override_index=0,
+        )
+        original_track = bundle.render_plan.segments[0].editorial_transform
+        assert original_track is not None
+
+        result = _apply_stage_edit_candidate_render_contract(
+            bundle,
+            materialized,
+            motion_authority_v3=self._authority(),
+        )
+
+        self.assertIs(
+            result.render_plan.segments[0].editorial_transform,
+            original_track,
+        )
+        evidence = result.dynamic_crop_motion_timeline_v3
+        assert evidence is not None
+        self.assertEqual(
+            evidence.segment_evidence[0].overlay_disposition,
+            "deterministic_geometry_override_suppressed_model_track",
+        )
+        self.assertEqual(evidence.motion_event_applied_count, 1)
+        event = result.candidate_lineage[-1]
+        self.assertFalse(event["ordinary_editorial_motion_discarded"])
+        self.assertEqual(
+            event["deterministic_geometry_precedence_segment_indices"],
+            [0],
+        )
 
     def test_final_output_replacement_refreshes_full_plan_evidence(self) -> None:
         bundle, materialized = self._fixture()

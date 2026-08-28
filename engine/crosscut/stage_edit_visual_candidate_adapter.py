@@ -10,6 +10,8 @@ borrows a candidate from the ordinary visual optimizer.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -18,9 +20,12 @@ from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
     RenderPlan,
+    RenderTransition,
     TransitionKind,
 )
+from .stage_edit import StageBoundary, StageEdit, StageShot
 from .stage_edit_pipeline_bridge import (
+    STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
     RetainedStageEditCandidate,
     StageEditPipelineBridgeResult,
 )
@@ -38,9 +43,20 @@ from .visual_score import (
 
 
 STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT = (
-    "exact_eight_stage_edit_visual_hard_gate_dynamic_crop_v2_v3_materialization_v2"
+    "exact_eight_stage_edit_visual_hard_gate_dynamic_crop_v2_v3_"
+    "typed_hybrid_floor_materialization_v3"
 )
 STAGE_EDIT_VISUAL_CANDIDATE_COUNT = 8
+STAGE_EDIT_LEARNED_ONLY_CANDIDATE_POOL = "stage_edit_generation_only"
+STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL = (
+    "stage_edit_generation_plus_typed_visual_floor_v1"
+)
+HYBRID_VISUAL_FLOOR_CONTRACT = (
+    "reviewed_visual_timeline_exact_pts_dynamic_crop_v3_seed_v1"
+)
+HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN = (
+    "hybrid_visual_floor_dynamic_crop_v3"
+)
 
 
 class StageEditVisualCandidateError(RuntimeError):
@@ -99,6 +115,14 @@ class StageEditVisualCandidateRecord:
     def dynamic_crop_version(self) -> int:
         return _retained_dynamic_crop_version(self.retained_candidate)
 
+    @property
+    def candidate_origin(self) -> str:
+        return getattr(
+            self.retained_candidate,
+            "candidate_origin",
+            "stage_edit_semimarkov",
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = self.base_record.to_dict()
         payload.update(
@@ -107,8 +131,19 @@ class StageEditVisualCandidateRecord:
                 "review_rank": self.review_rank,
                 "cadence_profile": self.cadence_profile,
                 "stage_edit_candidate_rank": self.retained_candidate.rank,
-                "stage_edit_semimarkov_score": self.retained_candidate.score,
-                "candidate_origin": "explicit_stage_edit_generation",
+                "stage_edit_candidate_score": self.retained_candidate.score,
+                "stage_edit_semimarkov_score": (
+                    self.retained_candidate.score
+                    if self.candidate_origin == "stage_edit_semimarkov"
+                    else None
+                ),
+                "hybrid_visual_floor_optimizer_score": (
+                    self.retained_candidate.score
+                    if self.candidate_origin
+                    == HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN
+                    else None
+                ),
+                "candidate_origin": self.candidate_origin,
                 "dynamic_crop_version": self.dynamic_crop_version,
             }
         )
@@ -141,6 +176,14 @@ class StageEditMaterializedVisualCandidate:
         return _retained_dynamic_crop_version(self.retained_candidate)
 
     @property
+    def candidate_origin(self) -> str:
+        return getattr(
+            self.retained_candidate,
+            "candidate_origin",
+            "stage_edit_semimarkov",
+        )
+
+    @property
     def segments(self) -> tuple[Any, ...]:
         return self.base_materialized.segments
 
@@ -161,6 +204,7 @@ class StageEditMaterializedVisualCandidate:
                 "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
                 "candidate_index": self.candidate_index,
                 "stage_edit_candidate_rank": self.retained_candidate.rank,
+                "candidate_origin": self.candidate_origin,
                 "prescribed_source_path": [
                     shot.segment.source_index
                     for shot in self.retained_candidate.edit.shots
@@ -177,7 +221,13 @@ class StageEditMaterializedVisualCandidate:
             "review_rank": self.review_rank,
             "cadence_profile": self.cadence_profile,
             "stage_edit_candidate_rank": self.retained_candidate.rank,
-            "stage_edit_semimarkov_score": self.retained_candidate.score,
+            "stage_edit_candidate_score": self.retained_candidate.score,
+            "stage_edit_semimarkov_score": (
+                self.retained_candidate.score
+                if self.candidate_origin == "stage_edit_semimarkov"
+                else None
+            ),
+            "candidate_origin": self.candidate_origin,
             "dynamic_crop_version": self.dynamic_crop_version,
             "visual_candidate": self.candidate_record.to_dict(),
             "lineage": list(self.lineage),
@@ -187,6 +237,7 @@ class StageEditMaterializedVisualCandidate:
 @dataclass(frozen=True, slots=True)
 class StageEditVisualCandidateBatch:
     candidates: tuple[StageEditMaterializedVisualCandidate, ...]
+    learned_candidate_rejections: tuple[Mapping[str, Any], ...] = ()
     contract: str = STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT
 
     def __post_init__(self) -> None:
@@ -226,14 +277,62 @@ class StageEditVisualCandidateBatch:
         versions = {item.dynamic_crop_version for item in self.candidates}
         if len(versions) != 1:
             raise ValueError("StageEdit visual batch mixes Dynamic Crop versions")
+        hybrid_count = sum(
+            item.candidate_origin == HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN
+            for item in self.candidates
+        )
+        if hybrid_count > 1:
+            raise ValueError(
+                "StageEdit visual batch can retain only one hybrid visual floor"
+            )
+        if hybrid_count and versions != {3}:
+            raise ValueError(
+                "hybrid visual floor requires Dynamic Crop v3"
+            )
+        if any(
+            not isinstance(item, Mapping)
+            for item in self.learned_candidate_rejections
+        ):
+            raise TypeError(
+                "learned candidate rejections must be scalar audit mappings"
+            )
+
+    @property
+    def hybrid_visual_floor_candidate_count(self) -> int:
+        return sum(
+            item.candidate_origin == HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN
+            for item in self.candidates
+        )
+
+    @property
+    def candidate_pool(self) -> str:
+        if self.hybrid_visual_floor_candidate_count:
+            return STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL
+        return STAGE_EDIT_LEARNED_ONLY_CANDIDATE_POOL
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "contract": self.contract,
             "activation": "explicit_stage_edit_generation_request_only",
-            "candidate_pool": "stage_edit_generation_only",
+            "candidate_pool": self.candidate_pool,
             "ordinary_visual_baseline_candidate_pool_eligible": False,
             "silent_baseline_fallback_allowed": False,
+            "raw_baseline_candidate_direct_selection_allowed": False,
+            "hybrid_visual_floor_contract": (
+                HYBRID_VISUAL_FLOOR_CONTRACT
+                if self.hybrid_visual_floor_candidate_count
+                else None
+            ),
+            "hybrid_visual_floor_candidate_count": (
+                self.hybrid_visual_floor_candidate_count
+            ),
+            "learned_candidate_count": (
+                len(self.candidates)
+                - self.hybrid_visual_floor_candidate_count
+            ),
+            "learned_candidate_rejections": [
+                dict(item) for item in self.learned_candidate_rejections
+            ],
             "required_candidate_count": STAGE_EDIT_VISUAL_CANDIDATE_COUNT,
             "candidate_count": len(self.candidates),
             "dynamic_crop_version": self.candidates[0].dynamic_crop_version,
@@ -272,6 +371,417 @@ def _absolute_stage_edit_spans(
     return spans
 
 
+def _canonical_path_sha256(
+    visual_plan: VisualTimelinePlan,
+) -> str:
+    payload = [
+        {
+            "segment_index": item.segment_index,
+            "source_index": item.source_index,
+            "canonical_master_start": round(
+                float(item.canonical_master_start), 9
+            ),
+            "canonical_master_end": round(
+                float(item.canonical_master_end), 9
+            ),
+        }
+        for item in visual_plan.choices
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _exact_head_frame(
+    head_frames: Sequence[Any],
+    master_time_seconds: float,
+) -> Any:
+    matches = tuple(
+        frame
+        for frame in head_frames
+        if math.isclose(
+            float(frame.master_time_seconds),
+            float(master_time_seconds),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    )
+    if len(matches) != 1:
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor boundary is not one exact Transformer "
+            f"decision time: {master_time_seconds:.6f}"
+        )
+    return matches[0]
+
+
+def _build_hybrid_visual_floor_retained_candidate_from_parts(
+    *,
+    visual_plan: VisualTimelinePlan,
+    segments: Sequence[Any],
+    common_master_start: float,
+    head_frames: Sequence[Any],
+    canonical_source_ids: Sequence[str],
+    template_edit: StageEdit,
+    candidate_rank: int,
+    optimizer_score: float,
+    cadence_profile: str,
+    path_signature: Sequence[str],
+    continuity_authority: str,
+) -> RetainedStageEditCandidate:
+    """Bind a reviewed visual path to exact v3 source-local crop decodes.
+
+    The visual optimizer remains the explicit source/cut authority for this
+    one quality-floor candidate.  The Transformer supplies only the exact
+    source-slot Dynamic Crop v3 prediction at each already selected boundary.
+    Every source gate is rechecked across the entire shot, so the conversion
+    cannot smuggle an unavailable source into a typed StageEdit.
+    """
+
+    if not isinstance(visual_plan, VisualTimelinePlan):
+        raise TypeError("hybrid visual floor requires a VisualTimelinePlan")
+    if not isinstance(template_edit, StageEdit):
+        raise TypeError("hybrid visual floor requires a StageEdit template")
+    choices = tuple(visual_plan.choices)
+    renderer_segments = tuple(segments)
+    frames = tuple(head_frames)
+    source_ids = tuple(str(value).strip() for value in canonical_source_ids)
+    if not choices or len(choices) != len(renderer_segments):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor choices and exact renderer segments differ"
+        )
+    if not frames or any(not value for value in source_ids):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor lacks Transformer frames or source identities"
+        )
+    if tuple(template_edit.sources) == () or len(template_edit.sources) != len(
+        source_ids
+    ):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor source identities do not align"
+        )
+    if not math.isfinite(float(optimizer_score)):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor optimizer score is not finite"
+        )
+    section_plan = template_edit.section_plan
+    if not math.isclose(
+        float(common_master_start),
+        float(section_plan.start_seconds),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ) or not math.isclose(
+        float(template_edit.master_audio_start),
+        float(common_master_start),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor master clock differs from StageEdit"
+        )
+    if not math.isclose(
+        float(choices[0].canonical_master_start),
+        float(section_plan.start_seconds),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ) or not math.isclose(
+        float(choices[-1].canonical_master_end),
+        float(section_plan.end_seconds),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor does not cover the exact StageEdit range"
+        )
+    frame_times = tuple(float(frame.master_time_seconds) for frame in frames)
+    if frame_times != tuple(sorted(frame_times)) or len(set(frame_times)) != len(
+        frame_times
+    ):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor Transformer decision times are not ordered"
+        )
+
+    shots: list[StageShot] = []
+    previous_end = float(common_master_start)
+    for index, (choice, renderer_segment) in enumerate(
+        zip(choices, renderer_segments, strict=True)
+    ):
+        start = float(choice.canonical_master_start)
+        end = float(choice.canonical_master_end)
+        duration = end - start
+        source_index = int(choice.source_index)
+        if choice.segment_index != index or not math.isclose(
+            start,
+            previous_end,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor spans are not contiguous"
+            )
+        if not 0 <= source_index < len(source_ids):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor source index is outside the snapshot"
+            )
+        if (
+            renderer_segment.source_index != source_index
+            or not math.isclose(
+                float(renderer_segment.master_start),
+                start - float(common_master_start),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            or not math.isclose(
+                float(renderer_segment.duration),
+                duration,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor renderer clock or source changed"
+            )
+        start_frame = _exact_head_frame(frames, start)
+        if end < section_plan.end_seconds - 1e-6:
+            _exact_head_frame(frames, end)
+        span_frames = tuple(
+            frame
+            for frame in frames
+            if start - 1e-6
+            <= float(frame.master_time_seconds)
+            < end - 1e-6
+        )
+        if not span_frames or any(
+            source_index >= len(frame.effective_source_mask)
+            or not frame.effective_source_mask[source_index]
+            for frame in span_frames
+        ):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor selected a source that fails a "
+                f"Transformer hard gate inside shot {index}"
+            )
+        predictions = tuple(start_frame.dynamic_crop_v3_by_source)
+        if source_index >= len(predictions):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor Dynamic Crop source slot is missing"
+            )
+        prediction = predictions[source_index]
+        if (
+            prediction is None
+            or prediction.source_index != source_index
+            or prediction.source_id != source_ids[source_index]
+        ):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor Dynamic Crop source identity differs"
+            )
+        if (
+            start_frame.section_role is None
+            or start_frame.section_progress is None
+            or start_frame.phrase_progress is None
+        ):
+            raise StageEditVisualCandidateError(
+                "hybrid visual floor lacks exact token music structure"
+            )
+        decode = prediction.decode(duration)
+        directive = section_plan.directive_at(start + 0.5 * duration)
+        segment = replace(
+            renderer_segment,
+            crop=None,
+            pan_crop=None,
+            editorial_transform=decode.track,
+        )
+        shots.append(
+            StageShot(
+                shot_index=index,
+                section_index=directive.section_index,
+                segment=segment,
+                decision_id=(
+                    f"hybrid-visual-floor-v3-r{candidate_rank:02d}-"
+                    f"s{index:04d}"
+                ),
+                decision_confidence=None,
+                section_role=start_frame.section_role,
+                section_progress=start_frame.section_progress,
+                phrase_progress=start_frame.phrase_progress,
+                dynamic_crop_decode_v3=decode,
+            )
+        )
+        previous_end = end
+
+    boundaries = tuple(
+        StageBoundary(
+            boundary_index=index,
+            transition=RenderTransition(
+                reason="hybrid_visual_floor_reviewed_hard_cut",
+                tier="C",
+            ),
+        )
+        for index in range(len(shots) - 1)
+    )
+    path_sha256 = _canonical_path_sha256(visual_plan)
+    output = template_edit.output.with_name(
+        f".{template_edit.output.stem}-hybrid-visual-floor-v3.mp4"
+    )
+    edit = StageEdit(
+        sources=template_edit.sources,
+        reference_source=template_edit.reference_source,
+        aspect_ratio=template_edit.aspect_ratio,
+        width=template_edit.width,
+        height=template_edit.height,
+        fps=template_edit.fps,
+        master_audio_start=float(common_master_start),
+        section_plan=section_plan,
+        shots=tuple(shots),
+        boundaries=boundaries,
+        output=output,
+        candidate_history=(
+            {
+                "generator": HYBRID_VISUAL_FLOOR_CONTRACT,
+                "candidate_origin": HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN,
+                "source_cut_authority": (
+                    "reviewed_ordinary_visual_optimizer"
+                ),
+                "dynamic_crop_authority": (
+                    "source_exact_transformer_v3_prediction_at_selected_boundary"
+                ),
+                "raw_baseline_direct_selection_allowed": False,
+                "dynamic_crop_version": 3,
+                "visual_optimizer_score": float(optimizer_score),
+                "cadence_profile": str(cadence_profile),
+                "visual_path_signature": list(path_signature),
+                "visual_path_sha256": path_sha256,
+                "exact_source_gate_checked_across_every_shot": True,
+            },
+            {
+                "bridge": STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
+                "visual_baseline_replaced": False,
+                "selected_for_render": False,
+                "exact_source_clock_reprojection": True,
+                "timewarped_segment_count": sum(
+                    segment.source_duration is not None
+                    for segment in renderer_segments
+                ),
+                "dynamic_crop_version": 3,
+                "continuity_authority": str(continuity_authority),
+                "hybrid_visual_floor_contract": (
+                    HYBRID_VISUAL_FLOOR_CONTRACT
+                ),
+            },
+        ),
+    )
+    return RetainedStageEditCandidate(
+        rank=candidate_rank,
+        score=float(optimizer_score),
+        edit=edit,
+        exact_clock_reprojected=True,
+        timewarped_segment_count=sum(
+            segment.source_duration is not None
+            for segment in renderer_segments
+        ),
+        candidate_origin=HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN,
+    )
+
+
+def _build_hybrid_visual_floor_retained_candidate(
+    bridge_result: StageEditPipelineBridgeResult,
+    materialized: MaterializedVisualTimelineCandidate,
+    *,
+    candidate_rank: int,
+) -> RetainedStageEditCandidate:
+    if not isinstance(bridge_result, StageEditPipelineBridgeResult):
+        raise TypeError("bridge_result must be a StageEditPipelineBridgeResult")
+    if not isinstance(materialized, MaterializedVisualTimelineCandidate):
+        raise TypeError(
+            "hybrid visual floor must be a materialized visual candidate"
+        )
+    if bridge_result.preflight.dynamic_crop_version != 3:
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor is supported only for Dynamic Crop v3"
+        )
+    if not materialized.candidate_record.review.passed:
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor must pass the ordinary visual hard gates"
+        )
+    template = bridge_result.retained_candidates[0].edit
+    normalized_sources = tuple(
+        Path(value).expanduser().resolve()
+        for value in materialized.candidate_set.sources
+    )
+    if tuple(template.sources) != normalized_sources:
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor media identity differs from StageEdit"
+        )
+    return _build_hybrid_visual_floor_retained_candidate_from_parts(
+        visual_plan=materialized.visual_plan,
+        segments=materialized.segments,
+        common_master_start=materialized.common_master_start,
+        head_frames=bridge_result.head_materialization.frames,
+        canonical_source_ids=bridge_result.preflight.source_ids,
+        template_edit=template,
+        candidate_rank=candidate_rank,
+        optimizer_score=materialized.candidate_record.optimizer_score,
+        cadence_profile=materialized.candidate_record.cadence_profile,
+        path_signature=materialized.candidate_record.path_signature,
+        continuity_authority=bridge_result.preflight.continuity_authority,
+    )
+
+
+def _reindex_stage_edit_materialized_candidate(
+    materialized: StageEditMaterializedVisualCandidate,
+    *,
+    candidate_index: int,
+) -> StageEditMaterializedVisualCandidate:
+    record = replace(
+        materialized.candidate_record,
+        candidate_index=candidate_index,
+        review_rank=candidate_index,
+    )
+    return replace(
+        materialized,
+        candidate_record=record,
+        visual_plan=replace(
+            materialized.visual_plan,
+            selected_candidate_index=candidate_index,
+            candidate_review_summaries=(record.to_dict(),),
+        ),
+    )
+
+
+def _wrap_hybrid_visual_floor_candidate(
+    materialized: MaterializedVisualTimelineCandidate,
+    retained: RetainedStageEditCandidate,
+    *,
+    candidate_index: int,
+) -> StageEditMaterializedVisualCandidate:
+    record = StageEditVisualCandidateRecord(
+        candidate_index=candidate_index,
+        review_rank=candidate_index,
+        cadence_profile=(
+            "hybrid_visual_floor_dynamic_crop_v3_prescribed_visual_gate"
+        ),
+        base_record=materialized.candidate_record,
+        retained_candidate=retained,
+    )
+    visual_plan = replace(
+        materialized.visual_plan,
+        analysis_basis=HYBRID_VISUAL_FLOOR_CONTRACT,
+        selected_candidate_index=candidate_index,
+        candidate_generation_basis=HYBRID_VISUAL_FLOOR_CONTRACT,
+        candidate_review_summaries=(record.to_dict(),),
+    )
+    return StageEditMaterializedVisualCandidate(
+        candidate_record=record,
+        base_materialized=materialized,
+        visual_plan=visual_plan,
+        retained_candidate=retained,
+    )
+
+
 def materialize_stage_edit_visual_candidates(
     bridge_result: StageEditPipelineBridgeResult,
     *,
@@ -280,13 +790,20 @@ def materialize_stage_edit_visual_candidates(
     sync_scores: Sequence[float],
     scene_cut_times: Sequence[Sequence[float]],
     source_timewarps: Sequence[TimeWarpMap | None],
+    hybrid_visual_floor_candidate: (
+        MaterializedVisualTimelineCandidate | None
+    ) = None,
     feature_cache_directory: Path | None = None,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
 ) -> StageEditVisualCandidateBatch:
-    """Hard-gate and materialize exactly eight learned source/cut paths.
+    """Hard-gate exactly eight StageEdit-typed rendered-proxy candidates.
 
-    A failed path aborts the entire explicitly requested learned batch.  The
-    ordinary visual optimizer is intentionally never consulted here.
+    The legacy path retains eight learned semi-Markov candidates.  Production
+    Dynamic Crop v3 may instead predeclare one already reviewed visual quality
+    floor: all eight learned paths are still checked, the best seven passing
+    paths are retained, and the floor is converted to an exact-PTS StageEdit
+    with source-local v3 crop decodes.  It is never a post-failure fallback or
+    a raw baseline candidate selected outside StageEdit proxy/montage QA.
     """
 
     if not isinstance(bridge_result, StageEditPipelineBridgeResult):
@@ -334,6 +851,97 @@ def materialize_stage_edit_visual_candidates(
         raise StageEditVisualCandidateError(
             "StageEdit visual source list does not match explicit source identities"
         )
+    if hybrid_visual_floor_candidate is not None and not isinstance(
+        hybrid_visual_floor_candidate,
+        MaterializedVisualTimelineCandidate,
+    ):
+        raise TypeError(
+            "hybrid_visual_floor_candidate must be a materialized visual candidate"
+        )
+    if (
+        hybrid_visual_floor_candidate is not None
+        and expected_dynamic_crop_version != 3
+    ):
+        raise StageEditVisualCandidateError(
+            "hybrid visual floor requires Dynamic Crop v3"
+        )
+
+    if hybrid_visual_floor_candidate is not None:
+        learned_materialized: list[StageEditMaterializedVisualCandidate] = []
+        learned_rejections: list[dict[str, Any]] = []
+        analysis_total = len(retained) + 1
+        for position, candidate in enumerate(retained):
+            try:
+                value = materialize_stage_edit_visual_candidate(
+                    candidate,
+                    candidate_index=position,
+                    review_rank=position,
+                    sources=normalized_sources,
+                    audio_offsets=audio_offsets,
+                    sync_scores=sync_scores,
+                    scene_cut_times=scene_cut_times,
+                    source_timewarps=source_timewarps,
+                    feature_cache_directory=feature_cache_directory,
+                    progress_callback=(
+                        (
+                            lambda completed, total, position=position: (
+                                progress_callback(
+                                    position + 1,
+                                    analysis_total,
+                                    completed,
+                                    total,
+                                )
+                            )
+                        )
+                        if progress_callback is not None
+                        else None
+                    ),
+                )
+            except StageEditVisualCandidateError as exc:
+                learned_rejections.append(
+                    {
+                        "stage_edit_candidate_rank": candidate.rank,
+                        "candidate_origin": candidate.candidate_origin,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            learned_materialized.append(value)
+        required_learned_count = STAGE_EDIT_VISUAL_CANDIDATE_COUNT - 1
+        if len(learned_materialized) < required_learned_count:
+            raise StageEditVisualCandidateError(
+                "hybrid StageEdit batch requires seven learned paths to pass "
+                "the visual hard gates; "
+                f"passed={len(learned_materialized)}, "
+                f"rejected={len(learned_rejections)}"
+            )
+        selected_learned = tuple(
+            _reindex_stage_edit_materialized_candidate(
+                value,
+                candidate_index=index,
+            )
+            for index, value in enumerate(
+                learned_materialized[:required_learned_count]
+            )
+        )
+        hybrid_rank = max(candidate.rank for candidate in retained) + 1
+        hybrid_retained = _build_hybrid_visual_floor_retained_candidate(
+            bridge_result,
+            hybrid_visual_floor_candidate,
+            candidate_rank=hybrid_rank,
+        )
+        hybrid_materialized = _wrap_hybrid_visual_floor_candidate(
+            hybrid_visual_floor_candidate,
+            hybrid_retained,
+            candidate_index=required_learned_count,
+        )
+        if progress_callback is not None:
+            progress_callback(analysis_total, analysis_total, 1, 1)
+        return StageEditVisualCandidateBatch(
+            selected_learned + (hybrid_materialized,),
+            learned_candidate_rejections=tuple(learned_rejections),
+        )
+
     materialized: list[StageEditMaterializedVisualCandidate] = []
     for position, candidate in enumerate(retained):
         materialized.append(
@@ -491,6 +1099,39 @@ def _reparameterized_dynamic_crop_track(
     )
 
 
+def dynamic_crop_v3_deterministic_geometry_override_indices(
+    render_plan: RenderPlan,
+) -> tuple[int, ...]:
+    """Return v3 segments whose verified visual geometry must keep authority.
+
+    The ordinary visual derivation has already run face matching, exact-frame
+    boundary subject alignment, and renderer-safety validation before the
+    StageEdit overlay is applied.  Dynamic Crop v3 must not erase those
+    source-specific results merely because its learned trajectory occupies the
+    same renderer field.  Face-dissolve sides remain governed by their older,
+    explicit suppression contract and are therefore excluded here.
+    """
+
+    if not isinstance(render_plan, RenderPlan):
+        raise TypeError("render_plan must be a RenderPlan")
+    face_dissolve_segments = {
+        segment_index
+        for boundary_index, transition in enumerate(render_plan.transitions)
+        if transition.kind is TransitionKind.FACE_DISSOLVE
+        for segment_index in (boundary_index, boundary_index + 1)
+    }
+    return tuple(
+        index
+        for index, segment in enumerate(render_plan.segments)
+        if index not in face_dissolve_segments
+        and (
+            segment.crop is not None
+            or segment.pan_crop is not None
+            or segment.editorial_transform is not None
+        )
+    )
+
+
 def apply_stage_edit_dynamic_crop_to_render_plan(
     materialized: StageEditMaterializedVisualCandidate,
     render_plan: RenderPlan,
@@ -519,6 +1160,11 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
     for boundary_index, transition in enumerate(render_plan.transitions):
         if transition.kind is TransitionKind.FACE_DISSOLVE:
             face_dissolve_segments.update((boundary_index, boundary_index + 1))
+    deterministic_geometry_segments = (
+        set(dynamic_crop_v3_deterministic_geometry_override_indices(render_plan))
+        if materialized.dynamic_crop_version == 3
+        else set()
+    )
     updated = []
     for index, (original, current) in enumerate(
         zip(original_segments, render_plan.segments, strict=True)
@@ -530,6 +1176,13 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
             )
         if index in face_dissolve_segments:
             updated.append(replace(current, editorial_transform=None))
+            continue
+        if index in deterministic_geometry_segments:
+            # V3 is a hybrid policy: learned source/cut/framing intent remains
+            # authoritative where no stronger source-local geometry exists,
+            # while already validated face tracking and boundary alignment
+            # retain the exact crop/track that was reviewed on real frames.
+            updated.append(current)
             continue
         updated.append(
             replace(
@@ -547,6 +1200,10 @@ def apply_stage_edit_dynamic_crop_to_render_plan(
 
 
 __all__ = [
+    "HYBRID_VISUAL_FLOOR_CANDIDATE_ORIGIN",
+    "HYBRID_VISUAL_FLOOR_CONTRACT",
+    "STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL",
+    "STAGE_EDIT_LEARNED_ONLY_CANDIDATE_POOL",
     "STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT",
     "STAGE_EDIT_VISUAL_CANDIDATE_COUNT",
     "StageEditMaterializedVisualCandidate",
@@ -554,6 +1211,7 @@ __all__ = [
     "StageEditVisualCandidateError",
     "StageEditVisualCandidateRecord",
     "apply_stage_edit_dynamic_crop_to_render_plan",
+    "dynamic_crop_v3_deterministic_geometry_override_indices",
     "materialize_stage_edit_visual_candidate",
     "materialize_stage_edit_visual_candidates",
 ]

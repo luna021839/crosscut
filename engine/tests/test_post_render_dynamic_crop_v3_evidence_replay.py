@@ -77,6 +77,7 @@ class PostRenderDynamicCropV3EvidenceReplayTests(unittest.TestCase):
         root: Path,
         *,
         dynamic_segment_index: int = 0,
+        deterministic_geometry_override_index: int | None = None,
     ) -> dict[str, object]:
         freeze_path = (root / "neutral-release-freeze.json").resolve()
         freeze_path.write_text("{}", encoding="utf-8")
@@ -110,6 +111,21 @@ class PostRenderDynamicCropV3EvidenceReplayTests(unittest.TestCase):
         segments: list[RenderSegment] = []
         for index in range(10):
             track = self._track(dynamic=index == dynamic_segment_index)
+            rendered_track = (
+                EditorialTransformTrack(
+                    (
+                        EditorialTransformKeyframe(
+                            0.0, 1.08, 0.49, 0.5, 0.0
+                        ),
+                        EditorialTransformKeyframe(
+                            0.8, 1.00, 0.5, 0.5, 0.0
+                        ),
+                    ),
+                    reason="boundary_local_exact_subject_alignment_b0",
+                )
+                if index == deterministic_geometry_override_index
+                else self._overlaid(track)
+            )
             decodes.append(
                 DynamicCropTrackDecodeV3(
                     source_id="neutral-source",
@@ -152,7 +168,7 @@ class PostRenderDynamicCropV3EvidenceReplayTests(unittest.TestCase):
                         if index == 1
                         else None
                     ),
-                    editorial_transform=self._overlaid(track),
+                    editorial_transform=rendered_track,
                     look_adjustment=(
                         SourceLookAdjustment(brightness=0.01)
                         if index == 2
@@ -183,11 +199,21 @@ class PostRenderDynamicCropV3EvidenceReplayTests(unittest.TestCase):
             render_plan=overlaid_plan,
             decodes=tuple(decodes),
             authority=authority,
+            deterministic_geometry_override_segment_indices=(
+                (deterministic_geometry_override_index,)
+                if deterministic_geometry_override_index is not None
+                else ()
+            ),
         )
         evidence = corroborate_dynamic_crop_motion_timeline_v3(
             render_plan=final_plan,
             decodes=tuple(decodes),
             authority=authority,
+            deterministic_geometry_override_segment_indices=(
+                (deterministic_geometry_override_index,)
+                if deterministic_geometry_override_index is not None
+                else ()
+            ),
         )
         return {
             "freeze_path": freeze_path,
@@ -241,6 +267,29 @@ class PostRenderDynamicCropV3EvidenceReplayTests(unittest.TestCase):
         )
         self.assertEqual(1, reconstructed.motion_event_applied_count)
         self.assertTrue(reconstructed.motion_budget_within_range)
+
+    def test_independent_replay_preserves_deterministic_geometry_override(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self._fixture(
+                Path(temporary),
+                dynamic_segment_index=1,
+                deterministic_geometry_override_index=0,
+            )
+            with patch(
+                "crosscut.stage_edit_dynamic_crop_v3_final_release_launcher."
+                "load_dynamic_crop_v3_release_freeze",
+                return_value=fixture["freeze_payload"],
+            ):
+                reconstructed = self._replay(fixture)
+
+        self.assertEqual(
+            reconstructed.segment_evidence[0].overlay_disposition,
+            "deterministic_geometry_override_suppressed_model_track",
+        )
+        self.assertEqual(1, reconstructed.motion_event_applied_count)
+        self.assertEqual(fixture["evidence"], reconstructed)
 
     def test_missing_or_malformed_decode_and_registry_mismatch_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

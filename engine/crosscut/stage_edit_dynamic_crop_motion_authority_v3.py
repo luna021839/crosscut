@@ -7,7 +7,8 @@ applied; it is not evidence that an editorial motion event was rendered.
 This module keeps those meanings separate.  A motion event is counted only
 when all three independent facts agree:
 
-* the exact v3 framing track reached the renderer;
+* the exact v3 framing track reached the renderer, unless independently
+  verified source geometry retained explicit precedence;
 * the model motion logit passes a leakage-safe, release-freeze-bound threshold;
 * samples at the renderer's actual output-frame timestamps cross one of the
   physical motion-label thresholds used by reference supervision.
@@ -54,16 +55,19 @@ DYNAMIC_CROP_MOTION_RENDERER_SAMPLING_CONTRACT = (
     "exact_render_plan_segment_frame_count_local_frame_timestamps_v1"
 )
 DYNAMIC_CROP_MOTION_OVERLAY_BINDING_CONTRACT = (
-    "exact_decode_track_to_final_stage_edit_overlay_or_face_dissolve_suppression_v1"
+    "exact_decode_overlay_or_verified_geometry_or_face_dissolve_precedence_v2"
 )
 DYNAMIC_CROP_RENDERER_FIRST_MOTION_CLOCK_CONTRACT = (
     "first_10_decimal_renderer_expression_state_change_per_corroborated_component_v1"
 )
 DYNAMIC_CROP_MOTION_SEGMENT_EVIDENCE_CONTRACT = (
-    "framing_track_and_loso_logit_and_renderer_physical_range_v1"
+    "hybrid_geometry_precedence_and_loso_renderer_motion_intersection_v2"
 )
 DYNAMIC_CROP_MOTION_TIMELINE_EVIDENCE_CONTRACT = (
-    "static_and_cut_time_reframe_excluded_from_motion_budget_v1"
+    "model_motion_budget_excludes_verified_geometry_and_cut_reframes_v2"
+)
+DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION = (
+    "deterministic_geometry_override_suppressed_model_track"
 )
 
 # The binary head is trained with BCE logits and evaluated at zero.  This
@@ -133,6 +137,28 @@ def _nonnegative_integer(value: object, label: str) -> int:
             f"{label} must be a non-negative integer"
         )
     return value
+
+
+def _deterministic_geometry_override_indices(
+    values: Sequence[int],
+    *,
+    segment_count: int,
+) -> tuple[int, ...]:
+    selected = tuple(values)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value < segment_count
+        for value in selected
+    ):
+        raise DynamicCropMotionAuthorityV3Error(
+            "deterministic geometry override index is invalid"
+        )
+    if tuple(sorted(set(selected))) != selected:
+        raise DynamicCropMotionAuthorityV3Error(
+            "deterministic geometry override indices must be unique and ordered"
+        )
+    return selected
 
 
 def _exact_keys(payload: Mapping[str, Any], expected: set[str], label: str) -> None:
@@ -656,6 +682,7 @@ def _resolve_overlay_binding(
     segment_index: int,
     plan: RenderPlan,
     decode: DynamicCropTrackDecodeV3,
+    deterministic_geometry_override: bool = False,
 ) -> _ResolvedOverlayBindingV3:
     segment = plan.segments[segment_index]
     selected_sha = _canonical_sha256(_decode_payload(decode))
@@ -696,6 +723,35 @@ def _resolve_overlay_binding(
     if decode.track is None or decode.shot_duration_seconds is None:
         raise DynamicCropMotionAuthorityV3Error(
             "eligible v3 decode lacks track/duration overlay provenance"
+        )
+    if deterministic_geometry_override:
+        if adjacent_face_dissolve:
+            raise DynamicCropMotionAuthorityV3Error(
+                "deterministic geometry override cannot alias face-dissolve suppression"
+            )
+        rendered = segment.editorial_transform
+        non_model_transform = bool(
+            rendered is not None
+            and not rendered.reason.startswith("stage_edit_dynamic_crop_head_v3")
+        )
+        if not (
+            segment.crop is not None
+            or segment.pan_crop is not None
+            or non_model_transform
+        ):
+            raise DynamicCropMotionAuthorityV3Error(
+                "deterministic geometry override lacks verified non-model geometry"
+            )
+        return _ResolvedOverlayBindingV3(
+            disposition=DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION,
+            framing_track_applied=False,
+            face_dissolve_suppressed=False,
+            motion_suppressed_to_static_framing=False,
+            time_reparameterization_scale=None,
+            selected_decode_content_sha256=selected_sha,
+            original_decode_track_sha256=original_sha,
+            provisional_overlay_track_sha256=None,
+            rendered_track_sha256=None,
         )
     if segment.editorial_transform is None:
         if not adjacent_face_dissolve:
@@ -1126,6 +1182,7 @@ class DynamicCropMotionSegmentEvidenceV3:
             "targeted_repair_duration_reparameterized",
             "verified_face_dissolve_suppressed",
             "loso_or_physical_motion_suppressed_to_static_framing",
+            DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION,
         }
         if self.overlay_disposition not in overlay_dispositions:
             raise DynamicCropMotionAuthorityV3Error(
@@ -1633,6 +1690,7 @@ def apply_dynamic_crop_motion_authority_to_render_plan_v3(
     render_plan: RenderPlan,
     decodes: Sequence[DynamicCropTrackDecodeV3],
     authority: DynamicCropMotionAuthorityV3,
+    deterministic_geometry_override_segment_indices: Sequence[int] = (),
 ) -> RenderPlan:
     """Collapse every unqualified provisional motion to exact static framing.
 
@@ -1653,6 +1711,12 @@ def apply_dynamic_crop_motion_authority_to_render_plan_v3(
         raise DynamicCropMotionAuthorityV3Error(
             "one typed Dynamic Crop v3 decode is required per render segment"
         )
+    deterministic_geometry_overrides = set(
+        _deterministic_geometry_override_indices(
+            deterministic_geometry_override_segment_indices,
+            segment_count=len(render_plan.segments),
+        )
+    )
     frame_counts = segment_frame_counts(render_plan)
     updated = []
     thresholds = authority.physical_thresholds
@@ -1671,6 +1735,9 @@ def apply_dynamic_crop_motion_authority_to_render_plan_v3(
             segment_index=index,
             plan=render_plan,
             decode=decode,
+            deterministic_geometry_override=(
+                index in deterministic_geometry_overrides
+            ),
         )
         if not overlay.framing_track_applied:
             updated.append(segment)
@@ -1764,6 +1831,7 @@ def _segment_evidence(
     plan: RenderPlan,
     decode: DynamicCropTrackDecodeV3,
     authority: DynamicCropMotionAuthorityV3,
+    deterministic_geometry_override: bool = False,
 ) -> DynamicCropMotionSegmentEvidenceV3:
     segment = plan.segments[segment_index]
     if decode.source_index != segment.source_index:
@@ -1782,6 +1850,7 @@ def _segment_evidence(
         segment_index=segment_index,
         plan=plan,
         decode=decode,
+        deterministic_geometry_override=deterministic_geometry_override,
     )
 
     sample_times = tuple(index / plan.fps for index in range(frame_count))
@@ -1810,7 +1879,13 @@ def _segment_evidence(
             [list(item) for item in provisional_states]
         )
     states: tuple[tuple[float, float, float, float], ...]
-    rendered_track = segment.editorial_transform
+    # A deterministic face/pan/boundary curve is part of the final RenderPlan
+    # but is deliberately outside the learned Dynamic Crop motion budget.  Its
+    # exact pixels are governed by the upstream geometry validator and the
+    # full-plan content hash, not falsely attributed to the model logit here.
+    rendered_track = (
+        segment.editorial_transform if overlay.framing_track_applied else None
+    )
     if rendered_track is None:
         states = ()
         zoom_range = 0.0
@@ -1876,6 +1951,8 @@ def _segment_evidence(
     reasons: list[str] = []
     if not framing:
         reasons.append("no_framing_track")
+    if overlay.disposition == DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION:
+        reasons.append(DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION)
     if not logit_passed:
         reasons.append("motion_logit_below_loso_frozen_threshold")
     if not physical:
@@ -2225,6 +2302,7 @@ def corroborate_dynamic_crop_motion_timeline_v3(
     render_plan: RenderPlan,
     decodes: Sequence[DynamicCropTrackDecodeV3],
     authority: DynamicCropMotionAuthorityV3,
+    deterministic_geometry_override_segment_indices: Sequence[int] = (),
     minimum_motion_applied_fraction: float = (
         DEFAULT_MINIMUM_MOTION_APPLIED_FRACTION
     ),
@@ -2245,6 +2323,12 @@ def corroborate_dynamic_crop_motion_timeline_v3(
         raise DynamicCropMotionAuthorityV3Error(
             "one typed Dynamic Crop v3 decode is required per render segment"
         )
+    deterministic_geometry_overrides = set(
+        _deterministic_geometry_override_indices(
+            deterministic_geometry_override_segment_indices,
+            segment_count=len(render_plan.segments),
+        )
+    )
     minimum = _finite(
         minimum_motion_applied_fraction, "minimum motion applied fraction"
     )
@@ -2263,6 +2347,9 @@ def corroborate_dynamic_crop_motion_timeline_v3(
             plan=render_plan,
             decode=decode,
             authority=authority,
+            deterministic_geometry_override=(
+                index in deterministic_geometry_overrides
+            ),
         )
         for index, (frame_count, decode) in enumerate(
             zip(frame_counts, selected, strict=True)
@@ -2312,6 +2399,7 @@ __all__ = [
     "DEFAULT_MAXIMUM_MOTION_APPLIED_FRACTION",
     "DEFAULT_MINIMUM_MOTION_APPLIED_FRACTION",
     "DEFAULT_MOTION_LOGIT_THRESHOLD",
+    "DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION",
     "DYNAMIC_CROP_MOTION_AUTHORITY_CONTRACT",
     "DYNAMIC_CROP_MOTION_AUTHORITY_SCHEMA_VERSION",
     "DYNAMIC_CROP_MOTION_PHYSICAL_THRESHOLD_CONTRACT",

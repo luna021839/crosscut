@@ -62,6 +62,7 @@ from .render import (
     SourceLookAdjustment,
 )
 from .stage_edit_dynamic_crop_motion_authority_v3 import (
+    DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION,
     DynamicCropMotionAuthorityV3Error,
     DynamicCropMotionTimelineEvidenceV3,
     apply_dynamic_crop_motion_authority_to_render_plan_v3,
@@ -1402,12 +1403,21 @@ def replay_dynamic_crop_v3_post_render_evidence(
         raise DynamicCropV3PostRenderEvidenceReplayError(
             "persisted motion evidence authority differs from the live registry"
         )
+    deterministic_geometry_override_indices = tuple(
+        item.segment_index
+        for item in persisted.segment_evidence
+        if item.overlay_disposition
+        == DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION
+    )
 
     try:
         sanitized = apply_dynamic_crop_motion_authority_to_render_plan_v3(
             render_plan=plan,
             decodes=decodes,
             authority=authority,
+            deterministic_geometry_override_segment_indices=(
+                deterministic_geometry_override_indices
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise DynamicCropV3PostRenderEvidenceReplayError(
@@ -1424,6 +1434,9 @@ def replay_dynamic_crop_v3_post_render_evidence(
             render_plan=sanitized,
             decodes=decodes,
             authority=authority,
+            deterministic_geometry_override_segment_indices=(
+                deterministic_geometry_override_indices
+            ),
         )
     except (DynamicCropMotionAuthorityV3Error, TypeError, ValueError) as exc:
         raise DynamicCropV3PostRenderEvidenceReplayError(

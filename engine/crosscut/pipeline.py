@@ -209,6 +209,7 @@ from .stage_edit_candidate_rerank import (
 )
 from .stage_edit import StageEdit
 from .stage_edit_dynamic_crop_motion_authority_v3 import (
+    DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION,
     DynamicCropMotionAuthorityV3,
     DynamicCropMotionTimelineEvidenceV3,
     apply_dynamic_crop_motion_authority_to_render_plan_v3,
@@ -259,11 +260,13 @@ from .stage_edit_production_registry import (
     discover_registered_stage_edit_production_bundle,
 )
 from .stage_edit_visual_candidate_adapter import (
+    STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL,
     STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
     StageEditMaterializedVisualCandidate,
     StageEditVisualCandidateBatch,
     StageEditVisualCandidateError,
     apply_stage_edit_dynamic_crop_to_render_plan,
+    dynamic_crop_v3_deterministic_geometry_override_indices,
     materialize_stage_edit_visual_candidate,
     materialize_stage_edit_visual_candidates,
 )
@@ -16282,6 +16285,13 @@ def _apply_stage_edit_candidate_render_contract(
     """Preserve the learned camera track after ordinary visual derivation."""
 
     dynamic_crop_version = materialized.dynamic_crop_version
+    deterministic_geometry_override_indices = (
+        dynamic_crop_v3_deterministic_geometry_override_indices(
+            bundle.render_plan
+        )
+        if dynamic_crop_version == 3
+        else ()
+    )
     plan = apply_stage_edit_dynamic_crop_to_render_plan(
         materialized,
         bundle.render_plan,
@@ -16313,11 +16323,17 @@ def _apply_stage_edit_candidate_render_contract(
                 render_plan=plan,
                 decodes=dynamic_crop_v3_decodes,
                 authority=motion_authority_v3,
+                deterministic_geometry_override_segment_indices=(
+                    deterministic_geometry_override_indices
+                ),
             )
             motion_timeline_v3 = corroborate_dynamic_crop_motion_timeline_v3(
                 render_plan=plan,
                 decodes=dynamic_crop_v3_decodes,
                 authority=motion_authority_v3,
+                deterministic_geometry_override_segment_indices=(
+                    deterministic_geometry_override_indices
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise StageEditVisualCandidateError(
@@ -16365,7 +16381,12 @@ def _apply_stage_edit_candidate_render_contract(
         "dynamic_crop_render_contract": (
             f"stage_edit_dynamic_crop_render_plan_overlay_v{dynamic_crop_version}"
         ),
-        "ordinary_editorial_motion_discarded": True,
+        "ordinary_editorial_motion_discarded": (
+            dynamic_crop_version == 2
+        ),
+        "deterministic_geometry_precedence_segment_indices": list(
+            deterministic_geometry_override_indices
+        ),
         "source_path_preserved": True,
         "timing_reparameterized_segment_indices": list(reparameterized),
         "verified_face_dissolve_alignment_preserved": True,
@@ -16411,7 +16432,11 @@ def _apply_stage_edit_candidate_render_contract(
     lineage = stripped_materialized_lineage + (overlay_event,)
     return replace(
         bundle,
-        editorial_motion_plan=None,
+        editorial_motion_plan=(
+            bundle.editorial_motion_plan
+            if dynamic_crop_version == 3
+            else None
+        ),
         render_plan=plan,
         diagnostics=bundle.diagnostics
         + (
@@ -16452,15 +16477,27 @@ def _refresh_stage_edit_dynamic_crop_motion_evidence_v3(
             "Dynamic Crop v3 final plan lost its typed replay evidence"
         )
     try:
+        deterministic_geometry_override_indices = tuple(
+            item.segment_index
+            for item in previous.segment_evidence
+            if item.overlay_disposition
+            == DETERMINISTIC_GEOMETRY_OVERRIDE_DISPOSITION
+        )
         plan = apply_dynamic_crop_motion_authority_to_render_plan_v3(
             render_plan=bundle.render_plan,
             decodes=decodes,
             authority=previous.authority,
+            deterministic_geometry_override_segment_indices=(
+                deterministic_geometry_override_indices
+            ),
         )
         refreshed = corroborate_dynamic_crop_motion_timeline_v3(
             render_plan=plan,
             decodes=decodes,
             authority=previous.authority,
+            deterministic_geometry_override_segment_indices=(
+                deterministic_geometry_override_indices
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise StageEditVisualCandidateError(
@@ -16848,8 +16885,9 @@ def _stage_edit_montage_analysis_payload(
             if bundle.editorial_motion_plan is not None
             else None
         ),
-        # Dynamic Crop v2/v3 is attached directly to RenderSegment after the
-        # ordinary editorial-motion plan is intentionally discarded.
+        # Dynamic Crop v2 is attached after discarding ordinary motion. V3
+        # instead preserves verified face/silhouette geometry and supplies a
+        # model track only where that stronger source-local geometry is absent.
         "render": {
             "segments": deepcopy(plan_payload["segments"]),
             "transitions": deepcopy(plan_payload["transitions"]),
@@ -19033,6 +19071,7 @@ def _attempt_stage_edit_windowed_beam_reedit(
                 value is not None and not value.scalar_fallback
                 for value in source_timewarps
             ),
+            candidate_origin=base_retained.candidate_origin,
         )
         try:
             materialized = materialize_stage_edit_visual_candidate(
@@ -21687,10 +21726,28 @@ def analyze(
             ):
                 if stage_edit_generation_result is not None:
                     reporter.status(
-                        "StageEdit 후보 8개의 실제 프레임·경계 안전성을 "
-                        "전수 검증하는 중…"
+                        "일반 시각 품질 하한선 1개와 StageEdit 학습 후보를 "
+                        "같은 실제 프레임 게이트로 검증하는 중…"
                     )
                     try:
+                        visual_candidate_set = (
+                            build_visual_timeline_candidate_set(
+                                **visual_builder_arguments,
+                                maximum_results=8,
+                            )
+                        )
+                        hybrid_floor_values = (
+                            materialize_visual_timeline_candidates(
+                                visual_candidate_set,
+                                maximum_candidates=1,
+                                passed_only=True,
+                            )
+                        )
+                        if len(hybrid_floor_values) != 1:
+                            raise StageEditVisualCandidateError(
+                                "reviewed hybrid visual quality floor did not "
+                                "materialize exactly once"
+                            )
                         stage_edit_visual_candidate_batch = (
                             materialize_stage_edit_visual_candidates(
                                 stage_edit_generation_result,
@@ -21702,6 +21759,9 @@ def analyze(
                                 sync_scores=sync_scores,
                                 scene_cut_times=scene_cut_times,
                                 source_timewarps=eligible_timewarps,
+                                hybrid_visual_floor_candidate=(
+                                    hybrid_floor_values[0]
+                                ),
                                 feature_cache_directory=(
                                     request.source_cache_directory
                                 ),
@@ -21724,14 +21784,23 @@ def analyze(
                                 ),
                             )
                         )
-                    except StageEditVisualCandidateError as exc:
+                    except (
+                        StageEditVisualCandidateError,
+                        TypeError,
+                        ValueError,
+                        cv2.error,
+                    ) as exc:
                         rendered_candidate_selection_payload = {
                             "analysis_basis": (
-                                "explicit_stage_edit_visual_hard_gate_failure_v1"
+                                "explicit_stage_edit_hybrid_visual_hard_gate_failure_v1"
                             ),
-                            "candidate_pool": "stage_edit_generation_only",
+                            "candidate_pool": (
+                                STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL
+                            ),
                             "ordinary_visual_baseline_candidate_pool_eligible": False,
                             "silent_baseline_fallback_allowed": False,
+                            "raw_baseline_candidate_direct_selection_allowed": False,
+                            "hybrid_visual_floor_predeclared": True,
                             "requested_review_count": 8,
                             "reviewed_candidate_count": 0,
                             "passed": False,
@@ -21767,9 +21836,9 @@ def analyze(
                         stage_edit_visual_candidate_batch.candidates
                     )
                     reporter.log(
-                        "StageEdit 후보 8개가 각자 제안한 소스·컷 경로 "
-                        "그대로 기존 시각 하드 게이트 통과 · "
-                        "실패 시 일반 시각 베이스라인 후보 보충 없음"
+                        "StageEdit 학습 후보 7개 + Dynamic Crop v3를 결합한 "
+                        "일반 시각 품질 하한선 1개가 동일 하드 게이트 통과 · "
+                        "실패 뒤 원시 베이스라인으로 교체하지 않음"
                     )
                 else:
                     visual_candidate_set = build_visual_timeline_candidate_set(
@@ -22036,7 +22105,7 @@ def analyze(
                             _rendered_candidate_selection_index_domains()
                         ),
                         "candidate_pool": (
-                            "stage_edit_generation_only"
+                            stage_edit_visual_candidate_batch.candidate_pool
                             if stage_edit_visual_candidate_batch is not None
                             else "ordinary_visual_baseline"
                         ),
@@ -22384,7 +22453,7 @@ def analyze(
             rendered_candidate_selection_payload.update(
                 {
                     "candidate_pool": (
-                        "stage_edit_generation_only"
+                        stage_edit_visual_candidate_batch.candidate_pool
                         if stage_edit_visual_candidate_batch is not None
                         else "ordinary_visual_baseline"
                     ),
@@ -22826,9 +22895,15 @@ def analyze(
                         if registered_stage_edit_bundle is not None
                         else "explicit_stage_edit_generation_request_only"
                     ),
-                    "candidate_pool": "stage_edit_generation_only",
+                    "candidate_pool": (
+                        stage_edit_visual_candidate_batch.candidate_pool
+                    ),
                     "ordinary_visual_baseline_candidate_pool_eligible": False,
                     "silent_baseline_fallback_allowed": False,
+                    "raw_baseline_candidate_direct_selection_allowed": False,
+                    "hybrid_visual_floor_candidate_count": (
+                        stage_edit_visual_candidate_batch.hybrid_visual_floor_candidate_count
+                    ),
                     "exact_eight_complete_candidates_required": True,
                     "exact_eight_decoded_proxy_reviews_required": True,
                     "deterministic_hard_gates_remain_authority": True,

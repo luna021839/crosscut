@@ -1599,7 +1599,10 @@ def resolve_cut_local_sync_activation(
     if required and explicit_seen or not required and registered_seen:
         errors.append("stage_edit_activation_markers_disagree")
     if stage_edit_present:
-        if candidate_pool != "stage_edit_generation_only":
+        if candidate_pool not in {
+            "stage_edit_generation_only",
+            "stage_edit_generation_plus_typed_visual_floor_v1",
+        }:
             errors.append("stage_edit_candidate_pool_missing_or_invalid")
         if candidate_origin != "explicit_stage_edit_generation":
             errors.append("stage_edit_candidate_origin_missing_or_invalid")

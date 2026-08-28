@@ -305,6 +305,84 @@ class DynamicCropMotionAuthorityV3Tests(unittest.TestCase):
         self.assertEqual(evidence.framing_track_applied_count, 0)
         self.assertEqual(evidence.motion_event_applied_count, 0)
 
+    def test_verified_geometry_override_preserves_tracking_without_model_attribution(
+        self,
+    ) -> None:
+        model_track = self._track(
+            (0.0, 1.02, 0.5, 0.5, 0.0),
+            (0.8, 1.06, 0.5, 0.5, 0.0),
+        )
+        tracking_track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.08, 0.49, 0.5, 0.0),
+                EditorialTransformKeyframe(0.8, 1.00, 0.5, 0.5, 0.0),
+            ),
+            reason="boundary_local_exact_subject_alignment_b0",
+        )
+        plan = RenderPlan(
+            sources=(Path("source-0.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    editorial_transform=tracking_track,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+        )
+        decode = self._decode(model_track)
+        authority = self._authority()
+
+        final = apply_dynamic_crop_motion_authority_to_render_plan_v3(
+            render_plan=plan,
+            decodes=(decode,),
+            authority=authority,
+            deterministic_geometry_override_segment_indices=(0,),
+        )
+        self.assertIs(final.segments[0].editorial_transform, tracking_track)
+        evidence = corroborate_dynamic_crop_motion_timeline_v3(
+            render_plan=final,
+            decodes=(decode,),
+            authority=authority,
+            deterministic_geometry_override_segment_indices=(0,),
+            minimum_motion_applied_fraction=0.0,
+            maximum_motion_applied_fraction=1.0,
+        )
+
+        segment = evidence.segment_evidence[0]
+        self.assertEqual(
+            segment.overlay_disposition,
+            "deterministic_geometry_override_suppressed_model_track",
+        )
+        self.assertFalse(segment.framing_track_applied)
+        self.assertFalse(segment.motion_event_applied)
+        self.assertIn(
+            "deterministic_geometry_override_suppressed_model_track",
+            segment.failure_reasons,
+        )
+        self.assertEqual(evidence.motion_event_applied_count, 0)
+
+    def test_geometry_override_cannot_relabel_a_model_overlay(self) -> None:
+        track = self._track(
+            (0.0, 1.02, 0.5, 0.5, 0.0),
+            (0.8, 1.05, 0.5, 0.5, 0.0),
+        )
+        with self.assertRaisesRegex(
+            DynamicCropMotionAuthorityV3Error,
+            "lacks verified non-model geometry",
+        ):
+            apply_dynamic_crop_motion_authority_to_render_plan_v3(
+                render_plan=self._plan((track,)),
+                decodes=(self._decode(track),),
+                authority=self._authority(),
+                deterministic_geometry_override_segment_indices=(0,),
+            )
+
     def test_physical_motion_below_frozen_logit_threshold_is_not_applied(self) -> None:
         track = self._track(
             (0.0, 1.02, 0.5, 0.5, 0.0),

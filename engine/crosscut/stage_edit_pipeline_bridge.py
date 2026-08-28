@@ -983,6 +983,16 @@ class RetainedStageEditCandidate:
     edit: StageEdit
     exact_clock_reprojected: bool
     timewarped_segment_count: int
+    candidate_origin: str = "stage_edit_semimarkov"
+
+    def __post_init__(self) -> None:
+        origin = str(self.candidate_origin).strip()
+        if origin not in {
+            "stage_edit_semimarkov",
+            "hybrid_visual_floor_dynamic_crop_v3",
+        }:
+            raise ValueError("retained StageEdit candidate origin is unsupported")
+        object.__setattr__(self, "candidate_origin", origin)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -993,6 +1003,8 @@ class RetainedStageEditCandidate:
             "selected_for_render": False,
             "stage_edit": self.edit.to_dict(),
         }
+        if self.candidate_origin != "stage_edit_semimarkov":
+            payload["candidate_origin"] = self.candidate_origin
         require_scalar_stage_edit_pose_payload(
             payload,
             context="retained StageEdit candidate",
