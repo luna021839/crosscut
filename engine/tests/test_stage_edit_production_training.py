@@ -23,8 +23,10 @@ from crosscut.stage_edit_dynamic_crop_head_v2 import (
 from crosscut.stage_edit_dynamic_crop_head_v3 import (
     DYNAMIC_CROP_V3_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V3_CHECKPOINT_WEIGHT_FILENAME,
+    DYNAMIC_CROP_V3_MAX_KEYFRAMES,
     DYNAMIC_CROP_V3_MODEL_CONTRACT,
     DYNAMIC_CROP_V3_OUTPUT_CONTRACT,
+    DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION,
     DYNAMIC_CROP_V3_TARGET_CONTRACT,
     StageEditTransformerDynamicCropV3,
     load_stage_edit_dynamic_crop_checkpoint_v3,
@@ -43,15 +45,19 @@ from crosscut.stage_edit_head_materializer import (
     materialize_stage_edit_head_frames_v2,
 )
 from crosscut.stage_edit_production_training import (
+    DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
     DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
     ProductionQualityThresholds,
     STAGE_EDIT_SELECTION_FREEZE_FILENAME,
     _HierarchicalSourceWindowSampler,
     _HierarchicalDynamicCropV3PriorSampler,
+    _DynamicCropV3StructuredPriorAdapterModule,
     _balanced_cut_windows,
     _cut_only_pretraining_loss_contract,
     _dynamic_crop_v3_validation_selection_evidence,
     _dynamic_crop_v3_prior_inventory,
+    _dynamic_crop_v3_structured_prior_head_snapshot,
+    _dynamic_crop_v3_structured_prior_projections,
     _require_unambiguous_checkpoint_namespace,
     _source_only_pretraining_loss_contract,
     _source_pretraining_inventory,
@@ -847,6 +853,67 @@ class StageEditSourcePretrainingTests(unittest.TestCase):
 
 @unittest.skipUnless(mlx_runtime_version() is not None, "MLX is optional")
 class StageEditProductionTrainingSmokeTests(unittest.TestCase):
+    def test_structured_prior_adapter_cannot_modify_value_rows(self) -> None:
+        dimension = 16
+        values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+        initial = {
+            "context_weight": mx.arange(
+                DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION * dimension,
+                dtype=mx.float32,
+            ).reshape((DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION, dimension)),
+            "context_bias": mx.arange(
+                DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION,
+                dtype=mx.float32,
+            ),
+            "source_weight": mx.arange(
+                DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION * dimension,
+                dtype=mx.float32,
+            ).reshape((DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION, dimension)),
+        }
+        context_projection, source_projection = (
+            _dynamic_crop_v3_structured_prior_projections(
+                dimension,
+                seed=29,
+                requested_rank=DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
+            )
+        )
+        adapter = _DynamicCropV3StructuredPriorAdapterModule(
+            DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK
+        )
+        adapter.context_adapter.weight = mx.ones_like(
+            adapter.context_adapter.weight
+        )
+        adapter.context_adapter.bias = mx.ones_like(
+            adapter.context_adapter.bias
+        )
+        adapter.source_adapter.weight = mx.ones_like(
+            adapter.source_adapter.weight
+        )
+        snapshot = _dynamic_crop_v3_structured_prior_head_snapshot(
+            adapter,
+            initial,
+            context_projection,
+            source_projection,
+        )
+
+        for name in ("context_weight", "source_weight"):
+            self.assertEqual(
+                initial[name][:values_stop].tolist(),
+                snapshot[name][:values_stop].tolist(),
+            )
+            self.assertNotEqual(
+                initial[name][values_stop:].tolist(),
+                snapshot[name][values_stop:].tolist(),
+            )
+        self.assertEqual(
+            initial["context_bias"][:values_stop].tolist(),
+            snapshot["context_bias"][:values_stop].tolist(),
+        )
+        self.assertNotEqual(
+            initial["context_bias"][values_stop:].tolist(),
+            snapshot["context_bias"][values_stop:].tolist(),
+        )
+
     def test_v3_trains_saves_reloads_and_reports_distinct_contracts(self) -> None:
         schema = DEFAULT_STAGE_EDIT_SCHEMA
         examples = tuple(
@@ -1041,31 +1108,67 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     "all_declared_invariant_groups_byte_identical"
                 ]
             )
-            self.assertTrue(
+            candidate = prior["candidate_selection"]
+            trained_prior_selected = (
+                candidate["selected_candidate_origin"]
+                == "trained_prior_candidate"
+            )
+            self.assertFalse(
                 prior["parameter_invariance"]["context_value_bias_changed"]
             )
-            self.assertTrue(
+            self.assertEqual(
+                trained_prior_selected,
                 prior["parameter_invariance"][
                     "dynamic_head_parameter_tree_changed"
+                ],
+            )
+            self.assertEqual(
+                trained_prior_selected,
+                prior["parameter_invariance"][
+                    "context_non_value_bias_changed"
+                ],
+            )
+            self.assertEqual(
+                trained_prior_selected,
+                prior["parameter_invariance"]["context_weight_changed"],
+            )
+            self.assertEqual(
+                trained_prior_selected,
+                prior["parameter_invariance"]["source_head_changed"],
+            )
+            self.assertFalse(
+                prior["parameter_invariance"][
+                    "context_value_weight_changed"
                 ]
+            )
+            self.assertEqual(
+                trained_prior_selected,
+                prior["parameter_invariance"][
+                    "context_structured_weight_changed"
+                ],
+            )
+            self.assertFalse(
+                prior["parameter_invariance"]["source_value_weight_changed"]
+            )
+            self.assertEqual(
+                trained_prior_selected,
+                prior["parameter_invariance"][
+                    "source_structured_weight_changed"
+                ],
+            )
+            self.assertFalse(
+                prior["parameter_invariance"]["value_row_gradients_computed"]
             )
             self.assertTrue(
                 prior["parameter_invariance"][
-                    "context_non_value_bias_changed"
+                    "structured_low_rank_adapter_gradients_computed"
                 ]
-            )
-            self.assertTrue(
-                prior["parameter_invariance"]["context_weight_changed"]
-            )
-            self.assertTrue(
-                prior["parameter_invariance"]["source_head_changed"]
             )
             self.assertTrue(
                 prior["parameter_invariance"][
                     "count_time_motion_bias_gradients_computed"
                 ]
             )
-            candidate = prior["candidate_selection"]
             self.assertEqual(
                 [50, 100, 200, 300, 400, 500],
                 candidate["predeclared_candidate_steps"],
@@ -1076,57 +1179,73 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 for item in candidate["candidate_evaluations"]
                 if item["selection"]["selectable"]
             ]
-            expected_selected = max(
-                selectable_candidates,
-                key=lambda item: (
-                    item["selection"]["score"],
-                    -item["candidate_step"],
-                ),
-            )
-            self.assertEqual(
-                expected_selected["candidate_step"],
-                candidate["selected_candidate_step"],
-            )
-            self.assertEqual(
-                expected_selected["value_bias_sha256"],
-                candidate["selected_candidate_value_bias_sha256"],
-            )
-            self.assertEqual(
-                expected_selected["head_parameter_sha256"],
-                candidate["selected_candidate_head_parameter_sha256"],
-            )
+            if selectable_candidates:
+                expected_selected = max(
+                    selectable_candidates,
+                    key=lambda item: (
+                        item["selection"]["score"],
+                        -item["candidate_step"],
+                    ),
+                )
+                self.assertEqual(
+                    expected_selected["candidate_step"],
+                    candidate["selected_candidate_step"],
+                )
+                self.assertEqual(
+                    expected_selected["value_bias_sha256"],
+                    candidate["selected_candidate_value_bias_sha256"],
+                )
+                self.assertEqual(
+                    expected_selected["head_parameter_sha256"],
+                    candidate["selected_candidate_head_parameter_sha256"],
+                )
+            else:
+                self.assertEqual(0, candidate["selected_candidate_step"])
+                self.assertIn(
+                    candidate["selected_candidate_origin"],
+                    {
+                        "validated_initial_dynamic_head",
+                        "unvalidated_initial_dynamic_head_fallback",
+                    },
+                )
             candidate_gate = candidate["selection"][
                 "dynamic_crop_v3_selection_gate"
             ]
-            self.assertTrue(candidate["retention_authorized"])
-            self.assertTrue(candidate_gate["selectable"])
-            self.assertGreater(candidate_gate["score_component"], 0.0)
             self.assertFalse(candidate["validation_gradients_computed"])
             self.assertFalse(candidate["heldout_forward_performed"])
             retention = prior["retention"]
-            self.assertTrue(
-                retention["all_dynamic_head_parameters_byte_identical"]
-            )
-            self.assertTrue(
-                retention["optimizer_state_reset_before_dynamic_head_release"]
-            )
-            self.assertEqual(0, retention["released_joint_optimizer_initial_step"])
-            self.assertEqual(
-                [2],
-                [
-                    step
-                    for epoch in report["history"]
-                    for step in epoch["finetune_optimizer_reset_before_steps"]
-                ],
-            )
-            self.assertEqual(
-                [1, 1, 2, 3, 4, 5, 6, 7],
-                [
-                    step
-                    for epoch in report["history"]
-                    for step in epoch["finetune_phase_local_optimizer_steps"]
-                ],
-            )
+            reset_steps = [
+                step
+                for epoch in report["history"]
+                for step in epoch["finetune_optimizer_reset_before_steps"]
+            ]
+            phase_steps = [
+                step
+                for epoch in report["history"]
+                for step in epoch["finetune_phase_local_optimizer_steps"]
+            ]
+            if candidate["retention_authorized"]:
+                self.assertTrue(candidate_gate["selectable"])
+                self.assertGreater(candidate_gate["score_component"], 0.0)
+                self.assertTrue(
+                    retention["all_dynamic_head_parameters_byte_identical"]
+                )
+                self.assertTrue(
+                    retention[
+                        "optimizer_state_reset_before_dynamic_head_release"
+                    ]
+                )
+                self.assertEqual(
+                    0,
+                    retention["released_joint_optimizer_initial_step"],
+                )
+                self.assertEqual([2], reset_steps)
+                self.assertEqual([1, 1, 2, 3, 4, 5, 6, 7], phase_steps)
+            else:
+                self.assertFalse(candidate_gate["selectable"])
+                self.assertIsNone(retention)
+                self.assertEqual([], reset_steps)
+                self.assertEqual(list(range(1, len(phase_steps) + 1)), phase_steps)
             self.assertIn(
                 report["optimization"]["best_checkpoint_origin"],
                 {

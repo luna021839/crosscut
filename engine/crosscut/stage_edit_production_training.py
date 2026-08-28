@@ -158,15 +158,20 @@ DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
 )
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS = (50, 100, 200, 300, 400, 500)
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT = (
-    "predeclared_train_only_detached_feature_head_optimizer_milestones_"
+    "predeclared_train_only_detached_structured_low_rank_adapter_milestones_"
     "existing_exact_validation_highest_score_lower_step_tiebreak_"
-    "initial_head_fallback_v3"
+    "initial_head_fallback_v4"
 )
 DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
     "frozen_post_source_pretraining_context_and_exact_source_embedding_v1"
 )
 DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT = (
-    "only_dynamic_crop_context_and_source_head_parameters_mutable_v2"
+    "only_dynamic_crop_count_time_motion_low_rank_residual_mutable_v3"
+)
+DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 8
+DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
+    "fixed_deterministic_random_projection_separate_context_source_"
+    "linear_structured_residual_v1"
 )
 PRODUCTION_TRAINING_FAILURE_REPORT_FILENAME = (
     "stageedit-production-training-failure-report.json"
@@ -1900,6 +1905,155 @@ class _DynamicCropV3PriorHeadModule(_DynamicCropV3PriorModuleBase):
         )
 
 
+class _DynamicCropV3StructuredPriorAdapterModule(
+    _DynamicCropV3PriorModuleBase
+):
+    """Low-capacity residual for count, time, and motion rows only."""
+
+    def __init__(self, projection_rank: int) -> None:
+        _require_mlx()
+        super().__init__()
+        values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+        structured_dimension = (
+            DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION - values_stop
+        )
+        self.context_adapter = nn.Linear(
+            projection_rank,
+            structured_dimension,
+        )
+        self.source_adapter = nn.Linear(
+            projection_rank,
+            structured_dimension,
+            bias=False,
+        )
+        self.context_adapter.weight = mx.zeros_like(
+            self.context_adapter.weight
+        )
+        self.context_adapter.bias = mx.zeros_like(
+            self.context_adapter.bias
+        )
+        self.source_adapter.weight = mx.zeros_like(
+            self.source_adapter.weight
+        )
+
+    def __call__(
+        self,
+        context_projection: Any,
+        source_projection: Any,
+    ) -> Any:
+        return self.context_adapter(context_projection) + self.source_adapter(
+            source_projection
+        )
+
+
+def _dynamic_crop_v3_structured_prior_projections(
+    dimension: int,
+    *,
+    seed: int,
+    requested_rank: int = DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
+) -> tuple[Any, Any]:
+    """Create deterministic fixed random features for a tiny residual head."""
+
+    if dimension < 1:
+        raise ValueError("Dynamic Crop v3 prior dimension must be positive")
+    rank = min(int(requested_rank), int(dimension))
+    if rank < 1:
+        raise ValueError("Dynamic Crop v3 prior projection rank must be positive")
+    rng = np.random.default_rng(int(seed) ^ 0x5A17C3)
+
+    def projection() -> Any:
+        values = rng.standard_normal((rank, dimension)).astype(np.float32)
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        values = np.ascontiguousarray(values / np.maximum(norms, 1.0e-12))
+        return mx.array(values)
+
+    context_projection = projection()
+    source_projection = projection()
+    mx.eval(context_projection, source_projection)
+    return context_projection, source_projection
+
+
+def _dynamic_crop_v3_structured_prior_raw(
+    module: _DynamicCropV3StructuredPriorAdapterModule,
+    initial_snapshot: Mapping[str, Any],
+    context_projection_matrix: Any,
+    source_projection_matrix: Any,
+    context_embedding: Any,
+    source_embedding: Any,
+) -> Any:
+    values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+    base_raw = (
+        mx.matmul(initial_snapshot["context_weight"], context_embedding)
+        + initial_snapshot["context_bias"]
+        + mx.matmul(initial_snapshot["source_weight"], source_embedding)
+    )
+    context_projection = mx.matmul(
+        context_projection_matrix,
+        context_embedding,
+    )
+    source_projection = mx.matmul(
+        source_projection_matrix,
+        source_embedding,
+    )
+    structured_residual = module(
+        context_projection,
+        source_projection,
+    )
+    return mx.concatenate(
+        (
+            base_raw[:values_stop],
+            base_raw[values_stop:] + structured_residual,
+        )
+    )
+
+
+def _dynamic_crop_v3_structured_prior_head_snapshot(
+    module: _DynamicCropV3StructuredPriorAdapterModule,
+    initial_snapshot: Mapping[str, Any],
+    context_projection_matrix: Any,
+    source_projection_matrix: Any,
+) -> dict[str, Any]:
+    """Merge the low-rank structured residual into a full renderer head."""
+
+    values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
+    context_delta = mx.matmul(
+        module.context_adapter.weight,
+        context_projection_matrix,
+    )
+    source_delta = mx.matmul(
+        module.source_adapter.weight,
+        source_projection_matrix,
+    )
+    snapshot = {
+        "context_weight": mx.concatenate(
+            (
+                initial_snapshot["context_weight"][:values_stop],
+                initial_snapshot["context_weight"][values_stop:]
+                + context_delta,
+            ),
+            axis=0,
+        ),
+        "context_bias": mx.concatenate(
+            (
+                initial_snapshot["context_bias"][:values_stop],
+                initial_snapshot["context_bias"][values_stop:]
+                + module.context_adapter.bias,
+            ),
+            axis=0,
+        ),
+        "source_weight": mx.concatenate(
+            (
+                initial_snapshot["source_weight"][:values_stop],
+                initial_snapshot["source_weight"][values_stop:]
+                + source_delta,
+            ),
+            axis=0,
+        ),
+    }
+    mx.eval(*snapshot.values())
+    return snapshot
+
+
 def _materialize_dynamic_crop_v3_prior_features(
     model: StageEditTransformerDynamicCropV3,
     examples: Sequence[ReferenceTrainingExample],
@@ -2047,6 +2201,28 @@ def _dynamic_crop_v3_prior_loss(
     """Train every v3 component without allowing gradients into the base."""
 
     raw = module(context_embedding, source_embedding)
+    return _dynamic_crop_v3_prior_loss_from_raw(
+        raw,
+        target_values,
+        target_times,
+        count_target,
+        motion_target,
+        motion_supervised,
+        contract,
+    )
+
+
+def _dynamic_crop_v3_prior_loss_from_raw(
+    raw: Any,
+    target_values: Any,
+    target_times: Any,
+    count_target: int,
+    motion_target: float,
+    motion_supervised: bool,
+    contract: DynamicCropV3LossContract,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Evaluate the exact v3 renderer loss for an already-composed head."""
+
     values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     count_stop = values_stop + DYNAMIC_CROP_V3_MAX_KEYFRAMES
     time_stop = count_stop + DYNAMIC_CROP_V3_TIME_LOGIT_COUNT
@@ -2122,12 +2298,14 @@ def _dynamic_crop_v3_prior_parameter_digests(
 ) -> dict[str, str]:
     values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     bias = model.dynamic_crop_context_head.bias
+    context_weight = model.dynamic_crop_context_head.weight
+    source_weight = model.dynamic_crop_source_head.weight
     return {
         "base_parameter_tree_sha256": _parameter_tree_sha256(
             model.base.parameters()
         ),
         "context_weight_sha256": _parameter_tree_sha256(
-            {"weight": model.dynamic_crop_context_head.weight}
+            {"weight": context_weight}
         ),
         "source_head_parameter_tree_sha256": _parameter_tree_sha256(
             model.dynamic_crop_source_head.parameters()
@@ -2145,6 +2323,18 @@ def _dynamic_crop_v3_prior_parameter_digests(
         ),
         "context_value_bias_sha256": _parameter_tree_sha256(
             {"bias": bias[:values_stop]}
+        ),
+        "context_value_weight_sha256": _parameter_tree_sha256(
+            {"weight": context_weight[:values_stop]}
+        ),
+        "context_structured_weight_sha256": _parameter_tree_sha256(
+            {"weight": context_weight[values_stop:]}
+        ),
+        "source_value_weight_sha256": _parameter_tree_sha256(
+            {"weight": source_weight[:values_stop]}
+        ),
+        "source_structured_weight_sha256": _parameter_tree_sha256(
+            {"weight": source_weight[values_stop:]}
         ),
     }
 
@@ -3001,16 +3191,33 @@ def train_production_stage_edit(
             values_stop = dynamic_crop_v3_prior_values_stop
             before_digests = _dynamic_crop_v3_prior_parameter_digests(model)
             dynamic_crop_v3_prior_before_digests = before_digests
-            prior_module = _DynamicCropV3PriorHeadModule(
+            initial_head_module = _DynamicCropV3PriorHeadModule(
                 model.dynamic_crop_context_head.weight,
                 model.dynamic_crop_context_head.bias,
                 model.dynamic_crop_source_head.weight,
             )
             dynamic_crop_v3_prior_initial_snapshot = (
-                _dynamic_crop_v3_prior_head_snapshot(prior_module)
+                _dynamic_crop_v3_prior_head_snapshot(initial_head_module)
+            )
+            projection_rank = min(
+                DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK,
+                int(model.dynamic_crop_context_head.weight.shape[-1]),
+            )
+            (
+                prior_context_projection,
+                prior_source_projection,
+            ) = _dynamic_crop_v3_structured_prior_projections(
+                int(model.dynamic_crop_context_head.weight.shape[-1]),
+                seed=seed,
+                requested_rank=projection_rank,
+            )
+            prior_adapter = _DynamicCropV3StructuredPriorAdapterModule(
+                projection_rank
             )
             initial_values_mx = renderer_safe_values_from_raw_v3(
-                prior_module.context_head.bias[:values_stop].reshape(
+                dynamic_crop_v3_prior_initial_snapshot["context_bias"]
+                [:values_stop]
+                .reshape(
                     (DYNAMIC_CROP_V3_MAX_KEYFRAMES, 4)
                 )
             )
@@ -3043,7 +3250,7 @@ def train_production_stage_edit(
                 )
 
             def prior_loss(
-                trained_prior: _DynamicCropV3PriorHeadModule,
+                trained_adapter: _DynamicCropV3StructuredPriorAdapterModule,
                 context_embedding: Any,
                 source_embedding: Any,
                 target_values: Any,
@@ -3052,10 +3259,16 @@ def train_production_stage_edit(
                 motion_target: float,
                 motion_supervised: bool,
             ) -> Any:
-                return _dynamic_crop_v3_prior_loss(
-                    trained_prior,
+                raw = _dynamic_crop_v3_structured_prior_raw(
+                    trained_adapter,
+                    dynamic_crop_v3_prior_initial_snapshot,
+                    prior_context_projection,
+                    prior_source_projection,
                     context_embedding,
                     source_embedding,
+                )
+                return _dynamic_crop_v3_prior_loss_from_raw(
+                    raw,
                     target_values,
                     target_times,
                     count_target,
@@ -3064,7 +3277,10 @@ def train_production_stage_edit(
                     effective_dynamic_crop_v3_loss_contract,
                 )[0]
 
-            prior_loss_and_grad = nn.value_and_grad(prior_module, prior_loss)
+            prior_loss_and_grad = nn.value_and_grad(
+                prior_adapter,
+                prior_loss,
+            )
             for prior_step in range(1, dynamic_crop_v3_prior_pretrain_steps + 1):
                 track = prior_sampler.sample()
                 if (
@@ -3086,7 +3302,7 @@ def train_production_stage_edit(
                 motion_target = float(track.motion_label == "dynamic")
                 motion_supervised = not track.motion_label_loss_masked
                 loss, gradients = prior_loss_and_grad(
-                    prior_module,
+                    prior_adapter,
                     context_embedding,
                     source_embedding,
                     target_values,
@@ -3101,11 +3317,17 @@ def train_production_stage_edit(
                     )
                 else:
                     gradient_norm = mx.array(float("nan"))
-                prior_optimizer.update(prior_module, gradients)
-                _, prior_components = _dynamic_crop_v3_prior_loss(
-                    prior_module,
+                prior_optimizer.update(prior_adapter, gradients)
+                updated_raw = _dynamic_crop_v3_structured_prior_raw(
+                    prior_adapter,
+                    dynamic_crop_v3_prior_initial_snapshot,
+                    prior_context_projection,
+                    prior_source_projection,
                     context_embedding,
                     source_embedding,
+                )
+                _, prior_components = _dynamic_crop_v3_prior_loss_from_raw(
+                    updated_raw,
                     target_values,
                     target_times,
                     count_target,
@@ -3119,14 +3341,19 @@ def train_production_stage_edit(
                     loss,
                     gradient_norm,
                     *prior_components.values(),
-                    prior_module.parameters(),
+                    prior_adapter.parameters(),
                     prior_optimizer.state,
                 )
                 candidate_value_digest = None
                 candidate_head_digest = None
                 if prior_step in DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS:
-                    snapshot = _dynamic_crop_v3_prior_head_snapshot(
-                        prior_module
+                    snapshot = (
+                        _dynamic_crop_v3_structured_prior_head_snapshot(
+                            prior_adapter,
+                            dynamic_crop_v3_prior_initial_snapshot,
+                            prior_context_projection,
+                            prior_source_projection,
+                        )
                     )
                     dynamic_crop_v3_prior_candidate_snapshots[prior_step] = (
                         snapshot
@@ -3202,6 +3429,22 @@ def train_production_stage_edit(
                     "deterministic_song_reference_trajectory_round_robin_v1"
                 ),
                 "feature_contract": DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT,
+                "adapter_contract": DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT,
+                "projection_rank": projection_rank,
+                "trainable_parameter_count": int(
+                    sum(
+                        np.asarray(value).size
+                        for _, value in tree_flatten(
+                            prior_adapter.parameters()
+                        )
+                    )
+                ),
+                "context_projection_sha256": _parameter_tree_sha256(
+                    {"projection": prior_context_projection}
+                ),
+                "source_projection_sha256": _parameter_tree_sha256(
+                    {"projection": prior_source_projection}
+                ),
                 "detached_feature_content_sha256": (
                     prior_inventory.detached_feature_content_sha256
                 ),
@@ -3482,7 +3725,12 @@ def train_production_stage_edit(
                 model, selected_candidate_snapshot
             )
             after_digests = _dynamic_crop_v3_prior_parameter_digests(model)
-            invariant_keys = ("base_parameter_tree_sha256",)
+            invariant_keys = (
+                "base_parameter_tree_sha256",
+                "context_value_bias_sha256",
+                "context_value_weight_sha256",
+                "source_value_weight_sha256",
+            )
             invariant = all(
                 dynamic_crop_v3_prior_before_digests[key]
                 == after_digests[key]
@@ -3509,6 +3757,30 @@ def train_production_stage_edit(
                     "source_head_parameter_tree_sha256"
                 ]
                 != after_digests["source_head_parameter_tree_sha256"]
+            )
+            context_value_weight_changed = (
+                dynamic_crop_v3_prior_before_digests[
+                    "context_value_weight_sha256"
+                ]
+                != after_digests["context_value_weight_sha256"]
+            )
+            context_structured_weight_changed = (
+                dynamic_crop_v3_prior_before_digests[
+                    "context_structured_weight_sha256"
+                ]
+                != after_digests["context_structured_weight_sha256"]
+            )
+            source_value_weight_changed = (
+                dynamic_crop_v3_prior_before_digests[
+                    "source_value_weight_sha256"
+                ]
+                != after_digests["source_value_weight_sha256"]
+            )
+            source_structured_weight_changed = (
+                dynamic_crop_v3_prior_before_digests[
+                    "source_structured_weight_sha256"
+                ]
+                != after_digests["source_structured_weight_sha256"]
             )
             dynamic_head_changed = (
                 dynamic_crop_v3_prior_before_digests[
@@ -3551,6 +3823,16 @@ def train_production_stage_edit(
                 "context_non_value_bias_changed": non_value_bias_changed,
                 "context_weight_changed": context_weight_changed,
                 "source_head_changed": source_head_changed,
+                "context_value_weight_changed": (
+                    context_value_weight_changed
+                ),
+                "context_structured_weight_changed": (
+                    context_structured_weight_changed
+                ),
+                "source_value_weight_changed": source_value_weight_changed,
+                "source_structured_weight_changed": (
+                    source_structured_weight_changed
+                ),
                 "context_value_bias_row_count": (
                     dynamic_crop_v3_prior_values_stop
                 ),
@@ -3558,6 +3840,9 @@ def train_production_stage_edit(
                 "source_head_gradients_computed": True,
                 "context_weight_gradients_computed": True,
                 "count_time_motion_bias_gradients_computed": True,
+                "value_row_gradients_computed": False,
+                "full_head_gradients_computed": False,
+                "structured_low_rank_adapter_gradients_computed": True,
                 "base_features_detached_before_prior_optimization": True,
             }
             if retention_authorized:
@@ -4680,8 +4965,8 @@ def train_production_stage_edit(
             "learning_rate": learning_rate,
             "learning_rate_schedule": {
                 "contract": (
-                    "independent_warmup_cosine_cut_source_v3_prior_and_"
-                    "joint_with_retained_selection_burn_in_v4"
+                    "independent_warmup_cosine_cut_source_v3_structured_"
+                    "prior_and_joint_with_retained_selection_burn_in_v5"
                     if dynamic_crop_v3_prior_pretrain_steps
                     else "independent_warmup_cosine_cut_source_and_joint_"
                     "with_step_floor_v3"
@@ -4767,8 +5052,8 @@ def train_production_stage_edit(
                     "enabled": True,
                     "partition": "training_references_only",
                     "objective": (
-                        "detached_context_and_source_conditioned_renderer_"
-                        "values_count_times_motion_joint_loss_v2"
+                        "detached_low_rank_context_and_source_conditioned_"
+                        "count_times_motion_residual_with_frozen_values_v3"
                     ),
                     "feature_contract": DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT,
                     "mutable_parameter_scope": (
