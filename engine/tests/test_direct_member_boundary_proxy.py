@@ -8,8 +8,11 @@ import unittest
 
 from crosscut.direct_member_boundary_proxy import (
     DirectMemberBoundaryProxyEvidence,
+    build_direct_member_boundary_authority_binding_sha256,
     build_direct_member_boundary_proxy_signature,
     direct_member_boundary_proxy_evidence_from_preflight,
+    direct_member_boundary_proxy_evidence_from_full_preflight,
+    direct_member_boundary_proxy_evidence_from_full_plan,
     extract_direct_member_boundary_proxy_plan,
     load_direct_member_boundary_proxy_cache,
     persist_direct_member_boundary_proxy_cache,
@@ -17,6 +20,7 @@ from crosscut.direct_member_boundary_proxy import (
 from crosscut.direct_member_rendered_proxy import (
     DirectMemberRenderedProxyPreflight,
 )
+from crosscut.direct_member_target_face import FocalFaceCandidate
 from crosscut.ive import AspectRatio
 from crosscut.render import (
     DIRECT_MEMBER_POSE_DISSOLVE_REASON,
@@ -202,6 +206,36 @@ class DirectMemberBoundaryProxyTests(unittest.TestCase):
             relocated_output.signature_sha256,
         )
 
+    def test_authority_binding_retains_no_face_embedding(self) -> None:
+        pair = (
+            FocalFaceCandidate(
+                bbox_xywh=(0.2, 0.1, 0.2, 0.2),
+                embedding=(0.1, 0.2, 0.3),
+                landmark_scale=0.04,
+            ),
+            FocalFaceCandidate(
+                bbox_xywh=(0.3, 0.1, 0.2, 0.2),
+                embedding=(0.3, 0.2, 0.1),
+                landmark_scale=0.05,
+            ),
+        )
+
+        binding = build_direct_member_boundary_authority_binding_sha256(pair)
+        changed_geometry = build_direct_member_boundary_authority_binding_sha256(
+            (
+                pair[0],
+                FocalFaceCandidate(
+                    bbox_xywh=(0.31, 0.1, 0.2, 0.2),
+                    embedding=pair[1].embedding,
+                    landmark_scale=0.05,
+                ),
+            )
+        )
+
+        self.assertEqual(len(binding), 64)
+        self.assertNotEqual(binding, changed_geometry)
+        self.assertNotIn("0.1", binding)
+
     def test_compact_evidence_and_cache_round_trip_are_binding_safe(self) -> None:
         window = extract_direct_member_boundary_proxy_plan(
             _plan(),
@@ -246,6 +280,106 @@ class DirectMemberBoundaryProxyTests(unittest.TestCase):
         self.assertEqual(loaded[signature.signature_sha256], evidence)
         self.assertEqual(foreign, {})
         self.assertEqual(foreign_diagnostics["foreign_binding_entry_count"], 1)
+
+    def test_full_proxy_evidence_is_boundary_local_not_global(self) -> None:
+        full_payload = dict(_preflight().payload)
+        continuity = dict(full_payload["rendered_continuity"])
+        continuity["failure_boundary_indices"] = {
+            "rendered_effect_endpoint_scale_discontinuity": [1]
+        }
+        continuity["boundaries"] = [
+            {
+                "boundary_index": 0,
+                "attention_position_mismatch": 0.05,
+                "attention_scale_mismatch": 0.04,
+                "pose_mismatch": 0.10,
+            },
+            {
+                "boundary_index": 1,
+                "attention_position_mismatch": 0.08,
+                "attention_scale_mismatch": 0.06,
+                "pose_mismatch": 0.14,
+                "endpoint_steps": [
+                    {
+                        "attention_position_step": 0.09,
+                        "attention_scale_step": 0.12,
+                        "pose_step": 0.12,
+                    }
+                ],
+            },
+        ]
+        full_payload["rendered_continuity"] = continuity
+        generic = dict(full_payload["rendered_proxy_review"])
+        generic["boundaries"] = [
+            {
+                "boundary_index": 0,
+                "weighted_score": 55.0,
+                "issue_reasons": ["sharpness_discontinuity"],
+                "technical_integrity_issue_reasons": [],
+            },
+            {
+                "boundary_index": 1,
+                "weighted_score": 74.0,
+                "issue_reasons": [],
+                "technical_integrity_issue_reasons": [],
+            },
+        ]
+        full_payload["rendered_proxy_review"] = generic
+        full_preflight = DirectMemberRenderedProxyPreflight(full_payload)
+        first_window = extract_direct_member_boundary_proxy_plan(
+            _plan(),
+            0,
+            Path("first.mp4"),
+        )
+        second_window = extract_direct_member_boundary_proxy_plan(
+            _plan(),
+            1,
+            Path("second.mp4"),
+        )
+        first_signature = build_direct_member_boundary_proxy_signature(
+            first_window,
+            dense_binding_sha256=_DENSE_BINDING,
+            authority_binding_sha256=_AUTHORITY_BINDING,
+        )
+        second_signature = build_direct_member_boundary_proxy_signature(
+            second_window,
+            dense_binding_sha256=_DENSE_BINDING,
+            authority_binding_sha256=_AUTHORITY_BINDING,
+        )
+
+        first = direct_member_boundary_proxy_evidence_from_full_preflight(
+            first_signature,
+            full_preflight,
+            boundary_index=0,
+        )
+        second = direct_member_boundary_proxy_evidence_from_full_preflight(
+            second_signature,
+            full_preflight,
+            boundary_index=1,
+        )
+
+        self.assertTrue(first.continuity_passed)
+        self.assertFalse(first.member_quality_passed)
+        self.assertFalse(second.continuity_passed)
+        self.assertTrue(second.member_quality_passed)
+        self.assertEqual(
+            second.continuity_failure_reasons,
+            ("rendered_effect_endpoint_scale_discontinuity",),
+        )
+        self.assertIsNone(
+            dict(second.metrics)["source_luma_median_span"]
+        )
+
+        all_evidence = direct_member_boundary_proxy_evidence_from_full_plan(
+            _plan(),
+            full_preflight,
+            dense_binding_sha256=_DENSE_BINDING,
+        )
+        self.assertEqual(len(all_evidence), 2)
+        self.assertEqual(
+            [item.continuity_passed for item in all_evidence],
+            [True, False],
+        )
 
     def test_malformed_cache_entry_is_ignored_fail_closed(self) -> None:
         with TemporaryDirectory() as directory:

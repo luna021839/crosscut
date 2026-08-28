@@ -19,6 +19,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 from .direct_member_rendered_proxy import DirectMemberRenderedProxyPreflight
+from .direct_member_target_face import FocalFaceCandidate
 from .render import (
     DIRECT_MEMBER_POSE_DISSOLVE_REASON,
     RenderPlan,
@@ -219,6 +220,49 @@ def build_direct_member_boundary_proxy_signature(
         transition_kind=transition.kind.value,
         transition_frame_count=transition.frame_count,
     )
+
+
+def build_direct_member_boundary_authority_binding_sha256(
+    reference_pair: tuple[FocalFaceCandidate, FocalFaceCandidate] | None,
+) -> str:
+    """Bind transient focal geometry without serializing face embeddings.
+
+    The dense media/code binding already fixes the source frames and embedding
+    implementation.  Normalized boxes and stable scale metadata distinguish
+    the review authority used for this edge while retaining no identity
+    vector or source pixels.
+    """
+
+    if reference_pair is None:
+        payload: dict[str, Any] = {
+            "contract": BOUNDARY_PROXY_CONTRACT,
+            "reference_mode": "decoded_output_correspondence_only",
+        }
+    else:
+        if (
+            not isinstance(reference_pair, tuple)
+            or len(reference_pair) != 2
+            or any(
+                not isinstance(candidate, FocalFaceCandidate)
+                for candidate in reference_pair
+            )
+        ):
+            raise TypeError("boundary proxy focal reference pair is invalid")
+        payload = {
+            "contract": BOUNDARY_PROXY_CONTRACT,
+            "reference_mode": "source_bound_focal_face_pair",
+            "candidates": [
+                {
+                    "bbox_xywh": list(candidate.bbox_xywh),
+                    "eye_scale": candidate.eye_scale,
+                    "landmark_scale": candidate.landmark_scale,
+                    "embedding_dimension": len(candidate.embedding),
+                }
+                for candidate in reference_pair
+            ],
+            "face_embeddings_persisted": False,
+        }
+    return _sha256(payload)
 
 
 def _finite_metric(value: Any) -> float | None:
@@ -504,6 +548,202 @@ def direct_member_boundary_proxy_evidence_from_preflight(
     )
 
 
+def direct_member_boundary_proxy_evidence_from_full_preflight(
+    signature: DirectMemberBoundaryProxySignature,
+    preflight: DirectMemberRenderedProxyPreflight,
+    *,
+    boundary_index: int,
+) -> DirectMemberBoundaryProxyEvidence:
+    """Extract edge-local evidence from one exact full-plan proxy review.
+
+    Global source-median admission is deliberately not copied onto every edge:
+    it can change when the rest of the path changes.  Only the selected
+    boundary's decoded continuity and generic boundary issues are reusable.
+    The assembled plan must still pass the unchanged full-proxy quality gate.
+    """
+
+    if not isinstance(signature, DirectMemberBoundaryProxySignature):
+        raise TypeError("full proxy boundary evidence needs a signature")
+    if not isinstance(preflight, DirectMemberRenderedProxyPreflight):
+        raise TypeError("full proxy boundary evidence needs a preflight")
+    if (
+        isinstance(boundary_index, bool)
+        or not isinstance(boundary_index, int)
+        or boundary_index < 0
+    ):
+        raise ValueError("full proxy boundary index is invalid")
+    payload = preflight.payload
+    continuity = payload.get("rendered_continuity")
+    continuity_payload = continuity if isinstance(continuity, Mapping) else {}
+    raw_continuity_boundaries = continuity_payload.get("boundaries")
+    continuity_record = next(
+        (
+            record
+            for record in raw_continuity_boundaries
+            if isinstance(record, Mapping)
+            and record.get("boundary_index") == boundary_index
+        ),
+        None,
+    ) if isinstance(raw_continuity_boundaries, list) else None
+    if not isinstance(continuity_record, Mapping):
+        raise ValueError("full proxy continuity boundary evidence is missing")
+    raw_failure_map = continuity_payload.get("failure_boundary_indices")
+    failure_map = raw_failure_map if isinstance(raw_failure_map, Mapping) else {}
+    continuity_failure_reasons = tuple(
+        sorted(
+            str(reason)
+            for reason, indices in failure_map.items()
+            if isinstance(reason, str)
+            and isinstance(indices, list)
+            and boundary_index in indices
+        )
+    )
+    generic = payload.get("rendered_proxy_review")
+    generic_payload = generic if isinstance(generic, Mapping) else {}
+    raw_generic_boundaries = generic_payload.get("boundaries")
+    generic_record = next(
+        (
+            record
+            for record in raw_generic_boundaries
+            if isinstance(record, Mapping)
+            and record.get("boundary_index") == boundary_index
+        ),
+        {},
+    ) if isinstance(raw_generic_boundaries, list) else {}
+    raw_issues = generic_record.get("issue_reasons")
+    generic_issue_reasons = tuple(
+        sorted(
+            str(reason)
+            for reason in raw_issues
+            if isinstance(reason, str) and reason
+        )
+    ) if isinstance(raw_issues, list) else ()
+    raw_technical = generic_record.get("technical_integrity_issue_reasons")
+    technical_issue_reasons = tuple(
+        sorted(
+            str(reason)
+            for reason in raw_technical
+            if isinstance(reason, str) and reason
+        )
+    ) if isinstance(raw_technical, list) else ()
+    member_quality_failure_reasons = tuple(
+        f"member_boundary_{reason}"
+        for reason in generic_issue_reasons
+        if reason not in technical_issue_reasons
+    )
+    metrics = {
+        "attention_position_mismatch_p95": _finite_metric(
+            continuity_record.get("attention_position_mismatch")
+        ),
+        "attention_scale_mismatch_p95": _finite_metric(
+            continuity_record.get("attention_scale_mismatch")
+        ),
+        "pose_mismatch_p95": _finite_metric(
+            continuity_record.get("pose_mismatch")
+        ),
+        "effect_endpoint_position_step_max": _maximum_endpoint_metric(
+            [continuity_record],
+            "attention_position_step",
+        ),
+        "effect_endpoint_scale_step_max": _maximum_endpoint_metric(
+            [continuity_record],
+            "attention_scale_step",
+        ),
+        "effect_endpoint_pose_step_max": _maximum_endpoint_metric(
+            [continuity_record],
+            "pose_step",
+        ),
+        "source_quality_median_span": None,
+        "source_sharpness_log_median_span": None,
+        "source_luma_median_span": None,
+        "source_chroma_median_span": None,
+        "generic_weighted_score": _finite_metric(
+            generic_record.get("weighted_score")
+        ),
+    }
+    continuity_passed = not continuity_failure_reasons
+    member_quality_passed = not member_quality_failure_reasons
+    technical_integrity_passed = not technical_issue_reasons
+    finite_penalty = (
+        4.0 * len(continuity_failure_reasons)
+        + 2.0 * len(member_quality_failure_reasons)
+        + 8.0 * len(technical_issue_reasons)
+    )
+    weighted_score = metrics["generic_weighted_score"]
+    if weighted_score is not None:
+        finite_penalty += max(0.0, (70.0 - weighted_score) / 10.0)
+    return DirectMemberBoundaryProxyEvidence(
+        signature=signature,
+        passed=bool(
+            continuity_passed
+            and member_quality_passed
+            and technical_integrity_passed
+        ),
+        continuity_passed=continuity_passed,
+        member_quality_passed=member_quality_passed,
+        technical_integrity_passed=technical_integrity_passed,
+        finite_solver_penalty=finite_penalty,
+        continuity_failure_reasons=continuity_failure_reasons,
+        member_quality_failure_reasons=member_quality_failure_reasons,
+        technical_issue_reasons=technical_issue_reasons,
+        metrics=tuple(sorted(metrics.items())),
+    )
+
+
+def direct_member_boundary_proxy_evidence_from_full_plan(
+    plan: RenderPlan,
+    preflight: DirectMemberRenderedProxyPreflight,
+    *,
+    dense_binding_sha256: str,
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ] | None = None,
+) -> tuple[DirectMemberBoundaryProxyEvidence, ...]:
+    """Split a full decoded review into exact reusable edge records."""
+
+    if not isinstance(plan, RenderPlan):
+        raise TypeError("full boundary evidence needs a render plan")
+    references = dict(focal_reference_candidates_by_boundary_index or {})
+    if any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(plan.transitions)
+        for index in references
+    ):
+        raise ValueError("full boundary evidence reference index is invalid")
+    evidence: list[DirectMemberBoundaryProxyEvidence] = []
+    for boundary_index, (outgoing, incoming) in enumerate(
+        zip(plan.segments, plan.segments[1:])
+    ):
+        if outgoing.source_index == incoming.source_index:
+            continue
+        window = extract_direct_member_boundary_proxy_plan(
+            plan,
+            boundary_index,
+            plan.output.with_name(
+                f".{plan.output.name}.boundary-signature-{boundary_index}.mp4"
+            ),
+        )
+        signature = build_direct_member_boundary_proxy_signature(
+            window,
+            dense_binding_sha256=dense_binding_sha256,
+            authority_binding_sha256=(
+                build_direct_member_boundary_authority_binding_sha256(
+                    references.get(boundary_index)
+                )
+            ),
+        )
+        evidence.append(
+            direct_member_boundary_proxy_evidence_from_full_preflight(
+                signature,
+                preflight,
+                boundary_index=boundary_index,
+            )
+        )
+    return tuple(evidence)
+
+
 def load_direct_member_boundary_proxy_cache(
     cache_directory: Path | None,
     *,
@@ -640,8 +880,11 @@ __all__ = [
     "BOUNDARY_PROXY_CONTRACT",
     "DirectMemberBoundaryProxyEvidence",
     "DirectMemberBoundaryProxySignature",
+    "build_direct_member_boundary_authority_binding_sha256",
     "build_direct_member_boundary_proxy_signature",
     "direct_member_boundary_proxy_evidence_from_preflight",
+    "direct_member_boundary_proxy_evidence_from_full_preflight",
+    "direct_member_boundary_proxy_evidence_from_full_plan",
     "extract_direct_member_boundary_proxy_plan",
     "load_direct_member_boundary_proxy_cache",
     "persist_direct_member_boundary_proxy_cache",

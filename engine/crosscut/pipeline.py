@@ -68,6 +68,12 @@ from .direct_member_editorial_motion import (
 from .direct_member_professional_gate import (
     evaluate_direct_member_professional_pre_render_gate,
 )
+from .direct_member_boundary_proxy import (
+    DirectMemberBoundaryProxyEvidence,
+    direct_member_boundary_proxy_evidence_from_full_plan,
+    load_direct_member_boundary_proxy_cache,
+    persist_direct_member_boundary_proxy_cache,
+)
 from .direct_member_rendered_proxy import (
     DirectMemberRenderedProxyPreflight,
     demote_failed_direct_member_pose_dissolves_from_rendered_proxy,
@@ -23484,6 +23490,34 @@ def analyze(
             render_penalized_transition_edges: list[
                 tuple[float, int, int, float]
             ] = list(loaded_proxy_feedback_penalties)
+            direct_member_boundary_proxy_binding_sha256 = (
+                dense_render_feedback_binding.get("binding_sha256")
+                if isinstance(dense_render_feedback_binding, Mapping)
+                and isinstance(
+                    dense_render_feedback_binding.get("binding_sha256"),
+                    str,
+                )
+                else None
+            )
+            direct_member_boundary_proxy_cache_entries: dict[
+                str,
+                DirectMemberBoundaryProxyEvidence,
+            ] = {}
+            direct_member_boundary_proxy_load_diagnostics: dict[str, Any] = {
+                "status": "binding_unavailable",
+                "requested": request.source_cache_directory is not None,
+                "loaded": 0,
+            }
+            if direct_member_boundary_proxy_binding_sha256 is not None:
+                (
+                    direct_member_boundary_proxy_cache_entries,
+                    direct_member_boundary_proxy_load_diagnostics,
+                ) = load_direct_member_boundary_proxy_cache(
+                    request.source_cache_directory,
+                    dense_binding_sha256=(
+                        direct_member_boundary_proxy_binding_sha256
+                    ),
+                )
             decoded_proxy_rejected_source_paths_by_partition: dict[
                 tuple[int, ...], list[tuple[int, ...]]
             ] = {}
@@ -23535,6 +23569,13 @@ def analyze(
                 "경로 전체 no-good 복원 "
                 f"{sum(len(paths) for paths in decoded_proxy_rejected_source_paths_by_partition.values())}개 · "
                 "하드 제외 0개"
+            )
+            reporter.log(
+                "직캠 정확 경계 증거 체크포인트 "
+                f"{direct_member_boundary_proxy_load_diagnostics.get('status')} · "
+                "복원 "
+                f"{len(direct_member_boundary_proxy_cache_entries)}개 · "
+                "선택 로직 미적용"
             )
             # Dense retries add hard camera-solve exclusions. Decoded-output
             # retries add only finite visual costs. Keep the descriptor session
@@ -24118,6 +24159,99 @@ def analyze(
                         payload[
                             "output_verified_dissolve_demotion"
                         ] = demotion_payload
+                    boundary_proxy_evidence: tuple[
+                        DirectMemberBoundaryProxyEvidence,
+                        ...,
+                    ] = ()
+                    boundary_proxy_persistence_diagnostics: dict[
+                        str,
+                        Any,
+                    ] = {
+                        "status": "binding_unavailable",
+                        "persisted": False,
+                    }
+                    if (
+                        direct_member_boundary_proxy_binding_sha256
+                        is not None
+                    ):
+                        try:
+                            boundary_proxy_evidence = (
+                                direct_member_boundary_proxy_evidence_from_full_plan(
+                                    candidate_plan,
+                                    preflight,
+                                    dense_binding_sha256=(
+                                        direct_member_boundary_proxy_binding_sha256
+                                    ),
+                                    focal_reference_candidates_by_boundary_index=(
+                                        candidate_focal_reference_candidates_by_boundary_index
+                                    ),
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            boundary_proxy_persistence_diagnostics = {
+                                "status": "evidence_rejected",
+                                "persisted": False,
+                                "error_type": type(exc).__name__,
+                                "reason": str(exc),
+                            }
+                        else:
+                            for item in boundary_proxy_evidence:
+                                signature_sha256 = (
+                                    item.signature.signature_sha256
+                                )
+                                direct_member_boundary_proxy_cache_entries.pop(
+                                    signature_sha256,
+                                    None,
+                                )
+                                direct_member_boundary_proxy_cache_entries[
+                                    signature_sha256
+                                ] = item
+                            boundary_proxy_persistence_diagnostics = (
+                                persist_direct_member_boundary_proxy_cache(
+                                    request.source_cache_directory,
+                                    tuple(
+                                        direct_member_boundary_proxy_cache_entries.values()
+                                    ),
+                                )
+                            )
+                    payload["exact_boundary_proxy_evidence"] = {
+                        "load": deepcopy(
+                            direct_member_boundary_proxy_load_diagnostics
+                        ),
+                        "persistence": deepcopy(
+                            boundary_proxy_persistence_diagnostics
+                        ),
+                        "reviewed_boundary_count": len(
+                            boundary_proxy_evidence
+                        ),
+                        "reviewed_passed_count": sum(
+                            int(item.passed)
+                            for item in boundary_proxy_evidence
+                        ),
+                        "reviewed_failed_count": sum(
+                            int(not item.passed)
+                            for item in boundary_proxy_evidence
+                        ),
+                        "reviewed_signature_sha256": [
+                            item.signature.signature_sha256
+                            for item in boundary_proxy_evidence
+                        ],
+                        "cache_entry_count_after_review": len(
+                            direct_member_boundary_proxy_cache_entries
+                        ),
+                        "selection_behavior_changed": False,
+                        "full_proxy_gate_still_required": True,
+                        "raw_frames_persisted": False,
+                        "face_embeddings_persisted": False,
+                    }
+                    reporter.log(
+                        "직캠 정확 경계 증거 기록 · "
+                        f"경계 {len(boundary_proxy_evidence)}개 · "
+                        "통과 "
+                        f"{sum(int(item.passed) for item in boundary_proxy_evidence)}개 · "
+                        f"{boundary_proxy_persistence_diagnostics.get('status')} · "
+                        "선택 로직 미적용"
+                    )
                     generic_payload = payload.get(
                         "rendered_proxy_review"
                     )
