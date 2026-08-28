@@ -6540,23 +6540,36 @@ def _load_direct_member_partition_warm_start_profiles(
         return (), diagnostics
 
     entries = payload["entries"]
-    ordered_entries = tuple(
-        entry
-        for _index, entry in sorted(
-            enumerate(entries),
-            key=lambda item: (
-                not (
-                    isinstance(item[1], dict)
-                    and item[1].get("origin")
-                    == "full_visual_selector_feasible"
-                ),
-                item[0],
-            ),
-        )
+    indexed_entries = tuple(enumerate(entries))
+    selected_anchor = next(
+        (
+            item
+            for item in indexed_entries
+            if isinstance(item[1], dict)
+            and item[1].get("origin") == "full_visual_selector_feasible"
+        ),
+        None,
     )
+    ordered_indices: list[int] = []
+    if selected_anchor is not None:
+        ordered_indices.append(selected_anchor[0])
+    ordered_indices.extend(
+        index
+        for index, entry in indexed_entries
+        if index not in ordered_indices
+        and isinstance(entry, dict)
+        and entry.get("origin") != "full_visual_selector_feasible"
+    )
+    ordered_indices.extend(
+        index
+        for index, _entry in indexed_entries
+        if index not in ordered_indices
+    )
+    ordered_entries = tuple(entries[index] for index in ordered_indices)
     diagnostics["entry_count"] = len(entries)
     diagnostics["entry_order_contract"] = (
-        "fully_selected_profile_before_failure_frontier_then_cache_order_v1"
+        "newest_fully_selected_anchor_then_failure_frontier_then_cache_"
+        "order_v2"
     )
     diagnostics["fully_selected_entry_count"] = sum(
         1

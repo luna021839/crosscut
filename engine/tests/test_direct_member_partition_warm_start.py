@@ -271,7 +271,96 @@ class DirectMemberPartitionWarmStartTests(unittest.TestCase):
             self.assertEqual(diagnostics["fully_selected_entry_count"], 1)
             self.assertEqual(
                 diagnostics["entry_order_contract"],
-                "fully_selected_profile_before_failure_frontier_then_cache_order_v1",
+                "newest_fully_selected_anchor_then_failure_frontier_then_"
+                "cache_order_v2",
+            )
+
+    def test_new_failure_frontier_is_not_starved_by_selected_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_directory = Path(temporary_directory)
+            self._write_manifest(cache_directory)
+            binding, _diagnostics = (
+                _direct_member_partition_warm_start_binding(
+                    cache_directory,
+                    self.base,
+                    source_count=8,
+                )
+            )
+            assert binding is not None
+            frontier_counts = (
+                (1, 3, *((4,) * 18)),
+                (2, 2, *((4,) * 18)),
+                (3, 1, *((4,) * 18)),
+                (1, 1, 2, *((4,) * 18)),
+            )
+            selected_counts = (
+                (2, 1, 1, *((4,) * 18)),
+                (1, 2, 1, *((4,) * 18)),
+                (1, 1, 1, 1, *((4,) * 18)),
+            )
+
+            def _entry(
+                counts: tuple[int, ...],
+                origin: str,
+            ) -> dict[str, object]:
+                return {
+                    **binding,
+                    "candidate_partition_signature_sha256": (
+                        _direct_partition_signature_sha256(counts)
+                    ),
+                    "partition_unit_counts": list(counts),
+                    "origin": origin,
+                }
+
+            entries = [
+                *(
+                    _entry(
+                        counts,
+                        "proof_bound_test_frontier",
+                    )
+                    for counts in frontier_counts
+                ),
+                *(
+                    _entry(counts, "full_visual_selector_feasible")
+                    for counts in selected_counts
+                ),
+            ]
+            (
+                cache_directory
+                / _DIRECT_MEMBER_PARTITION_WARM_START_FILENAME
+            ).write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "contract": (
+                            _DIRECT_MEMBER_PARTITION_WARM_START_CONTRACT
+                        ),
+                        "entries": entries,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            profiles, diagnostics = (
+                _load_direct_member_partition_warm_start_profiles(
+                    cache_directory,
+                    self.segments,
+                    self.base,
+                    source_count=8,
+                )
+            )
+
+            self.assertEqual(
+                tuple(profile.unit_counts for profile in profiles),
+                (selected_counts[0], *frontier_counts[:3]),
+            )
+            self.assertEqual(diagnostics["loaded_candidate_count"], 4)
+            self.assertEqual(
+                diagnostics["entry_order_contract"],
+                "newest_fully_selected_anchor_then_failure_frontier_then_"
+                "cache_order_v2",
             )
 
     def test_persisted_candidate_is_reloaded_for_full_recheck(self) -> None:
