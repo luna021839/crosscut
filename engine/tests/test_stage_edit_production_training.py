@@ -202,8 +202,36 @@ def _passing_dynamic_v3_metrics() -> dict:
             },
             "aggregate_normalized_improvement_over_static_prior": 0.04,
             "teacher_forced_count_normalized_time_mae": 0.03,
-            "count": {"label_count": 10, "exact_accuracy": 0.60},
-            "motion": {"label_count": 10, "accuracy": 0.70},
+            "count": {
+                "label_count": 10,
+                "exact_accuracy": 0.60,
+                "target_histogram_1_to_8": [3, 3, 4, 0, 0, 0, 0, 0],
+                "predicted_histogram_1_to_8": [2, 4, 4, 0, 0, 0, 0, 0],
+            },
+            "motion": {
+                "label_count": 10,
+                "accuracy": 0.70,
+                "balanced_accuracy": 0.70,
+                "recall": {"static": 0.60, "dynamic": 0.80},
+            },
+            "curve_delta_and_range": {
+                "zoom": {
+                    "target_mean_range": 0.04,
+                    "predicted_mean_range": 0.03,
+                },
+                "center_x": {
+                    "target_mean_range": 0.01,
+                    "predicted_mean_range": 0.008,
+                },
+                "center_y": {
+                    "target_mean_range": 0.01,
+                    "predicted_mean_range": 0.007,
+                },
+                "roll_degrees": {
+                    "target_mean_range": 0.20,
+                    "predicted_mean_range": 0.16,
+                },
+            },
             "renderer_decode": {
                 "attempt_count": 10,
                 "eligible_count": 10,
@@ -270,6 +298,26 @@ class StageEditProductionQualityTests(unittest.TestCase):
                 0.0,
                 "dynamic_crop_v3_validation_did_not_beat_static_prior",
             ),
+            (
+                ("trajectory", "count", "predicted_histogram_1_to_8"),
+                [10, 0, 0, 0, 0, 0, 0, 0],
+                "dynamic_crop_v3_validation_count_prediction_collapsed",
+            ),
+            (
+                ("trajectory", "motion", "recall", "static"),
+                0.0,
+                "dynamic_crop_v3_validation_motion_prediction_collapsed",
+            ),
+            (
+                (
+                    "trajectory",
+                    "curve_delta_and_range",
+                    "zoom",
+                    "predicted_mean_range",
+                ),
+                0.0,
+                "dynamic_crop_v3_validation_curve_prediction_collapsed",
+            ),
         )
         for path, value, expected_reason in mutations:
             with self.subTest(reason=expected_reason):
@@ -281,6 +329,16 @@ class StageEditProductionQualityTests(unittest.TestCase):
                 rejected = _dynamic_crop_v3_validation_selection_evidence(
                     metrics
                 )
+                if expected_reason == (
+                    "dynamic_crop_v3_validation_curve_prediction_collapsed"
+                ):
+                    for coordinate in ("center_x", "center_y", "roll_degrees"):
+                        metrics["trajectory"]["curve_delta_and_range"][coordinate][
+                            "predicted_mean_range"
+                        ] = 0.0
+                    rejected = _dynamic_crop_v3_validation_selection_evidence(
+                        metrics
+                    )
                 self.assertFalse(rejected["selectable"])
                 self.assertIn(expected_reason, rejected["reasons"])
 
@@ -725,15 +783,32 @@ def _dynamic_crop_corpus(
     for example in examples:
         targets = [None] * len(example.sequence.tokens)
         for token_index, source_id in ((1, "B"), (3, "A")):
+            if token_index == 1:
+                keyframes = (
+                    EditorialTransformKeyframe(
+                        0.0, 1.04, 0.50, 0.50, 0.0
+                    ),
+                )
+                motion_label = "static"
+            else:
+                keyframes = (
+                    EditorialTransformKeyframe(
+                        0.0, 1.03, 0.49, 0.50, -0.2
+                    ),
+                    EditorialTransformKeyframe(
+                        0.4, 1.08, 0.51, 0.49, 0.3
+                    ),
+                    EditorialTransformKeyframe(
+                        0.8, 1.05, 0.50, 0.51, 0.0
+                    ),
+                )
+                motion_label = "dynamic"
             targets[token_index] = DynamicCropTrajectoryTargetV2(
                 shot_index=token_index,
                 source_id=source_id,
                 shot_duration_seconds=1.0,
-                keyframes=(
-                    EditorialTransformKeyframe(0.0, 1.04, 0.50, 0.50, 0.0),
-                    EditorialTransformKeyframe(0.5, 1.06, 0.51, 0.50, 0.0),
-                ),
-                motion_label="dynamic",
+                keyframes=keyframes,
+                motion_label=motion_label,
                 motion_label_loss_masked=False,
                 artifact_content_sha256="a" * 64,
                 build_fingerprint_sha256="b" * 64,

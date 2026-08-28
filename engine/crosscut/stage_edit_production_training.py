@@ -243,6 +243,72 @@ def _finite_metric(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _dynamic_crop_v3_structural_health(
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Summarize whether all structured v3 outputs escaped zero-init collapse."""
+
+    trajectory = metrics.get("trajectory")
+    trajectory = trajectory if isinstance(trajectory, Mapping) else {}
+    count = trajectory.get("count")
+    count = count if isinstance(count, Mapping) else {}
+    target_histogram = count.get("target_histogram_1_to_8")
+    predicted_histogram = count.get("predicted_histogram_1_to_8")
+    target_histogram = (
+        list(target_histogram) if isinstance(target_histogram, list) else []
+    )
+    predicted_histogram = (
+        list(predicted_histogram)
+        if isinstance(predicted_histogram, list)
+        else []
+    )
+    target_class_count = sum(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in target_histogram
+    )
+    predicted_class_count = sum(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in predicted_histogram
+    )
+
+    motion = trajectory.get("motion")
+    motion = motion if isinstance(motion, Mapping) else {}
+    recall = motion.get("recall")
+    recall = recall if isinstance(recall, Mapping) else {}
+
+    curve = trajectory.get("curve_delta_and_range")
+    curve = curve if isinstance(curve, Mapping) else {}
+    target_range_coordinate_count = 0
+    predicted_range_coordinate_count = 0
+    for coordinate in ("zoom", "center_x", "center_y", "roll_degrees"):
+        row = curve.get(coordinate)
+        if not isinstance(row, Mapping):
+            continue
+        target_range = _finite_metric(row.get("target_mean_range"))
+        predicted_range = _finite_metric(row.get("predicted_mean_range"))
+        if target_range is not None and target_range > 1.0e-8:
+            target_range_coordinate_count += 1
+            if predicted_range is not None and predicted_range > 1.0e-8:
+                predicted_range_coordinate_count += 1
+
+    return {
+        "target_observed_count_class_count": target_class_count,
+        "predicted_observed_count_class_count": predicted_class_count,
+        "minimum_predicted_count_class_count": min(3, target_class_count),
+        "count_exact_accuracy": _finite_metric(count.get("exact_accuracy")),
+        "normalized_time_mae": _finite_metric(
+            trajectory.get("teacher_forced_count_normalized_time_mae")
+        ),
+        "motion_balanced_accuracy": _finite_metric(
+            motion.get("balanced_accuracy")
+        ),
+        "motion_static_recall": _finite_metric(recall.get("static")),
+        "motion_dynamic_recall": _finite_metric(recall.get("dynamic")),
+        "target_range_coordinate_count": target_range_coordinate_count,
+        "predicted_range_coordinate_count": predicted_range_coordinate_count,
+    }
+
+
 def _dynamic_crop_v3_validation_selection_evidence(
     metrics: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -319,6 +385,32 @@ def _dynamic_crop_v3_validation_selection_evidence(
     if improvement is None or improvement <= 0.0:
         reasons.append("dynamic_crop_v3_validation_did_not_beat_static_prior")
 
+    structural_health = _dynamic_crop_v3_structural_health(metrics)
+    if (
+        structural_health["target_observed_count_class_count"] < 2
+        or structural_health["predicted_observed_count_class_count"]
+        < structural_health["minimum_predicted_count_class_count"]
+    ):
+        reasons.append("dynamic_crop_v3_validation_count_prediction_collapsed")
+    if (
+        structural_health["count_exact_accuracy"] is None
+        or structural_health["normalized_time_mae"] is None
+    ):
+        reasons.append("dynamic_crop_v3_validation_structured_metrics_missing")
+    if (
+        structural_health["motion_balanced_accuracy"] is None
+        or structural_health["motion_static_recall"] is None
+        or structural_health["motion_dynamic_recall"] is None
+        or structural_health["motion_static_recall"] <= 0.0
+        or structural_health["motion_dynamic_recall"] <= 0.0
+    ):
+        reasons.append("dynamic_crop_v3_validation_motion_prediction_collapsed")
+    if (
+        structural_health["target_range_coordinate_count"] < 1
+        or structural_health["predicted_range_coordinate_count"] < 1
+    ):
+        reasons.append("dynamic_crop_v3_validation_curve_prediction_collapsed")
+
     return {
         "contract": DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT,
         "selectable": not reasons,
@@ -330,6 +422,7 @@ def _dynamic_crop_v3_validation_selection_evidence(
         "minimum_safe_zoom_projection_count": projection_count,
         "target_source_slot_mismatch_count": source_slot_mismatch_count,
         "aggregate_normalized_improvement_over_static_prior": improvement,
+        "structural_health": structural_health,
         "static_prior_can_be_selected": False,
         "heldout_metrics_consumed": False,
     }
