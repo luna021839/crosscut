@@ -10186,6 +10186,8 @@ def _direct_partition_terminal_audition_due(
     maximum_evaluation_count: int = (
         _DIRECT_MEMBER_MAX_STRICT_TERMINAL_AUDITION_COUNT
     ),
+    evaluated_total_profile_count: int = 0,
+    admitted_total_profile_limit: int = 0,
 ) -> bool:
     """Bound strict expansion before the audited hold/effect audition.
 
@@ -10199,6 +10201,8 @@ def _direct_partition_terminal_audition_due(
         ("feasible_profile_count", feasible_profile_count),
         ("queued_profile_count", queued_profile_count),
         ("maximum_evaluation_count", maximum_evaluation_count),
+        ("evaluated_total_profile_count", evaluated_total_profile_count),
+        ("admitted_total_profile_limit", admitted_total_profile_limit),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
@@ -10209,6 +10213,7 @@ def _direct_partition_terminal_audition_due(
         and queued_profile_count > 0
         and evaluated_profile_count
         >= maximum_evaluation_count
+        and evaluated_total_profile_count >= admitted_total_profile_limit
     )
 
 
@@ -11857,6 +11862,12 @@ def _select_direct_member_partition_profile(
                     maximum_evaluation_count=(
                         partition_search_strict_terminal_audition_limit
                     ),
+                    evaluated_total_profile_count=len(attempted),
+                    admitted_total_profile_limit=(
+                        partition_search_evaluation_limit
+                        if partition_search_limit_expansions
+                        else 0
+                    ),
                 ):
                     partition_search_strict_terminal_audition_limit_reached = True
                     partition_search_strict_terminal_audition_pruned_profile_count = (
@@ -11881,6 +11892,11 @@ def _select_direct_member_partition_profile(
                         ),
                         maximum_terminal_candidate_count=(
                             partition_search_strict_terminal_audition_limit
+                        ),
+                        admitted_total_profile_limit=(
+                            partition_search_evaluation_limit
+                            if partition_search_limit_expansions
+                            else 0
                         ),
                         composed_profile_evaluation_count=(
                             partition_search_composed_profile_evaluation_count

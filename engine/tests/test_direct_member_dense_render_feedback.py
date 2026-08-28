@@ -758,6 +758,30 @@ class DirectMemberDenseRenderFeedbackTests(unittest.TestCase):
             )
         )
 
+    def test_terminal_audition_waits_for_admitted_frontier_snapshot(
+        self,
+    ) -> None:
+        self.assertFalse(
+            _direct_partition_terminal_audition_due(
+                evaluated_profile_count=64,
+                feasible_profile_count=0,
+                queued_profile_count=25,
+                maximum_evaluation_count=64,
+                evaluated_total_profile_count=75,
+                admitted_total_profile_limit=77,
+            )
+        )
+        self.assertTrue(
+            _direct_partition_terminal_audition_due(
+                evaluated_profile_count=66,
+                feasible_profile_count=0,
+                queued_profile_count=23,
+                maximum_evaluation_count=64,
+                evaluated_total_profile_count=77,
+                admitted_total_profile_limit=77,
+            )
+        )
+
     def test_terminal_hold_cohort_excludes_content_invalid_profiles(
         self,
     ) -> None:

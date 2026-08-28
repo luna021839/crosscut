@@ -3315,6 +3315,75 @@ class DirectMemberVisualTests(unittest.TestCase):
         ):
             self.assertEqual(len(counterfactual[name]), 64)
 
+    def test_official_pose_detector_miss_uses_verified_structure_proxy(
+        self,
+    ) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(4))
+
+        def provider(
+            _source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            return replace(
+                _descriptor(0.30),
+                pose_backend="structure_hog_fallback",
+                pose_confidence=0.0,
+                pose_embedding=(),
+            )
+
+        selection = select_balanced_direct_member_sources(
+            sources=(Path("zero.mp4"), Path("one.mp4")),
+            canonical_spans=spans,
+            audio_offsets=(0.0, 0.0),
+            source_frame_sizes=((2160, 3840), (2160, 3840)),
+            continuous_official_portrait_fancam_contract=True,
+            config=DirectMemberVisualConfig(beam_width=200),
+            descriptor_provider=provider,
+        )
+
+        self.assertEqual(selection.source_counts, (2, 2))
+        self.assertTrue(
+            all(
+                boundary.mismatch.severe_flags == ()
+                and "verified_structure_pose_proxy"
+                in boundary.mismatch.warning_flags
+                and boundary.mismatch.dense_attention_validation_required
+                for boundary in selection.boundaries
+            )
+        )
+
+    def test_structure_proxy_rejects_disagreeing_pose_and_silhouette(
+        self,
+    ) -> None:
+        spans = tuple((float(index), float(index + 1)) for index in range(4))
+
+        def provider(
+            source_index: int,
+            _source: Path,
+            _source_local_seconds: float,
+        ) -> FrameVisualDescriptor:
+            proxy = (1.0, 0.0, 0.0) if source_index == 0 else (0.0, 1.0, 0.0)
+            return replace(
+                _descriptor(0.30),
+                pose_backend="structure_hog_fallback",
+                pose_confidence=0.0,
+                pose_embedding=(),
+                structure_embedding=proxy,
+                silhouette_embedding=proxy,
+            )
+
+        with self.assertRaises(DirectMemberVisualSelectionError):
+            select_balanced_direct_member_sources(
+                sources=(Path("zero.mp4"), Path("one.mp4")),
+                canonical_spans=spans,
+                audio_offsets=(0.0, 0.0),
+                source_frame_sizes=((2160, 3840), (2160, 3840)),
+                continuous_official_portrait_fancam_contract=True,
+                config=DirectMemberVisualConfig(beam_width=200),
+                descriptor_provider=provider,
+            )
+
     def test_official_4k_source_can_repair_severe_face_scale_without_upscale(
         self,
     ) -> None:

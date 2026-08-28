@@ -230,6 +230,9 @@ class DirectMemberVisualConfig:
     maximum_cross_source_pose_mismatch: float = 0.30
     maximum_cross_source_silhouette_mismatch: float = 0.42
     require_actual_pose_for_cross_source_cut: bool = True
+    allow_verified_structure_pose_proxy_for_cross_source_cut: bool = True
+    maximum_verified_structure_pose_proxy_mismatch: float = 0.22
+    maximum_verified_structure_pose_proxy_silhouette_mismatch: float = 0.30
     boundary_search_radius_frames: int = 0
     boundary_search_step_frames: int = 2
     boundary_search_offset_penalty_per_frame: float = 0.015
@@ -329,6 +332,8 @@ class DirectMemberVisualConfig:
             self.maximum_motion_endpoint_shape_mismatch,
             self.maximum_cross_source_pose_mismatch,
             self.maximum_cross_source_silhouette_mismatch,
+            self.maximum_verified_structure_pose_proxy_mismatch,
+            self.maximum_verified_structure_pose_proxy_silhouette_mismatch,
             self.boundary_search_offset_penalty_per_frame,
             self.duration_balance_weight,
             self.maximum_source_duration_relative_deviation,
@@ -480,6 +485,14 @@ class DirectMemberVisualConfig:
             raise TypeError(
                 "require_actual_pose_for_cross_source_cut must be boolean"
             )
+        if not isinstance(
+            self.allow_verified_structure_pose_proxy_for_cross_source_cut,
+            bool,
+        ):
+            raise TypeError(
+                "allow_verified_structure_pose_proxy_for_cross_source_cut "
+                "must be boolean"
+            )
         if (
             isinstance(self.boundary_search_radius_frames, bool)
             or not isinstance(self.boundary_search_radius_frames, int)
@@ -543,6 +556,8 @@ class DirectMemberVisualConfig:
             self.maximum_motion_endpoint_shape_mismatch,
             self.maximum_cross_source_pose_mismatch,
             self.maximum_cross_source_silhouette_mismatch,
+            self.maximum_verified_structure_pose_proxy_mismatch,
+            self.maximum_verified_structure_pose_proxy_silhouette_mismatch,
             self.terminal_composite_exit_quality_maximum,
             self.terminal_composite_pre_exit_quality_maximum,
             self.terminal_composite_first_quality_drop_minimum,
@@ -741,6 +756,23 @@ class DirectMemberVisualConfig:
                 "require_actual_pose_for_cross_source_cut": (
                     self.require_actual_pose_for_cross_source_cut
                 ),
+                "verified_structure_pose_proxy": {
+                    "enabled": (
+                        self.allow_verified_structure_pose_proxy_for_cross_source_cut
+                    ),
+                    "maximum_structure_pose_mismatch": (
+                        self.maximum_verified_structure_pose_proxy_mismatch
+                    ),
+                    "maximum_silhouette_mismatch": (
+                        self.maximum_verified_structure_pose_proxy_silhouette_mismatch
+                    ),
+                    "official_member_alignment_required": True,
+                    "attention_must_pass_repaired_warning_thresholds": True,
+                    "minimum_scalar_component_count": 4,
+                    "dense_every_output_frame_revalidation_required": True,
+                    "decoded_proxy_revalidation_required": True,
+                    "identity_inference_used": False,
+                },
                 "direction_cosine_policy": (
                     "hard_gate_for_both_moving_cross_source_cuts"
                 ),
@@ -4197,6 +4229,61 @@ def _cut_adjacent_motion_evidence(
     )
 
 
+def _verified_cross_source_structure_pose_proxy(
+    *,
+    continuous_official_portrait_fancam_contract: bool,
+    official_alignment_pair: bool,
+    pose_basis: str | None,
+    pose_mismatch: float | None,
+    silhouette_mismatch: float | None,
+    attention_position_mismatch: float | None,
+    attention_scale_mismatch: float | None,
+    evidence_component_count: int,
+    transform_repair: DirectMemberBoundaryTransformRepair | None,
+    config: DirectMemberVisualConfig,
+) -> bool:
+    """Admit detector misses only when independent render-space evidence agrees.
+
+    A dance frame can have a reliable face/body box and silhouette while the
+    keypoint backend returns no actual pose.  Treating that detector miss as a
+    visual discontinuity removes otherwise strong cuts.  This proxy remains
+    stricter than the ordinary hard-cut thresholds and forces downstream dense
+    frame and decoded-proxy validation; it is never an identity inference.
+    """
+
+    effective_position = (
+        transform_repair.residual_attention_position_mismatch
+        if transform_repair is not None
+        else attention_position_mismatch
+    )
+    effective_scale = (
+        transform_repair.residual_attention_scale_mismatch
+        if transform_repair is not None
+        else attention_scale_mismatch
+    )
+    return bool(
+        config.allow_verified_structure_pose_proxy_for_cross_source_cut
+        and continuous_official_portrait_fancam_contract
+        and official_alignment_pair
+        and pose_basis == "structure_hog_pose_fallback"
+        and pose_mismatch is not None
+        and pose_mismatch
+        <= config.maximum_verified_structure_pose_proxy_mismatch + 1e-9
+        and silhouette_mismatch is not None
+        and silhouette_mismatch
+        <= (
+            config.maximum_verified_structure_pose_proxy_silhouette_mismatch
+            + 1e-9
+        )
+        and effective_position is not None
+        and effective_position <= config.attention_position_warning + 1e-9
+        and effective_scale is not None
+        and effective_scale <= config.attention_scale_warning + 1e-9
+        and evidence_component_count
+        >= max(4, config.minimum_evidence_component_count)
+    )
+
+
 def _boundary_mismatch(
     outgoing: _BoundarySample,
     incoming: _BoundarySample,
@@ -4538,6 +4625,27 @@ def _boundary_mismatch(
                 repairable_attention_flags
             )
 
+    verified_structure_pose_proxy = bool(
+        cross_source_edge
+        and not actual_pose
+        and _verified_cross_source_structure_pose_proxy(
+            continuous_official_portrait_fancam_contract=(
+                continuous_official_portrait_fancam_contract
+            ),
+            official_alignment_pair=official_alignment_pair,
+            pose_basis=pose_basis,
+            pose_mismatch=pose,
+            silhouette_mismatch=silhouette,
+            attention_position_mismatch=attention_position,
+            attention_scale_mismatch=attention_scale,
+            evidence_component_count=len(available),
+            transform_repair=transform_repair,
+            config=config,
+        )
+    )
+    if verified_structure_pose_proxy:
+        warning_flags.append("verified_structure_pose_proxy")
+
     # Motion must be judged in the same portrait-fill/camera domain that will
     # reach the viewer.  Raw source coordinates can reverse or exaggerate
     # apparent travel after an aspect-fill crop, while an authorized pan/zoom
@@ -4636,7 +4744,11 @@ def _boundary_mismatch(
                 if official_face_pair
                 else "cross_source_body_alignment_unrepaired"
             )
-        if config.require_actual_pose_for_cross_source_cut and not actual_pose:
+        if (
+            config.require_actual_pose_for_cross_source_cut
+            and not actual_pose
+            and not verified_structure_pose_proxy
+        ):
             severe_flags.append("cross_source_actual_pose_missing")
         elif (
             pose is not None
@@ -4763,9 +4875,12 @@ def _boundary_mismatch(
         mismatch,
         dense_attention_validation_required=bool(
             cross_source_edge
-            and not _professional_hard_cut_attention_is_repairable(
-                mismatch,
-                config,
+            and (
+                verified_structure_pose_proxy
+                or not _professional_hard_cut_attention_is_repairable(
+                    mismatch,
+                    config,
+                )
             )
         ),
     )
