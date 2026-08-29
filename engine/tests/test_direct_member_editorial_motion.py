@@ -20,7 +20,10 @@ from crosscut.direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     direct_member_source_frame_geometry,
 )
-from crosscut.direct_member_target_face import FOCAL_FACE_BASIS
+from crosscut.direct_member_target_face import (
+    FOCAL_FACE_BASIS,
+    FocalFaceCandidate,
+)
 from crosscut.pose import SILHOUETTE_BACKEND
 from crosscut.render import RenderSegment, RenderTransition, TransitionKind
 from crosscut.visual_feature_cache import CanonicalFrameIdentity
@@ -91,6 +94,82 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             cursor += duration
         return tuple(output)
 
+    def test_registered_reference_temporally_bridges_exact_face(self) -> None:
+        outgoing_reference = FocalFaceCandidate(
+            (0.15, 0.10, 0.10, 0.10),
+            (1.0, 0.0),
+        )
+        incoming_reference = FocalFaceCandidate(
+            (0.60, 0.10, 0.10, 0.10),
+            (1.0, 0.0),
+        )
+        temporal_bridge = FocalFaceCandidate(
+            (0.48, 0.10, 0.10, 0.10),
+            (0.573576, 0.819152),
+        )
+        exact_target = FocalFaceCandidate(
+            (0.42, 0.10, 0.10, 0.10),
+            (-0.342020, 0.939693),
+        )
+        exact_distractor = FocalFaceCandidate(
+            (0.82, 0.10, 0.10, 0.10),
+            (-1.0, 0.0),
+        )
+        provider = object.__new__(DirectMemberDenseFaceProvider)
+        provider._sources = (Path("left.mp4"), Path("right.mp4"))
+        provider._focal_references = [
+            [outgoing_reference],
+            [incoming_reference],
+        ]
+
+        def candidates(source_index: int, seconds: float):
+            if source_index == 0:
+                return (outgoing_reference,)
+            if abs(seconds - 10.0) < 1e-6:
+                return (exact_target, exact_distractor)
+            if abs(seconds - 10.1) < 1e-6:
+                return (temporal_bridge,)
+            return ()
+
+        provider._focal_candidates = candidates
+        recovered = (
+            provider.recover_exact_focal_pair_from_registered_references(
+                0,
+                10.0,
+                1,
+                10.0,
+            )
+        )
+
+        self.assertEqual(
+            recovered,
+            (outgoing_reference, exact_target),
+        )
+        self.assertIn(exact_target, provider._focal_references[1])
+
+    def test_temporal_bridge_never_fabricates_missing_exact_face(self) -> None:
+        reference = FocalFaceCandidate(
+            (0.20, 0.10, 0.10, 0.10),
+            (1.0, 0.0),
+        )
+        provider = object.__new__(DirectMemberDenseFaceProvider)
+        provider._sources = (Path("left.mp4"), Path("right.mp4"))
+        provider._focal_references = [[reference], [reference]]
+        provider._focal_candidates = lambda source, seconds: (
+            (reference,)
+            if source == 0 or seconds > 10.0 + 1e-6
+            else ()
+        )
+
+        self.assertIsNone(
+            provider.recover_exact_focal_pair_from_registered_references(
+                0,
+                10.0,
+                1,
+                10.0,
+            )
+        )
+
     @staticmethod
     def _sample(
         box: tuple[float, float, float, float],
@@ -145,7 +224,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
             plan.analysis_basis,
             "official_target_fancam_face_or_verified_full_subject_dense_"
             "output_frame_boundary_anchored_subject_relative_face_track_"
-            "adaptive_review_v9",
+            "adaptive_review_v10",
         )
 
     def test_required_equal_scale_offset_uses_bilateral_camera_match(self) -> None:
@@ -190,6 +269,43 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(boundary_index, 0)
         self.assertAlmostEqual(position, 0.0, places=7)
         self.assertAlmostEqual(scale, 0.0, places=7)
+
+    def test_required_boundary_already_matched_is_natural_success(self) -> None:
+        boxes = (
+            (0.390, 0.220, 0.20, 0.56),
+            (0.398, 0.218, 0.20, 0.56),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "mismatch": SimpleNamespace(
+                        transform_repair=None,
+                        dense_attention_validation_required=True,
+                    )
+                }
+            },
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        selection.source_frame_geometries = (geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (8.0, 8.0)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source]
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, ())
+        self.assertEqual(plan.natural_match_boundary_indices, (0,))
+        self.assertEqual(plan.boundary_match_count, 0)
+        self.assertIsNone(plan.track_for(0))
+        self.assertIsNone(plan.track_for(1))
 
     def test_stored_geometry_keeps_omitted_trailing_source_slots(self) -> None:
         selection, renders, boxes = self._basic_inputs()
@@ -382,6 +498,7 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         config = DirectMemberEditorialMotionConfig()
 
         self.assertEqual(config.maximum_boundary_zoom, 1.50)
+        self.assertEqual(config.maximum_boundary_upscale_ratio, 1.15)
         self.assertEqual(config.maximum_center_shift, 0.16)
         self.assertEqual(config.maximum_face_residual_position_mismatch, 0.085)
         self.assertEqual(config.maximum_face_residual_scale_mismatch, 0.065)
@@ -407,8 +524,83 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(config.target_events_per_minute, 12.0)
         self.assertEqual(config.minimum_event_spacing_seconds, 2.0)
         self.assertFalse(config.enable_interior_zoom_pulses)
+        self.assertFalse(config.allow_partial_required_boundary_matches)
         self.assertEqual(config.target_rich_motion_events_per_minute, 4.0)
         self.assertEqual(config.interior_pulse_zoom, 1.05)
+
+    def test_boundary_upscale_budget_is_strictly_bounded(self) -> None:
+        with self.assertRaisesRegex(ValueError, "upscale ratio"):
+            DirectMemberEditorialMotionConfig(
+                maximum_boundary_upscale_ratio=1.151,
+            )
+        with self.assertRaisesRegex(ValueError, "upscale ratio"):
+            DirectMemberEditorialMotionConfig(
+                maximum_boundary_upscale_ratio=0.999,
+            )
+
+    def test_1080p_required_match_uses_bounded_upscale_only_as_fallback(
+        self,
+    ) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.22, 0.18, 0.56),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {
+                    "mismatch": SimpleNamespace(
+                        transform_repair=None,
+                        dense_attention_validation_required=True,
+                    )
+                }
+            },
+        )
+        geometry = direct_member_source_frame_geometry((1080, 1920))
+        self.assertEqual(geometry.lossless_zoom_capacity, 1.0)
+        selection.source_frame_geometries = (geometry, geometry)
+        renders = self._renders((0, 1), (8.0, 8.0))
+
+        with self.assertRaises(DirectMemberEditorialMotionError):
+            build_direct_member_editorial_motion_plan(
+                visual_selection=selection,
+                render_segments=renders,
+                transitions=(RenderTransition(),),
+                common_master_start=0.0,
+                geometry_provider=lambda source, _time: self._sample(
+                    boxes[source]
+                ),
+                fps=30.0,
+                config=DirectMemberEditorialMotionConfig(
+                    maximum_boundary_upscale_ratio=1.0,
+                ),
+            )
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=renders,
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(
+                boxes[source]
+            ),
+            fps=30.0,
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, (0,))
+        self.assertIn(
+            "official_fancam_dense_subject_bounded_perceptual_upscale_match",
+            plan.segments[0].reasons + plan.segments[1].reasons,
+        )
+        applied_zooms = tuple(
+            keyframe.zoom
+            for segment in plan.segments
+            if segment.track is not None
+            for keyframe in segment.track.keyframes
+        )
+        self.assertTrue(applied_zooms)
+        self.assertLessEqual(max(applied_zooms), 1.15 + 1e-9)
 
     def test_direct_residual_gates_must_preserve_face_before_subject_order(self) -> None:
         with self.assertRaisesRegex(ValueError, "position residual"):
@@ -671,6 +863,63 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertIn(
             "dense_widened_subject_evidence_missing=1",
             str(raised.exception),
+        )
+
+    def test_partial_required_match_keeps_safe_plan_for_rendered_proxy_review(
+        self,
+    ) -> None:
+        boxes = (
+            (0.40, 0.25, 0.18, 0.50),
+            (0.40, 0.20, 0.18, 0.60),
+        )
+        geometry = direct_member_source_frame_geometry((2160, 3840))
+        repair = DirectMemberBoundaryTransformRepair(
+            transformed_side="outgoing",
+            transformed_source_index=0,
+            zoom=1.20,
+            center_x=0.5,
+            center_y=0.5,
+            source_geometry=geometry,
+            raw_attention_position_mismatch=0.12,
+            raw_attention_scale_mismatch=0.40,
+            residual_attention_position_mismatch=0.0,
+            residual_attention_scale_mismatch=0.0,
+            baseline_face_geometry_mismatch=0.20,
+            transformed_face_geometry_mismatch=0.0,
+            improvement_fraction=1.0,
+            face_visible_fraction=1.0,
+            subject_geometry_basis="pphumanseg_full_subject_silhouette",
+            subject_visible_fraction=1.0,
+            repaired_severe_flags=("attention_scale",),
+        )
+        selection = self._selection(
+            (0, 1),
+            boxes,
+            boundary_overrides={
+                0: {"mismatch": SimpleNamespace(transform_repair=repair)}
+            },
+        )
+        selection.source_frame_geometries = (geometry, geometry)
+
+        plan = build_direct_member_editorial_motion_plan(
+            visual_selection=selection,
+            render_segments=self._renders((0, 1), (1.5, 1.5)),
+            transitions=(RenderTransition(),),
+            common_master_start=0.0,
+            geometry_provider=lambda source, _time: self._sample(boxes[source]),
+            fps=30.0,
+            config=DirectMemberEditorialMotionConfig(
+                minimum_mismatch_improvement_fraction=0.80,
+                allow_partial_required_boundary_matches=True,
+            ),
+        )
+
+        self.assertEqual(plan.accepted_boundary_indices, ())
+        self.assertEqual(plan.natural_match_boundary_indices, ())
+        self.assertEqual(plan.applied_count, 0)
+        self.assertIn(
+            ("required_dense_partial_unresolved", 1),
+            plan.skipped_boundary_reasons,
         )
 
     def test_tier_d_neighbor_does_not_block_a_continuous_required_ramp(
@@ -989,6 +1238,159 @@ class DirectMemberEditorialMotionTests(unittest.TestCase):
         self.assertEqual(diagnostics["decode_count"], 1)
         self.assertEqual(diagnostics["persistent_feature_cache_hit_count"], 2)
         self.assertTrue(FakeSampler.instances[0].closed)
+
+    def test_dense_provider_forwards_direct_cache_and_closes_partial_open(
+        self,
+    ) -> None:
+        direct_root = Path("direct-derived-cache")
+        calls: list[dict[str, object]] = []
+        instances: list[object] = []
+
+        class FailingSecondSampler:
+            def __init__(self, _path: Path, **kwargs: object) -> None:
+                self.closed = False
+                calls.append(dict(kwargs))
+                instances.append(self)
+                if len(instances) == 2:
+                    raise RuntimeError("required cache failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with patch(
+            "crosscut.direct_member_editorial_motion._VideoSampler",
+            FailingSecondSampler,
+        ), patch(
+            "crosscut.direct_member_editorial_motion."
+            "_enable_dense_sequential_frame_reads",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "required cache failed"):
+                DirectMemberDenseFaceProvider(
+                    (Path("first.mp4"), Path("second.mp4")),
+                    feature_cache_directory=Path("legacy-cache"),
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+
+        self.assertEqual(len(calls), 2)
+        for kwargs in calls:
+            self.assertEqual(
+                kwargs["feature_cache_directory"],
+                Path("legacy-cache"),
+            )
+            self.assertEqual(
+                kwargs["feature_derived_cache_directory"],
+                direct_root,
+            )
+            self.assertIs(kwargs["require_persistent_feature_cache"], True)
+        self.assertTrue(instances[0].closed)
+
+    def test_required_cache_guard_preempts_focal_and_dense_ram_fast_paths(
+        self,
+    ) -> None:
+        descriptor = SimpleNamespace(
+            silhouette_bbox_xywh=(0.25, 0.10, 0.50, 0.80),
+            silhouette_confidence=0.90,
+            silhouette_backend=SILHOUETTE_BACKEND,
+            primary_face_bbox=(0.40, 0.20, 0.20, 0.20),
+            face_count=1,
+            face_detector_backend="yunet",
+            formation_people=(),
+        )
+        candidate = FocalFaceCandidate(
+            (0.40, 0.20, 0.20, 0.20),
+            (1.0, 0.0),
+        )
+
+        class GuardedSampler:
+            instances: list["GuardedSampler"] = []
+
+            def __init__(self, _path: Path, **_kwargs: object) -> None:
+                self.frame_decode_count = 0
+                self.guard_unavailable = False
+                self.guard_call_count = 0
+                self.instances.append(self)
+
+            def assert_required_persistent_cache_available(self) -> None:
+                self.guard_call_count += 1
+                if self.guard_unavailable:
+                    raise RuntimeError("required direct cache unavailable")
+
+            def frame_identity(self, seconds: float) -> CanonicalFrameIdentity:
+                return CanonicalFrameIdentity.from_seconds(
+                    seconds,
+                    frame_rate=30.0,
+                )
+
+            def frame_at(self, _seconds: float) -> np.ndarray:
+                self.frame_decode_count += 1
+                return np.zeros((8, 8, 3), dtype="uint8")
+
+            def feature_descriptor_at(
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> object:
+                self.frame_decode_count += 1
+                return descriptor
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "crosscut.direct_member_editorial_motion._VideoSampler",
+            GuardedSampler,
+        ), patch(
+            "crosscut.direct_member_editorial_motion."
+            "_enable_dense_sequential_frame_reads",
+        ), patch(
+            "crosscut.direct_member_editorial_motion."
+            "detect_focal_face_candidates",
+            return_value=(candidate,),
+        ):
+            provider = DirectMemberDenseFaceProvider(
+                (Path("left.mp4"), Path("right.mp4")),
+                feature_derived_cache_directory=Path("direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+            paired = provider.paired_samples(0, 1.0, 1, 1.0)
+            self.assertTrue(all(sample is not None for sample in paired))
+            self.assertTrue(provider._focal_candidate_cache)
+            self.assertTrue(provider._cache)
+            decode_counts = tuple(
+                sampler.frame_decode_count
+                for sampler in GuardedSampler.instances
+            )
+            for sampler in GuardedSampler.instances:
+                sampler.guard_unavailable = True
+
+            guarded_requests = (
+                lambda: provider.paired_samples(0, 1.0, 1, 1.0),
+                lambda: provider.sample(0, 1.0),
+                lambda: provider.recover_exact_focal_pair_from_registered_references(
+                    0,
+                    1.0,
+                    1,
+                    1.0,
+                ),
+            )
+            for request in guarded_requests:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "required direct cache unavailable",
+                ):
+                    request()
+            provider.close()
+
+        self.assertEqual(
+            tuple(
+                sampler.frame_decode_count
+                for sampler in GuardedSampler.instances
+            ),
+            decode_counts,
+        )
+        self.assertEqual(GuardedSampler.instances[0].guard_call_count, 4)
+        self.assertEqual(GuardedSampler.instances[1].guard_call_count, 1)
 
     def test_dense_provider_decodes_proven_adjacent_frames_sequentially(
         self,

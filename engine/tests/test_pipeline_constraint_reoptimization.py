@@ -49,7 +49,9 @@ from crosscut.pipeline import (
     _splice_authorization_refinement_boundary_indices,
     _splice_graph_keys_for_plan,
     _validate_constrained_precomputed_repair_origin,
+    _visual_feature_cache_arguments,
     _merge_visual_boundary_repair_plans,
+    _attempt_proxy_triggered_partial_reedit,
 )
 from crosscut.render import (
     EditorialTransformKeyframe,
@@ -61,7 +63,12 @@ from crosscut.timeline import NoCompleteTimelinePath, ShotType
 from crosscut.timeline_no_good import TimelineNoGoodSet
 from crosscut.timeline_review import TimelineReviewConfig
 from crosscut.visual_boundary_repair import VisualBoundaryRepairPlan
-from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
+from crosscut.visual_score import (
+    PersistentVisualFeatureCacheInitializationError,
+    PersistentVisualFeatureCacheRuntimeError,
+    VisualTimelineChoice,
+    VisualTimelinePlan,
+)
 from crosscut.visual_splice_failure_feedback import (
     splice_feedback_edge_context,
     splice_feedback_edge_context_identity,
@@ -284,6 +291,86 @@ def _hard_assessment():
 
 
 class PipelineConstraintReoptimizationTests(unittest.TestCase):
+    def test_direct_visual_feature_cache_is_strict_while_legacy_fallback_remains(
+        self,
+    ) -> None:
+        legacy_directory = Path("/legacy/source-cache")
+        direct_directory = Path("/direct/derived-cache")
+
+        legacy = _visual_feature_cache_arguments(
+            SimpleNamespace(
+                source_cache_directory=legacy_directory,
+                visual_feature_derived_cache_directory=None,
+            )
+        )
+        self.assertEqual(legacy["feature_cache_directory"], legacy_directory)
+        self.assertIsNone(legacy["feature_derived_cache_directory"])
+        self.assertIs(legacy["require_persistent_feature_cache"], False)
+
+        direct = _visual_feature_cache_arguments(
+            SimpleNamespace(
+                source_cache_directory=legacy_directory,
+                visual_feature_derived_cache_directory=direct_directory,
+            )
+        )
+        self.assertEqual(direct["feature_cache_directory"], legacy_directory)
+        self.assertEqual(
+            direct["feature_derived_cache_directory"],
+            direct_directory,
+        )
+        self.assertIs(direct["require_persistent_feature_cache"], True)
+
+    def test_partial_reedit_propagates_required_cache_failures(self) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        selected_bundle = SimpleNamespace(
+            candidate_origin="test",
+            candidate_lineage=(),
+            visual_timeline=plan,
+            boundary_repairs=object(),
+            splice_graph_authorization={"proxy_eligible": True},
+        )
+        review_payload = {
+            "passed": False,
+            "partial_reedit_boundary_issue_indices": [0],
+        }
+        request = SimpleNamespace(
+            sources=(Path("source-0.mp4"), Path("source-1.mp4")),
+            source_cache_directory=Path("legacy-cache"),
+            visual_feature_derived_cache_directory=Path("derived-cache"),
+        )
+
+        for error_type in (
+            PersistentVisualFeatureCacheInitializationError,
+            PersistentVisualFeatureCacheRuntimeError,
+        ):
+            with self.subTest(error_type=error_type.__name__), patch(
+                "crosscut.pipeline._budgeted_repair_visual_timeline_boundaries",
+                side_effect=error_type("required cache unavailable"),
+            ):
+                with self.assertRaises(error_type):
+                    _attempt_proxy_triggered_partial_reedit(
+                        selected_bundle,
+                        object(),
+                        review_payload,
+                        request=request,
+                        eligible_indices=(0, 1),
+                        audio_offsets=(0.0, 0.0),
+                        scene_cut_times=((), ()),
+                        source_timewarps=(None, None),
+                        source_aspect_ratios=(16 / 9, 16 / 9),
+                        source_durations_seconds=(10.0, 10.0),
+                        beat_period_seconds=None,
+                        phrase_times=(),
+                        section_plan=None,
+                        common_master_start=0.0,
+                        width=1920,
+                        height=1080,
+                        scratch_directory=Path("scratch"),
+                        boundary_descriptor_cache=object(),
+                        splice_feasibility_graph=object(),
+                        boundary_search_budget=object(),
+                    )
+
     def test_automatic_group_authority_names_joint_primary_pool(self) -> None:
         request = SimpleNamespace(
             source_mode=SourceMode.AUTOMATIC,
@@ -1229,6 +1316,85 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         self.assertEqual(audit["repair_call_count"], 1)
         self.assertEqual(audit["repair_result_memo_entry_count"], 1)
         self.assertEqual(audit["repair_result_memo_hit_count"], 1)
+
+    def test_budgeted_boundary_repair_forwards_direct_cache_contract(self) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        repair_plan = _repair_plan(plan, requested=(0,))
+        budget = _BoundarySearchBudget(structural_edge_bound=1)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_root = root / "legacy-source-cache"
+            direct_root = root / "mounted-derived-cache"
+            direct_root.mkdir()
+
+            with patch(
+                "crosscut.pipeline.repair_visual_timeline_boundaries",
+                return_value=repair_plan,
+            ) as repair:
+                result = _budgeted_repair_visual_timeline_boundaries(
+                    budget=budget,
+                    phase="test_direct_cache_contract",
+                    visual_timeline=plan,
+                    sources=(Path("/tmp/source-a.mp4"), Path("/tmp/source-b.mp4")),
+                    audio_offsets=(0.0, 0.0),
+                    scene_cut_times=((), ()),
+                    beat_period_seconds=0.5,
+                    source_timewarps=(None, None),
+                    boundary_indices=(0,),
+                    feature_cache_directory=source_root,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+
+        self.assertIs(result, repair_plan)
+        self.assertEqual(
+            repair.call_args.kwargs["feature_cache_directory"],
+            source_root,
+        )
+        self.assertEqual(
+            repair.call_args.kwargs["feature_derived_cache_directory"],
+            direct_root,
+        )
+        self.assertIs(
+            repair.call_args.kwargs["require_persistent_feature_cache"],
+            True,
+        )
+
+    def test_required_cache_root_loss_preempts_repair_result_memo(self) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        repair_plan = _repair_plan(plan, requested=(0,))
+        budget = _BoundarySearchBudget(structural_edge_bound=1)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            direct_root = root / "mounted-derived-cache"
+            direct_root.mkdir()
+            arguments = {
+                "budget": budget,
+                "phase": "test_required_cache_memo_liveness",
+                "visual_timeline": plan,
+                "sources": (Path("/tmp/source-a.mp4"), Path("/tmp/source-b.mp4")),
+                "audio_offsets": (0.0, 0.0),
+                "scene_cut_times": ((), ()),
+                "beat_period_seconds": 0.5,
+                "source_timewarps": (None, None),
+                "boundary_indices": (0,),
+                "feature_derived_cache_directory": direct_root,
+                "require_persistent_feature_cache": True,
+            }
+            with patch(
+                "crosscut.pipeline.repair_visual_timeline_boundaries",
+                return_value=repair_plan,
+            ) as repair:
+                first = _budgeted_repair_visual_timeline_boundaries(**arguments)
+                direct_root.rename(root / "detached-derived-cache")
+                with self.assertRaises(
+                    PersistentVisualFeatureCacheRuntimeError
+                ) as raised:
+                    _budgeted_repair_visual_timeline_boundaries(**arguments)
+
+            self.assertIs(first, repair_plan)
+            self.assertEqual(repair.call_count, 1)
+            self.assertNotIn(str(root), str(raised.exception))
 
     def test_094259_boundary65_exact_raw_context_search_count_is_one(
         self,

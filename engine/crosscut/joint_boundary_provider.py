@@ -838,6 +838,8 @@ class DecodedBoundaryOptionProvider:
         analysis_basis: str = JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS,
         source_ids: Sequence[str] | None = None,
         feature_cache_directory: Path | None = None,
+        feature_derived_cache_directory: Path | None = None,
+        require_persistent_feature_cache: bool = False,
         descriptor_provider: DescriptorProvider | None = None,
         face_identity_provider: FaceIdentityProvider | None = None,
         transformed_descriptor_provider: (
@@ -936,9 +938,24 @@ class DecodedBoundaryOptionProvider:
             raise TypeError(
                 "transformed_descriptor_provider must be callable or None"
             )
-        if descriptor_provider is not None and feature_cache_directory is not None:
+        if not isinstance(require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be a boolean")
+        if (
+            require_persistent_feature_cache
+            and feature_derived_cache_directory is None
+        ):
             raise ValueError(
-                "feature_cache_directory cannot wrap an explicit descriptor_provider"
+                "require_persistent_feature_cache needs an explicit "
+                "feature_derived_cache_directory"
+            )
+        if descriptor_provider is not None and (
+            feature_cache_directory is not None
+            or feature_derived_cache_directory is not None
+            or require_persistent_feature_cache
+        ):
+            raise ValueError(
+                "persistent feature cache cannot wrap an explicit "
+                "descriptor_provider"
             )
 
         self.sources = resolved_sources
@@ -956,6 +973,14 @@ class DecodedBoundaryOptionProvider:
             Path(feature_cache_directory)
             if feature_cache_directory is not None
             else None
+        )
+        self.feature_derived_cache_directory = (
+            Path(feature_derived_cache_directory)
+            if feature_derived_cache_directory is not None
+            else None
+        )
+        self.require_persistent_feature_cache = (
+            require_persistent_feature_cache
         )
         self._source_index_by_id = {
             source_id: index for index, source_id in enumerate(ids)
@@ -1150,11 +1175,26 @@ class DecodedBoundaryOptionProvider:
                 "transformed_descriptor_backend_identity": (
                     transformed_descriptor_backend_identity
                 ),
+                "direct_persistent_feature_cache_configured": (
+                    self.feature_derived_cache_directory is not None
+                ),
+                "persistent_feature_cache_required": (
+                    self.require_persistent_feature_cache
+                ),
                 "offset_domain": list(JOINT_BOUNDARY_FRAME_OFFSETS),
                 "side_sample_radius_frames": _SIDE_SAMPLE_RADIUS_FRAMES,
                 "scene_cut_guard_frames": _SCENE_CUT_GUARD_FRAMES,
             }
         )
+        if self.require_persistent_feature_cache:
+            try:
+                for source_index in range(len(self.sources)):
+                    self._sampler(source_index)
+            except BaseException:
+                for sampler in self._samplers.values():
+                    sampler.close()
+                self._samplers.clear()
+                raise
 
     def __enter__(self) -> "DecodedBoundaryOptionProvider":
         return self
@@ -1243,6 +1283,15 @@ class DecodedBoundaryOptionProvider:
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("decoded boundary option provider is closed")
+
+    def _assert_required_persistent_cache_available(
+        self,
+        *source_indices: int,
+    ) -> None:
+        if not self.require_persistent_feature_cache:
+            return
+        for source_index in dict.fromkeys(source_indices):
+            self._sampler(source_index).assert_required_persistent_cache_available()
 
     def validate_segment_count(self, segment_count: int) -> None:
         """Fail before selection when the optimizer shape is not this basis."""
@@ -1509,6 +1558,12 @@ class DecodedBoundaryOptionProvider:
             sampler = _VideoSampler(
                 self.sources[source_index],
                 feature_cache_directory=self.feature_cache_directory,
+                feature_derived_cache_directory=(
+                    self.feature_derived_cache_directory
+                ),
+                require_persistent_feature_cache=(
+                    self.require_persistent_feature_cache
+                ),
             )
             self._samplers[source_index] = sampler
         return sampler
@@ -1520,6 +1575,7 @@ class DecodedBoundaryOptionProvider:
     ) -> FrameVisualDescriptor | None:
         if seconds < 0.0:
             return None
+        self._assert_required_persistent_cache_available(source_index)
         cache_source_index = self._cache_source_indices[source_index]
         transaction = self._active_descriptor_cache_transaction
         hit, cached = self.descriptor_cache.lookup(
@@ -1701,6 +1757,10 @@ class DecodedBoundaryOptionProvider:
         self._require_open()
         if not isinstance(key, BoundaryMeasurementKey):
             raise TypeError("joint boundary provider key is invalid")
+        self._assert_required_persistent_cache_available(
+            self._source_index(key.outgoing.source_id),
+            self._source_index(key.incoming.source_id),
+        )
         self.request_count += 1
         memo_key = self._memo_key(key)
         cached = self._memo.get(memo_key)
@@ -4527,7 +4587,12 @@ class DecodedBoundaryOptionProvider:
             raise RuntimeError("bridge disposition batch cannot be re-entered")
         for request in requests:
             self._validate_bridge_disposition_request(request)
-
+        self._assert_required_persistent_cache_available(
+            *(
+                self._source_index(request.candidate.source_id)
+                for request in requests
+            )
+        )
         journal: list[
             tuple[MutableMapping[Any, Any], Any, bool, Any]
         ] = []
@@ -4601,6 +4666,7 @@ class DecodedBoundaryOptionProvider:
             seconds: float,
         ) -> FrameVisualDescriptor | None:
             nonlocal descriptor_snapshot_hits, descriptor_snapshot_misses
+            self._assert_required_persistent_cache_available(source_index)
             key = (
                 self._cache_source_indices[source_index],
                 round(float(seconds), 7),
@@ -4619,6 +4685,7 @@ class DecodedBoundaryOptionProvider:
             descriptor: FrameVisualDescriptor,
         ) -> tuple[float, ...]:
             nonlocal face_snapshot_hits, face_snapshot_misses
+            self._assert_required_persistent_cache_available(source_index)
             key = (source_index, round(float(seconds), 7))
             if key in face_identity_snapshot:
                 face_snapshot_hits += 1
@@ -4770,6 +4837,9 @@ class DecodedBoundaryOptionProvider:
             raise ValueError("entry option does not enter bridge candidate")
         if exit_option.measurement_key.outgoing != candidate:
             raise ValueError("exit option does not leave bridge candidate")
+        self._assert_required_persistent_cache_available(
+            self._source_index(candidate.source_id)
+        )
         self.bridge_request_count += 1
         memo_key = (
             self.analysis_basis,
@@ -5710,6 +5780,49 @@ class DecodedBoundaryOptionProvider:
         self._touch_lru(self._audit_by_key, memo_key)
         return record.to_dict()
 
+    def _persistent_feature_cache_audit(self) -> dict[str, object]:
+        """Summarize sampler cache use without exposing media/cache paths."""
+
+        enabled_sampler_count = 0
+        source_frame_decode_count = 0
+        decode_free_hit_count = 0
+        status_counts: dict[str, int] = {}
+        for sampler in self._samplers.values():
+            diagnostics = sampler.persistent_feature_cache_diagnostics()
+            enabled_sampler_count += int(bool(diagnostics.get("enabled")))
+            status = str(diagnostics.get("status", "diagnostics_unavailable"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+            source_frame_decode_count += int(
+                diagnostics.get("source_frame_decode_count", 0)
+            )
+            decode_free_hit_count += int(
+                diagnostics.get("decode_free_hit_count", 0)
+            )
+        required_source_count = (
+            len(self.sources) if self.require_persistent_feature_cache else 0
+        )
+        return {
+            "contract": "decoded-joint-persistent-feature-cache-audit-v1",
+            "direct_cache_configured": (
+                self.feature_derived_cache_directory is not None
+            ),
+            "required": self.require_persistent_feature_cache,
+            "required_source_count": required_source_count,
+            "initialized_sampler_count": len(self._samplers),
+            "enabled_sampler_count": enabled_sampler_count,
+            "all_required_sources_preflighted": (
+                not self.require_persistent_feature_cache
+                or (
+                    len(self._samplers) == required_source_count
+                    and enabled_sampler_count == required_source_count
+                )
+            ),
+            "source_frame_decode_count": source_frame_decode_count,
+            "decode_free_hit_count": decode_free_hit_count,
+            "sampler_status_counts": dict(sorted(status_counts.items())),
+            "paths_persisted": False,
+        }
+
     def to_dict(self) -> dict[str, object]:
         records = tuple(
             sorted(
@@ -5832,6 +5945,9 @@ class DecodedBoundaryOptionProvider:
             ),
             "face_identity_cache_hit_count": (
                 self.face_identity_cache_hit_count
+            ),
+            "persistent_feature_cache": (
+                self._persistent_feature_cache_audit()
             ),
             "descriptor_cache": self.descriptor_cache.diagnostics(),
             "measurement_audits": [item.to_dict() for item in records],

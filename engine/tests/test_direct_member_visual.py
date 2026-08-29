@@ -2354,6 +2354,108 @@ class DirectMemberVisualTests(unittest.TestCase):
             1,
         )
 
+    def test_video_descriptor_provider_forwards_direct_cache_and_closes_partial_open(
+        self,
+    ) -> None:
+        direct_root = Path("direct-derived-cache")
+        calls: list[dict[str, object]] = []
+        instances: list[object] = []
+
+        class FailingSecondSampler:
+            def __init__(self, _source: Path, **kwargs: object) -> None:
+                self.closed = False
+                calls.append(dict(kwargs))
+                instances.append(self)
+                if len(instances) == 2:
+                    raise RuntimeError("required cache failed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with patch(
+            "crosscut.direct_member_visual._VideoSampler",
+            FailingSecondSampler,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "required cache failed"):
+                _VideoDescriptorProvider(
+                    (Path("first.mp4"), Path("second.mp4")),
+                    feature_cache_directory=Path("legacy-cache"),
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+
+        self.assertEqual(len(calls), 2)
+        for kwargs in calls:
+            self.assertEqual(
+                kwargs["feature_cache_directory"],
+                Path("legacy-cache"),
+            )
+            self.assertEqual(
+                kwargs["feature_derived_cache_directory"],
+                direct_root,
+            )
+            self.assertIs(kwargs["require_persistent_feature_cache"], True)
+        self.assertTrue(instances[0].closed)
+
+    def test_required_cache_guard_preempts_descriptor_ram_fast_path(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.2)
+
+        class GuardedSampler:
+            instances: list["GuardedSampler"] = []
+
+            def __init__(self, _source: Path, **_kwargs: object) -> None:
+                self.guard_unavailable = False
+                self.guard_call_count = 0
+                self.feature_call_count = 0
+                self.instances.append(self)
+
+            def assert_required_persistent_cache_available(self) -> None:
+                self.guard_call_count += 1
+                if self.guard_unavailable:
+                    raise RuntimeError("required direct cache unavailable")
+
+            def frame_identity(self, seconds: float) -> float:
+                return seconds
+
+            def feature_descriptor_at(
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                self.feature_call_count += 1
+                return descriptor
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "crosscut.direct_member_visual._VideoSampler",
+            GuardedSampler,
+        ):
+            provider = _VideoDescriptorProvider(
+                (Path("source.mp4"),),
+                feature_derived_cache_directory=Path("direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+            self.assertIs(
+                provider(0, Path("source.mp4"), 1.0),
+                descriptor,
+            )
+            sampler = GuardedSampler.instances[0]
+            sampler.guard_unavailable = True
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "required direct cache unavailable",
+            ):
+                provider(0, Path("source.mp4"), 1.0)
+            provider.close()
+
+        self.assertEqual(sampler.guard_call_count, 2)
+        self.assertEqual(sampler.feature_call_count, 1)
+        self.assertEqual(provider._cache_hit_count, 0)
+
     def test_visual_path_beats_round_robin_while_remaining_exactly_balanced(self) -> None:
         desired_path = (0, 2, 1, 0, 2, 1)
         spans = tuple((float(index), float(index + 1)) for index in range(6))

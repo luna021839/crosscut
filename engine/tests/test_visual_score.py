@@ -23,9 +23,12 @@ from crosscut.timeline import (
     select_timeline,
 )
 from crosscut.timeline_review import review_timeline
+from crosscut.visual_feature_cache import AnalyzerFingerprint
 from crosscut.visual_score import (
     FrameVisualDescriptor,
     PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS,
+    PersistentVisualFeatureCacheInitializationError,
+    PersistentVisualFeatureCacheRuntimeError,
     ProfessionalMontageSelectionPolicy,
     VisualDiversityConfig,
     VisualTimelineCandidateRecord,
@@ -42,6 +45,7 @@ from crosscut.visual_score import (
     _role_target_categories,
     _safe_cadence_profiles,
     _select_safe_cadence_candidates,
+    _VideoSampler,
     build_visual_timeline,
     describe_boundary_side_stability,
     describe_frame,
@@ -725,6 +729,314 @@ class VisualScoreTests(unittest.TestCase):
         for writer in writers:
             writer.release()
         return paths
+
+    @staticmethod
+    def _cache_analyzer() -> AnalyzerFingerprint:
+        return AnalyzerFingerprint(
+            digest="a" * 64,
+            components={
+                "descriptor_schema": "visual_score_direct_root_test_v1",
+                "model_asset_sha256_or_state": {},
+            },
+        )
+
+    @staticmethod
+    def _cache_descriptor() -> FrameVisualDescriptor:
+        return FrameVisualDescriptor(
+            quality_score=0.8,
+            composition_score=0.8,
+            shot_scale=0.18,
+            shot_type=ShotType.GROUP_WIDE,
+            face_count=0,
+            structure_embedding=(0.0,) * 96,
+            motion=(0.0, 0.0),
+            color_embedding=(0.2,) * 8,
+            face_detector_backend="none",
+            pose_embedding=(0.0,) * 96,
+            pose_confidence=0.0,
+            detected_person_count=0,
+            person_layout_embedding=(),
+            pose_backend="structure_hog_fallback",
+            silhouette_embedding=(),
+            silhouette_area_ratio=0.0,
+            silhouette_confidence=0.0,
+            silhouette_backend="none",
+        )
+
+    def test_required_direct_cache_symlink_fails_before_visual_analysis(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sources = self.write_constant_sources(root, (96, 128))
+            direct_target = root / "direct-target"
+            direct_target.mkdir()
+            direct_link = root / "direct-link"
+            direct_link.symlink_to(direct_target, target_is_directory=True)
+            legacy_root = root / "legacy-unused"
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score._VideoSampler.frame_at",
+                autospec=True,
+            ) as frame_at, patch(
+                "crosscut.visual_score.describe_frame",
+            ) as describe:
+                with self.assertRaises(
+                    PersistentVisualFeatureCacheInitializationError
+                ) as raised:
+                    build_visual_timeline(
+                        sources=sources,
+                        canonical_spans=((1.0, 2.0),),
+                        audio_offsets=(0.0, 0.0),
+                        sync_scores=(0.9, 0.8),
+                        scene_cut_times=((), ()),
+                        feature_cache_directory=legacy_root,
+                        feature_derived_cache_directory=direct_link,
+                        require_persistent_feature_cache=True,
+                    )
+
+            frame_at.assert_not_called()
+            describe.assert_not_called()
+            self.assertFalse(legacy_root.exists())
+            self.assertNotIn(str(direct_link), str(raised.exception))
+
+    def test_direct_cache_warm_locator_hit_decodes_and_describes_no_frame(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            legacy_root = root / "legacy-unused"
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            descriptor = self._cache_descriptor()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=descriptor,
+            ) as describe:
+                cold = _VideoSampler(
+                    source,
+                    feature_cache_directory=legacy_root,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+                cold_descriptor = cold.feature_descriptor_at(1.0)
+                cold.close()
+                warm = _VideoSampler(
+                    source,
+                    feature_cache_directory=legacy_root,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+                warm_descriptor = warm.feature_descriptor_at(1.0)
+                diagnostics = warm.persistent_feature_cache_diagnostics()
+                legacy_diagnostics = warm.feature_cache_diagnostics()
+                warm.close()
+
+            self.assertEqual(cold_descriptor, descriptor)
+            self.assertEqual(warm_descriptor, descriptor)
+            self.assertEqual(describe.call_count, 1)
+            self.assertEqual(diagnostics["source_frame_decode_count"], 0)
+            self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+            self.assertTrue(diagnostics["enabled"])
+            self.assertEqual(diagnostics["status"], "enabled")
+            self.assertFalse(diagnostics["local_paths_exposed"])
+            self.assertEqual(legacy_diagnostics, diagnostics)
+            self.assertNotIn(str(root), repr(diagnostics))
+            self.assertFalse(legacy_root.exists())
+            self.assertTrue(tuple(direct_root.rglob("*.json")))
+
+    def test_legacy_optional_cache_initialization_fallback_is_preserved(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            cache_target = root / "cache-target"
+            cache_target.mkdir()
+            cache_link = root / "cache-link"
+            cache_link.symlink_to(cache_target, target_is_directory=True)
+            descriptor = self._cache_descriptor()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=descriptor,
+            ) as describe:
+                sampler = _VideoSampler(
+                    source,
+                    feature_cache_directory=cache_link,
+                )
+                actual = sampler.feature_descriptor_at(1.0)
+                status = sampler.persistent_feature_cache_diagnostics()
+                legacy_diagnostics = sampler.feature_cache_diagnostics()
+                sampler.close()
+
+            self.assertEqual(actual, descriptor)
+            self.assertEqual(describe.call_count, 1)
+            self.assertIsNone(legacy_diagnostics)
+            self.assertFalse(status["enabled"])
+            self.assertEqual(status["status"], "initialization_failed_optional")
+            self.assertEqual(status["source_frame_decode_count"], 1)
+            self.assertEqual(status["decode_free_hit_count"], 0)
+            self.assertEqual(status["initialization_error_type"], "ValueError")
+            self.assertFalse(status["local_paths_exposed"])
+            self.assertNotIn(str(root), repr(status))
+
+    def test_required_cache_runtime_root_loss_fails_before_frame_decode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch.object(
+                _VideoSampler,
+                "frame_at",
+                autospec=True,
+            ) as frame_at, patch(
+                "crosscut.visual_score.describe_frame",
+            ) as describe:
+                sampler = _VideoSampler(
+                    source,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+                direct_root.rename(root / "detached-derived")
+                with self.assertRaises(
+                    PersistentVisualFeatureCacheRuntimeError
+                ) as raised:
+                    sampler.feature_descriptor_at(1.0)
+                diagnostics = sampler.persistent_feature_cache_diagnostics()
+                sampler.close()
+
+            frame_at.assert_not_called()
+            describe.assert_not_called()
+            self.assertEqual(diagnostics["status"], "runtime_io_failed_required")
+            self.assertEqual(diagnostics["runtime_failure_count"], 1)
+            self.assertEqual(
+                diagnostics["runtime_error_type"],
+                "PersistentVisualFeatureCacheStorageUnavailableError",
+            )
+            self.assertEqual(diagnostics["storage_io_failure_count"], 1)
+            self.assertFalse(diagnostics["local_paths_exposed"])
+            self.assertNotIn(str(root), str(raised.exception))
+            self.assertNotIn(str(root), repr(diagnostics))
+
+    def test_required_cache_root_loss_preempts_sampler_descriptor_lru(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            descriptor = self._cache_descriptor()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=descriptor,
+            ) as describe:
+                sampler = _VideoSampler(
+                    source,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+                self.assertEqual(sampler.feature_descriptor_at(1.0), descriptor)
+                direct_root.rename(root / "detached-derived")
+                with self.assertRaises(
+                    PersistentVisualFeatureCacheRuntimeError
+                ) as raised:
+                    sampler.feature_descriptor_at(1.0)
+                diagnostics = sampler.persistent_feature_cache_diagnostics()
+                sampler.close()
+
+            self.assertEqual(describe.call_count, 1)
+            self.assertEqual(diagnostics["status"], "runtime_io_failed_required")
+            self.assertEqual(diagnostics["runtime_failure_count"], 1)
+            self.assertNotIn(str(root), str(raised.exception))
+
+    def test_required_cache_atomic_write_failure_is_not_silenced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            descriptor = self._cache_descriptor()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=descriptor,
+            ) as describe, patch(
+                "crosscut.visual_feature_cache.os.replace",
+                side_effect=OSError("simulated atomic replace failure"),
+            ):
+                sampler = _VideoSampler(
+                    source,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+                with self.assertRaises(
+                    PersistentVisualFeatureCacheRuntimeError
+                ) as raised:
+                    sampler.feature_descriptor_at(1.0)
+                diagnostics = sampler.persistent_feature_cache_diagnostics()
+                sampler.close()
+
+            self.assertEqual(describe.call_count, 1)
+            self.assertEqual(diagnostics["status"], "runtime_io_failed_required")
+            self.assertEqual(
+                diagnostics["runtime_error_type"],
+                "PersistentVisualFeatureCacheWriteError",
+            )
+            self.assertEqual(diagnostics["atomic_write_failure_count"], 1)
+            self.assertEqual(diagnostics["write_count"], 0)
+            self.assertFalse(diagnostics["local_paths_exposed"])
+            self.assertNotIn(str(root), str(raised.exception))
+            self.assertNotIn(str(root), repr(diagnostics))
+
+    def test_optional_cache_runtime_loss_recomputes_and_disables_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = self.write_constant_sources(root, (118,))[0]
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            descriptor = self._cache_descriptor()
+            with patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint",
+                return_value=self._cache_analyzer(),
+            ), patch(
+                "crosscut.visual_score.describe_frame",
+                return_value=descriptor,
+            ) as describe:
+                sampler = _VideoSampler(
+                    source,
+                    feature_derived_cache_directory=direct_root,
+                )
+                direct_root.rename(root / "detached-derived")
+                actual = sampler.feature_descriptor_at(1.0)
+                diagnostics = sampler.persistent_feature_cache_diagnostics()
+                sampler.close()
+
+            self.assertEqual(actual, descriptor)
+            self.assertEqual(describe.call_count, 1)
+            self.assertFalse(diagnostics["enabled"])
+            self.assertEqual(diagnostics["status"], "runtime_io_failed_optional")
+            self.assertEqual(diagnostics["runtime_failure_count"], 1)
+            self.assertFalse(diagnostics["local_paths_exposed"])
+            self.assertNotIn(str(root), repr(diagnostics))
 
     def test_dissolve_window_samples_future_handle_and_rejects_scene_cut(self) -> None:
         geometry = (0.45, 0.35, 0.55, 0.35, 0.10, 0.0, 0.0, 0.5, 1.0, 0.0)

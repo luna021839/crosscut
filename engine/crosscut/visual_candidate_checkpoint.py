@@ -235,13 +235,14 @@ class CheckpointCodeFingerprintMigration:
 VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
     CheckpointCodeFingerprintMigration(
         contract=(
-            "whole_import_node_ast_v1_to_alias_ast_v2_20260829"
+            "whole_import_node_ast_v1_to_alias_ast_v2_"
+            "direct_cache_routing_v3_20260830"
         ),
         legacy_selector_code_sha256=(
             "363acfa826d846bfc62396f483ce1adc6d0b1ff903ffd32c39630dc2db70e857"
         ),
         current_selector_code_sha256=(
-            "9ad134a8bac4a4946bb56d5ca4d161ee226320fe2504b826fda6ad1c5abc5982"
+            "d1529daef216659bf3fa9b482a1fb5ab1bf53ec8c1ac1b3f486b2d65ae349230"
         ),
         legacy_crop_rerank_code_sha256=(
             "23aa118ec3a822544ca36d90ba72c821a6e9157175efe863b7c181b6e73a97ba"
@@ -249,6 +250,38 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
         current_crop_rerank_code_sha256=(
             "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
         ),
+    ),
+    CheckpointCodeFingerprintMigration(
+        contract="alias_ast_v2_direct_cache_routing_v2_to_v3_20260830",
+        legacy_selector_code_sha256=(
+            "9ad134a8bac4a4946bb56d5ca4d161ee226320fe2504b826fda6ad1c5abc5982"
+        ),
+        current_selector_code_sha256=(
+            "d1529daef216659bf3fa9b482a1fb5ab1bf53ec8c1ac1b3f486b2d65ae349230"
+        ),
+        legacy_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        current_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        legacy_fingerprint_contract=PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    ),
+    CheckpointCodeFingerprintMigration(
+        contract="alias_ast_v2_strict_cache_liveness_v3_to_v4_20260830",
+        legacy_selector_code_sha256=(
+            "59aa2115e68c773db670641ecf44581006ab6a0bb4dc7d70f8f6e65d87e731e8"
+        ),
+        current_selector_code_sha256=(
+            "d1529daef216659bf3fa9b482a1fb5ab1bf53ec8c1ac1b3f486b2d65ae349230"
+        ),
+        legacy_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        current_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        legacy_fingerprint_contract=PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
     ),
 )
 

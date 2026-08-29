@@ -549,6 +549,110 @@ class RequestTests(unittest.TestCase):
                     }
                 )
 
+    def test_visual_feature_derived_cache_directory_round_trips_when_present(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            direct_derived_root = root / "mounted-derived-cache"
+            direct_derived_root.mkdir()
+            request = AnalysisRequest.from_dict(
+                {
+                    "song": "I AM",
+                    "edit_mode": "group",
+                    "source_mode": "automatic",
+                    "sources": [],
+                    "visual_feature_derived_cache_directory": str(
+                        direct_derived_root
+                    ),
+                }
+            )
+
+            self.assertEqual(
+                request.visual_feature_derived_cache_directory,
+                direct_derived_root.resolve(strict=True),
+            )
+            serialized = request.as_dict()
+            self.assertEqual(
+                serialized["visual_feature_derived_cache_directory"],
+                str(direct_derived_root.resolve(strict=True)),
+            )
+            self.assertEqual(
+                AnalysisRequest.from_dict(
+                    serialized
+                ).visual_feature_derived_cache_directory,
+                request.visual_feature_derived_cache_directory,
+            )
+
+    def test_visual_feature_derived_cache_directory_defaults_to_none(self) -> None:
+        request = AnalysisRequest.from_dict(
+            {
+                "song": "I AM",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+                "sources": [],
+            }
+        )
+
+        self.assertIsNone(request.visual_feature_derived_cache_directory)
+        self.assertNotIn(
+            "visual_feature_derived_cache_directory",
+            request.as_dict(),
+        )
+
+    def test_visual_feature_derived_cache_directory_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            existing_directory = root / "real-derived-cache"
+            existing_directory.mkdir()
+            symlink = root / "derived-cache-link"
+            symlink.symlink_to(existing_directory, target_is_directory=True)
+            existing_file = root / "derived-cache-file"
+            existing_file.write_text("not a directory", encoding="utf-8")
+            common = {
+                "song": "I AM",
+                "edit_mode": "group",
+                "source_mode": "automatic",
+                "sources": [],
+            }
+
+            for invalid in (None, "", "   ", 1, [], {}):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError,
+                    "must be a non-empty string",
+                ):
+                    AnalysisRequest.from_dict(
+                        {
+                            **common,
+                            "visual_feature_derived_cache_directory": invalid,
+                        }
+                    )
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                AnalysisRequest.from_dict(
+                    {
+                        **common,
+                        "visual_feature_derived_cache_directory": str(symlink),
+                    }
+                )
+            with self.assertRaisesRegex(ValueError, "must exist"):
+                AnalysisRequest.from_dict(
+                    {
+                        **common,
+                        "visual_feature_derived_cache_directory": str(
+                            root / "missing-derived-cache"
+                        ),
+                    }
+                )
+            with self.assertRaisesRegex(ValueError, "must be a directory"):
+                AnalysisRequest.from_dict(
+                    {
+                        **common,
+                        "visual_feature_derived_cache_directory": str(
+                            existing_file
+                        ),
+                    }
+                )
+
     def test_group_default_floor_is_eight_but_explicit_counts_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

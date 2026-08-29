@@ -350,6 +350,8 @@ from .visual_candidate_materialization import (
     materialize_visual_timeline_candidates,
 )
 from .visual_score import (
+    PersistentVisualFeatureCacheInitializationError,
+    PersistentVisualFeatureCacheRuntimeError,
     ProfessionalMontageSelectionPolicy,
     VisualTimelineCandidateSet,
     VisualTimelineChoice,
@@ -375,6 +377,8 @@ from .visual_candidate_checkpoint import (
 )
 from .visual_feature_cache import (
     PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    PersistentVisualFeatureCacheStorageUnavailableError,
+    assert_visual_feature_derived_cache_root_available,
     python_symbol_dependency_sha256,
 )
 from .visual_local_source_repair import (
@@ -1421,10 +1425,27 @@ def _budgeted_repair_visual_timeline_boundaries(
     boundary_indices: Sequence[int] | None = None,
     descriptor_cache: BoundaryDescriptorCache | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     config: BoundaryRepairConfig | None = None,
 ) -> VisualBoundaryRepairPlan:
     if not isinstance(budget, _BoundarySearchBudget):
         raise TypeError("ordinary boundary repair needs a search budget")
+    if not isinstance(require_persistent_feature_cache, bool):
+        raise TypeError("require_persistent_feature_cache must be boolean")
+    if require_persistent_feature_cache:
+        if feature_derived_cache_directory is None:
+            raise PersistentVisualFeatureCacheInitializationError(
+                "persistent visual feature cache is required but was not configured"
+            )
+        try:
+            assert_visual_feature_derived_cache_root_available(
+                feature_derived_cache_directory
+            )
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            raise PersistentVisualFeatureCacheRuntimeError(
+                "required persistent visual feature cache failed during analysis"
+            ) from None
     settings = config or BoundaryRepairConfig()
     request_identity = _boundary_repair_request_identity(
         visual_timeline=visual_timeline,
@@ -1458,6 +1479,10 @@ def _budgeted_repair_visual_timeline_boundaries(
             boundary_indices=boundary_indices,
             descriptor_cache=descriptor_cache,
             feature_cache_directory=feature_cache_directory,
+            feature_derived_cache_directory=feature_derived_cache_directory,
+            require_persistent_feature_cache=(
+                require_persistent_feature_cache
+            ),
             config=settings,
         )
         budget.remember_repair(request_identity, result)
@@ -19146,6 +19171,27 @@ def _route_visual_timeline_selection_failure(
     )
 
 
+def _visual_feature_cache_arguments(
+    request: AnalysisRequest,
+) -> dict[str, Path | bool | None]:
+    """Bind legacy and explicit derived-cache roots without persisting paths."""
+
+    direct_directory = getattr(
+        request,
+        "visual_feature_derived_cache_directory",
+        None,
+    )
+    return {
+        "feature_cache_directory": getattr(
+            request,
+            "source_cache_directory",
+            None,
+        ),
+        "feature_derived_cache_directory": direct_directory,
+        "require_persistent_feature_cache": direct_directory is not None,
+    }
+
+
 def _derive_complete_joint_group_candidate(
     materialized: JointMaterializedVisualCandidate,
     *,
@@ -19463,7 +19509,7 @@ def _derive_complete_group_candidate(
                     source_timewarps=source_timewarps,
                     boundary_indices=remaining_boundary_indices,
                     descriptor_cache=boundary_descriptor_cache,
-                    feature_cache_directory=request.source_cache_directory,
+                    **_visual_feature_cache_arguments(request),
                 )
                 if splice_feasibility_graph is not None:
                     _record_boundary_repair_assessments(
@@ -19494,7 +19540,7 @@ def _derive_complete_group_candidate(
                 beat_period_seconds=beat_period_seconds,
                 source_timewarps=source_timewarps,
                 descriptor_cache=boundary_descriptor_cache,
-                feature_cache_directory=request.source_cache_directory,
+                **_visual_feature_cache_arguments(request),
             )
             if splice_feasibility_graph is not None:
                 _record_boundary_repair_assessments(
@@ -19559,7 +19605,7 @@ def _derive_complete_group_candidate(
                 source_timewarps=source_timewarps,
                 boundary_indices=adaptive_boundary_indices,
                 descriptor_cache=boundary_descriptor_cache,
-                feature_cache_directory=request.source_cache_directory,
+                **_visual_feature_cache_arguments(request),
                 config=BoundaryRepairConfig(
                     search_radius_frames=8,
                     interior_scene_cut_guard_frames=9,
@@ -19685,7 +19731,7 @@ def _derive_complete_group_candidate(
                     source_timewarps=source_timewarps,
                     boundary_indices=stale_boundary_indices,
                     descriptor_cache=boundary_descriptor_cache,
-                    feature_cache_directory=request.source_cache_directory,
+                    **_visual_feature_cache_arguments(request),
                     config=BoundaryRepairConfig(
                         search_radius_frames=8,
                         interior_scene_cut_guard_frames=9,
@@ -19883,7 +19929,7 @@ def _derive_complete_group_candidate(
             audio_offsets=audio_offsets,
             scene_cut_times=scene_cut_times,
             source_timewarps=source_timewarps,
-            feature_cache_directory=request.source_cache_directory,
+            **_visual_feature_cache_arguments(request),
         )
 
     group_transition_plan: GroupTransitionPlan | None = None
@@ -21117,7 +21163,7 @@ def _attempt_proxy_triggered_partial_reedit(
             source_timewarps=source_timewarps,
             boundary_indices=issue_indices,
             descriptor_cache=boundary_descriptor_cache,
-            feature_cache_directory=request.source_cache_directory,
+            **_visual_feature_cache_arguments(request),
             config=BoundaryRepairConfig(
                 search_radius_frames=8,
                 interior_scene_cut_guard_frames=9,
@@ -21432,6 +21478,14 @@ def _attempt_proxy_triggered_partial_reedit(
             )
         audit["reason"] = "decoded_proxy_rank_did_not_improve"
     except _BoundarySearchBudgetExhausted:
+        raise
+    except (
+        PersistentVisualFeatureCacheInitializationError,
+        PersistentVisualFeatureCacheRuntimeError,
+    ):
+        # An explicit derived-cache root is a production prerequisite.  Do not
+        # disguise initialization or mid-analysis storage loss as a harmless
+        # local repair miss and then retain a stale candidate.
         raise
     except (OSError, RuntimeError, TypeError, ValueError, cv2.error) as exc:
         audit["reason"] = "partial_reedit_failed_original_retained"
@@ -22664,7 +22718,7 @@ def _attempt_stage_edit_windowed_beam_reedit(
                 sync_scores=sync_scores,
                 scene_cut_times=scene_cut_times,
                 source_timewarps=source_timewarps,
-                feature_cache_directory=request.source_cache_directory,
+                **_visual_feature_cache_arguments(request),
             )
             bundle = _derive_complete_group_candidate(
                 materialized,
@@ -24287,7 +24341,7 @@ def _materialize_registered_stage_edit_preflight(
         rhythm=rhythm,
         section_plan=section_plan,
         output_directory=inference_artifact_root,
-        feature_cache_directory=request.source_cache_directory,
+        **_visual_feature_cache_arguments(request),
         maximum_sequence_length=bundle.maximum_sequence_length,
         maximum_sources=bundle.maximum_sources,
         causal_sensing=causal_sensing.stage_edit_artifacts,
@@ -25549,7 +25603,7 @@ def analyze(
                 # Only source-local numeric descriptors are persisted here.
                 # Timeline optimization/review/exact-eight/proxy gates always
                 # run again for every analysis.
-                "feature_cache_directory": request.source_cache_directory,
+                **_visual_feature_cache_arguments(request),
                 "preferred_source_indices": tuple(
                     item.source_index for item in group_draft.segments
                 ),
@@ -25609,9 +25663,7 @@ def analyze(
                                 hybrid_visual_floor_candidate=(
                                     hybrid_floor_values[0]
                                 ),
-                                feature_cache_directory=(
-                                    request.source_cache_directory
-                                ),
+                                **_visual_feature_cache_arguments(request),
                                 progress_callback=(
                                     lambda candidate_position,
                                     candidate_total,
@@ -25808,9 +25860,7 @@ def analyze(
                             group_draft.beat_period_seconds
                         ),
                         beat_intensity=rhythm_analysis.tempo_confidence,
-                        feature_cache_directory=(
-                            request.source_cache_directory
-                        ),
+                        **_visual_feature_cache_arguments(request),
                     )
                     provider_audit_before_close: dict[str, Any] | None = None
 
@@ -27743,9 +27793,7 @@ def analyze(
                                     descriptor_cache=(
                                         boundary_descriptor_cache
                                     ),
-                                    feature_cache_directory=(
-                                        request.source_cache_directory
-                                    ),
+                                    **_visual_feature_cache_arguments(request),
                                     config=BoundaryRepairConfig(
                                         search_radius_frames=8,
                                         interior_scene_cut_guard_frames=9,
@@ -28639,7 +28687,7 @@ def analyze(
                     scene_cut_times=scene_cut_times,
                     beat_period_seconds=group_draft.beat_period_seconds,
                     source_timewarps=eligible_timewarps,
-                    feature_cache_directory=request.source_cache_directory,
+                    **_visual_feature_cache_arguments(request),
                 )
                 visual_timeline = visual_boundary_repairs.timeline
                 reporter.log(
@@ -28707,9 +28755,7 @@ def analyze(
                             audio_offsets=offsets,
                             scene_cut_times=scene_cut_times,
                             source_timewarps=eligible_timewarps,
-                            feature_cache_directory=(
-                                request.source_cache_directory
-                            ),
+                            **_visual_feature_cache_arguments(request),
                         )
                     )
                 group_transition_plan = build_group_transition_plan(
@@ -30209,7 +30255,7 @@ def analyze(
             # alive across both so a 26-second proof does not repay feature IO.
             direct_visual_descriptor_provider = _VideoDescriptorProvider(
                 eligible_direct_sources,
-                feature_cache_directory=request.source_cache_directory,
+                **_visual_feature_cache_arguments(request),
             )
 
             def _select_direct_member_render_path(
@@ -30560,7 +30606,7 @@ def analyze(
             try:
                 dense_face_provider = DirectMemberDenseFaceProvider(
                     tuple(request.sources[index] for index in eligible_indices),
-                    feature_cache_directory=request.source_cache_directory,
+                    **_visual_feature_cache_arguments(request),
                 )
 
                 def direct_member_geometry_provider(

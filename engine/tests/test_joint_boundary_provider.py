@@ -19,6 +19,7 @@ from crosscut.joint_timeline import (
     BoundaryOffsetDisposition,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    SegmentBridgeProof,
     SegmentBridgeDisposition,
     SegmentBridgeDispositionRequest,
     select_joint_timeline,
@@ -121,6 +122,9 @@ def _provider(
     beat_period_seconds=None,
     beat_intensity=None,
     face_identity_provider=None,
+    feature_cache_directory=None,
+    feature_derived_cache_directory=None,
+    require_persistent_feature_cache=False,
 ) -> DecodedBoundaryOptionProvider:
     return DecodedBoundaryOptionProvider(
         sources=sources,
@@ -140,6 +144,9 @@ def _provider(
         face_identity_provider=face_identity_provider,
         transformed_descriptor_provider=transformed_descriptor_provider,
         source_ids=source_ids,
+        feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
     )
 
 
@@ -250,6 +257,246 @@ class _CountingBoundaryDescriptorCache(BoundaryDescriptorCache):
 
 
 class DecodedBoundaryOptionProviderTests(unittest.TestCase):
+    def test_required_direct_feature_cache_preflights_every_source_before_dp(
+        self,
+    ) -> None:
+        created: list[tuple[Path, dict[str, object]]] = []
+        closed: list[Path] = []
+
+        class _PersistentSampler:
+            def __init__(self, path: Path, **kwargs: object) -> None:
+                self.path = path
+                created.append((path, dict(kwargs)))
+
+            def persistent_feature_cache_diagnostics(self) -> dict[str, object]:
+                return {
+                    "enabled": True,
+                    "status": "enabled",
+                    "source_frame_decode_count": 0,
+                    "decode_free_hit_count": 0,
+                }
+
+            def close(self) -> None:
+                closed.append(self.path)
+
+        sources = tuple(Path(f"/private/source-{index}.mp4") for index in range(3))
+        direct_cache = Path("/private/direct-derived-cache")
+        with mock.patch(
+            "crosscut.joint_boundary_provider._VideoSampler",
+            _PersistentSampler,
+        ):
+            provider = DecodedBoundaryOptionProvider(
+                sources=sources,
+                audio_offsets=(0.0,) * 3,
+                scene_cut_times=((),) * 3,
+                source_timewarps=(None,) * 3,
+                descriptor_cache=BoundaryDescriptorCache(maximum_entries=128),
+                output_fps=FPS,
+                feature_cache_directory=Path("/private/legacy-source-cache"),
+                feature_derived_cache_directory=direct_cache,
+                require_persistent_feature_cache=True,
+            )
+
+            self.assertEqual(tuple(item[0] for item in created), sources)
+            for _path, kwargs in created:
+                self.assertEqual(
+                    kwargs["feature_cache_directory"],
+                    Path("/private/legacy-source-cache"),
+                )
+                self.assertEqual(
+                    kwargs["feature_derived_cache_directory"], direct_cache
+                )
+                self.assertIs(kwargs["require_persistent_feature_cache"], True)
+            audit = provider.to_dict()["persistent_feature_cache"]
+            self.assertEqual(audit["required_source_count"], 3)
+            self.assertEqual(audit["initialized_sampler_count"], 3)
+            self.assertEqual(audit["enabled_sampler_count"], 3)
+            self.assertTrue(audit["all_required_sources_preflighted"])
+            self.assertEqual(audit["source_frame_decode_count"], 0)
+            self.assertEqual(audit["decode_free_hit_count"], 0)
+            serialized = json.dumps(audit, sort_keys=True)
+            self.assertNotIn("/private/", serialized)
+            self.assertEqual(provider.request_count, 0)
+            provider.close()
+
+        self.assertEqual(closed, list(sources))
+
+    def test_required_direct_feature_cache_failure_closes_partial_preflight(
+        self,
+    ) -> None:
+        created: list[Path] = []
+        closed: list[Path] = []
+
+        class _FailingPersistentSampler:
+            def __init__(self, path: Path, **_kwargs: object) -> None:
+                created.append(path)
+                if path.name == "source-1.mp4":
+                    raise ValueError("persistent feature cache unavailable")
+                self.path = path
+
+            def close(self) -> None:
+                closed.append(self.path)
+
+        sources = tuple(Path(f"/private/source-{index}.mp4") for index in range(3))
+        with (
+            mock.patch(
+                "crosscut.joint_boundary_provider._VideoSampler",
+                _FailingPersistentSampler,
+            ),
+            self.assertRaisesRegex(ValueError, "cache unavailable"),
+        ):
+            DecodedBoundaryOptionProvider(
+                sources=sources,
+                audio_offsets=(0.0,) * 3,
+                scene_cut_times=((),) * 3,
+                source_timewarps=(None,) * 3,
+                descriptor_cache=BoundaryDescriptorCache(maximum_entries=128),
+                output_fps=FPS,
+                feature_derived_cache_directory=Path("/private/direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+
+        self.assertEqual(created, list(sources[:2]))
+        self.assertEqual(closed, [sources[0]])
+
+    def test_required_persistent_feature_cache_needs_direct_directory(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "feature_derived_cache_directory",
+        ):
+            DecodedBoundaryOptionProvider(
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                source_timewarps=(None, None),
+                descriptor_cache=BoundaryDescriptorCache(maximum_entries=128),
+                output_fps=FPS,
+                require_persistent_feature_cache=True,
+            )
+
+    def test_required_cache_guard_preempts_joint_ram_and_memo_fast_paths(
+        self,
+    ) -> None:
+        class _GuardedSampler:
+            instances: list["_GuardedSampler"] = []
+
+            def __init__(self, path: Path, **_kwargs: object) -> None:
+                self.path = path
+                self.guard_unavailable = False
+                self.guard_call_count = 0
+                self.instances.append(self)
+
+            def assert_required_persistent_cache_available(self) -> None:
+                self.guard_call_count += 1
+                if self.guard_unavailable:
+                    raise RuntimeError("required direct cache unavailable")
+
+            def close(self) -> None:
+                return None
+
+        with mock.patch(
+            "crosscut.joint_boundary_provider._VideoSampler",
+            _GuardedSampler,
+        ):
+            provider = DecodedBoundaryOptionProvider(
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                source_timewarps=(None, None),
+                descriptor_cache=BoundaryDescriptorCache(maximum_entries=128),
+                output_fps=FPS,
+                total_segment_count=3,
+                feature_derived_cache_directory=Path("direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+            key = _key()
+            provider._memo[provider._memo_key(key)] = object()  # type: ignore[assignment]
+
+            first = _candidate(0, "0")
+            middle = _candidate(1, "1")
+            last = TimelineCandidate(
+                segment_index=2,
+                source_id="0",
+                start_seconds=11.0,
+                end_seconds=12.0,
+                candidate_id="guard-last",
+                shot_id="guard-last-shot",
+            )
+            entry = AuthorizedBoundaryOption(
+                measurement_key=BoundaryMeasurementKey(0, first, middle),
+                frame_offset=0,
+                outgoing_transform=BoundaryTransformState("guard-entry-out"),
+                incoming_transform=BoundaryTransformState("guard-entry-in"),
+                proof_identity="guard-entry-proof",
+            )
+            exit_ = AuthorizedBoundaryOption(
+                measurement_key=BoundaryMeasurementKey(1, middle, last),
+                frame_offset=0,
+                outgoing_transform=BoundaryTransformState("guard-exit-out"),
+                incoming_transform=BoundaryTransformState("guard-exit-in"),
+                proof_identity="guard-exit-proof",
+            )
+            duration = middle.duration_seconds * FPS
+            cached_bridge = SegmentBridgeProof(
+                candidate=middle,
+                entry_option=entry,
+                exit_option=exit_,
+                duration_frames=duration,
+                proof_identity="guard-bridge-proof",
+                evidence_complete=True,
+                crop_compatible=True,
+                track_compatible=True,
+            )
+            provider._bridge_memo[
+                (
+                    provider.analysis_basis,
+                    provider._configuration_identity,
+                    middle,
+                    entry,
+                    exit_,
+                    duration,
+                )
+            ] = cached_bridge
+            provider._bridge_audit[cached_bridge.proof_identity] = object()  # type: ignore[assignment]
+            provider.descriptor_cache.store(
+                provider._cache_source_indices[1],
+                middle.start_seconds,
+                _descriptor(0.5),
+            )
+
+            _GuardedSampler.instances[1].guard_unavailable = True
+            guarded_requests = (
+                lambda: provider(key),
+                lambda: provider.bridge_provider(
+                    middle,
+                    entry,
+                    exit_,
+                    duration,
+                ),
+                lambda: provider.bridge_disposition_batch(
+                    (_bridge_request(middle, entry, exit_),)
+                ),
+            )
+            for request in guarded_requests:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "required direct cache unavailable",
+                ):
+                    request()
+
+            self.assertEqual(provider.request_count, 0)
+            self.assertEqual(provider.bridge_request_count, 0)
+            self.assertEqual(provider.raw_descriptor_cache_hit_count, 0)
+            provider.close()
+
+        self.assertEqual(
+            tuple(
+                sampler.guard_call_count
+                for sampler in _GuardedSampler.instances
+            ),
+            (1, 3),
+        )
+
     def test_segment_sample_requires_exact_immutable_subject_basis(self) -> None:
         transform = BoundaryTransformState(
             transform_identity="sample-transform",

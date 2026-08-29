@@ -3037,7 +3037,19 @@ class _VideoDescriptorProvider:
         sources: Sequence[Path],
         *,
         feature_cache_directory: Path | None = None,
+        feature_derived_cache_directory: Path | None = None,
+        require_persistent_feature_cache: bool = False,
     ) -> None:
+        if not isinstance(require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be boolean")
+        if (
+            require_persistent_feature_cache
+            and feature_derived_cache_directory is None
+        ):
+            raise ValueError(
+                "require_persistent_feature_cache needs an explicit "
+                "feature_derived_cache_directory"
+            )
         self._samplers: list[_VideoSampler | None] = []
         self._descriptor_cache: dict[
             tuple[int, CanonicalFrameIdentity], FrameVisualDescriptor | None
@@ -3045,15 +3057,33 @@ class _VideoDescriptorProvider:
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
-        for source in sources:
-            try:
-                sampler = _VideoSampler(
-                    source,
-                    feature_cache_directory=feature_cache_directory,
-                )
-            except (OSError, TypeError, ValueError, cv2.error):
-                sampler = None
-            self._samplers.append(sampler)
+        self._require_persistent_feature_cache = (
+            require_persistent_feature_cache
+        )
+        sampler_arguments: dict[str, Any] = {}
+        if feature_cache_directory is not None:
+            sampler_arguments["feature_cache_directory"] = (
+                feature_cache_directory
+            )
+        if feature_derived_cache_directory is not None:
+            sampler_arguments["feature_derived_cache_directory"] = (
+                feature_derived_cache_directory
+            )
+        if require_persistent_feature_cache:
+            sampler_arguments["require_persistent_feature_cache"] = True
+        try:
+            for source in sources:
+                try:
+                    sampler = _VideoSampler(source, **sampler_arguments)
+                except (OSError, TypeError, ValueError, cv2.error):
+                    sampler = None
+                self._samplers.append(sampler)
+        except BaseException:
+            for sampler in self._samplers:
+                if sampler is not None:
+                    sampler.close()
+            self._samplers.clear()
+            raise
 
     def __call__(
         self,
@@ -3061,8 +3091,13 @@ class _VideoDescriptorProvider:
         _source: Path,
         source_local_seconds: float,
     ) -> FrameVisualDescriptor | None:
-        self._request_count += 1
         sampler = self._samplers[source_index]
+        if (
+            sampler is not None
+            and self._require_persistent_feature_cache
+        ):
+            sampler.assert_required_persistent_cache_available()
+        self._request_count += 1
         if sampler is None:
             return None
         key = (source_index, sampler.frame_identity(source_local_seconds))

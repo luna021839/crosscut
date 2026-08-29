@@ -74,6 +74,7 @@ from .visual_feature_cache import (
     DescriptorRequestIdentity,
     DescriptorRequestLocator,
     PersistentVisualFeatureCache,
+    PersistentVisualFeatureCacheIOError,
     build_analyzer_fingerprint,
     python_symbol_dependency_sha256,
 )
@@ -2266,6 +2267,21 @@ class VisualTimelineCandidateSet:
         compare=False,
     )
     optimizer_input_identity: str | None = None
+    feature_cache_directory: Path | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    feature_derived_cache_directory: Path | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    require_persistent_feature_cache: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         records = tuple(self.candidates)
@@ -2293,6 +2309,26 @@ class VisualTimelineCandidateSet:
         object.__setattr__(self, "face_metadata_by_candidate", face_metadata)
         object.__setattr__(self, "subject_metadata_by_candidate", subject_metadata)
         object.__setattr__(self, "role_conditioned_selection", role_conditioning)
+        object.__setattr__(
+            self,
+            "feature_cache_directory",
+            (
+                None
+                if self.feature_cache_directory is None
+                else Path(self.feature_cache_directory)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "feature_derived_cache_directory",
+            (
+                None
+                if self.feature_derived_cache_directory is None
+                else Path(self.feature_derived_cache_directory)
+            ),
+        )
+        if not isinstance(self.require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be boolean")
         optimizer_input_identity = (
             None
             if self.optimizer_input_identity is None
@@ -4524,13 +4560,25 @@ def _descriptor_matches_analyzer_runtime(
     return True
 
 
+class PersistentVisualFeatureCacheInitializationError(RuntimeError):
+    """A required descriptor cache could not be initialized safely."""
+
+
+class PersistentVisualFeatureCacheRuntimeError(RuntimeError):
+    """A required descriptor cache failed after successful initialization."""
+
+
 class _VideoSampler:
     def __init__(
         self,
         path: Path,
         *,
         feature_cache_directory: Path | None = None,
+        feature_derived_cache_directory: Path | None = None,
+        require_persistent_feature_cache: bool = False,
     ) -> None:
+        if not isinstance(require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be boolean")
         self.path = path
         self.capture = cv2.VideoCapture(str(path))
         if not self.capture.isOpened():
@@ -4561,18 +4609,91 @@ class _VideoSampler:
         ] = OrderedDict()
         self.frame_decode_count = 0
         self.persistent_feature_cache: PersistentVisualFeatureCache | None = None
-        if feature_cache_directory is not None:
+        self._persistent_feature_cache_configured = bool(
+            feature_cache_directory is not None
+            or feature_derived_cache_directory is not None
+        )
+        self._persistent_feature_cache_required = (
+            require_persistent_feature_cache
+        )
+        self._persistent_feature_cache_direct_root_configured = (
+            feature_derived_cache_directory is not None
+        )
+        self._persistent_feature_cache_status = "not_configured"
+        self._persistent_feature_cache_initialization_error_type: str | None = None
+        self._persistent_feature_cache_runtime_error_type: str | None = None
+        self._persistent_feature_cache_runtime_failure_count = 0
+        if (
+            require_persistent_feature_cache
+            and not self._persistent_feature_cache_configured
+        ):
+            self.capture.release()
+            raise PersistentVisualFeatureCacheInitializationError(
+                "persistent visual feature cache is required but was not configured"
+            )
+        if self._persistent_feature_cache_configured:
+            source_cache_directory = (
+                feature_cache_directory
+                if feature_cache_directory is not None
+                else feature_derived_cache_directory
+            )
+            assert source_cache_directory is not None
             try:
                 self.persistent_feature_cache = PersistentVisualFeatureCache(
-                    source_cache_directory=feature_cache_directory,
+                    source_cache_directory=source_cache_directory,
                     source_path=path,
                     analyzer=_visual_analyzer_fingerprint(),
+                    derived_cache_directory=feature_derived_cache_directory,
                 )
-            except (OSError, TypeError, ValueError):
+                self._persistent_feature_cache_status = "enabled"
+            except (OSError, TypeError, ValueError) as exc:
+                self._persistent_feature_cache_initialization_error_type = (
+                    type(exc).__name__
+                )
+                self._persistent_feature_cache_status = (
+                    "initialization_failed_optional"
+                )
+                if require_persistent_feature_cache:
+                    self.capture.release()
+                    raise PersistentVisualFeatureCacheInitializationError(
+                        "required persistent visual feature cache initialization "
+                        "failed"
+                    ) from None
                 # Cache setup is strictly optional.  Any unsafe path, changing
                 # source, or unreadable fingerprint falls back to fresh
                 # in-memory analysis rather than weakening visual gates.
                 self.persistent_feature_cache = None
+
+    def _handle_persistent_feature_cache_io_error(
+        self,
+        exc: PersistentVisualFeatureCacheIOError,
+    ) -> None:
+        """Fail required runs, or disable an optional cache without path leaks."""
+
+        self._persistent_feature_cache_runtime_error_type = type(exc).__name__
+        self._persistent_feature_cache_runtime_failure_count += 1
+        if self._persistent_feature_cache_required:
+            self._persistent_feature_cache_status = "runtime_io_failed_required"
+            raise PersistentVisualFeatureCacheRuntimeError(
+                "required persistent visual feature cache failed during analysis"
+            ) from None
+        self._persistent_feature_cache_status = "runtime_io_failed_optional"
+        self.persistent_feature_cache = None
+
+    def assert_required_persistent_cache_available(self) -> None:
+        """Attest strict cache storage before any process-local fast return."""
+
+        if not self._persistent_feature_cache_required:
+            return
+        persistent = self.persistent_feature_cache
+        if persistent is None:  # pragma: no cover - constructor invariant
+            raise PersistentVisualFeatureCacheRuntimeError(
+                "required persistent visual feature cache failed during analysis"
+            )
+        try:
+            persistent.assert_storage_root_available()
+        except PersistentVisualFeatureCacheIOError as exc:
+            self._handle_persistent_feature_cache_io_error(exc)
 
     def frame_identity(self, seconds: float) -> CanonicalFrameIdentity:
         return CanonicalFrameIdentity.from_seconds(
@@ -4620,6 +4741,9 @@ class _VideoSampler:
     ) -> FrameVisualDescriptor | None:
         """Return one exact descriptor with optional persistent reuse."""
 
+        self.assert_required_persistent_cache_available()
+        persistent = self.persistent_feature_cache
+
         primary = self.frame_identity(seconds)
         following = (
             self.frame_identity(following_seconds)
@@ -4635,9 +4759,13 @@ class _VideoSampler:
         if locator in self.descriptor_locator_cache:
             self.descriptor_locator_cache.move_to_end(locator)
             return self.descriptor_locator_cache[locator]
-        persistent = self.persistent_feature_cache
         if persistent is not None:
-            cached = persistent.get_by_locator(locator)
+            try:
+                cached = persistent.get_by_locator(locator)
+            except PersistentVisualFeatureCacheIOError as exc:
+                self._handle_persistent_feature_cache_io_error(exc)
+                persistent = self.persistent_feature_cache
+                cached = None
             if cached is not None:
                 try:
                     descriptor = _descriptor_from_cache_payload(cached)
@@ -4683,7 +4811,12 @@ class _VideoSampler:
             return self.descriptor_cache[request]
         descriptor: FrameVisualDescriptor | None = None
         if persistent is not None:
-            cached = persistent.get(request)
+            try:
+                cached = persistent.get(request)
+            except PersistentVisualFeatureCacheIOError as exc:
+                self._handle_persistent_feature_cache_io_error(exc)
+                persistent = self.persistent_feature_cache
+                cached = None
             if cached is not None:
                 try:
                     descriptor = _descriptor_from_cache_payload(cached)
@@ -4714,6 +4847,8 @@ class _VideoSampler:
                         request,
                         _descriptor_cache_payload(descriptor),
                     )
+                except PersistentVisualFeatureCacheIOError as exc:
+                    self._handle_persistent_feature_cache_io_error(exc)
                 except (OSError, TypeError, ValueError):
                     # A cache write can never make a freshly computed
                     # descriptor unusable for the current analysis.
@@ -4784,13 +4919,122 @@ class _VideoSampler:
         # as the sampler closes; they never enter PersistentVisualFeatureCache.
         self.sface_cache.clear()
 
+    def persistent_feature_cache_diagnostics(self) -> dict[str, Any]:
+        """Report cache state and counters without exposing filesystem paths."""
+
+        persistent = self.persistent_feature_cache
+        diagnostics: dict[str, Any] = {
+            "enabled": persistent is not None,
+            "status": self._persistent_feature_cache_status,
+            "configured": self._persistent_feature_cache_configured,
+            "required": self._persistent_feature_cache_required,
+            "direct_derived_cache_configured": (
+                self._persistent_feature_cache_direct_root_configured
+            ),
+            "initialization_error_type": (
+                self._persistent_feature_cache_initialization_error_type
+            ),
+            "runtime_error_type": self._persistent_feature_cache_runtime_error_type,
+            "runtime_failure_count": (
+                self._persistent_feature_cache_runtime_failure_count
+            ),
+            "source_frame_decode_count": self.frame_decode_count,
+            "decode_free_hit_count": 0,
+            "decode_free_legacy_hit_count": 0,
+            "local_paths_exposed": False,
+        }
+        if persistent is None:
+            return diagnostics
+        raw = persistent.diagnostics()
+        safe_keys = (
+            "cache_contract",
+            "source_sha256",
+            "analyzer_fingerprint_sha256",
+            "hit_count",
+            "miss_count",
+            "write_count",
+            "invalid_record_count",
+            "decode_free_hit_count",
+            "decode_free_legacy_hit_count",
+            "locator_index_build_count",
+            "locator_index_status",
+            "locator_index_record_budget",
+            "locator_index_preflight_record_count",
+            "locator_index_budget_fallback_count",
+            "locator_index_process_memo_hit_count",
+            "ambiguous_locator_count",
+            "disabled_by_source_change",
+            "storage_io_failure_count",
+            "atomic_write_failure_count",
+            "raw_frames_persisted",
+            "face_identity_embeddings_persisted",
+        )
+        diagnostics.update(
+            {key: raw[key] for key in safe_keys if key in raw}
+        )
+        diagnostics["locator_index_over_budget"] = bool(
+            raw.get("locator_index_over_budget_root")
+        )
+        return diagnostics
+
     def feature_cache_diagnostics(self) -> dict[str, Any] | None:
+        """Retain the legacy Optional contract for existing aggregators."""
+
         if self.persistent_feature_cache is None:
             return None
-        return {
-            **self.persistent_feature_cache.diagnostics(),
-            "source_frame_decode_count": self.frame_decode_count,
-        }
+        return self.persistent_feature_cache_diagnostics()
+
+
+def _create_video_sampler(
+    path: Path,
+    *,
+    feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
+) -> _VideoSampler:
+    """Create a sampler while keeping default test/provider call shapes stable."""
+
+    arguments: dict[str, Any] = {}
+    if feature_cache_directory is not None:
+        arguments["feature_cache_directory"] = feature_cache_directory
+    if feature_derived_cache_directory is not None:
+        arguments["feature_derived_cache_directory"] = (
+            feature_derived_cache_directory
+        )
+    if require_persistent_feature_cache:
+        arguments["require_persistent_feature_cache"] = True
+    return _VideoSampler(Path(path), **arguments)
+
+
+def _create_video_samplers(
+    sources: Sequence[Path],
+    *,
+    feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
+) -> list[_VideoSampler]:
+    """Open every source before analysis and release partial construction."""
+
+    samplers: list[_VideoSampler] = []
+    try:
+        for source in sources:
+            samplers.append(
+                _create_video_sampler(
+                    Path(source),
+                    feature_cache_directory=feature_cache_directory,
+                    feature_derived_cache_directory=(
+                        feature_derived_cache_directory
+                    ),
+                    require_persistent_feature_cache=(
+                        require_persistent_feature_cache
+                    ),
+                )
+            )
+    except BaseException:
+        for sampler in samplers:
+            sampler.close()
+        raise
+    return samplers
 
 
 def _face_geometry_boundary_window(
@@ -5033,6 +5277,9 @@ def _selected_dissolve_evidence(
     source_timewarps: Sequence[TimeWarpMap | None],
     scene_cut_times: Sequence[Sequence[float]],
     face_metadata_by_candidate: dict[str, _CandidateFaceMetadata],
+    feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
 ) -> tuple[dict[str, _DissolveEvidence], dict[str, _DissolveEvidence]]:
     """Run future-overlap safety models only on DP-selected switch boundaries.
 
@@ -5061,7 +5308,12 @@ def _selected_dissolve_evidence(
     if not eligible_boundaries:
         return (entry, exit_)
 
-    samplers = [_VideoSampler(Path(path)) for path in sources]
+    samplers = _create_video_samplers(
+        sources,
+        feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
+    )
     try:
         for outgoing, incoming in eligible_boundaries:
             outgoing_source = int(outgoing.source_id)
@@ -5156,6 +5408,8 @@ def rehydrate_visual_timeline_dissolve_evidence(
     scene_cut_times: Sequence[Sequence[float]],
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
 ) -> VisualTimelinePlan:
     """Re-measure transient dissolve evidence on the final repaired clock.
 
@@ -5230,9 +5484,15 @@ def rehydrate_visual_timeline_dissolve_evidence(
     def sampler_for(source_index: int) -> _VideoSampler:
         sampler = samplers.get(source_index)
         if sampler is None:
-            sampler = _VideoSampler(
+            sampler = _create_video_sampler(
                 source_paths[source_index],
                 feature_cache_directory=feature_cache_directory,
+                feature_derived_cache_directory=(
+                    feature_derived_cache_directory
+                ),
+                require_persistent_feature_cache=(
+                    require_persistent_feature_cache
+                ),
             )
             samplers[source_index] = sampler
         return sampler
@@ -5439,6 +5699,13 @@ def materialize_visual_timeline_candidate(
             source_timewarps=candidate_set.source_timewarps,
             scene_cut_times=scene_cut_times,
             face_metadata_by_candidate=candidate_set.face_metadata_by_candidate,
+            feature_cache_directory=candidate_set.feature_cache_directory,
+            feature_derived_cache_directory=(
+                candidate_set.feature_derived_cache_directory
+            ),
+            require_persistent_feature_cache=(
+                candidate_set.require_persistent_feature_cache
+            ),
         )
     )
     choices: list[VisualTimelineChoice] = []
@@ -5756,6 +6023,8 @@ def _build_visual_timeline(
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     prescribed_source_indices: Sequence[int] | None = None,
     maximum_candidate_results: int,
     candidate_set_only: bool,
@@ -5836,17 +6105,12 @@ def _build_visual_timeline(
                 "prescribed source path cannot be combined with soft preferences"
             )
     diversity = diversity_config or VisualDiversityConfig()
-    samplers = [
-        (
-            _VideoSampler(Path(path))
-            if feature_cache_directory is None
-            else _VideoSampler(
-                Path(path),
-                feature_cache_directory=feature_cache_directory,
-            )
-        )
-        for path in sources
-    ]
+    samplers = _create_video_samplers(
+        sources,
+        feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
+    )
     candidates_by_segment: list[list[TimelineCandidate]] = []
     face_metadata_by_candidate: dict[str, _CandidateFaceMetadata] = {}
     subject_metadata_by_candidate: dict[str, _CandidateSubjectMetadata] = {}
@@ -6392,6 +6656,9 @@ def _build_visual_timeline(
         role_conditioned_selection=role_conditioned_selection_payload,
         optimizer_workspace=optimizer_workspace,
         optimizer_input_identity=optimizer_input_identity,
+        feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
     )
     if candidate_set_only:
         return candidate_set
@@ -6416,6 +6683,8 @@ def build_visual_timeline(
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
 ) -> VisualTimelinePlan:
     """Build the selected visual plan while preserving the existing API."""
 
@@ -6435,6 +6704,8 @@ def build_visual_timeline(
         source_timewarps=source_timewarps,
         progress_callback=progress_callback,
         feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
         maximum_candidate_results=32,
         candidate_set_only=False,
     )
@@ -6460,6 +6731,8 @@ def build_visual_timeline_candidate_set(
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     maximum_results: int = 32,
 ) -> VisualTimelineCandidateSet:
     """Retain reviewed top-N alternatives without selected-only postpasses.
@@ -6485,6 +6758,8 @@ def build_visual_timeline_candidate_set(
         source_timewarps=source_timewarps,
         progress_callback=progress_callback,
         feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
         maximum_candidate_results=maximum_results,
         candidate_set_only=True,
     )
@@ -6507,6 +6782,8 @@ def build_prescribed_visual_timeline_candidate_set(
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
 ) -> VisualTimelineCandidateSet:
     """Materialize one externally proposed path through existing visual gates.
 
@@ -6526,6 +6803,8 @@ def build_prescribed_visual_timeline_candidate_set(
         source_timewarps=source_timewarps,
         progress_callback=progress_callback,
         feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
         prescribed_source_indices=prescribed_source_indices,
         maximum_candidate_results=8,
         candidate_set_only=True,
@@ -6539,6 +6818,8 @@ def build_prescribed_visual_timeline_candidate_set(
 
 __all__ = [
     "FrameVisualDescriptor",
+    "PersistentVisualFeatureCacheInitializationError",
+    "PersistentVisualFeatureCacheRuntimeError",
     "ProfessionalMontageSelectionPolicy",
     "VisualDiversityConfig",
     "VisualTimelineCandidateRecord",

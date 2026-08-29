@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -8,6 +9,12 @@ import unittest
 from unittest.mock import patch
 
 from crosscut.audio import AlignmentResult, SourceAlignment
+from crosscut.causal_shooting_grammar import (
+    ShootingGrammarObservation,
+    ShootingGrammarProvenance,
+    build_causal_shooting_grammar_artifact,
+    write_causal_shooting_grammar_artifact,
+)
 from crosscut.draft import DraftSegment, GroupDraftTimeline
 from crosscut.rhythm import (
     Beat,
@@ -17,6 +24,22 @@ from crosscut.rhythm import (
     TempoEstimate,
 )
 from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
+from crosscut.ive import IVEMember
+from crosscut.ive_performer_state import (
+    IVEPerformerStateProvenance,
+    IVEPerformerStateSourceProvenance,
+    build_ive_performer_state_artifact,
+    write_ive_performer_state_artifact,
+)
+from crosscut.member_state_graph import (
+    CausalMemberObservation,
+    MemberProbabilityMass,
+    MemberStateArtifactProvenance,
+    MemberStateSourceProvenance,
+    build_member_state_graph,
+    write_member_state_graph_artifact,
+)
+from crosscut.stage_edit_feature_materializer import StageEditCausalSensingArtifacts
 from crosscut.stage_edit_inference_snapshot import (
     StageEditInferenceSnapshotError,
     build_stage_edit_inference_decision_times,
@@ -149,6 +172,122 @@ def _alignment(sources: tuple[Path, Path]) -> AlignmentResult:
     )
 
 
+def _causal_sensing(
+    root: Path,
+    *,
+    source_ids: tuple[str, ...],
+    decision_times: tuple[float, ...],
+) -> StageEditCausalSensingArtifacts:
+    source_hashes = tuple(str(index + 1) * 64 for index in range(len(source_ids)))
+    member_mass = MemberProbabilityMass(
+        {member: float(member is IVEMember.GAEUL) * 0.9 for member in IVEMember},
+        unknown_mass=0.1,
+    )
+    member_graph = build_member_state_graph(
+        tuple(
+            CausalMemberObservation(
+                observation_id=f"member-{source_id}",
+                source_id=source_id,
+                shot_id=f"shot-{source_id}",
+                timestamp_seconds=0.0,
+                frame_index=0,
+                causal_order=index,
+                member_probabilities=member_mass,
+                face_bbox=(0.42, 0.20, 0.58, 0.38),
+                body_bbox=(0.30, 0.10, 0.70, 0.95),
+                face_identity_id=f"face-{source_id}",
+                tracker_tracklet_id=f"track-{source_id}",
+            )
+            for index, source_id in enumerate(source_ids)
+        )
+    )
+    member_artifact = write_member_state_graph_artifact(
+        root / "member",
+        member_graph,
+        MemberStateArtifactProvenance(
+            producer_id="stageedit-inference-unit-test",
+            producer_version="1",
+            created_at_utc="2026-08-25T00:00:00Z",
+            sources=tuple(
+                MemberStateSourceProvenance(
+                    source_id=source_id,
+                    source_content_sha256=source_hash,
+                    observation_manifest_sha256=hashlib.sha256(
+                        f"observations:{source_id}".encode()
+                    ).hexdigest(),
+                )
+                for source_id, source_hash in zip(
+                    source_ids, source_hashes, strict=True
+                )
+            ),
+        ),
+    )
+    grammar = build_causal_shooting_grammar_artifact(
+        tuple(
+            ShootingGrammarObservation(
+                source_id=source_id,
+                master_time_seconds=timestamp,
+                shot_closeup_probability=0.6,
+                shot_medium_probability=0.3,
+                shot_wide_probability=0.1,
+                camera_pan_velocity=0.1,
+                camera_tilt_velocity=0.0,
+                camera_zoom_in_probability=0.2,
+                camera_zoom_out_probability=0.1,
+                camera_static_probability=0.7,
+                camera_roll_degrees_normalized=0.0,
+                subject_headroom_normalized=0.2,
+                subject_lead_room_normalized=0.1,
+                detected_person_count=0,
+                formation_person_count=0,
+                internal_native_cut_since_previous=False,
+                shooting_grammar_confidence=0.9,
+            )
+            for timestamp in decision_times
+            for source_id in source_ids
+        ),
+        provenance=ShootingGrammarProvenance(
+            upstream_sha256=(("source_catalog", "c" * 64),),
+            analyzer_fingerprint_sha256="d" * 64,
+            contracts=("inference_exact_timestamp_unit_test_v1",),
+        ),
+    )
+    grammar_path = write_causal_shooting_grammar_artifact(
+        grammar,
+        root / "grammar",
+    )
+    performer = build_ive_performer_state_artifact(
+        member_graph,
+        grammar.records,
+        provenance=IVEPerformerStateProvenance(
+            analyzer_fingerprint_sha256="e" * 64,
+            sources=tuple(
+                IVEPerformerStateSourceProvenance(
+                    source_id=source_id,
+                    source_content_sha256=source_hash,
+                )
+                for source_id, source_hash in zip(
+                    source_ids, source_hashes, strict=True
+                )
+            ),
+            contracts=("inference_member_grammar_unit_test_v1",),
+        ),
+    )
+    performer_path = write_ive_performer_state_artifact(
+        root / "performer",
+        performer,
+    )
+    return StageEditCausalSensingArtifacts(
+        shooting_grammar_path=grammar_path,
+        shooting_grammar_content_sha256=grammar.artifact_content_sha256,
+        member_state_graph_path=member_artifact.path,
+        member_state_graph_content_sha256=member_artifact.content_sha256,
+        target_member=None,
+        ive_performer_state_path=performer_path,
+        ive_performer_state_content_sha256=performer.content_sha256,
+    )
+
+
 def _descriptor() -> FrameVisualDescriptor:
     return FrameVisualDescriptor(
         quality_score=0.9,
@@ -205,12 +344,140 @@ class StageEditInferenceSnapshotTests(unittest.TestCase):
                 maximum_sequence_length=2,
             )
 
+    def test_direct_cache_contract_closes_partial_sampler_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sources = (root / "a.mp4", root / "b.mp4")
+            for source in sources:
+                source.write_bytes(b"fixture")
+            decision_times = build_stage_edit_inference_decision_times(
+                timing_draft=_draft(),
+                rhythm=_rhythm(),
+                section_plan=_sections(),
+                maximum_sequence_length=128,
+            )
+            causal_sensing = _causal_sensing(
+                root / "sensing",
+                source_ids=(
+                    "source-00-1111111111111111",
+                    "source-01-2222222222222222",
+                ),
+                decision_times=decision_times,
+            )
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            calls: list[dict[str, object]] = []
+            instances: list[object] = []
+
+            class FailingSecondSampler:
+                def __init__(self, _path: Path, **kwargs: object) -> None:
+                    self.closed = False
+                    calls.append(dict(kwargs))
+                    instances.append(self)
+                    if len(instances) == 2:
+                        raise RuntimeError("required cache failed")
+
+                def close(self) -> None:
+                    self.closed = True
+
+            with patch(
+                "crosscut.stage_edit_inference_snapshot._VideoSampler",
+                FailingSecondSampler,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "required cache failed"):
+                    materialize_stage_edit_inference_snapshot(
+                        song_id="NEW IVE SONG",
+                        sources=sources,
+                        alignment=_alignment(sources),
+                        alignment_hard_gates=(True, True),
+                        source_timewarps=(None, None),
+                        timing_draft=_draft(),
+                        rhythm=_rhythm(),
+                        section_plan=_sections(),
+                        output_directory=root / "snapshots",
+                        feature_cache_directory=root / "legacy-cache",
+                        feature_derived_cache_directory=direct_root,
+                        require_persistent_feature_cache=True,
+                        maximum_sequence_length=128,
+                        maximum_sources=8,
+                        causal_sensing=causal_sensing,
+                    )
+
+            self.assertEqual(len(calls), 2)
+            for kwargs in calls:
+                self.assertEqual(
+                    kwargs["feature_cache_directory"],
+                    (root / "legacy-cache").resolve(),
+                )
+                self.assertEqual(
+                    kwargs["feature_derived_cache_directory"],
+                    direct_root,
+                )
+                self.assertIs(
+                    kwargs["require_persistent_feature_cache"],
+                    True,
+                )
+            self.assertTrue(instances[0].closed)
+
     def test_actual_media_snapshot_is_content_addressed_and_source_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             sources = (root / "a.mp4", root / "b.mp4")
             for source in sources:
                 source.write_bytes(b"fixture")
+            decision_times = build_stage_edit_inference_decision_times(
+                timing_draft=_draft(),
+                rhythm=_rhythm(),
+                section_plan=_sections(),
+                maximum_sequence_length=128,
+            )
+            causal_sensing = _causal_sensing(
+                root / "sensing",
+                source_ids=(
+                    "source-00-1111111111111111",
+                    "source-01-2222222222222222",
+                ),
+                decision_times=decision_times,
+            )
+            with self.assertRaisesRegex(
+                StageEditInferenceSnapshotError,
+                "complete shooting-grammar/member-state/performer-state",
+            ):
+                materialize_stage_edit_inference_snapshot(
+                    song_id="NEW IVE SONG",
+                    sources=sources,
+                    alignment=_alignment(sources),
+                    alignment_hard_gates=(True, True),
+                    source_timewarps=(None, None),
+                    timing_draft=_draft(),
+                    rhythm=_rhythm(),
+                    section_plan=_sections(),
+                    output_directory=root / "missing-sensing",
+                    feature_cache_directory=root / "cache",
+                    maximum_sequence_length=128,
+                    maximum_sources=8,
+                )
+            with self.assertRaisesRegex(
+                StageEditInferenceSnapshotError,
+                "does not match MEMBER",
+            ):
+                materialize_stage_edit_inference_snapshot(
+                    song_id="NEW IVE SONG",
+                    sources=sources,
+                    alignment=_alignment(sources),
+                    alignment_hard_gates=(True, True),
+                    source_timewarps=(None, None),
+                    timing_draft=_draft(),
+                    rhythm=_rhythm(),
+                    section_plan=_sections(),
+                    output_directory=root / "wrong-mode",
+                    feature_cache_directory=root / "cache",
+                    maximum_sequence_length=128,
+                    maximum_sources=8,
+                    causal_sensing=causal_sensing,
+                    edit_mode="member",
+                    target_member="가을",
+                )
             _FakeSampler.next_index = 0
             with (
                 patch(
@@ -235,6 +502,7 @@ class StageEditInferenceSnapshotTests(unittest.TestCase):
                     feature_cache_directory=root / "cache",
                     maximum_sequence_length=128,
                     maximum_sources=8,
+                    causal_sensing=causal_sensing,
                 )
 
             self.assertTrue(result.snapshot_path.is_file())
@@ -312,6 +580,7 @@ class StageEditInferenceSnapshotTests(unittest.TestCase):
                     feature_cache_directory=root / "cache",
                     maximum_sequence_length=128,
                     maximum_sources=8,
+                    causal_sensing=causal_sensing,
                 )
 
 

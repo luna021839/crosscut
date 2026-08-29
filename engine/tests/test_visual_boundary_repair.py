@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from crosscut.visual_splice_failure_feedback import (
 from crosscut.visual_splice_feasibility import SpliceFeasibilityStatus
 from crosscut.visual_score import (
     FrameVisualDescriptor,
+    PersistentVisualFeatureCacheRuntimeError,
     VisualTimelineChoice,
     VisualTimelinePlan,
 )
@@ -236,6 +238,45 @@ class VisualBoundaryRepairTests(unittest.TestCase):
         self.assertGreater(cache.hit_count, 0)
         self.assertEqual(result.reviewed_cross_source_count, 1)
 
+    def test_required_cache_root_loss_fails_before_full_ram_hit(self) -> None:
+        descriptor = _descriptor(0.5)
+
+        class AlwaysHitBoundaryDescriptorCache(BoundaryDescriptorCache):
+            def lookup(
+                self,
+                source_index: int,
+                seconds: float,
+            ) -> tuple[bool, FrameVisualDescriptor | None]:
+                self._key(source_index, seconds)
+                self.hit_count += 1
+                return True, descriptor
+
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        cache = AlwaysHitBoundaryDescriptorCache()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            direct_root = root / "direct-derived"
+            direct_root.mkdir()
+            direct_root.rename(root / "detached-derived")
+            with patch(
+                "crosscut.visual_boundary_repair._VideoSampler"
+            ) as sampler, self.assertRaises(
+                PersistentVisualFeatureCacheRuntimeError
+            ) as raised:
+                repair_visual_timeline_boundaries(
+                    visual_timeline=plan,
+                    sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                    audio_offsets=(0.0, 0.0),
+                    scene_cut_times=((), ()),
+                    descriptor_cache=cache,
+                    feature_derived_cache_directory=direct_root,
+                    require_persistent_feature_cache=True,
+                )
+
+            sampler.assert_not_called()
+            self.assertEqual(cache.hit_count, 0)
+            self.assertNotIn(str(root), str(raised.exception))
+
     def test_one_source_descriptor_miss_opens_only_that_sampler(self) -> None:
         descriptor = _descriptor(0.5)
 
@@ -294,6 +335,57 @@ class VisualBoundaryRepairTests(unittest.TestCase):
 
         self.assertEqual(opened, [Path("source-a.mp4")])
         self.assertEqual(closed, opened)
+        self.assertEqual(result.reviewed_cross_source_count, 1)
+
+    def test_direct_feature_cache_contract_is_forwarded_to_sampler(self) -> None:
+        descriptor = _descriptor(0.5)
+        calls: list[tuple[Path, dict[str, object]]] = []
+
+        class FakeSampler:
+            def __init__(self, path: Path, **kwargs: object) -> None:
+                calls.append((Path(path), dict(kwargs)))
+
+            def feature_descriptor_at(
+                self,
+                seconds: float,
+                *,
+                include_subject_geometry: bool,
+                include_formation_pose: bool,
+            ) -> FrameVisualDescriptor:
+                del seconds, include_subject_geometry, include_formation_pose
+                return descriptor
+
+            def close(self) -> None:
+                return None
+
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_root = root / "source-cache"
+            derived_root = root / "mounted-derived-cache"
+            derived_root.mkdir()
+            with patch(
+                "crosscut.visual_boundary_repair._VideoSampler",
+                side_effect=FakeSampler,
+            ):
+                result = repair_visual_timeline_boundaries(
+                    visual_timeline=plan,
+                    sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                    audio_offsets=(0.0, 0.0),
+                    scene_cut_times=((), ()),
+                    feature_cache_directory=source_root,
+                    feature_derived_cache_directory=derived_root,
+                    require_persistent_feature_cache=True,
+                )
+
+        self.assertGreaterEqual(len(calls), 1)
+        for _path, kwargs in calls:
+            self.assertEqual(kwargs["feature_cache_directory"], source_root)
+            self.assertEqual(
+                kwargs["feature_derived_cache_directory"],
+                derived_root,
+            )
+            self.assertIs(kwargs["require_persistent_feature_cache"], True)
         self.assertEqual(result.reviewed_cross_source_count, 1)
 
     def test_descriptor_cache_cannot_wrap_test_provider(self) -> None:

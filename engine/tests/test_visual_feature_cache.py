@@ -25,7 +25,11 @@ from crosscut.visual_feature_cache import (
     DescriptorRequestIdentity,
     DescriptorRequestLocator,
     PersistentVisualFeatureCache,
+    PersistentVisualFeatureCacheStorageUnavailableError,
+    PersistentVisualFeatureCacheWriteError,
     PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    _DecodeEquivalentAnalyzerMigration,
+    _decode_equivalent_analyzer_migration_closure,
     build_analyzer_fingerprint,
     python_symbol_dependency_sha256,
 )
@@ -39,14 +43,32 @@ from crosscut.visual_score import (
 _AUDITED_LEGACY_ANALYZER_DIGEST = (
     "648cfb9801b2de54d4325a7c838e31bbadfbeaa8d71a68c37163d8c41f27b19c"
 )
-_AUDITED_CURRENT_ANALYZER_DIGEST = (
+_AUDITED_PREVIOUS_ANALYZER_DIGEST = (
     "14fff1f9ee74dbaed4023c6fbbbd4cd94b67e078a94f3d272885669cfe0e6b30"
+)
+_AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST = (
+    "753e2dbcee35d3bf8c72ed73005341b8b4ec3c142860e869904bc8cf5acac927"
+)
+_AUDITED_STRICT_CACHE_PREVIOUS_ANALYZER_DIGEST = (
+    "eb2ead7937ad96cd7225e536b1527075258de9014be52c82ba8355dfa9e81b33"
+)
+_AUDITED_CURRENT_ANALYZER_DIGEST = (
+    "0e2da6dae7879dea7d529dc36b87f0f7d87184a07c3e06f4bec15b752dc5ca41"
 )
 _AUDITED_LEGACY_DESCRIPTOR_DIGEST = (
     "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
 )
-_AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
+_AUDITED_PREVIOUS_DESCRIPTOR_DIGEST = (
     "c0de5b604e22d12c713b02edfe2b5a0de8d19a80475b1547b861f975d8978d89"
+)
+_AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST = (
+    "909c66c8dbd903ca6ad1b1cc75c63710838fba88179b2b308f7c964d55f82f84"
+)
+_AUDITED_STRICT_CACHE_PREVIOUS_DESCRIPTOR_DIGEST = (
+    "d62354e350187d5e090d103858d15b3fcc95191703ab048178ca428ca7a6d186"
+)
+_AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
+    "a2586f534c0ed3a8d7a018cec2a9cf0237598b9b4e51a3c0b84404d6cac0cdec"
 )
 
 
@@ -568,6 +590,152 @@ class VisualFeatureCacheTests(unittest.TestCase):
             self.assertIsNone(cache.get(request))
             self.assertEqual(cache.diagnostics()["invalid_record_count"], 1)
 
+    def test_direct_derived_root_reuses_real_records_decode_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            direct_derived_root = root / "mounted-derived-cache"
+            direct_derived_root.mkdir()
+            unused_legacy_root = root / "unused-source-cache"
+            request = _request(
+                following_index=31,
+                following_digest="2" * 64,
+                formation=True,
+            )
+            payload = {"quality": 0.8, "vector": [0.1, 0.2, 0.3]}
+
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=unused_legacy_root,
+                source_path=source,
+                analyzer=_analyzer(),
+                derived_cache_directory=direct_derived_root,
+            )
+            self.assertTrue(cold.put(request, payload))
+            self.assertFalse(unused_legacy_root.exists())
+            records = tuple(
+                (direct_derived_root / "visual-v1").rglob("*.json")
+            )
+            self.assertEqual(len(records), 1)
+
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=unused_legacy_root,
+                source_path=source,
+                analyzer=_analyzer(),
+                derived_cache_directory=direct_derived_root,
+            )
+            self.assertEqual(warm.get_by_locator(request.locator), payload)
+            diagnostics = warm.diagnostics()
+            self.assertEqual(diagnostics["hit_count"], 1)
+            self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+            self.assertEqual(diagnostics["miss_count"], 0)
+            self.assertFalse(unused_legacy_root.exists())
+
+    def test_direct_derived_root_rejects_symlink_missing_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            existing_directory = root / "real-derived-cache"
+            existing_directory.mkdir()
+            symlink = root / "derived-cache-link"
+            symlink.symlink_to(existing_directory, target_is_directory=True)
+            existing_file = root / "derived-cache-file"
+            existing_file.write_text("not a directory", encoding="utf-8")
+            common = {
+                "source_cache_directory": root / "unused-source-cache",
+                "source_path": source,
+                "analyzer": _analyzer(),
+            }
+
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                PersistentVisualFeatureCache(
+                    **common,
+                    derived_cache_directory=symlink,
+                )
+            with self.assertRaisesRegex(ValueError, "must exist"):
+                PersistentVisualFeatureCache(
+                    **common,
+                    derived_cache_directory=root / "missing-derived-cache",
+                )
+            with self.assertRaisesRegex(ValueError, "must be a directory"):
+                PersistentVisualFeatureCache(
+                    **common,
+                    derived_cache_directory=existing_file,
+                )
+
+    def test_direct_derived_root_preserves_visual_child_symlink_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            direct_derived_root = root / "mounted-derived-cache"
+            direct_derived_root.mkdir()
+            redirected_visual_root = root / "redirected-visual-cache"
+            redirected_visual_root.mkdir()
+            (direct_derived_root / "visual-v1").symlink_to(
+                redirected_visual_root,
+                target_is_directory=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "cache path is a symlink"):
+                PersistentVisualFeatureCache(
+                    source_cache_directory=root / "unused-source-cache",
+                    source_path=source,
+                    analyzer=_analyzer(),
+                    derived_cache_directory=direct_derived_root,
+                )
+
+    def test_runtime_direct_root_loss_raises_distinct_storage_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            direct_derived_root = root / "mounted-derived-cache"
+            direct_derived_root.mkdir()
+            cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "unused-source-cache",
+                source_path=source,
+                analyzer=_analyzer(),
+                derived_cache_directory=direct_derived_root,
+            )
+            detached_root = root / "detached-derived-cache"
+            direct_derived_root.rename(detached_root)
+
+            with self.assertRaises(
+                PersistentVisualFeatureCacheStorageUnavailableError
+            ) as raised:
+                cache.get_by_locator(_request().locator)
+
+            self.assertNotIn(str(root), str(raised.exception))
+            self.assertEqual(cache.diagnostics()["storage_io_failure_count"], 1)
+            self.assertEqual(cache.diagnostics()["atomic_write_failure_count"], 0)
+
+    def test_atomic_record_write_failure_raises_distinct_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            direct_derived_root = root / "mounted-derived-cache"
+            direct_derived_root.mkdir()
+            cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "unused-source-cache",
+                source_path=source,
+                analyzer=_analyzer(),
+                derived_cache_directory=direct_derived_root,
+            )
+
+            with patch(
+                "crosscut.visual_feature_cache.os.replace",
+                side_effect=OSError("simulated atomic replace failure"),
+            ), self.assertRaises(PersistentVisualFeatureCacheWriteError) as raised:
+                cache.put(_request(), {"quality": 0.8})
+
+            self.assertNotIn(str(root), str(raised.exception))
+            self.assertEqual(cache.diagnostics()["storage_io_failure_count"], 0)
+            self.assertEqual(cache.diagnostics()["atomic_write_failure_count"], 1)
+            self.assertEqual(cache.diagnostics()["write_count"], 0)
+
     def test_changed_source_never_reuses_old_content_address(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -764,13 +932,18 @@ class VisualFeatureCacheTests(unittest.TestCase):
     def test_exactly_audited_cache_only_analyzer_migration_reuses_record(
         self,
     ) -> None:
-        legacy = _analyzer_from_components(
-            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        previous = _analyzer_from_components(
+            _audited_analyzer_components(
+                _AUDITED_STRICT_CACHE_PREVIOUS_DESCRIPTOR_DIGEST
+            )
         )
         current = _analyzer_from_components(
             _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
         )
-        self.assertEqual(legacy.digest, _AUDITED_LEGACY_ANALYZER_DIGEST)
+        self.assertEqual(
+            previous.digest,
+            _AUDITED_STRICT_CACHE_PREVIOUS_ANALYZER_DIGEST,
+        )
         self.assertEqual(current.digest, _AUDITED_CURRENT_ANALYZER_DIGEST)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -781,7 +954,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
             cold = PersistentVisualFeatureCache(
                 source_cache_directory=root / "cache",
                 source_path=source,
-                analyzer=legacy,
+                analyzer=previous,
             )
             self.assertTrue(cold.put(request, {"value": 1.0}))
             warm = PersistentVisualFeatureCache(
@@ -798,11 +971,318 @@ class VisualFeatureCacheTests(unittest.TestCase):
             self.assertEqual(diagnostics["decode_free_hit_count"], 1)
             self.assertEqual(diagnostics["decode_free_legacy_hit_count"], 1)
 
-    def test_analyzer_migration_rejects_unknown_and_reverse_directions(
+    def test_current_analyzer_transitively_reuses_all_audited_generations_in_order(
+        self,
+    ) -> None:
+        generations = {
+            "oldest": _analyzer_from_components(
+                _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+            ),
+            "older": _analyzer_from_components(
+                _audited_analyzer_components(_AUDITED_PREVIOUS_DESCRIPTOR_DIGEST)
+            ),
+            "nearest": _analyzer_from_components(
+                _audited_analyzer_components(
+                    _AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST
+                )
+            ),
+            "strict_previous": _analyzer_from_components(
+                _audited_analyzer_components(
+                    _AUDITED_STRICT_CACHE_PREVIOUS_DESCRIPTOR_DIGEST
+                )
+            ),
+            "current": _analyzer_from_components(
+                _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+            ),
+        }
+        self.assertEqual(
+            [generations[name].digest for name in generations],
+            [
+                _AUDITED_LEGACY_ANALYZER_DIGEST,
+                _AUDITED_PREVIOUS_ANALYZER_DIGEST,
+                _AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST,
+                _AUDITED_STRICT_CACHE_PREVIOUS_ANALYZER_DIGEST,
+                _AUDITED_CURRENT_ANALYZER_DIGEST,
+            ],
+        )
+        cases = (
+            (("oldest",), "oldest"),
+            (("oldest", "older"), "older"),
+            (("oldest", "older", "nearest"), "nearest"),
+            (
+                ("oldest", "older", "nearest", "strict_previous"),
+                "strict_previous",
+            ),
+            (
+                (
+                    "oldest",
+                    "older",
+                    "nearest",
+                    "strict_previous",
+                    "current",
+                ),
+                "current",
+            ),
+        )
+        for present, expected_label in cases:
+            with self.subTest(present=present):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    source = root / "source.mp4"
+                    source.write_bytes(b"source-content-v1")
+                    request = _request()
+                    cache_root = root / "cache"
+                    for label in present:
+                        writer = PersistentVisualFeatureCache(
+                            source_cache_directory=cache_root,
+                            source_path=source,
+                            analyzer=generations[label],
+                        )
+                        self.assertTrue(writer.put(request, {"generation": label}))
+                    warm = PersistentVisualFeatureCache(
+                        source_cache_directory=cache_root,
+                        source_path=source,
+                        analyzer=generations["current"],
+                    )
+
+                    self.assertEqual(
+                        warm.get_by_locator(request.locator),
+                        {"generation": expected_label},
+                    )
+                    expected_legacy_order = tuple(
+                        label
+                        for label in (
+                            "strict_previous",
+                            "nearest",
+                            "older",
+                            "oldest",
+                        )
+                        if label in present
+                    )
+                    self.assertEqual(
+                        tuple(path.name for path in warm._lookup_roots),
+                        (
+                            _AUDITED_CURRENT_ANALYZER_DIGEST,
+                            *(
+                                generations[label].digest
+                                for label in expected_legacy_order
+                            ),
+                        ),
+                    )
+                    self.assertEqual(
+                        warm.diagnostics()["decode_free_legacy_hit_count"],
+                        int(expected_label != "current"),
+                    )
+
+    def test_transitive_legacy_root_ambiguity_still_fails_closed(self) -> None:
+        legacy = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        )
+        current = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            cache_root = root / "cache"
+            first = _request(frame_digest="1" * 64)
+            second = _request(frame_digest="2" * 64)
+            legacy_cache = PersistentVisualFeatureCache(
+                source_cache_directory=cache_root,
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(legacy_cache.put(first, {"value": 1.0}))
+            self.assertTrue(legacy_cache.put(second, {"value": 2.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=cache_root,
+                source_path=source,
+                analyzer=current,
+            )
+
+            self.assertIsNone(warm.get_by_locator(first.locator))
+            self.assertEqual(warm.diagnostics()["ambiguous_locator_count"], 1)
+
+    def test_migration_closure_rejects_cycle_duplicate_and_broken_chain(
+        self,
+    ) -> None:
+        current_digest = "a" * 64
+        first_legacy_digest = "b" * 64
+        second_legacy_digest = "c" * 64
+        shared_legacy_digest = "d" * 64
+
+        def edge(
+            legacy_analyzer_digest: str,
+            legacy_descriptor_digest: str,
+            current_descriptor_digest: str,
+        ) -> _DecodeEquivalentAnalyzerMigration:
+            return _DecodeEquivalentAnalyzerMigration(
+                legacy_analyzer_digest=legacy_analyzer_digest,
+                descriptor_component_name="visual_score_descriptor_ast_v1",
+                legacy_descriptor_digest=legacy_descriptor_digest,
+                current_descriptor_digest=current_descriptor_digest,
+            )
+
+        direct = edge(first_legacy_digest, "1" * 64, "2" * 64)
+        graphs = (
+            (
+                "cycle",
+                {
+                    current_digest: (direct,),
+                    first_legacy_digest: (
+                        edge(current_digest, "2" * 64, "1" * 64),
+                    ),
+                },
+                "cycle",
+            ),
+            (
+                "duplicate",
+                {current_digest: (direct, direct)},
+                "duplicate or ambiguous",
+            ),
+            (
+                "diamond",
+                {
+                    current_digest: (
+                        direct,
+                        edge(second_legacy_digest, "3" * 64, "2" * 64),
+                    ),
+                    first_legacy_digest: (
+                        edge(shared_legacy_digest, "4" * 64, "1" * 64),
+                    ),
+                    second_legacy_digest: (
+                        edge(shared_legacy_digest, "4" * 64, "3" * 64),
+                    ),
+                },
+                "duplicate or ambiguous",
+            ),
+            (
+                "broken_chain",
+                {
+                    current_digest: (direct,),
+                    first_legacy_digest: (
+                        edge(second_legacy_digest, "3" * 64, "4" * 64),
+                    ),
+                },
+                "chain endpoints do not match",
+            ),
+        )
+        for label, graph, error in graphs:
+            with self.subTest(graph=label), patch(
+                "crosscut.visual_feature_cache."
+                "_DECODE_EQUIVALENT_ANALYZER_MIGRATIONS",
+                graph,
+            ):
+                with self.assertRaisesRegex(ValueError, error):
+                    _decode_equivalent_analyzer_migration_closure(
+                        current_digest
+                    )
+
+    def test_transitive_migration_rejects_noncanonical_intermediate_endpoint(
         self,
     ) -> None:
         legacy = _analyzer_from_components(
             _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        )
+        current = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        forged_intermediate_descriptor = "f" * 64
+        graph = {
+            _AUDITED_PREVIOUS_ANALYZER_DIGEST: (
+                _DecodeEquivalentAnalyzerMigration(
+                    legacy_analyzer_digest=_AUDITED_LEGACY_ANALYZER_DIGEST,
+                    descriptor_component_name="visual_score_descriptor_ast_v1",
+                    legacy_descriptor_digest=_AUDITED_LEGACY_DESCRIPTOR_DIGEST,
+                    current_descriptor_digest=_AUDITED_PREVIOUS_DESCRIPTOR_DIGEST,
+                ),
+            ),
+            _AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST: (
+                _DecodeEquivalentAnalyzerMigration(
+                    legacy_analyzer_digest=_AUDITED_PREVIOUS_ANALYZER_DIGEST,
+                    descriptor_component_name="visual_score_descriptor_ast_v1",
+                    legacy_descriptor_digest=_AUDITED_PREVIOUS_DESCRIPTOR_DIGEST,
+                    current_descriptor_digest=forged_intermediate_descriptor,
+                ),
+            ),
+            _AUDITED_CURRENT_ANALYZER_DIGEST: (
+                _DecodeEquivalentAnalyzerMigration(
+                    legacy_analyzer_digest=(
+                        _AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST
+                    ),
+                    descriptor_component_name="visual_score_descriptor_ast_v1",
+                    legacy_descriptor_digest=forged_intermediate_descriptor,
+                    current_descriptor_digest=_AUDITED_CURRENT_DESCRIPTOR_DIGEST,
+                ),
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory, patch(
+            "crosscut.visual_feature_cache."
+            "_DECODE_EQUIVALENT_ANALYZER_MIGRATIONS",
+            graph,
+        ):
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=current,
+            )
+
+            self.assertIsNone(warm.get_by_locator(request.locator))
+            self.assertEqual(warm.diagnostics()["invalid_record_count"], 1)
+
+    def test_previous_generation_retains_audited_legacy_lookup(self) -> None:
+        legacy = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        )
+        previous = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_PREVIOUS_DESCRIPTOR_DIGEST)
+        )
+        self.assertEqual(legacy.digest, _AUDITED_LEGACY_ANALYZER_DIGEST)
+        self.assertEqual(previous.digest, _AUDITED_PREVIOUS_ANALYZER_DIGEST)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=previous,
+            )
+
+            self.assertEqual(
+                warm.get_by_locator(request.locator),
+                {"value": 1.0},
+            )
+            diagnostics = warm.diagnostics()
+            self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+            self.assertEqual(diagnostics["decode_free_legacy_hit_count"], 1)
+
+    def test_analyzer_migration_rejects_unknown_and_reverse_directions(
+        self,
+    ) -> None:
+        previous = _analyzer_from_components(
+            _audited_analyzer_components(
+                _AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST
+            )
         )
         current = _analyzer_from_components(
             _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
@@ -815,12 +1295,12 @@ class VisualFeatureCacheTests(unittest.TestCase):
             source = root / "source.mp4"
             source.write_bytes(b"source-content-v1")
             request = _request()
-            legacy_cache = PersistentVisualFeatureCache(
+            previous_cache = PersistentVisualFeatureCache(
                 source_cache_directory=root / "legacy-cache",
                 source_path=source,
-                analyzer=legacy,
+                analyzer=previous,
             )
-            self.assertTrue(legacy_cache.put(request, {"value": 1.0}))
+            self.assertTrue(previous_cache.put(request, {"value": 1.0}))
             unknown_cache = PersistentVisualFeatureCache(
                 source_cache_directory=root / "legacy-cache",
                 source_path=source,
@@ -837,7 +1317,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
             reverse_cache = PersistentVisualFeatureCache(
                 source_cache_directory=root / "reverse-cache",
                 source_path=source,
-                analyzer=legacy,
+                analyzer=previous,
             )
             self.assertIsNone(reverse_cache.get_by_locator(request.locator))
 
@@ -879,22 +1359,22 @@ class VisualFeatureCacheTests(unittest.TestCase):
                     source = root / "source.mp4"
                     source.write_bytes(b"source-content-v1")
                     request = _request()
-                    legacy_components = json.loads(
+                    previous_components = json.loads(
                         json.dumps(
                             _audited_analyzer_components(
-                                _AUDITED_LEGACY_DESCRIPTOR_DIGEST
+                                _AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST
                             )
                         )
                     )
-                    mutate(legacy_components)
-                    tampered_legacy = AnalyzerFingerprint(
-                        digest=_AUDITED_LEGACY_ANALYZER_DIGEST,
-                        components=legacy_components,
+                    mutate(previous_components)
+                    tampered_previous = AnalyzerFingerprint(
+                        digest=_AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST,
+                        components=previous_components,
                     )
                     cold = PersistentVisualFeatureCache(
                         source_cache_directory=root / "cache",
                         source_path=source,
-                        analyzer=tampered_legacy,
+                        analyzer=tampered_previous,
                     )
                     self.assertTrue(cold.put(request, {"value": 1.0}))
                     warm = PersistentVisualFeatureCache(
@@ -913,8 +1393,10 @@ class VisualFeatureCacheTests(unittest.TestCase):
     def test_analyzer_migration_rejects_tampered_current_endpoint(
         self,
     ) -> None:
-        legacy = _analyzer_from_components(
-            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        previous = _analyzer_from_components(
+            _audited_analyzer_components(
+                _AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST
+            )
         )
         tampered_current_components = _audited_analyzer_components(
             _AUDITED_CURRENT_DESCRIPTOR_DIGEST
@@ -932,7 +1414,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
             cold = PersistentVisualFeatureCache(
                 source_cache_directory=root / "cache",
                 source_path=source,
-                analyzer=legacy,
+                analyzer=previous,
             )
             self.assertTrue(cold.put(request, {"value": 1.0}))
             warm = PersistentVisualFeatureCache(

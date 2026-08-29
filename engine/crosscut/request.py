@@ -104,6 +104,7 @@ class AnalysisRequest:
     source_mode: SourceMode = SourceMode.LOCAL
     desired_source_count: int = DEFAULT_AUTOMATIC_SOURCE_COUNT
     source_cache_directory: Path | None = None
+    visual_feature_derived_cache_directory: Path | None = None
     catalog_cache_directory: Path | None = None
     acquire_only: bool = False
     render_range_start_seconds: float | None = None
@@ -576,6 +577,43 @@ class AnalysisRequest:
         ):
             raise ValueError("source_cache_directory points to an existing file")
 
+        visual_feature_derived_cache_directory: Path | None = None
+        visual_feature_derived_cache_key = (
+            "visual_feature_derived_cache_directory"
+        )
+        if visual_feature_derived_cache_key in payload:
+            raw_visual_feature_derived_cache = payload[
+                visual_feature_derived_cache_key
+            ]
+            if (
+                not isinstance(raw_visual_feature_derived_cache, str)
+                or not raw_visual_feature_derived_cache.strip()
+            ):
+                raise ValueError(
+                    "visual_feature_derived_cache_directory must be a "
+                    "non-empty string"
+                )
+            raw_visual_feature_derived_cache_path = Path(
+                raw_visual_feature_derived_cache
+            ).expanduser()
+            if raw_visual_feature_derived_cache_path.is_symlink():
+                raise ValueError(
+                    "visual_feature_derived_cache_directory cannot be a "
+                    "symbolic link"
+                )
+            try:
+                visual_feature_derived_cache_directory = (
+                    raw_visual_feature_derived_cache_path.resolve(strict=True)
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "visual_feature_derived_cache_directory must exist"
+                ) from exc
+            if not visual_feature_derived_cache_directory.is_dir():
+                raise ValueError(
+                    "visual_feature_derived_cache_directory must be a directory"
+                )
+
         raw_catalog_cache = payload.get("catalog_cache_directory")
         if raw_catalog_cache is not None and (
             not isinstance(raw_catalog_cache, str)
@@ -825,6 +863,9 @@ class AnalysisRequest:
             source_mode=source_mode,
             desired_source_count=desired_source_count,
             source_cache_directory=source_cache_directory,
+            visual_feature_derived_cache_directory=(
+                visual_feature_derived_cache_directory
+            ),
             catalog_cache_directory=catalog_cache_directory,
             acquire_only=raw_acquire_only,
             render_range_start_seconds=raw_render_range_start,
@@ -894,6 +935,10 @@ class AnalysisRequest:
         if self.catalog_cache_directory is not None:
             payload["catalog_cache_directory"] = str(
                 self.catalog_cache_directory
+            )
+        if self.visual_feature_derived_cache_directory is not None:
+            payload["visual_feature_derived_cache_directory"] = str(
+                self.visual_feature_derived_cache_directory
             )
         if self.render_range_start_seconds is not None:
             payload["render_range_start_seconds"] = (

@@ -36,6 +36,8 @@ from .visual_candidate_materialization import (
     materialize_visual_timeline_candidates,
 )
 from .visual_score import (
+    PersistentVisualFeatureCacheInitializationError,
+    PersistentVisualFeatureCacheRuntimeError,
     VisualTimelineCandidateRecord,
     VisualTimelinePlan,
     build_prescribed_visual_timeline_candidate_set,
@@ -794,6 +796,8 @@ def materialize_stage_edit_visual_candidates(
         MaterializedVisualTimelineCandidate | None
     ) = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
 ) -> StageEditVisualCandidateBatch:
     """Hard-gate exactly eight StageEdit-typed rendered-proxy candidates.
@@ -882,6 +886,12 @@ def materialize_stage_edit_visual_candidates(
                     scene_cut_times=scene_cut_times,
                     source_timewarps=source_timewarps,
                     feature_cache_directory=feature_cache_directory,
+                    feature_derived_cache_directory=(
+                        feature_derived_cache_directory
+                    ),
+                    require_persistent_feature_cache=(
+                        require_persistent_feature_cache
+                    ),
                     progress_callback=(
                         (
                             lambda completed, total, position=position: (
@@ -955,6 +965,12 @@ def materialize_stage_edit_visual_candidates(
                 scene_cut_times=scene_cut_times,
                 source_timewarps=source_timewarps,
                 feature_cache_directory=feature_cache_directory,
+                feature_derived_cache_directory=(
+                    feature_derived_cache_directory
+                ),
+                require_persistent_feature_cache=(
+                    require_persistent_feature_cache
+                ),
                 progress_callback=(
                     (
                         lambda completed, total, position=position: progress_callback(
@@ -983,6 +999,8 @@ def materialize_stage_edit_visual_candidate(
     scene_cut_times: Sequence[Sequence[float]],
     source_timewarps: Sequence[TimeWarpMap | None],
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> StageEditMaterializedVisualCandidate:
     """Hard-gate one exact StageEdit path for bounded beam-repair review."""
@@ -1015,8 +1033,21 @@ def materialize_stage_edit_visual_candidate(
             scene_cut_times=scene_cut_times,
             source_timewarps=source_timewarps,
             feature_cache_directory=feature_cache_directory,
+            feature_derived_cache_directory=feature_derived_cache_directory,
+            require_persistent_feature_cache=(
+                require_persistent_feature_cache
+            ),
             progress_callback=progress_callback,
         )
+    except (
+        PersistentVisualFeatureCacheInitializationError,
+        PersistentVisualFeatureCacheRuntimeError,
+    ):
+        # A user-selected direct derived-cache root is a production
+        # prerequisite, not a per-candidate visual rejection.  Propagate
+        # initialization and mid-analysis storage failures before the hybrid
+        # loop can retry the same broken source set.
+        raise
     except Exception as exc:
         raise StageEditVisualCandidateError(
             "StageEdit candidate failed prescribed visual hard gates: "

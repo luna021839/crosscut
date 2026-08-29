@@ -27,6 +27,7 @@ from .rhythm import RhythmAnalysis
 from .section_director import SectionPlan
 from .stage_edit_feature_materializer import (
     SourceFeatureObservation,
+    StageEditCausalSensingArtifacts,
     StageEditFeatureFrame,
     StageEditFeatureProvenance,
     StageEditFeatureSnapshot,
@@ -48,9 +49,9 @@ from .visual_score import (
 )
 
 
-STAGE_EDIT_INFERENCE_SNAPSHOT_SCHEMA_VERSION = 1
+STAGE_EDIT_INFERENCE_SNAPSHOT_SCHEMA_VERSION = 2
 STAGE_EDIT_INFERENCE_SNAPSHOT_CONTRACT = (
-    "actual_synchronized_media_inference_snapshot_v1"
+    "actual_synchronized_media_inference_snapshot_v2"
 )
 DEFAULT_INFERENCE_CANDIDATE_SPACING_SECONDS = 0.50
 DEFAULT_INFERENCE_VISUAL_WORKING_WIDTH = 480
@@ -322,11 +323,16 @@ def materialize_stage_edit_inference_snapshot(
     section_plan: SectionPlan,
     output_directory: Path,
     feature_cache_directory: Path | None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     maximum_sequence_length: int,
     maximum_sources: int,
     minimum_source_availability_ratio: float = (
         MINIMUM_PER_SOURCE_AVAILABILITY_RATIO
     ),
+    causal_sensing: StageEditCausalSensingArtifacts | None = None,
+    edit_mode: object = "group",
+    target_member: object | None = None,
 ) -> StageEditInferenceSnapshotResult:
     """Decode target-free model inputs from one actual synchronized source pool."""
 
@@ -340,6 +346,20 @@ def materialize_stage_edit_inference_snapshot(
     source_count = len(normalized_sources)
     if not normalized_song or source_count < 2:
         raise ValueError("song_id and at least two sources are required")
+    if not isinstance(causal_sensing, StageEditCausalSensingArtifacts):
+        raise StageEditInferenceSnapshotError(
+            "registered automatic StageEdit inference requires the complete "
+            "shooting-grammar/member-state/performer-state artifact triple"
+        )
+    try:
+        causal_sensing.binding.require_production_scope(
+            edit_mode=edit_mode,
+            target_member=target_member,
+        )
+    except (TypeError, ValueError) as exc:
+        raise StageEditInferenceSnapshotError(
+            f"registered automatic StageEdit causal sensing is invalid: {exc}"
+        ) from exc
     if source_count > maximum_sources:
         raise StageEditInferenceSnapshotError(
             "actual source count exceeds the registered Transformer limit"
@@ -376,12 +396,31 @@ def materialize_stage_edit_inference_snapshot(
         if feature_cache_directory is not None
         else None
     )
+    derived_cache_directory = (
+        Path(feature_derived_cache_directory).expanduser()
+        if feature_derived_cache_directory is not None
+        else None
+    )
+    if not isinstance(require_persistent_feature_cache, bool):
+        raise TypeError("require_persistent_feature_cache must be a boolean")
+    if require_persistent_feature_cache and derived_cache_directory is None:
+        raise ValueError(
+            "require_persistent_feature_cache needs an explicit "
+            "feature_derived_cache_directory"
+        )
+    sampler_arguments: dict[str, Any] = {}
+    if cache_directory is not None:
+        sampler_arguments["feature_cache_directory"] = cache_directory
+    if derived_cache_directory is not None:
+        sampler_arguments["feature_derived_cache_directory"] = (
+            derived_cache_directory
+        )
+    if require_persistent_feature_cache:
+        sampler_arguments["require_persistent_feature_cache"] = True
     samplers: list[_VideoSampler] = []
     try:
-        samplers = [
-            _VideoSampler(path, feature_cache_directory=cache_directory)
-            for path in normalized_sources
-        ]
+        for path in normalized_sources:
+            samplers.append(_VideoSampler(path, **sampler_arguments))
         content_hashes = tuple(
             (
                 sampler.persistent_feature_cache.source_sha256
@@ -566,6 +605,9 @@ def materialize_stage_edit_inference_snapshot(
             performance_start_seconds=section_plan.start_seconds,
             performance_end_seconds=section_plan.end_seconds,
             provenance=provenance,
+            causal_sensing=causal_sensing,
+            production_edit_mode=edit_mode,
+            production_target_member=target_member,
         )
         snapshot = StageEditFeatureSnapshot.build(
             mask_stage_edit_recent_history_for_semimarkov(
@@ -573,7 +615,8 @@ def materialize_stage_edit_inference_snapshot(
                 DEFAULT_STAGE_EDIT_SCHEMA,
             ),
             schema=DEFAULT_STAGE_EDIT_SCHEMA,
-            provenance=provenance,
+            provenance=unmasked_snapshot.provenance,
+            causal_sensing_binding=unmasked_snapshot.causal_sensing_binding,
         )
     finally:
         for sampler in samplers:
@@ -604,7 +647,14 @@ def materialize_stage_edit_inference_snapshot(
         "source_ids": list(source_ids),
         "source_content_sha256": list(content_hashes),
         "decision_times_seconds": list(decision_times),
-        "feature_provenance": provenance.to_dict(),
+        "feature_provenance": snapshot.provenance.to_dict(),
+        "causal_sensing_binding": snapshot.causal_sensing_binding.to_dict(),
+        "production_causal_sensing_gate": (
+            snapshot.require_production_causal_sensing(
+                edit_mode=edit_mode,
+                target_member=target_member,
+            )
+        ),
         "decision_history_input_contract": (
             stage_edit_recent_history_mask_contract(DEFAULT_STAGE_EDIT_SCHEMA)
         ),
@@ -621,6 +671,9 @@ def materialize_stage_edit_inference_snapshot(
             "face_identity_embeddings_persisted": False,
             "source_content_sha256_bound": True,
             "all_sources_passed_alignment_hard_gate": True,
+            "causal_sensing_exact_timestamp_and_content_hash_bound": True,
+            "member_state_unknown_preserved": True,
+            "ive_performer_distribution_unknown_preserved": True,
         },
     }
     manifest_sha = _canonical_sha256(manifest_unsigned)
@@ -639,6 +692,10 @@ def materialize_stage_edit_inference_snapshot(
         raise StageEditInferenceSnapshotError(
             "written StageEdit inference snapshot failed strict round-trip"
         )
+    restored.require_production_causal_sensing(
+        edit_mode=edit_mode,
+        target_member=target_member,
+    )
     return StageEditInferenceSnapshotResult(
         snapshot=snapshot,
         snapshot_path=snapshot_path,

@@ -318,7 +318,19 @@ class DirectMemberDenseFaceProvider:
         sources: Sequence[Path],
         *,
         feature_cache_directory: Path | None = None,
+        feature_derived_cache_directory: Path | None = None,
+        require_persistent_feature_cache: bool = False,
     ) -> None:
+        if not isinstance(require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be boolean")
+        if (
+            require_persistent_feature_cache
+            and feature_derived_cache_directory is None
+        ):
+            raise ValueError(
+                "require_persistent_feature_cache needs an explicit "
+                "feature_derived_cache_directory"
+            )
         self._sources = tuple(Path(source) for source in sources)
         self._samplers: list[_VideoSampler | None] = []
         self._cache: dict[
@@ -330,22 +342,55 @@ class DirectMemberDenseFaceProvider:
         self._focal_references: list[list[FocalFaceCandidate]] = [
             [] for _source in self._sources
         ]
+        self._focal_boundary_reference_capture: list[
+            tuple[
+                int,
+                int,
+                FocalFaceCandidate | None,
+                FocalFaceCandidate | None,
+            ]
+        ] = []
         self._request_count = 0
         self._cache_hit_count = 0
         self._decode_count = 0
         self._focal_pair_request_count = 0
         self._focal_pair_match_count = 0
         self._focal_reference_match_count = 0
-        for source in self._sources:
-            try:
-                sampler = _VideoSampler(
-                    source,
-                    feature_cache_directory=feature_cache_directory,
-                )
-                _enable_dense_sequential_frame_reads(sampler)
-            except (OSError, TypeError, ValueError, cv2.error):
-                sampler = None
-            self._samplers.append(sampler)
+        self._require_persistent_feature_cache = (
+            require_persistent_feature_cache
+        )
+        sampler_arguments: dict[str, object] = {}
+        if feature_cache_directory is not None:
+            sampler_arguments["feature_cache_directory"] = (
+                feature_cache_directory
+            )
+        if feature_derived_cache_directory is not None:
+            sampler_arguments["feature_derived_cache_directory"] = (
+                feature_derived_cache_directory
+            )
+        if require_persistent_feature_cache:
+            sampler_arguments["require_persistent_feature_cache"] = True
+        try:
+            for source in self._sources:
+                sampler: _VideoSampler | None = None
+                try:
+                    sampler = _VideoSampler(source, **sampler_arguments)
+                    _enable_dense_sequential_frame_reads(sampler)
+                except (OSError, TypeError, ValueError, cv2.error):
+                    if sampler is not None:
+                        sampler.close()
+                    sampler = None
+                except BaseException:
+                    if sampler is not None:
+                        sampler.close()
+                    raise
+                self._samplers.append(sampler)
+        except BaseException:
+            for sampler in self._samplers:
+                if sampler is not None:
+                    sampler.close()
+            self._samplers.clear()
+            raise
 
     @staticmethod
     def _identity_key(
@@ -369,6 +414,8 @@ class DirectMemberDenseFaceProvider:
         sampler = self._samplers[source_index]
         if sampler is None:
             return ()
+        if self._require_persistent_feature_cache:
+            sampler.assert_required_persistent_cache_available()
         key = self._identity_key(source_index, sampler, seconds)
         if key in self._focal_candidate_cache:
             return self._focal_candidate_cache[key]
@@ -463,6 +510,26 @@ class DirectMemberDenseFaceProvider:
         if len(references) > 32:
             del references[:-32]
 
+    def begin_focal_boundary_reference_capture(self) -> None:
+        """Start one ordered, path-local capture before dense motion planning."""
+
+        self._focal_boundary_reference_capture.clear()
+
+    def focal_boundary_reference_capture(
+        self,
+    ) -> tuple[
+        tuple[
+            int,
+            int,
+            FocalFaceCandidate | None,
+            FocalFaceCandidate | None,
+        ],
+        ...,
+    ]:
+        """Return exact transient face pairs used at this path's boundaries."""
+
+        return tuple(self._focal_boundary_reference_capture)
+
     def paired_samples(
         self,
         outgoing_source_index: int,
@@ -483,11 +550,27 @@ class DirectMemberDenseFaceProvider:
         )
         pair = select_focal_face_pair(left_candidates, right_candidates)
         if pair is None:
+            self._focal_boundary_reference_capture.append(
+                (
+                    outgoing_source_index,
+                    incoming_source_index,
+                    None,
+                    None,
+                )
+            )
             return (
                 self.sample(outgoing_source_index, outgoing_seconds),
                 self.sample(incoming_source_index, incoming_seconds),
             )
         self._focal_pair_match_count += 1
+        self._focal_boundary_reference_capture.append(
+            (
+                outgoing_source_index,
+                incoming_source_index,
+                pair.outgoing,
+                pair.incoming,
+            )
+        )
         self._register_focal_reference(
             outgoing_source_index,
             pair.outgoing,
@@ -525,6 +608,111 @@ class DirectMemberDenseFaceProvider:
         ] = right_sample
         return (left_sample, right_sample)
 
+    def recover_exact_focal_pair_from_registered_references(
+        self,
+        outgoing_source_index: int,
+        outgoing_seconds: float,
+        incoming_source_index: int,
+        incoming_seconds: float,
+        *,
+        maximum_temporal_bridge_seconds: float = 0.50,
+        temporal_step_seconds: float = 0.10,
+    ) -> tuple[FocalFaceCandidate, FocalFaceCandidate] | None:
+        """Recover an ambiguous exact endpoint through a nearby same-source face.
+
+        Dense planning visits every selected boundary before this method is
+        called, so each source can already hold transient references from a
+        different, unambiguous cut. If an exact endpoint contains several
+        faces and none matches that older reference directly, a nearby frame
+        can bridge appearance change back to one of the *exact-frame*
+        candidates. A face absent from the exact frame is never fabricated or
+        extrapolated, and neither embeddings nor pixels leave process memory.
+        """
+
+        for source_index in (
+            outgoing_source_index,
+            incoming_source_index,
+        ):
+            if (
+                isinstance(source_index, bool)
+                or not isinstance(source_index, int)
+                or not 0 <= source_index < len(self._sources)
+            ):
+                raise ValueError("focal recovery source index is invalid")
+        for seconds in (outgoing_seconds, incoming_seconds):
+            if not math.isfinite(seconds):
+                raise ValueError("focal recovery time is invalid")
+        if (
+            not math.isfinite(maximum_temporal_bridge_seconds)
+            or not 0.0 < maximum_temporal_bridge_seconds <= 0.75
+            or not math.isfinite(temporal_step_seconds)
+            or not 0.0 < temporal_step_seconds <= 0.25
+        ):
+            raise ValueError("focal recovery temporal search is invalid")
+        def recover_one(
+            source_index: int,
+            exact_seconds: float,
+            direction: float,
+        ) -> FocalFaceCandidate | None:
+            exact_candidates = self._focal_candidates(
+                source_index,
+                max(0.0, exact_seconds),
+            )
+            references = tuple(self._focal_references[source_index])
+            if not exact_candidates or not references:
+                return None
+            direct = select_focal_face_matching_reference(
+                exact_candidates,
+                references,
+            )
+            if direct is not None:
+                return direct
+            step_count = int(
+                math.floor(
+                    maximum_temporal_bridge_seconds
+                    / temporal_step_seconds
+                    + 1e-9
+                )
+            )
+            for step in range(1, step_count + 1):
+                adjacent_seconds = max(
+                    0.0,
+                    exact_seconds
+                    + direction * step * temporal_step_seconds,
+                )
+                adjacent = select_focal_face_matching_reference(
+                    self._focal_candidates(
+                        source_index,
+                        adjacent_seconds,
+                    ),
+                    references,
+                )
+                if adjacent is None:
+                    continue
+                bridged = select_focal_face_matching_reference(
+                    exact_candidates,
+                    (adjacent,),
+                )
+                if bridged is not None:
+                    return bridged
+            return None
+
+        outgoing = recover_one(
+            outgoing_source_index,
+            outgoing_seconds,
+            -1.0,
+        )
+        incoming = recover_one(
+            incoming_source_index,
+            incoming_seconds,
+            1.0,
+        )
+        if outgoing is None or incoming is None:
+            return None
+        self._register_focal_reference(outgoing_source_index, outgoing)
+        self._register_focal_reference(incoming_source_index, incoming)
+        return (outgoing, incoming)
+
     def sample(
         self,
         source_index: int,
@@ -538,8 +726,13 @@ class DirectMemberDenseFaceProvider:
             raise ValueError("dense member face source index is invalid")
         if not math.isfinite(source_local_seconds):
             raise ValueError("dense member face time must be finite")
-        self._request_count += 1
         sampler = self._samplers[source_index]
+        if (
+            sampler is not None
+            and self._require_persistent_feature_cache
+        ):
+            sampler.assert_required_persistent_cache_available()
+        self._request_count += 1
         if sampler is None:
             return None
         normalized_seconds = max(0.0, source_local_seconds)
@@ -716,6 +909,13 @@ class DirectMemberDenseFaceProvider:
 class DirectMemberEditorialMotionConfig:
     ramp_seconds: float = 0.75
     maximum_boundary_zoom: float = 1.50
+    # Human editors routinely accept a small, high-quality resample to make a
+    # face or full-body action land cleanly across a cut.  Keep exact-pixel
+    # transforms preferred, but do not make a 1080p source categorically
+    # uneditable: at most fifteen percent of the requested camera zoom may be
+    # supplied by Lanczos upscaling.  Containment, dense-frame continuity, and
+    # residual position/scale gates remain unchanged.
+    maximum_boundary_upscale_ratio: float = 1.15
     maximum_center_shift: float = 0.160
     maximum_boundary_center_distance: float = 0.30
     maximum_residual_center_distance: float = 0.08
@@ -762,6 +962,7 @@ class DirectMemberEditorialMotionConfig:
     target_events_per_minute: float = 12.0
     minimum_event_spacing_seconds: float = 2.0
     enable_interior_zoom_pulses: bool = False
+    allow_partial_required_boundary_matches: bool = False
     target_rich_motion_events_per_minute: float = 4.0
     minimum_interior_pulse_duration_seconds: float = 2.2
     interior_pulse_zoom: float = 1.05
@@ -770,6 +971,7 @@ class DirectMemberEditorialMotionConfig:
         values = tuple(float(getattr(self, name)) for name in (
             "ramp_seconds",
             "maximum_boundary_zoom",
+            "maximum_boundary_upscale_ratio",
             "maximum_center_shift",
             "maximum_boundary_center_distance",
             "maximum_residual_center_distance",
@@ -808,6 +1010,8 @@ class DirectMemberEditorialMotionConfig:
         # Reuse the confirmed-member configuration as the shared camera/schema
         # contract.  Dense-direct adds stricter continuity gates below.
         _shared_settings(self)
+        if not 1.0 <= self.maximum_boundary_upscale_ratio <= 1.15:
+            raise ValueError("bounded boundary upscale ratio is invalid")
         if not (
             0.0
             <= self.maximum_face_residual_position_mismatch
@@ -902,6 +1106,10 @@ class DirectMemberEditorialMotionConfig:
             raise ValueError("dense endpoint height-ratio gate is invalid")
         if not isinstance(self.enable_interior_zoom_pulses, bool):
             raise ValueError("interior zoom pulse switch must be boolean")
+        if not isinstance(self.allow_partial_required_boundary_matches, bool):
+            raise ValueError(
+                "partial required boundary match switch must be boolean"
+            )
         if not 0.0 <= self.target_rich_motion_events_per_minute <= 12.0:
             raise ValueError("rich direct-member motion density is invalid")
         if not 1.5 <= self.minimum_interior_pulse_duration_seconds <= 6.0:
@@ -940,6 +1148,8 @@ class _BoundaryCandidate:
     right_box: tuple[float, float, float, float]
     alternative_states: tuple[_State, ...] = ()
     paired_state: _State | None = None
+    upscale_ratio: float = 1.0
+    paired_upscale_ratio: float = 1.0
     required: bool = False
 
 
@@ -2858,7 +3068,18 @@ def build_direct_member_editorial_motion_plan(
             1e-9, min(left_box[3], right_box[3])
         )
         if ratio <= 1.015 and center_distance <= 0.025:
-            reject_boundary("already_scale_position_matched")
+            if required:
+                naturally_satisfied_required_boundary_indices.add(
+                    boundary_index
+                )
+                natural_match_geometry[boundary_index] = (
+                    audited_basis,
+                    left_box,
+                    right_box,
+                )
+                skip("required_dense_natural_match")
+            else:
+                skip("already_scale_position_matched")
             continue
         baseline = _mismatch(left_box, right_box)
         if required and repair is not None:
@@ -2947,19 +3168,25 @@ def build_direct_member_editorial_motion_plan(
                     None,
                     "required_transform_source_resolution_missing",
                 )
-            lossless_zoom_limit = (
+            lossless_zoom_capacity = (
+                affected_geometry.lossless_zoom_capacity
+                if affected_geometry is not None
+                else settings.maximum_boundary_zoom
+            )
+            render_quality_zoom_limit = (
                 min(
                     settings.maximum_boundary_zoom,
-                    affected_geometry.lossless_zoom_capacity,
+                    lossless_zoom_capacity
+                    * settings.maximum_boundary_upscale_ratio,
                 )
                 if affected_geometry is not None
                 else settings.maximum_boundary_zoom
             )
-            if lossless_zoom_limit <= 1.0 + 1e-9:
+            if render_quality_zoom_limit <= 1.0 + 1e-9:
                 return (
                     [],
-                    lossless_zoom_limit,
-                    "source_resolution_has_no_lossless_transform_headroom",
+                    render_quality_zoom_limit,
+                    "source_resolution_has_no_bounded_upscale_headroom",
                 )
             desired_center_shift = min(
                 settings.maximum_center_shift,
@@ -2978,7 +3205,7 @@ def build_direct_member_editorial_motion_plan(
                 pan_headroom_zoom,
             )
             maximum_candidate_zoom = min(
-                lossless_zoom_limit,
+                render_quality_zoom_limit,
                 requested_zoom,
             )
             if (
@@ -2987,7 +3214,7 @@ def build_direct_member_editorial_motion_plan(
                 and candidate_side == preferred_side
             ):
                 maximum_candidate_zoom = min(
-                    lossless_zoom_limit,
+                    render_quality_zoom_limit,
                     max(maximum_candidate_zoom, repair.zoom),
                 )
             zoom_values = [maximum_candidate_zoom]
@@ -3088,7 +3315,23 @@ def build_direct_member_editorial_motion_plan(
                         continue
                     if transformed + 1e-4 < baseline:
                         qualifying.append((transformed, state))
-            qualifying.sort(key=lambda item: item[0])
+            # Exact-pixel states are a separate first tier.  Only use bounded
+            # upscaling when no lossless state satisfies the same professional
+            # residual and containment gates.
+            lossless_qualifying = [
+                item
+                for item in qualifying
+                if item[1].zoom <= lossless_zoom_capacity + 1e-9
+            ]
+            if lossless_qualifying:
+                qualifying = lossless_qualifying
+            qualifying.sort(
+                key=lambda item: (
+                    item[0],
+                    max(1.0, item[1].zoom / max(1e-9, lossless_zoom_capacity)),
+                    item[1].zoom,
+                )
+            )
             return (qualifying, maximum_candidate_zoom, None)
 
         side_results: list[
@@ -3105,7 +3348,7 @@ def build_direct_member_editorial_motion_plan(
                 (candidate_side, qualifying, maximum_zoom, failure)
             )
 
-        bilateral_match: tuple[float, _State, _State] | None = None
+        bilateral_match: tuple[float, _State, _State, float] | None = None
         bilateral_failure: str | None = None
         if required and not any(
             qualifying for _side, qualifying, _zoom, _failure in side_results
@@ -3123,13 +3366,17 @@ def build_direct_member_editorial_motion_plan(
             elif left_geometry is None or right_geometry is None:
                 bilateral_failure = "bilateral_source_resolution_missing"
             else:
+                left_lossless_capacity = left_geometry.lossless_zoom_capacity
+                right_lossless_capacity = right_geometry.lossless_zoom_capacity
                 left_zoom_limit = min(
                     settings.maximum_boundary_zoom,
-                    left_geometry.lossless_zoom_capacity,
+                    left_lossless_capacity
+                    * settings.maximum_boundary_upscale_ratio,
                 )
                 right_zoom_limit = min(
                     settings.maximum_boundary_zoom,
-                    right_geometry.lossless_zoom_capacity,
+                    right_lossless_capacity
+                    * settings.maximum_boundary_upscale_ratio,
                 )
                 minimum_target_height = max(left_box[3], right_box[3])
                 maximum_target_height = min(
@@ -3137,18 +3384,22 @@ def build_direct_member_editorial_motion_plan(
                     right_box[3] * right_zoom_limit,
                 )
                 if maximum_target_height + 1e-9 < minimum_target_height:
-                    bilateral_failure = "bilateral_lossless_zoom_exceeded"
+                    bilateral_failure = "bilateral_bounded_upscale_exceeded"
                 else:
-                    target_centers = (
-                        (0.50, 0.50),
-                        (0.42, 0.50),
-                        (0.58, 0.50),
-                        (0.50, 0.42),
-                        (0.50, 0.58),
-                        (0.42, 0.42),
-                        (0.42, 0.58),
-                        (0.58, 0.42),
-                        (0.58, 0.58),
+                    # A fixed 3x3 target grid misses valid shared-camera
+                    # solutions when two edge-framed fancams must split the
+                    # pan between them.  Search the complete bounded camera
+                    # interval at four-percent steps.  Every resulting state
+                    # is still checked by the exact pan, containment, dense
+                    # continuity, and residual gates below.
+                    target_axis_values = tuple(
+                        0.50 + 0.04 * offset
+                        for offset in range(-4, 5)
+                    )
+                    target_centers = tuple(
+                        (target_x, target_y)
+                        for target_x in target_axis_values
+                        for target_y in target_axis_values
                     )
                     minimum_alignment_visible_fraction = (
                         settings.minimum_dense_face_visible_fraction
@@ -3156,7 +3407,7 @@ def build_direct_member_editorial_motion_plan(
                         else settings.minimum_widened_subject_visible_fraction
                     )
                     options: list[
-                        tuple[float, float, _State, _State]
+                        tuple[bool, float, float, float, _State, _State]
                     ] = []
                     height_span = maximum_target_height - minimum_target_height
                     for step in range(33):
@@ -3251,23 +3502,45 @@ def build_direct_member_editorial_motion_plan(
                                             right_state.center_y - 0.5,
                                         )
                                     )
+                                    upscale_ratio = max(
+                                        1.0,
+                                        left_state.zoom
+                                        / max(1e-9, left_lossless_capacity),
+                                        right_state.zoom
+                                        / max(1e-9, right_lossless_capacity),
+                                    )
                                     options.append(
                                         (
+                                            upscale_ratio > 1.0 + 1e-9,
                                             transformed,
                                             camera_effort,
+                                            upscale_ratio,
                                             left_state,
                                             right_state,
                                         )
                                     )
                     if options:
-                        transformed, _effort, left_state, right_state = min(
+                        (
+                            _uses_upscale,
+                            transformed,
+                            _effort,
+                            bilateral_upscale_ratio,
+                            left_state,
+                            right_state,
+                        ) = min(
                             options,
-                            key=lambda item: (item[0], item[1]),
+                            key=lambda item: (
+                                item[0],
+                                item[1],
+                                item[2],
+                                item[3],
+                            ),
                         )
                         bilateral_match = (
                             transformed,
                             left_state,
                             right_state,
+                            bilateral_upscale_ratio,
                         )
                     else:
                         bilateral_failure = (
@@ -3275,7 +3548,12 @@ def build_direct_member_editorial_motion_plan(
                         )
 
         if bilateral_match is not None:
-            bilateral_score, left_state, right_state = bilateral_match
+            (
+                bilateral_score,
+                left_state,
+                right_state,
+                bilateral_upscale_ratio,
+            ) = bilateral_match
             candidates.append(
                 _BoundaryCandidate(
                     boundary_index=boundary_index,
@@ -3284,6 +3562,16 @@ def build_direct_member_editorial_motion_plan(
                     side="both",
                     state=left_state,
                     paired_state=right_state,
+                    upscale_ratio=max(
+                        1.0,
+                        left_state.zoom
+                        / max(1e-9, left_geometry.lossless_zoom_capacity),
+                    ),
+                    paired_upscale_ratio=max(
+                        1.0,
+                        right_state.zoom
+                        / max(1e-9, right_geometry.lossless_zoom_capacity),
+                    ),
                     alignment_geometry_basis=audited_basis,
                     left_box=left_box,
                     right_box=right_box,
@@ -3321,6 +3609,19 @@ def build_direct_member_editorial_motion_plan(
             if not qualifying:
                 continue
             best_score, best_state = qualifying[0]
+            affected_source = (
+                left_source if candidate_side == "left" else right_source
+            )
+            affected_geometry = source_frame_geometries[affected_source]
+            upscale_ratio = (
+                max(
+                    1.0,
+                    best_state.zoom
+                    / max(1e-9, affected_geometry.lossless_zoom_capacity),
+                )
+                if affected_geometry is not None
+                else 1.0
+            )
             candidates.append(
                 _BoundaryCandidate(
                     boundary_index=boundary_index,
@@ -3328,6 +3629,7 @@ def build_direct_member_editorial_motion_plan(
                     score=baseline - best_score,
                     side=candidate_side,
                     state=best_state,
+                    upscale_ratio=upscale_ratio,
                     alignment_geometry_basis=audited_basis,
                     left_box=left_box,
                     right_box=right_box,
@@ -3571,6 +3873,19 @@ def build_direct_member_editorial_motion_plan(
                 score=candidate.score,
                 side=candidate.side,
                 state=accepted_state,
+                upscale_ratio=max(
+                    1.0,
+                    accepted_state.zoom
+                    / max(
+                        1e-9,
+                        source_frame_geometries[
+                            source_path[affected_index]
+                        ].lossless_zoom_capacity,
+                    ),
+                )
+                if source_frame_geometries[source_path[affected_index]]
+                is not None
+                else 1.0,
                 alignment_geometry_basis=(
                     candidate.alignment_geometry_basis
                 ),
@@ -3834,11 +4149,18 @@ def build_direct_member_editorial_motion_plan(
         )
 
     accepted_segments: set[int] = set()
+    bounded_upscale_segments: set[int] = set()
     for item in accepted:
         if item.side in {"left", "both"}:
             accepted_segments.add(item.boundary_index)
+            if item.upscale_ratio > 1.0 + 1e-9:
+                bounded_upscale_segments.add(item.boundary_index)
         if item.side in {"right", "both"}:
             accepted_segments.add(item.boundary_index + 1)
+            if item.paired_upscale_ratio > 1.0 + 1e-9 or (
+                item.side == "right" and item.upscale_ratio > 1.0 + 1e-9
+            ):
+                bounded_upscale_segments.add(item.boundary_index + 1)
     accepted_boundary_indices = tuple(
         sorted(item.boundary_index for item in accepted)
     )
@@ -3850,7 +4172,7 @@ def build_direct_member_editorial_motion_plan(
             .union(final_residual_failure_indices)
         )
     )
-    if missing_required:
+    if missing_required and not config.allow_partial_required_boundary_matches:
         rejection_counts: dict[str, int] = {}
         for boundary_index in missing_required:
             reasons = required_rejection_reasons.get(
@@ -3894,6 +4216,8 @@ def build_direct_member_editorial_motion_plan(
             rejection_reasons=required_rejection_reasons,
             rejection_context=required_rejection_context,
         )
+    if missing_required:
+        skipped["required_dense_partial_unresolved"] = len(missing_required)
 
     return EditorialMotionPlan(
         segments=tuple(
@@ -3903,6 +4227,11 @@ def build_direct_member_editorial_motion_plan(
                 track=tracks[index],
                 reasons=(
                     (
+                        "official_fancam_dense_subject_bounded_"
+                        "perceptual_upscale_match",
+                    )
+                    if index in bounded_upscale_segments
+                    else (
                         "official_fancam_dense_face_subject_"
                         "scale_position_match",
                     )
@@ -3943,7 +4272,7 @@ def build_direct_member_editorial_motion_plan(
         analysis_basis=(
             "official_target_fancam_face_or_verified_full_subject_dense_"
             "output_frame_boundary_anchored_subject_relative_face_track_"
-            "adaptive_review_v9"
+            "adaptive_review_v10"
         ),
         accepted_boundary_indices=accepted_boundary_indices,
         natural_match_boundary_indices=tuple(

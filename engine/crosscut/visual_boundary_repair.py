@@ -46,10 +46,16 @@ from .stage_edit_temporal_pose_motion import (
 )
 from .visual_score import (
     FrameVisualDescriptor,
+    PersistentVisualFeatureCacheInitializationError,
+    PersistentVisualFeatureCacheRuntimeError,
     VisualTimelineChoice,
     VisualTimelinePlan,
     _VideoSampler,
     describe_boundary_side_stability,
+)
+from .visual_feature_cache import (
+    PersistentVisualFeatureCacheStorageUnavailableError,
+    assert_visual_feature_derived_cache_root_available,
 )
 from .visual_splice_failure_feedback import (
     build_splice_failure_feedback,
@@ -1942,6 +1948,8 @@ def repair_visual_timeline_boundaries(
     descriptor_provider: DescriptorProvider | None = None,
     descriptor_cache: BoundaryDescriptorCache | None = None,
     feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
     config: BoundaryRepairConfig | None = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     boundary_indices: Sequence[int] | None = None,
@@ -1952,6 +1960,22 @@ def repair_visual_timeline_boundaries(
     lets decoded-output QA revisit only the failed cuts with a wider local
     radius while preserving every decision outside those exact boundaries.
     """
+
+    if not isinstance(require_persistent_feature_cache, bool):
+        raise TypeError("require_persistent_feature_cache must be boolean")
+    if require_persistent_feature_cache:
+        if feature_derived_cache_directory is None:
+            raise PersistentVisualFeatureCacheInitializationError(
+                "persistent visual feature cache is required but was not configured"
+            )
+        try:
+            assert_visual_feature_derived_cache_root_available(
+                feature_derived_cache_directory
+            )
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            raise PersistentVisualFeatureCacheRuntimeError(
+                "required persistent visual feature cache failed during analysis"
+            ) from None
 
     if not visual_timeline.choices:
         raise ValueError("visual timeline cannot be empty")
@@ -2054,9 +2078,20 @@ def repair_visual_timeline_boundaries(
                     return cached
             sampler = samplers.get(source_index)
             if sampler is None:
+                sampler_arguments: dict[str, object] = {}
+                if feature_cache_directory is not None:
+                    sampler_arguments["feature_cache_directory"] = (
+                        feature_cache_directory
+                    )
+                if feature_derived_cache_directory is not None:
+                    sampler_arguments["feature_derived_cache_directory"] = (
+                        feature_derived_cache_directory
+                    )
+                if require_persistent_feature_cache:
+                    sampler_arguments["require_persistent_feature_cache"] = True
                 sampler = _VideoSampler(
                     Path(sources[source_index]),
-                    feature_cache_directory=feature_cache_directory,
+                    **sampler_arguments,
                 )
                 samplers[source_index] = sampler
             descriptor = sampler.feature_descriptor_at(
@@ -2069,9 +2104,13 @@ def repair_visual_timeline_boundaries(
             return descriptor
 
     else:
-        if feature_cache_directory is not None:
+        if (
+            feature_cache_directory is not None
+            or feature_derived_cache_directory is not None
+            or require_persistent_feature_cache
+        ):
             raise ValueError(
-                "feature_cache_directory cannot wrap an explicit "
+                "persistent feature cache cannot wrap an explicit "
                 "descriptor_provider"
             )
         if descriptor_cache is not None:

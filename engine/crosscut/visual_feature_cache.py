@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -54,6 +55,55 @@ _MAXIMUM_DECODE_FREE_LOCATOR_RECORDS = 4_096
 _LOCATOR_INDEX_OVER_BUDGET_PROCESS_ROOTS: set[str] = set()
 
 
+class PersistentVisualFeatureCacheIOError(RuntimeError):
+    """Base class for cache-storage failures that are not record corruption."""
+
+
+class PersistentVisualFeatureCacheStorageUnavailableError(
+    PersistentVisualFeatureCacheIOError
+):
+    """The initialized cache root disappeared or changed identity."""
+
+
+class PersistentVisualFeatureCacheWriteError(PersistentVisualFeatureCacheIOError):
+    """An atomic persistent-cache record write could not be completed."""
+
+
+def assert_visual_feature_derived_cache_root_available(
+    directory: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[Path, tuple[int, int]]:
+    """Resolve and attest one direct derived-cache root without opening media."""
+
+    raw_directory = Path(directory).expanduser()
+    try:
+        if raw_directory.is_symlink():
+            raise PersistentVisualFeatureCacheStorageUnavailableError(
+                "persistent visual feature cache storage is unavailable"
+            )
+        resolved_directory = raw_directory.resolve(strict=True)
+        root_stat = resolved_directory.lstat()
+    except PersistentVisualFeatureCacheStorageUnavailableError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise PersistentVisualFeatureCacheStorageUnavailableError(
+            "persistent visual feature cache storage is unavailable"
+        ) from None
+    identity = (root_stat.st_dev, root_stat.st_ino)
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or (
+            expected_identity is not None
+            and identity != expected_identity
+        )
+    ):
+        raise PersistentVisualFeatureCacheStorageUnavailableError(
+            "persistent visual feature cache storage identity changed"
+        )
+    return resolved_directory, identity
+
+
 @dataclass(frozen=True, slots=True)
 class _DecodeEquivalentAnalyzerMigration:
     """One audited, one-way analyzer migration with exact code identities."""
@@ -77,15 +127,37 @@ class _DecodeEquivalentAnalyzerMigration:
             raise ValueError("analyzer migration must change descriptor code")
 
 
-# Alias-level AST v2 changes only the dependency fingerprint representation;
-# the descriptor implementation and every decoded numeric feature are
-# unchanged.  Reuse is deliberately restricted to the exact XOXZ analyzer
-# generation that produced the current complete descriptor set.  The reverse
-# direction and every unknown intermediate generation remain incompatible.
+@dataclass(frozen=True, slots=True)
+class _DecodeEquivalentAnalyzerMigrationPath:
+    """One legacy generation and every audited edge to the active analyzer."""
+
+    legacy_analyzer_digest: str
+    edges: tuple[tuple[str, _DecodeEquivalentAnalyzerMigration], ...]
+
+
+# Alias-level AST v2 and the later direct-derived-cache sampler plumbing change
+# only the dependency fingerprint representation; the descriptor computation
+# and every decoded numeric feature are unchanged.  Every permitted forward
+# edge is enumerated with both complete analyzer identities below.  Reverse
+# directions and every unknown intermediate generation remain incompatible.
 _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    "0e2da6dae7879dea7d529dc36b87f0f7d87184a07c3e06f4bec15b752dc5ca41": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "eb2ead7937ad96cd7225e536b1527075258de9014be52c82ba8355dfa9e81b33"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "d62354e350187d5e090d103858d15b3fcc95191703ab048178ca428ca7a6d186"
+            ),
+            current_descriptor_digest=(
+                "a2586f534c0ed3a8d7a018cec2a9cf0237598b9b4e51a3c0b84404d6cac0cdec"
+            ),
+        ),
+    ),
     "14fff1f9ee74dbaed4023c6fbbbd4cd94b67e078a94f3d272885669cfe0e6b30": (
         _DecodeEquivalentAnalyzerMigration(
             legacy_analyzer_digest=(
@@ -100,7 +172,108 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
             ),
         ),
     ),
+    "753e2dbcee35d3bf8c72ed73005341b8b4ec3c142860e869904bc8cf5acac927": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "14fff1f9ee74dbaed4023c6fbbbd4cd94b67e078a94f3d272885669cfe0e6b30"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "c0de5b604e22d12c713b02edfe2b5a0de8d19a80475b1547b861f975d8978d89"
+            ),
+            current_descriptor_digest=(
+                "909c66c8dbd903ca6ad1b1cc75c63710838fba88179b2b308f7c964d55f82f84"
+            ),
+        ),
+    ),
+    "eb2ead7937ad96cd7225e536b1527075258de9014be52c82ba8355dfa9e81b33": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "753e2dbcee35d3bf8c72ed73005341b8b4ec3c142860e869904bc8cf5acac927"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "909c66c8dbd903ca6ad1b1cc75c63710838fba88179b2b308f7c964d55f82f84"
+            ),
+            current_descriptor_digest=(
+                "d62354e350187d5e090d103858d15b3fcc95191703ab048178ca428ca7a6d186"
+            ),
+        ),
+    ),
 }
+
+
+def _decode_equivalent_analyzer_migration_closure(
+    current_analyzer_digest: str,
+) -> tuple[_DecodeEquivalentAnalyzerMigrationPath, ...]:
+    """Resolve audited predecessors breadth-first and reject ambiguous graphs."""
+
+    if _SHA256.fullmatch(current_analyzer_digest) is None:
+        raise ValueError("current analyzer migration digest is invalid")
+    # Queue entries retain edges oldest-to-newest even though the graph is
+    # traversed backwards. Breadth-first discovery gives lookup precedence to
+    # the current root, then the nearest legacy generation, then older roots.
+    queue: list[
+        tuple[
+            str,
+            tuple[tuple[str, _DecodeEquivalentAnalyzerMigration], ...],
+            tuple[str, ...],
+        ]
+    ] = [(current_analyzer_digest, (), (current_analyzer_digest,))]
+    queue_index = 0
+    seen = {current_analyzer_digest}
+    resolved: list[_DecodeEquivalentAnalyzerMigrationPath] = []
+    while queue_index < len(queue):
+        endpoint_digest, newer_edges, ancestry = queue[queue_index]
+        queue_index += 1
+        raw_edges = _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS.get(
+            endpoint_digest,
+            (),
+        )
+        if not isinstance(raw_edges, tuple):
+            raise ValueError("analyzer migration edges must be a tuple")
+        local_legacy_digests: set[str] = set()
+        for edge in raw_edges:
+            if not isinstance(edge, _DecodeEquivalentAnalyzerMigration):
+                raise ValueError("analyzer migration edge type is invalid")
+            legacy_digest = edge.legacy_analyzer_digest
+            if legacy_digest in ancestry:
+                raise ValueError("legacy analyzer migration graph contains a cycle")
+            if legacy_digest in local_legacy_digests or legacy_digest in seen:
+                raise ValueError(
+                    "legacy analyzer migration graph is duplicate or ambiguous"
+                )
+            local_legacy_digests.add(legacy_digest)
+            path_edges = ((endpoint_digest, edge),) + newer_edges
+            for (older_endpoint, older), (_newer_endpoint, newer) in zip(
+                path_edges,
+                path_edges[1:],
+            ):
+                if (
+                    older_endpoint != newer.legacy_analyzer_digest
+                    or older.descriptor_component_name
+                    != newer.descriptor_component_name
+                    or older.current_descriptor_digest
+                    != newer.legacy_descriptor_digest
+                ):
+                    raise ValueError(
+                        "legacy analyzer migration chain endpoints do not match"
+                    )
+            seen.add(legacy_digest)
+            resolved.append(
+                _DecodeEquivalentAnalyzerMigrationPath(
+                    legacy_analyzer_digest=legacy_digest,
+                    edges=path_edges,
+                )
+            )
+            queue.append(
+                (
+                    legacy_digest,
+                    path_edges,
+                    ancestry + (legacy_digest,),
+                )
+            )
+    return tuple(resolved)
 
 
 def _stable_sha256(path: Path) -> tuple[str, tuple[int, int, int, int, int]]:
@@ -615,37 +788,52 @@ class PersistentVisualFeatureCache:
         source_cache_directory: Path,
         source_path: Path,
         analyzer: AnalyzerFingerprint,
+        derived_cache_directory: Path | None = None,
     ) -> None:
-        cache_root = Path(source_cache_directory).expanduser()
-        if cache_root.is_symlink():
-            raise ValueError("source cache directory cannot be a symbolic link")
-        cache_root.mkdir(parents=True, exist_ok=True)
-        if not cache_root.is_dir():
-            raise ValueError("source cache directory must be a directory")
+        if derived_cache_directory is None:
+            cache_root = Path(source_cache_directory).expanduser()
+            if cache_root.is_symlink():
+                raise ValueError("source cache directory cannot be a symbolic link")
+            cache_root.mkdir(parents=True, exist_ok=True)
+            if not cache_root.is_dir():
+                raise ValueError("source cache directory must be a directory")
+            derived_root = self._safe_directory(cache_root, "derived")
+        else:
+            direct_derived_root = Path(derived_cache_directory).expanduser()
+            if direct_derived_root.is_symlink():
+                raise ValueError(
+                    "visual feature derived cache directory cannot be a "
+                    "symbolic link"
+                )
+            try:
+                derived_root = direct_derived_root.resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "visual feature derived cache directory must exist"
+                ) from exc
+            if not derived_root.is_dir():
+                raise ValueError(
+                    "visual feature derived cache directory must be a directory"
+                )
         self.source_path = Path(source_path).expanduser().resolve(strict=True)
         self.source_sha256, self._source_stat_identity = _stable_sha256(
             self.source_path
         )
         self.analyzer = analyzer
-        source_root = self._safe_directory(cache_root, "derived")
-        source_root = self._safe_directory(source_root, "visual-v1")
+        source_root = self._safe_directory(derived_root, "visual-v1")
         source_root = self._safe_directory(
             source_root,
             self.source_sha256[:2],
         )
         source_root = self._safe_directory(source_root, self.source_sha256)
         self._root = self._safe_directory(source_root, analyzer.digest)
-        self._compatible_legacy_analyzer_migrations = tuple(
-            _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS.get(analyzer.digest, ())
+        self._compatible_legacy_analyzer_migration_paths = (
+            _decode_equivalent_analyzer_migration_closure(analyzer.digest)
         )
         self._compatible_legacy_analyzer_digests = tuple(
-            migration.legacy_analyzer_digest
-            for migration in self._compatible_legacy_analyzer_migrations
+            path.legacy_analyzer_digest
+            for path in self._compatible_legacy_analyzer_migration_paths
         )
-        if len(set(self._compatible_legacy_analyzer_digests)) != len(
-            self._compatible_legacy_analyzer_digests
-        ):
-            raise ValueError("legacy analyzer migration digests must be unique")
         lookup_roots = [self._root]
         for legacy_digest in self._compatible_legacy_analyzer_digests:
             if _SHA256.fullmatch(legacy_digest) is None:
@@ -675,6 +863,22 @@ class PersistentVisualFeatureCache:
         self._locator_index_over_budget_root: str | None = None
         self._locator_index_budget_fallback_count = 0
         self._locator_index_process_memo_hit_count = 0
+        try:
+            (
+                self._storage_root,
+                self._storage_root_identity,
+            ) = assert_visual_feature_derived_cache_root_available(
+                derived_root,
+            )
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            # Preserve the constructor's configuration-error surface so the
+            # sampler can consistently translate required versus optional
+            # initialization races.
+            raise ValueError(
+                "visual feature derived cache directory became unavailable"
+            ) from None
+        self._storage_io_failure_count = 0
+        self._atomic_write_failure_count = 0
 
     @staticmethod
     def _safe_directory(parent: Path, name: str) -> Path:
@@ -685,6 +889,18 @@ class PersistentVisualFeatureCache:
         if not child.is_dir():
             raise ValueError(f"visual feature cache path is not a directory: {child}")
         return child
+
+    def assert_storage_root_available(self) -> None:
+        """Fail distinctly if the initialized cache mount/path is no longer live."""
+
+        try:
+            assert_visual_feature_derived_cache_root_available(
+                self._storage_root,
+                expected_identity=self._storage_root_identity,
+            )
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            self._storage_io_failure_count += 1
+            raise
 
     def _source_is_unchanged(self) -> bool:
         if self._disabled_by_source_change:
@@ -749,15 +965,17 @@ class PersistentVisualFeatureCache:
         }:
             return False
         legacy_digest = actual_analyzer.get("fingerprint_sha256")
-        migration = next(
+        migration_path = next(
             (
                 candidate
-                for candidate in self._compatible_legacy_analyzer_migrations
+                for candidate in (
+                    self._compatible_legacy_analyzer_migration_paths
+                )
                 if candidate.legacy_analyzer_digest == legacy_digest
             ),
             None,
         )
-        if migration is None:
+        if migration_path is None or not migration_path.edges:
             return False
         actual_components = actual_analyzer.get("components")
         expected_components = expected_analyzer["components"]
@@ -783,12 +1001,14 @@ class PersistentVisualFeatureCache:
             return False
         if set(actual_code) != set(expected_code):
             return False
-        descriptor_name = migration.descriptor_component_name
+        descriptor_names = {
+            edge.descriptor_component_name
+            for _endpoint_digest, edge in migration_path.edges
+        }
+        if len(descriptor_names) != 1:
+            return False
+        descriptor_name = next(iter(descriptor_names))
         if descriptor_name not in actual_code:
-            return False
-        if actual_code.get(descriptor_name) != migration.legacy_descriptor_digest:
-            return False
-        if expected_code.get(descriptor_name) != migration.current_descriptor_digest:
             return False
         if any(
             actual_code.get(name) != expected_code.get(name)
@@ -796,18 +1016,37 @@ class PersistentVisualFeatureCache:
             if name != descriptor_name
         ):
             return False
-        # The allowlist is not authority to manufacture either endpoint.  Both
-        # complete component objects must hash to their stated full analyzer
-        # identities, so schema/model/runtime/pose tampering fails closed even
-        # when a caller supplies one of the two allowlisted digest strings.
-        if _analyzer_components_sha256(actual_components) != legacy_digest:
-            return False
-        if (
-            _analyzer_components_sha256(expected_components)
-            != self.analyzer.digest
-        ):
-            return False
-        return True
+        # Replay the complete audited chain. Each intermediate component object
+        # is reconstructed by changing only the allowlisted descriptor digest,
+        # then hashed against that edge's canonical full analyzer endpoint.
+        # The graph is therefore routing only; it cannot manufacture an
+        # endpoint or bridge any schema/model/runtime/other-code difference.
+        working_components = dict(actual_components)
+        working_code = dict(actual_code)
+        working_components["code_sha256"] = working_code
+        working_analyzer_digest = legacy_digest
+        for endpoint_digest, edge in migration_path.edges:
+            if (
+                working_analyzer_digest != edge.legacy_analyzer_digest
+                or working_code.get(descriptor_name)
+                != edge.legacy_descriptor_digest
+                or _analyzer_components_sha256(working_components)
+                != edge.legacy_analyzer_digest
+            ):
+                return False
+            working_code[descriptor_name] = edge.current_descriptor_digest
+            if (
+                _analyzer_components_sha256(working_components)
+                != endpoint_digest
+            ):
+                return False
+            working_analyzer_digest = endpoint_digest
+        return bool(
+            working_analyzer_digest == self.analyzer.digest
+            and working_components == expected_components
+            and _analyzer_components_sha256(expected_components)
+            == self.analyzer.digest
+        )
 
     def _record_path(self, request: DescriptorRequestIdentity) -> Path:
         identity = self._record_identity(request)
@@ -894,13 +1133,10 @@ class PersistentVisualFeatureCache:
         records: list[Path] = []
         if lookup_root.is_symlink() or not lookup_root.is_dir():
             return (), False
-        try:
-            shards = sorted(
-                lookup_root.iterdir(),
-                key=lambda item: item.name,
-            )
-        except OSError:
-            return (), False
+        shards = sorted(
+            lookup_root.iterdir(),
+            key=lambda item: item.name,
+        )
         for shard in shards:
             if (
                 shard.is_symlink()
@@ -908,13 +1144,10 @@ class PersistentVisualFeatureCache:
                 or re.fullmatch(r"[0-9a-f]{2}", shard.name) is None
             ):
                 continue
-            try:
-                shard_records = sorted(
-                    shard.iterdir(),
-                    key=lambda item: item.name,
-                )
-            except OSError:
-                continue
+            shard_records = sorted(
+                shard.iterdir(),
+                key=lambda item: item.name,
+            )
             for path in shard_records:
                 if (
                     path.is_symlink()
@@ -1010,10 +1243,19 @@ class PersistentVisualFeatureCache:
         decode can resolve the exact working-frame identity.
         """
 
+        self.assert_storage_root_available()
         if not self._source_is_unchanged():
             self._miss_count += 1
             return None
-        if not self._ensure_locator_index():
+        try:
+            locator_index_ready = self._ensure_locator_index()
+        except (OSError, ValueError):
+            self._storage_io_failure_count += 1
+            raise PersistentVisualFeatureCacheStorageUnavailableError(
+                "persistent visual feature cache index is unavailable"
+            ) from None
+        self.assert_storage_root_available()
+        if not locator_index_ready:
             self._locator_index_budget_fallback_count += 1
             self._miss_count += 1
             return None
@@ -1047,6 +1289,7 @@ class PersistentVisualFeatureCache:
             TypeError,
             ValueError,
         ):
+            self.assert_storage_root_available()
             self._invalid_count += 1
             self._miss_count += 1
             return None
@@ -1058,11 +1301,19 @@ class PersistentVisualFeatureCache:
         return payload
 
     def get(self, request: DescriptorRequestIdentity) -> dict[str, Any] | None:
+        self.assert_storage_root_available()
         if not self._source_is_unchanged():
             self._miss_count += 1
             return None
-        path = self._record_path(request)
+        try:
+            path = self._record_path(request)
+        except (OSError, ValueError):
+            self._storage_io_failure_count += 1
+            raise PersistentVisualFeatureCacheStorageUnavailableError(
+                "persistent visual feature cache path is unavailable"
+            ) from None
         if path.is_symlink() or not path.is_file():
+            self.assert_storage_root_available()
             self._miss_count += 1
             return None
         try:
@@ -1071,6 +1322,7 @@ class PersistentVisualFeatureCache:
                 expected_request=request,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            self.assert_storage_root_available()
             self._invalid_count += 1
             self._miss_count += 1
             return None
@@ -1083,6 +1335,7 @@ class PersistentVisualFeatureCache:
         request: DescriptorRequestIdentity,
         payload: Mapping[str, Any],
     ) -> bool:
+        self.assert_storage_root_available()
         if not self._source_is_unchanged():
             return False
         safe_payload = dict(payload)
@@ -1116,11 +1369,11 @@ class PersistentVisualFeatureCache:
         ).encode("utf-8")
         if not 1 <= len(encoded) <= _MAXIMUM_RECORD_BYTES:
             raise ValueError("visual feature cache record is too large")
-        path = self._record_path(request)
-        temporary = path.with_name(
-            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
         try:
+            path = self._record_path(request)
+            temporary = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
             with temporary.open("xb") as stream:
                 stream.write(encoded)
                 stream.flush()
@@ -1135,11 +1388,14 @@ class PersistentVisualFeatureCache:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
-        except OSError:
+        except (OSError, ValueError):
             # A partial temporary is deliberately ignored by readers.  Do not
             # delete it here: interruption evidence remains recoverable and no
             # cleanup operation is needed for correctness.
-            return False
+            self._atomic_write_failure_count += 1
+            raise PersistentVisualFeatureCacheWriteError(
+                "persistent visual feature cache atomic write failed"
+            ) from None
         if self._locator_index is not None:
             paths = self._locator_index.setdefault(request.locator, [])
             if path not in paths:
@@ -1179,6 +1435,8 @@ class PersistentVisualFeatureCache:
             ),
             "ambiguous_locator_count": self._ambiguous_locator_count,
             "disabled_by_source_change": self._disabled_by_source_change,
+            "storage_io_failure_count": self._storage_io_failure_count,
+            "atomic_write_failure_count": self._atomic_write_failure_count,
             "raw_frames_persisted": False,
             "face_identity_embeddings_persisted": False,
         }
@@ -1189,10 +1447,14 @@ __all__ = [
     "CanonicalFrameIdentity",
     "DescriptorRequestIdentity",
     "DescriptorRequestLocator",
+    "PersistentVisualFeatureCacheIOError",
     "PersistentVisualFeatureCache",
+    "PersistentVisualFeatureCacheStorageUnavailableError",
+    "PersistentVisualFeatureCacheWriteError",
     "PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT",
     "VISUAL_FEATURE_CACHE_CONTRACT",
     "VISUAL_FEATURE_SCHEMA_VERSION",
     "build_analyzer_fingerprint",
+    "assert_visual_feature_derived_cache_root_available",
     "python_symbol_dependency_sha256",
 ]
