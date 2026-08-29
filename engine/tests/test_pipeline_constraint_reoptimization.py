@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+import crosscut.pipeline as pipeline_module
 from crosscut.lazy_splice_feasibility_graph import LazySpliceFeasibilityGraph
 from crosscut.boundary_repair import BoundaryRepairConfig
 from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
@@ -291,6 +293,118 @@ def _hard_assessment():
 
 
 class PipelineConstraintReoptimizationTests(unittest.TestCase):
+    def test_group_scalar_cache_calls_forward_direct_derived_root(self) -> None:
+        pipeline_path = Path(pipeline_module.__file__)
+        syntax = ast.parse(pipeline_path.read_text(encoding="utf-8"))
+        expected_call_counts = {
+            "PersistentSourceScalarCache": 2,
+            "detect_scene_changes_in_video_cached": 1,
+            "PersistentSourceDerivativeDiversityCache": 1,
+        }
+
+        for call_name, expected_count in expected_call_counts.items():
+            calls = [
+                node
+                for node in ast.walk(syntax)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == call_name
+            ]
+            self.assertEqual(expected_count, len(calls), call_name)
+            for call in calls:
+                keywords = {
+                    item.arg: item.value
+                    for item in call.keywords
+                    if item.arg is not None
+                }
+                direct_root = keywords.get("derived_cache_directory")
+                self.assertIsInstance(direct_root, ast.Attribute, call_name)
+                assert isinstance(direct_root, ast.Attribute)
+                self.assertEqual(
+                    "visual_feature_derived_cache_directory",
+                    direct_root.attr,
+                    call_name,
+                )
+                self.assertIsInstance(direct_root.value, ast.Name, call_name)
+                assert isinstance(direct_root.value, ast.Name)
+                self.assertEqual("request", direct_root.value.id, call_name)
+
+    def test_scalar_storage_loss_precedes_runtime_analysis_fallback(self) -> None:
+        pipeline_path = Path(pipeline_module.__file__)
+        syntax = ast.parse(pipeline_path.read_text(encoding="utf-8"))
+        found_ordered_rethrow = False
+        for node in ast.walk(syntax):
+            if not isinstance(node, ast.Try):
+                continue
+            for index, handler in enumerate(node.handlers[:-1]):
+                if not (
+                    isinstance(handler.type, ast.Name)
+                    and handler.type.id
+                    == "PersistentSourceScalarCacheStorageUnavailableError"
+                    and len(handler.body) == 1
+                    and isinstance(handler.body[0], ast.Raise)
+                ):
+                    continue
+                following = node.handlers[index + 1]
+                if not isinstance(following.type, ast.Tuple):
+                    continue
+                caught_names = {
+                    item.id
+                    for item in following.type.elts
+                    if isinstance(item, ast.Name)
+                }
+                if "RuntimeError" in caught_names:
+                    found_ordered_rethrow = True
+                    break
+            if found_ordered_rethrow:
+                break
+
+        self.assertTrue(found_ordered_rethrow)
+
+    def test_group_and_member_cut_local_storage_loss_rethrow_exactly(self) -> None:
+        pipeline_path = Path(pipeline_module.__file__)
+        syntax = ast.parse(pipeline_path.read_text(encoding="utf-8"))
+        protected_cut_local_calls = []
+        for node in ast.walk(syntax):
+            if not isinstance(node, ast.Try) or not node.handlers:
+                continue
+            cut_local_calls = [
+                item
+                for statement in node.body
+                for item in ast.walk(statement)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "analyze_cut_local_sync"
+            ]
+            if not cut_local_calls:
+                continue
+            first_handler = node.handlers[0]
+            self.assertIsInstance(first_handler.type, ast.Name)
+            assert isinstance(first_handler.type, ast.Name)
+            self.assertEqual(
+                "PersistentSourceScalarCacheStorageUnavailableError",
+                first_handler.type.id,
+            )
+            self.assertEqual(1, len(first_handler.body))
+            self.assertIsInstance(first_handler.body[0], ast.Raise)
+            assert isinstance(first_handler.body[0], ast.Raise)
+            self.assertIsNone(first_handler.body[0].exc)
+            protected_cut_local_calls.extend(cut_local_calls)
+
+        self.assertEqual(2, len(protected_cut_local_calls))
+        activation_modes = {
+            next(
+                (
+                    keyword.arg
+                    for keyword in call.keywords
+                    if keyword.arg == "activation"
+                ),
+                "group_default",
+            )
+            for call in protected_cut_local_calls
+        }
+        self.assertEqual({"group_default", "activation"}, activation_modes)
+
     def test_direct_visual_feature_cache_is_strict_while_legacy_fallback_remains(
         self,
     ) -> None:

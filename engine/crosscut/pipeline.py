@@ -209,6 +209,7 @@ from .section_director import SectionPlan, SectionRole, build_section_plan
 from .source_look_match import SourceLookMatchResult, analyze_source_look_match
 from .source_scalar_cache import (
     PersistentSourceScalarCache,
+    PersistentSourceScalarCacheStorageUnavailableError,
     source_content_sha256,
 )
 from .source_derivative_diversity import (
@@ -4085,6 +4086,8 @@ def _align_sequentially(
     try:
         reference_sha256 = source_content_sha256(reference_path)
     except (OSError, TypeError, ValueError):
+        if request.visual_feature_derived_cache_directory is not None:
+            raise
         reference_sha256 = None
 
     for index, source in enumerate(request.sources):
@@ -4109,13 +4112,17 @@ def _align_sequentially(
         reporter.status(f"음원 정렬 중: {source.name}")
         alignment_cache: PersistentSourceScalarCache | None = None
         cached_alignment: SourceAlignment | None = None
-        if (
-            request.source_cache_directory is not None
-            and reference_sha256 is not None
-        ):
+        scalar_cache_directory = (
+            request.source_cache_directory
+            or request.visual_feature_derived_cache_directory
+        )
+        if scalar_cache_directory is not None and reference_sha256 is not None:
             try:
                 alignment_cache = PersistentSourceScalarCache(
-                    source_cache_directory=request.source_cache_directory,
+                    source_cache_directory=scalar_cache_directory,
+                    derived_cache_directory=(
+                        request.visual_feature_derived_cache_directory
+                    ),
                     source_path=source,
                     namespace="audio-alignment-v1",
                     analyzer=_audio_alignment_cache_analyzer(
@@ -4123,14 +4130,27 @@ def _align_sequentially(
                     ),
                 )
                 cached_payload = alignment_cache.get()
-                if cached_payload is not None:
-                    cached_alignment = _audio_alignment_from_scalar_payload(
-                        cached_payload,
-                        source=source,
-                    )
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (OSError, TypeError, ValueError):
+                if request.visual_feature_derived_cache_directory is not None:
+                    raise
                 alignment_cache = None
-                cached_alignment = None
+            else:
+                if cached_payload is not None:
+                    try:
+                        cached_alignment = (
+                            _audio_alignment_from_scalar_payload(
+                                cached_payload,
+                                source=source,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        # The generic scalar envelope can be intact while an
+                        # older or corrupt analysis payload is semantically
+                        # unusable.  That is a cache miss, not evidence that
+                        # the explicitly selected storage root disappeared.
+                        cached_alignment = None
         if cached_alignment is not None:
             alignments.append(cached_alignment)
             reporter.log(
@@ -4191,6 +4211,8 @@ def _align_sequentially(
                 alignment_cache.put(
                     _audio_alignment_scalar_payload(source_alignment)
                 )
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (OSError, TypeError, ValueError):
                 pass
         reporter.log(
@@ -4606,6 +4628,8 @@ def _estimate_source_timewarps(
             request.sources[reference_index]
         )
     except (OSError, TypeError, ValueError):
+        if request.visual_feature_derived_cache_directory is not None:
+            raise
         reference_sha256 = None
     for index, source in enumerate(request.sources):
         if index not in eligible:
@@ -4620,13 +4644,17 @@ def _estimate_source_timewarps(
         reporter.status(f"로컬 음원 드리프트 분석 중: {source.name}")
         timewarp_cache: PersistentSourceScalarCache | None = None
         cached_timewarp: TimeWarpMap | None = None
-        if (
-            request.source_cache_directory is not None
-            and reference_sha256 is not None
-        ):
+        scalar_cache_directory = (
+            request.source_cache_directory
+            or request.visual_feature_derived_cache_directory
+        )
+        if scalar_cache_directory is not None and reference_sha256 is not None:
             try:
                 timewarp_cache = PersistentSourceScalarCache(
-                    source_cache_directory=request.source_cache_directory,
+                    source_cache_directory=scalar_cache_directory,
+                    derived_cache_directory=(
+                        request.visual_feature_derived_cache_directory
+                    ),
                     source_path=source,
                     namespace="local-timewarp-v1",
                     analyzer=_timewarp_cache_analyzer(
@@ -4637,21 +4665,35 @@ def _estimate_source_timewarps(
                     ),
                 )
                 cached_payload = timewarp_cache.get()
-                if cached_payload is not None:
-                    cached_timewarp = _timewarp_from_scalar_payload(
-                        cached_payload
-                    )
-                    if not math.isclose(
-                        cached_timewarp.global_offset_seconds,
-                        alignment.alignments[index].offset_seconds,
-                        rel_tol=0.0,
-                        abs_tol=1e-9,
-                    ):
-                        raise ValueError(
-                            "cached timewarp global offset does not match alignment"
-                        )
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (OSError, TypeError, ValueError):
+                if request.visual_feature_derived_cache_directory is not None:
+                    raise
                 cached_timewarp = None
+            else:
+                if cached_payload is not None:
+                    try:
+                        candidate_timewarp = _timewarp_from_scalar_payload(
+                            cached_payload
+                        )
+                        if not math.isclose(
+                            candidate_timewarp.global_offset_seconds,
+                            alignment.alignments[index].offset_seconds,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        ):
+                            raise ValueError(
+                                "cached timewarp global offset does not match "
+                                "alignment"
+                            )
+                    except (TypeError, ValueError):
+                        # A signed scalar record may still carry a stale or
+                        # semantically invalid time-warp payload.  Recompute
+                        # it without misreporting a direct-root outage.
+                        cached_timewarp = None
+                    else:
+                        cached_timewarp = candidate_timewarp
         if cached_timewarp is not None:
             try:
                 if decoded_pcm_by_source is not None and index != reference_index:
@@ -4737,6 +4779,8 @@ def _estimate_source_timewarps(
         if timewarp_cache is not None:
             try:
                 timewarp_cache.put(_timewarp_scalar_payload(timewarp))
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (OSError, TypeError, ValueError):
                 pass
         payload = timewarp.to_dict()
@@ -24772,6 +24816,9 @@ def analyze(
             config=scene_config,
             sample_every=2,
             source_cache_directory=request.source_cache_directory,
+            derived_cache_directory=(
+                request.visual_feature_derived_cache_directory
+            ),
         )
         frame_rate = info.video_streams[0].frame_rate or 30.0
         scene_payloads.append(
@@ -25275,7 +25322,11 @@ def analyze(
                 cached_source_derivatives: (
                     SourceDerivativeDiversityResult | None
                 ) = None
-                if request.source_cache_directory is None:
+                scalar_cache_directory = (
+                    request.source_cache_directory
+                    or request.visual_feature_derived_cache_directory
+                )
+                if scalar_cache_directory is None:
                     source_derivative_persistent_cache_diagnostics = {
                         "requested": False,
                         "status": "not_configured",
@@ -25286,8 +25337,9 @@ def analyze(
                     try:
                         source_derivative_cache = (
                             PersistentSourceDerivativeDiversityCache(
-                                source_cache_directory=(
-                                    request.source_cache_directory
+                                source_cache_directory=scalar_cache_directory,
+                                derived_cache_directory=(
+                                    request.visual_feature_derived_cache_directory
                                 ),
                                 sources=derivative_sources,
                                 source_offsets_seconds=offsets,
@@ -25300,7 +25352,14 @@ def analyze(
                         source_derivative_persistent_cache_diagnostics = (
                             source_derivative_cache.diagnostics()
                         )
+                    except PersistentSourceScalarCacheStorageUnavailableError:
+                        raise
                     except (OSError, TypeError, ValueError) as cache_exc:
+                        if (
+                            request.visual_feature_derived_cache_directory
+                            is not None
+                        ):
+                            raise
                         source_derivative_cache = None
                         cached_source_derivatives = None
                         source_derivative_persistent_cache_diagnostics = {
@@ -25340,6 +25399,8 @@ def analyze(
                             source_derivative_persistent_cache_diagnostics[
                                 "live_analysis_cache_written"
                             ] = cache_written
+                        except PersistentSourceScalarCacheStorageUnavailableError:
+                            raise
                         except (OSError, TypeError, ValueError) as cache_exc:
                             source_derivative_persistent_cache_diagnostics = {
                                 **(
@@ -25376,6 +25437,8 @@ def analyze(
                     "불확실 쌍 "
                     f"{source_derivative_diversity_result.uncertain_pair_count}개"
                 )
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (cv2.error, OSError, RuntimeError, TypeError, ValueError) as exc:
                 source_derivative_audit_path.write_text(
                     json.dumps(
@@ -29750,6 +29813,9 @@ def analyze(
                     source_timewarps=source_timewarps,
                     timewarp_payloads=local_timewarp_payloads,
                     pts_cache_directory=request.source_cache_directory,
+                    pts_derived_cache_directory=(
+                        request.visual_feature_derived_cache_directory
+                    ),
                 )
                 reporter.log(
                     "보존 교차소스 경계 "
@@ -29759,6 +29825,8 @@ def analyze(
                     "로컬 잔차 p95 "
                     f"{cut_local_sync_payload['residual_p95_frames']} frame"
                 )
+            except PersistentSourceScalarCacheStorageUnavailableError:
+                raise
             except (cv2.error, OSError, RuntimeError, TypeError, ValueError) as exc:
                 cut_local_sync_payload = {
                     "schema_version": 2,
@@ -33086,6 +33154,9 @@ def analyze(
                         timewarp_payloads=local_timewarp_payloads,
                         activation=MEMBER_CUT_LOCAL_SYNC_ACTIVATION,
                         pts_cache_directory=request.source_cache_directory,
+                        pts_derived_cache_directory=(
+                            request.visual_feature_derived_cache_directory
+                        ),
                     )
                     reporter.log(
                         "멤버 보존 교차소스 경계 "
@@ -33102,6 +33173,8 @@ def analyze(
                             f"over_threshold={cut_local_sync_payload.get('threshold_exceeding_boundary_count')}; "
                             f"reasons={cut_local_sync_payload.get('unknown_reason_counts')}"
                         )
+                except PersistentSourceScalarCacheStorageUnavailableError:
+                    raise
                 except (
                     cv2.error,
                     OSError,

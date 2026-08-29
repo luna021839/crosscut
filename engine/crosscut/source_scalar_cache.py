@@ -17,7 +17,11 @@ import re
 from typing import Any, Mapping
 import uuid
 
-from .visual_feature_cache import _stable_sha256
+from .visual_feature_cache import (
+    PersistentVisualFeatureCacheStorageUnavailableError,
+    _stable_sha256,
+    assert_visual_feature_derived_cache_root_available,
+)
 
 
 SOURCE_SCALAR_CACHE_CONTRACT = "ive_source_scalar_analysis_v1"
@@ -35,6 +39,10 @@ _FORBIDDEN_KEY_PARTS = (
     "face_identity_embedding",
     "appearance_embedding",
 )
+
+
+class PersistentSourceScalarCacheStorageUnavailableError(RuntimeError):
+    """An explicitly selected direct derived-cache root was lost."""
 
 
 def source_content_sha256(path: Path) -> str:
@@ -91,15 +99,44 @@ class PersistentSourceScalarCache:
         source_path: Path,
         namespace: str,
         analyzer: Mapping[str, Any],
+        derived_cache_directory: Path | None = None,
     ) -> None:
         if _SAFE_NAMESPACE.fullmatch(namespace) is None:
             raise ValueError("scalar cache namespace is invalid")
-        root = Path(source_cache_directory).expanduser()
-        if root.is_symlink():
-            raise ValueError("source cache directory cannot be a symbolic link")
-        root.mkdir(parents=True, exist_ok=True)
-        if not root.is_dir():
-            raise ValueError("source cache directory must be a directory")
+        self._direct_derived_cache_configured = (
+            derived_cache_directory is not None
+        )
+        self._storage_root: Path | None = None
+        self._storage_root_identity: tuple[int, int] | None = None
+        self._storage_io_failure_count = 0
+        if derived_cache_directory is None:
+            root = Path(source_cache_directory).expanduser()
+            if root.is_symlink():
+                raise ValueError(
+                    "source cache directory cannot be a symbolic link"
+                )
+            root.mkdir(parents=True, exist_ok=True)
+            if not root.is_dir():
+                raise ValueError("source cache directory must be a directory")
+            derived_root = self._safe_directory(root, "derived")
+        else:
+            direct_root = Path(derived_cache_directory).expanduser()
+            if direct_root.is_symlink():
+                raise PersistentSourceScalarCacheStorageUnavailableError(
+                    "required direct source scalar cache storage is unavailable"
+                )
+            try:
+                (
+                    derived_root,
+                    self._storage_root_identity,
+                ) = assert_visual_feature_derived_cache_root_available(
+                    direct_root,
+                )
+            except PersistentVisualFeatureCacheStorageUnavailableError:
+                raise PersistentSourceScalarCacheStorageUnavailableError(
+                    "required direct source scalar cache storage is unavailable"
+                ) from None
+            self._storage_root = derived_root
         self.source_path = Path(source_path).expanduser().resolve(strict=True)
         self.source_sha256, self._source_stat_identity = _stable_sha256(
             self.source_path
@@ -111,11 +148,31 @@ class PersistentSourceScalarCache:
             **dict(analyzer),
         }
         self.analyzer_sha256 = _canonical_sha256(self.analyzer)
-        self._root = self._safe_directory(root, "derived")
-        self._root = self._safe_directory(self._root, "scalar-v1")
-        self._root = self._safe_directory(self._root, namespace)
-        self._root = self._safe_directory(self._root, self.source_sha256[:2])
-        self._root = self._safe_directory(self._root, self.source_sha256)
+        try:
+            if self._direct_derived_cache_configured:
+                assert self._storage_root is not None
+                assert self._storage_root_identity is not None
+                assert_visual_feature_derived_cache_root_available(
+                    self._storage_root,
+                    expected_identity=self._storage_root_identity,
+                )
+            self._root = self._safe_directory(derived_root, "scalar-v1")
+            self._root = self._safe_directory(self._root, namespace)
+            self._root = self._safe_directory(
+                self._root,
+                self.source_sha256[:2],
+            )
+            self._root = self._safe_directory(self._root, self.source_sha256)
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            raise PersistentSourceScalarCacheStorageUnavailableError(
+                "required direct source scalar cache storage is unavailable"
+            ) from None
+        except (OSError, ValueError):
+            if self._direct_derived_cache_configured:
+                raise PersistentSourceScalarCacheStorageUnavailableError(
+                    "required direct source scalar cache storage is unavailable"
+                ) from None
+            raise
         self._path = self._root / f"{self.analyzer_sha256}.json"
         self._hit_count = 0
         self._miss_count = 0
@@ -153,6 +210,24 @@ class PersistentSourceScalarCache:
             return False
         return True
 
+    def assert_storage_root_available(self) -> None:
+        """Attest a required direct root without weakening legacy caching."""
+
+        if not self._direct_derived_cache_configured:
+            return
+        assert self._storage_root is not None
+        assert self._storage_root_identity is not None
+        try:
+            assert_visual_feature_derived_cache_root_available(
+                self._storage_root,
+                expected_identity=self._storage_root_identity,
+            )
+        except PersistentVisualFeatureCacheStorageUnavailableError:
+            self._storage_io_failure_count += 1
+            raise PersistentSourceScalarCacheStorageUnavailableError(
+                "required direct source scalar cache storage is unavailable"
+            ) from None
+
     def _identity(self) -> dict[str, Any]:
         return {
             "cache_contract": SOURCE_SCALAR_CACHE_CONTRACT,
@@ -168,10 +243,12 @@ class PersistentSourceScalarCache:
         }
 
     def get(self) -> dict[str, Any] | None:
+        self.assert_storage_root_available()
         if not self._source_is_unchanged():
             self._miss_count += 1
             return None
         if self._path.is_symlink() or not self._path.is_file():
+            self.assert_storage_root_available()
             self._miss_count += 1
             return None
         try:
@@ -203,6 +280,7 @@ class PersistentSourceScalarCache:
             ):
                 raise ValueError("scalar cache payload checksum mismatch")
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            self.assert_storage_root_available()
             self._invalid_count += 1
             self._miss_count += 1
             return None
@@ -210,6 +288,7 @@ class PersistentSourceScalarCache:
         return payload
 
     def put(self, payload: Mapping[str, Any]) -> bool:
+        self.assert_storage_root_available()
         if not self._source_is_unchanged():
             return False
         safe_payload = dict(payload)
@@ -256,6 +335,7 @@ class PersistentSourceScalarCache:
             finally:
                 os.close(directory_fd)
         except OSError:
+            self.assert_storage_root_available()
             return False
         self._write_count += 1
         return True
@@ -271,12 +351,19 @@ class PersistentSourceScalarCache:
             "write_count": self._write_count,
             "invalid_record_count": self._invalid_count,
             "disabled_by_source_change": self._disabled_by_source_change,
+            "required": self._direct_derived_cache_configured,
+            "direct_derived_cache_configured": (
+                self._direct_derived_cache_configured
+            ),
+            "storage_io_failure_count": self._storage_io_failure_count,
+            "local_paths_exposed": False,
             "raw_media_persisted": False,
         }
 
 
 __all__ = [
     "PersistentSourceScalarCache",
+    "PersistentSourceScalarCacheStorageUnavailableError",
     "SOURCE_SCALAR_CACHE_CONTRACT",
     "SOURCE_SCALAR_CACHE_SCHEMA_VERSION",
     "source_content_sha256",

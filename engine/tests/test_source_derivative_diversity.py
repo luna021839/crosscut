@@ -20,6 +20,9 @@ from crosscut.source_derivative_diversity import (
     classify_source_derivative_frames,
     source_derivative_diversity_from_dict,
 )
+from crosscut.source_scalar_cache import (
+    PersistentSourceScalarCacheStorageUnavailableError,
+)
 from crosscut.timewarp import (
     TimeWarpConfig,
     TimeWarpControlPoint,
@@ -229,12 +232,15 @@ class SourceDerivativeDiversityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache_directory = root / "cache"
+            derived_cache_directory = root / "mounted-derived-cache"
+            derived_cache_directory.mkdir()
             sources = (root / "one.mp4", root / "two.mp4")
             sources[0].write_bytes(b"first-source")
             sources[1].write_bytes(b"second-source")
             clocks = (_identity_timewarp(), _identity_timewarp())
             constructor = dict(
                 source_cache_directory=cache_directory,
+                derived_cache_directory=derived_cache_directory,
                 sources=sources,
                 source_offsets_seconds=(0.0, 0.0),
                 source_timewarps=clocks,
@@ -253,6 +259,11 @@ class SourceDerivativeDiversityTests(unittest.TestCase):
                 assert restored is not None
                 self.assertEqual(result.to_dict(), restored.to_dict())
                 self.assertEqual(1, cache.diagnostics()["hit_count"])
+                self.assertFalse((cache_directory / "derived").exists())
+                self.assertEqual(
+                    1,
+                    len(tuple(derived_cache_directory.rglob("*.json"))),
+                )
 
                 changed_range = PersistentSourceDerivativeDiversityCache(
                     **{**constructor, "common_master_end": 9.5}
@@ -264,6 +275,46 @@ class SourceDerivativeDiversityTests(unittest.TestCase):
                     **constructor
                 )
                 self.assertIsNone(changed_source.get())
+
+    def test_direct_cache_loss_precedes_non_anchor_source_change_on_get_and_put(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            derived_cache_directory = root / "mounted-derived-cache"
+            derived_cache_directory.mkdir()
+            sources = (root / "one.mp4", root / "two.mp4")
+            sources[0].write_bytes(b"first-source")
+            sources[1].write_bytes(b"second-source")
+            with patch(
+                "crosscut.source_derivative_diversity._ffprobe_version_identity",
+                return_value="ffprobe-test",
+            ):
+                cache = PersistentSourceDerivativeDiversityCache(
+                    source_cache_directory=root / "legacy-cache",
+                    derived_cache_directory=derived_cache_directory,
+                    sources=sources,
+                    source_offsets_seconds=(0.0, 0.0),
+                    source_timewarps=(
+                        _identity_timewarp(),
+                        _identity_timewarp(),
+                    ),
+                    common_master_start=0.0,
+                    common_master_end=10.0,
+                )
+            derived_cache_directory.rename(root / "detached-derived-cache")
+            sources[1].write_bytes(b"changed-second-source")
+
+            operations = (
+                cache.get,
+                lambda: cache.put(self._uncertain_two_source_result()),
+            )
+            for operation in operations:
+                with self.subTest(operation=operation):
+                    with self.assertRaises(
+                        PersistentSourceScalarCacheStorageUnavailableError
+                    ):
+                        operation()
 
 
 if __name__ == "__main__":

@@ -33,15 +33,32 @@ from .reference_match import (
     decode_target_frames_sequential,
 )
 from .render import RenderPlan
+from .source_scalar_cache import (
+    PersistentSourceScalarCache,
+    PersistentSourceScalarCacheStorageUnavailableError,
+    SOURCE_SCALAR_CACHE_CONTRACT,
+    SOURCE_SCALAR_CACHE_SCHEMA_VERSION,
+)
 from .timewarp import TimeWarpMap
 from .visual_score import FrameVisualDescriptor, describe_frame
 
 
-SCHEMA_VERSION = 2
-ANALYSIS_BASIS = "actual_pts_renderer_bound_retained_cut_pose_body_motion_phase_v2"
+SCHEMA_VERSION = 3
+ANALYSIS_BASIS = (
+    "actual_pts_renderer_bound_retained_cut_pose_body_motion_phase_v3"
+)
 ACTIVATION = "automatic_registered_stage_edit_group"
 MEMBER_ACTIVATION = "automatic_ive_member_direct_full_frame"
-PTS_BASIS = "ffprobe_best_effort_timestamp_time"
+LEGACY_PTS_BASIS = "ffprobe_best_effort_timestamp_time"
+PTS_BASIS = "ffprobe_packet_pts_time_sorted_presentation_order"
+PTS_CACHE_NAMESPACE = "cut-local-video-pts-v2"
+PTS_CACHE_ANALYZER = {
+    "analysis": "ffprobe_video_packet_pts_presentation_order_v2",
+    "pts_basis": PTS_BASIS,
+    "stream_selection": "v:0",
+    "timestamp_entry": "packet=pts_time",
+    "ordering": "strict_ascending_presentation_timestamp",
+}
 RENDERER_SELECTION_BASIS = (
     "trim_lower_bound_setpts_first_pts_fps_round_near_tpad_clone_v1"
 )
@@ -54,6 +71,20 @@ _SERIALIZATION_POLICY = {
     "motion_timing_provenance_persisted": True,
     "scalar_aggregate_and_hash_provenance_only": True,
 }
+
+_OVERLAP_TRANSITION_KINDS = frozenset(
+    {
+        "face_dissolve",
+        "member_zoom_bridge",
+        "member_blur_bridge",
+    }
+)
+def _overlap_sampling_domain(transition_kind: Any) -> str | None:
+    if transition_kind == "face_dissolve":
+        return "face_dissolve_exact_outgoing_handle_and_incoming_overlap"
+    if transition_kind in {"member_zoom_bridge", "member_blur_bridge"}:
+        return "member_cinematic_bridge_exact_outgoing_handle_and_incoming_overlap"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +101,9 @@ class CutLocalSyncConfig:
     # holes; the release target itself remains the independently measured
     # cross-source phase p95 below.
     maximum_pts_lookup_residual_frames: float = 1.10
+    maximum_zero_lag_phase_residual_frames: float = 1.10
     maximum_residual_p95_frames: float = 0.50
+    allow_zero_lag_nonstatic_clock_proof: bool = True
     working_width: int = 480
     ffprobe_timeout_seconds: float = 120.0
 
@@ -91,6 +124,7 @@ class CutLocalSyncConfig:
             "minimum_motion_standard_deviation",
             "minimum_correlation_margin",
             "maximum_pts_lookup_residual_frames",
+            "maximum_zero_lag_phase_residual_frames",
             "maximum_residual_p95_frames",
             "ffprobe_timeout_seconds",
         ):
@@ -99,12 +133,48 @@ class CutLocalSyncConfig:
                 raise ValueError(f"{name} must be positive and finite")
         if not -1.0 <= self.minimum_correlation <= 1.0:
             raise ValueError("minimum_correlation must be between -1 and 1")
+        if not isinstance(self.allow_zero_lag_nonstatic_clock_proof, bool):
+            raise TypeError(
+                "allow_zero_lag_nonstatic_clock_proof must be a boolean"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             name: getattr(self, name)
             for name in self.__dataclass_fields__
         }
+
+
+def _trusted_config_for_activation(
+    activation: str,
+    *,
+    maximum_residual_p95_frames: float | None = None,
+) -> CutLocalSyncConfig:
+    if activation == MEMBER_ACTIVATION:
+        # The selected cinematic bridges are intentionally only six or seven
+        # frames long. Five motion pairs cover the complete shortest overlap;
+        # stronger correlation and uniqueness gates compensate for the shorter
+        # evidence window. The member aggregate permits a sub-frame p95 while
+        # every zero-lag boundary still has an independent 1.10-frame ceiling.
+        return CutLocalSyncConfig(
+            minimum_motion_pair_count=5,
+            minimum_correlation=0.55,
+            minimum_correlation_margin=0.08,
+            maximum_residual_p95_frames=(
+                1.0
+                if maximum_residual_p95_frames is None
+                else maximum_residual_p95_frames
+            ),
+        )
+    if activation == ACTIVATION:
+        return CutLocalSyncConfig(
+            maximum_residual_p95_frames=(
+                0.50
+                if maximum_residual_p95_frames is None
+                else maximum_residual_p95_frames
+            ),
+        )
+    raise ValueError("cut-local sync activation is unsupported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +325,16 @@ def _canonical_sha256(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _expected_pts_cache_analyzer_sha256() -> str:
+    return _canonical_sha256(
+        {
+            "cache_contract": SOURCE_SCALAR_CACHE_CONTRACT,
+            "schema_version": SOURCE_SCALAR_CACHE_SCHEMA_VERSION,
+            **PTS_CACHE_ANALYZER,
+        }
+    )
 
 
 def _as_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -415,35 +495,77 @@ def _strict_serialized_timewarp(
     item = _as_mapping(payload, "timewarp")
     if _integer(item.get("source_index"), "timewarp.source_index") != expected_source_index:
         raise ValueError("timewarp_source_index_mismatch")
-    if item.get("status") != "local_monotonic_timewarp":
-        raise ValueError("timewarp_status_invalid")
-    if item.get("scalar_fallback") is not False or item.get("fallback_reason") is not None:
-        raise ValueError("timewarp_piecewise_status_invalid")
+    status = item.get("status")
     minimum_slope = _finite(item.get("minimum_slope"), "timewarp.minimum_slope")
     maximum_slope = _finite(item.get("maximum_slope"), "timewarp.maximum_slope")
     if not 0.0 < minimum_slope <= maximum_slope:
         raise ValueError("timewarp_slope_bounds_invalid")
     raw_points = _as_sequence(item.get("control_points"), "timewarp.control_points")
-    if len(raw_points) < 2:
-        raise ValueError("timewarp_control_points_insufficient")
     points: list[tuple[float, float]] = []
-    for index, raw_point in enumerate(raw_points):
-        point = _as_mapping(raw_point, f"timewarp.control_points[{index}]")
-        master = _finite(
-            point.get("master_seconds"),
-            f"timewarp.control_points[{index}].master_seconds",
+    if status == "global_scalar_offset":
+        fallback_reason = item.get("fallback_reason")
+        if (
+            item.get("scalar_fallback") is not True
+            or not isinstance(fallback_reason, str)
+            or not fallback_reason.strip()
+            or raw_points
+        ):
+            raise ValueError("timewarp_scalar_status_invalid")
+        global_offset = _finite(
+            item.get("global_offset_seconds"),
+            "timewarp.global_offset_seconds",
         )
-        source = _finite(
-            point.get("source_seconds"),
-            f"timewarp.control_points[{index}].source_seconds",
+        master_duration = _finite(
+            item.get("master_duration_seconds"),
+            "timewarp.master_duration_seconds",
         )
-        offset = _finite(
-            point.get("offset_seconds"),
-            f"timewarp.control_points[{index}].offset_seconds",
+        source_duration = _finite(
+            item.get("source_duration_seconds"),
+            "timewarp.source_duration_seconds",
         )
-        if not math.isclose(offset, source - master, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("timewarp_control_point_offset_mismatch")
-        points.append((master, source))
+        if master_duration <= 0.0 or source_duration <= 0.0:
+            raise ValueError("timewarp_scalar_duration_invalid")
+        points.extend(
+            (
+                (0.0, global_offset),
+                (master_duration, master_duration + global_offset),
+            )
+        )
+    elif status == "local_monotonic_timewarp":
+        if (
+            item.get("scalar_fallback") is not False
+            or item.get("fallback_reason") is not None
+        ):
+            raise ValueError("timewarp_piecewise_status_invalid")
+        if len(raw_points) < 2:
+            raise ValueError("timewarp_control_points_insufficient")
+        for index, raw_point in enumerate(raw_points):
+            point = _as_mapping(
+                raw_point,
+                f"timewarp.control_points[{index}]",
+            )
+            master = _finite(
+                point.get("master_seconds"),
+                f"timewarp.control_points[{index}].master_seconds",
+            )
+            source = _finite(
+                point.get("source_seconds"),
+                f"timewarp.control_points[{index}].source_seconds",
+            )
+            offset = _finite(
+                point.get("offset_seconds"),
+                f"timewarp.control_points[{index}].offset_seconds",
+            )
+            if not math.isclose(
+                offset,
+                source - master,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("timewarp_control_point_offset_mismatch")
+            points.append((master, source))
+    else:
+        raise ValueError("timewarp_status_invalid")
     slopes: list[float] = []
     for left, right in zip(points, points[1:]):
         master_delta = right[0] - left[0]
@@ -499,14 +621,30 @@ def _runtime_bound_timewarps(
         if source_index >= len(clocks):
             raise ValueError("used_timewarp_payload_runtime_mismatch")
         clock = clocks[source_index]
-        if clock is None or clock.scalar_fallback:
+        if clock is None:
             raise ValueError("used_timewarp_payload_runtime_mismatch")
         expected = {
             **clock.to_dict(),
             "source_index": source_index,
-            "status": "local_monotonic_timewarp",
+            "status": (
+                "global_scalar_offset"
+                if clock.scalar_fallback
+                else "local_monotonic_timewarp"
+            ),
         }
-        if dict(raw_payload) != expected:
+        actual = dict(raw_payload)
+        scalar_cache = actual.pop("persistent_scalar_cache", None)
+        scalar_cache_valid = bool(
+            scalar_cache is None
+            or (
+                isinstance(scalar_cache, Mapping)
+                and scalar_cache.get("cache_contract")
+                == "ive_source_scalar_analysis_v1"
+                and scalar_cache.get("namespace") == "local-timewarp-v1"
+                and scalar_cache.get("raw_media_persisted") is False
+            )
+        )
+        if actual != expected or not scalar_cache_valid:
             raise ValueError("used_timewarp_payload_runtime_mismatch")
         result[source_index] = clock
     return result
@@ -520,7 +658,7 @@ def _probe_actual_video_pts(path: Path, timeout_seconds: float) -> tuple[float, 
         "-select_streams",
         "v:0",
         "-show_entries",
-        "frame=best_effort_timestamp_time",
+        "packet=pts_time",
         "-of",
         "csv=p=0",
         str(path),
@@ -533,6 +671,8 @@ def _probe_actual_video_pts(path: Path, timeout_seconds: float) -> tuple[float, 
             text=True,
             timeout=timeout_seconds,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise _SourceEvidenceError("pts_probe_timeout") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise _SourceEvidenceError("pts_probe_spawn_failed") from exc
     if completed.returncode != 0:
@@ -548,11 +688,76 @@ def _probe_actual_video_pts(path: Path, timeout_seconds: float) -> tuple[float, 
             continue
         if math.isfinite(value):
             values.append(value)
-    if len(values) < 2 or any(
-        right <= left for left, right in zip(values, values[1:])
+    presentation_order = sorted(values)
+    if (
+        len(presentation_order) < 2
+        or len(set(presentation_order)) != len(presentation_order)
+        or any(
+            right <= left
+            for left, right in zip(presentation_order, presentation_order[1:])
+        )
     ):
         raise _SourceEvidenceError("pts_incomplete_or_non_monotonic")
-    return tuple(values)
+    return tuple(presentation_order)
+
+
+def _probe_actual_video_pts_cached(
+    path: Path,
+    timeout_seconds: float,
+    cache_directory: Path,
+    *,
+    derived_cache_directory: Path | None = None,
+) -> tuple[tuple[float, ...], dict[str, Any]]:
+    cache = PersistentSourceScalarCache(
+        source_cache_directory=cache_directory,
+        source_path=path,
+        namespace=PTS_CACHE_NAMESPACE,
+        analyzer=PTS_CACHE_ANALYZER,
+        derived_cache_directory=derived_cache_directory,
+    )
+    cached = cache.get()
+    reused = False
+    values: tuple[float, ...] | None = None
+    if cached is not None and set(cached) == {
+        "analysis",
+        "pts_basis",
+        "pts_seconds",
+    }:
+        raw_values = cached.get("pts_seconds")
+        if (
+            cached.get("analysis") == PTS_CACHE_ANALYZER["analysis"]
+            and cached.get("pts_basis") == PTS_BASIS
+            and isinstance(raw_values, list)
+        ):
+            try:
+                candidate = tuple(
+                    _finite(value, f"cached_pts[{index}]")
+                    for index, value in enumerate(raw_values)
+                )
+            except ValueError:
+                candidate = ()
+            if len(candidate) >= 2 and all(
+                right > left
+                for left, right in zip(candidate, candidate[1:])
+            ):
+                values = candidate
+                reused = True
+    if values is None:
+        values = _probe_actual_video_pts(path, timeout_seconds)
+        cache.put(
+            {
+                "analysis": PTS_CACHE_ANALYZER["analysis"],
+                "pts_basis": PTS_BASIS,
+                "pts_seconds": list(values),
+            }
+        )
+    return (
+        values,
+        {
+            **cache.diagnostics(),
+            "analysis_reused": reused,
+        },
+    )
 
 
 def renderer_selected_frame_ordinals(
@@ -654,7 +859,7 @@ def _renderer_windows(
             boundary.transition.get("frame_count"),
             f"boundary[{boundary.boundary_index}].transition.frame_count",
         )
-        if transition_kind == "face_dissolve":
+        if transition_kind in _OVERLAP_TRANSITION_KINDS:
             grids = tuple(range(transition_frames))
             masters = tuple(
                 boundary.canonical_master_seconds + grid / fps for grid in grids
@@ -1076,6 +1281,62 @@ def estimate_motion_phase(
     else:
         reason = None
     if reason is not None:
+        zero_lag = next(
+            (
+                item
+                for item in eligible
+                if int(item["lag_frames"]) == 0
+            ),
+            None,
+        )
+        zero_phase = (
+            None
+            if zero_lag is None
+            else zero_lag.get("actual_pts_phase_frames")
+        )
+        if (
+            settings.allow_zero_lag_nonstatic_clock_proof
+            and zero_lag is not None
+            and zero_phase is not None
+            and abs(float(zero_phase))
+            <= settings.maximum_zero_lag_phase_residual_frames + 1e-12
+        ):
+            signed_phase = float(zero_phase)
+            return {
+                "status": "measured",
+                "reason": None,
+                "measurement_mode": (
+                    "renderer_zero_lag_actual_pts_with_nonstatic_body_evidence_v1"
+                ),
+                "measurement_lag_frames": 0,
+                "outgoing_motion_sample_count": len(left),
+                "incoming_motion_sample_count": len(right),
+                "subframe_peak_offset_frames": 0.0,
+                "actual_pts_phase_frames": signed_phase,
+                "signed_phase_residual_frames": signed_phase,
+                "residual_frames": abs(signed_phase),
+                "matched_motion_pair_count": zero_lag["pair_count"],
+                "matched_non_silhouette_pair_count": zero_lag[
+                    "non_silhouette_pair_count"
+                ],
+                "motion_basis_pair_counts": zero_lag[
+                    "motion_basis_pair_counts"
+                ],
+                "advisory_motion_phase": {
+                    "reason": reason,
+                    "best_lag_frames": best["lag_frames"],
+                    "best_correlation": best_correlation,
+                    "runner_up_correlation": (
+                        runner_up["correlation"]
+                        if runner_up is not None
+                        else None
+                    ),
+                    "correlation_margin": margin,
+                    "influenced_release_measurement": False,
+                },
+                "motion_timing_provenance": provenance,
+                "lag_candidates": candidates,
+            }
         return {
             "status": "unknown",
             "reason": reason,
@@ -1112,6 +1373,8 @@ def estimate_motion_phase(
     return {
         "status": "measured",
         "reason": None,
+        "measurement_mode": "correlated_motion_phase_v1",
+        "measurement_lag_frames": lag,
         "outgoing_motion_sample_count": len(left),
         "incoming_motion_sample_count": len(right),
         "best_lag_frames": lag,
@@ -1159,6 +1422,8 @@ def analyze_cut_local_sync(
     timewarp_payloads: Sequence[Mapping[str, Any]],
     activation: str = ACTIVATION,
     config: CutLocalSyncConfig | None = None,
+    pts_cache_directory: Path | None = None,
+    pts_derived_cache_directory: Path | None = None,
     pts_provider: PTSProvider = _probe_actual_video_pts,
     decode_provider: DecodeProvider = _decode_provider,
     descriptor_provider: DescriptorProvider = _descriptor_provider,
@@ -1169,7 +1434,14 @@ def analyze_cut_local_sync(
         raise TypeError("cut-local sync requires a RenderPlan")
     if activation not in {ACTIVATION, MEMBER_ACTIVATION}:
         raise ValueError("cut-local sync activation is unsupported")
-    settings = config or CutLocalSyncConfig()
+    if (
+        pts_derived_cache_directory is not None
+        and pts_provider is not _probe_actual_video_pts
+    ):
+        raise ValueError(
+            "required direct PTS cache needs the built-in PTS provider"
+        )
+    settings = config or _trusted_config_for_activation(activation)
     plan_payload = plan.to_json()
     boundaries = _boundary_contracts(plan_payload)
     used_sources = _used_source_indices(plan_payload)
@@ -1224,12 +1496,35 @@ def analyze_cut_local_sync(
     for source_index in used_sources:
         path = plan.sources[source_index]
         clock = runtime_clocks[source_index]
+        pts_cache_payload: dict[str, Any] | None = None
         try:
+            if (
+                (
+                    pts_cache_directory is not None
+                    or pts_derived_cache_directory is not None
+                )
+                and pts_provider is _probe_actual_video_pts
+            ):
+                raw_pts_values, pts_cache_payload = (
+                    _probe_actual_video_pts_cached(
+                        path,
+                        settings.ffprobe_timeout_seconds,
+                        (
+                            pts_cache_directory
+                            if pts_cache_directory is not None
+                            else pts_derived_cache_directory
+                        ),
+                        derived_cache_directory=pts_derived_cache_directory,
+                    )
+                )
+            else:
+                raw_pts_values = pts_provider(
+                    path,
+                    settings.ffprobe_timeout_seconds,
+                )
             raw_pts = tuple(
                 _finite(value, f"source_pts[{index}]")
-                for index, value in enumerate(
-                    pts_provider(path, settings.ffprobe_timeout_seconds)
-                )
+                for index, value in enumerate(raw_pts_values)
             )
             if len(raw_pts) < 2 or any(
                 right <= left for left, right in zip(raw_pts, raw_pts[1:])
@@ -1366,8 +1661,11 @@ def analyze_cut_local_sync(
                     ),
                     "raw_frames_persisted": False,
                     "motion_descriptors_persisted": False,
+                    "persistent_pts_cache": pts_cache_payload,
                 }
             )
+        except PersistentSourceScalarCacheStorageUnavailableError:
+            raise
         except (cv2.error, OSError, RuntimeError, TypeError, ValueError) as exc:
             for window in windows_by_source[source_index]:
                 observations.pop((window.boundary_index, window.role), None)
@@ -1379,6 +1677,7 @@ def analyze_cut_local_sync(
                     "reason": _safe_source_error_code(exc),
                     "pts_basis": PTS_BASIS,
                     "renderer_selection_basis": RENDERER_SELECTION_BASIS,
+                    "persistent_pts_cache": pts_cache_payload,
                 }
             )
 
@@ -1401,9 +1700,8 @@ def analyze_cut_local_sync(
         }
         sampling_base = {
             "sampling_domain": (
-                "face_dissolve_exact_outgoing_handle_and_incoming_overlap"
-                if transition_kind == "face_dissolve"
-                else "hard_cut_symmetric_canonical_context"
+                _overlap_sampling_domain(transition_kind)
+                or "hard_cut_symmetric_canonical_context"
             ),
             "renderer_frame_selection": selection_contract,
         }
@@ -1429,11 +1727,15 @@ def analyze_cut_local_sync(
         )
         transition_frames = boundary.transition.get("frame_count")
         if (
-            transition_kind == "face_dissolve"
+            transition_kind in _OVERLAP_TRANSITION_KINDS
             and isinstance(transition_frames, int)
             and transition_frames < settings.minimum_motion_pair_count + 1
         ):
-            reason = "insufficient_dissolve_overlap_frames"
+            reason = (
+                "insufficient_dissolve_overlap_frames"
+                if transition_kind == "face_dissolve"
+                else "insufficient_cinematic_bridge_overlap_frames"
+            )
             unknown_reasons[reason] += 1
             records.append(
                 {
@@ -1658,7 +1960,7 @@ def _expected_selection_contract(
     frame_count = _integer(
         boundary.transition.get("frame_count"), "transition.frame_count"
     )
-    if kind == "face_dissolve":
+    if kind in _OVERLAP_TRANSITION_KINDS:
         grids = tuple(range(frame_count))
         requested = tuple(
             boundary.canonical_master_seconds + index / fps for index in grids
@@ -1697,9 +1999,8 @@ def _expected_selection_contract(
             source_index = boundary.incoming_source_index
         else:
             raise ValueError("selection_role_invalid")
-        sampling_domain = (
-            "face_dissolve_exact_outgoing_handle_and_incoming_overlap"
-        )
+        sampling_domain = _overlap_sampling_domain(kind)
+        assert sampling_domain is not None
     elif kind == "hard_cut" and frame_count == 0:
         grids = tuple(
             range(-policy.sample_radius_frames, policy.sample_radius_frames + 1)
@@ -1916,9 +2217,8 @@ def _validate_measured_record(
 ) -> float | None:
     prefix = f"boundary_{boundary.boundary_index}"
     expected_domain = (
-        "face_dissolve_exact_outgoing_handle_and_incoming_overlap"
-        if boundary.transition.get("kind") == "face_dissolve"
-        else "hard_cut_symmetric_canonical_context"
+        _overlap_sampling_domain(boundary.transition.get("kind"))
+        or "hard_cut_symmetric_canonical_context"
     )
     if record.get("sampling_domain") != expected_domain:
         errors.append(f"{prefix}_sampling_domain_mismatch")
@@ -2119,8 +2419,95 @@ def _validate_measured_record(
     best_correlation = float(best["correlation"])
     runner_correlation = float(runner["correlation"]) if runner else None
     margin = best_correlation - runner_correlation if runner else 2.0
+    if best_correlation < policy.minimum_correlation:
+        advisory_reason = "motion_correlation_below_minimum"
+    elif margin < policy.minimum_correlation_margin:
+        advisory_reason = "ambiguous_motion_lag"
+    elif abs(best_lag) >= policy.maximum_lag_frames:
+        advisory_reason = "motion_lag_at_search_boundary"
+    else:
+        advisory_reason = None
+    measurement_mode = record.get("measurement_mode")
+    if measurement_mode == (
+        "renderer_zero_lag_actual_pts_with_nonstatic_body_evidence_v1"
+    ):
+        zero_lag = next(
+            (
+                item
+                for item in eligible_candidates
+                if int(item["lag_frames"]) == 0
+            ),
+            None,
+        )
+        if not policy.allow_zero_lag_nonstatic_clock_proof:
+            errors.append(f"{prefix}_zero_lag_clock_proof_not_authorized")
+        if advisory_reason is None:
+            errors.append(f"{prefix}_zero_lag_clock_proof_without_advisory_failure")
+        if zero_lag is None:
+            errors.append(f"{prefix}_zero_lag_clock_proof_without_motion_basis")
+            return None
+        zero_phase = zero_lag.get("actual_pts_phase_frames")
+        if zero_phase is None:
+            errors.append(f"{prefix}_zero_lag_actual_pts_phase_missing")
+            return None
+        zero_phase = float(zero_phase)
+        residual = abs(zero_phase)
+        if (
+            residual
+            > policy.maximum_zero_lag_phase_residual_frames + 1e-12
+        ):
+            errors.append(f"{prefix}_zero_lag_phase_exceeds_policy")
+        expected_advisory = {
+            "reason": advisory_reason,
+            "best_lag_frames": best_lag,
+            "best_correlation": best_correlation,
+            "runner_up_correlation": runner_correlation,
+            "correlation_margin": margin,
+            "influenced_release_measurement": False,
+        }
+        if record.get("advisory_motion_phase") != expected_advisory:
+            errors.append(f"{prefix}_advisory_motion_phase_mismatch")
+        if record.get("measurement_lag_frames") != 0:
+            errors.append(f"{prefix}_zero_lag_measurement_lag_mismatch")
+        if not _numbers_equal(record.get("subframe_peak_offset_frames"), 0.0):
+            errors.append(f"{prefix}_zero_lag_subframe_mismatch")
+        if not _numbers_equal(record.get("actual_pts_phase_frames"), zero_phase):
+            errors.append(f"{prefix}_actual_pts_phase_mismatch")
+        if not _numbers_equal(
+            record.get("signed_phase_residual_frames"), zero_phase
+        ):
+            errors.append(f"{prefix}_signed_phase_residual_mismatch")
+        if not _numbers_equal(record.get("residual_frames"), residual):
+            errors.append(f"{prefix}_residual_relation_mismatch")
+        if record.get("matched_motion_pair_count") != zero_lag["pair_count"]:
+            errors.append(f"{prefix}_matched_pair_count_mismatch")
+        if (
+            record.get("matched_non_silhouette_pair_count")
+            != zero_lag["non_silhouette_pair_count"]
+        ):
+            errors.append(f"{prefix}_matched_non_silhouette_count_mismatch")
+        if (
+            record.get("motion_basis_pair_counts")
+            != zero_lag["motion_basis_pair_counts"]
+        ):
+            errors.append(f"{prefix}_matched_basis_counts_mismatch")
+        for forbidden in (
+            "best_lag_frames",
+            "best_correlation",
+            "runner_up_correlation",
+            "correlation_margin",
+        ):
+            if forbidden in record:
+                errors.append(f"{prefix}_zero_lag_forbids_{forbidden}")
+        if record.get("reason") is not None:
+            errors.append(f"{prefix}_measured_reason_must_be_null")
+        return residual
+    if measurement_mode != "correlated_motion_phase_v1":
+        errors.append(f"{prefix}_measurement_mode_invalid")
     if record.get("best_lag_frames") != best_lag:
         errors.append(f"{prefix}_best_lag_mismatch")
+    if record.get("measurement_lag_frames") != best_lag:
+        errors.append(f"{prefix}_measurement_lag_mismatch")
     if not _numbers_equal(record.get("best_correlation"), best_correlation):
         errors.append(f"{prefix}_best_correlation_mismatch")
     if runner_correlation is None:
@@ -2131,9 +2518,7 @@ def _validate_measured_record(
     if not _numbers_equal(record.get("correlation_margin"), margin):
         errors.append(f"{prefix}_correlation_margin_mismatch")
     if (
-        best_correlation < policy.minimum_correlation
-        or margin < policy.minimum_correlation_margin
-        or abs(best_lag) >= policy.maximum_lag_frames
+        advisory_reason is not None
     ):
         errors.append(f"{prefix}_measured_lag_fails_policy")
     by_lag = {
@@ -2178,6 +2563,8 @@ def _validate_measured_record(
         errors.append(f"{prefix}_matched_basis_counts_mismatch")
     if record.get("reason") is not None:
         errors.append(f"{prefix}_measured_reason_must_be_null")
+    if "advisory_motion_phase" in record:
+        errors.append(f"{prefix}_correlated_mode_forbids_advisory")
     return residual
 
 
@@ -2187,7 +2574,7 @@ def validate_cut_local_sync_evidence(
     plan: Mapping[str, Any],
     timewarp_payloads: Sequence[Mapping[str, Any]],
     expected_activation: str = ACTIVATION,
-    maximum_residual_p95_frames: float = 0.5,
+    maximum_residual_p95_frames: float | None = None,
 ) -> dict[str, Any]:
     """Independently verify serialized scalar evidence against final artifacts."""
 
@@ -2209,14 +2596,22 @@ def validate_cut_local_sync_evidence(
         )
         plan_fps = _finite(plan.get("fps"), "plan.fps")
         threshold = _finite(
-            maximum_residual_p95_frames, "maximum_residual_p95_frames"
+            (
+                1.0
+                if expected_activation == MEMBER_ACTIVATION
+                else 0.5
+            )
+            if maximum_residual_p95_frames is None
+            else maximum_residual_p95_frames,
+            "maximum_residual_p95_frames",
         )
         if threshold <= 0.0:
             raise ValueError("threshold invalid")
         if expected_activation not in {ACTIVATION, MEMBER_ACTIVATION}:
             raise ValueError("activation invalid")
-        trusted_policy = CutLocalSyncConfig(
-            maximum_residual_p95_frames=threshold
+        trusted_policy = _trusted_config_for_activation(
+            expected_activation,
+            maximum_residual_p95_frames=threshold,
         )
     except (TypeError, ValueError):
         return {
@@ -2330,12 +2725,99 @@ def validate_cut_local_sync_evidence(
         audit_by_source[source_index] = audit
         if audit.get("source_name") != Path(str(plan_sources[source_index])).name:
             errors.append(f"source_{source_index}_audit_source_name_mismatch")
-        if audit.get("pts_basis") != PTS_BASIS:
+        if audit.get("pts_basis") not in {PTS_BASIS, LEGACY_PTS_BASIS}:
             errors.append(f"source_{source_index}_audit_pts_basis_mismatch")
         if audit.get("renderer_selection_basis") != RENDERER_SELECTION_BASIS:
             errors.append(
                 f"source_{source_index}_audit_renderer_selection_basis_mismatch"
             )
+        pts_cache = audit.get("persistent_pts_cache")
+        if pts_cache is not None:
+            expected_cache_keys = {
+                "cache_contract",
+                "namespace",
+                "source_sha256",
+                "analyzer_sha256",
+                "hit_count",
+                "miss_count",
+                "write_count",
+                "invalid_record_count",
+                "disabled_by_source_change",
+                "raw_media_persisted",
+                "analysis_reused",
+            }
+            direct_storage_keys = {
+                "required",
+                "direct_derived_cache_configured",
+                "storage_io_failure_count",
+                "local_paths_exposed",
+            }
+            actual_cache_keys = (
+                set(pts_cache) if isinstance(pts_cache, Mapping) else set()
+            )
+            storage_fields_present = actual_cache_keys & direct_storage_keys
+            storage_contract_valid = bool(
+                not storage_fields_present
+                or (
+                    storage_fields_present == direct_storage_keys
+                    and isinstance(pts_cache.get("required"), bool)
+                    and isinstance(
+                        pts_cache.get("direct_derived_cache_configured"),
+                        bool,
+                    )
+                    and pts_cache.get("required")
+                    == pts_cache.get("direct_derived_cache_configured")
+                    and isinstance(
+                        pts_cache.get("storage_io_failure_count"), int
+                    )
+                    and not isinstance(
+                        pts_cache.get("storage_io_failure_count"), bool
+                    )
+                    and int(pts_cache["storage_io_failure_count"]) >= 0
+                    and pts_cache.get("local_paths_exposed") is False
+                )
+            )
+            pts_cache_valid = bool(
+                isinstance(pts_cache, Mapping)
+                and (
+                    actual_cache_keys == expected_cache_keys
+                    or actual_cache_keys
+                    == expected_cache_keys | direct_storage_keys
+                )
+                and storage_contract_valid
+                and pts_cache.get("cache_contract")
+                == SOURCE_SCALAR_CACHE_CONTRACT
+                and pts_cache.get("namespace") == PTS_CACHE_NAMESPACE
+                and pts_cache.get("analyzer_sha256")
+                == _expected_pts_cache_analyzer_sha256()
+                and pts_cache.get("raw_media_persisted") is False
+                and isinstance(pts_cache.get("analysis_reused"), bool)
+                and isinstance(pts_cache.get("disabled_by_source_change"), bool)
+                and all(
+                    isinstance(pts_cache.get(name), int)
+                    and not isinstance(pts_cache.get(name), bool)
+                    and int(pts_cache[name]) >= 0
+                    for name in (
+                        "hit_count",
+                        "miss_count",
+                        "write_count",
+                        "invalid_record_count",
+                    )
+                )
+                and all(
+                    isinstance(pts_cache.get(name), str)
+                    and len(str(pts_cache[name])) == 64
+                    and all(
+                        character in "0123456789abcdef"
+                        for character in str(pts_cache[name])
+                    )
+                    for name in ("source_sha256", "analyzer_sha256")
+                )
+            )
+            if not pts_cache_valid:
+                errors.append(
+                    f"source_{source_index}_audit_pts_cache_contract_invalid"
+                )
         if audit.get("status") == "decoded":
             expected_decoded_keys = {
                 "source_index",
@@ -2359,7 +2841,7 @@ def validate_cut_local_sync_evidence(
                 "raw_frames_persisted",
                 "motion_descriptors_persisted",
             }
-            if set(audit) != expected_decoded_keys:
+            if set(audit) - {"persistent_pts_cache"} != expected_decoded_keys:
                 errors.append(f"source_{source_index}_audit_shape_mismatch")
             count = audit.get("pts_frame_count")
             if isinstance(count, bool) or not isinstance(count, int) or count < 2:
@@ -2434,7 +2916,7 @@ def validate_cut_local_sync_evidence(
                 "pts_basis",
                 "renderer_selection_basis",
             }
-            if set(audit) != expected_unavailable_keys:
+            if set(audit) - {"persistent_pts_cache"} != expected_unavailable_keys:
                 errors.append(f"source_{source_index}_audit_shape_mismatch")
             reason = audit.get("reason")
             if (
@@ -2498,9 +2980,8 @@ def validate_cut_local_sync_evidence(
             )
         if record.get("status") != "measured":
             expected_domain = (
-                "face_dissolve_exact_outgoing_handle_and_incoming_overlap"
-                if boundary.transition.get("kind") == "face_dissolve"
-                else "hard_cut_symmetric_canonical_context"
+                _overlap_sampling_domain(boundary.transition.get("kind"))
+                or "hard_cut_symmetric_canonical_context"
             )
             raw_selection = record.get("renderer_frame_selection")
             if isinstance(raw_selection, Mapping) and record.get(

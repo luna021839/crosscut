@@ -1245,6 +1245,7 @@ class PersistentSourceDerivativeDiversityCache:
         self,
         *,
         source_cache_directory: Path,
+        derived_cache_directory: Path | None = None,
         sources: Sequence[Path],
         source_offsets_seconds: Sequence[float],
         source_timewarps: Sequence[TimeWarpMap | None],
@@ -1354,6 +1355,7 @@ class PersistentSourceDerivativeDiversityCache:
         }
         self._cache = PersistentSourceScalarCache(
             source_cache_directory=source_cache_directory,
+            derived_cache_directory=derived_cache_directory,
             source_path=normalized_sources[0],
             namespace=SOURCE_DERIVATIVE_CACHE_NAMESPACE,
             analyzer=analyzer,
@@ -1375,6 +1377,7 @@ class PersistentSourceDerivativeDiversityCache:
         return True
 
     def get(self) -> SourceDerivativeDiversityResult | None:
+        self._cache.assert_storage_root_available()
         if not self._sources_unchanged():
             return None
         payload = self._cache.get()
@@ -1402,6 +1405,7 @@ class PersistentSourceDerivativeDiversityCache:
     def put(self, result: SourceDerivativeDiversityResult) -> bool:
         if not isinstance(result, SourceDerivativeDiversityResult):
             raise TypeError("derivative cache needs a diversity result")
+        self._cache.assert_storage_root_available()
         if not self._sources_unchanged():
             return False
         canonical = source_derivative_diversity_from_dict(result.to_dict())

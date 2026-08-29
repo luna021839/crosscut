@@ -24,7 +24,10 @@ import cv2
 import numpy as np
 
 from .ive import IVEMember
-from .source_scalar_cache import PersistentSourceScalarCache
+from .source_scalar_cache import (
+    PersistentSourceScalarCache,
+    PersistentSourceScalarCacheStorageUnavailableError,
+)
 
 IVE_MEMBER_STABLE_IDS: dict[IVEMember, str] = {
     IVEMember.ANYUJIN: "an_yujin",
@@ -410,11 +413,12 @@ def detect_scene_changes_in_video_cached(
     config: SceneDetectionConfig | None = None,
     sample_every: int = 1,
     source_cache_directory: Path | None = None,
+    derived_cache_directory: Path | None = None,
 ) -> tuple[tuple[SceneChange, ...], dict[str, Any]]:
     """Reuse completed per-source scene scans and recompute on any mismatch."""
 
     settings = config or SceneDetectionConfig()
-    if source_cache_directory is None:
+    if source_cache_directory is None and derived_cache_directory is None:
         return (
             detect_scene_changes_in_video(
                 path,
@@ -427,9 +431,14 @@ def detect_scene_changes_in_video_cached(
                 "raw_media_persisted": False,
             },
         )
+    cache_source_directory = (
+        source_cache_directory or derived_cache_directory
+    )
+    assert cache_source_directory is not None
     try:
         cache = PersistentSourceScalarCache(
-            source_cache_directory=source_cache_directory,
+            source_cache_directory=cache_source_directory,
+            derived_cache_directory=derived_cache_directory,
             source_path=Path(path),
             namespace="scene-changes-v2",
             analyzer=_scene_detection_analyzer_identity(
@@ -437,7 +446,11 @@ def detect_scene_changes_in_video_cached(
                 sample_every=sample_every,
             ),
         )
+    except PersistentSourceScalarCacheStorageUnavailableError:
+        raise
     except (OSError, TypeError, ValueError):
+        if derived_cache_directory is not None:
+            raise
         return (
             detect_scene_changes_in_video(
                 path,

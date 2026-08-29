@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -19,7 +19,10 @@ from crosscut.pipeline import (
     _timewarp_from_scalar_payload,
     _timewarp_scalar_payload,
 )
-from crosscut.source_scalar_cache import PersistentSourceScalarCache
+from crosscut.source_scalar_cache import (
+    PersistentSourceScalarCache,
+    PersistentSourceScalarCacheStorageUnavailableError,
+)
 from crosscut.timewarp import (
     TimeWarpAnchor,
     TimeWarpConfig,
@@ -108,6 +111,7 @@ class SourceScalarCacheTests(unittest.TestCase):
                 sources=(reference, source),
                 reference_source=0,
                 source_cache_directory=root / "cache",
+                visual_feature_derived_cache_directory=None,
             )
             alignments = (
                 SourceAlignment(
@@ -228,6 +232,7 @@ class SourceScalarCacheTests(unittest.TestCase):
                 sources=(reference, source),
                 reference_source=0,
                 source_cache_directory=root / "cache",
+                visual_feature_derived_cache_directory=None,
             )
             estimate = OffsetEstimate(
                 offset_samples=800,
@@ -261,6 +266,279 @@ class SourceScalarCacheTests(unittest.TestCase):
             self.assertEqual(decode.call_count, 3)
             self.assertEqual(align.call_count, 1)
 
+    def test_direct_audio_semantic_cache_miss_recomputes_without_storage_error(
+        self,
+    ) -> None:
+        class Reporter:
+            def status(self, _message: str) -> None:
+                return None
+
+            def log(self, _message: str) -> None:
+                return None
+
+            def progress(self, _value: float, _message: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            reference = root / "reference.mp4"
+            source = root / "source.mp4"
+            reference.write_bytes(b"reference-video")
+            source.write_bytes(b"source-video")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            request = SimpleNamespace(
+                sources=(reference, source),
+                reference_source=0,
+                source_cache_directory=root / "legacy-cache",
+                visual_feature_derived_cache_directory=direct_root,
+            )
+            estimate = OffsetEstimate(
+                offset_samples=800,
+                offset_seconds=0.2,
+                score=0.8,
+                overlap_samples=8_000,
+                overlap_seconds=2.0,
+                sample_rate=4_000,
+                second_best_score=0.5,
+                score_margin=0.3,
+                overlap_ratio=0.9,
+                backend="spectral_flux_ncc",
+            )
+            cache = Mock()
+            cache.get.return_value = {"score": True}
+            cache.put.return_value = True
+            with patch(
+                "crosscut.pipeline.PersistentSourceScalarCache",
+                return_value=cache,
+            ), patch(
+                "crosscut.pipeline.extract_mono_pcm",
+                return_value=np.ones(12_000, dtype=np.float32),
+            ) as decode, patch(
+                "crosscut.pipeline.spectral_flux_alignment_offset",
+                return_value=estimate,
+            ) as align:
+                result, _reference_pcm = _align_sequentially(
+                    request,
+                    Reporter(),
+                )
+
+            self.assertEqual(result.alignments[1].offset_seconds, 0.2)
+            self.assertEqual(align.call_count, 1)
+            self.assertEqual(decode.call_count, 2)
+            cache.put.assert_called_once()
+
+    def test_direct_audio_reference_hash_failure_never_starts_live_alignment(
+        self,
+    ) -> None:
+        class Reporter:
+            def status(self, _message: str) -> None:
+                return None
+
+            def log(self, _message: str) -> None:
+                return None
+
+            def progress(self, _value: float, _message: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            reference = root / "reference.mp4"
+            source = root / "source.mp4"
+            reference.write_bytes(b"reference-video")
+            source.write_bytes(b"source-video")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            request = SimpleNamespace(
+                sources=(reference, source),
+                reference_source=0,
+                source_cache_directory=root / "legacy-cache",
+                visual_feature_derived_cache_directory=direct_root,
+            )
+            with patch(
+                "crosscut.pipeline.extract_mono_pcm",
+                return_value=np.ones(12_000, dtype=np.float32),
+            ) as decode, patch(
+                "crosscut.pipeline.source_content_sha256",
+                side_effect=OSError("source hash failed"),
+            ), patch(
+                "crosscut.pipeline.PersistentSourceScalarCache"
+            ) as cache_type, patch(
+                "crosscut.pipeline.spectral_flux_alignment_offset"
+            ) as live_alignment:
+                with self.assertRaisesRegex(OSError, "source hash failed"):
+                    _align_sequentially(request, Reporter())
+
+            self.assertEqual(decode.call_count, 1)
+            cache_type.assert_not_called()
+            live_alignment.assert_not_called()
+
+    def test_direct_timewarp_semantic_cache_miss_recomputes_without_storage_error(
+        self,
+    ) -> None:
+        class Reporter:
+            def status(self, _message: str) -> None:
+                return None
+
+            def log(self, _message: str) -> None:
+                return None
+
+            def emit(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            reference = root / "reference.mp4"
+            source = root / "source.mp4"
+            reference.write_bytes(b"reference-video")
+            source.write_bytes(b"source-video")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            request = SimpleNamespace(
+                sources=(reference, source),
+                reference_source=0,
+                source_cache_directory=root / "legacy-cache",
+                visual_feature_derived_cache_directory=direct_root,
+            )
+            alignment = AlignmentResult(
+                reference=str(reference),
+                sample_rate=4_000,
+                alignments=(
+                    SourceAlignment(
+                        source=str(reference),
+                        is_reference=True,
+                        offset_samples=0,
+                        offset_seconds=0.0,
+                        score=1.0,
+                        overlap_samples=12_000,
+                        overlap_seconds=3.0,
+                        backend="reference",
+                    ),
+                    SourceAlignment(
+                        source=str(source),
+                        is_reference=False,
+                        offset_samples=800,
+                        offset_seconds=0.2,
+                        score=0.8,
+                        overlap_samples=8_000,
+                        overlap_seconds=2.0,
+                        second_best_score=0.5,
+                        score_margin=0.3,
+                        overlap_ratio=0.9,
+                        backend="spectral_flux_ncc",
+                    ),
+                ),
+            )
+            reference_pcm = np.ones(12_000, dtype=np.float32)
+            cache = Mock()
+            cache.get.return_value = {"scalar_fallback": "invalid"}
+            cache.put.return_value = True
+            cache.diagnostics.return_value = {
+                "cache_contract": "ive_source_scalar_analysis_v1",
+                "namespace": "local-timewarp-v1",
+                "raw_media_persisted": False,
+            }
+
+            def estimate(
+                _reference_pcm,  # type: ignore[no-untyped-def]
+                _source_pcm,  # type: ignore[no-untyped-def]
+                *,
+                global_offset_seconds: float,
+                **_kwargs,
+            ) -> TimeWarpMap:
+                return self._timewarp(global_offset_seconds)
+
+            with patch(
+                "crosscut.pipeline.PersistentSourceScalarCache",
+                return_value=cache,
+            ), patch(
+                "crosscut.pipeline.extract_mono_pcm",
+                return_value=reference_pcm,
+            ) as decode, patch(
+                "crosscut.pipeline.estimate_local_timewarp",
+                side_effect=estimate,
+            ) as estimate_timewarp:
+                maps, _payloads = _estimate_source_timewarps(
+                    request,
+                    alignment,
+                    reference_pcm,
+                    eligible_indices=(0, 1),
+                    reporter=Reporter(),
+                )
+
+            self.assertIsNotNone(maps[0])
+            self.assertIsNotNone(maps[1])
+            self.assertEqual(estimate_timewarp.call_count, 2)
+            self.assertEqual(decode.call_count, 1)
+            self.assertEqual(cache.put.call_count, 2)
+
+    def test_direct_timewarp_reference_hash_failure_never_starts_estimator(
+        self,
+    ) -> None:
+        class Reporter:
+            def status(self, _message: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            reference = root / "reference.mp4"
+            source = root / "source.mp4"
+            reference.write_bytes(b"reference-video")
+            source.write_bytes(b"source-video")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            request = SimpleNamespace(
+                sources=(reference, source),
+                reference_source=0,
+                source_cache_directory=root / "legacy-cache",
+                visual_feature_derived_cache_directory=direct_root,
+            )
+            alignment = AlignmentResult(
+                reference=str(reference),
+                sample_rate=4_000,
+                alignments=(
+                    SourceAlignment(
+                        source=str(reference),
+                        is_reference=True,
+                        offset_samples=0,
+                        offset_seconds=0.0,
+                        score=1.0,
+                        overlap_samples=12_000,
+                        overlap_seconds=3.0,
+                        backend="reference",
+                    ),
+                    SourceAlignment(
+                        source=str(source),
+                        is_reference=False,
+                        offset_samples=800,
+                        offset_seconds=0.2,
+                        score=0.8,
+                        overlap_samples=8_000,
+                        overlap_seconds=2.0,
+                        backend="spectral_flux_ncc",
+                    ),
+                ),
+            )
+            with patch(
+                "crosscut.pipeline.source_content_sha256",
+                side_effect=OSError("source hash failed"),
+            ), patch(
+                "crosscut.pipeline.PersistentSourceScalarCache"
+            ) as cache_type, patch(
+                "crosscut.pipeline.estimate_local_timewarp"
+            ) as estimator:
+                with self.assertRaisesRegex(OSError, "source hash failed"):
+                    _estimate_source_timewarps(
+                        request,
+                        alignment,
+                        np.ones(12_000, dtype=np.float32),
+                        eligible_indices=(0, 1),
+                        reporter=Reporter(),
+                    )
+
+            cache_type.assert_not_called()
+            estimator.assert_not_called()
+
     def test_atomic_record_is_content_and_analyzer_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -291,6 +569,154 @@ class SourceScalarCacheTests(unittest.TestCase):
             records[0].write_text(json.dumps(record), encoding="utf-8")
             self.assertIsNone(cache.get())
             self.assertEqual(cache.diagnostics()["invalid_record_count"], 1)
+
+    def test_direct_derived_root_ignores_legacy_derived_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-v1")
+            source_cache = root / "legacy-source-cache"
+            source_cache.mkdir()
+            legacy_target = root / "legacy-derived-target"
+            legacy_target.mkdir()
+            (source_cache / "derived").symlink_to(
+                legacy_target,
+                target_is_directory=True,
+            )
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            payload = {"values": [0.1, 0.2], "count": 2}
+
+            cache = PersistentSourceScalarCache(
+                source_cache_directory=source_cache,
+                source_path=source,
+                namespace="test-analysis",
+                analyzer={"contract": "test-v1"},
+                derived_cache_directory=direct_root,
+            )
+
+            self.assertTrue(cache.put(payload))
+            self.assertEqual(cache.get(), payload)
+            self.assertEqual(
+                len(tuple((direct_root / "scalar-v1").rglob("*.json"))),
+                1,
+            )
+            self.assertEqual(tuple(legacy_target.iterdir()), ())
+            self.assertTrue((source_cache / "derived").is_symlink())
+            diagnostics = cache.diagnostics()
+            self.assertTrue(diagnostics["required"])
+            self.assertTrue(
+                diagnostics["direct_derived_cache_configured"]
+            )
+            self.assertFalse(diagnostics["local_paths_exposed"])
+            self.assertNotIn(str(root), json.dumps(diagnostics))
+
+    def test_missing_direct_root_is_typed_and_path_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-v1")
+            missing_direct_root = root / "missing-derived-cache"
+
+            with self.assertRaises(
+                PersistentSourceScalarCacheStorageUnavailableError
+            ) as raised:
+                PersistentSourceScalarCache(
+                    source_cache_directory=root / "unused-source-cache",
+                    source_path=source,
+                    namespace="test-analysis",
+                    analyzer={"contract": "test-v1"},
+                    derived_cache_directory=missing_direct_root,
+                )
+
+            self.assertNotIn(str(root), str(raised.exception))
+
+    def test_direct_root_rename_fails_before_cache_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-v1")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            cache = PersistentSourceScalarCache(
+                source_cache_directory=root / "unused-source-cache",
+                source_path=source,
+                namespace="test-analysis",
+                analyzer={"contract": "test-v1"},
+                derived_cache_directory=direct_root,
+            )
+            self.assertTrue(cache.put({"value": 1.0}))
+            direct_root.rename(root / "detached-derived-cache")
+
+            with self.assertRaises(
+                PersistentSourceScalarCacheStorageUnavailableError
+            ) as raised:
+                cache.get()
+
+            self.assertNotIn(str(root), str(raised.exception))
+            diagnostics = cache.diagnostics()
+            self.assertEqual(diagnostics["hit_count"], 0)
+            self.assertEqual(diagnostics["miss_count"], 0)
+            self.assertEqual(diagnostics["storage_io_failure_count"], 1)
+
+    def test_direct_root_identity_replacement_fails_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-v1")
+            direct_root = root / "direct-derived-cache"
+            direct_root.mkdir()
+            cache = PersistentSourceScalarCache(
+                source_cache_directory=root / "unused-source-cache",
+                source_path=source,
+                namespace="test-analysis",
+                analyzer={"contract": "test-v1"},
+                derived_cache_directory=direct_root,
+            )
+            direct_root.rename(root / "detached-derived-cache")
+            direct_root.mkdir()
+
+            with self.assertRaises(
+                PersistentSourceScalarCacheStorageUnavailableError
+            ) as raised:
+                cache.put({"value": 1.0})
+
+            self.assertNotIn(str(root), str(raised.exception))
+            self.assertFalse((direct_root / "scalar-v1").exists())
+            diagnostics = cache.diagnostics()
+            self.assertEqual(diagnostics["write_count"], 0)
+            self.assertEqual(diagnostics["storage_io_failure_count"], 1)
+
+    def test_legacy_derived_root_remains_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-v1")
+            source_cache = root / "source-cache"
+            cache = PersistentSourceScalarCache(
+                source_cache_directory=source_cache,
+                source_path=source,
+                namespace="test-analysis",
+                analyzer={"contract": "test-v1"},
+            )
+
+            self.assertTrue(cache.put({"value": 1.0}))
+            self.assertEqual(
+                len(
+                    tuple(
+                        (source_cache / "derived" / "scalar-v1").rglob(
+                            "*.json"
+                        )
+                    )
+                ),
+                1,
+            )
+            diagnostics = cache.diagnostics()
+            self.assertFalse(diagnostics["required"])
+            self.assertFalse(
+                diagnostics["direct_derived_cache_configured"]
+            )
+            self.assertEqual(diagnostics["storage_io_failure_count"], 0)
 
     def test_source_change_disables_existing_instance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
