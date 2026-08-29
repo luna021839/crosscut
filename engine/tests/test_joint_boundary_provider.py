@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import math
 from pathlib import Path
 import random
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from crosscut.joint_boundary_provider import (
     DecodedBoundaryOptionProvider,
+    PersistentScalarBridgeCacheWriteError,
     SegmentTransformPathSample,
 )
 from crosscut.joint_timeline import (
@@ -25,6 +28,9 @@ from crosscut.joint_timeline import (
     select_joint_timeline,
 )
 from crosscut.pose import FormationPersonDescriptor, POSE_BACKEND
+from crosscut.source_scalar_cache import (
+    PersistentSourceScalarCacheStorageUnavailableError,
+)
 from crosscut.timeline import ShotType, TimelineCandidate
 from crosscut.timewarp import (
     TimeWarpAnchor,
@@ -1219,6 +1225,739 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
                 exact.score_adjustment,
             ),
         )
+
+    def test_scalar_batch_rejects_crop_before_requesting_face_vector(self) -> None:
+        face_calls: list[float] = []
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(
+                0.5,
+                pose_value=0.1,
+                face_bbox=(0.42, 0.30, 0.16, 0.22),
+            ),
+            face_identity_provider=lambda _source, seconds, _descriptor: (
+                face_calls.append(seconds) or (1.0, 0.0)
+            ),
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        face_calls.clear()
+        crop = (0.0, 0.25, 0.5, 0.5)
+        entry = replace(
+            entries[8],
+            incoming_transform=BoundaryTransformState(
+                transform_identity="coverage-first-entry",
+                crop_xywh=crop,
+                track_id="coverage-first-track",
+                subject_basis="dominant_face",
+            ),
+        )
+        exit_ = replace(
+            exits[8],
+            outgoing_transform=BoundaryTransformState(
+                transform_identity="coverage-first-exit",
+                crop_xywh=crop,
+                track_id="coverage-first-track",
+                subject_basis="dominant_face",
+            ),
+        )
+
+        disposition = provider.bridge_disposition_batch(
+            (_bridge_request(middle, entry, exit_),)
+        )[0]
+
+        self.assertEqual(
+            disposition.failure_codes,
+            ("segment_subject_exits_crop_track",),
+        )
+        self.assertEqual(face_calls, [])
+
+    def test_production_face_preflight_skips_decode_for_unusable_geometry(
+        self,
+    ) -> None:
+        descriptor = _descriptor(
+            0.5,
+            pose_value=0.1,
+            face_bbox=(0.42, 0.30, 0.16, 0.22),
+        )
+        provider = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        provider._descriptor_provider = None
+        sampler = mock.Mock()
+
+        with mock.patch.object(provider, "_sampler", return_value=sampler):
+            identity = provider._sample_face_identity(1, 10.0, descriptor)
+
+        self.assertEqual(identity, ())
+        self.assertEqual(provider.face_identity_model_call_count, 0)
+        sampler.sface_embedding_at.assert_not_called()
+
+    def test_production_face_cache_uses_exact_canonical_frame_identity(
+        self,
+    ) -> None:
+        descriptor = replace(
+            _descriptor(
+                0.5,
+                pose_value=0.1,
+                face_bbox=(0.42, 0.30, 0.16, 0.22),
+            ),
+            face_detector_backend="yunet",
+            primary_face_landmarks_xy=(
+                (0.46, 0.37),
+                (0.54, 0.37),
+                (0.50, 0.42),
+                (0.47, 0.47),
+                (0.53, 0.47),
+            ),
+        )
+        provider = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        provider._descriptor_provider = None
+        sampler = mock.Mock()
+        sampler.frame_identity.side_effect = lambda _seconds: "frame:30"
+        sampler.sface_embedding_at.return_value = (1.0, 0.0)
+
+        with mock.patch.object(provider, "_sampler", return_value=sampler):
+            first = provider._sample_face_identity(1, 1.0000, descriptor)
+            second = provider._sample_face_identity(1, 1.0010, descriptor)
+
+        self.assertEqual(first, (1.0, 0.0))
+        self.assertEqual(second, first)
+        self.assertEqual(sampler.sface_embedding_at.call_count, 1)
+        self.assertEqual(provider.face_identity_model_call_count, 1)
+        self.assertEqual(provider.face_identity_cache_hit_count, 1)
+
+    def test_required_direct_scalar_bridge_cache_is_cold_then_decode_free_warm(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.5, pose_value=0.1)
+        donor = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(donor)
+        request = _bridge_request(middle, entries[8], exits[8])
+        sampler_descriptor_calls: list[tuple[Path, float]] = []
+        cache_analyzers: list[dict[str, object]] = []
+
+        class _PersistentVisualState:
+            def __init__(self, path: Path) -> None:
+                suffix = "a" if path.name.startswith("source-a") else "b"
+                self.source_sha256 = suffix * 64
+                self.analyzer = SimpleNamespace(digest="c" * 64)
+
+        class _PersistentSampler:
+            def __init__(self, path: Path, **_kwargs: object) -> None:
+                self.path = path
+                self.persistent_feature_cache = _PersistentVisualState(path)
+
+            def assert_required_persistent_cache_available(self) -> None:
+                return None
+
+            def feature_descriptor_at(
+                self,
+                seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                sampler_descriptor_calls.append((self.path, seconds))
+                return descriptor
+
+            def sface_embedding_at(
+                self,
+                _seconds: float,
+                _descriptor: FrameVisualDescriptor,
+            ) -> tuple[float, ...]:
+                return (1.0, 0.0)
+
+            def persistent_feature_cache_diagnostics(self) -> dict[str, object]:
+                return {
+                    "enabled": True,
+                    "status": "enabled",
+                    "source_frame_decode_count": 0,
+                    "decode_free_hit_count": 0,
+                }
+
+            def close(self) -> None:
+                return None
+
+        class _AtomicScalarCache:
+            stored: dict[str, object] | None = None
+
+            def __init__(self, **kwargs: object) -> None:
+                cache_analyzers.append(dict(kwargs["analyzer"]))
+
+            def get(self) -> dict[str, object] | None:
+                return (
+                    json.loads(json.dumps(self.stored))
+                    if self.stored is not None
+                    else None
+                )
+
+            def put(self, payload: dict[str, object]) -> bool:
+                type(self).stored = json.loads(json.dumps(payload))
+                return True
+
+            def assert_storage_root_available(self) -> None:
+                return None
+
+            def diagnostics(self) -> dict[str, object]:
+                return {
+                    "required": True,
+                    "local_paths_exposed": False,
+                }
+
+        sources = (Path("/private/source-a.mp4"), Path("/private/source-b.mp4"))
+        direct_root = Path("/private/direct-derived-cache")
+        with mock.patch(
+            "crosscut.joint_boundary_provider._VideoSampler",
+            _PersistentSampler,
+        ), mock.patch(
+            "crosscut.joint_boundary_provider.PersistentSourceScalarCache",
+            _AtomicScalarCache,
+        ):
+            cold = _provider(
+                None,
+                sources=sources,
+                total_segment_count=3,
+                feature_derived_cache_directory=direct_root,
+                require_persistent_feature_cache=True,
+            )
+            cold_result = cold.bridge_disposition_batch((request,))[0]
+            cold_audit = cold.to_dict()["scalar_bridge_batch"][
+                "persistent_scalar_cache"
+            ]
+            calls_after_cold = len(sampler_descriptor_calls)
+            self.assertGreater(calls_after_cold, 0)
+            self.assertEqual(cold_audit["request_miss_count"], 1)
+            self.assertEqual(cold_audit["request_hit_count"], 0)
+            self.assertEqual(cold_audit["atomic_write_count"], 1)
+            cold.close()
+
+            warm = _provider(
+                None,
+                sources=sources,
+                total_segment_count=3,
+                feature_derived_cache_directory=direct_root,
+                require_persistent_feature_cache=True,
+            )
+            warm_result = warm.bridge_disposition_batch((request,))[0]
+            warm_audit = warm.to_dict()["scalar_bridge_batch"][
+                "persistent_scalar_cache"
+            ]
+
+        self.assertEqual(
+            (
+                warm_result.evidence_complete,
+                warm_result.crop_compatible,
+                warm_result.track_compatible,
+                warm_result.failure_codes,
+                warm_result.score_adjustment,
+            ),
+            (
+                cold_result.evidence_complete,
+                cold_result.crop_compatible,
+                cold_result.track_compatible,
+                cold_result.failure_codes,
+                cold_result.score_adjustment,
+            ),
+        )
+        self.assertEqual(len(sampler_descriptor_calls), calls_after_cold)
+        self.assertEqual(warm.descriptor_decode_count, 0)
+        self.assertEqual(warm.face_identity_model_call_count, 0)
+        self.assertEqual(warm_audit["request_hit_count"], 1)
+        self.assertEqual(warm_audit["request_miss_count"], 0)
+        self.assertEqual(warm_audit["atomic_write_count"], 0)
+        self.assertEqual(len(cache_analyzers), 2)
+        for analyzer in cache_analyzers:
+            implementation = analyzer["implementation_sha256"]
+            assert isinstance(implementation, dict)
+            self.assertRegex(
+                str(implementation["timewarp_map_ast"]),
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                str(implementation["editorial_transform_track_ast"]),
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(analyzer["segment_index"], 1)
+        serialized = json.dumps(
+            {
+                "audit": warm_audit,
+                "analyzers": cache_analyzers,
+                "payload": _AtomicScalarCache.stored,
+            },
+            sort_keys=True,
+        )
+        self.assertNotIn("/private/", serialized)
+        self.assertNotIn("source-a.mp4", serialized)
+        self.assertFalse(warm_audit["raw_frames_persisted"])
+        self.assertFalse(warm_audit["biometric_model_vectors_persisted"])
+
+    def test_required_direct_scalar_bridge_cache_is_lazy_and_segment_sharded(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.5, pose_value=0.1)
+
+        class _PersistentSampler:
+            def __init__(self, path: Path, **_kwargs: object) -> None:
+                suffix = "a" if path.name.startswith("source-a") else "b"
+                self.persistent_feature_cache = SimpleNamespace(
+                    source_sha256=suffix * 64,
+                    analyzer=SimpleNamespace(digest="c" * 64),
+                )
+
+            def assert_required_persistent_cache_available(self) -> None:
+                return None
+
+            def feature_descriptor_at(
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                return descriptor
+
+            def persistent_feature_cache_diagnostics(self) -> dict[str, object]:
+                return {"enabled": True, "status": "enabled"}
+
+            def close(self) -> None:
+                return None
+
+        class _SegmentScalarCache:
+            stored_by_segment: dict[int, dict[str, object]] = {}
+            put_count_by_segment: dict[int, int] = {}
+
+            def __init__(self, **kwargs: object) -> None:
+                analyzer = kwargs["analyzer"]
+                assert isinstance(analyzer, dict)
+                self.segment_index = int(analyzer["segment_index"])
+
+            def get(self) -> dict[str, object] | None:
+                stored = self.stored_by_segment.get(self.segment_index)
+                return (
+                    json.loads(json.dumps(stored))
+                    if stored is not None
+                    else None
+                )
+
+            def put(self, payload: dict[str, object]) -> bool:
+                self.stored_by_segment[self.segment_index] = json.loads(
+                    json.dumps(payload)
+                )
+                self.put_count_by_segment[self.segment_index] = (
+                    self.put_count_by_segment.get(self.segment_index, 0) + 1
+                )
+                return True
+
+            def assert_storage_root_available(self) -> None:
+                return None
+
+            def diagnostics(self) -> dict[str, object]:
+                return {
+                    "hit_count": 0,
+                    "miss_count": 0,
+                    "write_count": self.put_count_by_segment.get(
+                        self.segment_index,
+                        0,
+                    ),
+                    "invalid_record_count": 0,
+                    "storage_io_failure_count": 0,
+                    "required": True,
+                    "local_paths_exposed": False,
+                    "raw_media_persisted": False,
+                }
+
+        def candidate(segment_index: int, source_id: str) -> TimelineCandidate:
+            return TimelineCandidate(
+                segment_index=segment_index,
+                source_id=source_id,
+                start_seconds=9.0 + segment_index,
+                end_seconds=10.0 + segment_index,
+                candidate_id=f"shard-candidate:{segment_index}:{source_id}",
+                shot_id=f"shard-shot:{segment_index}:{source_id}",
+            )
+
+        sources = (Path("source-a.mp4"), Path("source-b.mp4"))
+        direct_root = Path("direct-cache")
+        with mock.patch(
+            "crosscut.joint_boundary_provider._VideoSampler",
+            _PersistentSampler,
+        ), mock.patch(
+            "crosscut.joint_boundary_provider.PersistentSourceScalarCache",
+            _SegmentScalarCache,
+        ):
+            cold = _provider(
+                None,
+                sources=sources,
+                total_segment_count=4,
+                feature_derived_cache_directory=direct_root,
+                require_persistent_feature_cache=True,
+            )
+            candidates = (
+                candidate(0, "0"),
+                candidate(1, "1"),
+                candidate(2, "0"),
+                candidate(3, "1"),
+            )
+            options = tuple(
+                cold(
+                    BoundaryMeasurementKey(
+                        boundary_index,
+                        candidates[boundary_index],
+                        candidates[boundary_index + 1],
+                    )
+                ).audit_for(0).authorized_option
+                for boundary_index in range(3)
+            )
+            self.assertTrue(all(option is not None for option in options))
+            first, second, third = options
+            assert first is not None and second is not None and third is not None
+            requests = (
+                _bridge_request(candidates[1], first, second),
+                _bridge_request(candidates[2], second, third),
+            )
+
+            cold.bridge_disposition_batch((requests[0],))
+            first_audit = cold.to_dict()["scalar_bridge_batch"][
+                "persistent_scalar_cache"
+            ]
+            self.assertEqual(first_audit["loaded_shard_count"], 1)
+            self.assertEqual(set(_SegmentScalarCache.stored_by_segment), {1})
+
+            cold.bridge_disposition_batch(requests)
+            second_audit = cold.to_dict()["scalar_bridge_batch"][
+                "persistent_scalar_cache"
+            ]
+            self.assertEqual(second_audit["loaded_shard_count"], 2)
+            self.assertEqual(second_audit["entry_count"], 2)
+            self.assertEqual(set(_SegmentScalarCache.stored_by_segment), {1, 2})
+            self.assertEqual(
+                _SegmentScalarCache.put_count_by_segment,
+                {1: 1, 2: 1},
+            )
+            self.assertEqual(
+                {
+                    segment_index: payload["segment_index"]
+                    for segment_index, payload in (
+                        _SegmentScalarCache.stored_by_segment.items()
+                    )
+                },
+                {1: 1, 2: 2},
+            )
+
+            warm = _provider(
+                None,
+                sources=sources,
+                total_segment_count=4,
+                feature_derived_cache_directory=direct_root,
+                require_persistent_feature_cache=True,
+            )
+            warm.bridge_disposition_batch(requests)
+            warm_audit = warm.to_dict()["scalar_bridge_batch"][
+                "persistent_scalar_cache"
+            ]
+
+        self.assertEqual(warm_audit["request_hit_count"], 2)
+        self.assertEqual(warm_audit["request_miss_count"], 0)
+        self.assertEqual(warm_audit["loaded_shard_count"], 2)
+        self.assertEqual(
+            _SegmentScalarCache.put_count_by_segment,
+            {1: 1, 2: 1},
+        )
+
+    def test_scalar_bridge_cache_distinguishes_root_loss_from_write_failure(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.5, pose_value=0.1)
+        donor = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(donor)
+        request = _bridge_request(middle, entries[8], exits[8])
+
+        class _PersistentSampler:
+            def __init__(self, _path: Path, **_kwargs: object) -> None:
+                self.persistent_feature_cache = SimpleNamespace(
+                    source_sha256="a" * 64,
+                    analyzer=SimpleNamespace(digest="b" * 64),
+                )
+
+            def assert_required_persistent_cache_available(self) -> None:
+                return None
+
+            def feature_descriptor_at(
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                return descriptor
+
+            def persistent_feature_cache_diagnostics(self) -> dict[str, object]:
+                return {"enabled": True, "status": "enabled"}
+
+            def close(self) -> None:
+                return None
+
+        class _FailingScalarCache:
+            fail_with_root_loss = True
+
+            def __init__(self, **_kwargs: object) -> None:
+                return None
+
+            def get(self) -> None:
+                return None
+
+            def put(self, _payload: dict[str, object]) -> bool:
+                if self.fail_with_root_loss:
+                    raise PersistentSourceScalarCacheStorageUnavailableError(
+                        "required direct source scalar cache storage is unavailable"
+                    )
+                return False
+
+            def assert_storage_root_available(self) -> None:
+                return None
+
+        with mock.patch(
+            "crosscut.joint_boundary_provider._VideoSampler",
+            _PersistentSampler,
+        ), mock.patch(
+            "crosscut.joint_boundary_provider.PersistentSourceScalarCache",
+            _FailingScalarCache,
+        ):
+            provider = _provider(
+                None,
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                total_segment_count=3,
+                feature_derived_cache_directory=Path("direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+            with self.assertRaises(
+                PersistentSourceScalarCacheStorageUnavailableError
+            ):
+                provider.bridge_disposition_batch((request,))
+
+            _FailingScalarCache.fail_with_root_loss = False
+            write_failure_provider = _provider(
+                None,
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                total_segment_count=3,
+                feature_derived_cache_directory=Path("direct-cache"),
+                require_persistent_feature_cache=True,
+            )
+            with self.assertRaises(
+                PersistentScalarBridgeCacheWriteError
+            ) as raised:
+                write_failure_provider.bridge_disposition_batch((request,))
+
+        self.assertEqual(provider.scalar_bridge_batch_call_count, 0)
+        self.assertEqual(provider.descriptor_cache.diagnostics()["entry_count"], 0)
+        self.assertNotIsInstance(
+            raised.exception,
+            PersistentSourceScalarCacheStorageUnavailableError,
+        )
+        self.assertNotIn("direct-cache", str(raised.exception))
+        self.assertNotIn("source-a", str(raised.exception))
+
+    def test_incomplete_scalar_bridge_evidence_is_never_persisted(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.5, pose_value=0.1)
+        provider = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        request = _bridge_request(middle, entries[8], exits[8])
+        scalar_cache = mock.Mock()
+        scalar_cache.assert_storage_root_available = mock.Mock()
+        provider._scalar_bridge_persistent_caches[1] = scalar_cache
+        provider._scalar_bridge_persistent_entries_by_segment[1] = {}
+        provider._scalar_bridge_persistent_cache_loaded_segments.add(1)
+
+        with mock.patch.object(
+            provider,
+            "_transform_path_scalar_disposition",
+            return_value=(
+                False,
+                False,
+                False,
+                ("bridge_descriptor_missing",),
+                -1.0,
+            ),
+        ):
+            result = provider.bridge_disposition_batch((request,))[0]
+
+        self.assertFalse(result.evidence_complete)
+        scalar_cache.put.assert_not_called()
+        audit = provider.to_dict()["scalar_bridge_batch"][
+            "persistent_scalar_cache"
+        ]
+        self.assertEqual(audit["entry_count"], 0)
+        self.assertEqual(audit["atomic_write_count"], 0)
+        self.assertFalse(audit["evidence_incomplete_results_persisted"])
+        self.assertIsNone(
+            provider._decode_persisted_scalar_bridge_entry(
+                [
+                    False,
+                    False,
+                    False,
+                    ["bridge_descriptor_missing"],
+                    -1.0,
+                ]
+            )
+        )
+
+    def test_scalar_bridge_segment_shard_enforces_its_entry_bound(self) -> None:
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5, pose_value=0.1),
+            total_segment_count=3,
+        )
+        cache = mock.Mock()
+        cache.get.return_value = None
+        cache.put.return_value = True
+        cache.assert_storage_root_available = mock.Mock()
+        provider._scalar_bridge_persistent_caches[1] = cache
+        provider._scalar_bridge_persistent_entries_by_segment[1] = {}
+        provider._scalar_bridge_persistent_cache_loaded_segments.add(1)
+        entries = {
+            f"{index:064x}": (True, True, True, (), 0.0)
+            for index in range(3)
+        }
+
+        with mock.patch(
+            "crosscut.joint_boundary_provider."
+            "_SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD",
+            2,
+        ):
+            provider._commit_scalar_bridge_persistent_cache(1, entries)
+
+        payload = cache.put.call_args.args[0]
+        self.assertEqual(payload["segment_index"], 1)
+        self.assertEqual(tuple(payload["entries"]), tuple(entries)[:2])
+        self.assertEqual(
+            len(provider._scalar_bridge_persistent_entries_by_segment[1]),
+            2,
+        )
+
+    def test_required_direct_scalar_bridge_cache_real_record_is_atomic_and_bound(
+        self,
+    ) -> None:
+        descriptor = _descriptor(0.5, pose_value=0.1)
+        donor = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(donor)
+        request = _bridge_request(middle, entries[8], exits[8])
+        descriptor_calls: list[tuple[Path, float]] = []
+
+        class _PersistentSampler:
+            def __init__(self, path: Path, **_kwargs: object) -> None:
+                self.path = path
+                self.persistent_feature_cache = SimpleNamespace(
+                    source_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    analyzer=SimpleNamespace(digest="d" * 64),
+                )
+
+            def assert_required_persistent_cache_available(self) -> None:
+                return None
+
+            def feature_descriptor_at(
+                self,
+                seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                descriptor_calls.append((self.path, seconds))
+                return descriptor
+
+            def persistent_feature_cache_diagnostics(self) -> dict[str, object]:
+                return {"enabled": True, "status": "enabled"}
+
+            def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = root / "source-a.mp4"
+            source_b = root / "source-b.mp4"
+            source_a.write_bytes(b"source-a-v1")
+            source_b.write_bytes(b"source-b-v1")
+            sources = (source_a, source_b)
+            with mock.patch(
+                "crosscut.joint_boundary_provider._VideoSampler",
+                _PersistentSampler,
+            ):
+                cold = _provider(
+                    None,
+                    sources=sources,
+                    total_segment_count=3,
+                    feature_derived_cache_directory=root,
+                    require_persistent_feature_cache=True,
+                )
+                cold.bridge_disposition_batch((request,))
+                calls_after_cold = len(descriptor_calls)
+                cold.close()
+
+                warm = _provider(
+                    None,
+                    sources=sources,
+                    total_segment_count=3,
+                    feature_derived_cache_directory=root,
+                    require_persistent_feature_cache=True,
+                )
+                warm.bridge_disposition_batch((request,))
+                warm_audit = warm.to_dict()["scalar_bridge_batch"][
+                    "persistent_scalar_cache"
+                ]
+                warm.close()
+                self.assertEqual(len(descriptor_calls), calls_after_cold)
+                self.assertEqual(warm_audit["request_hit_count"], 1)
+
+                watching = _provider(
+                    None,
+                    sources=sources,
+                    total_segment_count=3,
+                    feature_derived_cache_directory=root,
+                    require_persistent_feature_cache=True,
+                )
+                watching.bridge_disposition_batch((request,))
+                source_b.write_bytes(b"source-b-v2")
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "source changed during selection",
+                ):
+                    watching.bridge_disposition_batch((request,))
+                watching.close()
+                changed = _provider(
+                    None,
+                    sources=sources,
+                    total_segment_count=3,
+                    feature_derived_cache_directory=root,
+                    require_persistent_feature_cache=True,
+                )
+                changed.bridge_disposition_batch((request,))
+                changed_audit = changed.to_dict()["scalar_bridge_batch"][
+                    "persistent_scalar_cache"
+                ]
+
+            self.assertGreater(len(descriptor_calls), calls_after_cold)
+            self.assertEqual(changed_audit["request_hit_count"], 0)
+            self.assertEqual(changed_audit["request_miss_count"], 1)
+            records = tuple(
+                (
+                    root
+                    / "scalar-v1"
+                    / "joint-bridge-disposition-v2"
+                ).rglob("*.json")
+            )
+            self.assertEqual(len(records), 2)
+            for record in records:
+                serialized = record.read_text(encoding="utf-8")
+                self.assertNotIn(str(root), serialized)
+                self.assertIn('"identity_embeddings_persisted":false', serialized)
 
     def test_scalar_batch_parity_across_timewarp_fps_and_offset_cases(self) -> None:
         randomizer = random.Random(20260829)

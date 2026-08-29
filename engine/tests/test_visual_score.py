@@ -851,6 +851,93 @@ class VisualScoreTests(unittest.TestCase):
             self.assertFalse(legacy_root.exists())
             self.assertTrue(tuple(direct_root.rglob("*.json")))
 
+    def test_sface_ineligible_descriptor_does_not_decode_frame(self) -> None:
+        sampler = object.__new__(_VideoSampler)
+        sampler.frame_rate = 29.97
+        sampler.sface_cache = {}
+        descriptor = FrameVisualDescriptor(
+            quality_score=0.8,
+            composition_score=0.8,
+            shot_scale=0.4,
+            shot_type=ShotType.MEDIUM,
+            face_count=0,
+            structure_embedding=(0.0,) * 96,
+            face_detector_backend="none",
+        )
+        with patch.object(
+            _VideoSampler,
+            "frame_at",
+            autospec=True,
+        ) as frame_at:
+            embedding = sampler.sface_embedding_at(1.0, descriptor)
+
+        self.assertEqual(embedding, ())
+        frame_at.assert_not_called()
+
+    def test_builder_skips_unused_midpoint_sface_identity(self) -> None:
+        descriptor = FrameVisualDescriptor(
+            quality_score=0.8,
+            composition_score=0.8,
+            shot_scale=0.4,
+            shot_type=ShotType.MEDIUM,
+            face_count=1,
+            structure_embedding=(0.0,) * 96,
+            primary_face_bbox=(0.4, 0.2, 0.2, 0.3),
+            face_detector_backend="yunet",
+            primary_face_landmarks_xy=(
+                (0.44, 0.31),
+                (0.56, 0.31),
+                (0.50, 0.38),
+                (0.45, 0.44),
+                (0.55, 0.44),
+            ),
+        )
+
+        class Sampler:
+            instances: list["Sampler"] = []
+
+            def __init__(self, _path: Path, **_kwargs: object) -> None:
+                self.sface_times: list[float] = []
+                self.instances.append(self)
+
+            def feature_descriptor_at(  # type: ignore[no-untyped-def]
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                return descriptor
+
+            def sface_embedding_at(  # type: ignore[no-untyped-def]
+                self,
+                seconds: float,
+                _descriptor: FrameVisualDescriptor,
+            ) -> tuple[float, ...]:
+                self.sface_times.append(seconds)
+                return (1.0, 0.0)
+
+            def close(self) -> None:
+                pass
+
+        with patch("crosscut.visual_score._VideoSampler", Sampler):
+            build_visual_timeline(
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                canonical_spans=((1.0, 1.1),),
+                audio_offsets=(0.0, 0.0),
+                sync_scores=(0.9, 0.8),
+                scene_cut_times=((), ()),
+            )
+
+        middle_time = 1.05
+        self.assertEqual(len(Sampler.instances), 2)
+        for instance in Sampler.instances:
+            self.assertEqual(len(instance.sface_times), 2)
+            self.assertFalse(
+                any(
+                    abs(seconds - middle_time) < 1e-9
+                    for seconds in instance.sface_times
+                )
+            )
+
     def test_legacy_optional_cache_initialization_fallback_is_preserved(
         self,
     ) -> None:

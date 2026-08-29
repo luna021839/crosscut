@@ -135,15 +135,30 @@ class _DecodeEquivalentAnalyzerMigrationPath:
     edges: tuple[tuple[str, _DecodeEquivalentAnalyzerMigration], ...]
 
 
-# Alias-level AST v2 and the later direct-derived-cache sampler plumbing change
-# only the dependency fingerprint representation; the descriptor computation
-# and every decoded numeric feature are unchanged.  Every permitted forward
-# edge is enumerated with both complete analyzer identities below.  Reverse
-# directions and every unknown intermediate generation remain incompatible.
+# Alias-level AST v2, direct-derived-cache sampler plumbing, and lazy SFace
+# eligibility/midpoint removal change only dependency code outside persisted
+# descriptor numerics.  Descriptor computation and every decoded numeric
+# feature are unchanged.  Every permitted forward edge is enumerated with both
+# complete analyzer identities below.  Reverse directions and every unknown
+# intermediate generation remain incompatible.
 _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    "072871c33ea2610cd30f4210b7cc80a35e418ca7c563a4c10ce39ca2e5b52173": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "0e2da6dae7879dea7d529dc36b87f0f7d87184a07c3e06f4bec15b752dc5ca41"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "a2586f534c0ed3a8d7a018cec2a9cf0237598b9b4e51a3c0b84404d6cac0cdec"
+            ),
+            current_descriptor_digest=(
+                "512bf2d767f5ca035f986f0e4e7b4693bb93e5aff828308537e0d8d795204c1e"
+            ),
+        ),
+    ),
     "0e2da6dae7879dea7d529dc36b87f0f7d87184a07c3e06f4bec15b752dc5ca41": (
         _DecodeEquivalentAnalyzerMigration(
             legacy_analyzer_digest=(

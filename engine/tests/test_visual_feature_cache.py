@@ -52,8 +52,11 @@ _AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST = (
 _AUDITED_STRICT_CACHE_PREVIOUS_ANALYZER_DIGEST = (
     "eb2ead7937ad96cd7225e536b1527075258de9014be52c82ba8355dfa9e81b33"
 )
-_AUDITED_CURRENT_ANALYZER_DIGEST = (
+_AUDITED_SFACE_PREVIOUS_ANALYZER_DIGEST = (
     "0e2da6dae7879dea7d529dc36b87f0f7d87184a07c3e06f4bec15b752dc5ca41"
+)
+_AUDITED_CURRENT_ANALYZER_DIGEST = (
+    "072871c33ea2610cd30f4210b7cc80a35e418ca7c563a4c10ce39ca2e5b52173"
 )
 _AUDITED_LEGACY_DESCRIPTOR_DIGEST = (
     "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
@@ -67,8 +70,11 @@ _AUDITED_RUNTIME_PREVIOUS_DESCRIPTOR_DIGEST = (
 _AUDITED_STRICT_CACHE_PREVIOUS_DESCRIPTOR_DIGEST = (
     "d62354e350187d5e090d103858d15b3fcc95191703ab048178ca428ca7a6d186"
 )
-_AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
+_AUDITED_SFACE_PREVIOUS_DESCRIPTOR_DIGEST = (
     "a2586f534c0ed3a8d7a018cec2a9cf0237598b9b4e51a3c0b84404d6cac0cdec"
+)
+_AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
+    "512bf2d767f5ca035f986f0e4e7b4693bb93e5aff828308537e0d8d795204c1e"
 )
 
 
@@ -991,6 +997,11 @@ class VisualFeatureCacheTests(unittest.TestCase):
                     _AUDITED_STRICT_CACHE_PREVIOUS_DESCRIPTOR_DIGEST
                 )
             ),
+            "sface_previous": _analyzer_from_components(
+                _audited_analyzer_components(
+                    _AUDITED_SFACE_PREVIOUS_DESCRIPTOR_DIGEST
+                )
+            ),
             "current": _analyzer_from_components(
                 _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
             ),
@@ -1002,6 +1013,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
                 _AUDITED_PREVIOUS_ANALYZER_DIGEST,
                 _AUDITED_RUNTIME_PREVIOUS_ANALYZER_DIGEST,
                 _AUDITED_STRICT_CACHE_PREVIOUS_ANALYZER_DIGEST,
+                _AUDITED_SFACE_PREVIOUS_ANALYZER_DIGEST,
                 _AUDITED_CURRENT_ANALYZER_DIGEST,
             ],
         )
@@ -1019,6 +1031,17 @@ class VisualFeatureCacheTests(unittest.TestCase):
                     "older",
                     "nearest",
                     "strict_previous",
+                    "sface_previous",
+                ),
+                "sface_previous",
+            ),
+            (
+                (
+                    "oldest",
+                    "older",
+                    "nearest",
+                    "strict_previous",
+                    "sface_previous",
                     "current",
                 ),
                 "current",
@@ -1052,6 +1075,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
                     expected_legacy_order = tuple(
                         label
                         for label in (
+                            "sface_previous",
                             "strict_previous",
                             "nearest",
                             "older",

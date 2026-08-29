@@ -26,7 +26,7 @@ from typing import Any
 import cv2
 
 from .boundary_repair import BoundaryRepairConfig
-from .face_identity import cosine_similarity
+from .face_identity import cosine_similarity, sface_model_asset_status
 from .joint_timeline import (
     AuthorizedBoundaryOption,
     BOUNDARY_TRANSFORM_SUBJECT_BASES,
@@ -46,6 +46,10 @@ from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
 )
+from .source_scalar_cache import (
+    PersistentSourceScalarCache,
+    PersistentSourceScalarCacheStorageUnavailableError,
+)
 from .timeline import TimelineCandidate
 from .timewarp import TimeWarpMap
 from .visual_boundary_repair import (
@@ -59,6 +63,7 @@ from .visual_boundary_repair import (
     _stable_temporal_pose_choice,
     _visual_evidence,
 )
+from .visual_feature_cache import python_symbol_dependency_sha256
 from .visual_score import FrameVisualDescriptor, _VideoSampler, describe_frame
 
 
@@ -85,6 +90,11 @@ _BOUNDARY_MATERIALIZATION_LIMIT = 64
 _SEGMENT_MATERIALIZATION_LIMIT = 32
 _MEASUREMENT_AUDIT_LIMIT = 8
 _TRANSIENT_AUDIT_LIMIT = 32
+_SCALAR_BRIDGE_CACHE_NAMESPACE = "joint-bridge-disposition-v2"
+_SCALAR_BRIDGE_CACHE_CONTRACT = "joint-bridge-disposition-scalar-shard-v2"
+_SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD = 8 * (
+    1 + (8 - 1) * len(JOINT_BOUNDARY_FRAME_OFFSETS)
+) ** 2
 
 
 DescriptorProvider = Callable[[int, float], FrameVisualDescriptor | None]
@@ -100,6 +110,11 @@ TransformedDescriptorProvider = Callable[
     ],
     FrameVisualDescriptor | None,
 ]
+_ScalarBridgeEntry = tuple[bool, bool, bool, tuple[str, ...], float]
+
+
+class PersistentScalarBridgeCacheWriteError(RuntimeError):
+    """A scalar shard write failed while its direct root remained live."""
 
 
 def _sha256_json(value: object) -> str:
@@ -136,6 +151,22 @@ def _source_provenance(path: Path) -> dict[str, object]:
         "size": int(state.st_size),
         "mtime_ns": int(state.st_mtime_ns),
     }
+
+
+def _source_runtime_stat_identity(
+    path: Path,
+) -> tuple[int, int, int, int, int] | None:
+    try:
+        state = Path(path).resolve(strict=False).stat()
+    except OSError:
+        return None
+    return (
+        int(state.st_dev),
+        int(state.st_ino),
+        int(state.st_size),
+        int(state.st_mtime_ns),
+        int(state.st_ctime_ns),
+    )
 
 
 def _finite(value: object, name: str) -> float:
@@ -1010,6 +1041,9 @@ class DecodedBoundaryOptionProvider:
         self._source_provenance = tuple(
             _source_provenance(source) for source in self.sources
         )
+        self._source_runtime_stat_identities = tuple(
+            _source_runtime_stat_identity(source) for source in self.sources
+        )
         self._cache_source_indices = tuple(
             int(
                 _sha256_json(
@@ -1028,7 +1062,7 @@ class DecodedBoundaryOptionProvider:
         )
         self._samplers: dict[int, _VideoSampler] = {}
         self._face_identity_cache: OrderedDict[
-            tuple[int, float], tuple[float, ...]
+            tuple[int, object], tuple[float, ...]
         ] = OrderedDict()
         self._memo: OrderedDict[
             tuple[str, str, BoundaryMeasurementKey], BoundaryOptionSet
@@ -1134,6 +1168,23 @@ class DecodedBoundaryOptionProvider:
         self.scalar_bridge_descriptor_snapshot_miss_count = 0
         self.scalar_bridge_face_identity_snapshot_hit_count = 0
         self.scalar_bridge_face_identity_snapshot_miss_count = 0
+        self.scalar_bridge_persistent_cache_hit_count = 0
+        self.scalar_bridge_persistent_cache_miss_count = 0
+        self.scalar_bridge_persistent_cache_write_count = 0
+        self.scalar_bridge_persistent_cache_invalid_entry_count = 0
+        self._scalar_bridge_persistent_caches: dict[
+            int, PersistentSourceScalarCache
+        ] = {}
+        self._scalar_bridge_persistent_entries_by_segment: dict[
+            int, dict[str, _ScalarBridgeEntry]
+        ] = {}
+        self._scalar_bridge_persistent_cache_loaded_segments: set[int] = set()
+        self._scalar_bridge_persistent_analyzer_base: dict[
+            str, object
+        ] | None = None
+        self._scalar_bridge_candidate_sha256_cache: dict[
+            int, tuple[TimelineCandidate, str]
+        ] = {}
         self.selection_request_count = 0
         self.selection_materialization_count = 0
         self.selection_failure_count = 0
@@ -1266,6 +1317,15 @@ class DecodedBoundaryOptionProvider:
         self.scalar_bridge_descriptor_snapshot_miss_count = 0
         self.scalar_bridge_face_identity_snapshot_hit_count = 0
         self.scalar_bridge_face_identity_snapshot_miss_count = 0
+        self.scalar_bridge_persistent_cache_hit_count = 0
+        self.scalar_bridge_persistent_cache_miss_count = 0
+        self.scalar_bridge_persistent_cache_write_count = 0
+        self.scalar_bridge_persistent_cache_invalid_entry_count = 0
+        self._scalar_bridge_persistent_caches.clear()
+        self._scalar_bridge_persistent_entries_by_segment.clear()
+        self._scalar_bridge_persistent_cache_loaded_segments.clear()
+        self._scalar_bridge_persistent_analyzer_base = None
+        self._scalar_bridge_candidate_sha256_cache.clear()
         self.selection_request_count = 0
         self.selection_materialization_count = 0
         self.selection_failure_count = 0
@@ -1709,14 +1769,40 @@ class DecodedBoundaryOptionProvider:
         seconds: float,
         descriptor: FrameVisualDescriptor,
     ) -> tuple[float, ...]:
-        key = (source_index, round(float(seconds), 7))
+        if descriptor.primary_face_bbox is None:
+            return ()
+        production_backend = bool(
+            self._face_identity_provider is None
+            and self._descriptor_provider is None
+        )
+        if (
+            production_backend
+            and (
+                descriptor.face_detector_backend != "yunet"
+                or descriptor.primary_face_landmarks_xy is None
+                or len(descriptor.primary_face_landmarks_xy) != 5
+            )
+        ):
+            # The production SFace sampler would return empty evidence for
+            # this descriptor after decoding the frame.  Preserve that exact
+            # outcome without paying for a decode that cannot reach the model.
+            return ()
+        production_sampler = (
+            self._sampler(source_index) if production_backend else None
+        )
+        key = (
+            source_index,
+            (
+                production_sampler.frame_identity(seconds)
+                if production_sampler is not None
+                else round(float(seconds), 7)
+            ),
+        )
         cached = self._face_identity_cache.get(key)
         if cached is not None:
             self.face_identity_cache_hit_count += 1
             self._touch_lru(self._face_identity_cache, key)
             return cached
-        if descriptor.primary_face_bbox is None:
-            return ()
         self.face_identity_model_call_count += 1
         if self._face_identity_provider is not None:
             identity = tuple(
@@ -1728,8 +1814,9 @@ class DecodedBoundaryOptionProvider:
                 )
             )
         elif self._descriptor_provider is None:
+            assert production_sampler is not None
             identity = tuple(
-                self._sampler(source_index).sface_embedding_at(
+                production_sampler.sface_embedding_at(
                     seconds,
                     descriptor,
                 )
@@ -4233,6 +4320,332 @@ class DecodedBoundaryOptionProvider:
             self._bridge_transform_semantic_state(exit_transform),
         )
 
+    def _scalar_bridge_request_sha256(
+        self,
+        request: SegmentBridgeDispositionRequest,
+    ) -> str:
+        """Bind a persisted scalar to every input that can change its gates."""
+
+        candidate = request.candidate
+        entry_option = request.entry_option
+        exit_option = request.exit_option
+        start_master_seconds = (
+            candidate.start_seconds
+            + entry_option.frame_offset / self.output_fps
+        )
+        end_master_seconds = (
+            candidate.end_seconds
+            + exit_option.frame_offset / self.output_fps
+        )
+
+        def renderer_state(
+            transform: BoundaryTransformState,
+        ) -> dict[str, object]:
+            return {
+                "crop_xywh": (
+                    list(transform.crop_xywh)
+                    if transform.crop_xywh is not None
+                    else None
+                ),
+                "rotation_degrees": float(transform.rotation_degrees),
+                "track_id": transform.track_id,
+                "subject_basis": transform.subject_basis,
+            }
+
+        candidate_cache_key = id(candidate)
+        cached_candidate = self._scalar_bridge_candidate_sha256_cache.get(
+            candidate_cache_key
+        )
+        candidate_sha256 = (
+            cached_candidate[1]
+            if cached_candidate is not None
+            and cached_candidate[0] is candidate
+            else None
+        )
+        if candidate_sha256 is None:
+            candidate_sha256 = _candidate_private_state_sha256(candidate)
+            self._scalar_bridge_candidate_sha256_cache[candidate_cache_key] = (
+                candidate,
+                candidate_sha256,
+            )
+        return _sha256_json(
+            {
+                "contract": _SCALAR_BRIDGE_CACHE_CONTRACT,
+                "provider_configuration_sha256": self._configuration_identity,
+                "candidate_private_state_sha256": candidate_sha256,
+                "source_index": self._source_index(candidate.source_id),
+                "start_master_seconds": float(start_master_seconds),
+                "end_master_seconds": float(end_master_seconds),
+                "duration_frames": float(request.duration_frames),
+                "entry_renderer_state": renderer_state(
+                    entry_option.incoming_transform
+                ),
+                "exit_renderer_state": renderer_state(
+                    exit_option.outgoing_transform
+                ),
+            }
+        )
+
+    @staticmethod
+    def _decode_persisted_scalar_bridge_entry(
+        value: object,
+    ) -> tuple[bool, bool, bool, tuple[str, ...], float] | None:
+        if not isinstance(value, list) or len(value) != 5:
+            return None
+        evidence_complete, crop_compatible, track_compatible, raw_codes, score = (
+            value
+        )
+        if not all(
+            type(item) is bool
+            for item in (
+                evidence_complete,
+                crop_compatible,
+                track_compatible,
+            )
+        ):
+            return None
+        # Incomplete evidence can be caused by a transient descriptor/model
+        # failure.  It must be recomputed on the next run instead of becoming
+        # a durable rejection in the direct scalar cache.
+        if not evidence_complete:
+            return None
+        if not isinstance(raw_codes, list) or any(
+            not isinstance(item, str) or not item or item != item.strip()
+            for item in raw_codes
+        ):
+            return None
+        codes = tuple(raw_codes)
+        if codes != tuple(sorted(set(codes))):
+            return None
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+            or float(score) > 0.0
+        ):
+            return None
+        authorized = bool(
+            evidence_complete and crop_compatible and track_compatible
+        )
+        if (authorized and codes) or (not authorized and not codes):
+            return None
+        return (
+            evidence_complete,
+            crop_compatible,
+            track_compatible,
+            codes,
+            float(score),
+        )
+
+    def _scalar_bridge_analyzer_base(self) -> dict[str, object]:
+        cached = self._scalar_bridge_persistent_analyzer_base
+        if cached is not None:
+            return dict(cached)
+        source_sha256s: list[str] = []
+        analyzer_sha256s: list[str] = []
+        for source_index in range(len(self.sources)):
+            sampler = self._sampler(source_index)
+            persistent = sampler.persistent_feature_cache
+            if persistent is None:  # pragma: no cover - required invariant
+                raise PersistentSourceScalarCacheStorageUnavailableError(
+                    "required direct source scalar cache storage is unavailable"
+                )
+            source_sha256s.append(str(persistent.source_sha256))
+            analyzer_sha256s.append(str(persistent.analyzer.digest))
+        appearance_model = sface_model_asset_status()
+        cached = {
+            "analysis_contract": _SCALAR_BRIDGE_CACHE_CONTRACT,
+            "provider_configuration_sha256": self._configuration_identity,
+            "source_content_sha256s": source_sha256s,
+            "visual_analyzer_sha256s": analyzer_sha256s,
+            "maximum_entries_per_segment_shard": (
+                _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD
+            ),
+            "implementation_sha256": {
+                "provider_class_ast": python_symbol_dependency_sha256(
+                    Path(__file__),
+                    root_symbols=("DecodedBoundaryOptionProvider",),
+                ),
+                "face_vector_ast": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("face_identity.py"),
+                    root_symbols=(
+                        "extract_sface_embedding",
+                        "cosine_similarity",
+                    ),
+                ),
+                "timewarp_map_ast": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("timewarp.py"),
+                    root_symbols=("TimeWarpMap",),
+                ),
+                "editorial_transform_track_ast": (
+                    python_symbol_dependency_sha256(
+                        Path(__file__).with_name("render.py"),
+                        root_symbols=(
+                            "EditorialTransformKeyframe",
+                            "EditorialTransformTrack",
+                        ),
+                    )
+                ),
+            },
+            "appearance_model_asset": {
+                "name": appearance_model.name,
+                "expected_sha256": appearance_model.expected_sha256,
+                "actual_sha256": appearance_model.actual_sha256,
+                "present": appearance_model.present,
+                "digest_valid": appearance_model.digest_valid,
+            },
+        }
+        self._scalar_bridge_persistent_analyzer_base = cached
+        return dict(cached)
+
+    def _decode_scalar_bridge_shard_payload(
+        self,
+        payload: Mapping[str, object] | None,
+        *,
+        segment_index: int,
+    ) -> dict[str, _ScalarBridgeEntry]:
+        if payload is None:
+            return {}
+        if (
+            payload.get("contract") != _SCALAR_BRIDGE_CACHE_CONTRACT
+            or payload.get("provider_configuration_sha256")
+            != self._configuration_identity
+            or payload.get("segment_index") != segment_index
+            or not isinstance(payload.get("entries"), dict)
+        ):
+            self.scalar_bridge_persistent_cache_invalid_entry_count += 1
+            return {}
+        entries = payload["entries"]
+        assert isinstance(entries, dict)
+        decoded_entries: dict[str, _ScalarBridgeEntry] = {}
+        for raw_key, raw_value in entries.items():
+            if (
+                not isinstance(raw_key, str)
+                or len(raw_key) != 64
+                or any(character not in "0123456789abcdef" for character in raw_key)
+            ):
+                self.scalar_bridge_persistent_cache_invalid_entry_count += 1
+                continue
+            decoded = self._decode_persisted_scalar_bridge_entry(raw_value)
+            if decoded is None:
+                self.scalar_bridge_persistent_cache_invalid_entry_count += 1
+                continue
+            decoded_entries[raw_key] = decoded
+        return decoded_entries
+
+    def _load_scalar_bridge_persistent_cache(self, segment_index: int) -> None:
+        """Lazily load one bounded, path-free middle-segment scalar shard."""
+
+        if segment_index in self._scalar_bridge_persistent_cache_loaded_segments:
+            self._assert_scalar_bridge_sources_unchanged()
+            self._scalar_bridge_persistent_caches[
+                segment_index
+            ].assert_storage_root_available()
+            return
+        if not (
+            self.require_persistent_feature_cache
+            and self.feature_derived_cache_directory is not None
+        ):
+            return
+        if not 1 <= segment_index < self.total_segment_count - 1:
+            raise ValueError("scalar bridge shard segment index is invalid")
+        self._assert_scalar_bridge_sources_unchanged()
+        direct_root = self.feature_derived_cache_directory
+        assert direct_root is not None
+        cache = PersistentSourceScalarCache(
+            source_cache_directory=direct_root,
+            source_path=self.sources[0],
+            namespace=_SCALAR_BRIDGE_CACHE_NAMESPACE,
+            analyzer={
+                **self._scalar_bridge_analyzer_base(),
+                "segment_index": segment_index,
+            },
+            derived_cache_directory=direct_root,
+        )
+        payload = cache.get()
+        self._scalar_bridge_persistent_caches[segment_index] = cache
+        self._scalar_bridge_persistent_cache_loaded_segments.add(segment_index)
+        self._scalar_bridge_persistent_entries_by_segment[segment_index] = (
+            self._decode_scalar_bridge_shard_payload(
+                payload,
+                segment_index=segment_index,
+            )
+        )
+
+    def _assert_scalar_bridge_sources_unchanged(self) -> None:
+        current = tuple(
+            _source_runtime_stat_identity(source) for source in self.sources
+        )
+        if current != self._source_runtime_stat_identities:
+            raise RuntimeError(
+                "joint scalar bridge source changed during selection"
+            )
+
+    def _commit_scalar_bridge_persistent_cache(
+        self,
+        segment_index: int,
+        new_entries: Mapping[str, _ScalarBridgeEntry],
+    ) -> None:
+        cache = self._scalar_bridge_persistent_caches.get(segment_index)
+        if cache is None:
+            return
+        self._assert_scalar_bridge_sources_unchanged()
+        cache.assert_storage_root_available()
+        latest_entries = self._decode_scalar_bridge_shard_payload(
+            cache.get(),
+            segment_index=segment_index,
+        )
+        merged_entries = {
+            **latest_entries,
+            **self._scalar_bridge_persistent_entries_by_segment.get(
+                segment_index,
+                {},
+            ),
+            **new_entries,
+        }
+        bounded_entries = {
+            key: merged_entries[key]
+            for key in sorted(merged_entries)[
+                :_SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD
+            ]
+        }
+        entries = {
+            key: [
+                evidence_complete,
+                crop_compatible,
+                track_compatible,
+                list(failure_codes),
+                score_adjustment,
+            ]
+            for key, (
+                evidence_complete,
+                crop_compatible,
+                track_compatible,
+                failure_codes,
+                score_adjustment,
+            ) in sorted(bounded_entries.items())
+        }
+        if not cache.put(
+            {
+                "contract": _SCALAR_BRIDGE_CACHE_CONTRACT,
+                "provider_configuration_sha256": self._configuration_identity,
+                "segment_index": segment_index,
+                "entries": entries,
+                "media_artifacts_persisted": False,
+                "biometric_model_vectors_persisted": False,
+                "local_paths_persisted": False,
+            }
+        ):
+            self._assert_scalar_bridge_sources_unchanged()
+            cache.assert_storage_root_available()
+            raise PersistentScalarBridgeCacheWriteError(
+                "required persistent scalar bridge cache write failed"
+            )
+        self._scalar_bridge_persistent_entries_by_segment[segment_index] = (
+            bounded_entries
+        )
+        self.scalar_bridge_persistent_cache_write_count += 1
+
     def _transform_path_scalar_disposition(
         self,
         *,
@@ -4454,6 +4867,13 @@ class DecodedBoundaryOptionProvider:
                 if bbox is not None
                 else None
             )
+            if coverage is not None and coverage < 0.95 - _EPSILON:
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_subject_exits_crop_track",),
+                )
             face_identity: tuple[float, ...] = ()
             similarity_to_anchor: float | None = None
             similarity_to_previous: float | None = None
@@ -4476,13 +4896,6 @@ class DecodedBoundaryOptionProvider:
                         previous_face_identity,
                         face_identity,
                     )
-            if coverage is not None and coverage < 0.95 - _EPSILON:
-                return outcome(
-                    evidence_complete=True,
-                    crop_compatible=False,
-                    track_compatible=True,
-                    failure_codes=("segment_subject_exits_crop_track",),
-                )
             if subject_basis == "dominant_face" and (
                 not face_identity
                 or similarity_to_anchor is None
@@ -4593,6 +5006,10 @@ class DecodedBoundaryOptionProvider:
                 for request in requests
             )
         )
+        for segment_index in dict.fromkeys(
+            request.candidate.segment_index for request in requests
+        ):
+            self._load_scalar_bridge_persistent_cache(segment_index)
         journal: list[
             tuple[MutableMapping[Any, Any], Any, bool, Any]
         ] = []
@@ -4703,7 +5120,52 @@ class DecodedBoundaryOptionProvider:
         self._active_descriptor_cache_transaction = descriptor_cache_transaction
         try:
             dispositions: list[SegmentBridgeDisposition] = []
+            new_persistent_entries_by_segment: dict[
+                int, dict[str, _ScalarBridgeEntry]
+            ] = {}
             for request in requests:
+                segment_index = request.candidate.segment_index
+                persistent_cache = self._scalar_bridge_persistent_caches.get(
+                    segment_index
+                )
+                persistent_entries = (
+                    self._scalar_bridge_persistent_entries_by_segment.get(
+                        segment_index,
+                        {},
+                    )
+                )
+                persistent_key = (
+                    self._scalar_bridge_request_sha256(request)
+                    if persistent_cache is not None
+                    else None
+                )
+                persisted = (
+                    persistent_entries.get(persistent_key)
+                    if persistent_key is not None
+                    else None
+                )
+                if persisted is not None:
+                    self.scalar_bridge_persistent_cache_hit_count += 1
+                    (
+                        evidence_complete,
+                        crop_compatible,
+                        track_compatible,
+                        failure_codes,
+                        score_adjustment,
+                    ) = persisted
+                    dispositions.append(
+                        SegmentBridgeDisposition(
+                            request=request,
+                            evidence_complete=evidence_complete,
+                            crop_compatible=crop_compatible,
+                            track_compatible=track_compatible,
+                            failure_codes=failure_codes,
+                            score_adjustment=score_adjustment,
+                        )
+                    )
+                    continue
+                if persistent_cache is not None:
+                    self.scalar_bridge_persistent_cache_miss_count += 1
                 candidate = request.candidate
                 entry_option = request.entry_option
                 exit_option = request.exit_option
@@ -4731,6 +5193,17 @@ class DecodedBoundaryOptionProvider:
                     descriptor_resolver=resolve_descriptor,
                     face_identity_resolver=resolve_face_identity,
                 )
+                if persistent_key is not None and evidence_complete:
+                    new_persistent_entries_by_segment.setdefault(
+                        segment_index,
+                        {},
+                    )[persistent_key] = (
+                        evidence_complete,
+                        crop_compatible,
+                        track_compatible,
+                        failure_codes,
+                        score_adjustment,
+                    )
                 dispositions.append(
                     SegmentBridgeDisposition(
                         request=request,
@@ -4748,6 +5221,13 @@ class DecodedBoundaryOptionProvider:
             ):
                 raise RuntimeError(
                     "bridge disposition batch lost exact request identities"
+                )
+            for segment_index, new_persistent_entries in sorted(
+                new_persistent_entries_by_segment.items()
+            ):
+                self._commit_scalar_bridge_persistent_cache(
+                    segment_index,
+                    new_persistent_entries,
                 )
             self.descriptor_cache.commit_transaction(
                 descriptor_cache_transaction
@@ -5823,6 +6303,91 @@ class DecodedBoundaryOptionProvider:
             "paths_persisted": False,
         }
 
+    def _persistent_scalar_bridge_cache_audit(self) -> dict[str, object]:
+        storage_records = tuple(
+            diagnostics
+            for cache in self._scalar_bridge_persistent_caches.values()
+            for diagnostics in (cache.diagnostics(),)
+            if isinstance(diagnostics, Mapping)
+        )
+        storage = (
+            {
+                "shard_count": len(self._scalar_bridge_persistent_caches),
+                "hit_count": sum(
+                    int(item.get("hit_count", 0)) for item in storage_records
+                ),
+                "miss_count": sum(
+                    int(item.get("miss_count", 0)) for item in storage_records
+                ),
+                "write_count": sum(
+                    int(item.get("write_count", 0)) for item in storage_records
+                ),
+                "invalid_record_count": sum(
+                    int(item.get("invalid_record_count", 0))
+                    for item in storage_records
+                ),
+                "storage_io_failure_count": sum(
+                    int(item.get("storage_io_failure_count", 0))
+                    for item in storage_records
+                ),
+                "required": bool(storage_records)
+                and all(bool(item.get("required")) for item in storage_records),
+                "local_paths_exposed": False,
+                "raw_media_persisted": False,
+            }
+            if self._scalar_bridge_persistent_caches
+            else None
+        )
+        return {
+            "contract": _SCALAR_BRIDGE_CACHE_CONTRACT,
+            "configured": bool(
+                self.require_persistent_feature_cache
+                and self.feature_derived_cache_directory is not None
+            ),
+            "required": bool(
+                self.require_persistent_feature_cache
+                and self.feature_derived_cache_directory is not None
+            ),
+            "loaded": bool(
+                self._scalar_bridge_persistent_cache_loaded_segments
+            ),
+            "loaded_shard_count": len(
+                self._scalar_bridge_persistent_cache_loaded_segments
+            ),
+            "entry_count": sum(
+                len(entries)
+                for entries in (
+                    self._scalar_bridge_persistent_entries_by_segment.values()
+                )
+            ),
+            "maximum_entries_per_shard": (
+                _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD
+            ),
+            "request_hit_count": (
+                self.scalar_bridge_persistent_cache_hit_count
+            ),
+            "request_miss_count": (
+                self.scalar_bridge_persistent_cache_miss_count
+            ),
+            "atomic_write_count": (
+                self.scalar_bridge_persistent_cache_write_count
+            ),
+            "invalid_entry_count": (
+                self.scalar_bridge_persistent_cache_invalid_entry_count
+            ),
+            "storage": storage,
+            "source_content_bound": True,
+            "provider_configuration_bound": True,
+            "visual_analyzer_bound": True,
+            "request_private_state_bound": True,
+            "middle_segment_sharded": True,
+            "legacy_unsharded_records_reused": False,
+            "evidence_incomplete_results_persisted": False,
+            "raw_frames_persisted": False,
+            "biometric_model_vectors_persisted": False,
+            "local_paths_persisted": False,
+        }
+
     def to_dict(self) -> dict[str, object]:
         records = tuple(
             sorted(
@@ -5905,6 +6470,9 @@ class DecodedBoundaryOptionProvider:
                 ),
                 "face_identity_snapshot_miss_count": (
                     self.scalar_bridge_face_identity_snapshot_miss_count
+                ),
+                "persistent_scalar_cache": (
+                    self._persistent_scalar_bridge_cache_audit()
                 ),
                 "scalar_evidence_only": True,
                 "proof_identities_created": False,
@@ -6073,6 +6641,7 @@ __all__ = [
     "FaceIdentityProvider",
     "JointSelectionMaterializationProof",
     "JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS",
+    "PersistentScalarBridgeCacheWriteError",
     "SegmentTransformPathMaterializationProof",
     "SegmentTransformPathSample",
     "TransformedDescriptorProvider",

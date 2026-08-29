@@ -1033,6 +1033,31 @@ class _Extension:
     bridge_evidence: _SharedBridgeEvidence | None
 
 
+@dataclass(frozen=True, slots=True)
+class _JointNodeStream:
+    """One score-shifted predecessor bucket entering the same joint state.
+
+    Every predecessor in ``previous_nodes`` receives the same emission,
+    transition, boundary option, and bridge evidence.  The predecessor bucket
+    is already ranked, so this is a sorted stream.  Keeping only the best
+    ``K`` stream heads is exact: a discarded stream's later entries can never
+    outrank its own discarded head, while the retained heads already provide
+    ``K`` candidates at least as good.
+    """
+
+    previous_nodes: tuple[_JointNode, ...] = field(repr=False)
+    state: _JointState
+    candidate: TimelineCandidate = field(repr=False)
+    emission_score: float
+    transition_score: float
+    used_fallback: bool
+    entering_boundary_option: AuthorizedBoundaryOption = field(repr=False)
+    bridge_evidence_for_previous_segment: _SharedBridgeEvidence | None = field(
+        repr=False,
+    )
+    path_tail: tuple[tuple[str, ...], tuple[str, ...]] = field(repr=False)
+
+
 def _renderer_semantic_state(
     transform: BoundaryTransformState,
 ) -> _RendererSemanticState:
@@ -1100,46 +1125,129 @@ def _candidate_signature(candidate: TimelineCandidate) -> tuple[str, ...]:
     )
 
 
-def _extended_path_signature(
-    previous: tuple[tuple[str, ...], ...],
-    option: AuthorizedBoundaryOption,
-    candidate: TimelineCandidate,
-) -> tuple[tuple[str, ...], ...]:
-    return previous + (
-        (
-            "boundary",
-            str(option.measurement_key.boundary_index),
-            option.proof_identity,
-            str(option.frame_offset),
-        ),
-        _candidate_signature(candidate),
-    )
-
-
 def _node_rank_key(node: _JointNode) -> tuple[object, ...]:
     return (
         -node.cumulative_score,
         _state_sort_key(node.state),
         node.path_signature,
     )
+def _joint_node_stream_rank_key(
+    stream: _JointNodeStream,
+    previous_node: _JointNode,
+) -> tuple[object, ...]:
+    """Rank one lazy stream entry exactly like its materialized joint node.
+
+    All paths at a DP layer have the same prefix length.  Comparing the
+    predecessor signature first and the two appended records second is
+    therefore identical to comparing the concatenated path signature, without
+    allocating that growing tuple for every explored predecessor.
+    """
+
+    return (
+        -(
+            previous_node.cumulative_score
+            + stream.transition_score
+            + stream.emission_score
+        ),
+        previous_node.path_signature,
+        stream.path_tail,
+    )
 
 
-def _retain_ranked_node(
-    bucket: list[_JointNode],
-    node: _JointNode,
+def _retain_ranked_node_stream(
+    bucket: list[_JointNodeStream],
+    stream: _JointNodeStream,
     *,
     maximum_results: int,
 ) -> None:
-    for index, existing in enumerate(bucket):
-        if existing.path_signature != node.path_signature:
-            continue
-        if node.cumulative_score > existing.cumulative_score + 1e-12:
-            bucket[index] = node
-        break
-    else:
-        bucket.append(node)
-    bucket.sort(key=_node_rank_key)
+    """Retain only stream heads that can contribute to an exact top-K."""
+
+    stream_key = _joint_node_stream_rank_key(
+        stream,
+        stream.previous_nodes[0],
+    )
+    if len(bucket) >= maximum_results:
+        worst = bucket[-1]
+        worst_key = _joint_node_stream_rank_key(
+            worst,
+            worst.previous_nodes[0],
+        )
+        if stream_key >= worst_key:
+            return
+    insertion_index = 0
+    while insertion_index < len(bucket):
+        existing = bucket[insertion_index]
+        existing_key = _joint_node_stream_rank_key(
+            existing,
+            existing.previous_nodes[0],
+        )
+        if stream_key < existing_key:
+            break
+        insertion_index += 1
+    bucket.insert(insertion_index, stream)
     del bucket[maximum_results:]
+
+
+def _materialize_ranked_node_streams(
+    streams: Sequence[_JointNodeStream],
+    *,
+    maximum_results: int,
+) -> list[_JointNode]:
+    """Merge at most ``K`` sorted predecessor streams into exact top-K nodes."""
+
+    active = tuple(streams)
+    positions = [0] * len(active)
+    retained: list[_JointNode] = []
+    signatures: set[tuple[tuple[str, ...], ...]] = set()
+    while len(retained) < maximum_results:
+        available = tuple(
+            index
+            for index, stream in enumerate(active)
+            if positions[index] < len(stream.previous_nodes)
+        )
+        if not available:
+            break
+        stream_index = min(
+            available,
+            key=lambda index: (
+                _joint_node_stream_rank_key(
+                    active[index],
+                    active[index].previous_nodes[positions[index]],
+                ),
+                index,
+            ),
+        )
+        stream = active[stream_index]
+        previous_node = stream.previous_nodes[positions[stream_index]]
+        positions[stream_index] += 1
+        signature = previous_node.path_signature + stream.path_tail
+        if signature in signatures:
+            continue
+        signatures.add(signature)
+        retained.append(
+            _JointNode(
+                state=stream.state,
+                candidate=stream.candidate,
+                cumulative_score=(
+                    previous_node.cumulative_score
+                    + stream.transition_score
+                    + stream.emission_score
+                ),
+                previous_node=previous_node,
+                emission_score=stream.emission_score,
+                transition_score=stream.transition_score,
+                used_fallback=stream.used_fallback,
+                entering_boundary_option=(
+                    stream.entering_boundary_option
+                ),
+                bridge_evidence_for_previous_segment=(
+                    stream.bridge_evidence_for_previous_segment
+                ),
+                path_signature=signature,
+            )
+        )
+    retained.sort(key=_node_rank_key)
+    return retained
 
 
 def _resolve_mode_and_target(
@@ -1291,6 +1399,16 @@ def _select_joint_timeline_candidates_core(
         raise TypeError("config must be a TimelineConfig")
     timeline_mode, target = _resolve_mode_and_target(mode, target_member)
     segments = _normalise_segments(candidates_by_segment)
+    unique_candidate_path_components = all(
+        len(
+            {
+                _candidate_signature(candidate)
+                for candidate in segment
+            }
+        )
+        == len(segment)
+        for segment in segments
+    )
     no_goods = compile_timeline_no_good_constraint_index(
         segments,
         forbidden_boundary_edges,
@@ -1424,8 +1542,28 @@ def _select_joint_timeline_candidates_core(
             ),
         )
     option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+    # One immutable authorized option can be reached from many renderer and
+    # cadence states.  Its visual transition decision depends only on the
+    # option's exact scoring candidates and the incoming shot-run length.
+    # Cache by process-local option identity while the owning option set stays
+    # live in ``option_cache`` for the entire selection.
+    transition_cache: dict[
+        tuple[int, int],
+        tuple[float, int] | None,
+    ] = {}
     semantic_bridge_cache: dict[
         _BridgeSemanticKey,
+        _SharedBridgeEvidence,
+    ] = {}
+    semantic_bridge_fast_cache: dict[
+        tuple[
+            int,
+            float,
+            float,
+            float,
+            _RendererSemanticState,
+            _RendererSemanticState,
+        ],
         _SharedBridgeEvidence,
     ] = {}
     selected_exact_bridge_cache: dict[
@@ -1481,6 +1619,22 @@ def _select_joint_timeline_candidates_core(
         option_cache[key] = measured
         return measured
 
+    def locate_transition(
+        option: AuthorizedBoundaryOption,
+        shot_run: int,
+    ) -> tuple[float, int] | None:
+        cache_key = (id(option), shot_run)
+        if cache_key not in transition_cache:
+            assert option.scoring_outgoing is not None
+            assert option.scoring_incoming is not None
+            transition_cache[cache_key] = _transition_score(
+                option.scoring_outgoing,
+                option.scoring_incoming,
+                shot_run,
+                settings,
+            )
+        return transition_cache[cache_key]
+
     def call_bridge_provider(
         candidate: TimelineCandidate,
         entry_option: AuthorizedBoundaryOption,
@@ -1532,12 +1686,68 @@ def _select_joint_timeline_candidates_core(
             ),
         )
 
+    def bridge_semantic_fast_key(
+        candidate: TimelineCandidate,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> tuple[
+        int,
+        float,
+        float,
+        float,
+        _RendererSemanticState,
+        _RendererSemanticState,
+    ]:
+        """Use live object identity to avoid repeatedly hashing embeddings.
+
+        Every candidate object is owned by ``segments`` for this call, so its
+        identity cannot be recycled while the cache is live.  The remaining
+        fields are the complete renderer-semantic bridge state; proof identity
+        is intentionally excluded exactly as in ``_BridgeSemanticKey``.
+        """
+
+        return (
+            id(candidate),
+            candidate.start_seconds
+            + entry_option.frame_offset / resolved_fps,
+            candidate.end_seconds
+            + exit_option.frame_offset / resolved_fps,
+            duration_frames,
+            _renderer_semantic_state(entry_option.incoming_transform),
+            _renderer_semantic_state(exit_option.outgoing_transform),
+        )
+
+    def cache_fast_bridge_evidence(
+        evidence: _SharedBridgeEvidence,
+    ) -> None:
+        semantic_key = evidence.semantic_key
+        semantic_bridge_fast_cache[
+            (
+                id(semantic_key.candidate),
+                semantic_key.start_master_seconds,
+                semantic_key.end_master_seconds,
+                semantic_key.duration_frames,
+                semantic_key.entry_renderer_state,
+                semantic_key.exit_renderer_state,
+            )
+        ] = evidence
+
     def locate_bridge_evidence(
         candidate: TimelineCandidate,
         entry_option: AuthorizedBoundaryOption,
         exit_option: AuthorizedBoundaryOption,
         duration_frames: float,
     ) -> _SharedBridgeEvidence:
+        fast_key = bridge_semantic_fast_key(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        fast_cached = semantic_bridge_fast_cache.get(fast_key)
+        if fast_cached is not None:
+            return fast_cached
         semantic_key = bridge_semantic_key(
             candidate,
             entry_option,
@@ -1546,11 +1756,13 @@ def _select_joint_timeline_candidates_core(
         )
         cached = semantic_bridge_cache.get(semantic_key)
         if cached is not None:
+            semantic_bridge_fast_cache[fast_key] = cached
             return cached
         if shared_bridge_evidence_cache is not None:
             shared = shared_bridge_evidence_cache._locate(semantic_key)
             if shared is not None:
                 semantic_bridge_cache[semantic_key] = shared
+                semantic_bridge_fast_cache[fast_key] = shared
                 return shared
         if bridge_disposition_batch_provider is not None:
             raise RuntimeError(
@@ -1571,6 +1783,7 @@ def _select_joint_timeline_candidates_core(
             score_adjustment=proof.score_adjustment,
         )
         semantic_bridge_cache[semantic_key] = evidence
+        semantic_bridge_fast_cache[fast_key] = evidence
         if shared_bridge_evidence_cache is not None:
             shared_bridge_evidence_cache._admit(evidence)
         return evidence
@@ -1578,7 +1791,7 @@ def _select_joint_timeline_candidates_core(
     def prime_bridge_evidence_for_layer(
         segment_position: int,
         frontier: Mapping[_JointState, Sequence[_JointNode]],
-    ) -> None:
+    ) -> dict[_JointState, AuthorizedBoundaryOption]:
         """Batch every first-seen semantic bridge request for one DP layer.
 
         This deterministic prepass mirrors every cheap gate before the replay's
@@ -1589,27 +1802,28 @@ def _select_joint_timeline_candidates_core(
 
         nonlocal bridge_disposition_batch_call_count
         nonlocal bridge_disposition_batch_request_count
-        if bridge_disposition_batch_provider is None or segment_position < 2:
-            return
+        if segment_position < 2:
+            return {}
         previous_segment = segments[segment_position - 1]
         current_segment = segments[segment_position]
-        shared_hits: dict[_BridgeSemanticKey, _SharedBridgeEvidence] = {}
-        deferred_shared_hit_count = 0
-        deferred_shared_miss_count = 0
-        pending: dict[
-            _BridgeSemanticKey,
-            SegmentBridgeDispositionRequest,
+        representative_entry_options: dict[
+            _JointState,
+            AuthorizedBoundaryOption,
+        ] = {}
+        bridge_groups: dict[
+            tuple[
+                int,
+                int,
+                int,
+                _RendererSemanticState,
+            ],
+            tuple[_JointState, AuthorizedBoundaryOption],
         ] = {}
         for previous_state, previous_nodes in sorted(
             frontier.items(),
             key=lambda item: _state_sort_key(item[0]),
         ):
-            previous_candidate = previous_segment[
-                previous_state.candidate_index
-            ]
-            ranked_previous_nodes = tuple(
-                sorted(previous_nodes, key=_node_rank_key)
-            )
+            ranked_previous_nodes = tuple(previous_nodes)
             expected_entry_state = previous_state.endpoint_renderer_state
             expected_entry_offset = previous_state.previous_boundary_offset
             if expected_entry_state is None or expected_entry_offset is None:
@@ -1636,6 +1850,34 @@ def _select_joint_timeline_candidates_core(
                 ranked_previous_nodes[0].entering_boundary_option
             )
             assert representative_entry_option is not None
+            representative_entry_options[previous_state] = (
+                representative_entry_option
+            )
+            bridge_groups.setdefault(
+                (
+                    previous_state.candidate_index,
+                    previous_state.shot_run,
+                    expected_entry_offset,
+                    expected_entry_state,
+                ),
+                (previous_state, representative_entry_option),
+            )
+        if bridge_disposition_batch_provider is None:
+            return representative_entry_options
+        shared_hits: dict[_BridgeSemanticKey, _SharedBridgeEvidence] = {}
+        deferred_shared_hit_count = 0
+        deferred_shared_miss_count = 0
+        pending: dict[
+            _BridgeSemanticKey,
+            SegmentBridgeDispositionRequest,
+        ] = {}
+        for previous_state, representative_entry_option in sorted(
+            bridge_groups.values(),
+            key=lambda item: _state_sort_key(item[0]),
+        ):
+            previous_candidate = previous_segment[
+                previous_state.candidate_index
+            ]
             for current_index in emissions[segment_position]:
                 current_candidate = current_segment[current_index]
                 if no_goods and build_timeline_no_good_edge_key(
@@ -1663,13 +1905,9 @@ def _select_joint_timeline_candidates_core(
                         < MINIMUM_JOINT_SEGMENT_DURATION_FRAMES - 1e-9
                     ):
                         continue
-                    assert option.scoring_outgoing is not None
-                    assert option.scoring_incoming is not None
-                    if _transition_score(
-                        option.scoring_outgoing,
-                        option.scoring_incoming,
+                    if locate_transition(
+                        option,
                         previous_state.shot_run,
-                        settings,
                     ) is None:
                         continue
                     duration_frames = (
@@ -1681,6 +1919,14 @@ def _select_joint_timeline_candidates_core(
                         duration_frames
                         < MINIMUM_JOINT_SEGMENT_DURATION_FRAMES - 1e-9
                     ):
+                        continue
+                    fast_key = bridge_semantic_fast_key(
+                        previous_candidate,
+                        representative_entry_option,
+                        option,
+                        duration_frames,
+                    )
+                    if fast_key in semantic_bridge_fast_cache:
                         continue
                     semantic_key = bridge_semantic_key(
                         previous_candidate,
@@ -1711,12 +1957,14 @@ def _select_joint_timeline_candidates_core(
                     )
         if not pending:
             semantic_bridge_cache.update(shared_hits)
+            for evidence in shared_hits.values():
+                cache_fast_bridge_evidence(evidence)
             if shared_bridge_evidence_cache is not None:
                 shared_bridge_evidence_cache._record_lookups(
                     hit_count=deferred_shared_hit_count,
                     miss_count=deferred_shared_miss_count,
                 )
-            return
+            return representative_entry_options
 
         requests = tuple(pending.values())
         dispositions = bridge_disposition_batch_provider(requests)
@@ -1762,6 +2010,8 @@ def _select_joint_timeline_candidates_core(
         bridge_disposition_batch_call_count += 1
         bridge_disposition_batch_request_count += len(requests)
         semantic_bridge_cache.update(shared_hits)
+        for evidence in shared_hits.values():
+            cache_fast_bridge_evidence(evidence)
         if shared_bridge_evidence_cache is not None:
             shared_bridge_evidence_cache._record_lookups(
                 hit_count=deferred_shared_hit_count,
@@ -1769,8 +2019,10 @@ def _select_joint_timeline_candidates_core(
             )
         for semantic_key, evidence in validated:
             semantic_bridge_cache[semantic_key] = evidence
+            cache_fast_bridge_evidence(evidence)
             if shared_bridge_evidence_cache is not None:
                 shared_bridge_evidence_cache._admit(evidence)
+        return representative_entry_options
 
     def locate_selected_exact_bridge(
         evidence: _SharedBridgeEvidence,
@@ -1851,8 +2103,11 @@ def _select_joint_timeline_candidates_core(
         layer_rejection_counts = {}
         previous_segment = segments[segment_position - 1]
         current_segment = segments[segment_position]
-        current_layer: dict[_JointState, list[_JointNode]] = {}
-        prime_bridge_evidence_for_layer(segment_position, frontier)
+        current_streams: dict[_JointState, list[_JointNodeStream]] = {}
+        representative_entry_options = prime_bridge_evidence_for_layer(
+            segment_position,
+            frontier,
+        )
         for previous_state, previous_nodes in sorted(
             frontier.items(),
             key=lambda item: _state_sort_key(item[0]),
@@ -1860,37 +2115,12 @@ def _select_joint_timeline_candidates_core(
             previous_candidate = previous_segment[
                 previous_state.candidate_index
             ]
-            ranked_previous_nodes = tuple(
-                sorted(previous_nodes, key=_node_rank_key)
-            )
+            ranked_previous_nodes = tuple(previous_nodes)
             representative_entry_option: AuthorizedBoundaryOption | None = None
             if segment_position >= 2:
-                expected_entry_state = previous_state.endpoint_renderer_state
-                expected_entry_offset = previous_state.previous_boundary_offset
-                if expected_entry_state is None or expected_entry_offset is None:
-                    raise RuntimeError(
-                        "joint DP lost its previous renderer endpoint state"
-                    )
-                for previous_node in ranked_previous_nodes:
-                    entry_option = previous_node.entering_boundary_option
-                    if entry_option is None:
-                        raise RuntimeError(
-                            "joint DP lost an exact previous boundary option"
-                        )
-                    if (
-                        entry_option.frame_offset != expected_entry_offset
-                        or _renderer_semantic_state(
-                            entry_option.incoming_transform
-                        )
-                        != expected_entry_state
-                    ):
-                        raise RuntimeError(
-                            "joint DP renderer-semantic state is not exact"
-                        )
                 representative_entry_option = (
-                    ranked_previous_nodes[0].entering_boundary_option
+                    representative_entry_options[previous_state]
                 )
-                assert representative_entry_option is not None
             extensions: list[_Extension] = []
             for current_index, (emission_score, used_fallback) in emissions[
                 segment_position
@@ -1958,13 +2188,9 @@ def _select_joint_timeline_candidates_core(
                     ):
                         reject("segment_duration_below_two_frames")
                         continue
-                    assert option.scoring_outgoing is not None
-                    assert option.scoring_incoming is not None
-                    transition = _transition_score(
-                        option.scoring_outgoing,
-                        option.scoring_incoming,
+                    transition = locate_transition(
+                        option,
                         previous_state.shot_run,
-                        settings,
                     )
                     if transition is None:
                         reject("boundary_option_timeline_hard_gate")
@@ -2015,18 +2241,24 @@ def _select_joint_timeline_candidates_core(
                         )
                     )
 
+            alternate_emission_floor = max(
+                (
+                    alternate.emission_score
+                    for alternate in extensions
+                    if previous_candidate.source_id
+                    != current_segment[alternate.current_index].source_id
+                ),
+                default=float("-inf"),
+            )
             for extension in extensions:
                 current_candidate = current_segment[extension.current_index]
                 same_source = (
                     previous_candidate.source_id == current_candidate.source_id
                 )
-                comparable_alternate_exists = any(
-                    previous_candidate.source_id
-                    != current_segment[alternate.current_index].source_id
-                    and alternate.emission_score
+                comparable_alternate_exists = (
+                    alternate_emission_floor
                     >= extension.emission_score
                     - settings.maximum_switch_score_sacrifice
-                    for alternate in extensions
                 )
                 source_run_start_position = (
                     segment_position - extension.source_run + 1
@@ -2114,36 +2346,48 @@ def _select_joint_timeline_candidates_core(
                         option.incoming_transform
                     ),
                 )
-                bucket = current_layer.setdefault(state, [])
-                for previous_node in ranked_previous_nodes:
-                    cumulative = (
-                        previous_node.cumulative_score
-                        + transition_score
-                        + extension.emission_score
-                    )
-                    node = _JointNode(
-                        state=state,
-                        candidate=current_candidate,
-                        cumulative_score=cumulative,
-                        previous_node=previous_node,
-                        emission_score=extension.emission_score,
-                        transition_score=transition_score,
-                        used_fallback=extension.used_fallback,
-                        entering_boundary_option=option,
-                        bridge_evidence_for_previous_segment=(
-                            extension.bridge_evidence
+                stream = _JointNodeStream(
+                    previous_nodes=ranked_previous_nodes,
+                    state=state,
+                    candidate=current_candidate,
+                    emission_score=extension.emission_score,
+                    transition_score=transition_score,
+                    used_fallback=extension.used_fallback,
+                    entering_boundary_option=option,
+                    bridge_evidence_for_previous_segment=(
+                        extension.bridge_evidence
+                    ),
+                    path_tail=(
+                        (
+                            "boundary",
+                            str(option.measurement_key.boundary_index),
+                            option.proof_identity,
+                            str(option.frame_offset),
                         ),
-                        path_signature=_extended_path_signature(
-                            previous_node.path_signature,
-                            option,
-                            current_candidate,
-                        ),
-                    )
-                    _retain_ranked_node(
-                        bucket,
-                        node,
+                        _candidate_signature(current_candidate),
+                    ),
+                )
+                stream_bucket = current_streams.setdefault(state, [])
+                if unique_candidate_path_components:
+                    _retain_ranked_node_stream(
+                        stream_bucket,
+                        stream,
                         maximum_results=maximum_results,
                     )
+                else:
+                    # Ambiguous public lattices may repeat the same logical
+                    # path component.  Their duplicate stream heads must not
+                    # evict a lower-ranked unique path before final signature
+                    # coalescing.  Production visual lattices have exact
+                    # ``source:segment`` IDs and take the bounded fast path.
+                    stream_bucket.append(stream)
+        current_layer = {
+            state: _materialize_ranked_node_streams(
+                streams,
+                maximum_results=maximum_results,
+            )
+            for state, streams in current_streams.items()
+        }
         if not current_layer:
             reason_code = _no_path_reason(layer_rejection_counts)
             summary = ",".join(

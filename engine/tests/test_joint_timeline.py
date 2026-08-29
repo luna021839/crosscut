@@ -1569,6 +1569,33 @@ class JointTimelineTests(unittest.TestCase):
             all(item.option_provider_call_count == 8 for item in ranked)
         )
 
+    def test_duplicate_logical_path_does_not_evict_unique_runner_up(self) -> None:
+        duplicate_best = candidate(0, "duplicate", 1.0)
+        duplicate_lower = replace(duplicate_best, quality_score=0.99)
+        unique_runner_up = candidate(0, "unique", 0.9)
+        segments = (
+            (duplicate_best, duplicate_lower, unique_runner_up),
+            (candidate(1, "end", 0.0),),
+        )
+
+        ranked = select_joint_timeline_candidates(
+            segments,
+            option_provider=zero_offset_options,
+            config=isolated_score_config(),
+            maximum_results=2,
+        )
+
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(
+            tuple(
+                tuple(item.source_id for item in result.candidates)
+                for result in ranked
+            ),
+            (("duplicate", "end"), ("unique", "end")),
+        )
+        self.assertAlmostEqual(ranked[0].total_score, 1.0)
+        self.assertAlmostEqual(ranked[1].total_score, 0.9)
+
     def test_three_by_eight_semantic_bridge_dominance_preserves_exact_proofs(
         self,
     ) -> None:

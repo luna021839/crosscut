@@ -4886,22 +4886,26 @@ class _VideoSampler:
 
         key = self.frame_identity(seconds)
         if key not in self.sface_cache:
-            frame = self.frame_at(seconds)
             bbox = descriptor.primary_face_bbox
             landmarks = descriptor.primary_face_landmarks_xy
             embedding: tuple[float, ...] = ()
             if (
-                frame is not None
-                and descriptor.face_detector_backend == "yunet"
+                descriptor.face_detector_backend == "yunet"
                 and bbox is not None
                 and landmarks is not None
                 and len(landmarks) == 5
             ):
-                embedding = extract_sface_embedding(
-                    frame,
-                    bbox_xywh=bbox,
-                    landmarks_xy=landmarks,
-                )
+                # Descriptor-only eligibility is authoritative and avoids a
+                # random media seek when no SFace measurement can possibly be
+                # produced.  Eligible frames retain the exact previous model
+                # path and process-local privacy boundary.
+                frame = self.frame_at(seconds)
+                if frame is not None:
+                    embedding = extract_sface_embedding(
+                        frame,
+                        bbox_xywh=bbox,
+                        landmarks_xy=landmarks,
+                    )
             self.sface_cache[key] = embedding
             while len(self.sface_cache) > 16:
                 self.sface_cache.popitem(last=False)
@@ -6454,7 +6458,12 @@ def _build_visual_timeline(
                     entry_face_window = ()
                     exit_face_window = ()
                 entry_identity = sampler.sface_embedding_at(entry_time, entry)
-                middle_identity = sampler.sface_embedding_at(middle_time, middle)
+                # This builder always supplies entry/exit shot-scale evidence,
+                # so every transition takes the boundary-specific identity
+                # branch in ``timeline``.  A midpoint SFace vector is never
+                # consulted by emission, joint selection, review, or render;
+                # keep it empty rather than paying one random decode per cell.
+                middle_identity: tuple[float, ...] = ()
                 exit_identity = sampler.sface_embedding_at(
                     exit_time,
                     exit_descriptor,
