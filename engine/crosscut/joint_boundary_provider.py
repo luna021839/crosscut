@@ -4220,6 +4220,11 @@ class DecodedBoundaryOptionProvider:
                     outer_candidates.append(key.outgoing)
                 if key.boundary_index == self.total_segment_count - 2:
                     outer_candidates.append(key.incoming)
+                if self._selection_measurement_active and not outer_proofs:
+                    # Selection-scalar mode deliberately omits both endpoint
+                    # outer tracks.  Keep the exact-mode cardinality check
+                    # below, while making the deferred pair explicitly empty.
+                    outer_candidates.clear()
                 for outer_index, (proof, outer_candidate) in enumerate(
                     zip(outer_proofs, outer_candidates, strict=True)
                 ):

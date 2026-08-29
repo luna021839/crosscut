@@ -640,6 +640,39 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             0,
         )
 
+    def test_same_source_selection_options_defer_both_outer_tracks(
+        self,
+    ) -> None:
+        key = BoundaryMeasurementKey(
+            0,
+            _candidate(0, "0"),
+            _candidate(1, "0"),
+        )
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5, pose_value=0.1),
+        )
+
+        provisional_set = provider.selection_options(key)
+        provisional = provisional_set.audit_for(0).authorized_option
+        self.assertIsNotNone(provisional)
+        self.assertEqual(provider.to_dict()["outer_track_audits"], [])
+        self.assertEqual(provider.to_dict()["materialization_proof_count"], 0)
+
+        assert provisional is not None
+        rehydrated = provider.rehydrate_selection_option(provisional)
+        self.assertIsNotNone(rehydrated)
+        assert rehydrated is not None
+        exact, exact_set = rehydrated
+        self.assertIn(exact, exact_set.authorized_options)
+        self.assertEqual(
+            len(
+                provider.materialization_proof(
+                    exact.proof_identity
+                ).outer_track_proof_identities
+            ),
+            2,
+        )
+
     def test_plus_five_can_be_viable_while_zero_is_nonwaivably_hard(self) -> None:
         incoming_exact_zero = NOMINAL + 0.5 / FPS
 
