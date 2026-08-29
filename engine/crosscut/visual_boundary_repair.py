@@ -9,6 +9,7 @@ pose, framing and structure discontinuity.  The output is a new immutable
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -45,8 +46,8 @@ from .visual_score import (
     FrameVisualDescriptor,
     VisualTimelineChoice,
     VisualTimelinePlan,
+    _VideoSampler,
     describe_boundary_side_stability,
-    describe_frame,
 )
 
 
@@ -587,33 +588,86 @@ class VisualBoundaryRepairPlan:
         }
 
 
-class _FrameSampler:
-    def __init__(self, path: Path) -> None:
-        self.capture = cv2.VideoCapture(str(path))
-        if not self.capture.isOpened():
-            raise ValueError(f"cannot open boundary-repair source: {path}")
-        self._descriptor_cache: dict[float, FrameVisualDescriptor | None] = {}
-
-    def descriptor_at(self, seconds: float) -> FrameVisualDescriptor | None:
-        if seconds < 0.0:
-            return None
-        key = round(float(seconds), 7)
-        if key in self._descriptor_cache:
-            return self._descriptor_cache[key]
-        self.capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
-        ok, frame = self.capture.read()
-        if not ok or frame is None:
-            self._descriptor_cache[key] = None
-            return None
-        descriptor = describe_frame(frame, include_formation_pose=True)
-        self._descriptor_cache[key] = descriptor
-        return descriptor
-
-    def close(self) -> None:
-        self.capture.release()
-
-
 DescriptorProvider = Callable[[int, float], FrameVisualDescriptor | None]
+
+
+class BoundaryDescriptorCache:
+    """Bounded process-local descriptor reuse across candidate repairs.
+
+    GROUP candidates share the same canonical boundaries and frequently ask
+    for the same source-local frame neighborhoods.  Re-running pose, formation,
+    face, and silhouette inference for every candidate made the exact-eight
+    production path scale with candidate count instead of unique frames.  This
+    cache stores only immutable numeric descriptors, never decoded pixels, and
+    deliberately has no persistence surface.
+    """
+
+    def __init__(self, *, maximum_entries: int = 8_192) -> None:
+        if (
+            isinstance(maximum_entries, bool)
+            or not isinstance(maximum_entries, int)
+            or maximum_entries < 1
+        ):
+            raise ValueError("maximum_entries must be a positive integer")
+        self.maximum_entries = maximum_entries
+        self._values: OrderedDict[
+            tuple[int, float], FrameVisualDescriptor | None
+        ] = OrderedDict()
+        self.hit_count = 0
+        self.miss_count = 0
+        self.eviction_count = 0
+
+    @staticmethod
+    def _key(source_index: int, seconds: float) -> tuple[int, float]:
+        if (
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+        ):
+            raise ValueError("descriptor cache source index is invalid")
+        numeric = float(seconds)
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise ValueError("descriptor cache timestamp is invalid")
+        return source_index, round(numeric, 7)
+
+    def lookup(
+        self,
+        source_index: int,
+        seconds: float,
+    ) -> tuple[bool, FrameVisualDescriptor | None]:
+        key = self._key(source_index, seconds)
+        if key not in self._values:
+            self.miss_count += 1
+            return False, None
+        value = self._values.pop(key)
+        self._values[key] = value
+        self.hit_count += 1
+        return True, value
+
+    def store(
+        self,
+        source_index: int,
+        seconds: float,
+        descriptor: FrameVisualDescriptor | None,
+    ) -> None:
+        key = self._key(source_index, seconds)
+        self._values.pop(key, None)
+        self._values[key] = descriptor
+        while len(self._values) > self.maximum_entries:
+            self._values.popitem(last=False)
+            self.eviction_count += 1
+
+    def diagnostics(self) -> dict[str, int | bool | str]:
+        return {
+            "contract": "bounded_process_local_boundary_descriptor_cache_v1",
+            "maximum_entries": self.maximum_entries,
+            "entry_count": len(self._values),
+            "hit_count": self.hit_count,
+            "miss_count": self.miss_count,
+            "eviction_count": self.eviction_count,
+            "raw_frames_persisted": False,
+            "persistent": False,
+        }
 
 
 def _stable_temporal_pose_choice(
@@ -1359,6 +1413,8 @@ def repair_visual_timeline_boundaries(
     output_fps: float = 29.97,
     beat_period_seconds: float | None = None,
     descriptor_provider: DescriptorProvider | None = None,
+    descriptor_cache: BoundaryDescriptorCache | None = None,
+    feature_cache_directory: Path | None = None,
     config: BoundaryRepairConfig | None = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     boundary_indices: Sequence[int] | None = None,
@@ -1456,14 +1512,45 @@ def repair_visual_timeline_boundaries(
             )
         )
 
-    samplers: list[_FrameSampler] = []
+    samplers: dict[int, _VideoSampler] = {}
     if descriptor_provider is None:
-        samplers = [_FrameSampler(Path(path)) for path in sources]
-
         def provider(source_index: int, seconds: float) -> FrameVisualDescriptor | None:
-            return samplers[source_index].descriptor_at(seconds)
+            # Preserve the former boundary sampler's fail-closed behavior at
+            # the start of a source.  CanonicalFrameIdentity intentionally
+            # clamps negative values for general callers, but a repair handle
+            # before source time zero is missing evidence, not frame zero.
+            if seconds < 0.0:
+                return None
+            if descriptor_cache is not None:
+                hit, cached = descriptor_cache.lookup(source_index, seconds)
+                if hit:
+                    return cached
+            sampler = samplers.get(source_index)
+            if sampler is None:
+                sampler = _VideoSampler(
+                    Path(sources[source_index]),
+                    feature_cache_directory=feature_cache_directory,
+                )
+                samplers[source_index] = sampler
+            descriptor = sampler.feature_descriptor_at(
+                seconds,
+                include_subject_geometry=True,
+                include_formation_pose=True,
+            )
+            if descriptor_cache is not None:
+                descriptor_cache.store(source_index, seconds, descriptor)
+            return descriptor
 
     else:
+        if feature_cache_directory is not None:
+            raise ValueError(
+                "feature_cache_directory cannot wrap an explicit "
+                "descriptor_provider"
+            )
+        if descriptor_cache is not None:
+            raise ValueError(
+                "descriptor_cache cannot wrap an explicit descriptor_provider"
+            )
         provider = descriptor_provider
 
     geometry_provider_attempts: set[tuple[int, float]] = set()
@@ -1788,7 +1875,7 @@ def repair_visual_timeline_boundaries(
                 )
             )
     finally:
-        for sampler in samplers:
+        for sampler in samplers.values():
             sampler.close()
 
     repaired_timeline = VisualTimelinePlan(
@@ -1822,6 +1909,7 @@ def repair_visual_timeline_boundaries(
 
 __all__ = [
     "ANALYSIS_BASIS",
+    "BoundaryDescriptorCache",
     "BoundaryEvidenceCoverage",
     "BoundaryVisualEvidence",
     "TemporalPoseMotionEvidence",

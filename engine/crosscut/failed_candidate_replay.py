@@ -438,6 +438,19 @@ def _parse_source_look(value: Any, name: str) -> SourceLookAdjustment | None:
         temperature_balance=_number(
             payload.get("temperature_balance"), f"{name}.temperature_balance"
         ),
+        tint_balance=(
+            _number(payload.get("tint_balance"), f"{name}.tint_balance")
+            if "tint_balance" in payload
+            else 0.0
+        ),
+        detail_enhancement=(
+            _number(
+                payload.get("detail_enhancement"),
+                f"{name}.detail_enhancement",
+            )
+            if "detail_enhancement" in payload
+            else 0.0
+        ),
     )
     if _boolean(payload.get("identity"), f"{name}.identity") != result.is_identity:
         raise CandidateReplayValidationError(f"{name} identity flag is inconsistent")
@@ -1212,9 +1225,9 @@ def _deserialize_visual_timeline(
             # The manifest intentionally stores only the transient embedding
             # count, never SFace vectors.  Current replay geometry consumers
             # (face crop, exact-frame subject boxes, affine, editorial motion)
-            # do not read those identity windows, and final transitions are
-            # reused rather than rebuilt.  Validate the count type while
-            # leaving the unavailable vectors empty.
+            # do not read those identity windows.  Production transitions are
+            # rebuilt only after a RAM-only post-repair evidence pass, so
+            # replay must validate the count while leaving vectors empty.
             _integer(
                 evidence.get("appearance_embedding_count"),
                 f"{evidence_name}.appearance_embedding_count",
@@ -1262,6 +1275,10 @@ def _deserialize_visual_timeline(
             ),
             exit_scene_cut_near=_boolean(
                 item.get("exit_scene_cut_near"), "choice.exit_scene_cut_near"
+            ),
+            intentional_transition_anchor_basis=_optional_string(
+                item.get("intentional_transition_anchor_basis"),
+                "choice.intentional_transition_anchor_basis",
             ),
             internal_scene_cut_master_seconds=_finite_vector(
                 item.get("internal_scene_cut_master_seconds"),
@@ -1484,6 +1501,18 @@ def _deserialize_visual_timeline(
             payload.get("source_clock_basis"), "visual_timeline.source_clock_basis"
         ),
     )
+
+
+def deserialize_visual_timeline_plan(
+    payload: Mapping[str, Any],
+) -> Any:
+    """Strictly reconstruct a persisted non-biometric visual timeline plan."""
+
+    if not isinstance(payload, Mapping):
+        raise CandidateReplayValidationError(
+            "visual timeline checkpoint payload must be an object"
+        )
+    return _deserialize_visual_timeline({"visual_timeline": payload})
 
 
 def _geometry_source_contract(
@@ -2347,6 +2376,7 @@ __all__ = [
     "ReplayBoundaryRepairHook",
     "ReplayBoundaryRepairResult",
     "apply_current_boundary_repairs",
+    "deserialize_visual_timeline_plan",
     "load_replay_repair_hook",
     "reconstruct_failed_candidate",
     "replay_failed_candidate",

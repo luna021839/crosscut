@@ -22,8 +22,10 @@ from crosscut.visual_feature_cache import (
     AnalyzerFingerprint,
     CanonicalFrameIdentity,
     DescriptorRequestIdentity,
+    DescriptorRequestLocator,
     PersistentVisualFeatureCache,
     build_analyzer_fingerprint,
+    python_symbol_dependency_sha256,
 )
 from crosscut.visual_score import (
     FrameVisualDescriptor,
@@ -160,6 +162,7 @@ class _FakeCapture:
         self.frame_rate = frame_rate
         self.position = 0
         self.opened = True
+        self.read_count = 0
 
     def isOpened(self) -> bool:
         return self.opened
@@ -177,6 +180,7 @@ class _FakeCapture:
         return True
 
     def read(self):  # type: ignore[no-untyped-def]
+        self.read_count += 1
         value = self.position % 251
         return (True, np.full((12, 20, 3), value, dtype=np.uint8))
 
@@ -219,6 +223,48 @@ class VisualFeatureCacheTests(unittest.TestCase):
                 runtime_components={"opencv": "1"},
             )
             self.assertEqual(len({first.digest, second.digest, third.digest}), 3)
+
+    def test_symbol_dependency_fingerprint_ignores_unrelated_selector_code(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            module = Path(temporary_directory) / "combined.py"
+            module.write_text(
+                "CONST = 2\n"
+                "def helper(value):\n    return value * CONST\n"
+                "def descriptor(value):\n    return helper(value)\n"
+                "def selector(value):\n    return value + 1\n",
+                encoding="utf-8",
+            )
+            first = python_symbol_dependency_sha256(
+                module,
+                root_symbols=("descriptor",),
+            )
+            module.write_text(
+                "CONST = 2\n"
+                "def helper(value):\n    return value * CONST\n"
+                "def descriptor(value):\n    return helper(value)\n"
+                "def selector(value):\n    return value + 999\n",
+                encoding="utf-8",
+            )
+            selector_changed = python_symbol_dependency_sha256(
+                module,
+                root_symbols=("descriptor",),
+            )
+            module.write_text(
+                "CONST = 3\n"
+                "def helper(value):\n    return value * CONST\n"
+                "def descriptor(value):\n    return helper(value)\n"
+                "def selector(value):\n    return value + 999\n",
+                encoding="utf-8",
+            )
+            descriptor_changed = python_symbol_dependency_sha256(
+                module,
+                root_symbols=("descriptor",),
+            )
+
+            self.assertEqual(first, selector_changed)
+            self.assertNotEqual(first, descriptor_changed)
 
     def test_atomic_round_trip_binds_source_frame_options_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -315,9 +361,16 @@ class VisualFeatureCacheTests(unittest.TestCase):
             source = root / "source.mp4"
             source.write_bytes(b"fake-video-source")
             cache_root = root / "cache"
+            captures: list[_FakeCapture] = []
+
+            def capture(path: str) -> _FakeCapture:
+                value = _FakeCapture(path)
+                captures.append(value)
+                return value
+
             with patch(
                 "crosscut.visual_score.cv2.VideoCapture",
-                side_effect=lambda path: _FakeCapture(path),
+                side_effect=capture,
             ), patch(
                 "crosscut.visual_score._visual_analyzer_fingerprint",
                 return_value=_analyzer(),
@@ -348,13 +401,237 @@ class VisualFeatureCacheTests(unittest.TestCase):
                 second.close()
             self.assertEqual(cold, warm)
             self.assertEqual(describe.call_count, 1)
+            self.assertEqual(len(captures), 2)
+            self.assertGreater(captures[0].read_count, 0)
+            self.assertEqual(captures[1].read_count, 0)
             assert diagnostics is not None
             self.assertEqual(diagnostics["hit_count"], 1)
+            self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+            self.assertEqual(diagnostics["source_frame_decode_count"], 0)
             records = tuple((cache_root / "derived").rglob("*.json"))
             self.assertTrue(records)
             joined = b"".join(path.read_bytes() for path in records)
             self.assertNotIn(b"SFACE_PRIVATE_SENTINEL", joined)
             self.assertNotIn(source.read_bytes(), joined)
+
+    def test_decode_free_locator_fails_closed_on_ambiguous_frame_digests(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=_analyzer(),
+            )
+            first = _request(frame_digest="1" * 64)
+            second = _request(frame_digest="2" * 64)
+            self.assertTrue(cache.put(first, {"value": 1.0}))
+            self.assertTrue(cache.put(second, {"value": 2.0}))
+            locator = DescriptorRequestLocator(
+                primary=first.primary,
+                following=first.following,
+                include_subject_geometry=first.include_subject_geometry,
+                include_formation_pose=first.include_formation_pose,
+            )
+
+            self.assertIsNone(cache.get_by_locator(locator))
+            self.assertEqual(cache.get(first), {"value": 1.0})
+            self.assertEqual(cache.get(second), {"value": 2.0})
+            self.assertEqual(cache.diagnostics()["ambiguous_locator_count"], 1)
+
+    def test_over_budget_locator_preflight_reads_no_json_and_uses_exact_lookup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            cache_root = root / "cache"
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=cache_root,
+                source_path=source,
+                analyzer=_analyzer(),
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            shard = cold._root / "ff"
+            shard.mkdir(exist_ok=True)
+            (shard / f"{'f' * 64}.json").write_text("{}", encoding="utf-8")
+
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=cache_root,
+                source_path=source,
+                analyzer=_analyzer(),
+            )
+            with patch(
+                "crosscut.visual_feature_cache."
+                "_MAXIMUM_DECODE_FREE_LOCATOR_RECORDS",
+                1,
+            ), patch.object(
+                warm,
+                "_read_record",
+                wraps=warm._read_record,
+            ) as read_record:
+                self.assertIsNone(warm.get_by_locator(request.locator))
+                read_record.assert_not_called()
+                self.assertEqual(warm.get(request), {"value": 1.0})
+                self.assertEqual(read_record.call_count, 1)
+                diagnostics = warm.diagnostics()
+
+            self.assertEqual(
+                diagnostics["locator_index_status"],
+                "over_budget_exact_decode_fallback",
+            )
+            self.assertEqual(diagnostics["locator_index_record_budget"], 1)
+            self.assertEqual(
+                diagnostics["locator_index_budget_fallback_count"],
+                1,
+            )
+            self.assertEqual(diagnostics["locator_index_build_count"], 0)
+
+            restarted = PersistentVisualFeatureCache(
+                source_cache_directory=cache_root,
+                source_path=source,
+                analyzer=_analyzer(),
+            )
+            with patch(
+                "crosscut.visual_feature_cache."
+                "_MAXIMUM_DECODE_FREE_LOCATOR_RECORDS",
+                1,
+            ), patch.object(
+                restarted,
+                "_preflight_locator_record_paths",
+                wraps=restarted._preflight_locator_record_paths,
+            ) as preflight, patch.object(
+                restarted,
+                "_read_record",
+                wraps=restarted._read_record,
+            ) as read_record:
+                self.assertIsNone(restarted.get_by_locator(request.locator))
+                preflight.assert_not_called()
+                read_record.assert_not_called()
+                restarted_diagnostics = restarted.diagnostics()
+            self.assertEqual(
+                restarted_diagnostics["locator_index_status"],
+                "over_budget_process_memo_exact_decode_fallback",
+            )
+            self.assertEqual(
+                restarted_diagnostics["locator_index_process_memo_hit_count"],
+                1,
+            )
+
+    def test_exactly_audited_cache_only_analyzer_migration_reuses_record(
+        self,
+    ) -> None:
+        migrations = (
+            (
+                "ac7de83aac79715f25f4a7c93f2d861b93047e5a92e89694496c2d7b3d3fb47d",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "e3196dd457bfcf0d3227475e21083d04b808fd331e1c2a1dfe7890510ee2e8e4",
+                "dd214dcfe13d3af7c5119a5ea3067fe7ec703fd8ff864b7fa34c11f95622f433",
+            ),
+            (
+                "48f2ed8ef454539ac3e8502c905c325b1113158c7bd840de6aefac83105ce3d1",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "b7d906f1578b0bb967ad9c331a1c6ad3c7147cb596e0ba155af41c80f667a7a4",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "976479db2b02b46830aa53e55c20b03aabd5bdb660aee9795d81e2587b2cab93",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "5d32ea38abfbad7fac015c91f00e8957ac2db95a460778e3a207c16ae3ca9fe2",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "c44b51f780f0d2b6e37751c2053f8630b63d3e799cd617936333ecace435da8b",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "19740a80bc18933032e9265a747a74678a4ff7cfa22e26ddb0ea14528705d6d1",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "ba991e083dd4e94ef7d4a251bc05538d1bb2feaf0582408249090d2908e0b23b",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "b7e9ad896ed5403819b8fa31772a97b4f82365ba5f65a032c22d024233f83d4a",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+            (
+                "e09b787bf407c2eacc09f1d1f52a0318dc8b1e981b70eaf199c863cf67af0829",
+                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+            ),
+        )
+        for current_digest, legacy_digest in migrations:
+            with self.subTest(current_digest=current_digest):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    source = root / "source.mp4"
+                    source.write_bytes(b"source-content-v1")
+                    shared_components = {
+                        "cache_contract": "ive_source_local_visual_features_v1",
+                        "feature_schema_version": 1,
+                        "descriptor_schema": "test_numeric_descriptor_v1",
+                        "model_asset_sha256_or_state": {"test": "present"},
+                        "runtime": {"opencv": cv2.__version__},
+                    }
+                    legacy = AnalyzerFingerprint(
+                        digest=legacy_digest,
+                        components={
+                            **shared_components,
+                            "code_sha256": {
+                                "pose.py": "3" * 64,
+                                "visual_score.py": "1" * 64,
+                            },
+                        },
+                    )
+                    current_code = {
+                        "pose.py": "3" * 64,
+                        "visual_score_descriptor_ast_v1": "2" * 64,
+                    } if current_digest.startswith("ac7de83a") else {
+                        "pose.py": "3" * 64,
+                        "visual_score.py": "2" * 64,
+                    }
+                    current = AnalyzerFingerprint(
+                        digest=current_digest,
+                        components={
+                            **shared_components,
+                            "code_sha256": current_code,
+                        },
+                    )
+                    request = _request()
+                    cold = PersistentVisualFeatureCache(
+                        source_cache_directory=root / "cache",
+                        source_path=source,
+                        analyzer=legacy,
+                    )
+                    self.assertTrue(cold.put(request, {"value": 1.0}))
+                    warm = PersistentVisualFeatureCache(
+                        source_cache_directory=root / "cache",
+                        source_path=source,
+                        analyzer=current,
+                    )
+
+                    self.assertEqual(
+                        warm.get_by_locator(request.locator),
+                        {"value": 1.0},
+                    )
+                    diagnostics = warm.diagnostics()
+                    self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+                    self.assertEqual(
+                        diagnostics["decode_free_legacy_hit_count"],
+                        1,
+                    )
 
     def test_direct_member_provider_reuses_interrupted_run_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

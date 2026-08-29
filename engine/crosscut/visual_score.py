@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import hashlib
 import math
@@ -35,21 +36,37 @@ from .timeline import (
     BoundarySideStability,
     ShotType,
     TimelineCandidate,
+    TimelineChoice,
     TimelineConfig,
     TimelineResult,
     comparable_group_formation_mismatch,
     cross_source_layout_mismatch,
     face_geometry_minimax_mismatch,
     select_timeline_candidates,
+    timeline_transition_hard_gates_admit,
+)
+# Selector-only policy constants stay in a separate import node so changing
+# editorial policy cannot invalidate persisted frame descriptors.
+from .timeline import (
+    INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH,
+    INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH,
+    INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH,
+    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
+    PRODUCTION_MAX_LAYOUT_MISMATCH,
+    PRODUCTION_MAX_SCALE_MISMATCH,
+    PRODUCTION_MAX_SILHOUETTE_MISMATCH,
 )
 from .timeline_review import TimelineReview, review_timeline
 from .timewarp import TimeWarpMap
+from .section_director import SectionPlan, SectionRole
 from .visual_feature_cache import (
     AnalyzerFingerprint,
     CanonicalFrameIdentity,
     DescriptorRequestIdentity,
+    DescriptorRequestLocator,
     PersistentVisualFeatureCache,
     build_analyzer_fingerprint,
+    python_symbol_dependency_sha256,
 )
 
 
@@ -141,6 +158,113 @@ class VisualDiversityConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ProfessionalMontageSelectionPolicy:
+    """Human-reference shot-scale/cadence targets for candidate generation.
+
+    These values are soft optimizer controls only.  They cannot admit an
+    unsafe visual edge, and every resulting candidate still has to pass the
+    decoded-output montage grammar independently.
+    """
+
+    highlight_minimum_closeup_fraction: float
+    highlight_preferred_closeup_fraction: float
+    highlight_minimum_nonwide_fraction: float
+    highlight_preferred_nonwide_fraction: float
+    build_minimum_closeup_fraction: float
+    build_preferred_closeup_fraction: float
+    build_minimum_nonwide_fraction: float
+    build_preferred_nonwide_fraction: float
+    bridge_minimum_closeup_fraction: float
+    bridge_preferred_closeup_fraction: float
+    bridge_minimum_nonwide_fraction: float
+    bridge_preferred_nonwide_fraction: float
+    highlight_minimum_source_switches_per_minute: float
+    highlight_preferred_source_switches_per_minute: float
+    minimum_early_wide_anchor_fraction: float
+    minimum_phrase_entry_wide_anchor_fraction: float
+
+    def __post_init__(self) -> None:
+        fraction_pairs = (
+            (
+                "highlight_closeup",
+                self.highlight_minimum_closeup_fraction,
+                self.highlight_preferred_closeup_fraction,
+            ),
+            (
+                "highlight_nonwide",
+                self.highlight_minimum_nonwide_fraction,
+                self.highlight_preferred_nonwide_fraction,
+            ),
+            (
+                "build_closeup",
+                self.build_minimum_closeup_fraction,
+                self.build_preferred_closeup_fraction,
+            ),
+            (
+                "build_nonwide",
+                self.build_minimum_nonwide_fraction,
+                self.build_preferred_nonwide_fraction,
+            ),
+            (
+                "bridge_closeup",
+                self.bridge_minimum_closeup_fraction,
+                self.bridge_preferred_closeup_fraction,
+            ),
+            (
+                "bridge_nonwide",
+                self.bridge_minimum_nonwide_fraction,
+                self.bridge_preferred_nonwide_fraction,
+            ),
+        )
+        for name, minimum, preferred in fraction_pairs:
+            if not (
+                math.isfinite(minimum)
+                and math.isfinite(preferred)
+                and 0.0 <= minimum <= preferred <= 1.0
+            ):
+                raise ValueError(f"{name} fractions are invalid")
+        if (
+            self.highlight_preferred_closeup_fraction
+            > self.highlight_preferred_nonwide_fraction + 1e-12
+            or self.build_preferred_closeup_fraction
+            > self.build_preferred_nonwide_fraction + 1e-12
+            or self.bridge_preferred_closeup_fraction
+            > self.bridge_preferred_nonwide_fraction + 1e-12
+        ):
+            raise ValueError("closeup targets cannot exceed nonwide targets")
+        if not (
+            math.isfinite(self.highlight_minimum_source_switches_per_minute)
+            and math.isfinite(self.highlight_preferred_source_switches_per_minute)
+            and 0.0
+            < self.highlight_minimum_source_switches_per_minute
+            <= self.highlight_preferred_source_switches_per_minute
+            <= 60.0
+        ):
+            raise ValueError("highlight source-switch targets are invalid")
+        for name in (
+            "minimum_early_wide_anchor_fraction",
+            "minimum_phrase_entry_wide_anchor_fraction",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must lie in 0...1")
+
+    def to_dict(self) -> dict[str, float | str | bool]:
+        return {
+            "contract": (
+                "human_reference_role_conditioned_visual_candidate_soft_"
+                "controls_v1"
+            ),
+            **{
+                name: float(getattr(self, name))
+                for name in self.__dataclass_fields__
+            },
+            "hard_visual_gate_relaxed": False,
+            "decoded_output_montage_gate_required": True,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _CadenceProfile:
     name: str
     config: TimelineConfig
@@ -204,17 +328,24 @@ def _safe_cadence_profiles(
         person_layout_transition_weight=2.10,
         formation_transition_weight=2.45,
         shot_type_transition_weight=1.20,
-        maximum_cross_source_scale_delta=0.20,
-        maximum_cross_source_focus_mismatch=0.24,
-        maximum_cross_source_layout_mismatch=0.32,
+        maximum_cross_source_scale_delta=PRODUCTION_MAX_SCALE_MISMATCH,
+        # The decoded +/-3-frame boundary repair explicitly corrects focal
+        # subject jumps. Keep the strong transition penalty, then require the
+        # unchanged post-repair 0.24 review gate instead of deleting those
+        # potentially useful close-shot edges before repair can inspect them.
+        maximum_cross_source_focus_mismatch=None,
+        maximum_cross_source_layout_mismatch=PRODUCTION_MAX_LAYOUT_MISMATCH,
         # Screen-space formation is strongly perspective-dependent across
         # broadcasters. Keep its 2.45 transition penalty, then require the
         # decoded +/-3-frame repair and final reviewer to satisfy the unchanged
         # 0.30 gate instead of disconnecting the selector graph prematurely.
         maximum_cross_source_formation_mismatch=None,
-        maximum_cross_source_silhouette_mismatch=0.36,
+        maximum_cross_source_silhouette_mismatch=(
+            PRODUCTION_MAX_SILHOUETTE_MISMATCH
+        ),
         minimum_cross_source_face_similarity=0.36,
         require_cross_source_visual_evidence=True,
+        allow_intentional_phrase_anchor_transitions=True,
         maximum_boundary_side_scale_delta=BOUNDARY_SIDE_MAX_SCALE_DELTA,
         maximum_boundary_side_structure_mismatch=(
             BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH
@@ -309,32 +440,970 @@ def _review_ranked_candidate_indices(
     )
 
 
+def _role_fraction_targets(
+    policy: ProfessionalMontageSelectionPolicy,
+    *,
+    role: SectionRole,
+    cadence_profile: str,
+) -> tuple[float, float] | None:
+    if role is SectionRole.CHORUS_LIKE:
+        minimum_close = policy.highlight_minimum_closeup_fraction
+        preferred_close = policy.highlight_preferred_closeup_fraction
+        minimum_nonwide = policy.highlight_minimum_nonwide_fraction
+        preferred_nonwide = policy.highlight_preferred_nonwide_fraction
+    elif role is SectionRole.BUILD:
+        minimum_close = policy.build_minimum_closeup_fraction
+        preferred_close = policy.build_preferred_closeup_fraction
+        minimum_nonwide = policy.build_minimum_nonwide_fraction
+        preferred_nonwide = policy.build_preferred_nonwide_fraction
+    elif role is SectionRole.BRIDGE_LIKE:
+        minimum_close = policy.bridge_minimum_closeup_fraction
+        preferred_close = policy.bridge_preferred_closeup_fraction
+        minimum_nonwide = policy.bridge_minimum_nonwide_fraction
+        preferred_nonwide = policy.bridge_preferred_nonwide_fraction
+    else:
+        return None
+    if cadence_profile == "balanced":
+        close_lift, nonwide_lift = 0.08, 0.00
+    elif cadence_profile == "reference":
+        close_lift, nonwide_lift = 0.16, 0.08
+    elif cadence_profile == "dense_safe":
+        close_lift, nonwide_lift = 0.24, 0.16
+    else:
+        raise ValueError("unknown safe cadence profile")
+    close = min(0.82, max(minimum_close, preferred_close + close_lift))
+    nonwide = min(
+        0.90,
+        max(minimum_nonwide, preferred_nonwide + nonwide_lift, close),
+    )
+    return close, nonwide
+
+
+def _evenly_spaced_positions(
+    values: Sequence[int],
+    count: int,
+) -> set[int]:
+    ordered = tuple(values)
+    if count <= 0 or not ordered:
+        return set()
+    if count >= len(ordered):
+        return set(ordered)
+    if count == 1:
+        return {ordered[0]}
+    return {
+        ordered[
+            min(
+                len(ordered) - 1,
+                int(round(index * (len(ordered) - 1) / (count - 1))),
+            )
+        ]
+        for index in range(count)
+    }
+
+
+def _spread_distance(position: int, selected: set[int]) -> int:
+    if not selected:
+        return 1 << 30
+    return min(abs(position - value) for value in selected)
+
+
+def _wide_positions_for_duration_target(
+    values: Sequence[int],
+    *,
+    duration_by_position: Mapping[int, float],
+    maximum_wide_seconds: float,
+    mandatory_positions: set[int],
+    preference_by_position: Mapping[int, float] | None = None,
+) -> set[int]:
+    """Spread wide anchors without exceeding the profile duration budget."""
+
+    ordered = tuple(values)
+    preferences = dict(preference_by_position or {})
+    selected = {value for value in mandatory_positions if value in ordered}
+    selected_seconds = sum(duration_by_position[value] for value in selected)
+    while True:
+        eligible = tuple(
+            value
+            for value in ordered
+            if value not in selected
+            and selected_seconds + duration_by_position[value]
+            <= maximum_wide_seconds + 1e-9
+        )
+        if not eligible:
+            break
+        choice = max(
+            eligible,
+            key=lambda value: (
+                float(preferences.get(value, 0.0)),
+                selected_seconds + duration_by_position[value],
+                _spread_distance(value, selected),
+                -value,
+            ),
+        )
+        selected.add(choice)
+        selected_seconds += duration_by_position[choice]
+    return selected
+
+
+def _close_positions_for_duration_target(
+    values: Sequence[int],
+    *,
+    duration_by_position: Mapping[int, float],
+    minimum_close_seconds: float,
+    seeded_positions: set[int],
+    preference_by_position: Mapping[int, float] | None = None,
+) -> set[int]:
+    """Spread close targets until their duration meets the profile floor."""
+
+    ordered = tuple(values)
+    preferences = dict(preference_by_position or {})
+    selected = {value for value in seeded_positions if value in ordered}
+    selected_seconds = sum(duration_by_position[value] for value in selected)
+    while selected_seconds + 1e-9 < minimum_close_seconds:
+        available = tuple(value for value in ordered if value not in selected)
+        if not available:
+            break
+        choice = min(
+            available,
+            key=lambda value: (
+                -float(preferences.get(value, 0.0)),
+                abs(
+                    selected_seconds
+                    + duration_by_position[value]
+                    - minimum_close_seconds
+                ),
+                -_spread_distance(value, selected),
+                value,
+            ),
+        )
+        selected.add(choice)
+        selected_seconds += duration_by_position[choice]
+    return selected
+
+
+def _preferred_spread_positions(
+    values: Sequence[int],
+    count: int,
+    *,
+    preference_by_position: Mapping[int, float],
+    seeded_positions: set[int] | None = None,
+) -> set[int]:
+    """Choose evidence-backed positions while retaining temporal spread."""
+
+    ordered = tuple(values)
+    selected = {
+        value for value in (seeded_positions or set()) if value in ordered
+    }
+    target_count = min(len(ordered), max(0, int(count)))
+    while len(selected) < target_count:
+        available = tuple(value for value in ordered if value not in selected)
+        if not available:
+            break
+        choice = max(
+            available,
+            key=lambda value: (
+                float(preference_by_position.get(value, 0.0)),
+                _spread_distance(value, selected),
+                -value,
+            ),
+        )
+        selected.add(choice)
+    return selected
+
+
+def _complete_path_reachable_candidate_keys(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    timeline_config: TimelineConfig,
+) -> set[tuple[int, str]]:
+    """Find candidates lying on at least one full hard-gate-admitted path."""
+
+    segments = tuple(tuple(segment) for segment in candidates_by_segment)
+    if not segments or any(not segment for segment in segments):
+        raise ValueError("reachability requires non-empty candidate segments")
+    forward: list[set[int]] = [set(range(len(segments[0])))]
+    for position in range(1, len(segments)):
+        reachable: set[int] = set()
+        for current_index, current in enumerate(segments[position]):
+            if any(
+                timeline_transition_hard_gates_admit(
+                    segments[position - 1][previous_index],
+                    current,
+                    config=timeline_config,
+                )
+                for previous_index in forward[-1]
+            ):
+                reachable.add(current_index)
+        if not reachable:
+            raise ValueError(
+                "visual hard-gate graph has no complete forward path"
+            )
+        forward.append(reachable)
+    backward: list[set[int]] = [set() for _ in segments]
+    backward[-1] = set(range(len(segments[-1])))
+    for position in range(len(segments) - 2, -1, -1):
+        reachable = set()
+        for previous_index, previous in enumerate(segments[position]):
+            if any(
+                timeline_transition_hard_gates_admit(
+                    previous,
+                    segments[position + 1][current_index],
+                    config=timeline_config,
+                )
+                for current_index in backward[position + 1]
+            ):
+                reachable.add(previous_index)
+        if not reachable:
+            raise ValueError(
+                "visual hard-gate graph has no complete backward path"
+            )
+        backward[position] = reachable
+    return {
+        (candidate.segment_index, candidate.source_id)
+        for position, segment in enumerate(segments)
+        for candidate_index, candidate in enumerate(segment)
+        if candidate_index in forward[position]
+        and candidate_index in backward[position]
+    }
+
+
+def _role_target_categories(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    section_plan: SectionPlan,
+    phrase_times: Sequence[float],
+    policy: ProfessionalMontageSelectionPolicy,
+    cadence_profile: str,
+    subject_metadata_by_candidate: Mapping[
+        str, "_CandidateSubjectMetadata"
+    ] | None = None,
+    reachable_candidate_keys: set[tuple[int, str]] | None = None,
+) -> tuple[dict[int, str], dict[str, Any]]:
+    """Build an auditable wide/close/nonwide motif from profile fractions."""
+
+    if not candidates_by_segment:
+        raise ValueError("role-conditioned selection needs timeline segments")
+    phrases = tuple(sorted({float(value) for value in phrase_times}))
+    if any(not math.isfinite(value) for value in phrases):
+        raise ValueError("role-conditioned phrase times must be finite")
+    by_section: dict[int, list[int]] = {}
+    segment_by_index: dict[int, TimelineCandidate] = {}
+    candidates_by_index: dict[int, Sequence[TimelineCandidate]] = {}
+    for segment in candidates_by_segment:
+        if not segment:
+            raise ValueError("role-conditioned segment cannot be empty")
+        reference = segment[0]
+        if any(
+            item.segment_index != reference.segment_index
+            or not math.isclose(
+                item.start_seconds,
+                reference.start_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            or not math.isclose(
+                item.end_seconds,
+                reference.end_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            for item in segment[1:]
+        ):
+            raise ValueError(
+                "role-conditioned candidates disagree on canonical spans"
+            )
+        directive = section_plan.directive_at(reference.start_seconds)
+        by_section.setdefault(directive.section_index, []).append(
+            reference.segment_index
+        )
+        segment_by_index[reference.segment_index] = reference
+        candidates_by_index[reference.segment_index] = segment
+
+    targets: dict[int, str] = {}
+    subject_metadata = dict(subject_metadata_by_candidate or {})
+    section_audit: list[dict[str, Any]] = []
+    for section_index, segment_indices in sorted(by_section.items()):
+        directive = section_plan.sections[section_index]
+        fractions = _role_fraction_targets(
+            policy,
+            role=directive.role,
+            cadence_profile=cadence_profile,
+        )
+        if fractions is None:
+            continue
+        close_fraction, nonwide_fraction = fractions
+        count = len(segment_indices)
+        duration_by_position = {
+            position: (
+                segment_by_index[segment_index].end_seconds
+                - segment_by_index[segment_index].start_seconds
+            )
+            for position, segment_index in enumerate(segment_indices)
+        }
+        total_duration = sum(duration_by_position.values())
+        close_availability_by_position: dict[int, float] = {}
+        nonwide_availability_by_position: dict[int, float] = {}
+        wide_availability_by_position: dict[int, float] = {}
+        for position, segment_index in enumerate(segment_indices):
+            segment = candidates_by_index[segment_index]
+            close_availability = 0.0
+            nonwide_availability = 0.0
+            wide_availability = 0.0
+            for candidate in segment:
+                if (
+                    reachable_candidate_keys is not None
+                    and (candidate.segment_index, candidate.source_id)
+                    not in reachable_candidate_keys
+                ):
+                    continue
+                samples, formation_proven = _candidate_role_shot_samples(
+                    candidate,
+                    subject_metadata,
+                )
+                close = samples.count("close") / 3.0
+                wide = samples.count("wide") / 3.0
+                nonwide = (
+                    samples.count("close") + samples.count("medium")
+                ) / 3.0
+                close_availability = max(close_availability, close)
+                nonwide_availability = max(nonwide_availability, nonwide)
+                wide_availability = max(
+                    wide_availability,
+                    wide * (1.0 if formation_proven else 0.72),
+                )
+            close_availability_by_position[position] = close_availability
+            nonwide_availability_by_position[position] = nonwide_availability
+            wide_availability_by_position[position] = wide_availability
+        mandatory_wide_positions: set[int] = set()
+        phrase_entry_positions: list[int] = []
+        if directive.role is SectionRole.CHORUS_LIKE:
+            mandatory_wide_positions.add(0)
+            for local_position, segment_index in enumerate(segment_indices):
+                start = segment_by_index[segment_index].start_seconds
+                if local_position == 0 or any(
+                    math.isclose(start, value, rel_tol=0.0, abs_tol=1e-6)
+                    for value in phrases
+                ):
+                    phrase_entry_positions.append(local_position)
+            required_phrase_wide = int(
+                math.ceil(
+                    policy.minimum_phrase_entry_wide_anchor_fraction
+                    * len(phrase_entry_positions)
+                    - 1e-12
+                )
+            )
+            mandatory_wide_positions = _preferred_spread_positions(
+                phrase_entry_positions,
+                required_phrase_wide,
+                preference_by_position=wide_availability_by_position,
+                seeded_positions=mandatory_wide_positions,
+            )
+        wide_budget_positions = _wide_positions_for_duration_target(
+            tuple(range(count)),
+            duration_by_position=duration_by_position,
+            maximum_wide_seconds=(1.0 - nonwide_fraction) * total_duration,
+            mandatory_positions=mandatory_wide_positions,
+            preference_by_position={
+                position: (
+                    wide_availability_by_position[position]
+                    - 0.30 * close_availability_by_position[position]
+                    - 0.15 * nonwide_availability_by_position[position]
+                )
+                for position in range(count)
+            },
+        )
+
+        # ``1 - preferred_nonwide_fraction`` is a ceiling on how much wide
+        # coverage the human-reference grammar can tolerate, not a quota that
+        # the selector must fill.  Pre-assigning every position up to that
+        # ceiling made the later Viterbi path add unavoidable connector wides
+        # on top, leaving real XOXZ chorus paths below the non-wide floor even
+        # though safe non-wide candidates were reachable.  Protect only the
+        # evidence-backed formation anchors here; all remaining positions may
+        # choose their best graph-compatible close/non-wide candidate.  The
+        # decoded montage reviewer still requires real formation-wide anchors
+        # and resets, so this does not erase the wide-shot grammar.
+        wide_positions = set(mandatory_wide_positions)
+
+        nonwide_positions = [
+            position for position in range(count) if position not in wide_positions
+        ]
+        close_positions: set[int] = set()
+        if directive.role is SectionRole.CHORUS_LIKE:
+            # Seed one close frame in each qualifying nonwide pair so the
+            # decoded reviewer can observe close/nonwide bursts followed by a
+            # real wide reset.  This remains a soft source preference.
+            run: list[int] = []
+            for position in range(count + 1):
+                if position < count and position not in wide_positions:
+                    run.append(position)
+                    continue
+                if len(run) >= 2:
+                    close_positions.add(
+                        max(
+                            run,
+                            key=lambda value: (
+                                close_availability_by_position[value],
+                                duration_by_position[value],
+                                -value,
+                            ),
+                        )
+                    )
+                run = []
+        close_positions = _close_positions_for_duration_target(
+            nonwide_positions,
+            duration_by_position=duration_by_position,
+            minimum_close_seconds=close_fraction * total_duration,
+            seeded_positions=close_positions,
+            preference_by_position=close_availability_by_position,
+        )
+        for local_position, segment_index in enumerate(segment_indices):
+            targets[segment_index] = (
+                "wide"
+                if local_position in wide_positions
+                else "close"
+                if local_position in close_positions
+                else "nonwide"
+            )
+        section_audit.append(
+            {
+                "section_index": section_index,
+                "role": directive.role.value,
+                "segment_count": count,
+                "target_closeup_fraction": close_fraction,
+                "target_nonwide_fraction": nonwide_fraction,
+                "assigned_closeup_duration_fraction": (
+                    sum(
+                        duration_by_position[position]
+                        for position in close_positions
+                    )
+                    / total_duration
+                ),
+                "assigned_nonwide_duration_fraction": (
+                    sum(
+                        duration_by_position[position]
+                        for position in nonwide_positions
+                    )
+                    / total_duration
+                ),
+                "target_wide_position_count": len(wide_positions),
+                "wide_budget_position_count": len(wide_budget_positions),
+                "optional_wide_budget_position_count": len(
+                    wide_budget_positions - mandatory_wide_positions
+                ),
+                "optional_wide_budget_forced": False,
+                "target_close_position_count": len(close_positions),
+                "target_nonwide_position_count": count - len(wide_positions),
+                "mandatory_wide_positions": sorted(
+                    mandatory_wide_positions
+                ),
+                "phrase_entry_positions": phrase_entry_positions,
+                "availability_aware_target_assignment": True,
+            }
+        )
+    return targets, {
+        "cadence_profile": cadence_profile,
+        "section_targets": section_audit,
+        "target_segment_count": len(targets),
+    }
+
+
+def _candidate_role_shot_samples(
+    candidate: TimelineCandidate,
+    subject_metadata_by_candidate: Mapping[str, "_CandidateSubjectMetadata"],
+) -> tuple[tuple[str, str, str], bool]:
+    shot_types = (
+        candidate.entry_shot_type or candidate.shot_type,
+        candidate.shot_type,
+        candidate.exit_shot_type or candidate.shot_type,
+    )
+    metadata = subject_metadata_by_candidate.get(candidate.candidate_id)
+    bases = (
+        metadata.shot_scale_bases
+        if metadata is not None
+        else ("legacy", "legacy", "legacy")
+    )
+    samples: list[str] = []
+    for shot_type, basis in zip(shot_types, bases, strict=True):
+        if shot_type in {ShotType.GROUP_WIDE, ShotType.WIDE}:
+            samples.append("wide")
+        elif shot_type is ShotType.CLOSE_UP:
+            samples.append("close")
+        elif basis == "unknown_no_subject_geometry":
+            samples.append("unknown")
+        else:
+            samples.append("medium")
+    formation_proven = bool(
+        metadata is not None
+        and (
+            max(metadata.formation_person_counts, default=0) >= 4
+            or max(metadata.formation_upper_body_counts, default=0) >= 1
+        )
+    )
+    return (tuple(samples), formation_proven)
+
+
+def _role_conditioned_visual_controls(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    section_plan: SectionPlan,
+    phrase_times: Sequence[float],
+    policy: ProfessionalMontageSelectionPolicy,
+    cadence_profile: str,
+    subject_metadata_by_candidate: Mapping[str, "_CandidateSubjectMetadata"],
+    timeline_config: TimelineConfig | None = None,
+) -> tuple[dict[tuple[int, str], float], dict[int, float], dict[str, Any]]:
+    reachable_candidate_keys = _complete_path_reachable_candidate_keys(
+        candidates_by_segment,
+        timeline_config=timeline_config or TimelineConfig(),
+    )
+    targets, audit = _role_target_categories(
+        candidates_by_segment,
+        section_plan=section_plan,
+        phrase_times=phrase_times,
+        policy=policy,
+        cadence_profile=cadence_profile,
+        subject_metadata_by_candidate=subject_metadata_by_candidate,
+        reachable_candidate_keys=reachable_candidate_keys,
+    )
+    # A complete source-local emission spans roughly 0...2.3, while the sum of
+    # all admitted transition terms can still exceed 16.  Wide separation is
+    # intentional: balanced preserves aesthetics-first exploration, reference
+    # makes the human motif decisive, and dense_safe is a lexicographic grammar
+    # exploration inside the unchanged visual hard-gate graph.
+    strength = {
+        "balanced": 8.00,
+        "reference": 32.00,
+        "dense_safe": 128.00,
+    }[cadence_profile]
+    adjustments: dict[tuple[int, str], float] = {}
+    penalized = 0
+    availability: dict[int, dict[str, float | int]] = {}
+    for segment in candidates_by_segment:
+        reference = segment[0]
+        target = targets.get(reference.segment_index)
+        if target is None:
+            continue
+        directive = section_plan.directive_at(reference.start_seconds)
+        duration = reference.end_seconds - reference.start_seconds
+        best_close = 0.0
+        best_nonwide = 0.0
+        best_wide = 0.0
+        exact_target_available = False
+        for candidate in segment:
+            if (
+                candidate.segment_index,
+                candidate.source_id,
+            ) not in reachable_candidate_keys:
+                continue
+            samples, formation_proven = _candidate_role_shot_samples(
+                candidate,
+                subject_metadata_by_candidate,
+            )
+            close_fraction = samples.count("close") / 3.0
+            wide_fraction = samples.count("wide") / 3.0
+            unknown_fraction = samples.count("unknown") / 3.0
+            nonwide_fraction = (
+                samples.count("close") + samples.count("medium")
+            ) / 3.0
+            best_close = max(best_close, close_fraction)
+            best_nonwide = max(best_nonwide, nonwide_fraction)
+            best_wide = max(best_wide, wide_fraction)
+            if target == "wide":
+                penalty = strength * (1.0 - wide_fraction)
+                if not formation_proven:
+                    penalty += 0.30 * strength
+                exact_target_available = exact_target_available or (
+                    math.isclose(
+                        wide_fraction,
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    and formation_proven
+                )
+            elif target in {"close", "nonwide"}:
+                role_targets = _role_fraction_targets(
+                    policy,
+                    role=directive.role,
+                    cadence_profile=cadence_profile,
+                )
+                if role_targets is None:  # pragma: no cover - target invariant
+                    raise RuntimeError(
+                        "role density target is missing for targeted section"
+                    )
+                close_target, nonwide_target = role_targets
+                close_pressure = min(
+                    0.90,
+                    max(0.20, close_target / max(nonwide_target, 1e-9)),
+                )
+                # Do not pin close-ups to one preselected beat.  All non-anchor
+                # positions compete for the section-wide duration quota, so a
+                # visually admitted close shot can move to the neighboring
+                # beat that actually connects to the full path.
+                penalty = strength * (
+                    wide_fraction
+                    + unknown_fraction
+                    + 0.45 * close_pressure * (1.0 - close_fraction)
+                )
+                exact_target_available = exact_target_available or (
+                    nonwide_fraction >= 1.0 - 1e-12
+                    and (
+                        target != "close"
+                        or close_fraction >= 1.0 - 1e-12
+                    )
+                )
+            else:  # pragma: no cover - helper invariant
+                raise RuntimeError("role-conditioned shot target is unknown")
+            if penalty > 1e-12:
+                adjustments[(candidate.segment_index, candidate.source_id)] = (
+                    -float(penalty)
+                )
+                penalized += 1
+
+        values = availability.setdefault(
+            directive.section_index,
+            {
+                "duration_seconds": 0.0,
+                "attainable_closeup_seconds": 0.0,
+                "attainable_nonwide_seconds": 0.0,
+                "attainable_wide_seconds": 0.0,
+                "target_segment_count": 0,
+                "exact_target_available_segment_count": 0,
+            },
+        )
+        values["duration_seconds"] = float(
+            values["duration_seconds"]
+        ) + duration
+        values["attainable_closeup_seconds"] = float(
+            values["attainable_closeup_seconds"]
+        ) + duration * best_close
+        values["attainable_nonwide_seconds"] = float(
+            values["attainable_nonwide_seconds"]
+        ) + duration * best_nonwide
+        values["attainable_wide_seconds"] = float(
+            values["attainable_wide_seconds"]
+        ) + duration * best_wide
+        values["target_segment_count"] = int(
+            values["target_segment_count"]
+        ) + 1
+        values["exact_target_available_segment_count"] = int(
+            values["exact_target_available_segment_count"]
+        ) + int(exact_target_available)
+
+    section_availability: list[dict[str, float | int]] = []
+    for section_index, values in sorted(availability.items()):
+        duration = float(values["duration_seconds"])
+        section_availability.append(
+            {
+                "section_index": section_index,
+                "duration_seconds": duration,
+                "attainable_closeup_duration_fraction_upper_bound": (
+                    float(values["attainable_closeup_seconds"]) / duration
+                ),
+                "attainable_nonwide_duration_fraction_upper_bound": (
+                    float(values["attainable_nonwide_seconds"]) / duration
+                ),
+                "attainable_wide_duration_fraction_upper_bound": (
+                    float(values["attainable_wide_seconds"]) / duration
+                ),
+                "target_segment_count": int(values["target_segment_count"]),
+                "exact_target_available_segment_count": int(
+                    values["exact_target_available_segment_count"]
+                ),
+            }
+        )
+
+    switch_bonus: dict[int, float] = {}
+    if cadence_profile == "balanced":
+        highlight_rate = (
+            policy.highlight_minimum_source_switches_per_minute
+        )
+        highlight_bonus = (
+            0.65 * highlight_rate
+        )
+    elif cadence_profile == "reference":
+        highlight_rate = (
+            policy.highlight_preferred_source_switches_per_minute
+        )
+        highlight_bonus = (
+            1.20 * highlight_rate
+        )
+    else:
+        highlight_rate = min(
+            30.0,
+            1.15 * policy.highlight_preferred_source_switches_per_minute,
+        )
+        highlight_bonus = min(
+            72.0,
+            2.40 * highlight_rate,
+        )
+    highlight_segments_by_section: dict[int, list[TimelineCandidate]] = {}
+    for segment in candidates_by_segment:
+        reference = segment[0]
+        directive = section_plan.directive_at(reference.start_seconds)
+        if directive.role is SectionRole.CHORUS_LIKE:
+            highlight_segments_by_section.setdefault(
+                directive.section_index,
+                [],
+            ).append(reference)
+    switch_target_audit: list[dict[str, Any]] = []
+    for section_index, references in sorted(
+        highlight_segments_by_section.items()
+    ):
+        if len(references) < 2:
+            continue
+        duration = references[-1].end_seconds - references[0].start_seconds
+        target_count = min(
+            len(references) - 1,
+            max(
+                1,
+                int(math.ceil(highlight_rate * duration / 60.0 - 1e-12)),
+            ),
+        )
+        local_positions = _evenly_spaced_positions(
+            tuple(range(1, len(references))),
+            target_count,
+        )
+        target_segment_indices = tuple(
+            references[position].segment_index
+            for position in sorted(local_positions)
+        )
+        for segment_index in target_segment_indices:
+            switch_bonus[segment_index] = highlight_bonus
+        switch_target_audit.append(
+            {
+                "section_index": section_index,
+                "duration_seconds": duration,
+                "target_source_switches_per_minute": highlight_rate,
+                "target_source_switch_count": target_count,
+                "bonus_segment_indices": list(target_segment_indices),
+            }
+        )
+    return adjustments, switch_bonus, {
+        **audit,
+        "penalty_strength": strength,
+        "penalized_candidate_count": penalized,
+        "emission_adjustment_count": len(adjustments),
+        "highlight_source_switch_bonus": highlight_bonus,
+        "highlight_source_switch_target_rate": highlight_rate,
+        "highlight_source_switch_targets": switch_target_audit,
+        "source_switch_bonus_override_segment_count": len(switch_bonus),
+        "section_candidate_availability": section_availability,
+        "flexible_role_density_allocation": True,
+        "fixed_role_positions": ["formation_wide_anchors"],
+        "complete_path_reachable_candidate_count": len(
+            reachable_candidate_keys
+        ),
+        "hard_visual_gate_relaxed": False,
+    }
+
+
+def _role_conditioned_candidate_outcomes(
+    records: Sequence["VisualTimelineCandidateRecord"],
+    *,
+    section_plan: SectionPlan,
+    policy: ProfessionalMontageSelectionPolicy,
+    subject_metadata_by_candidate: Mapping[
+        str, "_CandidateSubjectMetadata"
+    ],
+) -> tuple[dict[str, Any], ...]:
+    """Serialize scalar pre-render role attainment without claiming QA."""
+
+    outcomes: list[dict[str, Any]] = []
+    for record in records:
+        choices_by_section: dict[int, list[TimelineChoice]] = {}
+        for choice in record.timeline_result.choices:
+            directive = section_plan.directive_at(
+                choice.candidate.start_seconds
+            )
+            choices_by_section.setdefault(directive.section_index, []).append(
+                choice
+            )
+        sections: list[dict[str, Any]] = []
+        normalized_scores: list[float] = []
+        highlight_passes: list[bool] = []
+        highlight_scores: list[float] = []
+        for directive in section_plan.sections:
+            choices = choices_by_section.get(directive.section_index, [])
+            if not choices or directive.role not in {
+                SectionRole.BUILD,
+                SectionRole.CHORUS_LIKE,
+                SectionRole.BRIDGE_LIKE,
+            }:
+                continue
+            duration = sum(
+                choice.candidate.end_seconds
+                - choice.candidate.start_seconds
+                for choice in choices
+            )
+            close_seconds = 0.0
+            nonwide_seconds = 0.0
+            for choice in choices:
+                candidate = choice.candidate
+                span = candidate.end_seconds - candidate.start_seconds
+                samples, _formation_proven = _candidate_role_shot_samples(
+                    candidate,
+                    subject_metadata_by_candidate,
+                )
+                close_seconds += span * samples.count("close") / 3.0
+                nonwide_seconds += span * (
+                    samples.count("close") + samples.count("medium")
+                ) / 3.0
+            close_fraction = close_seconds / duration
+            nonwide_fraction = nonwide_seconds / duration
+            switches = sum(
+                outgoing.candidate.source_id
+                != incoming.candidate.source_id
+                for outgoing, incoming in zip(choices, choices[1:])
+            )
+            switches_per_minute = switches * 60.0 / duration
+            if directive.role is SectionRole.CHORUS_LIKE:
+                minimum_close = policy.highlight_minimum_closeup_fraction
+                minimum_nonwide = policy.highlight_minimum_nonwide_fraction
+                minimum_switches = (
+                    policy.highlight_minimum_source_switches_per_minute
+                )
+            elif directive.role is SectionRole.BUILD:
+                minimum_close = policy.build_minimum_closeup_fraction
+                minimum_nonwide = policy.build_minimum_nonwide_fraction
+                minimum_switches = None
+            else:
+                minimum_close = policy.bridge_minimum_closeup_fraction
+                minimum_nonwide = policy.bridge_minimum_nonwide_fraction
+                minimum_switches = None
+            requirements = [
+                min(1.0, close_fraction / max(minimum_close, 1e-9)),
+                min(1.0, nonwide_fraction / max(minimum_nonwide, 1e-9)),
+            ]
+            passed = bool(
+                close_fraction + 1e-9 >= minimum_close
+                and nonwide_fraction + 1e-9 >= minimum_nonwide
+                and (
+                    minimum_switches is None
+                    or switches_per_minute + 1e-9 >= minimum_switches
+                )
+            )
+            if minimum_switches is not None:
+                requirements.append(
+                    min(
+                        1.0,
+                        switches_per_minute / max(minimum_switches, 1e-9),
+                    )
+                )
+                highlight_passes.append(passed)
+            attainment_score = sum(requirements) / len(requirements)
+            normalized_scores.append(attainment_score)
+            if minimum_switches is not None:
+                highlight_scores.append(attainment_score)
+            sections.append(
+                {
+                    "section_index": directive.section_index,
+                    "role": directive.role.value,
+                    "duration_seconds": duration,
+                    "closeup_duration_fraction": close_fraction,
+                    "nonwide_duration_fraction": nonwide_fraction,
+                    "source_switch_count": switches,
+                    "source_switches_per_minute": switches_per_minute,
+                    "minimum_closeup_duration_fraction": minimum_close,
+                    "minimum_nonwide_duration_fraction": minimum_nonwide,
+                    "minimum_source_switches_per_minute": minimum_switches,
+                    "metadata_floor_passed": passed,
+                }
+            )
+        outcomes.append(
+            {
+                "candidate_index": record.candidate_index,
+                "cadence_profile": record.cadence_profile,
+                "metadata_role_attainment_score": (
+                    sum(normalized_scores) / len(normalized_scores)
+                    if normalized_scores
+                    else 0.0
+                ),
+                "minimum_highlight_metadata_attainment_score": (
+                    min(highlight_scores) if highlight_scores else 0.0
+                ),
+                "highlight_metadata_floor_pass_count": sum(highlight_passes),
+                "highlight_metadata_floor_count": len(highlight_passes),
+                "all_highlight_metadata_floors_passed": bool(
+                    highlight_passes and all(highlight_passes)
+                ),
+                "timeline_review_passed": record.review.passed,
+                "timeline_review_hard_failure_codes": [
+                    issue.code for issue in record.review.hard_failures
+                ],
+                "sections": sections,
+                "decoded_output_authority": False,
+            }
+        )
+    return tuple(outcomes)
+
+
 def _select_safe_cadence_candidates(
     candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
     *,
     preferred_source_ids: Sequence[str | None] | None,
     diversity: VisualDiversityConfig,
     maximum_results: int = 32,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_policy: (
+        ProfessionalMontageSelectionPolicy | None
+    ) = None,
+    subject_metadata_by_candidate: Mapping[
+        str, "_CandidateSubjectMetadata"
+    ] | None = None,
+    role_conditioning_audit: list[dict[str, Any]] | None = None,
 ) -> tuple[tuple[TimelineResult, ...], tuple[str, ...]]:
     """Generate profile-local alternatives, then interleave unique paths."""
 
     profiles = _safe_cadence_profiles(diversity)
-    pools = tuple(
-        select_timeline_candidates(
+    if (section_plan is None) != (professional_montage_policy is None):
+        raise ValueError(
+            "section_plan and professional_montage_policy must be supplied together"
+        )
+    metadata = dict(subject_metadata_by_candidate or {})
+    pools: list[tuple[TimelineResult, ...]] = []
+    for profile in profiles:
+        selection_kwargs: dict[str, Any] = {}
+        if professional_montage_policy is not None:
+            assert section_plan is not None
+            adjustments, switch_bonus, audit = (
+                _role_conditioned_visual_controls(
+                    candidates_by_segment,
+                    section_plan=section_plan,
+                    phrase_times=phrase_times,
+                    policy=professional_montage_policy,
+                    cadence_profile=profile.name,
+                    subject_metadata_by_candidate=metadata,
+                    timeline_config=profile.config,
+                )
+            )
+            selection_kwargs.update(
+                {
+                    "emission_adjustments": adjustments,
+                    "source_switch_bonus_by_segment": switch_bonus,
+                }
+            )
+            if role_conditioning_audit is not None:
+                role_conditioning_audit.append(audit)
+        pools.append(
+            select_timeline_candidates(
             candidates_by_segment,
             config=profile.config,
             preferred_source_ids=preferred_source_ids,
             maximum_results=16,
             diversity_penalty=0.12,
             minimum_hamming_fraction=0.02,
+            **selection_kwargs,
         )
-        for profile in profiles
-    )
+        )
+    pooled = tuple(pools)
     candidates: list[TimelineResult] = []
     cadence_profiles: list[str] = []
     signatures: set[tuple[str, ...]] = set()
-    for rank in range(max(len(pool) for pool in pools)):
-        for profile, pool in zip(profiles, pools, strict=True):
+    for rank in range(max(len(pool) for pool in pooled)):
+        for profile, pool in zip(profiles, pooled, strict=True):
             if rank >= len(pool):
                 continue
             result = pool[rank]
@@ -486,6 +1555,7 @@ class VisualTimelineChoice:
     exit_shot_type: ShotType | None = None
     entry_scene_cut_near: bool = False
     exit_scene_cut_near: bool = False
+    intentional_transition_anchor_basis: str | None = None
     internal_scene_cut_master_seconds: tuple[float, ...] = ()
     entry_boundary_side_stability: BoundarySideStability | None = None
     exit_boundary_side_stability: BoundarySideStability | None = None
@@ -620,6 +1690,9 @@ class VisualTimelineChoice:
             ),
             "entry_scene_cut_near": self.entry_scene_cut_near,
             "exit_scene_cut_near": self.exit_scene_cut_near,
+            "intentional_transition_anchor_basis": (
+                self.intentional_transition_anchor_basis
+            ),
             "internal_scene_cut_master_seconds": list(
                 self.internal_scene_cut_master_seconds
             ),
@@ -879,6 +1952,7 @@ class VisualTimelineCandidateSet:
         "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
     )
     minimum_materialization_target: int = 8
+    role_conditioned_selection: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         records = tuple(self.candidates)
@@ -891,6 +1965,13 @@ class VisualTimelineCandidateSet:
         )
         face_metadata = MappingProxyType(dict(self.face_metadata_by_candidate))
         subject_metadata = MappingProxyType(dict(self.subject_metadata_by_candidate))
+        role_conditioning = (
+            None
+            if self.role_conditioned_selection is None
+            else MappingProxyType(
+                deepcopy(dict(self.role_conditioned_selection))
+            )
+        )
         object.__setattr__(self, "candidates", records)
         object.__setattr__(self, "sources", sources)
         object.__setattr__(self, "audio_offsets", offsets)
@@ -898,6 +1979,7 @@ class VisualTimelineCandidateSet:
         object.__setattr__(self, "scene_cut_times", scene_cuts)
         object.__setattr__(self, "face_metadata_by_candidate", face_metadata)
         object.__setattr__(self, "subject_metadata_by_candidate", subject_metadata)
+        object.__setattr__(self, "role_conditioned_selection", role_conditioning)
         if (
             isinstance(self.requested_maximum_results, bool)
             or not isinstance(self.requested_maximum_results, int)
@@ -999,6 +2081,128 @@ class VisualTimelineCandidateSet:
         return tuple(sorted(self.candidates, key=lambda item: item.review_rank))
 
     @property
+    def role_conditioned_ranked_candidates(
+        self,
+    ) -> tuple[VisualTimelineCandidateRecord, ...]:
+        """Preserve human-grammar candidates before generic review tie-breaks.
+
+        The scalar metadata estimate only orders candidates for decoded proxy
+        review; it never replaces the decoded-output montage authority.
+        """
+
+        payload = self.role_conditioned_selection
+        if payload is None:
+            return self.ranked_candidates
+        raw_outcomes = payload.get("candidate_outcomes")
+        if not isinstance(raw_outcomes, list):
+            raise ValueError(
+                "role-conditioned candidate outcomes are missing"
+            )
+        outcomes: dict[int, Mapping[str, Any]] = {}
+        for raw in raw_outcomes:
+            if not isinstance(raw, Mapping):
+                raise ValueError("role-conditioned candidate outcome is invalid")
+            candidate_index = raw.get("candidate_index")
+            score = raw.get("metadata_role_attainment_score")
+            highlight_score = raw.get(
+                "minimum_highlight_metadata_attainment_score"
+            )
+            passed = raw.get("all_highlight_metadata_floors_passed")
+            if (
+                isinstance(candidate_index, bool)
+                or not isinstance(candidate_index, int)
+                or candidate_index in outcomes
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0.0 <= float(score) <= 1.0
+                or isinstance(highlight_score, bool)
+                or not isinstance(highlight_score, (int, float))
+                or not math.isfinite(float(highlight_score))
+                or not 0.0 <= float(highlight_score) <= 1.0
+                or not isinstance(passed, bool)
+            ):
+                raise ValueError(
+                    "role-conditioned candidate outcome values are invalid"
+                )
+            outcomes[candidate_index] = raw
+        if set(outcomes) != {
+            record.candidate_index for record in self.candidates
+        }:
+            raise ValueError(
+                "role-conditioned outcomes do not bind every candidate"
+            )
+
+        def priority(record: VisualTimelineCandidateRecord) -> tuple[Any, ...]:
+            outcome = outcomes[record.candidate_index]
+            return (
+                bool(outcome["all_highlight_metadata_floors_passed"]),
+                float(
+                    outcome[
+                        "minimum_highlight_metadata_attainment_score"
+                    ]
+                ),
+                float(outcome["metadata_role_attainment_score"]),
+                record.review.passed,
+                -len(record.review.hard_failures),
+                record.review.weighted_score,
+                -record.review_rank,
+            )
+
+        qualified = sorted(
+            (
+                record
+                for record in self.candidates
+                if bool(
+                    outcomes[record.candidate_index][
+                        "all_highlight_metadata_floors_passed"
+                    ]
+                )
+            ),
+            key=priority,
+            reverse=True,
+        )
+        ordered = list(qualified)
+        used = {record.candidate_index for record in ordered}
+        remaining_by_profile: dict[
+            str, list[VisualTimelineCandidateRecord]
+        ] = {}
+        for record in self.candidates:
+            if record.candidate_index in used:
+                continue
+            remaining_by_profile.setdefault(record.cadence_profile, []).append(
+                record
+            )
+        for records in remaining_by_profile.values():
+            records.sort(key=priority, reverse=True)
+        profile_order = tuple(
+            profile
+            for profile in ("balanced", "reference", "dense_safe")
+            if profile in remaining_by_profile
+        ) + tuple(
+            sorted(
+                set(remaining_by_profile)
+                - {"balanced", "reference", "dense_safe"}
+            )
+        )
+        rank = 0
+        while len(ordered) < len(self.candidates):
+            appended = False
+            for profile in profile_order:
+                records = remaining_by_profile[profile]
+                if rank < len(records):
+                    ordered.append(records[rank])
+                    appended = True
+            if not appended:
+                break
+            rank += 1
+        if len(ordered) != len(self.candidates):
+            raise RuntimeError(
+                "role-conditioned candidate ordering lost candidates"
+            )
+        return tuple(ordered)
+
+    @property
     def minimum_materialization_target_satisfied(self) -> bool:
         return len(self.candidates) >= self.minimum_materialization_target
 
@@ -1027,6 +2231,11 @@ class VisualTimelineCandidateSet:
             "source_count": len(self.sources),
             "source_clock_basis": self.source_clock_basis,
             "per_shot_quality_soft_floor": _quality_soft_floor_policy(),
+            "role_conditioned_selection": (
+                deepcopy(dict(self.role_conditioned_selection))
+                if self.role_conditioned_selection is not None
+                else None
+            ),
             "transient_materialization_metadata": {
                 "scene_cut_source_count": len(self.scene_cut_times),
                 "face_candidate_count": len(self.face_metadata_by_candidate),
@@ -1043,7 +2252,7 @@ class VisualTimelinePlan:
     choices: tuple[VisualTimelineChoice, ...]
     optimizer_score: float
     analysis_basis: str = (
-        "reviewed_thirty_two_candidate_shot_hierarchy_boundary_stability_safe_v13"
+        "reviewed_thirty_two_candidate_shot_hierarchy_phrase_anchor_contrast_v14"
     )
     selected_candidate_index: int = 0
     candidate_generation_basis: str = (
@@ -2268,12 +3477,27 @@ def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
     opencv_build_digest = hashlib.sha256(
         cv2.getBuildInformation().encode("utf-8")
     ).hexdigest()
+    descriptor_implementation_digest = python_symbol_dependency_sha256(
+        Path(__file__),
+        root_symbols=(
+            "FrameVisualDescriptor",
+            "_VideoSampler",
+            "_descriptor_cache_payload",
+            "_descriptor_from_cache_payload",
+            "describe_frame",
+        ),
+    )
     _VISUAL_ANALYZER_FINGERPRINT = build_analyzer_fingerprint(
         descriptor_schema=(
             "frame_visual_descriptor_v1_numeric_geometry_pose_silhouette_"
             "nanodet_formation_motion_no_sface_no_raw_frame"
         ),
-        code_paths=(Path(__file__), Path(__file__).with_name("pose.py")),
+        code_paths=(Path(__file__).with_name("pose.py"),),
+        code_digests={
+            "visual_score_descriptor_ast_v1": (
+                descriptor_implementation_digest
+            ),
+        },
         model_assets=model_assets,
         runtime_components={
             "opencv": str(cv2.__version__),
@@ -2725,9 +3949,13 @@ class _VideoSampler:
         self.descriptor_cache: OrderedDict[
             DescriptorRequestIdentity, FrameVisualDescriptor | None
         ] = OrderedDict()
+        self.descriptor_locator_cache: OrderedDict[
+            DescriptorRequestLocator, FrameVisualDescriptor | None
+        ] = OrderedDict()
         self.sface_cache: OrderedDict[
             CanonicalFrameIdentity, tuple[float, ...]
         ] = OrderedDict()
+        self.frame_decode_count = 0
         self.persistent_feature_cache: PersistentVisualFeatureCache | None = None
         if feature_cache_directory is not None:
             try:
@@ -2760,6 +3988,7 @@ class _VideoSampler:
                 key.canonical_seconds * 1000.0,
             )
             success, frame = self.capture.read()
+            self.frame_decode_count += 1
             self.cache[key] = _working_frame(frame) if success else None
             while len(self.cache) > 32:
                 self.cache.popitem(last=False)
@@ -2787,21 +4016,50 @@ class _VideoSampler:
     ) -> FrameVisualDescriptor | None:
         """Return one exact descriptor with optional persistent reuse."""
 
-        frame = self.frame_at(seconds)
-        if frame is None:
-            return None
         primary = self.frame_identity(seconds)
         following = (
             self.frame_identity(following_seconds)
             if following_seconds is not None
             else None
         )
+        locator = DescriptorRequestLocator(
+            primary=primary,
+            following=following,
+            include_subject_geometry=include_subject_geometry,
+            include_formation_pose=include_formation_pose,
+        )
+        if locator in self.descriptor_locator_cache:
+            self.descriptor_locator_cache.move_to_end(locator)
+            return self.descriptor_locator_cache[locator]
+        persistent = self.persistent_feature_cache
+        if persistent is not None:
+            cached = persistent.get_by_locator(locator)
+            if cached is not None:
+                try:
+                    descriptor = _descriptor_from_cache_payload(cached)
+                except (TypeError, ValueError):
+                    descriptor = None
+                if descriptor is not None and _descriptor_matches_analyzer_runtime(
+                    descriptor,
+                    analyzer=persistent.analyzer,
+                    include_subject_geometry=include_subject_geometry,
+                ):
+                    self.descriptor_locator_cache[locator] = descriptor
+                    while len(self.descriptor_locator_cache) > 64:
+                        self.descriptor_locator_cache.popitem(last=False)
+                    return descriptor
+
+        frame = self.frame_at(seconds)
+        if frame is None:
+            self.descriptor_locator_cache[locator] = None
+            return None
         following_frame = (
             self.frame_at(following_seconds)
             if following_seconds is not None
             else None
         )
         if following_seconds is not None and following_frame is None:
+            self.descriptor_locator_cache[locator] = None
             return None
         request = DescriptorRequestIdentity(
             primary=primary,
@@ -2820,7 +4078,6 @@ class _VideoSampler:
             self.descriptor_cache.move_to_end(request)
             return self.descriptor_cache[request]
         descriptor: FrameVisualDescriptor | None = None
-        persistent = self.persistent_feature_cache
         if persistent is not None:
             cached = persistent.get(request)
             if cached is not None:
@@ -2860,6 +4117,9 @@ class _VideoSampler:
         self.descriptor_cache[request] = descriptor
         while len(self.descriptor_cache) > 64:
             self.descriptor_cache.popitem(last=False)
+        self.descriptor_locator_cache[locator] = descriptor
+        while len(self.descriptor_locator_cache) > 64:
+            self.descriptor_locator_cache.popitem(last=False)
         return descriptor
 
     def descriptor_at(self, seconds: float) -> FrameVisualDescriptor | None:
@@ -2915,16 +4175,18 @@ class _VideoSampler:
         self.cache.clear()
         self.frame_digest_cache.clear()
         self.descriptor_cache.clear()
+        self.descriptor_locator_cache.clear()
         # SFace appearance vectors are RAM-only and explicitly dropped as soon
         # as the sampler closes; they never enter PersistentVisualFeatureCache.
         self.sface_cache.clear()
 
     def feature_cache_diagnostics(self) -> dict[str, Any] | None:
-        return (
-            self.persistent_feature_cache.diagnostics()
-            if self.persistent_feature_cache is not None
-            else None
-        )
+        if self.persistent_feature_cache is None:
+            return None
+        return {
+            **self.persistent_feature_cache.diagnostics(),
+            "source_frame_decode_count": self.frame_decode_count,
+        }
 
 
 def _face_geometry_boundary_window(
@@ -3242,6 +4504,250 @@ def _selected_dissolve_evidence(
     return (entry, exit_)
 
 
+_DISSOLVE_EVIDENCE_FIELD_NAMES = (
+    "dissolve_entry_face_geometry_window",
+    "dissolve_exit_face_geometry_window",
+    "dissolve_entry_face_box_window",
+    "dissolve_exit_face_box_window",
+    "dissolve_entry_face_identity_window",
+    "dissolve_exit_face_identity_window",
+    "dissolve_entry_pose_embedding_window",
+    "dissolve_exit_pose_embedding_window",
+    "dissolve_entry_pose_backend_window",
+    "dissolve_exit_pose_backend_window",
+    "dissolve_entry_pose_confidence_window",
+    "dissolve_exit_pose_confidence_window",
+    "dissolve_entry_silhouette_embedding_window",
+    "dissolve_exit_silhouette_embedding_window",
+    "dissolve_entry_silhouette_backend_window",
+    "dissolve_exit_silhouette_backend_window",
+    "dissolve_entry_silhouette_confidence_window",
+    "dissolve_exit_silhouette_confidence_window",
+)
+_DISSOLVE_REHYDRATION_ANALYSIS_BASIS = (
+    "post_repair_ram_dissolve_rehydration_v1"
+)
+
+
+def _choice_can_enter_dissolve_postpass(
+    choice: VisualTimelineChoice,
+) -> bool:
+    """Apply the retained face-metadata prefilter to a materialized choice."""
+
+    return bool(
+        choice.face_match_candidate_failure is None
+        and all(backend == "yunet" for backend in choice.face_detector_backends)
+        and all(
+            landmarks is not None and len(landmarks) == 5
+            for landmarks in choice.face_landmark_samples_xy
+        )
+    )
+
+
+def rehydrate_visual_timeline_dissolve_evidence(
+    visual_timeline: VisualTimelinePlan,
+    *,
+    sources: Sequence[Path],
+    audio_offsets: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    feature_cache_directory: Path | None = None,
+) -> VisualTimelinePlan:
+    """Re-measure transient dissolve evidence on the final repaired clock.
+
+    Checkpoints deliberately omit raw SFace, pose, and silhouette vectors, and
+    local boundary repair invalidates evidence sampled at the former cut time.
+    This authoritative post-repair pass therefore clears *all* retained
+    dissolve fields before sampling only eligible selected source switches.
+    SFace vectors remain process-local inside the returned immutable plan;
+    :meth:`VisualTimelineChoice.to_dict` continues to serialize counts and
+    backend/confidence metadata only.
+    """
+
+    if not isinstance(visual_timeline, VisualTimelinePlan):
+        raise TypeError("visual_timeline must be a VisualTimelinePlan")
+    if not visual_timeline.choices:
+        raise ValueError("visual timeline cannot be empty")
+    source_paths = tuple(Path(path) for path in sources)
+    if not source_paths:
+        raise ValueError("dissolve evidence rehydration needs sources")
+    if not (
+        len(source_paths) == len(audio_offsets) == len(scene_cut_times)
+    ):
+        raise ValueError(
+            "dissolve evidence source arrays must have matching lengths"
+        )
+    clock_maps = _source_clock_maps(
+        source_timewarps,
+        audio_offsets=audio_offsets,
+        source_count=len(source_paths),
+    )
+    if any(
+        choice.source_index < 0 or choice.source_index >= len(source_paths)
+        for choice in visual_timeline.choices
+    ):
+        raise ValueError("visual timeline references an unknown source")
+    for outgoing, incoming in zip(
+        visual_timeline.choices,
+        visual_timeline.choices[1:],
+    ):
+        if not math.isclose(
+            outgoing.canonical_master_end,
+            incoming.canonical_master_start,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "visual timeline contains a non-contiguous dissolve boundary"
+            )
+
+    empty_fields = {
+        name: () for name in _DISSOLVE_EVIDENCE_FIELD_NAMES
+    }
+    cleared_choices = tuple(
+        replace(choice, **empty_fields)
+        for choice in visual_timeline.choices
+    )
+    eligible_boundaries = tuple(
+        (boundary_index, outgoing, incoming)
+        for boundary_index, (outgoing, incoming) in enumerate(
+            zip(cleared_choices, cleared_choices[1:])
+        )
+        if outgoing.source_index != incoming.source_index
+        and incoming.duration_seconds + 1e-9 >= _DISSOLVE_HANDLE_SECONDS
+        and _choice_can_enter_dissolve_postpass(outgoing)
+        and _choice_can_enter_dissolve_postpass(incoming)
+    )
+
+    entry_by_choice_index: dict[int, _DissolveEvidence] = {}
+    exit_by_choice_index: dict[int, _DissolveEvidence] = {}
+    samplers: dict[int, _VideoSampler] = {}
+
+    def sampler_for(source_index: int) -> _VideoSampler:
+        sampler = samplers.get(source_index)
+        if sampler is None:
+            sampler = _VideoSampler(
+                source_paths[source_index],
+                feature_cache_directory=feature_cache_directory,
+            )
+            samplers[source_index] = sampler
+        return sampler
+
+    try:
+        for boundary_index, outgoing, incoming in eligible_boundaries:
+            boundary_master_seconds = outgoing.canonical_master_end
+            handle_master_times = (
+                boundary_master_seconds,
+                boundary_master_seconds + _DISSOLVE_HANDLE_SECONDS / 2.0,
+                boundary_master_seconds + _DISSOLVE_HANDLE_SECONDS,
+            )
+            outgoing_source = outgoing.source_index
+            incoming_source = incoming.source_index
+            exit_by_choice_index[boundary_index] = _dissolve_evidence_window(
+                sampler_for(outgoing_source),
+                sample_times_seconds=tuple(
+                    _source_clock_time(
+                        master_time,
+                        source_index=outgoing_source,
+                        audio_offsets=audio_offsets,
+                        source_timewarps=clock_maps,
+                    )
+                    for master_time in handle_master_times
+                ),
+                scene_cut_times=scene_cut_times[outgoing_source],
+            )
+            entry_by_choice_index[boundary_index + 1] = (
+                _dissolve_evidence_window(
+                    sampler_for(incoming_source),
+                    sample_times_seconds=tuple(
+                        _source_clock_time(
+                            master_time,
+                            source_index=incoming_source,
+                            audio_offsets=audio_offsets,
+                            source_timewarps=clock_maps,
+                        )
+                        for master_time in handle_master_times
+                    ),
+                    scene_cut_times=scene_cut_times[incoming_source],
+                )
+            )
+    finally:
+        for sampler in samplers.values():
+            sampler.close()
+
+    rehydrated_choices: list[VisualTimelineChoice] = []
+    for choice_index, choice in enumerate(cleared_choices):
+        entry_evidence = entry_by_choice_index.get(
+            choice_index,
+            _DissolveEvidence(),
+        )
+        exit_evidence = exit_by_choice_index.get(
+            choice_index,
+            _DissolveEvidence(),
+        )
+        rehydrated_choices.append(
+            replace(
+                choice,
+                dissolve_entry_face_geometry_window=(
+                    entry_evidence.face_geometry
+                ),
+                dissolve_exit_face_geometry_window=exit_evidence.face_geometry,
+                dissolve_entry_face_box_window=entry_evidence.face_boxes,
+                dissolve_exit_face_box_window=exit_evidence.face_boxes,
+                dissolve_entry_face_identity_window=(
+                    entry_evidence.face_identity_embeddings
+                ),
+                dissolve_exit_face_identity_window=(
+                    exit_evidence.face_identity_embeddings
+                ),
+                dissolve_entry_pose_embedding_window=(
+                    entry_evidence.pose_embeddings
+                ),
+                dissolve_exit_pose_embedding_window=(
+                    exit_evidence.pose_embeddings
+                ),
+                dissolve_entry_pose_backend_window=entry_evidence.pose_backends,
+                dissolve_exit_pose_backend_window=exit_evidence.pose_backends,
+                dissolve_entry_pose_confidence_window=(
+                    entry_evidence.pose_confidences
+                ),
+                dissolve_exit_pose_confidence_window=(
+                    exit_evidence.pose_confidences
+                ),
+                dissolve_entry_silhouette_embedding_window=(
+                    entry_evidence.silhouette_embeddings
+                ),
+                dissolve_exit_silhouette_embedding_window=(
+                    exit_evidence.silhouette_embeddings
+                ),
+                dissolve_entry_silhouette_backend_window=(
+                    entry_evidence.silhouette_backends
+                ),
+                dissolve_exit_silhouette_backend_window=(
+                    exit_evidence.silhouette_backends
+                ),
+                dissolve_entry_silhouette_confidence_window=(
+                    entry_evidence.silhouette_confidences
+                ),
+                dissolve_exit_silhouette_confidence_window=(
+                    exit_evidence.silhouette_confidences
+                ),
+            )
+        )
+
+    basis_tokens = visual_timeline.analysis_basis.split("+")
+    analysis_basis = visual_timeline.analysis_basis
+    if _DISSOLVE_REHYDRATION_ANALYSIS_BASIS not in basis_tokens:
+        analysis_basis = (
+            f"{analysis_basis}+{_DISSOLVE_REHYDRATION_ANALYSIS_BASIS}"
+        )
+    return replace(
+        visual_timeline,
+        choices=tuple(rehydrated_choices),
+        analysis_basis=analysis_basis,
+    )
+
+
 def _resolve_visual_timeline_candidate_record(
     candidate_set: VisualTimelineCandidateSet,
     candidate: int | VisualTimelineCandidateRecord | None,
@@ -3454,6 +4960,9 @@ def materialize_visual_timeline_candidate(
                 exit_shot_type=choice.exit_shot_type,
                 entry_scene_cut_near=choice.entry_scene_cut_near,
                 exit_scene_cut_near=choice.exit_scene_cut_near,
+                intentional_transition_anchor_basis=(
+                    choice.intentional_transition_anchor_basis
+                ),
                 internal_scene_cut_master_seconds=(
                     choice.internal_scene_cut_master_seconds
                 ),
@@ -3595,6 +5104,37 @@ def _describe_sampler_frame(
     return describe_frame(frame, **describe_arguments)
 
 
+def _professional_intentional_transition_anchor_basis(
+    master_start: float,
+    *,
+    section_plan: SectionPlan | None,
+    phrase_times: Sequence[float],
+    professional_policy: ProfessionalMontageSelectionPolicy | None,
+) -> str | None:
+    """Mark only authored highlight phrase entries for bounded contrast cuts."""
+
+    if section_plan is None or professional_policy is None:
+        return None
+    directive = section_plan.directive_at(master_start)
+    if directive.role not in {
+        SectionRole.BUILD,
+        SectionRole.CHORUS_LIKE,
+        SectionRole.BRIDGE_LIKE,
+    }:
+        return None
+    if not any(
+        math.isclose(
+            master_start,
+            float(phrase_time),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        for phrase_time in phrase_times
+    ):
+        return None
+    return INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
+
+
 def _build_visual_timeline(
     *,
     sources: Sequence[Path],
@@ -3604,6 +5144,11 @@ def _build_visual_timeline(
     scene_cut_times: Sequence[Sequence[float]],
     preferred_source_indices: Sequence[int] | None = None,
     diversity_config: VisualDiversityConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_selection_policy: (
+        ProfessionalMontageSelectionPolicy | None
+    ) = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
@@ -3706,6 +5251,16 @@ def _build_visual_timeline(
             if master_end <= master_start:
                 raise ValueError("canonical spans must have positive duration")
             duration = master_end - master_start
+            intentional_anchor_basis = (
+                _professional_intentional_transition_anchor_basis(
+                    master_start,
+                    section_plan=section_plan,
+                    phrase_times=phrase_times,
+                    professional_policy=(
+                        professional_montage_selection_policy
+                    ),
+                )
+            )
             candidates: list[TimelineCandidate] = []
             for source_index, sampler in enumerate(samplers):
                 source_start = _source_clock_time(
@@ -4060,6 +5615,9 @@ def _build_visual_timeline(
                         exit_shot_type=exit_descriptor.shot_type,
                         entry_scene_cut_near=entry_scene_cut_near,
                         exit_scene_cut_near=exit_scene_cut_near,
+                        intentional_transition_anchor_basis=(
+                            intentional_anchor_basis
+                        ),
                         internal_scene_cut_master_seconds=(
                             internal_scene_cut_master_seconds
                         ),
@@ -4138,6 +5696,7 @@ def _build_visual_timeline(
         "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
     )
     minimum_materialization_target = 8
+    role_conditioning_audit: list[dict[str, Any]] = []
     if prescribed_indices is None:
         timeline_candidates, candidate_cadence_profiles = (
             _select_safe_cadence_candidates(
@@ -4145,8 +5704,22 @@ def _build_visual_timeline(
                 preferred_source_ids=preferred_source_ids,
                 diversity=diversity,
                 maximum_results=maximum_candidate_results,
+                section_plan=section_plan,
+                phrase_times=phrase_times,
+                professional_montage_policy=(
+                    professional_montage_selection_policy
+                ),
+                subject_metadata_by_candidate=(
+                    subject_metadata_by_candidate
+                ),
+                role_conditioning_audit=role_conditioning_audit,
             )
         )
+        if professional_montage_selection_policy is not None:
+            candidate_generation_basis = (
+                "human_reference_role_conditioned_three_cadence_profiles_"
+                "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
+            )
     else:
         restricted_candidates: list[tuple[TimelineCandidate, ...]] = []
         for segment_index, (candidates, source_index) in enumerate(
@@ -4212,6 +5785,53 @@ def _build_visual_timeline(
             zip(timeline_candidates, candidate_reviews, strict=True)
         )
     )
+    role_conditioned_selection_payload: dict[str, Any] | None = None
+    if professional_montage_selection_policy is not None:
+        assert section_plan is not None
+        role_conditioned_selection_payload = {
+            "contract": (
+                "human_reference_role_conditioned_visual_candidate_"
+                "soft_controls_v1"
+            ),
+            "policy": professional_montage_selection_policy.to_dict(),
+            "section_plan_analysis_basis": section_plan.analysis_basis,
+            "phrase_boundary_count": len(
+                tuple(sorted({float(value) for value in phrase_times}))
+            ),
+            "cadence_profiles": role_conditioning_audit,
+            "intentional_phrase_anchor_transition_authority": {
+                "analysis_basis": (
+                    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
+                ),
+                "scope": ["build", "chorus_like", "bridge_like"],
+                "timing": "exact_acoustic_phrase_entry_only",
+                "authorized_mismatch_metrics": ["scale", "focus"],
+                "maximum_scale_mismatch": (
+                    INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH
+                ),
+                "maximum_focus_mismatch": (
+                    INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH
+                ),
+                "maximum_pose_mismatch": (
+                    INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH
+                ),
+                "layout_silhouette_formation_gates_unchanged": True,
+                "scene_cut_and_boundary_side_gates_unchanged": True,
+                "ordinary_boundaries_relaxed": False,
+            },
+            "candidate_outcomes": list(
+                _role_conditioned_candidate_outcomes(
+                    candidate_records,
+                    section_plan=section_plan,
+                    policy=professional_montage_selection_policy,
+                    subject_metadata_by_candidate=(
+                        subject_metadata_by_candidate
+                    ),
+                )
+            ),
+            "raw_visual_descriptors_persisted": False,
+            "decoded_output_montage_gate_required": True,
+        }
     candidate_set = VisualTimelineCandidateSet(
         candidates=candidate_records,
         selected_candidate_index=selected_candidate_index,
@@ -4228,6 +5848,7 @@ def _build_visual_timeline(
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         candidate_generation_basis=candidate_generation_basis,
         minimum_materialization_target=minimum_materialization_target,
+        role_conditioned_selection=role_conditioned_selection_payload,
     )
     if candidate_set_only:
         return candidate_set
@@ -4244,6 +5865,11 @@ def build_visual_timeline(
     scene_cut_times: Sequence[Sequence[float]],
     preferred_source_indices: Sequence[int] | None = None,
     diversity_config: VisualDiversityConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_selection_policy: (
+        ProfessionalMontageSelectionPolicy | None
+    ) = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
@@ -4258,6 +5884,11 @@ def build_visual_timeline(
         scene_cut_times=scene_cut_times,
         preferred_source_indices=preferred_source_indices,
         diversity_config=diversity_config,
+        section_plan=section_plan,
+        phrase_times=phrase_times,
+        professional_montage_selection_policy=(
+            professional_montage_selection_policy
+        ),
         source_timewarps=source_timewarps,
         progress_callback=progress_callback,
         feature_cache_directory=feature_cache_directory,
@@ -4278,6 +5909,11 @@ def build_visual_timeline_candidate_set(
     scene_cut_times: Sequence[Sequence[float]],
     preferred_source_indices: Sequence[int] | None = None,
     diversity_config: VisualDiversityConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_selection_policy: (
+        ProfessionalMontageSelectionPolicy | None
+    ) = None,
     source_timewarps: Sequence[TimeWarpMap | None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     feature_cache_directory: Path | None = None,
@@ -4298,6 +5934,11 @@ def build_visual_timeline_candidate_set(
         scene_cut_times=scene_cut_times,
         preferred_source_indices=preferred_source_indices,
         diversity_config=diversity_config,
+        section_plan=section_plan,
+        phrase_times=phrase_times,
+        professional_montage_selection_policy=(
+            professional_montage_selection_policy
+        ),
         source_timewarps=source_timewarps,
         progress_callback=progress_callback,
         feature_cache_directory=feature_cache_directory,
@@ -4355,6 +5996,7 @@ def build_prescribed_visual_timeline_candidate_set(
 
 __all__ = [
     "FrameVisualDescriptor",
+    "ProfessionalMontageSelectionPolicy",
     "VisualDiversityConfig",
     "VisualTimelineCandidateRecord",
     "VisualTimelineCandidateSet",
@@ -4369,6 +6011,7 @@ __all__ = [
     "describe_frame",
     "frame_visual_numeric_features",
     "materialize_visual_timeline_candidate",
+    "rehydrate_visual_timeline_dissolve_evidence",
     "visual_analyzer_fingerprint_sha256",
     "yunet_model_asset_status",
 ]

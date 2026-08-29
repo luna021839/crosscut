@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from crosscut.pose import FormationPersonDescriptor, POSE_BACKEND
 from crosscut.timeline import ShotType
@@ -14,6 +15,7 @@ from crosscut.stage_edit_temporal_pose_motion import (
     TemporalPoseMotionThresholds,
 )
 from crosscut.visual_boundary_repair import (
+    BoundaryDescriptorCache,
     _passes_production_transition_gates,
     _visual_evidence,
     repair_visual_timeline_boundaries,
@@ -91,6 +93,131 @@ def _choice(index: int, source: int) -> VisualTimelineChoice:
 
 
 class VisualBoundaryRepairTests(unittest.TestCase):
+    def test_process_local_descriptor_cache_is_bounded_and_reuses_none(self) -> None:
+        cache = BoundaryDescriptorCache(maximum_entries=2)
+        first = _descriptor(0.4)
+        cache.store(0, 1.0, first)
+        cache.store(1, 2.0, None)
+
+        self.assertEqual(cache.lookup(0, 1.0), (True, first))
+        self.assertEqual(cache.lookup(1, 2.0), (True, None))
+        self.assertEqual(cache.lookup(2, 3.0), (False, None))
+        cache.store(2, 3.0, _descriptor(0.6))
+
+        diagnostics = cache.diagnostics()
+        self.assertEqual(diagnostics["entry_count"], 2)
+        self.assertEqual(diagnostics["hit_count"], 2)
+        self.assertEqual(diagnostics["miss_count"], 1)
+        self.assertEqual(diagnostics["eviction_count"], 1)
+        self.assertFalse(diagnostics["raw_frames_persisted"])
+        self.assertFalse(diagnostics["persistent"])
+
+    def test_full_ram_descriptor_cache_hit_opens_no_video_sampler(self) -> None:
+        descriptor = _descriptor(0.5)
+
+        class AlwaysHitBoundaryDescriptorCache(BoundaryDescriptorCache):
+            def lookup(
+                self,
+                source_index: int,
+                seconds: float,
+            ) -> tuple[bool, FrameVisualDescriptor | None]:
+                self._key(source_index, seconds)
+                self.hit_count += 1
+                return True, descriptor
+
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        cache = AlwaysHitBoundaryDescriptorCache()
+        with patch(
+            "crosscut.visual_boundary_repair._VideoSampler"
+        ) as sampler:
+            result = repair_visual_timeline_boundaries(
+                visual_timeline=plan,
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                descriptor_cache=cache,
+            )
+
+        sampler.assert_not_called()
+        self.assertGreater(cache.hit_count, 0)
+        self.assertEqual(result.reviewed_cross_source_count, 1)
+
+    def test_one_source_descriptor_miss_opens_only_that_sampler(self) -> None:
+        descriptor = _descriptor(0.5)
+
+        class SourceOneHitBoundaryDescriptorCache(BoundaryDescriptorCache):
+            def lookup(
+                self,
+                source_index: int,
+                seconds: float,
+            ) -> tuple[bool, FrameVisualDescriptor | None]:
+                if source_index == 1:
+                    self._key(source_index, seconds)
+                    self.hit_count += 1
+                    return True, descriptor
+                return super().lookup(source_index, seconds)
+
+        opened: list[Path] = []
+        closed: list[Path] = []
+
+        class FakeSampler:
+            def __init__(
+                self,
+                path: Path,
+                *,
+                feature_cache_directory: Path | None = None,
+            ) -> None:
+                del feature_cache_directory
+                self.path = Path(path)
+                opened.append(self.path)
+
+            def feature_descriptor_at(
+                self,
+                seconds: float,
+                *,
+                include_subject_geometry: bool,
+                include_formation_pose: bool,
+            ) -> FrameVisualDescriptor:
+                del seconds, include_subject_geometry, include_formation_pose
+                return descriptor
+
+            def close(self) -> None:
+                closed.append(self.path)
+
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        cache = SourceOneHitBoundaryDescriptorCache()
+        with patch(
+            "crosscut.visual_boundary_repair._VideoSampler",
+            side_effect=FakeSampler,
+        ):
+            result = repair_visual_timeline_boundaries(
+                visual_timeline=plan,
+                sources=(Path("source-a.mp4"), Path("source-b.mp4")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                descriptor_cache=cache,
+            )
+
+        self.assertEqual(opened, [Path("source-a.mp4")])
+        self.assertEqual(closed, opened)
+        self.assertEqual(result.reviewed_cross_source_count, 1)
+
+    def test_descriptor_cache_cannot_wrap_test_provider(self) -> None:
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "cannot wrap an explicit descriptor_provider",
+        ):
+            repair_visual_timeline_boundaries(
+                visual_timeline=plan,
+                sources=(Path("a"), Path("b")),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                descriptor_provider=lambda _source, _seconds: _descriptor(0.5),
+                descriptor_cache=BoundaryDescriptorCache(),
+            )
+
     def test_unbound_temporal_pose_motion_preserves_exact_prior_cost(self) -> None:
         kwargs = {
             "outgoing_preceding": _pose_descriptor(0.5, -0.20),
