@@ -35,12 +35,21 @@ from .timeline import (
     _normalise_segments,
     _resolved_preferred_sources,
     _transition_score,
+    compile_timeline_no_good_constraint_index,
+)
+from .timeline_no_good import (
+    TimelineNoGoodEdgeKey,
+    TimelineNoGoodSet,
+    build_timeline_no_good_edge_key,
 )
 from .vision import IVEMember
 
 
 JOINT_BOUNDARY_FRAME_OFFSETS = tuple(range(-8, 9))
 MINIMUM_JOINT_SEGMENT_DURATION_FRAMES = 2.0
+BOUNDARY_TRANSFORM_SUBJECT_BASES = frozenset(
+    {"dominant_face", "subject_silhouette", "full_frame_identity"}
+)
 
 
 def _exact_identifier(value: object, name: str) -> str:
@@ -116,6 +125,7 @@ class BoundaryTransformState:
     crop_xywh: tuple[float, float, float, float] | None = None
     rotation_degrees: float = 0.0
     track_id: str | None = None
+    subject_basis: str = "full_frame_identity"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -143,6 +153,10 @@ class BoundaryTransformState:
                 "track_id",
                 _exact_identifier(self.track_id, "track_id"),
             )
+        subject_basis = _exact_identifier(self.subject_basis, "subject_basis")
+        if subject_basis not in BOUNDARY_TRANSFORM_SUBJECT_BASES:
+            raise ValueError("subject_basis is not a supported tracking basis")
+        object.__setattr__(self, "subject_basis", subject_basis)
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +512,16 @@ class JointTimelineResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _RendererSemanticState:
+    """Future-relevant renderer state without boundary-proof provenance."""
+
+    crop_xywh: tuple[float, float, float, float] | None
+    rotation_degrees: float
+    track_id: str | None
+    subject_basis: str
+
+
+@dataclass(frozen=True, slots=True)
 class _JointState:
     candidate_index: int
     source_id: str
@@ -506,9 +530,7 @@ class _JointState:
     source_run: int
     source_before_run: str | None
     previous_boundary_offset: int | None
-    endpoint_transform: BoundaryTransformState | None
-    previous_boundary_proof_identity: str | None
-    previous_boundary_option: AuthorizedBoundaryOption | None
+    endpoint_renderer_state: _RendererSemanticState | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,16 +543,47 @@ class _JointNode:
     transition_score: float
     used_fallback: bool
     entering_boundary_option: AuthorizedBoundaryOption | None
-    bridge_for_previous_segment: SegmentBridgeProof | None
+    bridge_evidence_for_previous_segment: _SharedBridgeEvidence | None
     path_signature: tuple[tuple[str, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
-class _BridgeRequestKey:
+class _BridgeSemanticKey:
+    candidate: TimelineCandidate
+    start_master_seconds: float
+    end_master_seconds: float
+    duration_frames: float
+    entry_renderer_state: _RendererSemanticState
+    exit_renderer_state: _RendererSemanticState
+
+
+@dataclass(frozen=True, slots=True)
+class _ExactBridgeRequestKey:
     candidate: TimelineCandidate
     entry_option: AuthorizedBoundaryOption
     exit_option: AuthorizedBoundaryOption
     duration_frames: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedBridgeEvidence:
+    semantic_key: _BridgeSemanticKey
+    evidence_complete: bool
+    crop_compatible: bool
+    track_compatible: bool
+    failure_codes: tuple[str, ...]
+    score_adjustment: float
+
+    @property
+    def evidence_incomplete(self) -> bool:
+        return not self.evidence_complete
+
+    @property
+    def hard_incompatible(self) -> bool:
+        return bool(
+            self.evidence_complete
+            and not (self.crop_compatible and self.track_compatible)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,7 +596,34 @@ class _Extension:
     source_run: int
     source_before_run: str | None
     boundary_option: AuthorizedBoundaryOption
-    bridge_proof: SegmentBridgeProof | None
+    bridge_evidence: _SharedBridgeEvidence | None
+
+
+def _renderer_semantic_state(
+    transform: BoundaryTransformState,
+) -> _RendererSemanticState:
+    """Strip proof-only identity while preserving every rendered endpoint value."""
+
+    return _RendererSemanticState(
+        crop_xywh=transform.crop_xywh,
+        rotation_degrees=transform.rotation_degrees,
+        track_id=transform.track_id,
+        subject_basis=transform.subject_basis,
+    )
+
+
+def _renderer_semantic_sort_key(
+    state: _RendererSemanticState | None,
+) -> tuple[object, ...]:
+    if state is None:
+        return (0, (), 0.0, "", "")
+    return (
+        1,
+        state.crop_xywh or (),
+        state.rotation_degrees,
+        state.track_id or "",
+        state.subject_basis,
+    )
 
 
 def _state_sort_key(state: _JointState) -> tuple[object, ...]:
@@ -557,17 +637,7 @@ def _state_sort_key(state: _JointState) -> tuple[object, ...]:
         state.previous_boundary_offset
         if state.previous_boundary_offset is not None
         else -10_000,
-        state.endpoint_transform.transform_identity
-        if state.endpoint_transform is not None
-        else "",
-        state.previous_boundary_proof_identity or "",
-        (
-            _measurement_sort_key(
-                state.previous_boundary_option.measurement_key
-            )
-            if state.previous_boundary_option is not None
-            else ()
-        ),
+        _renderer_semantic_sort_key(state.endpoint_renderer_state),
     )
 
 
@@ -674,6 +744,7 @@ def _no_path_reason(rejection_counts: Mapping[str, int]) -> str:
         or reason
         in {
             "boundary_option_timeline_hard_gate",
+            "exact_boundary_no_good",
             "segment_duration_below_two_frames",
         }
     )
@@ -698,14 +769,22 @@ def _select_joint_timeline_candidates_core(
     maximum_results: int,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
 ) -> tuple[JointTimelineResult, ...]:
     """Select ranked candidates and exact boundary options in one finite DP.
 
     ``option_provider`` is memoized by ``BoundaryMeasurementKey``.  It must
     return all 17 offset audits even when only one offset is usable.  A bridge
     provider is required when the timeline has a segment between two editable
-    boundaries; its exact proof is likewise memoized by candidate and endpoint
-    options.
+    boundaries.  Its disposition and score must be invariant for equal
+    candidate clocks and numeric crop/rotation/track endpoint states.  That
+    semantic evidence is shared during optimization, while each selected
+    backtrace is re-requested with its exact boundary options so proof
+    provenance is never collapsed.  ``forbidden_boundary_edges`` is reserved
+    for exact edges already proven hard-incompatible; every key is validated
+    against this lattice and rejected before the option provider can decode it.
     """
 
     if not callable(option_provider):
@@ -726,6 +805,10 @@ def _select_joint_timeline_candidates_core(
         raise TypeError("config must be a TimelineConfig")
     timeline_mode, target = _resolve_mode_and_target(mode, target_member)
     segments = _normalise_segments(candidates_by_segment)
+    no_goods = compile_timeline_no_good_constraint_index(
+        segments,
+        forbidden_boundary_edges,
+    ).no_goods
     if len(segments) >= 3 and bridge_provider is None:
         raise ValueError(
             "bridge_provider is required for segments between adjacent boundaries"
@@ -847,7 +930,15 @@ def _select_joint_timeline_candidates_core(
                     )
 
     option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
-    bridge_cache: dict[_BridgeRequestKey, SegmentBridgeProof] = {}
+    semantic_bridge_cache: dict[
+        _BridgeSemanticKey,
+        _SharedBridgeEvidence,
+    ] = {}
+    selected_exact_bridge_cache: dict[
+        _ExactBridgeRequestKey,
+        SegmentBridgeProof,
+    ] = {}
+    bridge_provider_call_count = 0
     rejection_counts: dict[str, int] = {}
     layer_rejection_counts: dict[str, int] = {}
 
@@ -869,22 +960,14 @@ def _select_joint_timeline_candidates_core(
         option_cache[key] = measured
         return measured
 
-    def locate_bridge(
+    def call_bridge_provider(
         candidate: TimelineCandidate,
         entry_option: AuthorizedBoundaryOption,
         exit_option: AuthorizedBoundaryOption,
         duration_frames: float,
     ) -> SegmentBridgeProof:
+        nonlocal bridge_provider_call_count
         assert bridge_provider is not None
-        request_key = _BridgeRequestKey(
-            candidate,
-            entry_option,
-            exit_option,
-            duration_frames,
-        )
-        cached = bridge_cache.get(request_key)
-        if cached is not None:
-            return cached
         proof = bridge_provider(
             candidate,
             entry_option,
@@ -900,10 +983,111 @@ def _select_joint_timeline_candidates_core(
             or abs(proof.duration_frames - duration_frames) > 1e-9
         ):
             raise RuntimeError("bridge_provider returned proof for another request")
-        bridge_cache[request_key] = proof
+        bridge_provider_call_count += 1
         return proof
 
-    layers: list[dict[_JointState, list[_JointNode]]] = []
+    def bridge_semantic_key(
+        candidate: TimelineCandidate,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> _BridgeSemanticKey:
+        return _BridgeSemanticKey(
+            candidate=candidate,
+            start_master_seconds=(
+                candidate.start_seconds
+                + entry_option.frame_offset / resolved_fps
+            ),
+            end_master_seconds=(
+                candidate.end_seconds
+                + exit_option.frame_offset / resolved_fps
+            ),
+            duration_frames=duration_frames,
+            entry_renderer_state=_renderer_semantic_state(
+                entry_option.incoming_transform
+            ),
+            exit_renderer_state=_renderer_semantic_state(
+                exit_option.outgoing_transform
+            ),
+        )
+
+    def locate_bridge_evidence(
+        candidate: TimelineCandidate,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> _SharedBridgeEvidence:
+        semantic_key = bridge_semantic_key(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        cached = semantic_bridge_cache.get(semantic_key)
+        if cached is not None:
+            return cached
+        proof = call_bridge_provider(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        evidence = _SharedBridgeEvidence(
+            semantic_key=semantic_key,
+            evidence_complete=proof.evidence_complete,
+            crop_compatible=proof.crop_compatible,
+            track_compatible=proof.track_compatible,
+            failure_codes=proof.failure_codes,
+            score_adjustment=proof.score_adjustment,
+        )
+        semantic_bridge_cache[semantic_key] = evidence
+        return evidence
+
+    def locate_selected_exact_bridge(
+        evidence: _SharedBridgeEvidence,
+        candidate: TimelineCandidate,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> SegmentBridgeProof:
+        semantic_key = bridge_semantic_key(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        if semantic_key != evidence.semantic_key:
+            raise RuntimeError(
+                "joint DP backtrace changed renderer-semantic bridge state"
+            )
+        exact_key = _ExactBridgeRequestKey(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        cached = selected_exact_bridge_cache.get(exact_key)
+        if cached is not None:
+            return cached
+        proof = call_bridge_provider(
+            candidate,
+            entry_option,
+            exit_option,
+            duration_frames,
+        )
+        if (
+            proof.evidence_complete != evidence.evidence_complete
+            or proof.crop_compatible != evidence.crop_compatible
+            or proof.track_compatible != evidence.track_compatible
+            or proof.failure_codes != evidence.failure_codes
+            or abs(proof.score_adjustment - evidence.score_adjustment) > 1e-12
+        ):
+            raise RuntimeError(
+                "bridge_provider diverged within one renderer-semantic state"
+            )
+        selected_exact_bridge_cache[exact_key] = proof
+        return proof
+
     first_layer: dict[_JointState, list[_JointNode]] = {}
     for candidate_index, (emission_score, used_fallback) in emissions[0].items():
         candidate = segments[0][candidate_index]
@@ -915,9 +1099,7 @@ def _select_joint_timeline_candidates_core(
             source_run=1,
             source_before_run=None,
             previous_boundary_offset=None,
-            endpoint_transform=None,
-            previous_boundary_proof_identity=None,
-            previous_boundary_option=None,
+            endpoint_renderer_state=None,
         )
         first_layer[state] = [
             _JointNode(
@@ -929,11 +1111,11 @@ def _select_joint_timeline_candidates_core(
                 transition_score=0.0,
                 used_fallback=used_fallback,
                 entering_boundary_option=None,
-                bridge_for_previous_segment=None,
+                bridge_evidence_for_previous_segment=None,
                 path_signature=(_candidate_signature(candidate),),
             )
         ]
-    layers.append(first_layer)
+    frontier = first_layer
 
     for segment_position in range(1, len(segments)):
         layer_rejection_counts = {}
@@ -941,17 +1123,55 @@ def _select_joint_timeline_candidates_core(
         current_segment = segments[segment_position]
         current_layer: dict[_JointState, list[_JointNode]] = {}
         for previous_state, previous_nodes in sorted(
-            layers[-1].items(),
+            frontier.items(),
             key=lambda item: _state_sort_key(item[0]),
         ):
             previous_candidate = previous_segment[
                 previous_state.candidate_index
             ]
+            ranked_previous_nodes = tuple(
+                sorted(previous_nodes, key=_node_rank_key)
+            )
+            representative_entry_option: AuthorizedBoundaryOption | None = None
+            if segment_position >= 2:
+                expected_entry_state = previous_state.endpoint_renderer_state
+                expected_entry_offset = previous_state.previous_boundary_offset
+                if expected_entry_state is None or expected_entry_offset is None:
+                    raise RuntimeError(
+                        "joint DP lost its previous renderer endpoint state"
+                    )
+                for previous_node in ranked_previous_nodes:
+                    entry_option = previous_node.entering_boundary_option
+                    if entry_option is None:
+                        raise RuntimeError(
+                            "joint DP lost an exact previous boundary option"
+                        )
+                    if (
+                        entry_option.frame_offset != expected_entry_offset
+                        or _renderer_semantic_state(
+                            entry_option.incoming_transform
+                        )
+                        != expected_entry_state
+                    ):
+                        raise RuntimeError(
+                            "joint DP renderer-semantic state is not exact"
+                        )
+                representative_entry_option = (
+                    ranked_previous_nodes[0].entering_boundary_option
+                )
+                assert representative_entry_option is not None
             extensions: list[_Extension] = []
             for current_index, (emission_score, used_fallback) in emissions[
                 segment_position
             ].items():
                 current_candidate = current_segment[current_index]
+                if no_goods and build_timeline_no_good_edge_key(
+                    segment_position - 1,
+                    previous_candidate,
+                    current_candidate,
+                ) in no_goods:
+                    reject("exact_boundary_no_good")
+                    continue
                 measurement_key = BoundaryMeasurementKey.from_candidates(
                     segment_position - 1,
                     previous_candidate,
@@ -1019,13 +1239,10 @@ def _select_joint_timeline_candidates_core(
                         reject("boundary_option_timeline_hard_gate")
                         continue
                     base_transition_score, shot_run = transition
-                    bridge: SegmentBridgeProof | None = None
+                    bridge_evidence: _SharedBridgeEvidence | None = None
                     if segment_position >= 2:
-                        entry_option = previous_state.previous_boundary_option
-                        if entry_option is None:
-                            raise RuntimeError(
-                                "joint DP lost its previous boundary option"
-                            )
+                        entry_option = representative_entry_option
+                        assert entry_option is not None
                         duration_frames = (
                             (
                                 previous_candidate.end_seconds
@@ -1041,16 +1258,16 @@ def _select_joint_timeline_candidates_core(
                         ):
                             reject("segment_duration_below_two_frames")
                             continue
-                        bridge = locate_bridge(
+                        bridge_evidence = locate_bridge_evidence(
                             previous_candidate,
                             entry_option,
                             option,
                             duration_frames,
                         )
-                        if bridge.evidence_incomplete:
+                        if bridge_evidence.evidence_incomplete:
                             reject("bridge_evidence_incomplete")
                             continue
-                        if bridge.hard_incompatible:
+                        if bridge_evidence.hard_incompatible:
                             reject("bridge_hard_incompatible")
                             continue
                     extensions.append(
@@ -1063,7 +1280,7 @@ def _select_joint_timeline_candidates_core(
                             source_run=source_run,
                             source_before_run=source_before_run,
                             boundary_option=option,
-                            bridge_proof=bridge,
+                            bridge_evidence=bridge_evidence,
                         )
                     )
 
@@ -1148,8 +1365,8 @@ def _select_joint_timeline_candidates_core(
                     + cadence_score
                     + extension.boundary_option.score_adjustment
                     + (
-                        extension.bridge_proof.score_adjustment
-                        if extension.bridge_proof is not None
+                        extension.bridge_evidence.score_adjustment
+                        if extension.bridge_evidence is not None
                         else 0.0
                     )
                 )
@@ -1162,15 +1379,12 @@ def _select_joint_timeline_candidates_core(
                     source_run=extension.source_run,
                     source_before_run=extension.source_before_run,
                     previous_boundary_offset=option.frame_offset,
-                    endpoint_transform=option.incoming_transform,
-                    previous_boundary_proof_identity=option.proof_identity,
-                    previous_boundary_option=option,
+                    endpoint_renderer_state=_renderer_semantic_state(
+                        option.incoming_transform
+                    ),
                 )
                 bucket = current_layer.setdefault(state, [])
-                for previous_node in sorted(
-                    previous_nodes,
-                    key=_node_rank_key,
-                ):
+                for previous_node in ranked_previous_nodes:
                     cumulative = (
                         previous_node.cumulative_score
                         + transition_score
@@ -1185,7 +1399,9 @@ def _select_joint_timeline_candidates_core(
                         transition_score=transition_score,
                         used_fallback=extension.used_fallback,
                         entering_boundary_option=option,
-                        bridge_for_previous_segment=extension.bridge_proof,
+                        bridge_evidence_for_previous_segment=(
+                            extension.bridge_evidence
+                        ),
                         path_signature=_extended_path_signature(
                             previous_node.path_signature,
                             option,
@@ -1210,13 +1426,13 @@ def _select_joint_timeline_candidates_core(
                 segment_index=current_segment[0].segment_index,
                 rejection_counts=layer_rejection_counts,
             )
-        layers.append(current_layer)
+        frontier = current_layer
 
     final_by_signature: dict[
         tuple[tuple[str, ...], ...],
         _JointNode,
     ] = {}
-    for bucket in layers[-1].values():
+    for bucket in frontier.values():
         for node in bucket:
             existing = final_by_signature.get(node.path_signature)
             if (
@@ -1232,7 +1448,14 @@ def _select_joint_timeline_candidates_core(
         for key in sorted(option_cache, key=_measurement_sort_key)
     )
 
-    results: list[JointTimelineResult] = []
+    pending_results: list[
+        tuple[
+            TimelineResult,
+            tuple[AuthorizedBoundaryOption, ...],
+            tuple[BoundaryOptionSet, ...],
+            tuple[SegmentBridgeProof, ...],
+        ]
+    ] = []
     for final_node in ranked_final_nodes:
         selected_nodes: list[_JointNode] = []
         node: _JointNode | None = final_node
@@ -1246,7 +1469,7 @@ def _select_joint_timeline_candidates_core(
         choices: list[TimelineChoice] = []
         boundary_options: list[AuthorizedBoundaryOption] = []
         bridge_proofs: list[SegmentBridgeProof] = []
-        for selected_node in selected_nodes:
+        for selected_position, selected_node in enumerate(selected_nodes):
             choices.append(
                 TimelineChoice(
                     candidate=selected_node.candidate,
@@ -1260,9 +1483,45 @@ def _select_joint_timeline_candidates_core(
                 boundary_options.append(
                     selected_node.entering_boundary_option
                 )
-            if selected_node.bridge_for_previous_segment is not None:
-                bridge_proofs.append(
-                    selected_node.bridge_for_previous_segment
+            bridge_evidence = (
+                selected_node.bridge_evidence_for_previous_segment
+            )
+            if bridge_evidence is not None:
+                if selected_position < 2:
+                    raise RuntimeError(
+                        "joint DP attached bridge evidence before a middle segment"
+                    )
+                entry_option = selected_nodes[
+                    selected_position - 1
+                ].entering_boundary_option
+                exit_option = selected_node.entering_boundary_option
+                if entry_option is None or exit_option is None:
+                    raise RuntimeError(
+                        "joint DP backtrace lost exact bridge boundary options"
+                    )
+                middle_candidate = selected_nodes[
+                    selected_position - 1
+                ].candidate
+                duration_frames = (
+                    middle_candidate.duration_seconds * resolved_fps
+                    + exit_option.frame_offset
+                    - entry_option.frame_offset
+                )
+                exact_bridge = locate_selected_exact_bridge(
+                    bridge_evidence,
+                    middle_candidate,
+                    entry_option,
+                    exit_option,
+                    duration_frames,
+                )
+                if not exact_bridge.authorized:
+                    raise RuntimeError(
+                        "selected exact bridge lost semantic authorization"
+                    )
+                bridge_proofs.append(exact_bridge)
+            elif selected_position >= 2:
+                raise RuntimeError(
+                    "joint DP backtrace lost middle-segment bridge evidence"
                 )
 
         timeline = TimelineResult(
@@ -1275,19 +1534,32 @@ def _select_joint_timeline_candidates_core(
             option_cache[option.measurement_key]
             for option in boundary_options
         )
-        results.append(
-            JointTimelineResult(
-                timeline=timeline,
-                boundary_options=tuple(boundary_options),
-                selected_boundary_option_sets=selected_option_sets,
-                segment_bridge_proofs=tuple(bridge_proofs),
-                measured_boundary_option_sets=measured_option_sets,
-                rejection_counts=tuple(sorted(rejection_counts.items())),
-                option_provider_call_count=len(option_cache),
-                bridge_provider_call_count=len(bridge_cache),
+        pending_results.append(
+            (
+                timeline,
+                tuple(boundary_options),
+                selected_option_sets,
+                tuple(bridge_proofs),
             )
         )
-    return tuple(results)
+    return tuple(
+        JointTimelineResult(
+            timeline=timeline,
+            boundary_options=boundary_options,
+            selected_boundary_option_sets=selected_option_sets,
+            segment_bridge_proofs=bridge_proofs,
+            measured_boundary_option_sets=measured_option_sets,
+            rejection_counts=tuple(sorted(rejection_counts.items())),
+            option_provider_call_count=len(option_cache),
+            bridge_provider_call_count=bridge_provider_call_count,
+        )
+        for (
+            timeline,
+            boundary_options,
+            selected_option_sets,
+            bridge_proofs,
+        ) in pending_results
+    )
 
 
 def select_joint_timeline(
@@ -1303,6 +1575,9 @@ def select_joint_timeline(
     preferred_source_ids: Sequence[str | None] | None = None,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
 ) -> JointTimelineResult:
     """Return the single best fully authorized joint timeline."""
 
@@ -1318,6 +1593,7 @@ def select_joint_timeline(
         maximum_results=1,
         emission_adjustments=emission_adjustments,
         source_switch_bonus_by_segment=source_switch_bonus_by_segment,
+        forbidden_boundary_edges=forbidden_boundary_edges,
     )[0]
 
 
@@ -1335,6 +1611,9 @@ def select_joint_timeline_candidates(
     maximum_results: int = 8,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
     source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
 ) -> tuple[JointTimelineResult, ...]:
     """Return up to eight distinct source/shot/boundary-proof paths.
 
@@ -1356,6 +1635,7 @@ def select_joint_timeline_candidates(
         maximum_results=maximum_results,
         emission_adjustments=emission_adjustments,
         source_switch_bonus_by_segment=source_switch_bonus_by_segment,
+        forbidden_boundary_edges=forbidden_boundary_edges,
     )
 
 

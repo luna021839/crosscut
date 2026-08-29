@@ -23,6 +23,11 @@ from crosscut.timeline import (
     select_timeline,
     timeline_transition_hard_gates_admit,
 )
+from crosscut.timeline_no_good import (
+    TimelineNoGoodEdgeKey,
+    TimelineNoGoodSet,
+    build_timeline_no_good_edge_key,
+)
 
 
 def candidate(
@@ -508,6 +513,73 @@ class JointTimelineTests(unittest.TestCase):
         self.assertEqual(result.option_provider_call_count, 2)
         self.assertEqual(len(result.measured_boundary_option_sets), 2)
 
+    def test_exact_no_good_rejects_before_option_provider_decoding(self) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8),),
+        )
+        forbidden = build_timeline_no_good_edge_key(
+            0,
+            segments[0][0],
+            segments[1][0],
+        )
+        provider_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal provider_calls
+            provider_calls += 1
+            return option_set(key, authorized={0: 0.0})
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_timeline(
+                segments,
+                option_provider=provide_options,
+                config=isolated_score_config(),
+                forbidden_boundary_edges=TimelineNoGoodSet((forbidden,)),
+            )
+
+        self.assertEqual(provider_calls, 0)
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_timeline_hard_incompatible",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts,
+            {"exact_boundary_no_good": 1},
+        )
+
+    def test_unknown_exact_no_good_fails_before_option_provider(self) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8),),
+        )
+        unknown = TimelineNoGoodEdgeKey(
+            boundary_index=0,
+            outgoing_source_id="A",
+            outgoing_shot_id="shot:0:A",
+            incoming_source_id="B",
+            incoming_shot_id="shot:1:unknown",
+        )
+        provider_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal provider_calls
+            provider_calls += 1
+            return option_set(key, authorized={0: 0.0})
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "forbidden boundary edge does not belong",
+        ):
+            select_joint_timeline_candidates(
+                segments,
+                option_provider=provide_options,
+                config=isolated_score_config(),
+                forbidden_boundary_edges=(unknown,),
+            )
+
+        self.assertEqual(provider_calls, 0)
+
     def test_preference_adjustment_and_switch_scoring_matches_timeline(self) -> None:
         segments = (
             (candidate(0, "A", 0.83), candidate(0, "B", 0.76)),
@@ -713,6 +785,141 @@ class JointTimelineTests(unittest.TestCase):
         self.assertTrue(
             all(item.option_provider_call_count == 8 for item in ranked)
         )
+
+    def test_three_by_eight_semantic_bridge_dominance_preserves_exact_proofs(
+        self,
+    ) -> None:
+        source_ids = tuple(f"S{index}" for index in range(8))
+        segments = tuple(
+            tuple(candidate(segment, source, 0.8) for source in source_ids)
+            for segment in range(3)
+        )
+        option_calls = 0
+        bridge_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal option_calls
+            option_calls += 1
+            authorized = (
+                {0: 0.0}
+                if key.outgoing.source_id == key.incoming.source_id
+                else {offset: 0.0 for offset in JOINT_BOUNDARY_FRAME_OFFSETS}
+            )
+            return option_set(key, authorized=authorized)
+
+        def provide_bridge(
+            middle: TimelineCandidate,
+            entry: AuthorizedBoundaryOption,
+            exit: AuthorizedBoundaryOption,
+            duration_frames: float,
+        ) -> SegmentBridgeProof:
+            nonlocal bridge_calls
+            bridge_calls += 1
+            return valid_bridge(middle, entry, exit, duration_frames)
+
+        ranked = select_joint_timeline_candidates(
+            segments,
+            option_provider=provide_options,
+            bridge_provider=provide_bridge,
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+
+        old_exact_option_product = 8 * (1 + 7 * 17) ** 2
+        semantic_bridge_bound = 8 * 17**2 + len(ranked)
+        self.assertEqual(option_calls, 2 * 8**2)
+        self.assertEqual(len(ranked), 8)
+        self.assertLessEqual(bridge_calls, semantic_bridge_bound)
+        self.assertLess(bridge_calls, old_exact_option_product // 40)
+        self.assertTrue(
+            all(
+                item.bridge_provider_call_count == bridge_calls
+                for item in ranked
+            )
+        )
+        proof_variants = {
+            tuple(option.proof_identity for option in item.boundary_options)
+            for item in ranked
+        }
+        self.assertEqual(len(proof_variants), len(ranked))
+        for item in ranked:
+            self.assertEqual(len(item.segment_bridge_proofs), 1)
+            bridge = item.segment_bridge_proofs[0]
+            self.assertIs(bridge.entry_option, item.boundary_options[0])
+            self.assertIs(bridge.exit_option, item.boundary_options[1])
+            self.assertIn(
+                item.boundary_options[0].proof_identity,
+                bridge.proof_identity,
+            )
+            self.assertIn(
+                item.boundary_options[1].proof_identity,
+                bridge.proof_identity,
+            )
+            self.assertTrue(
+                all(
+                    len(option_set_.offset_audits) == 17
+                    for option_set_ in item.measured_boundary_option_sets
+                )
+            )
+
+    def test_semantic_state_bucket_retains_top_eight_proof_variants(self) -> None:
+        first_segment = tuple(
+            replace(
+                candidate(0, "A", 0.8),
+                candidate_id=f"candidate:0:A:{index}",
+                shot_id=f"shot:0:A:{index}",
+            )
+            for index in range(8)
+        )
+        segments = (
+            first_segment,
+            (candidate(1, "B", 0.8),),
+            (candidate(2, "C", 0.8),),
+        )
+        bridge_calls = 0
+
+        def provide_bridge(
+            middle: TimelineCandidate,
+            entry: AuthorizedBoundaryOption,
+            exit: AuthorizedBoundaryOption,
+            duration_frames: float,
+        ) -> SegmentBridgeProof:
+            nonlocal bridge_calls
+            bridge_calls += 1
+            return valid_bridge(middle, entry, exit, duration_frames)
+
+        ranked = select_joint_timeline_candidates(
+            segments,
+            option_provider=lambda key: option_set(
+                key,
+                authorized={0: 0.0},
+            ),
+            bridge_provider=provide_bridge,
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+
+        self.assertEqual(len(ranked), 8)
+        self.assertEqual(bridge_calls, 9)
+        self.assertEqual(
+            {item.candidates[0].candidate_id for item in ranked},
+            {item.candidate_id for item in first_segment},
+        )
+        self.assertEqual(
+            len(
+                {
+                    item.boundary_options[0].proof_identity
+                    for item in ranked
+                }
+            ),
+            8,
+        )
+        for item in ranked:
+            bridge = item.segment_bridge_proofs[0]
+            self.assertIs(bridge.entry_option, item.boundary_options[0])
+            self.assertIs(bridge.exit_option, item.boundary_options[1])
 
     def test_ranked_candidate_limit_is_at_most_eight(self) -> None:
         segments = ((candidate(0, "A", 0.8),),)

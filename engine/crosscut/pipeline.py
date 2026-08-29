@@ -95,7 +95,11 @@ from .crop_aware_candidate_rerank import (
     CropAwareCandidateRerankResult,
     rerank_materialized_visual_candidates_for_safe_crops,
 )
-from .editorial_motion import EditorialMotionPlan, build_editorial_motion_plan
+from .editorial_motion import (
+    EditorialMotionPlan,
+    EditorialMotionSegment,
+    build_editorial_motion_plan,
+)
 from .events import EventReporter
 from .face_match import FaceMatchPlan, build_face_match_plan
 from .group_transition import GroupTransitionPlan, build_group_transition_plan
@@ -302,6 +306,14 @@ from .lazy_splice_feasibility_graph import (
     LazySpliceFeasibilityGraph,
     LazySpliceFeasibilityKey,
 )
+from .joint_boundary_provider import DecodedBoundaryOptionProvider
+from .joint_visual_candidate_adapter import (
+    JointMaterializedVisualCandidate,
+    JointVisualSelectionSet,
+    candidate_review_summaries as joint_candidate_review_summaries,
+    materialize_joint_visual_candidates,
+    select_joint_visual_candidates,
+)
 from .no_good_selector_identity import build_no_good_selector_identity
 from .timeline import NoCompleteTimelinePath
 from .timeline_no_good import (
@@ -339,6 +351,7 @@ from .visual_candidate_materialization import (
 from .visual_score import (
     ProfessionalMontageSelectionPolicy,
     VisualTimelineCandidateSet,
+    VisualTimelineChoice,
     VisualTimelinePlan,
     build_visual_timeline,
     build_visual_timeline_candidate_set,
@@ -3404,6 +3417,26 @@ def _rendered_candidate_selection_index_domains() -> dict[str, str]:
             ELIGIBLE_SOURCE_INDEX_DOMAIN
         ),
         (
+            "complete_candidates[].splice_graph_authorization"
+            ".boundary_proof_bundle.segment_paths[].source_index"
+        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        (
+            "complete_candidates[].candidate_lineage[].candidate_history"
+            ".boundary_proof_bundle.segment_paths[].source_index"
+        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        (
+            "complete_candidates[].candidate_lineage[].candidate_history"
+            ".editorial_motion_plan.segments[].source_index"
+        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        (
+            "joint_visual_selection.candidate_histories[]"
+            ".boundary_proof_bundle.segment_paths[].source_index"
+        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        (
+            "joint_visual_selection.candidate_histories[]"
+            ".editorial_motion_plan.segments[].source_index"
+        ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
+        (
             "complete_candidates[].editorial_motion.boundary_subject_alignment"
             ".decisions[].outgoing_source_index"
         ): ELIGIBLE_SOURCE_INDEX_DOMAIN,
@@ -3654,6 +3687,19 @@ def _source_index_mapping(
                 for path, domain in (
                     _rendered_candidate_selection_index_domains().items()
                 )
+            },
+            **{
+                f"render.rendered_candidate_selection.{path}": domain
+                for path, domain in (
+                    _rendered_candidate_selection_index_domains().items()
+                )
+            },
+            **{
+                f"render.{path}": domain
+                for path, domain in (
+                    _rendered_candidate_selection_index_domains().items()
+                )
+                if path.startswith("joint_visual_selection.")
             },
             "render_plan.sources[]": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
             "render_plan.reference_source": RENDER_PLAN_SOURCE_INDEX_DOMAIN,
@@ -18974,8 +19020,316 @@ def _post_repair_review_rejection_payload(
     }
 
 
+def _validate_joint_editorial_motion_plan(
+    materialized: JointMaterializedVisualCandidate,
+    *,
+    eligible_indices: Sequence[int],
+) -> EditorialMotionPlan:
+    """Keep provider tracks in the eligible-local editorial-motion domain."""
+
+    plan = materialized.editorial_motion_plan
+    eligible_source_count = len(tuple(eligible_indices))
+    if any(
+        item.source_index < 0 or item.source_index >= eligible_source_count
+        for item in plan.segments
+    ):
+        raise RuntimeError(
+            "joint editorial motion left the eligible source-index domain"
+        )
+    tracks_by_segment = {
+        item.segment_index: item.track for item in plan.segments
+    }
+    if len(tracks_by_segment) != len(materialized.segments) or any(
+        tracks_by_segment.get(index) is not segment.editorial_transform
+        for index, segment in enumerate(materialized.segments)
+    ):
+        raise RuntimeError(
+            "joint editorial-motion validation lost provider track identity"
+        )
+    return plan
+
+
+def _joint_group_hard_cut_transition(
+    outgoing: VisualTimelineChoice,
+    incoming: VisualTimelineChoice,
+) -> RenderTransition:
+    """Classify decoded joint cuts without hiding source-internal shot changes."""
+
+    same_source = outgoing.source_index == incoming.source_index
+    same_shot = same_source and outgoing.shot_id == incoming.shot_id
+    if same_shot:
+        tier = "D"
+        reason = "joint_decoded_same_source_same_shot_hold"
+    elif same_source:
+        tier = "C"
+        reason = "joint_decoded_source_internal_shot_change_hard_cut"
+    else:
+        tier = "C"
+        reason = "joint_decoded_pose_motion_matched_hard_cut"
+    return RenderTransition(
+        kind=TransitionKind.HARD_CUT,
+        frame_count=0,
+        tier=tier,
+        reason=reason,
+    )
+
+
+def _raise_joint_visual_selection_failure(
+    *,
+    request: AnalysisRequest,
+    base_filename: str,
+    eligible_indices: Sequence[int],
+    exc: ValueError | cv2.error,
+    selection_active: bool,
+    materialized_candidate_count: int,
+) -> None:
+    """Persist the original joint failure and forbid rhythm/baseline fallback."""
+
+    payload: dict[str, Any] = {
+        "analysis_basis": "joint_decoded_visual_selection_failure_v1",
+        "status": "joint_visual_selection_failed_closed",
+        "passed": False,
+        "production_use_forbidden": True,
+        "final_media_authority": False,
+        "candidate_pool": "joint_decoded_visual_selector",
+        "joint_selection_active_before_failure": selection_active,
+        "materialized_candidate_count": materialized_candidate_count,
+        "ordinary_visual_baseline_fallback_allowed": False,
+        "rhythm_timeline_fallback_allowed": False,
+        "source_index_mapping": _source_index_mapping(
+            request.sources,
+            eligible_indices,
+        ),
+        "nested_index_domains": _rendered_candidate_selection_index_domains(),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "raw_frames_persisted": False,
+        "raw_visual_descriptors_persisted": False,
+    }
+    if isinstance(exc, NoCompleteTimelinePath):
+        payload["no_complete_timeline_path"] = exc.to_dict()
+    failure_path = request.output_directory / (
+        f"{base_filename}-joint-visual-selection-failure.json"
+    )
+    _write_analysis_manifest_atomically(failure_path, payload)
+    raise RuntimeError(
+        "automatic GROUP joint visual selection failed closed; no rhythm or "
+        f"ordinary baseline fallback was used; report: {failure_path}"
+    ) from exc
+
+
+def _route_visual_timeline_selection_failure(
+    *,
+    request: AnalysisRequest,
+    base_filename: str,
+    eligible_indices: Sequence[int],
+    exc: ValueError | cv2.error,
+    joint_visual_selection_attempted: bool,
+    joint_visual_selection_active: bool,
+    materialized_candidate_count: int,
+    warnings: list[str],
+) -> None:
+    """Route joint failures to fail-close and retain the legacy fallback only."""
+
+    if joint_visual_selection_attempted:
+        _raise_joint_visual_selection_failure(
+            request=request,
+            base_filename=base_filename,
+            eligible_indices=eligible_indices,
+            exc=exc,
+            selection_active=joint_visual_selection_active,
+            materialized_candidate_count=materialized_candidate_count,
+        )
+    warnings.append(
+        f"프레임 시각 점수를 확정하지 못해 리듬 타임라인을 사용함: {exc}"
+    )
+
+
+def _derive_complete_joint_group_candidate(
+    materialized: JointMaterializedVisualCandidate,
+    *,
+    request: AnalysisRequest,
+    eligible_indices: Sequence[int],
+    source_aspect_ratios: Sequence[float],
+    phrase_times: Sequence[float],
+    section_plan: SectionPlan | None,
+    common_master_start: float,
+    width: int,
+    height: int,
+    output: Path,
+    source_look_match: SourceLookMatchResult | None,
+    boundary_look_measurement_cache: BoundaryLookMeasurementCache | None,
+) -> _GroupRenderCandidateBundle:
+    """Derive a joint candidate without replacing any decoded crop proof.
+
+    The joint adapter has already measured every chosen boundary offset and
+    every rendered half-frame crop sample.  Re-entering the legacy repair,
+    face-pan, affine, or ordinary editorial-motion paths here would decode a
+    different picture and could silently stack a second transform.  This path
+    therefore keeps those provider objects authoritative, while retaining the
+    ordinary timeline, hard-cut, look-match, proxy, montage, and final QA
+    gates.
+    """
+
+    if not math.isclose(
+        materialized.common_master_start,
+        common_master_start,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError(
+            "joint candidate master start disagrees with synchronized range"
+        )
+    visual_timeline = materialized.visual_plan
+    timeline_review = review_timeline(
+        visual_timeline,
+        available_source_count=len(eligible_indices),
+    )
+    transitions = tuple(
+        _joint_group_hard_cut_transition(outgoing, incoming)
+        for outgoing, incoming in zip(
+            visual_timeline.choices,
+            visual_timeline.choices[1:],
+        )
+    )
+    group_transition_plan = GroupTransitionPlan(
+        transitions,
+        analysis_basis=(
+            "joint_decoded_boundary_proof_hard_cut_only_v1"
+        ),
+    )
+    editorial_motion_plan = _validate_joint_editorial_motion_plan(
+        materialized,
+        eligible_indices=eligible_indices,
+    )
+    remapped_segments = tuple(
+        replace(
+            segment,
+            source_index=eligible_indices[segment.source_index],
+            look_adjustment=(
+                source_look_match.adjustment_for_source(segment.source_index)
+                if source_look_match is not None
+                else None
+            ),
+        )
+        for segment in materialized.segments
+    )
+    if any(
+        final.editorial_transform is not original.editorial_transform
+        for final, original in zip(
+            remapped_segments,
+            materialized.segments,
+            strict=True,
+        )
+    ):
+        raise RuntimeError("joint render remap replaced a provider crop track")
+    plan = RenderPlan(
+        sources=request.sources,
+        segments=remapped_segments,
+        reference_source=request.reference_source,
+        aspect_ratio=request.aspect_ratio,
+        output=Path(output),
+        master_audio_start=common_master_start,
+        width=width,
+        height=height,
+        fps=materialized.output_fps,
+        transitions=group_transition_plan.transitions,
+    )
+    diagnostics = [
+        "joint_decoded_boundary_and_segment_proofs_authoritative",
+        "legacy_boundary_repair_and_geometry_overlay_bypassed",
+        "unsafe_dissolve_disabled_for_joint_candidate",
+    ]
+    boundary_look_match: BoundaryLookMatchResult | None = None
+    source_aspects_are_editorial_safe = (
+        len(source_aspect_ratios) == len(eligible_indices)
+        and all(
+            abs(float(value) - 16.0 / 9.0) <= 0.03
+            for value in source_aspect_ratios
+        )
+    )
+    if (
+        request.source_mode is SourceMode.AUTOMATIC
+        and request.aspect_ratio is AspectRatio.LANDSCAPE
+        and source_aspects_are_editorial_safe
+        and timeline_review.passed
+    ):
+        try:
+            boundary_look_match = analyze_boundary_look_match(
+                plan,
+                group_16x9_safe=True,
+                measurement_cache=boundary_look_measurement_cache,
+            )
+            boundary_look_match = verify_boundary_look_match_render_domain(
+                plan,
+                boundary_look_match,
+            )
+            plan = boundary_look_match.apply(plan)
+        except (OSError, ValueError, cv2.error) as exc:
+            diagnostics.append(f"boundary_look_match_failed: {exc}")
+    if any(
+        final.editorial_transform is not original.editorial_transform
+        for final, original in zip(
+            plan.segments,
+            materialized.segments,
+            strict=True,
+        )
+    ):
+        raise RuntimeError("look matching replaced a provider crop track")
+    proof_payload = materialized.boundary_proof_bundle.to_dict()
+    return _GroupRenderCandidateBundle(
+        candidate_index=materialized.candidate_index,
+        review_rank=materialized.review_rank,
+        cadence_profile=materialized.cadence_profile,
+        pre_render_score=float(timeline_review.weighted_score),
+        visual_timeline=visual_timeline,
+        boundary_repairs=None,
+        timeline_review=timeline_review,
+        face_match_plan=None,
+        group_transition_plan=group_transition_plan,
+        boundary_affine_plan=None,
+        editorial_motion_plan=editorial_motion_plan,
+        render_plan=plan,
+        boundary_look_match=boundary_look_match,
+        output_geometry_deferral=None,
+        splice_graph_authorization={
+            "contract": "joint_decoded_selection_proxy_authorization_v1",
+            "proxy_eligible": True,
+            "legacy_lazy_splice_graph_required": False,
+            "selection_identity": (
+                materialized.boundary_proof_bundle.selection_identity
+            ),
+            "boundary_proof_bundle": proof_payload,
+            "raw_frames_persisted": False,
+            "raw_visual_descriptors_persisted": False,
+        },
+        diagnostics=tuple(diagnostics),
+        candidate_origin="joint_decoded_visual_selector",
+        candidate_lineage=(
+            {
+                "stage": "joint_decoded_visual_selector",
+                "candidate_pool": "joint_decoded_visual_selector",
+                "joint_path_signature": materialized.privacy_safe_signature,
+                "candidate_history": materialized.candidate_history_entry,
+                "legacy_local_source_repair_allowed": False,
+                "legacy_constraint_reoptimization_allowed": False,
+            },
+        ),
+        stage_edit_exact_shot_clock=(
+            _deterministic_exact_shot_clock_from_timeline(
+                visual_timeline,
+                section_plan=section_plan,
+                phrase_times=phrase_times,
+            )
+            if section_plan is not None
+            else None
+        ),
+    )
+
+
 def _derive_complete_group_candidate(
-    materialized: MaterializedVisualTimelineCandidate,
+    materialized: MaterializedVisualTimelineCandidate
+    | JointMaterializedVisualCandidate,
     *,
     request: AnalysisRequest,
     eligible_indices: Sequence[int],
@@ -19013,6 +19367,27 @@ def _derive_complete_group_candidate(
         == len(source_durations_seconds)
     ):
         raise ValueError("complete group candidate source arrays must match")
+    if isinstance(materialized, JointMaterializedVisualCandidate):
+        if visual_timeline_override is not None:
+            raise ValueError("joint candidate cannot accept a timeline override")
+        if precomputed_boundary_repairs is not None:
+            raise ValueError("joint candidate cannot accept legacy boundary repair")
+        if splice_feasibility_graph is not None:
+            raise ValueError("joint candidate cannot enter the lazy splice graph")
+        return _derive_complete_joint_group_candidate(
+            materialized,
+            request=request,
+            eligible_indices=eligible_indices,
+            source_aspect_ratios=source_aspect_ratios,
+            phrase_times=phrase_times,
+            section_plan=section_plan,
+            common_master_start=common_master_start,
+            width=width,
+            height=height,
+            output=output,
+            source_look_match=source_look_match,
+            boundary_look_measurement_cache=boundary_look_measurement_cache,
+        )
     diagnostics: list[str] = []
 
     def run_boundary_repair(
@@ -23996,8 +24371,8 @@ def _enforce_automatic_group_stage_edit_requirement(
         "mode": "deterministic_professional_visual",
         "transformer_authority": False,
         "transformer_status": "inactive_no_verified_production_bundle",
-        "candidate_pool": "ordinary_visual_primary",
-        "ordinary_visual_candidate_is_primary_not_fallback": True,
+        "candidate_pool": "joint_decoded_visual_selector",
+        "joint_decoded_visual_candidate_is_primary_not_fallback": True,
         "decoded_proxy_candidate_count_required": 8,
         "decoded_proxy_review_required": True,
         "final_post_render_qa_required": True,
@@ -24696,6 +25071,11 @@ def analyze(
     visual_candidate_checkpoint_code_fingerprint_migration: str | None = None
     visual_candidate_checkpoint_reused = False
     checkpoint_materialized_candidate_order: tuple[Any, ...] = ()
+    joint_visual_selection_set: JointVisualSelectionSet | None = None
+    joint_visual_selection_audit: dict[str, Any] | None = None
+    joint_boundary_provider_audit: dict[str, Any] | None = None
+    joint_visual_selection_active = False
+    joint_visual_selection_attempted = False
     candidate_stream_progress_path: Path | None = None
     materialized_group_candidates: tuple[Any, ...] = ()
     complete_group_candidates: tuple[_GroupRenderCandidateBundle, ...] = ()
@@ -25185,6 +25565,7 @@ def analyze(
             visual_candidate_checkpoint_input_identity: dict[str, Any] | None = (
                 None
             )
+            boundary_descriptor_cache = BoundaryDescriptorCache()
             if (
                 request.source_mode is SourceMode.AUTOMATIC
                 and review_rendered_proxies
@@ -25305,6 +25686,7 @@ def analyze(
                         "실패 뒤 원시 베이스라인으로 교체하지 않음"
                     )
                 else:
+                    joint_visual_selection_attempted = True
                     if (
                         request.stage_edit_checkpoint_directory is None
                         and isinstance(visual_section_plan, SectionPlan)
@@ -25368,12 +25750,6 @@ def analyze(
                         pre_derivation_candidate_selection_path = (
                             loaded_candidate_checkpoint.path
                         )
-                        materialized_group_candidates = (
-                            loaded_candidate_checkpoint.initial_candidates
-                        )
-                        checkpoint_materialized_candidate_order = (
-                            loaded_candidate_checkpoint.candidates
-                        )
                         visual_candidate_checkpoint_reused = True
                         visual_candidate_checkpoint_stored_input_identity_sha256 = (
                             loaded_candidate_checkpoint
@@ -25388,43 +25764,143 @@ def analyze(
                         )
                         if migration_name is None:
                             reporter.log(
-                                "입력·정책·코드 지문이 같은 완전 후보 "
-                                "체크포인트 "
-                                f"{len(checkpoint_materialized_candidate_order)}개 "
-                                "재사용 · 120구간 descriptor와 32후보 "
-                                "최적화 생략"
+                                "입력·정책·코드 지문이 같은 이전 후보 "
+                                "체크포인트를 feature seed로만 확인 · "
+                                "저장 후보는 joint 선택에 직접 사용하지 않음"
                             )
                         else:
                             reporter.log(
                                 "입력·정책은 완전 일치하고 코드 지문은 "
-                                "검증된 단방향 이관과 일치한 후보 "
-                                f"{len(checkpoint_materialized_candidate_order)}개 "
-                                f"재사용 · {migration_name} · 120구간 descriptor와 "
-                                "32후보 최적화 생략"
+                                "검증된 단방향 이관과 일치한 이전 체크포인트를 "
+                                f"feature seed로만 확인 · {migration_name} · "
+                                "저장 후보는 joint 선택에 직접 사용하지 않음"
                             )
-                    else:
-                        visual_candidate_set = (
-                            build_visual_timeline_candidate_set(
-                                **visual_builder_arguments,
-                                maximum_results=32,
+                    # A persisted candidate checkpoint is an input-identity and
+                    # scalar-feature seed only.  Joint boundary proofs are
+                    # process-local, so both hit and miss rebuild the transient
+                    # optimizer workspace exactly once through the persistent
+                    # feature cache and never materialize a baseline candidate.
+                    visual_candidate_set = build_visual_timeline_candidate_set(
+                        **visual_builder_arguments,
+                        maximum_results=32,
+                    )
+                    workspace = visual_candidate_set.optimizer_workspace
+                    if workspace is None:
+                        raise RuntimeError(
+                            "joint visual selection could not recover its "
+                            "transient optimizer workspace"
+                        )
+                    provider = DecodedBoundaryOptionProvider(
+                        sources=tuple(
+                            request.sources[index]
+                            for index in eligible_indices
+                        ),
+                        audio_offsets=offsets,
+                        scene_cut_times=scene_cut_times,
+                        source_timewarps=eligible_timewarps,
+                        descriptor_cache=boundary_descriptor_cache,
+                        output_fps=29.97,
+                        total_segment_count=len(
+                            workspace.candidates_by_segment
+                        ),
+                        beat_period_seconds=(
+                            group_draft.beat_period_seconds
+                        ),
+                        beat_intensity=rhythm_analysis.tempo_confidence,
+                        feature_cache_directory=(
+                            request.source_cache_directory
+                        ),
+                    )
+                    provider_audit_before_close: dict[str, Any] | None = None
+                    try:
+                        joint_visual_selection_set = (
+                            select_joint_visual_candidates(
+                                visual_candidate_set,
+                                provider=provider,
+                                fps=29.97,
+                                minimum_unique_paths=8,
+                                maximum_candidates=24,
                             )
                         )
-                        (
-                            materialized_group_candidates,
-                            stage_edit_candidate_rerank_result,
-                            crop_aware_candidate_rerank_result,
-                        ) = _materialize_crop_aware_ranked_visual_proxy_candidates(
-                            visual_candidate_set,
-                            request=request,
-                            rhythm_analysis=rhythm_analysis,
-                            section_plan=section_plan,
-                            source_aspect_ratios=source_aspect_ratios,
-                            visual_montage_selection_policy=(
-                                visual_montage_selection_policy
-                            ),
-                            rendered_montage_config=rendered_montage_config,
-                            reporter=reporter,
+                        materialized_group_candidates = (
+                            materialize_joint_visual_candidates(
+                                joint_visual_selection_set,
+                                provider=provider,
+                                fps=29.97,
+                                maximum_candidates=len(
+                                    joint_visual_selection_set.candidate_records
+                                ),
+                            )
                         )
+                        provider_audit_before_close = provider.to_dict()
+                    finally:
+                        provider.close()
+                    if provider_audit_before_close is None:
+                        raise RuntimeError(
+                            "joint provider audit was not captured before close"
+                        )
+                    joint_boundary_provider_audit = {
+                        **provider_audit_before_close,
+                        "provider_closed_after_materialization": True,
+                        "process_local_materialization_retained": True,
+                    }
+                    joint_visual_selection_audit = {
+                        "analysis_basis": (
+                            joint_visual_selection_set.analysis_basis
+                        ),
+                        "candidate_pool": "joint_decoded_visual_selector",
+                        "candidate_count": len(
+                            joint_visual_selection_set.candidate_records
+                        ),
+                        "selected_candidate_index": (
+                            joint_visual_selection_set
+                            .selected_candidate_index
+                        ),
+                        "candidate_reviews": list(
+                            joint_candidate_review_summaries(
+                                joint_visual_selection_set,
+                                selected_candidate_index=(
+                                    joint_visual_selection_set
+                                    .selected_candidate_index
+                                ),
+                            )
+                        ),
+                        "candidate_histories": [
+                            item.candidate_history_entry
+                            for item in materialized_group_candidates
+                        ],
+                        "role_control_audits": [
+                            dict(item)
+                            for item in (
+                                joint_visual_selection_set
+                                .role_control_audits
+                            )
+                        ],
+                        "profile_failures": [
+                            {
+                                "cadence_profile": profile,
+                                "failure": failure.to_dict(),
+                            }
+                            for profile, failure in (
+                                joint_visual_selection_set.profile_failures
+                            )
+                        ],
+                        "minimum_unique_path_floor": 8,
+                        "maximum_candidate_pool": 24,
+                        "baseline_candidate_materialization_invoked": False,
+                        "checkpoint_candidate_direct_reuse": False,
+                        "restartable_without_visual_reanalysis": False,
+                        "raw_frames_persisted": False,
+                        "raw_visual_descriptors_persisted": False,
+                    }
+                    joint_visual_selection_active = True
+                    checkpoint_materialized_candidate_order = ()
+                    reporter.log(
+                        "joint decoded 후보 "
+                        f"{len(materialized_group_candidates)}개 생성 · "
+                        "정확한 +/-8 프레임 경계·렌더 crop proof 유지 · "
+                        "legacy 후보/repair fallback 미사용"
+                    )
                 if (
                     stage_edit_visual_candidate_batch is None
                     and visual_candidate_set is not None
@@ -25437,7 +25913,12 @@ def analyze(
                         selected_materialized_index_order
                     )
                     intentional_anchor_diagnostics: list[dict[str, Any]] = []
-                    for record in visual_candidate_set.candidates:
+                    diagnostics_records = (
+                        joint_visual_selection_set.candidate_records
+                        if joint_visual_selection_set is not None
+                        else visual_candidate_set.candidates
+                    )
+                    for record in diagnostics_records:
                         chosen_path = record.timeline_result.candidates
                         marked_cross_source_boundary_count = sum(
                             left.source_id != right.source_id
@@ -25479,23 +25960,9 @@ def analyze(
                                 ),
                             }
                         )
-                    checkpoint_candidate_order = (
-                        crop_aware_candidate_rerank_result.ordered_candidates
-                        if crop_aware_candidate_rerank_result is not None
-                        else materialized_group_candidates
-                    )
-                    restart_checkpoint_ready = bool(
-                        visual_candidate_checkpoint_input_identity is not None
-                        and visual_candidate_checkpoint_input_identity_sha256
-                        is not None
-                        and len(selected_materialized_index_order) == 8
-                        and len(checkpoint_candidate_order) >= 8
-                    )
                     pre_derivation_payload: dict[str, Any] = {
                         "analysis_basis": (
-                            VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS
-                            if restart_checkpoint_ready
-                            else "pre_derivation_visual_candidate_checkpoint_v1"
+                            "joint_decoded_visual_candidate_selection_v1"
                         ),
                         "status": (
                             "candidate_selection_complete_derivation_pending"
@@ -25513,25 +25980,33 @@ def analyze(
                         "nested_index_domains": (
                             _rendered_candidate_selection_index_domains()
                         ),
-                        "visual_candidate_set": visual_candidate_set.to_dict(),
+                        "candidate_pool": "joint_decoded_visual_selector",
+                        "optimizer_seed_candidate_set": (
+                            visual_candidate_set.to_dict()
+                        ),
+                        "joint_visual_selection": (
+                            joint_visual_selection_audit
+                        ),
+                        "joint_boundary_provider": (
+                            joint_boundary_provider_audit
+                        ),
                         "intentional_phrase_anchor_diagnostics": (
                             intentional_anchor_diagnostics
                         ),
                         "raw_frames_persisted": False,
                         "decoded_output_review_complete": False,
+                        "restartable_without_visual_reanalysis": False,
+                        "checkpoint_candidate_direct_reuse": False,
                     }
-                    if restart_checkpoint_ready:
-                        assert (
-                            visual_candidate_checkpoint_input_identity is not None
-                        )
-                        assert (
-                            visual_candidate_checkpoint_input_identity_sha256
-                            is not None
-                        )
+                    if (
+                        visual_candidate_checkpoint_input_identity is not None
+                        and visual_candidate_checkpoint_input_identity_sha256
+                        is not None
+                    ):
                         pre_derivation_payload.update(
                             {
-                                "checkpoint_contract": (
-                                    VISUAL_CANDIDATE_CHECKPOINT_CONTRACT
+                                "checkpoint_role": (
+                                    "input_identity_and_persistent_feature_seed_only"
                                 ),
                                 "input_identity": (
                                     visual_candidate_checkpoint_input_identity
@@ -25539,21 +26014,8 @@ def analyze(
                                 "input_identity_sha256": (
                                     visual_candidate_checkpoint_input_identity_sha256
                                 ),
-                                "materialized_candidate_plans": [
-                                    materialized_candidate_checkpoint_payload(
-                                        candidate,
-                                        selected_for_initial_stream=(
-                                            candidate.candidate_index
-                                            in selected_materialized_indices
-                                        ),
-                                    )
-                                    for candidate in checkpoint_candidate_order
-                                ],
-                                "restartable_without_visual_reanalysis": True,
+                                "materialized_candidate_plans": [],
                             }
-                        )
-                        checkpoint_materialized_candidate_order = tuple(
-                            checkpoint_candidate_order
                         )
                     if stage_edit_candidate_rerank_result is not None:
                         pre_derivation_payload["stage_edit_candidate_rerank"] = (
@@ -25580,7 +26042,7 @@ def analyze(
                         if item["selected_for_complete_derivation"]
                     )
                     reporter.log(
-                        "완전 파생 전 후보 체크포인트 저장 · 선택 8개 중 "
+                        "완전 파생 전 joint 후보 감사 저장 · 선택 후보 중 "
                         f"의도적 프레이즈 대비 권한 {authorized_boundary_count}경계 · "
                         f"{pre_derivation_candidate_selection_path.name}"
                     )
@@ -25610,6 +26072,10 @@ def analyze(
                 local_source_repair_generated_candidate_index_start: (
                     int | None
                 ) = None
+                legacy_ordinary_candidate_stream = bool(
+                    stage_edit_visual_candidate_batch is None
+                    and not joint_visual_selection_active
+                )
                 ordered_recovery_candidates = (
                     checkpoint_materialized_candidate_order
                     if checkpoint_materialized_candidate_order
@@ -25634,7 +26100,7 @@ def analyze(
                         )
                         for item in local_source_repair_donor_candidates
                     )
-                    if stage_edit_visual_candidate_batch is None
+                    if legacy_ordinary_candidate_stream
                     else ()
                 )
                 local_source_repair_donor_materialized_by_index = {
@@ -25665,12 +26131,11 @@ def analyze(
                 boundary_look_measurement_cache = (
                     BoundaryLookMeasurementCache()
                 )
-                boundary_descriptor_cache = BoundaryDescriptorCache()
                 constraint_optimizer_context_keys: set[
                     LazySpliceFeasibilityKey
                 ] = set()
                 global_candidate_stream: _GlobalVisualCandidateStream | None
-                if stage_edit_visual_candidate_batch is None:
+                if legacy_ordinary_candidate_stream:
                     global_candidate_stream = _GlobalVisualCandidateStream()
                     globally_indexed_initial_candidates: list[
                         _GloballyIndexedVisualCandidate
@@ -25726,7 +26191,7 @@ def analyze(
                 constraint_graph_resume_path: Path | None = None
                 constraint_graph_resume_discard_reason: str | None = None
                 initial_constraint_stream_audit: dict[str, int] | None = None
-                if stage_edit_visual_candidate_batch is None:
+                if legacy_ordinary_candidate_stream:
                     if visual_candidate_checkpoint_reused:
                         if (
                             visual_candidate_checkpoint_input_identity_sha256
@@ -25985,6 +26450,25 @@ def analyze(
 
                 def constraint_reoptimization_payload() -> dict[str, Any]:
                     if splice_feasibility_graph is None:
+                        if joint_visual_selection_active:
+                            return {
+                                "enabled": False,
+                                "reason": (
+                                    "joint_decoded_visual_selector_owns_"
+                                    "source_offset_and_crop_search"
+                                ),
+                                "candidate_pool": (
+                                    "joint_decoded_visual_selector"
+                                ),
+                                "legacy_lazy_splice_loop_invoked": False,
+                                "legacy_local_source_repair_invoked": False,
+                                "termination_reason": (
+                                    constraint_reoptimization_termination_reason
+                                ),
+                                "terminal_proof": deepcopy(
+                                    constraint_reoptimization_terminal_proof
+                                ),
+                            }
                         return {
                             "enabled": False,
                             "reason": "explicit_stage_edit_candidate_pool",
@@ -26170,6 +26654,16 @@ def analyze(
                             "analysis_basis": (
                                 "derive_then_immediate_decoded_proxy_stream_v1"
                             ),
+                            "candidate_pool": (
+                                "joint_decoded_visual_selector"
+                                if joint_visual_selection_active
+                                else (
+                                    STAGE_EDIT_HYBRID_VISUAL_FLOOR_CANDIDATE_POOL
+                                    if stage_edit_visual_candidate_batch
+                                    is not None
+                                    else "ordinary_visual_baseline"
+                                )
+                            ),
                             "status": status,
                             "production_use_forbidden": True,
                             "final_media_authority": False,
@@ -26193,6 +26687,12 @@ def analyze(
                             ),
                             "constraint_reoptimization": (
                                 constraint_reoptimization_payload()
+                            ),
+                            "joint_visual_selection": (
+                                deepcopy(joint_visual_selection_audit)
+                            ),
+                            "joint_boundary_provider": (
+                                deepcopy(joint_boundary_provider_audit)
                             ),
                             "local_source_repair": {
                                 "seed_count": len(local_source_repair_seeds),
@@ -26574,6 +27074,10 @@ def analyze(
                         )
                         if (
                             not local_source_repair
+                            and not isinstance(
+                                materialized,
+                                JointMaterializedVisualCandidate,
+                            )
                             and bundle.timeline_review is not None
                         ):
                             seed = LocalSourceRepairSeed(
@@ -27831,7 +28335,7 @@ def analyze(
 
                 if (
                     not candidate_stream_reducer.required_passing_cohort_complete
-                    and stage_edit_visual_candidate_batch is None
+                    and legacy_ordinary_candidate_stream
                 ):
                     reporter.log(
                         "일반 후보 순차 스캔·donor splice를 중단하고 "
@@ -27846,7 +28350,7 @@ def analyze(
                         abort_boundary_search_failure(exc)
 
                 if (
-                    stage_edit_visual_candidate_batch is None
+                    legacy_ordinary_candidate_stream
                     and candidate_stream_reducer
                     .required_passing_cohort_complete
                     and constraint_reoptimization_termination_reason is None
@@ -27854,12 +28358,41 @@ def analyze(
                     constraint_reoptimization_termination_reason = (
                         "initial_stream_exact_eight"
                     )
+                elif (
+                    joint_visual_selection_active
+                    and candidate_stream_reducer
+                    .required_passing_cohort_complete
+                ):
+                    constraint_reoptimization_termination_reason = (
+                        "joint_decoded_visual_selector_exact_eight"
+                    )
                 materialized_group_candidates = tuple(
                     attempted_materialized_candidates
                 )
                 complete_group_candidates = tuple(derived)
                 if len(complete_group_candidates) != 8:
-                    if constraint_reoptimization_terminal_proof is None:
+                    if joint_visual_selection_active:
+                        constraint_reoptimization_termination_reason = (
+                            "joint_decoded_candidate_pool_exhausted_before_"
+                            "exact_eight"
+                        )
+                        constraint_reoptimization_terminal_proof = {
+                            "contract": (
+                                "joint_decoded_candidate_pool_terminal_proof_v1"
+                            ),
+                            "cause": (
+                                "joint_decoded_candidate_pool_exhausted_"
+                                "before_exact_eight"
+                            ),
+                            "authorized_candidate_count": len(derived),
+                            "attempted_candidate_count": len(
+                                attempted_candidate_indices
+                            ),
+                            "legacy_constraint_reoptimization_invoked": False,
+                            "legacy_local_source_repair_invoked": False,
+                            "production_use_forbidden": True,
+                        }
+                    elif constraint_reoptimization_terminal_proof is None:
                         set_nonstructural_constraint_exhaustion(
                             cause="candidate_stream_exhausted_before_exact_eight"
                         )
@@ -27966,7 +28499,11 @@ def analyze(
                         "candidate_pool": (
                             stage_edit_visual_candidate_batch.candidate_pool
                             if stage_edit_visual_candidate_batch is not None
-                            else "ordinary_visual_baseline"
+                            else (
+                                "joint_decoded_visual_selector"
+                                if joint_visual_selection_active
+                                else "ordinary_visual_baseline"
+                            )
                         ),
                         "visual_candidate_set": (
                             visual_candidate_set.to_dict()
@@ -27977,6 +28514,12 @@ def analyze(
                             stage_edit_visual_candidate_batch.to_dict()
                             if stage_edit_visual_candidate_batch is not None
                             else None
+                        ),
+                        "joint_visual_selection": deepcopy(
+                            joint_visual_selection_audit
+                        ),
+                        "joint_boundary_provider": deepcopy(
+                            joint_boundary_provider_audit
                         ),
                         "silent_baseline_fallback_allowed": False,
                         "candidate_derivation_failures": (
@@ -28039,8 +28582,17 @@ def analyze(
                     f"{visual_timeline.optimizer_score:.3f}"
                 )
         except (ValueError, cv2.error) as exc:
-            warnings.append(
-                f"프레임 시각 점수를 확정하지 못해 리듬 타임라인을 사용함: {exc}"
+            _route_visual_timeline_selection_failure(
+                request=request,
+                base_filename=base_filename,
+                eligible_indices=eligible_indices,
+                exc=exc,
+                joint_visual_selection_attempted=(
+                    joint_visual_selection_attempted
+                ),
+                joint_visual_selection_active=joint_visual_selection_active,
+                materialized_candidate_count=len(materialized_group_candidates),
+                warnings=warnings,
             )
         if visual_timeline is not None:
             reporter.status("선택된 컷을 앞뒤 3프레임에서 정밀 보정하는 중…")
@@ -28294,7 +28846,11 @@ def analyze(
                     "candidate_pool": (
                         stage_edit_visual_candidate_batch.candidate_pool
                         if stage_edit_visual_candidate_batch is not None
-                        else "ordinary_visual_baseline"
+                        else (
+                            "joint_decoded_visual_selector"
+                            if joint_visual_selection_active
+                            else "ordinary_visual_baseline"
+                        )
                     ),
                     "visual_candidate_set": (
                         visual_candidate_set.to_dict()
@@ -28305,6 +28861,12 @@ def analyze(
                         stage_edit_visual_candidate_batch.to_dict()
                         if stage_edit_visual_candidate_batch is not None
                         else None
+                    ),
+                    "joint_visual_selection": deepcopy(
+                        joint_visual_selection_audit
+                    ),
+                    "joint_boundary_provider": deepcopy(
+                        joint_boundary_provider_audit
                     ),
                     "silent_baseline_fallback_allowed": False,
                     "source_index_mapping": _source_index_mapping(
@@ -28537,6 +29099,29 @@ def analyze(
                     motion_authority_v3=(
                         registered_stage_edit_motion_authority_v3
                     ),
+                )
+            elif joint_visual_selection_active:
+                partial_reedit = _ProxyTriggeredPartialReeditResult(
+                    selected_bundle=selected_bundle,
+                    selected_review_payload=rendered_proxy_review_payload,
+                    audit_payload={
+                        "analysis_basis": (
+                            "joint_decoded_provider_proof_retention_v1"
+                        ),
+                        "attempted": False,
+                        "selected_version": "original",
+                        "reason": (
+                            "joint_provider_offsets_and_crop_tracks_are_"
+                            "atomic_and_cannot_enter_legacy_partial_reedit"
+                        ),
+                        "candidate_origin": (
+                            "joint_decoded_visual_selector"
+                        ),
+                        "legacy_boundary_repair_invoked": False,
+                        "legacy_local_source_repair_invoked": False,
+                        "legacy_constraint_reoptimization_invoked": False,
+                        "decoded_proxy_review_retained": True,
+                    },
                 )
             else:
                 partial_reedit = _attempt_proxy_triggered_partial_reedit(
@@ -29165,12 +29750,20 @@ def analyze(
             "candidate_origin": (
                 "explicit_stage_edit_generation"
                 if stage_edit_visual_candidate_batch is not None
-                else "ordinary_visual_baseline"
+                else (
+                    "joint_decoded_visual_selector"
+                    if joint_visual_selection_active
+                    else "ordinary_visual_baseline"
+                )
             ),
             "stage_edit_promotion_contract": (
                 STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT
                 if stage_edit_visual_candidate_batch is not None
                 else None
+            ),
+            "joint_visual_selection": deepcopy(joint_visual_selection_audit),
+            "joint_boundary_provider": deepcopy(
+                joint_boundary_provider_audit
             ),
             "source_clock_basis": (
                 visual_timeline.source_clock_basis

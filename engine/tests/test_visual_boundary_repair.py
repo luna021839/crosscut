@@ -117,6 +117,61 @@ class VisualBoundaryRepairTests(unittest.TestCase):
         self.assertFalse(diagnostics["raw_frames_persisted"])
         self.assertFalse(diagnostics["persistent"])
 
+    def test_descriptor_cache_exact_and_namespace_discard_include_none(self) -> None:
+        cache = BoundaryDescriptorCache(maximum_entries=4)
+        cache.store(10, 1.0, None)
+        cache.store(10, 2.0, _descriptor(0.4))
+        cache.store(11, 1.0, _descriptor(0.6))
+
+        self.assertTrue(cache.discard(10, 1.0))
+        self.assertFalse(cache.discard(10, 1.0))
+        self.assertEqual(cache.discard_source_indices((10,)), 1)
+        self.assertEqual(cache.diagnostics()["entry_count"], 1)
+        self.assertEqual(cache.lookup(11, 1.0), (True, _descriptor(0.6)))
+
+    def test_descriptor_cache_transaction_commit_matches_direct_lru(self) -> None:
+        direct = BoundaryDescriptorCache(maximum_entries=3)
+        staged = BoundaryDescriptorCache(maximum_entries=3)
+        initial = (
+            (10, 1.0, _descriptor(0.3)),
+            (11, 2.0, None),
+            (12, 3.0, _descriptor(0.5)),
+        )
+        for source, seconds, descriptor in initial:
+            direct.store(source, seconds, descriptor)
+            staged.store(source, seconds, descriptor)
+        transaction = staged.begin_transaction()
+
+        direct_results = (
+            direct.lookup(10, 1.0),
+            direct.lookup(11, 2.0),
+        )
+        staged_results = (
+            staged.lookup(10, 1.0, transaction=transaction),
+            staged.lookup(11, 2.0, transaction=transaction),
+        )
+        replacement = _descriptor(0.7)
+        direct.store(13, 4.0, replacement)
+        staged.store(13, 4.0, replacement, transaction=transaction)
+        direct_tail = (
+            direct.lookup(12, 3.0),
+            direct.lookup(13, 4.0),
+        )
+        staged_tail = (
+            staged.lookup(12, 3.0, transaction=transaction),
+            staged.lookup(13, 4.0, transaction=transaction),
+        )
+
+        staged.commit_transaction(transaction)
+
+        self.assertEqual(staged_results, direct_results)
+        self.assertEqual(staged_tail, direct_tail)
+        self.assertEqual(staged.diagnostics(), direct.diagnostics())
+        self.assertEqual(
+            tuple(staged._values.items()),
+            tuple(direct._values.items()),
+        )
+
     def test_full_ram_descriptor_cache_hit_opens_no_video_sampler(self) -> None:
         descriptor = _descriptor(0.5)
 

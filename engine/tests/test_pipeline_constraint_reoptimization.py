@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from crosscut.lazy_splice_feasibility_graph import LazySpliceFeasibilityGraph
 from crosscut.boundary_repair import BoundaryRepairConfig
+from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegment
+from crosscut.ive import AspectRatio, EditMode, SourceMode
+from crosscut.joint_visual_candidate_adapter import (
+    JointMaterializedVisualCandidate,
+)
 from crosscut.pipeline import (
+    ELIGIBLE_SOURCE_INDEX_DOMAIN,
     _BoundarySearchBudget,
     _BoundarySearchBudgetExhausted,
     _BoundarySearchNoProgress,
@@ -22,19 +30,32 @@ from crosscut.pipeline import (
     _constraint_terminal_status,
     _cross_source_timeline_edge_contexts,
     _cross_source_timeline_edge_keys,
+    _derive_complete_group_candidate,
+    _derive_complete_joint_group_candidate,
+    _enforce_automatic_group_stage_edit_requirement,
     _group_splice_analysis_basis_identity,
     _incomplete_splice_context_keys,
     _optimizer_workspace_cross_source_edge_bound,
     _optimizer_blocked_set_for_contexts,
     _record_boundary_repair_assessments,
+    _joint_group_hard_cut_transition,
+    _raise_joint_visual_selection_failure,
     _regenerate_visual_candidate_set_or_no_path,
+    _route_visual_timeline_selection_failure,
     _resume_or_reset_splice_feasibility_graph,
     _run_initial_edge_constrained_stream,
+    _source_index_mapping,
     _splice_authorization_evidence_incomplete,
     _splice_authorization_refinement_boundary_indices,
     _splice_graph_keys_for_plan,
     _validate_constrained_precomputed_repair_origin,
     _merge_visual_boundary_repair_plans,
+)
+from crosscut.render import (
+    EditorialTransformKeyframe,
+    EditorialTransformTrack,
+    RenderSegment,
+    TransitionKind,
 )
 from crosscut.timeline import NoCompleteTimelinePath, ShotType
 from crosscut.timeline_no_good import TimelineNoGoodSet
@@ -263,6 +284,32 @@ def _hard_assessment():
 
 
 class PipelineConstraintReoptimizationTests(unittest.TestCase):
+    def test_automatic_group_authority_names_joint_primary_pool(self) -> None:
+        request = SimpleNamespace(
+            source_mode=SourceMode.AUTOMATIC,
+            edit_mode=EditMode.GROUP,
+            acquire_only=False,
+        )
+
+        authority = _enforce_automatic_group_stage_edit_requirement(
+            request,  # type: ignore[arg-type]
+            None,
+            review_rendered_proxies=True,
+        )
+
+        assert authority is not None
+        self.assertEqual(
+            authority["candidate_pool"],
+            "joint_decoded_visual_selector",
+        )
+        self.assertTrue(
+            authority["joint_decoded_visual_candidate_is_primary_not_fallback"]
+        )
+        self.assertNotIn(
+            "ordinary_visual_candidate_is_primary_not_fallback",
+            authority,
+        )
+
     def test_stream_ids_are_global_and_source_shot_paths_dedupe_across_rounds(
         self,
     ) -> None:
@@ -1385,6 +1432,376 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             assessments[0][2].status,
             SpliceFeasibilityStatus.INDETERMINATE,
         )
+
+    def test_joint_complete_derivation_keeps_provider_tracks_and_hard_cuts(
+        self,
+    ) -> None:
+        tracks = tuple(
+            EditorialTransformTrack(
+                (
+                    EditorialTransformKeyframe(
+                        time_seconds=0.0,
+                        zoom=1.0 + 0.05 * index,
+                    ),
+                    EditorialTransformKeyframe(
+                        time_seconds=1.0,
+                        zoom=1.0 + 0.05 * index,
+                    ),
+                ),
+                reason=f"joint-track-{index}",
+            )
+            for index in range(2)
+        )
+        segments = tuple(
+            RenderSegment(
+                source_index=index,
+                source_start=float(index),
+                duration=1.0,
+                master_start=float(index),
+                editorial_transform=tracks[index],
+            )
+            for index in range(2)
+        )
+        motion = EditorialMotionPlan(
+            segments=tuple(
+                EditorialMotionSegment(
+                    segment_index=index,
+                    source_index=index,
+                    track=tracks[index],
+                    reasons=("joint_decoded_segment_transform",),
+                )
+                for index in range(2)
+            ),
+            boundary_match_count=1,
+            zoom_event_count=1,
+            pan_event_count=0,
+            roll_event_count=0,
+            blocked_dissolve_segment_count=0,
+            analysis_basis="joint_decoded_test_motion_v1",
+            accepted_boundary_indices=(0,),
+        )
+        proof_bundle = SimpleNamespace(
+            selection_identity="joint-selection:test",
+            to_dict=lambda: {
+                "selection_identity": "joint-selection:test",
+                "raw_frames_persisted": False,
+            },
+        )
+        materialized = SimpleNamespace(
+            common_master_start=0.0,
+            visual_plan=_plan(_choice(0, "0:a"), _choice(1, "1:b")),
+            editorial_motion_plan=motion,
+            segments=segments,
+            output_fps=29.97,
+            boundary_proof_bundle=proof_bundle,
+            candidate_index=3,
+            review_rank=0,
+            cadence_profile="joint-balanced",
+            privacy_safe_signature="joint-visual-path:test",
+            candidate_history_entry={"joint_path_signature": "test"},
+        )
+        request = SimpleNamespace(
+            sources=tuple(
+                Path(f"/tmp/joint-source-{index}.mp4")
+                for index in range(4)
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.PORTRAIT,
+            source_mode=SourceMode.AUTOMATIC,
+        )
+        review = SimpleNamespace(
+            passed=True,
+            weighted_score=91.5,
+            hard_failures=(),
+        )
+        with patch("crosscut.pipeline.review_timeline", return_value=review):
+            bundle = _derive_complete_joint_group_candidate(
+                materialized,  # type: ignore[arg-type]
+                request=request,  # type: ignore[arg-type]
+                eligible_indices=(1, 3),
+                source_aspect_ratios=(16.0 / 9.0, 16.0 / 9.0),
+                phrase_times=(),
+                section_plan=None,
+                common_master_start=0.0,
+                width=1080,
+                height=1920,
+                output=Path("/tmp/joint-output.mp4"),
+                source_look_match=None,
+                boundary_look_measurement_cache=None,
+            )
+
+        self.assertEqual(bundle.candidate_origin, "joint_decoded_visual_selector")
+        self.assertIsNone(bundle.boundary_repairs)
+        self.assertIsNone(bundle.face_match_plan)
+        self.assertIsNone(bundle.boundary_affine_plan)
+        self.assertEqual(
+            tuple(item.source_index for item in bundle.render_plan.segments),
+            (1, 3),
+        )
+        self.assertEqual(
+            tuple(
+                item.source_index for item in bundle.editorial_motion_plan.segments
+            ),
+            (0, 1),
+        )
+        for index, segment in enumerate(bundle.render_plan.segments):
+            self.assertIs(segment.editorial_transform, tracks[index])
+            self.assertIs(
+                bundle.editorial_motion_plan.segments[index].track,
+                tracks[index],
+            )
+        self.assertEqual(bundle.group_transition_plan.dissolve_count, 0)
+        self.assertTrue(
+            all(
+                item.kind is TransitionKind.HARD_CUT
+                for item in bundle.group_transition_plan.transitions
+            )
+        )
+        self.assertTrue(bundle.splice_graph_authorization["proxy_eligible"])
+        self.assertEqual(
+            bundle.candidate_lineage[0]["candidate_pool"],
+            "joint_decoded_visual_selector",
+        )
+
+    def test_joint_motion_identity_stays_in_eligible_domain_with_request_gaps(
+        self,
+    ) -> None:
+        track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(time_seconds=0.0, zoom=1.0),
+                EditorialTransformKeyframe(time_seconds=1.0, zoom=1.0),
+            ),
+            reason="joint-identity",
+        )
+        motion = EditorialMotionPlan(
+            segments=(
+                EditorialMotionSegment(0, 0, track),
+                EditorialMotionSegment(1, 1, track),
+            ),
+            boundary_match_count=1,
+            zoom_event_count=0,
+            pan_event_count=0,
+            roll_event_count=0,
+            blocked_dissolve_segment_count=0,
+            analysis_basis="joint_identity_test_v1",
+        )
+        bundle_request = SimpleNamespace(
+            sources=tuple(Path(f"/tmp/source-{index}.mp4") for index in range(4)),
+            reference_source=0,
+            aspect_ratio=AspectRatio.PORTRAIT,
+            source_mode=SourceMode.AUTOMATIC,
+        )
+        materialized = SimpleNamespace(
+            editorial_motion_plan=motion,
+            segments=(
+                RenderSegment(0, 0.0, 1.0, 0.0, editorial_transform=track),
+                RenderSegment(1, 1.0, 1.0, 1.0, editorial_transform=track),
+            ),
+            common_master_start=0.0,
+            visual_plan=_plan(_choice(0, "0:a"), _choice(1, "1:b")),
+            output_fps=29.97,
+            boundary_proof_bundle=SimpleNamespace(
+                selection_identity="joint-selection:gapped",
+                to_dict=lambda: {"selection_identity": "joint-selection:gapped"},
+            ),
+            candidate_index=0,
+            review_rank=0,
+            cadence_profile="joint-balanced",
+            privacy_safe_signature="joint-visual-path:gapped",
+            candidate_history_entry={},
+        )
+        review = SimpleNamespace(passed=True, weighted_score=1.0, hard_failures=())
+        with patch("crosscut.pipeline.review_timeline", return_value=review):
+            bundle = _derive_complete_joint_group_candidate(
+                materialized,  # type: ignore[arg-type]
+                request=bundle_request,  # type: ignore[arg-type]
+                eligible_indices=(1, 3),
+                source_aspect_ratios=(16.0 / 9.0, 16.0 / 9.0),
+                phrase_times=(),
+                section_plan=None,
+                common_master_start=0.0,
+                width=1080,
+                height=1920,
+                output=Path("/tmp/joint-gapped.mp4"),
+                source_look_match=None,
+                boundary_look_measurement_cache=None,
+            )
+
+        self.assertIs(bundle.editorial_motion_plan, motion)
+        self.assertEqual(
+            tuple(item.source_index for item in bundle.editorial_motion_plan.segments),
+            (0, 1),
+        )
+        self.assertEqual(
+            tuple(item.source_index for item in bundle.render_plan.segments),
+            (1, 3),
+        )
+
+    def test_joint_transition_distinguishes_internal_shot_change_from_hold(
+        self,
+    ) -> None:
+        same_shot = _joint_group_hard_cut_transition(
+            _choice(0, "0:a"),
+            _choice(0, "0:a"),
+        )
+        changed_shot = _joint_group_hard_cut_transition(
+            _choice(0, "0:a"),
+            _choice(0, "0:b"),
+        )
+        changed_source = _joint_group_hard_cut_transition(
+            _choice(0, "0:a"),
+            _choice(1, "1:b"),
+        )
+
+        self.assertEqual(
+            (same_shot.tier, same_shot.reason),
+            ("D", "joint_decoded_same_source_same_shot_hold"),
+        )
+        self.assertEqual(
+            (changed_shot.tier, changed_shot.reason),
+            ("C", "joint_decoded_source_internal_shot_change_hard_cut"),
+        )
+        self.assertEqual(
+            (changed_source.tier, changed_source.reason),
+            ("C", "joint_decoded_pose_motion_matched_hard_cut"),
+        )
+
+    def test_joint_value_error_is_persisted_and_fails_closed(self) -> None:
+        no_path = NoCompleteTimelinePath(
+            "joint path exhausted",
+            reason_code="forward_reachability_exhausted",
+            segment_index=4,
+            rejection_counts={"exact_boundary_no_good": 2},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory)
+            request = SimpleNamespace(
+                sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+                output_directory=output_directory,
+            )
+            with self.assertRaisesRegex(RuntimeError, "failed closed"):
+                _raise_joint_visual_selection_failure(
+                    request=request,  # type: ignore[arg-type]
+                    base_filename="joint-test",
+                    eligible_indices=(0, 1),
+                    exc=no_path,
+                    selection_active=False,
+                    materialized_candidate_count=0,
+                )
+            payload = json.loads(
+                (
+                    output_directory
+                    / "joint-test-joint-visual-selection-failure.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["status"], "joint_visual_selection_failed_closed")
+        self.assertFalse(payload["rhythm_timeline_fallback_allowed"])
+        self.assertEqual(
+            payload["no_complete_timeline_path"]["reason_code"],
+            "forward_reachability_exhausted",
+        )
+
+    def test_joint_failure_router_never_appends_rhythm_fallback(self) -> None:
+        request = SimpleNamespace(
+            sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+            output_directory=Path("/tmp"),
+        )
+        warnings: list[str] = []
+        with patch(
+            "crosscut.pipeline._raise_joint_visual_selection_failure",
+            side_effect=RuntimeError("sentinel joint failure"),
+        ) as fail_closed:
+            with self.assertRaisesRegex(RuntimeError, "sentinel joint failure"):
+                _route_visual_timeline_selection_failure(
+                    request=request,  # type: ignore[arg-type]
+                    base_filename="joint-test",
+                    eligible_indices=(0, 1),
+                    exc=ValueError("provider mismatch"),
+                    joint_visual_selection_attempted=True,
+                    joint_visual_selection_active=False,
+                    materialized_candidate_count=0,
+                    warnings=warnings,
+                )
+
+        fail_closed.assert_called_once()
+        self.assertEqual(warnings, [])
+
+    def test_legacy_visual_failure_router_retains_rhythm_fallback(self) -> None:
+        request = SimpleNamespace(
+            sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+            output_directory=Path("/tmp"),
+        )
+        warnings: list[str] = []
+        with patch(
+            "crosscut.pipeline._raise_joint_visual_selection_failure"
+        ) as fail_closed:
+            _route_visual_timeline_selection_failure(
+                request=request,  # type: ignore[arg-type]
+                base_filename="legacy-test",
+                eligible_indices=(0, 1),
+                exc=ValueError("legacy descriptor unavailable"),
+                joint_visual_selection_attempted=False,
+                joint_visual_selection_active=False,
+                materialized_candidate_count=0,
+                warnings=warnings,
+            )
+
+        fail_closed.assert_not_called()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("리듬 타임라인", warnings[0])
+
+    def test_joint_nested_source_domains_cover_final_render_copies(self) -> None:
+        domains = _source_index_mapping(
+            (Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+            (0, 1),
+        )["payload_index_domains"]
+        suffixes = (
+            "boundary_proof_bundle.segment_paths[].source_index",
+            "editorial_motion_plan.segments[].source_index",
+        )
+        for suffix in suffixes:
+            self.assertEqual(
+                domains[
+                    "render.joint_visual_selection.candidate_histories[]."
+                    f"{suffix}"
+                ],
+                ELIGIBLE_SOURCE_INDEX_DOMAIN,
+            )
+            self.assertEqual(
+                domains[
+                    "render.rendered_candidate_selection."
+                    "joint_visual_selection.candidate_histories[]."
+                    f"{suffix}"
+                ],
+                ELIGIBLE_SOURCE_INDEX_DOMAIN,
+            )
+
+    def test_joint_candidate_cannot_enter_legacy_splice_graph(self) -> None:
+        materialized = Mock(spec=JointMaterializedVisualCandidate)
+        self.assertIsInstance(materialized, JointMaterializedVisualCandidate)
+        request = SimpleNamespace(
+            sources=(Path("/tmp/source-a.mp4"), Path("/tmp/source-b.mp4")),
+        )
+        with self.assertRaisesRegex(ValueError, "lazy splice graph"):
+            _derive_complete_group_candidate(
+                materialized,
+                request=request,  # type: ignore[arg-type]
+                eligible_indices=(0, 1),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                source_timewarps=(None, None),
+                source_aspect_ratios=(16.0 / 9.0, 16.0 / 9.0),
+                source_durations_seconds=(30.0, 30.0),
+                beat_period_seconds=0.5,
+                phrase_times=(),
+                section_plan=None,
+                common_master_start=0.0,
+                width=1920,
+                height=1080,
+                output=Path("/tmp/output.mp4"),
+                splice_feasibility_graph=LazySpliceFeasibilityGraph("test"),
+            )
 
 
 if __name__ == "__main__":  # pragma: no cover

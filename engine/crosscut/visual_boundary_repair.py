@@ -901,6 +901,37 @@ class VisualBoundaryRepairPlan:
 DescriptorProvider = Callable[[int, float], FrameVisualDescriptor | None]
 
 
+@dataclass(slots=True)
+class _BoundaryDescriptorCacheTransaction:
+    """Process-local overlay for one atomic descriptor measurement.
+
+    The shared cache is not mutated until commit.  The overlay simulates its
+    exact LRU order and evictions using only keys touched by the transaction,
+    so rollback is O(touched) and cannot delete or reorder another user's
+    entries.
+    """
+
+    owner_id: int
+    base_revision: int
+    base_lru_iterator: Any
+    logical_size: int
+    operations: list[
+        tuple[
+            str,
+            tuple[int, float],
+            FrameVisualDescriptor | None,
+            bool | None,
+        ]
+    ]
+    tail_order: OrderedDict[tuple[int, float], None]
+    overlay: dict[tuple[int, float], FrameVisualDescriptor | None]
+    evicted_base_keys: set[tuple[int, float]]
+    hit_count: int = 0
+    miss_count: int = 0
+    eviction_count: int = 0
+    active: bool = True
+
+
 class BoundaryDescriptorCache:
     """Bounded process-local descriptor reuse across candidate repairs.
 
@@ -926,6 +957,7 @@ class BoundaryDescriptorCache:
         self.hit_count = 0
         self.miss_count = 0
         self.eviction_count = 0
+        self._revision = 0
 
     @staticmethod
     def _key(source_index: int, seconds: float) -> tuple[int, float]:
@@ -944,14 +976,40 @@ class BoundaryDescriptorCache:
         self,
         source_index: int,
         seconds: float,
+        *,
+        transaction: _BoundaryDescriptorCacheTransaction | None = None,
     ) -> tuple[bool, FrameVisualDescriptor | None]:
         key = self._key(source_index, seconds)
+        if transaction is not None:
+            self._validate_transaction(transaction)
+            if key in transaction.overlay:
+                hit = True
+                value = transaction.overlay[key]
+            elif (
+                key not in transaction.evicted_base_keys
+                and key in self._values
+            ):
+                hit = True
+                value = self._values[key]
+            else:
+                hit = False
+                value = None
+            transaction.operations.append(("lookup", key, None, hit))
+            if hit:
+                transaction.hit_count += 1
+                transaction.tail_order.pop(key, None)
+                transaction.tail_order[key] = None
+            else:
+                transaction.miss_count += 1
+            return hit, value
         if key not in self._values:
             self.miss_count += 1
+            self._revision += 1
             return False, None
         value = self._values.pop(key)
         self._values[key] = value
         self.hit_count += 1
+        self._revision += 1
         return True, value
 
     def store(
@@ -959,13 +1017,133 @@ class BoundaryDescriptorCache:
         source_index: int,
         seconds: float,
         descriptor: FrameVisualDescriptor | None,
+        *,
+        transaction: _BoundaryDescriptorCacheTransaction | None = None,
     ) -> None:
         key = self._key(source_index, seconds)
+        if transaction is not None:
+            self._validate_transaction(transaction)
+            present = bool(
+                key in transaction.overlay
+                or (
+                    key not in transaction.evicted_base_keys
+                    and key in self._values
+                )
+            )
+            if not present:
+                transaction.logical_size += 1
+            transaction.evicted_base_keys.discard(key)
+            transaction.overlay[key] = descriptor
+            transaction.tail_order.pop(key, None)
+            transaction.tail_order[key] = None
+            transaction.operations.append(("store", key, descriptor, None))
+            while transaction.logical_size > self.maximum_entries:
+                evicted: tuple[int, float] | None = None
+                while evicted is None:
+                    try:
+                        candidate = next(transaction.base_lru_iterator)
+                    except StopIteration:
+                        break
+                    if (
+                        candidate in transaction.evicted_base_keys
+                        or candidate in transaction.tail_order
+                    ):
+                        continue
+                    evicted = candidate
+                if evicted is None:
+                    try:
+                        evicted = next(iter(transaction.tail_order))
+                    except StopIteration as exc:  # pragma: no cover - invariant
+                        raise RuntimeError(
+                            "descriptor transaction lost its logical LRU"
+                        ) from exc
+                transaction.tail_order.pop(evicted, None)
+                transaction.overlay.pop(evicted, None)
+                if evicted in self._values:
+                    transaction.evicted_base_keys.add(evicted)
+                transaction.logical_size -= 1
+                transaction.eviction_count += 1
+            return
         self._values.pop(key, None)
         self._values[key] = descriptor
         while len(self._values) > self.maximum_entries:
             self._values.popitem(last=False)
             self.eviction_count += 1
+        self._revision += 1
+
+    def begin_transaction(self) -> _BoundaryDescriptorCacheTransaction:
+        """Start an exact staged LRU transaction without copying the cache."""
+
+        return _BoundaryDescriptorCacheTransaction(
+            owner_id=id(self),
+            base_revision=self._revision,
+            base_lru_iterator=iter(self._values),
+            logical_size=len(self._values),
+            operations=[],
+            tail_order=OrderedDict(),
+            overlay={},
+            evicted_base_keys=set(),
+        )
+
+    def commit_transaction(
+        self,
+        transaction: _BoundaryDescriptorCacheTransaction,
+    ) -> None:
+        """Replay a staged transaction atomically onto the unchanged base."""
+
+        self._validate_transaction(transaction)
+        if transaction.base_revision != self._revision:
+            raise RuntimeError(
+                "descriptor cache changed while a transaction was active"
+            )
+        observed_evictions = 0
+        for operation, key, descriptor, expected_hit in transaction.operations:
+            if operation == "lookup":
+                hit = key in self._values
+                if hit != expected_hit:
+                    raise RuntimeError(
+                        "descriptor transaction replay changed cache visibility"
+                    )
+                if hit:
+                    value = self._values.pop(key)
+                    self._values[key] = value
+                continue
+            if operation != "store":  # pragma: no cover - token invariant
+                raise RuntimeError("descriptor transaction operation is invalid")
+            self._values.pop(key, None)
+            self._values[key] = descriptor
+            while len(self._values) > self.maximum_entries:
+                self._values.popitem(last=False)
+                observed_evictions += 1
+        if observed_evictions != transaction.eviction_count:
+            raise RuntimeError(
+                "descriptor transaction replay changed eviction semantics"
+            )
+        self.hit_count += transaction.hit_count
+        self.miss_count += transaction.miss_count
+        self.eviction_count += transaction.eviction_count
+        self._revision += 1
+        transaction.active = False
+
+    def rollback_transaction(
+        self,
+        transaction: _BoundaryDescriptorCacheTransaction,
+    ) -> None:
+        """Discard a staged transaction; the shared cache is already exact."""
+
+        self._validate_transaction(transaction)
+        transaction.active = False
+
+    def _validate_transaction(
+        self,
+        transaction: _BoundaryDescriptorCacheTransaction,
+    ) -> None:
+        if not isinstance(transaction, _BoundaryDescriptorCacheTransaction):
+            raise TypeError("descriptor cache transaction is invalid")
+        if transaction.owner_id != id(self):
+            raise ValueError("descriptor cache transaction belongs to another cache")
+        if not transaction.active:
+            raise RuntimeError("descriptor cache transaction is no longer active")
 
     def diagnostics(self) -> dict[str, int | bool | str]:
         return {
@@ -978,6 +1156,38 @@ class BoundaryDescriptorCache:
             "raw_frames_persisted": False,
             "persistent": False,
         }
+
+    def discard_source_indices(self, source_indices: Sequence[int]) -> int:
+        """Drop exact process-local namespaces without flushing other users."""
+
+        normalized: set[int] = set()
+        for value in source_indices:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError("descriptor cache source index is invalid")
+            normalized.add(value)
+        discarded = 0
+        for key in tuple(self._values):
+            if key[0] not in normalized:
+                continue
+            self._values.pop(key)
+            discarded += 1
+        if discarded:
+            self._revision += 1
+        return discarded
+
+    def discard(self, source_index: int, seconds: float) -> bool:
+        """Remove one exact transient entry for transaction rollback."""
+
+        key = self._key(source_index, seconds)
+        if key not in self._values:
+            return False
+        self._values.pop(key)
+        self._revision += 1
+        return True
 
 
 def _stable_temporal_pose_choice(
