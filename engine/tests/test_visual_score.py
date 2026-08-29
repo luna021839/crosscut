@@ -10,8 +10,11 @@ import cv2
 import numpy as np
 
 from crosscut.pose import FormationPersonDescriptor, SubjectGeometryDescriptor
+from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.timeline import (
     BoundarySideStability,
+    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
+    NoCompleteTimelinePath,
     ShotType,
     TimelineCandidate,
     TimelineChoice,
@@ -23,13 +26,20 @@ from crosscut.timeline_review import review_timeline
 from crosscut.visual_score import (
     FrameVisualDescriptor,
     PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS,
+    ProfessionalMontageSelectionPolicy,
     VisualDiversityConfig,
+    VisualTimelineCandidateRecord,
     YUNET_EXPECTED_SHA256,
     _DissolveEvidence,
     _DetectedFace,
     _dark_foreground_obstruction_score,
     _dissolve_evidence_window,
+    _candidate_role_shot_samples,
     _normalized_face_metadata,
+    _professional_intentional_transition_anchor_basis,
+    _role_conditioned_candidate_outcomes,
+    _role_conditioned_visual_controls,
+    _role_target_categories,
     _safe_cadence_profiles,
     _select_safe_cadence_candidates,
     build_visual_timeline,
@@ -54,6 +64,27 @@ def formation_person(center_x: float) -> FormationPersonDescriptor:
             (-0.16, 0.38, 0.9),
             (0.16, 0.38, 0.9),
         ),
+    )
+
+
+def professional_policy() -> ProfessionalMontageSelectionPolicy:
+    return ProfessionalMontageSelectionPolicy(
+        highlight_minimum_closeup_fraction=0.25,
+        highlight_preferred_closeup_fraction=0.34,
+        highlight_minimum_nonwide_fraction=0.49,
+        highlight_preferred_nonwide_fraction=0.66,
+        build_minimum_closeup_fraction=0.12,
+        build_preferred_closeup_fraction=0.25,
+        build_minimum_nonwide_fraction=0.15,
+        build_preferred_nonwide_fraction=0.31,
+        bridge_minimum_closeup_fraction=0.27,
+        bridge_preferred_closeup_fraction=0.43,
+        bridge_minimum_nonwide_fraction=0.42,
+        bridge_preferred_nonwide_fraction=0.58,
+        highlight_minimum_source_switches_per_minute=18.6,
+        highlight_preferred_source_switches_per_minute=23.5,
+        minimum_early_wide_anchor_fraction=1.0 / 3.0,
+        minimum_phrase_entry_wide_anchor_fraction=0.28,
     )
 
 
@@ -113,6 +144,7 @@ class VisualScoreTests(unittest.TestCase):
                 config.maximum_same_source_hold_seconds,
                 PROFESSIONAL_MAX_SOURCE_HOLD_SECONDS,
             )
+            self.assertIsNone(config.maximum_cross_source_focus_mismatch)
             self.assertIsNone(config.maximum_cross_source_formation_mismatch)
             self.assertGreater(config.formation_transition_weight, 0.0)
             self.assertEqual(
@@ -229,6 +261,337 @@ class VisualScoreTests(unittest.TestCase):
         self.assertEqual(cadence_profiles.count("balanced"), 11)
         self.assertEqual(cadence_profiles.count("reference"), 11)
         self.assertEqual(cadence_profiles.count("dense_safe"), 10)
+
+    def test_safe_cadence_profile_exhaustion_keeps_other_profiles(self) -> None:
+        reference = self.timeline_result("reference")
+        dense = self.timeline_result("dense")
+        candidates_by_segment = ((reference.candidates[0],),)
+        exhausted = NoCompleteTimelinePath(
+            "balanced has no path",
+            reason_code="cadence_state_graph_exhausted",
+            segment_index=3,
+            rejection_counts={"same_source_segment_hold_cap": 2},
+        )
+
+        with patch(
+            "crosscut.visual_score.select_timeline_candidates",
+            side_effect=(exhausted, (reference,), (dense,)),
+        ):
+            results, cadence_profiles = _select_safe_cadence_candidates(
+                candidates_by_segment,
+                preferred_source_ids=None,
+                diversity=VisualDiversityConfig(),
+            )
+
+        self.assertEqual(results, (reference, dense))
+        self.assertEqual(cadence_profiles, ("reference", "dense_safe"))
+
+    def test_safe_cadence_all_profile_exhaustion_is_structured(self) -> None:
+        candidate = self.timeline_result("only").candidates[0]
+        failures = tuple(
+            NoCompleteTimelinePath(
+                f"profile {index} has no path",
+                reason_code="cadence_state_graph_exhausted",
+                segment_index=index,
+            )
+            for index in range(3)
+        )
+
+        with patch(
+            "crosscut.visual_score.select_timeline_candidates",
+            side_effect=failures,
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                _select_safe_cadence_candidates(
+                    ((candidate,),),
+                    preferred_source_ids=None,
+                    diversity=VisualDiversityConfig(),
+                )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "all_safe_cadence_profiles_exhausted",
+        )
+        self.assertEqual(
+            set(caught.exception.rejection_counts),
+            {
+                "balanced:cadence_state_graph_exhausted",
+                "reference:cadence_state_graph_exhausted",
+                "dense_safe:cadence_state_graph_exhausted",
+            },
+        )
+
+    def test_role_conditioning_builds_chorus_anchor_burst_and_cadence_controls(
+        self,
+    ) -> None:
+        policy = professional_policy()
+        section_plan = SectionPlan(
+            sections=(
+                SectionDirective(
+                    section_index=0,
+                    role=SectionRole.CHORUS_LIKE,
+                    start_seconds=0.0,
+                    end_seconds=12.0,
+                    energy_score=0.9,
+                    confidence=0.9,
+                    phrase_count=3,
+                    preferred_source_hold_beats=2,
+                    target_source_switches_per_minute=18.0,
+                    camera_motion_budget=0.8,
+                    target_roll_events_per_minute=0.3,
+                    establish_with_wide_shot=True,
+                    protect_last_beat_from_extra_cut=False,
+                ),
+            )
+        )
+        candidates_by_segment = []
+        for index in range(12):
+            candidates_by_segment.append(
+                [
+                    TimelineCandidate(
+                        segment_index=index,
+                        source_id="wide",
+                        start_seconds=float(index),
+                        end_seconds=float(index + 1),
+                        shot_type=ShotType.GROUP_WIDE,
+                        entry_shot_type=ShotType.GROUP_WIDE,
+                        exit_shot_type=ShotType.GROUP_WIDE,
+                        is_group_wide=True,
+                        candidate_id=f"{index}:wide",
+                    ),
+                    TimelineCandidate(
+                        segment_index=index,
+                        source_id="close",
+                        start_seconds=float(index),
+                        end_seconds=float(index + 1),
+                        shot_type=ShotType.CLOSE_UP,
+                        entry_shot_type=ShotType.CLOSE_UP,
+                        exit_shot_type=ShotType.CLOSE_UP,
+                        candidate_id=f"{index}:close",
+                    ),
+                ]
+            )
+
+        targets, target_audit = _role_target_categories(
+            candidates_by_segment,
+            section_plan=section_plan,
+            phrase_times=(0.0, 4.0, 8.0, 12.0),
+            policy=policy,
+            cadence_profile="reference",
+        )
+        adjustments, switch_bonus, control_audit = (
+            _role_conditioned_visual_controls(
+                candidates_by_segment,
+                section_plan=section_plan,
+                phrase_times=(0.0, 4.0, 8.0, 12.0),
+                policy=policy,
+                cadence_profile="reference",
+                subject_metadata_by_candidate={},
+            )
+        )
+
+        self.assertEqual(targets[0], "wide")
+        self.assertGreaterEqual(
+            sum(value == "close" for value in targets.values()),
+            6,
+        )
+        self.assertGreaterEqual(
+            sum(value != "wide" for value in targets.values()),
+            9,
+        )
+
+        first_close = next(
+            index for index, value in targets.items() if value == "close"
+        )
+        self.assertLess(
+            adjustments[(first_close, "wide")],
+            adjustments.get((first_close, "close"), 0.0),
+        )
+        self.assertLess(
+            adjustments[(0, "close")],
+            adjustments[(0, "wide")],
+        )
+        self.assertEqual(len(switch_bonus), 5)
+        self.assertIn(1, switch_bonus)
+        self.assertIn(11, switch_bonus)
+        self.assertGreater(min(switch_bonus.values()), 3.0)
+        self.assertEqual(
+            control_audit["highlight_source_switch_targets"][0][
+                "target_source_switch_count"
+            ],
+            5,
+        )
+        self.assertEqual(target_audit["target_segment_count"], 12)
+        target_section = target_audit["section_targets"][0]
+        self.assertFalse(target_section["optional_wide_budget_forced"])
+        self.assertEqual(
+            target_section["target_wide_position_count"],
+            len(target_section["mandatory_wide_positions"]),
+        )
+        self.assertGreater(
+            target_section["wide_budget_position_count"],
+            target_section["target_wide_position_count"],
+        )
+        availability = control_audit["section_candidate_availability"][0]
+        self.assertEqual(availability["section_index"], 0)
+        self.assertEqual(
+            availability[
+                "attainable_closeup_duration_fraction_upper_bound"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            availability[
+                "attainable_nonwide_duration_fraction_upper_bound"
+            ],
+            1.0,
+        )
+        self.assertFalse(control_audit["hard_visual_gate_relaxed"])
+        _, dense_switch_bonus, dense_audit = (
+            _role_conditioned_visual_controls(
+                candidates_by_segment,
+                section_plan=section_plan,
+                phrase_times=(0.0, 4.0, 8.0, 12.0),
+                policy=policy,
+                cadence_profile="dense_safe",
+                subject_metadata_by_candidate={},
+            )
+        )
+        self.assertEqual(dense_audit["penalty_strength"], 128.0)
+        self.assertGreater(min(dense_switch_bonus.values()), 60.0)
+
+        close_only_at_seven = [
+            segment if index == 7 else [segment[0]]
+            for index, segment in enumerate(candidates_by_segment)
+        ]
+        availability_targets, availability_audit = _role_target_categories(
+            close_only_at_seven,
+            section_plan=section_plan,
+            phrase_times=(0.0, 4.0, 8.0, 12.0),
+            policy=policy,
+            cadence_profile="reference",
+        )
+        self.assertEqual(availability_targets[7], "close")
+        self.assertTrue(
+            availability_audit["section_targets"][0][
+                "availability_aware_target_assignment"
+            ]
+        )
+
+        choices = tuple(
+            TimelineChoice(
+                candidate=(
+                    segment[0] if index in {0, 4, 8} else segment[1]
+                ),
+                emission_score=1.0,
+                transition_score=0.0,
+                cumulative_score=float(index + 1),
+                used_group_wide_fallback=False,
+            )
+            for index, segment in enumerate(candidates_by_segment)
+        )
+        result = TimelineResult(
+            mode=TimelineMode.GENERAL,
+            target_member=None,
+            choices=choices,
+            total_score=12.0,
+        )
+        record = VisualTimelineCandidateRecord(
+            candidate_index=0,
+            cadence_profile="reference",
+            timeline_result=result,
+            review=review_timeline(result, available_source_count=2),
+            review_rank=0,
+            selected=True,
+        )
+        outcome = _role_conditioned_candidate_outcomes(
+            (record,),
+            section_plan=section_plan,
+            policy=policy,
+            subject_metadata_by_candidate={},
+        )[0]
+        self.assertTrue(outcome["all_highlight_metadata_floors_passed"])
+        self.assertFalse(outcome["decoded_output_authority"])
+        self.assertEqual(outcome["sections"][0]["section_index"], 0)
+
+    def test_intentional_contrast_marker_is_highlight_phrase_only(self) -> None:
+        def directive(
+            index: int,
+            role: SectionRole,
+            start: float,
+            end: float,
+        ) -> SectionDirective:
+            return SectionDirective(
+                section_index=index,
+                role=role,
+                start_seconds=start,
+                end_seconds=end,
+                energy_score=0.8,
+                confidence=0.8,
+                phrase_count=1,
+                preferred_source_hold_beats=2,
+                target_source_switches_per_minute=16.0,
+                camera_motion_budget=0.7,
+                target_roll_events_per_minute=0.2,
+                establish_with_wide_shot=False,
+                protect_last_beat_from_extra_cut=False,
+            )
+
+        section_plan = SectionPlan(
+            sections=(
+                directive(0, SectionRole.CHORUS_LIKE, 0.0, 4.0),
+                directive(1, SectionRole.VERSE_LIKE, 4.0, 8.0),
+            )
+        )
+        arguments = {
+            "section_plan": section_plan,
+            "phrase_times": (0.0, 2.0, 4.0, 6.0, 8.0),
+            "professional_policy": professional_policy(),
+        }
+
+        self.assertEqual(
+            _professional_intentional_transition_anchor_basis(
+                2.0,
+                **arguments,
+            ),
+            INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
+        )
+        self.assertIsNone(
+            _professional_intentional_transition_anchor_basis(
+                1.0,
+                **arguments,
+            )
+        )
+        self.assertIsNone(
+            _professional_intentional_transition_anchor_basis(
+                6.0,
+                **arguments,
+            )
+        )
+        self.assertIsNone(
+            _professional_intentional_transition_anchor_basis(
+                2.0,
+                **{**arguments, "professional_policy": None},
+            )
+        )
+
+    def test_role_shot_samples_have_exact_entry_mid_exit_cardinality(
+        self,
+    ) -> None:
+        wide = TimelineCandidate(
+            segment_index=0,
+            source_id="wide",
+            start_seconds=0.0,
+            end_seconds=1.0,
+            shot_type=ShotType.GROUP_WIDE,
+            entry_shot_type=ShotType.WIDE,
+            exit_shot_type=ShotType.GROUP_WIDE,
+        )
+
+        samples, formation_proven = _candidate_role_shot_samples(wide, {})
+
+        self.assertEqual(samples, ("wide", "wide", "wide"))
+        self.assertFalse(formation_proven)
 
     def test_bbox_layout_gate_removes_the_all_review_failure_path(self) -> None:
         stable = BoundarySideStability(
@@ -1451,7 +1814,7 @@ class VisualScoreTests(unittest.TestCase):
         self.assertLessEqual(self.maximum_source_run(sources), 6)
         self.assertEqual(
             plan.analysis_basis,
-            "reviewed_thirty_two_candidate_shot_hierarchy_boundary_stability_safe_v13",
+            "reviewed_thirty_two_candidate_shot_hierarchy_phrase_anchor_contrast_v14",
         )
 
     def test_nine_equal_sources_follow_full_coverage_preferences(self) -> None:

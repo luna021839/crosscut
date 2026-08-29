@@ -14,7 +14,15 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .render import NormalizedCrop, PanCropKeyframe, PanCropTrack
+from .render import (
+    NormalizedCrop,
+    PanCropKeyframe,
+    PanCropTrack,
+    RenderSegment,
+    _tier_d_base_crop_is_frame_continuous,
+)
+from .section_director import SectionPlan, SectionRole
+from .timeline import ShotType
 from .visual_score import VisualTimelinePlan
 
 
@@ -40,6 +48,7 @@ class FaceMatchConfig:
     silhouette_target_screen_y: float = 0.50
     maximum_partial_face_center_span: float = 0.16
     maximum_partial_face_scale_ratio: float = 1.45
+    minimum_nonwide_rescue_face_height: float = 0.096096
 
     def __post_init__(self) -> None:
         numeric = (
@@ -62,6 +71,7 @@ class FaceMatchConfig:
             self.silhouette_target_screen_y,
             self.maximum_partial_face_center_span,
             self.maximum_partial_face_scale_ratio,
+            self.minimum_nonwide_rescue_face_height,
         )
         if any(not math.isfinite(value) for value in numeric):
             raise ValueError("face-match configuration must be finite")
@@ -103,6 +113,8 @@ class FaceMatchConfig:
             raise ValueError("partial face center span must be in (0, 0.28]")
         if not 1.0 <= self.maximum_partial_face_scale_ratio <= 1.8:
             raise ValueError("partial face scale ratio must be in [1.0, 1.8]")
+        if not 0.09 <= self.minimum_nonwide_rescue_face_height <= 0.14:
+            raise ValueError("nonwide rescue face height is outside its safe range")
         if self.target_face_height_override is not None and not (
             math.isfinite(self.target_face_height_override)
             and 0.0 < self.target_face_height_override < 1.0
@@ -124,6 +136,8 @@ class FaceMatchSegment:
     alignment_subject: str | None = None
     observed_silhouette_height: float | None = None
     target_silhouette_height: float | None = None
+    continuous_run_stitched: bool = False
+    alignment_purpose: str | None = None
 
     @property
     def transition_tier(self) -> str:
@@ -157,6 +171,8 @@ class FaceMatchSegment:
             "target_silhouette_height": self.target_silhouette_height,
             "required_zoom": self.required_zoom,
             "applied_zoom": self.applied_zoom,
+            "continuous_run_stitched": self.continuous_run_stitched,
+            "alignment_purpose": self.alignment_purpose,
             "crop_keyframes": (
                 [
                     {
@@ -192,7 +208,7 @@ class FaceMatchPlan:
     silhouette_target_candidate_count: int = 0
     eligible_silhouette_segment_count: int = 0
     analysis_basis: str = (
-        "boundary_local_partial_face_or_silhouette_safe_virtual_camera_v4"
+        "role_conditioned_nonwide_rescue_and_run_stitched_virtual_camera_v8"
     )
 
     @property
@@ -218,6 +234,19 @@ class FaceMatchPlan:
         )
 
     @property
+    def continuous_run_stitched_segment_count(self) -> int:
+        return sum(item.continuous_run_stitched for item in self.segments)
+
+    @property
+    def nonwide_rescue_applied_count(self) -> int:
+        return sum(
+            item.applied
+            and item.alignment_purpose
+            == "chorus_single_subject_nonwide_rescue"
+            for item in self.segments
+        )
+
+    @property
     def raw_segment_count(self) -> int:
         return sum(
             item.transition_tier == "raw_hard_cut_fallback"
@@ -239,7 +268,9 @@ class FaceMatchPlan:
             "analysis_basis": self.analysis_basis,
             "policy": (
                 "face_then_stable_silhouette_static_or_pan_crop; "
-                "one_sided_cross_source_edges_remain_tier_c_hard_cuts"
+                "chorus_single_subject_nonwide_rescue; "
+                "formation_wides_preserved; one_sided_cross_source_edges "
+                "remain_tier_c_hard_cuts"
             ),
             "target_face_height": self.target_face_height,
             "target_selection_policy": self.target_selection_policy,
@@ -260,6 +291,12 @@ class FaceMatchPlan:
             "applied_count": self.applied_count,
             "fallback_count": self.fallback_count,
             "silhouette_applied_count": self.silhouette_applied_count,
+            "continuous_run_stitched_segment_count": (
+                self.continuous_run_stitched_segment_count
+            ),
+            "nonwide_rescue_applied_count": (
+                self.nonwide_rescue_applied_count
+            ),
             "count_basis": "selected_segments",
             "aligned_segment_count": self.aligned_segment_count,
             "raw_segment_count": self.raw_segment_count,
@@ -847,6 +884,7 @@ def _alignment_attempt(
     maximum_zoom: float,
     settings: FaceMatchConfig,
     sample_time_fractions: Sequence[float] | None = None,
+    alignment_purpose: str | None = None,
 ) -> FaceMatchSegment:
     """Build one face/silhouette crop or an explicit raw-frame attempt result."""
 
@@ -984,7 +1022,272 @@ def _alignment_attempt(
         target_silhouette_height=(
             alignment_target if alignment_subject == "silhouette" else None
         ),
+        alignment_purpose=alignment_purpose,
     )
+
+
+def _fixed_crop_at(
+    track: PanCropTrack,
+    time_seconds: float,
+) -> NormalizedCrop:
+    """Evaluate the renderer's fixed-size linear pan-crop path."""
+
+    width, height = track.fixed_crop_size
+    positions = track.fixed_crop_positions()
+    if time_seconds <= positions[0][0] + 1e-9:
+        return NormalizedCrop(positions[0][1], positions[0][2], width, height)
+    for left, right in zip(positions, positions[1:]):
+        if time_seconds <= right[0] + 1e-9:
+            span = right[0] - left[0]
+            alpha = 1.0 if span <= 1e-9 else (time_seconds - left[0]) / span
+            return NormalizedCrop(
+                left[1] + (right[1] - left[1]) * alpha,
+                left[2] + (right[2] - left[2]) * alpha,
+                width,
+                height,
+            )
+    return NormalizedCrop(positions[-1][1], positions[-1][2], width, height)
+
+
+def _covering_crop(
+    rectangles: Sequence[NormalizedCrop],
+    *,
+    width: float,
+    height: float,
+) -> NormalizedCrop | None:
+    """Place one crop that contains every already-proven safe rectangle."""
+
+    if not rectangles:
+        return None
+    union_left = min(item.x for item in rectangles)
+    union_top = min(item.y for item in rectangles)
+    union_right = max(item.x + item.width for item in rectangles)
+    union_bottom = max(item.y + item.height for item in rectangles)
+    if (
+        union_right - union_left > width + 1e-9
+        or union_bottom - union_top > height + 1e-9
+    ):
+        return None
+    minimum_left = max(0.0, union_right - width)
+    maximum_left = min(union_left, 1.0 - width)
+    minimum_top = max(0.0, union_bottom - height)
+    maximum_top = min(union_top, 1.0 - height)
+    if minimum_left > maximum_left + 1e-9 or minimum_top > maximum_top + 1e-9:
+        return None
+    desired_left = (union_left + union_right - width) / 2.0
+    desired_top = (union_top + union_bottom - height) / 2.0
+    return NormalizedCrop(
+        min(max(desired_left, minimum_left), maximum_left),
+        min(max(desired_top, minimum_top), maximum_top),
+        width,
+        height,
+    )
+
+
+def _stitch_continuous_applied_run(
+    decisions: Sequence[FaceMatchSegment],
+    choices: Sequence[Any],
+    frame_counts: Sequence[int],
+    *,
+    fps: float,
+) -> tuple[FaceMatchSegment, ...] | None:
+    """Join an all-safe same-shot run without a hidden crop reset.
+
+    Each original crop has already passed subject containment. The stitched
+    run uses one fixed crop size large enough to contain both independently
+    proven endpoint rectangles at every invisible split, then gives adjacent
+    segments the exact same boundary rectangle. This preserves the safety
+    evidence while avoiding the former all-or-nothing demotion.
+    """
+
+    if (
+        not decisions
+        or len(decisions) != len(choices)
+        or len(decisions) != len(frame_counts)
+        or any(not item.applied or item.pan_crop is None for item in decisions)
+        or len({item.alignment_subject for item in decisions}) != 1
+    ):
+        return None
+    typed_tracks = tuple(
+        item.pan_crop for item in decisions if item.pan_crop is not None
+    )
+    if len(typed_tracks) != len(decisions):  # pragma: no cover - precondition
+        return None
+    ratios = tuple(
+        track.fixed_crop_size[0] / track.fixed_crop_size[1]
+        for track in typed_tracks
+    )
+    if max(ratios) - min(ratios) > 0.002:
+        return None
+    ratio = sum(ratios) / len(ratios)
+
+    constraints: list[dict[float, list[NormalizedCrop]]] = []
+    for choice, track in zip(choices, typed_tracks, strict=True):
+        duration = float(choice.duration_seconds)
+        times = {0.0, duration}
+        times.update(
+            min(duration, max(0.0, float(item.time_seconds)))
+            for item in track.keyframes
+        )
+        constraints.append(
+            {
+                time_value: [_fixed_crop_at(track, time_value)]
+                for time_value in sorted(times)
+            }
+        )
+    for position in range(len(decisions) - 1):
+        left_duration = float(choices[position].duration_seconds)
+        left_crop = _fixed_crop_at(typed_tracks[position], left_duration)
+        right_crop = _fixed_crop_at(typed_tracks[position + 1], 0.0)
+        shared = [left_crop, right_crop]
+        constraints[position][left_duration] = shared
+        constraints[position + 1][0.0] = shared
+
+    required_height = 0.0
+    for by_time in constraints:
+        for rectangles in by_time.values():
+            union_width = max(
+                item.x + item.width for item in rectangles
+            ) - min(item.x for item in rectangles)
+            union_height = max(
+                item.y + item.height for item in rectangles
+            ) - min(item.y for item in rectangles)
+            required_height = max(
+                required_height,
+                union_height,
+                union_width / ratio,
+            )
+    maximum_height = min(1.0, 1.0 / ratio)
+    if required_height > maximum_height + 1e-9:
+        return None
+    common_height = min(maximum_height, required_height)
+    common_width = ratio * common_height
+    applied_zoom = 1.0 / common_height
+    if applied_zoom < 1.025 - 1e-9:
+        return None
+
+    stitched: list[FaceMatchSegment] = []
+    for decision, by_time in zip(decisions, constraints, strict=True):
+        keyframes: list[PanCropKeyframe] = []
+        for time_value, rectangles in sorted(by_time.items()):
+            crop = _covering_crop(
+                rectangles,
+                width=common_width,
+                height=common_height,
+            )
+            if crop is None:
+                return None
+            keyframes.append(PanCropKeyframe(time_value, crop))
+        first_crop = keyframes[0].crop
+        if all(
+            max(
+                abs(item.crop.x - first_crop.x),
+                abs(item.crop.y - first_crop.y),
+            )
+            <= 1e-7
+            for item in keyframes[1:]
+        ):
+            keyframes = [PanCropKeyframe(0.0, first_crop)]
+        stitched.append(
+            replace(
+                decision,
+                applied_zoom=applied_zoom,
+                pan_crop=PanCropTrack(tuple(keyframes)),
+                continuous_run_stitched=True,
+            )
+        )
+    def render_safe(items: Sequence[FaceMatchSegment]) -> bool:
+        for position, (left, right) in enumerate(zip(items, items[1:])):
+            assert left.pan_crop is not None and right.pan_crop is not None
+            left_choice = choices[position]
+            right_choice = choices[position + 1]
+            left_segment = RenderSegment(
+                source_index=int(left_choice.source_index),
+                source_start=0.0,
+                duration=float(left_choice.duration_seconds),
+                master_start=0.0,
+                pan_crop=left.pan_crop,
+            )
+            right_segment = RenderSegment(
+                source_index=int(right_choice.source_index),
+                source_start=0.0,
+                duration=float(right_choice.duration_seconds),
+                master_start=float(left_choice.duration_seconds),
+                pan_crop=right.pan_crop,
+            )
+            if not _tier_d_base_crop_is_frame_continuous(
+                left_segment,
+                right_segment,
+                left_frame_count=int(frame_counts[position]),
+                right_frame_count=int(frame_counts[position + 1]),
+                fps=fps,
+            ):
+                return False
+        return True
+
+    for position, (left, right) in enumerate(zip(stitched, stitched[1:])):
+        assert left.pan_crop is not None and right.pan_crop is not None
+        left_crop = _fixed_crop_at(
+            left.pan_crop,
+            float(choices[position].duration_seconds),
+        )
+        right_crop = _fixed_crop_at(right.pan_crop, 0.0)
+        if max(
+            abs(left_value - right_value)
+            for left_value, right_value in zip(
+                (left_crop.x, left_crop.y, left_crop.width, left_crop.height),
+                (right_crop.x, right_crop.y, right_crop.width, right_crop.height),
+                strict=True,
+            )
+        ) > 1e-8:
+            return None
+    if render_safe(stitched):
+        return tuple(stitched)
+
+    # A sparse tracker can imply a fast pan during the fractional final-frame
+    # interval even though both mathematical endpoints meet. Prefer one static
+    # crop that contains every already-proven safe rectangle in the same
+    # source-local shot. This keeps the scale match without introducing a
+    # hidden one-frame whip. If the union would erase meaningful zoom, the
+    # caller demotes the whole invisible run to raw frames instead.
+    all_rectangles = tuple(
+        rectangle
+        for by_time in constraints
+        for rectangles in by_time.values()
+        for rectangle in rectangles
+    )
+    union_width = max(
+        item.x + item.width for item in all_rectangles
+    ) - min(item.x for item in all_rectangles)
+    union_height = max(
+        item.y + item.height for item in all_rectangles
+    ) - min(item.y for item in all_rectangles)
+    static_height = max(union_height, union_width / ratio)
+    if static_height > maximum_height + 1e-9:
+        return None
+    static_width = ratio * static_height
+    static_zoom = 1.0 / static_height
+    if static_zoom < 1.025 - 1e-9:
+        return None
+    static_crop = _covering_crop(
+        all_rectangles,
+        width=static_width,
+        height=static_height,
+    )
+    if static_crop is None:
+        return None
+    static_stitched = tuple(
+        replace(
+            decision,
+            applied_zoom=static_zoom,
+            pan_crop=PanCropTrack((PanCropKeyframe(0.0, static_crop),)),
+            continuous_run_stitched=True,
+        )
+        for decision in decisions
+    )
+    if not render_safe(static_stitched):  # pragma: no cover - exact static proof
+        return None
+    return static_stitched
 
 
 def build_face_match_plan(
@@ -992,13 +1295,22 @@ def build_face_match_plan(
     visual_timeline: VisualTimelinePlan,
     source_aspect_ratios: Sequence[float],
     config: FaceMatchConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    fps: float = 29.97,
 ) -> FaceMatchPlan:
-    """Create fixed-zoom, smoothly panning 16:9 crops for selected shots."""
+    """Create fixed-zoom, smoothly panning 16:9 crops for selected shots.
+
+    When a section plan is supplied, a chorus-like single-subject wide shot
+    may use a smaller secondary target that merely crosses the decoded
+    non-wide face threshold. Genuine multi-person formation wides remain raw.
+    """
 
     if not visual_timeline.choices:
         raise ValueError("visual timeline cannot be empty")
     if not source_aspect_ratios:
         raise ValueError("source aspect ratios cannot be empty")
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError("face-match fps must be positive and finite")
     if any(
         not math.isfinite(value) or value <= 0.0
         for value in source_aspect_ratios
@@ -1009,6 +1321,13 @@ def build_face_match_plan(
         for choice in visual_timeline.choices
     ):
         raise ValueError("visual choice references an unknown source aspect ratio")
+    if section_plan is not None and (
+        section_plan.start_seconds
+        > visual_timeline.choices[0].canonical_master_start + 1e-6
+        or section_plan.end_seconds
+        < visual_timeline.choices[-1].canonical_master_end - 1e-6
+    ):
+        raise ValueError("section plan does not cover the visual timeline")
 
     settings = config or FaceMatchConfig()
     if settings.target_face_height_override is not None:
@@ -1070,9 +1389,55 @@ def build_face_match_plan(
                 maximum_zoom=settings.maximum_zoom,
                 settings=settings,
                 sample_time_fractions=face_geometry.time_fractions,
+                alignment_purpose="global_face_scale_match",
             )
             if face_attempt.applied:
                 decisions.append(face_attempt)
+                continue
+
+        nonwide_rescue: FaceMatchSegment | None = None
+        shot_types = (
+            choice.entry_shot_type or choice.shot_type,
+            choice.shot_type,
+            choice.exit_shot_type or choice.shot_type,
+        )
+        directive = (
+            section_plan.directive_at(choice.canonical_master_start)
+            if section_plan is not None
+            else None
+        )
+        if (
+            face_geometry is not None
+            and directive is not None
+            and directive.role is SectionRole.CHORUS_LIKE
+            and sum(
+                value in {ShotType.GROUP_WIDE, ShotType.WIDE}
+                for value in shot_types
+            )
+            >= 2
+            and max(
+                (*choice.detected_person_counts, *choice.formation_person_counts),
+                default=0,
+            )
+            < 3
+        ):
+            nonwide_rescue = _alignment_attempt(
+                choice=choice,
+                alignment_subject="face",
+                samples=face_geometry.samples,
+                centers=face_geometry.centers,
+                alignment_target=settings.minimum_nonwide_rescue_face_height,
+                face_target=settings.minimum_nonwide_rescue_face_height,
+                silhouette_target=target_silhouette,
+                source_aspect=source_aspect,
+                target_screen_y=settings.target_screen_y,
+                maximum_zoom=settings.maximum_zoom,
+                settings=settings,
+                sample_time_fractions=face_geometry.time_fractions,
+                alignment_purpose="chorus_single_subject_nonwide_rescue",
+            )
+            if nonwide_rescue.applied:
+                decisions.append(nonwide_rescue)
                 continue
 
         silhouette_attempt: FaceMatchSegment | None = None
@@ -1093,12 +1458,15 @@ def build_face_match_plan(
                 ),
                 settings=settings,
                 sample_time_fractions=silhouette_geometry.time_fractions,
+                alignment_purpose="global_silhouette_scale_match",
             )
             if silhouette_attempt.applied:
                 decisions.append(silhouette_attempt)
                 continue
 
-        if face_attempt is not None:
+        if nonwide_rescue is not None:
+            decisions.append(nonwide_rescue)
+        elif face_attempt is not None:
             decisions.append(face_attempt)
         elif silhouette_attempt is not None:
             decisions.append(silhouette_attempt)
@@ -1123,6 +1491,17 @@ def build_face_match_plan(
     # locally demote the silhouette side. Only a same-source/same-shot boundary
     # is invisible and therefore requires exact local crop continuity.
     choices = visual_timeline.choices
+    frame_counts: list[int] = []
+    cumulative_duration = 0.0
+    previous_boundary = 0
+    for choice in choices:
+        cumulative_duration += float(choice.duration_seconds)
+        boundary = int(round(cumulative_duration * fps))
+        frame_count = boundary - previous_boundary
+        if frame_count < 2:
+            raise ValueError("face-match segment is shorter than two output frames")
+        frame_counts.append(frame_count)
+        previous_boundary = boundary
     mixed_subject_demotions: set[int] = set()
     for position, (left_choice, right_choice) in enumerate(
         zip(choices, choices[1:])
@@ -1189,12 +1568,13 @@ def build_face_match_plan(
         right_crop = crop_endpoint(right, final=False)
         if left_crop is None or right_crop is None:
             return False
-        # Roughly one percent of a normalized frame is already visible as a
-        # punch-in at an otherwise invisible boundary; fail closed at that run.
+        # Tier D is one uninterrupted source-local shot. Even a sub-percent
+        # independent endpoint change is stitched below instead of being left
+        # for frame quantization to expose as a one-frame punch or pan reset.
         return max(
             abs(left_value - right_value)
             for left_value, right_value in zip(left_crop, right_crop, strict=True)
-        ) <= 0.01
+        ) <= 1e-8
 
     run_start = 0
     while run_start < len(choices):
@@ -1211,16 +1591,27 @@ def build_face_match_plan(
             )
             for position in range(run_start, run_end)
         ):
-            for position in range(run_start, run_end + 1):
-                item = decisions[position]
-                if item.applied:
-                    decisions[position] = replace(
-                        item,
-                        applied=False,
-                        fallback_reason="continuous_shot_crop_pair_incompatible",
-                        applied_zoom=None,
-                        pan_crop=None,
-                    )
+            stitched = _stitch_continuous_applied_run(
+                decisions[run_start : run_end + 1],
+                choices[run_start : run_end + 1],
+                frame_counts[run_start : run_end + 1],
+                fps=fps,
+            )
+            if stitched is not None:
+                decisions[run_start : run_end + 1] = stitched
+            else:
+                for position in range(run_start, run_end + 1):
+                    item = decisions[position]
+                    if item.applied:
+                        decisions[position] = replace(
+                            item,
+                            applied=False,
+                            fallback_reason=(
+                                "continuous_shot_crop_pair_incompatible"
+                            ),
+                            applied_zoom=None,
+                            pan_crop=None,
+                        )
         run_start = run_end + 1
 
     return FaceMatchPlan(

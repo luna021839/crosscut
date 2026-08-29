@@ -1152,80 +1152,150 @@ def review_rendered_candidates(
     indices = tuple(item.candidate_index for item in ordered)
     if len(indices) != len(set(indices)):
         raise ValueError("rendered candidate indices must be unique")
-    scratch = Path(scratch_directory)
-    scratch.mkdir(parents=True, exist_ok=True)
     reviews: list[RenderedCandidateReview] = []
     for position, candidate in enumerate(ordered, start=1):
         if progress_callback is not None:
             progress_callback(position, len(ordered), candidate.candidate_index)
-        # A separate context per candidate makes cleanup a sequencing barrier:
-        # the next proxy cannot start until every file from the prior review is
-        # gone.  Cleanup errors intentionally propagate because otherwise the
-        # serialized one-proxy-at-a-time guarantee would be false.
-        with tempfile.TemporaryDirectory(
-            prefix=(
-                ".ive-crosscut-candidate-proxy-"
-                f"{candidate.candidate_index:02d}-"
-            ),
-            dir=scratch,
-        ) as temporary_directory:
-            temporary_root = Path(temporary_directory)
-            proxy_path = temporary_root / (
-                f"candidate-{candidate.candidate_index:02d}.mp4"
+        reviews.append(
+            render_one_candidate_review(
+                candidate,
+                scratch_directory=scratch_directory,
+                render_review=render_review,
             )
-            try:
-                _proxy_plan, review = render_review(
-                    candidate.render_plan,
-                    proxy_path,
-                )
-                payload = deepcopy(review.payload)
-                proxy = payload.get("proxy")
-                if isinstance(proxy, dict):
-                    proxy["path"] = None
-                    proxy["temporary_proxy_removed_after_review"] = True
-                reviews.append(RenderedCandidateReview(candidate, payload))
-            except (OSError, RuntimeError, TypeError, ValueError, cv2.error) as exc:
-                exception_name = (
-                    "cv2.error" if isinstance(exc, cv2.error) else type(exc).__name__
-                )
-                reviews.append(
-                    RenderedCandidateReview(
-                        candidate,
-                        None,
-                        f"{exception_name}: {exc}",
-                    )
-                )
-            finally:
-                # Remove the known proxy before context cleanup handles any
-                # renderer sidecars.  Do not suppress failure: advancing with a
-                # live prior proxy would violate the storage contract.
-                proxy_path.unlink(missing_ok=True)
+        )
+    return select_rendered_candidate_reviews(
+        reviews,
+        requested_review_count=maximum_review_count,
+        minimum_required_candidate_count=minimum_required_candidate_count,
+        professional_reference_profile=professional_reference_profile,
+        professional_reference_cadence_profile=(
+            professional_reference_cadence_profile
+        ),
+        learned_reviewer_session=learned_reviewer_session,
+    )
+
+
+def render_one_candidate_review(
+    candidate: RenderedCandidate,
+    *,
+    scratch_directory: Path,
+    render_review: RenderReviewFunction = render_and_review_proxy,
+) -> RenderedCandidateReview:
+    """Render and decode-review exactly one candidate with bounded storage."""
+
+    if not isinstance(candidate, RenderedCandidate):
+        raise TypeError("candidate must be a RenderedCandidate")
+    scratch = Path(scratch_directory)
+    scratch.mkdir(parents=True, exist_ok=True)
+    # A separate context per candidate makes cleanup a sequencing barrier: the
+    # next proxy cannot start until every file from the prior review is gone.
+    with tempfile.TemporaryDirectory(
+        prefix=(
+            ".ive-crosscut-candidate-proxy-"
+            f"{candidate.candidate_index:02d}-"
+        ),
+        dir=scratch,
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        proxy_path = temporary_root / (
+            f"candidate-{candidate.candidate_index:02d}.mp4"
+        )
+        try:
+            _proxy_plan, review = render_review(
+                candidate.render_plan,
+                proxy_path,
+            )
+            payload = deepcopy(review.payload)
+            proxy = payload.get("proxy")
+            if isinstance(proxy, dict):
+                proxy["path"] = None
+                proxy["temporary_proxy_removed_after_review"] = True
+            return RenderedCandidateReview(candidate, payload)
+        except (OSError, RuntimeError, TypeError, ValueError, cv2.error) as exc:
+            exception_name = (
+                "cv2.error" if isinstance(exc, cv2.error) else type(exc).__name__
+            )
+            return RenderedCandidateReview(
+                candidate,
+                None,
+                f"{exception_name}: {exc}",
+            )
+        finally:
+            # Do not suppress failure: advancing with a live prior proxy would
+            # violate the serialized one-proxy-at-a-time storage guarantee.
+            proxy_path.unlink(missing_ok=True)
+
+
+def select_rendered_candidate_reviews(
+    reviews: Sequence[RenderedCandidateReview],
+    *,
+    requested_review_count: int,
+    minimum_required_candidate_count: int,
+    professional_reference_profile: ProfessionalReferenceProfile | None = None,
+    professional_reference_cadence_profile: (
+        ProfessionalReferenceCadenceProfile | None
+    ) = None,
+    learned_reviewer_session: LearnedReviewerProductionSession | None = None,
+) -> RenderedCandidateSelection:
+    """Rank already decoded reviews without rendering their proxies again."""
+
+    values = tuple(reviews)
+    if not values:
+        raise ValueError("at least one rendered candidate review is required")
+    if (
+        isinstance(requested_review_count, bool)
+        or not isinstance(requested_review_count, int)
+        or not 1 <= requested_review_count <= 32
+    ):
+        raise ValueError("requested_review_count must be between one and 32")
+    if (
+        isinstance(minimum_required_candidate_count, bool)
+        or not isinstance(minimum_required_candidate_count, int)
+        or not 1 <= minimum_required_candidate_count <= 32
+    ):
+        raise ValueError(
+            "minimum_required_candidate_count must be between one and 32"
+        )
+    if len(values) > requested_review_count:
+        raise ValueError("reviewed more candidates than requested")
+    if any(not isinstance(item, RenderedCandidateReview) for item in values):
+        raise TypeError("reviews must contain RenderedCandidateReview values")
+    indices = tuple(item.candidate.candidate_index for item in values)
+    if len(indices) != len(set(indices)):
+        raise ValueError("rendered candidate reviews contain duplicate indices")
+    if (
+        professional_reference_cadence_profile is not None
+        and professional_reference_profile is None
+    ):
+        raise ValueError(
+            "professional cadence prior requires a professional quality profile"
+        )
     professional_plateau_rerank: dict[str, Any] | None = None
     professional_cadence_prior: dict[str, Any] | None = None
     if professional_reference_profile is None:
-        selected = max(reviews, key=_rank)
+        selected = max(values, key=_rank)
     else:
         (
             selected,
             professional_plateau_rerank,
             professional_cadence_prior,
         ) = _professional_plateau_selection(
-            reviews,
+            values,
             professional_reference_profile,
             professional_reference_cadence_profile,
         )
     learned_reviewer_rerank: dict[str, Any] | None = None
     if learned_reviewer_session is not None:
         selected, learned_reviewer_rerank = _learned_reviewer_selection(
-            reviews,
+            values,
             deterministic_selected=selected,
             session=learned_reviewer_session,
             professional_plateau_rerank=professional_plateau_rerank,
         )
     return RenderedCandidateSelection(
-        tuple(reviews),
+        values,
         selected.candidate.candidate_index,
-        maximum_review_count,
+        requested_review_count,
         minimum_required_candidate_count,
         analysis_basis=(
             LEARNED_REVIEWER_RERANK_ANALYSIS_BASIS
@@ -1254,5 +1324,7 @@ __all__ = [
     "RenderedCandidateReview",
     "RenderedCandidateSelection",
     "SELECTION_BASIS",
+    "render_one_candidate_review",
     "review_rendered_candidates",
+    "select_rendered_candidate_reviews",
 ]

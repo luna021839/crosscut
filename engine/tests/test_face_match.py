@@ -8,6 +8,7 @@ from crosscut.face_match import (
     _alignment_attempt,
     build_face_match_plan,
 )
+from crosscut.section_director import SectionDirective, SectionPlan, SectionRole
 from crosscut.timeline import ShotType
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
@@ -62,6 +63,106 @@ def _with_silhouette(
 
 
 class FaceMatchTests(unittest.TestCase):
+    def test_chorus_single_subject_wide_uses_bounded_nonwide_rescue(self) -> None:
+        close = replace(
+            _choice(0, face_height=0.40),
+            shot_type=ShotType.CLOSE_UP,
+        )
+        distant = replace(
+            _choice(1, face_height=0.08),
+            shot_type=ShotType.WIDE,
+            entry_shot_type=ShotType.WIDE,
+            exit_shot_type=ShotType.WIDE,
+            detected_person_counts=(1, 1, 1),
+            formation_person_counts=(1, 1, 1),
+        )
+        section_plan = SectionPlan(
+            sections=(
+                SectionDirective(
+                    section_index=0,
+                    role=SectionRole.CHORUS_LIKE,
+                    start_seconds=0.0,
+                    end_seconds=2.0,
+                    energy_score=0.9,
+                    confidence=0.9,
+                    phrase_count=1,
+                    preferred_source_hold_beats=2,
+                    target_source_switches_per_minute=18.0,
+                    camera_motion_budget=0.8,
+                    target_roll_events_per_minute=0.0,
+                    establish_with_wide_shot=False,
+                    protect_last_beat_from_extra_cut=False,
+                ),
+            )
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(close, distant),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            section_plan=section_plan,
+        )
+
+        rescue = plan.segments[1]
+        self.assertTrue(rescue.applied)
+        self.assertEqual(
+            rescue.alignment_purpose,
+            "chorus_single_subject_nonwide_rescue",
+        )
+        self.assertEqual(plan.nonwide_rescue_applied_count, 1)
+        self.assertGreaterEqual(
+            0.08 * (rescue.applied_zoom or 0.0),
+            FaceMatchConfig().minimum_nonwide_rescue_face_height,
+        )
+        self.assertLessEqual(rescue.applied_zoom or 99.0, 1.35)
+
+    def test_chorus_formation_wide_cannot_use_single_subject_rescue(self) -> None:
+        close = replace(
+            _choice(0, face_height=0.40),
+            shot_type=ShotType.CLOSE_UP,
+        )
+        formation = replace(
+            _choice(1, face_height=0.08),
+            shot_type=ShotType.GROUP_WIDE,
+            entry_shot_type=ShotType.GROUP_WIDE,
+            exit_shot_type=ShotType.GROUP_WIDE,
+            detected_person_counts=(4, 4, 4),
+            formation_person_counts=(4, 4, 4),
+        )
+        section_plan = SectionPlan(
+            sections=(
+                SectionDirective(
+                    section_index=0,
+                    role=SectionRole.CHORUS_LIKE,
+                    start_seconds=0.0,
+                    end_seconds=2.0,
+                    energy_score=0.9,
+                    confidence=0.9,
+                    phrase_count=1,
+                    preferred_source_hold_beats=2,
+                    target_source_switches_per_minute=18.0,
+                    camera_motion_budget=0.8,
+                    target_roll_events_per_minute=0.0,
+                    establish_with_wide_shot=True,
+                    protect_last_beat_from_extra_cut=False,
+                ),
+            )
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=(close, formation),
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9, 16 / 9),
+            section_plan=section_plan,
+        )
+
+        self.assertFalse(plan.segments[1].applied)
+        self.assertEqual(plan.nonwide_rescue_applied_count, 0)
+
     def test_target_search_rejects_silhouette_wider_than_safe_crop(self) -> None:
         narrow_box = (0.10, 0.25, 0.80, 0.50)
         wide_box = (0.02, 0.25, 0.96, 0.50)
@@ -563,7 +664,7 @@ class FaceMatchTests(unittest.TestCase):
         )
         self.assertIsNone(plan.segments[0].pan_crop)
 
-    def test_continuous_source_hold_requires_matching_crop_endpoints(self) -> None:
+    def test_continuous_source_hold_stitches_safe_crop_endpoints(self) -> None:
         choices = (
             replace(
                 _choice(0, face_height=0.13, center_x=0.45),
@@ -585,13 +686,94 @@ class FaceMatchTests(unittest.TestCase):
             config=FaceMatchConfig(target_face_height_override=0.15),
         )
 
-        self.assertEqual(plan.applied_count, 0)
+        self.assertEqual(plan.applied_count, 2)
+        self.assertEqual(plan.continuous_run_stitched_segment_count, 2)
         self.assertTrue(
-            all(
-                segment.fallback_reason
-                == "continuous_shot_crop_pair_incompatible"
-                for segment in plan.segments
+            all(segment.continuous_run_stitched for segment in plan.segments)
+        )
+        left = plan.segments[0].pan_crop
+        right = plan.segments[1].pan_crop
+        assert left is not None and right is not None
+        left_width, left_height = left.fixed_crop_size
+        right_width, right_height = right.fixed_crop_size
+        left_position = left.fixed_crop_positions()[-1]
+        right_position = right.fixed_crop_positions()[0]
+        self.assertEqual(
+            (left_position[1], left_position[2], left_width, left_height),
+            (right_position[1], right_position[2], right_width, right_height),
+        )
+        self.assertGreaterEqual(plan.segments[0].applied_zoom or 0.0, 1.025)
+
+    def test_continuous_source_hold_stitches_subpercent_crop_reset(self) -> None:
+        choices = (
+            replace(
+                _choice(0, face_height=0.13, center_x=0.500),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+            replace(
+                _choice(1, face_height=0.13, center_x=0.502),
+                source_index=0,
+                shot_id="source-0:shot-1",
+            ),
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=choices,
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.15),
+        )
+
+        self.assertEqual(plan.continuous_run_stitched_segment_count, 2)
+        left = plan.segments[0].pan_crop
+        right = plan.segments[1].pan_crop
+        assert left is not None and right is not None
+        self.assertEqual(
+            left.fixed_crop_positions()[-1][1:],
+            right.fixed_crop_positions()[0][1:],
+        )
+
+    def test_fast_invisible_pan_uses_static_covering_crop(self) -> None:
+        duration = 0.6122383722162043
+        choices = tuple(
+            replace(
+                _choice(
+                    index,
+                    face_height=0.10,
+                    center_x=center_x,
+                ),
+                source_index=0,
+                shot_id="source-0:shot-1",
+                canonical_master_start=index * duration,
+                canonical_master_end=(index + 1) * duration,
+                source_local_start=index * duration,
+                source_local_end=(index + 1) * duration,
             )
+            for index, center_x in enumerate((0.43, 0.57))
+        )
+
+        plan = build_face_match_plan(
+            visual_timeline=VisualTimelinePlan(
+                choices=choices,
+                optimizer_score=1.0,
+            ),
+            source_aspect_ratios=(16 / 9,),
+            config=FaceMatchConfig(target_face_height_override=0.135),
+        )
+
+        self.assertEqual(plan.applied_count, 2)
+        self.assertEqual(plan.continuous_run_stitched_segment_count, 2)
+        tracks = tuple(item.pan_crop for item in plan.segments)
+        self.assertTrue(all(track is not None for track in tracks))
+        self.assertTrue(
+            all(len(track.keyframes) == 1 for track in tracks if track is not None)
+        )
+        self.assertEqual(
+            tracks[0].fixed_crop_positions() if tracks[0] is not None else (),
+            tracks[1].fixed_crop_positions() if tracks[1] is not None else (),
         )
 
     def test_continuous_source_hold_preserves_matching_static_crop(self) -> None:

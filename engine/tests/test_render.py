@@ -8,8 +8,10 @@ from crosscut.ive import AspectRatio
 from crosscut.render import (
     BoundaryLookKeyframe,
     BoundaryLookTrack,
+    DIRECT_MEMBER_POSE_DISSOLVE_REASON,
     EditorialTransformKeyframe,
     EditorialTransformTrack,
+    MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
     NormalizedCrop,
     PanCropKeyframe,
     PanCropTrack,
@@ -75,6 +77,7 @@ class RenderTests(unittest.TestCase):
             saturation=0.96,
             temperature_balance=0.015,
             tint_balance=-0.012,
+            detail_enhancement=0.35,
         )
         plan = RenderPlan(
             sources=(Path("one.mp4"),),
@@ -104,6 +107,7 @@ class RenderTests(unittest.TestCase):
         )
         self.assertIn(eq, graph)
         self.assertIn(chroma, graph)
+        self.assertIn("cas=strength=0.350000", graph)
         self.assertNotIn("colorbalance=", graph)
         self.assertLess(graph.index("crop="), graph.index(eq))
         self.assertLess(graph.index("crop="), graph.index(chroma))
@@ -117,6 +121,7 @@ class RenderTests(unittest.TestCase):
                 "saturation": 0.96,
                 "temperature_balance": 0.015,
                 "tint_balance": -0.012,
+                "detail_enhancement": 0.35,
             },
         )
 
@@ -150,6 +155,8 @@ class RenderTests(unittest.TestCase):
             SourceLookAdjustment(temperature_balance=0.181)
         with self.assertRaisesRegex(ValueError, "tint"):
             SourceLookAdjustment(tint_balance=-0.101)
+        with self.assertRaisesRegex(ValueError, "detail enhancement"):
+            SourceLookAdjustment(detail_enhancement=1.001)
         with self.assertRaisesRegex(TypeError, "look_adjustment"):
             RenderSegment(
                 0,
@@ -713,10 +720,12 @@ class RenderTests(unittest.TestCase):
         self.assertIs(plan.segments[0].editorial_transform, track)
 
     def test_group_transform_rejects_black_corner_roll_and_mixed_crop_modes(self) -> None:
-        widened_pan = EditorialTransformKeyframe(0.0, 1.50, 0.65, 0.50)
-        self.assertEqual(widened_pan.center_x, 0.65)
-        with self.assertRaisesRegex(ValueError, "sixteen-percent"):
-            EditorialTransformKeyframe(0.0, 1.50, 0.661, 0.50)
+        widened_pan = EditorialTransformKeyframe(0.0, 2.0, 0.75, 0.50)
+        self.assertEqual(widened_pan.center_x, 0.75)
+        with self.assertRaisesRegex(ValueError, "quarter-frame"):
+            EditorialTransformKeyframe(0.0, 2.0, 0.751, 0.50)
+        with self.assertRaisesRegex(ValueError, "zoom"):
+            EditorialTransformKeyframe(0.0, 2.001)
         with self.assertRaisesRegex(ValueError, "frame edges"):
             EditorialTransformKeyframe(0.0, 1.0, roll_degrees=1.0)
         track = EditorialTransformTrack((EditorialTransformKeyframe(0.0, 1.05),))
@@ -866,6 +875,56 @@ class RenderTests(unittest.TestCase):
                 ),
             )
 
+    def test_output_verified_member_dissolve_authorizes_transformed_overlap(
+        self,
+    ) -> None:
+        incoming = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.02),
+                EditorialTransformKeyframe(0.2, 1.06),
+                EditorialTransformKeyframe(1.0, 1.06),
+            ),
+            reason="decoded_output_face_match",
+        )
+        plan = RenderPlan(
+            sources=(Path("zero.mp4"), Path("one.mp4")),
+            segments=(
+                RenderSegment(0, 0.0, 1.0, 0.0),
+                RenderSegment(
+                    1,
+                    1.0,
+                    1.0,
+                    1.0,
+                    editorial_transform=incoming,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(
+                    TransitionKind.FACE_DISSOLVE,
+                    7,
+                    DIRECT_MEMBER_POSE_DISSOLVE_REASON,
+                    tier="A",
+                    transform_overlap_authority=(
+                        MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
+                    ),
+                ),
+            ),
+            member_pose_dissolve_requested=True,
+            member_pose_dissolve_effective=True,
+            member_pose_dissolve_count=1,
+        )
+
+        transition_payload = plan.to_json()["transitions"][0]  # type: ignore[index]
+        self.assertEqual(
+            transition_payload["transform_overlap_authority"],
+            MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
+        )
+        self.assertIn("xfade=transition=custom", build_filter_graph(plan))
+
     def test_tier_d_same_source_hold_rejects_editorial_camera_reset(self) -> None:
         transformed = EditorialTransformTrack(
             (EditorialTransformKeyframe(0.0, 1.10),),
@@ -944,6 +1003,67 @@ class RenderTests(unittest.TestCase):
                 fps=30.0,
                 transitions=(RenderTransition(tier="D", reason="crop reset"),),
             )
+
+    def test_tier_d_accepts_exact_crop_endpoint_across_fractional_frame_cut(
+        self,
+    ) -> None:
+        duration = 0.6122383722162043
+        width = 0.9666666666666668
+        height = 0.9666666666666668
+        top = 0.006
+        shared_x = 0.016666666666666607
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    duration,
+                    0.0,
+                    pan_crop=PanCropTrack(
+                        (
+                            PanCropKeyframe(
+                                0.0,
+                                NormalizedCrop(0.0, top, width, height),
+                            ),
+                            PanCropKeyframe(
+                                duration,
+                                NormalizedCrop(shared_x, top, width, height),
+                            ),
+                        )
+                    ),
+                ),
+                RenderSegment(
+                    0,
+                    duration,
+                    duration,
+                    duration,
+                    pan_crop=PanCropTrack(
+                        (
+                            PanCropKeyframe(
+                                0.0,
+                                NormalizedCrop(shared_x, top, width, height),
+                            ),
+                            PanCropKeyframe(
+                                duration,
+                                NormalizedCrop(
+                                    1.0 - width,
+                                    top,
+                                    width,
+                                    height,
+                                ),
+                            ),
+                        )
+                    ),
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("out.mp4"),
+            transitions=(RenderTransition(tier="D", reason="same shot"),),
+        )
+
+        self.assertEqual(segment_frame_counts(plan), (18, 19))
 
     def test_dense_pan_crop_is_simplified_below_ffmpeg_parser_limit(self) -> None:
         keyframes = tuple(

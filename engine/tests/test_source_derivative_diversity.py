@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -14,8 +15,10 @@ from crosscut.source_derivative_diversity import (
     DERIVATIVE_DISTINCT,
     DERIVATIVE_UNCERTAIN,
     DecodedSourceFrame,
+    PersistentSourceDerivativeDiversityCache,
     analyze_source_derivative_diversity,
     classify_source_derivative_frames,
+    source_derivative_diversity_from_dict,
 )
 from crosscut.timewarp import (
     TimeWarpConfig,
@@ -87,6 +90,25 @@ def _identity_timewarp(duration: float = 10.0) -> TimeWarpMap:
 
 
 class SourceDerivativeDiversityTests(unittest.TestCase):
+    @staticmethod
+    def _uncertain_two_source_result():
+        blank = np.full((270, 480, 3), 127, dtype=np.uint8)
+        rows = tuple(
+            tuple(_observation(blank.copy(), index) for index in range(9))
+            for _ in range(2)
+        )
+        return classify_source_derivative_frames(
+            rows,
+            canonical_sample_times_seconds=tuple(
+                float(index + 1) for index in range(9)
+            ),
+            source_decode_audit=(
+                {"source_index": 0, "decoded_sample_count": 9},
+                {"source_index": 1, "decoded_sample_count": 9},
+            ),
+            clock_contract_complete=False,
+        )
+
     def test_crop_transcode_forms_one_family_while_distinct_camera_stays_separate(self):
         rows: list[list[DecodedSourceFrame | None]] = [[], [], []]
         for index in range(9):
@@ -120,26 +142,14 @@ class SourceDerivativeDiversityTests(unittest.TestCase):
         payload = result.to_dict()
         # The full payload must be JSON-safe and contain scalar audit only.
         json.dumps(payload, sort_keys=True)
+        self.assertEqual(payload["source_count"], 3)
         self.assertFalse(payload["persistence_policy"]["raw_frames_persisted"])
         self.assertFalse(payload["persistence_policy"]["descriptors_persisted"])
         self.assertFalse(payload["persistence_policy"]["embeddings_persisted"])
         self.assertNotIn("homography_reference_to_source", json.dumps(payload))
 
     def test_low_structure_or_missing_clock_is_uncertain_not_false_positive(self):
-        blank = np.full((270, 480, 3), 127, dtype=np.uint8)
-        rows = tuple(
-            tuple(_observation(blank.copy(), index) for index in range(9))
-            for _ in range(2)
-        )
-        result = classify_source_derivative_frames(
-            rows,
-            canonical_sample_times_seconds=tuple(float(index + 1) for index in range(9)),
-            source_decode_audit=(
-                {"source_index": 0, "decoded_sample_count": 9},
-                {"source_index": 1, "decoded_sample_count": 9},
-            ),
-            clock_contract_complete=False,
-        )
+        result = self._uncertain_two_source_result()
         self.assertEqual(DERIVATIVE_UNCERTAIN, result.pairs[0].status)
         self.assertEqual((0, 1), result.family_ids)
         self.assertFalse(result.production_ready)
@@ -203,6 +213,57 @@ class SourceDerivativeDiversityTests(unittest.TestCase):
                 for item in result.source_decode_audit
             )
         )
+
+    def test_scalar_payload_round_trip_recomputes_audit_sha(self):
+        result = self._uncertain_two_source_result()
+        decoded = source_derivative_diversity_from_dict(result.to_dict())
+        self.assertEqual(result.to_dict(), decoded.to_dict())
+
+        tampered = json.loads(json.dumps(result.to_dict()))
+        tampered["pairs"][0]["matching_sample_count"] += 1
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            source_derivative_diversity_from_dict(tampered)
+
+    def test_persistent_cache_binds_all_sources_clocks_and_common_range(self):
+        result = self._uncertain_two_source_result()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_directory = root / "cache"
+            sources = (root / "one.mp4", root / "two.mp4")
+            sources[0].write_bytes(b"first-source")
+            sources[1].write_bytes(b"second-source")
+            clocks = (_identity_timewarp(), _identity_timewarp())
+            constructor = dict(
+                source_cache_directory=cache_directory,
+                sources=sources,
+                source_offsets_seconds=(0.0, 0.0),
+                source_timewarps=clocks,
+                common_master_start=0.0,
+                common_master_end=10.0,
+            )
+            with patch(
+                "crosscut.source_derivative_diversity._ffprobe_version_identity",
+                return_value="ffprobe-test",
+            ):
+                cache = PersistentSourceDerivativeDiversityCache(**constructor)
+                self.assertIsNone(cache.get())
+                self.assertTrue(cache.put(result))
+                restored = cache.get()
+                self.assertIsNotNone(restored)
+                assert restored is not None
+                self.assertEqual(result.to_dict(), restored.to_dict())
+                self.assertEqual(1, cache.diagnostics()["hit_count"])
+
+                changed_range = PersistentSourceDerivativeDiversityCache(
+                    **{**constructor, "common_master_end": 9.5}
+                )
+                self.assertIsNone(changed_range.get())
+
+                sources[1].write_bytes(b"changed-second-source")
+                changed_source = PersistentSourceDerivativeDiversityCache(
+                    **constructor
+                )
+                self.assertIsNone(changed_source.get())
 
 
 if __name__ == "__main__":

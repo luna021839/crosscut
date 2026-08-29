@@ -20,6 +20,11 @@ from crosscut.visual_boundary_repair import (
     _visual_evidence,
     repair_visual_timeline_boundaries,
 )
+from crosscut.visual_splice_failure_feedback import (
+    build_splice_failure_feedback,
+    splice_feedback_result_context_identity,
+)
+from crosscut.visual_splice_feasibility import SpliceFeasibilityStatus
 from crosscut.visual_score import (
     FrameVisualDescriptor,
     VisualTimelineChoice,
@@ -500,6 +505,30 @@ class VisualBoundaryRepairTests(unittest.TestCase):
             "actual_pose_pair_unavailable",
         )
 
+    def test_plan_canonicalizes_mutable_repair_and_requested_inputs(self) -> None:
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        repaired = repair_visual_timeline_boundaries(
+            visual_timeline=plan,
+            sources=(Path("a"), Path("b")),
+            audio_offsets=(0.0, 0.0),
+            scene_cut_times=((), ()),
+            descriptor_provider=lambda _source, _seconds: _descriptor(0.5),
+        )
+        mutable_repairs = list(repaired.repairs)
+        mutable_requested = [0]
+        copied = replace(
+            repaired,
+            repairs=mutable_repairs,  # type: ignore[arg-type]
+            requested_boundary_indices=mutable_requested,  # type: ignore[arg-type]
+        )
+        mutable_repairs.clear()
+        mutable_requested.clear()
+
+        self.assertEqual(copied.repairs, repaired.repairs)
+        self.assertEqual(copied.requested_boundary_indices, (0,))
+        with self.assertRaises(TypeError):
+            replace(repaired, repairs=(object(),))
+
     def test_geometry_provider_decode_failure_is_audited(self) -> None:
         plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
         repaired = repair_visual_timeline_boundaries(
@@ -513,6 +542,118 @@ class VisualBoundaryRepairTests(unittest.TestCase):
         self.assertEqual(repaired.reviewed_cross_source_count, 0)
         self.assertGreater(repaired.geometry_provider_failure_count, 0)
         self.assertEqual(len(repaired.failures), 1)
+
+    def test_wide_descriptor_gap_is_terminal_indeterminate_and_immutable(
+        self,
+    ) -> None:
+        plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 2.0)
+        fps = 29.97
+
+        def provider(
+            source: int,
+            seconds: float,
+        ) -> FrameVisualDescriptor | None:
+            if source == 1:
+                incoming_offset = round(
+                    (seconds - (1.0 + 0.5 / fps)) * fps
+                )
+                if incoming_offset == 4:
+                    return None
+            return _descriptor(0.1 if source == 0 else 0.9)
+
+        repaired = repair_visual_timeline_boundaries(
+            visual_timeline=plan,
+            sources=(Path("a"), Path("b")),
+            audio_offsets=(0.0, 0.0),
+            scene_cut_times=((), ()),
+            output_fps=fps,
+            descriptor_provider=provider,
+            config=BoundaryRepairConfig(
+                search_radius_frames=8,
+                interior_scene_cut_guard_frames=9,
+            ),
+        )
+
+        self.assertEqual(len(repaired.failures), 1)
+        audit = repaired.failures[0]["candidate_evidence_audit"]
+        self.assertEqual(
+            tuple(item["frame_offset"] for item in audit),
+            tuple(range(-8, 9)),
+        )
+        feedback = build_splice_failure_feedback(
+            plan,
+            repaired.failures,
+        )
+        assessment = feedback.edges[0].assessments[0]
+        self.assertIs(
+            assessment.status,
+            SpliceFeasibilityStatus.INDETERMINATE,
+        )
+        self.assertTrue(assessment.search_complete)
+        self.assertTrue(assessment.terminal_for_expected_domain)
+
+        first_payload = repaired.to_dict()
+        first_payload["failures"][0]["candidate_evidence_audit"][0][
+            "missing_mask"
+        ].append("tampered")
+        second_payload = repaired.to_dict()
+        self.assertNotIn(
+            "tampered",
+            second_payload["failures"][0]["candidate_evidence_audit"][0][
+                "missing_mask"
+            ],
+        )
+        self.assertEqual(
+            build_splice_failure_feedback(plan, repaired.failures),
+            feedback,
+        )
+
+    def test_success_after_adjacent_repair_keeps_observed_context(self) -> None:
+        plan = VisualTimelinePlan(
+            (_choice(0, 0), _choice(1, 1), _choice(2, 2)),
+            4.0,
+        )
+        fps = 29.97
+
+        def provider(source: int, seconds: float) -> FrameVisualDescriptor:
+            frame_offset = round(
+                (
+                    seconds
+                    - (1.0 + (-0.5 if source == 0 else 0.5) / fps)
+                )
+                * fps
+            )
+            if source == 0:
+                return _descriptor(0.4)
+            if source == 1:
+                return _descriptor(0.4 if frame_offset in (2, 5) else 0.8)
+            return _descriptor(0.8)
+
+        repaired = repair_visual_timeline_boundaries(
+            visual_timeline=plan,
+            sources=(Path("a"), Path("b"), Path("c")),
+            audio_offsets=(0.0, 0.0, 0.0),
+            scene_cut_times=((), (), ()),
+            output_fps=fps,
+            descriptor_provider=provider,
+        )
+
+        by_boundary = {item.boundary_index: item for item in repaired.repairs}
+        self.assertTrue(by_boundary[0].result.changed)
+        self.assertTrue(by_boundary[0].optimizer_edge_context_match)
+        self.assertFalse(by_boundary[1].optimizer_edge_context_match)
+        self.assertNotEqual(
+            by_boundary[1].optimizer_edge_context_identity,
+            by_boundary[1].observed_edge_context_identity,
+        )
+        self.assertEqual(
+            by_boundary[1].result_edge_context_identity,
+            splice_feedback_result_context_identity(repaired.timeline, 1),
+        )
+        self.assertEqual(
+            by_boundary[0].result_edge_context_identity,
+            splice_feedback_result_context_identity(repaired.timeline, 0),
+        )
 
     def test_selects_best_frame_and_updates_both_clocks(self) -> None:
         plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 1)), 4.0)
@@ -550,6 +691,10 @@ class VisualBoundaryRepairTests(unittest.TestCase):
         self.assertIsNotNone(serialized[1]["entry_boundary_side_stability"])
         self.assertFalse(
             repaired.timeline.choices[0].dissolve_exit_face_geometry_window
+        )
+        self.assertEqual(
+            repaired.repairs[0].result_edge_context_identity,
+            splice_feedback_result_context_identity(repaired.timeline, 0),
         )
 
     def test_same_source_boundary_is_not_retimed(self) -> None:

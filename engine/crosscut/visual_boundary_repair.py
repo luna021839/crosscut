@@ -10,11 +10,13 @@ pose, framing and structure discontinuity.  The output is a new immutable
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Sequence
 
 import cv2
@@ -49,6 +51,16 @@ from .visual_score import (
     _VideoSampler,
     describe_boundary_side_stability,
 )
+from .visual_splice_failure_feedback import (
+    build_splice_failure_feedback,
+    splice_feedback_context_identity,
+    splice_feedback_edge_context,
+    splice_feedback_edge_context_identity,
+    splice_feedback_plan_context,
+    splice_feedback_plan_identity,
+    splice_feedback_result_context,
+    splice_feedback_result_context_identity,
+)
 
 
 ANALYSIS_BASIS = (
@@ -57,6 +69,34 @@ ANALYSIS_BASIS = (
 )
 _PRODUCTION_REVIEW_GATES = TimelineReviewConfig()
 _NEAREST_TEMPORAL_POSE_RADIUS_FRAMES = 3
+
+
+def _freeze_audit_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("boundary repair audit keys must be strings")
+            frozen[key] = _freeze_audit_value(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_audit_value(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    raise TypeError(
+        f"boundary repair audit value is not manifest-safe: {type(value)!r}"
+    )
+
+
+def _thaw_audit_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _thaw_audit_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_thaw_audit_value(item) for item in value]
+    return value
 
 
 def _actual_pose_available(descriptor: FrameVisualDescriptor | None) -> bool:
@@ -394,6 +434,53 @@ class VisualBoundaryRepair:
     incoming_source_index: int
     result: BoundaryRepairResult
     selected_visual_evidence: BoundaryVisualEvidence
+    optimizer_edge_context: Mapping[str, Any]
+    optimizer_edge_context_identity: str
+    observed_edge_context: Mapping[str, Any]
+    observed_edge_context_identity: str
+    result_edge_context: Mapping[str, Any]
+    result_edge_context_identity: str
+    optimizer_edge_context_match: bool
+
+    def __post_init__(self) -> None:
+        optimizer_context = _freeze_audit_value(
+            self.optimizer_edge_context
+        )
+        observed_context = _freeze_audit_value(self.observed_edge_context)
+        result_context = _freeze_audit_value(self.result_edge_context)
+        if not isinstance(optimizer_context, Mapping) or not isinstance(
+            observed_context,
+            Mapping,
+        ) or not isinstance(result_context, Mapping):
+            raise TypeError("boundary repair edge contexts must be mappings")
+        object.__setattr__(
+            self,
+            "optimizer_edge_context",
+            optimizer_context,
+        )
+        object.__setattr__(self, "observed_edge_context", observed_context)
+        object.__setattr__(self, "result_edge_context", result_context)
+        if (
+            splice_feedback_context_identity(optimizer_context)
+            != self.optimizer_edge_context_identity
+        ):
+            raise ValueError("boundary repair optimizer edge identity is stale")
+        if (
+            splice_feedback_context_identity(observed_context)
+            != self.observed_edge_context_identity
+        ):
+            raise ValueError("boundary repair observed edge identity is stale")
+        if (
+            splice_feedback_context_identity(result_context)
+            != self.result_edge_context_identity
+        ):
+            raise ValueError("boundary repair result edge identity is stale")
+        if not isinstance(self.optimizer_edge_context_match, bool):
+            raise TypeError("boundary repair edge context match must be a bool")
+        if self.optimizer_edge_context_match is not (
+            optimizer_context == observed_context
+        ):
+            raise ValueError("boundary repair edge context match contradicts inputs")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -402,21 +489,151 @@ class VisualBoundaryRepair:
             "incoming_source_index": self.incoming_source_index,
             "result": self.result.to_dict(),
             "selected_visual_evidence": self.selected_visual_evidence.to_dict(),
+            "optimizer_edge_context": _thaw_audit_value(
+                self.optimizer_edge_context
+            ),
+            "optimizer_edge_context_identity": (
+                self.optimizer_edge_context_identity
+            ),
+            "observed_edge_context": _thaw_audit_value(
+                self.observed_edge_context
+            ),
+            "observed_edge_context_identity": (
+                self.observed_edge_context_identity
+            ),
+            "result_edge_context": _thaw_audit_value(
+                self.result_edge_context
+            ),
+            "result_edge_context_identity": (
+                self.result_edge_context_identity
+            ),
+            "optimizer_edge_context_match": (
+                self.optimizer_edge_context_match
+            ),
         }
 
 
 @dataclass(frozen=True, slots=True)
 class VisualBoundaryRepairPlan:
     timeline: VisualTimelinePlan
+    attempt_input_timelines: tuple[VisualTimelinePlan, ...]
     repairs: tuple[VisualBoundaryRepair, ...]
     skipped_same_source_boundaries: int
-    failures: tuple[dict[str, Any], ...]
+    failures: tuple[Mapping[str, Any], ...]
     requested_boundary_indices: tuple[int, ...] | None = None
     geometry_provider_attempt_count: int = 0
     geometry_provider_failure_count: int = 0
     temporal_pose_motion_thresholds: TemporalPoseMotionThresholds | None = None
     temporal_pose_motion_preference_weight: float = 0.0
     analysis_basis: str = ANALYSIS_BASIS
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeline, VisualTimelinePlan):
+            raise TypeError("boundary repair output timeline is invalid")
+        attempts = tuple(self.attempt_input_timelines)
+        if not attempts or any(
+            not isinstance(item, VisualTimelinePlan) for item in attempts
+        ):
+            raise TypeError(
+                "boundary repair plan needs exact attempt input timelines"
+            )
+        object.__setattr__(self, "attempt_input_timelines", attempts)
+        repairs = tuple(self.repairs)
+        if any(not isinstance(item, VisualBoundaryRepair) for item in repairs):
+            raise TypeError("boundary repair entries are invalid")
+        output_boundary_count = len(self.timeline.choices) - 1
+        for repair in repairs:
+            if not 0 <= repair.boundary_index < output_boundary_count:
+                raise ValueError("boundary repair entry is outside the timeline")
+            for context_name, context in (
+                ("optimizer", repair.optimizer_edge_context),
+                ("observed", repair.observed_edge_context),
+                ("result", repair.result_edge_context),
+            ):
+                if context.get("boundary_index") != repair.boundary_index:
+                    raise ValueError(
+                        f"boundary repair {context_name} context index drifted"
+                    )
+                outgoing = context.get("outgoing")
+                incoming = context.get("incoming")
+                if not isinstance(outgoing, Mapping) or not isinstance(
+                    incoming,
+                    Mapping,
+                ):
+                    raise TypeError("boundary repair context choices are invalid")
+                if (
+                    outgoing.get("source_index")
+                    != repair.outgoing_source_index
+                    or incoming.get("source_index")
+                    != repair.incoming_source_index
+                ):
+                    raise ValueError(
+                        f"boundary repair {context_name} source direction drifted"
+                    )
+        object.__setattr__(self, "repairs", repairs)
+        requested = self.requested_boundary_indices
+        if requested is not None:
+            requested_values = tuple(requested)
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in requested_values
+            ):
+                raise TypeError("requested boundary indices must be integers")
+            if len(set(requested_values)) != len(requested_values):
+                raise ValueError("requested boundary indices cannot repeat")
+            if any(
+                not 0 <= value < output_boundary_count
+                for value in requested_values
+            ):
+                raise ValueError("requested boundary index is outside timeline")
+            object.__setattr__(
+                self,
+                "requested_boundary_indices",
+                tuple(sorted(requested_values)),
+            )
+        for name in (
+            "skipped_same_source_boundaries",
+            "geometry_provider_attempt_count",
+            "geometry_provider_failure_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"boundary repair {name} is invalid")
+        if (
+            not isinstance(self.analysis_basis, str)
+            or not self.analysis_basis.strip()
+            or self.analysis_basis != self.analysis_basis.strip()
+        ):
+            raise ValueError("boundary repair analysis_basis is invalid")
+        frozen_failures = tuple(
+            _freeze_audit_value(failure) for failure in self.failures
+        )
+        if any(not isinstance(failure, Mapping) for failure in frozen_failures):
+            raise TypeError("boundary repair failure must be a mapping")
+        object.__setattr__(self, "failures", frozen_failures)
+        attempts_by_identity: dict[str, VisualTimelinePlan] = {}
+        for attempt in attempts:
+            identity = splice_feedback_plan_identity(attempt)
+            previous = attempts_by_identity.get(identity)
+            if previous is not None and (
+                splice_feedback_plan_context(previous)
+                != splice_feedback_plan_context(attempt)
+            ):
+                raise ValueError("boundary repair attempt identity collision")
+            attempts_by_identity[identity] = attempt
+        failures_by_identity: dict[str, list[Mapping[str, Any]]] = {}
+        for failure in self.failures:
+            identity = failure.get("timeline_path_identity")
+            if not isinstance(identity, str) or identity not in attempts_by_identity:
+                raise ValueError(
+                    "boundary repair failure has no matching attempt input"
+                )
+            failures_by_identity.setdefault(identity, []).append(failure)
+        for identity, failures in failures_by_identity.items():
+            build_splice_failure_feedback(
+                attempts_by_identity[identity],
+                tuple(failures),
+            )
 
     @property
     def changed_count(self) -> int:
@@ -559,8 +776,35 @@ class VisualBoundaryRepairPlan:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        attempt_identities = tuple(
+            splice_feedback_plan_identity(item)
+            for item in self.attempt_input_timelines
+        )
+        unique_attempt_contexts: dict[str, dict[str, object]] = {}
+        for identity, attempt in zip(
+            attempt_identities,
+            self.attempt_input_timelines,
+            strict=True,
+        ):
+            unique_attempt_contexts.setdefault(
+                identity,
+                splice_feedback_plan_context(attempt),
+            )
         return {
             "analysis_basis": self.analysis_basis,
+            "repair_attempt_count": len(self.attempt_input_timelines),
+            "repair_attempt_input_timeline_identities": list(
+                attempt_identities
+            ),
+            "repair_attempt_input_timeline_contexts": [
+                {
+                    "timeline_path_identity": identity,
+                    "timeline_context": context,
+                }
+                for identity, context in sorted(
+                    unique_attempt_contexts.items()
+                )
+            ],
             "reviewed_cross_source_count": self.reviewed_cross_source_count,
             "changed_count": self.changed_count,
             "skipped_same_source_boundaries": self.skipped_same_source_boundaries,
@@ -570,7 +814,9 @@ class VisualBoundaryRepairPlan:
                 else None
             ),
             "failure_count": len(self.failures),
-            "failures": list(self.failures),
+            "failures": [
+                _thaw_audit_value(failure) for failure in self.failures
+            ],
             "geometry_provider_attempt_count": (
                 self.geometry_provider_attempt_count
             ),
@@ -1579,6 +1825,91 @@ def repair_visual_timeline_boundaries(
         )
 
     choices = list(visual_timeline.choices)
+    optimizer_timeline_identity = splice_feedback_plan_identity(
+        visual_timeline
+    )
+
+    def attempt_edge_contexts(
+        boundary_index: int,
+        observed_choices: Sequence[VisualTimelineChoice],
+    ) -> tuple[dict[str, object], str, dict[str, object], str]:
+        observed_plan = {
+            "analysis_basis": visual_timeline.analysis_basis,
+            "source_clock_basis": visual_timeline.source_clock_basis,
+            "choices": tuple(observed_choices),
+        }
+        optimizer_context = splice_feedback_edge_context(
+            visual_timeline,
+            boundary_index,
+        )
+        observed_context = splice_feedback_edge_context(
+            observed_plan,
+            boundary_index,
+        )
+        return (
+            optimizer_context,
+            splice_feedback_edge_context_identity(
+                visual_timeline,
+                boundary_index,
+            ),
+            observed_context,
+            splice_feedback_edge_context_identity(
+                observed_plan,
+                boundary_index,
+            ),
+        )
+
+    def bind_failure_to_attempt(
+        failure: dict[str, Any],
+        *,
+        observed_choices: Sequence[VisualTimelineChoice],
+    ) -> dict[str, Any]:
+        boundary_index = failure.get("boundary_index")
+        if isinstance(boundary_index, bool) or not isinstance(
+            boundary_index,
+            int,
+        ):
+            raise TypeError("boundary repair failure index is invalid")
+        if not 0 <= boundary_index < len(visual_timeline.choices) - 1:
+            raise ValueError("boundary repair failure index is outside input")
+        optimizer_outgoing = visual_timeline.choices[boundary_index]
+        optimizer_incoming = visual_timeline.choices[boundary_index + 1]
+        if (
+            failure.get("outgoing_source_index")
+            != optimizer_outgoing.source_index
+            or failure.get("incoming_source_index")
+            != optimizer_incoming.source_index
+        ):
+            raise ValueError(
+                "boundary repair failure direction drifted from optimizer input"
+            )
+        (
+            optimizer_edge_context,
+            optimizer_edge_identity,
+            observed_edge_context,
+            observed_edge_identity,
+        ) = attempt_edge_contexts(
+            boundary_index,
+            observed_choices,
+        )
+        return {
+            **failure,
+            "outgoing_shot_id": optimizer_outgoing.shot_id,
+            "incoming_shot_id": optimizer_incoming.shot_id,
+            "timeline_analysis_basis": visual_timeline.analysis_basis,
+            "timeline_source_clock_basis": (
+                visual_timeline.source_clock_basis
+            ),
+            "timeline_path_identity": optimizer_timeline_identity,
+            "optimizer_edge_context": optimizer_edge_context,
+            "optimizer_edge_context_identity": optimizer_edge_identity,
+            "observed_edge_context": observed_edge_context,
+            "observed_edge_context_identity": observed_edge_identity,
+            "optimizer_edge_context_match": (
+                observed_edge_context == optimizer_edge_context
+            ),
+        }
+
     current_review = review_timeline(tuple(choices))
     repairs: list[VisualBoundaryRepair] = []
     failures: list[dict[str, Any]] = []
@@ -1753,8 +2084,31 @@ def repair_visual_timeline_boundaries(
                     "incoming_source_index": incoming.source_index,
                     "reason": str(exc),
                 }
-                if evidence_by_offset:
-                    failure["candidate_evidence_audit"] = [
+                evidence_audit: list[dict[str, Any]] = []
+                for frame_offset in range(
+                    -settings.search_radius_frames,
+                    settings.search_radius_frames + 1,
+                ):
+                    item = evidence_by_offset.get(frame_offset)
+                    if item is None:
+                        evidence_audit.append(
+                            {
+                                "frame_offset": frame_offset,
+                                "pose_basis": "missing",
+                                "professional_evidence_basis": (
+                                    "missing_combined_geometry_descriptor"
+                                ),
+                                "professional_gate_passed": False,
+                                "production_transition_gate_passed": False,
+                                "missing_mask": [
+                                    "combined_geometry_descriptor"
+                                ],
+                                "temporal_pose_motion": None,
+                                "visual_evidence": {},
+                            }
+                        )
+                        continue
+                    evidence_audit.append(
                         {
                             "frame_offset": frame_offset,
                             "pose_basis": item[0].pose_basis,
@@ -1777,11 +2131,14 @@ def repair_visual_timeline_boundaries(
                             ),
                             "visual_evidence": item[0].to_dict(),
                         }
-                        for frame_offset, item in sorted(
-                            evidence_by_offset.items()
-                        )
-                    ]
-                failures.append(failure)
+                    )
+                failure["candidate_evidence_audit"] = evidence_audit
+                failures.append(
+                    bind_failure_to_attempt(
+                        failure,
+                        observed_choices=tuple(choices),
+                    )
+                )
                 continue
 
             boundary = result.selected_boundary_seconds
@@ -1794,7 +2151,8 @@ def repair_visual_timeline_boundaries(
             )
             if selected_scene_risk and not original_scene_risk:
                 failures.append(
-                    {
+                    bind_failure_to_attempt(
+                        {
                         "boundary_index": boundary_index,
                         "outgoing_source_index": outgoing.source_index,
                         "incoming_source_index": incoming.source_index,
@@ -1803,7 +2161,9 @@ def repair_visual_timeline_boundaries(
                         "original_scene_cut_risk": False,
                         "selected_scene_cut_risk": True,
                         "selected_visual_evidence": evidence.to_dict(),
-                    }
+                        },
+                        observed_choices=tuple(choices),
+                    )
                 )
                 continue
 
@@ -1849,7 +2209,8 @@ def repair_visual_timeline_boundaries(
             )
             if introduced_hard_failures:
                 failures.append(
-                    {
+                    bind_failure_to_attempt(
+                        {
                         "boundary_index": boundary_index,
                         "outgoing_source_index": outgoing.source_index,
                         "incoming_source_index": incoming.source_index,
@@ -1859,12 +2220,42 @@ def repair_visual_timeline_boundaries(
                             introduced_hard_failures
                         ),
                         "selected_visual_evidence": evidence.to_dict(),
-                    }
+                        },
+                        observed_choices=tuple(choices),
+                    )
                 )
                 continue
 
             choices = proposed_choices
             current_review = proposed_review
+            (
+                optimizer_edge_context,
+                optimizer_edge_context_identity,
+                observed_edge_context,
+                observed_edge_context_identity,
+            ) = attempt_edge_contexts(
+                boundary_index,
+                # The scalar evidence was measured before applying this
+                # boundary transaction.  Preserve that exact input context.
+                tuple(choices[:boundary_index])
+                + (outgoing, incoming)
+                + tuple(choices[boundary_index + 2 :]),
+            )
+            result_plan = {
+                "analysis_basis": visual_timeline.analysis_basis,
+                "source_clock_basis": visual_timeline.source_clock_basis,
+                "choices": tuple(choices),
+            }
+            result_edge_context = splice_feedback_result_context(
+                result_plan,
+                boundary_index,
+            )
+            result_edge_context_identity = (
+                splice_feedback_result_context_identity(
+                    result_plan,
+                    boundary_index,
+                )
+            )
             repairs.append(
                 VisualBoundaryRepair(
                     boundary_index=boundary_index,
@@ -1872,6 +2263,21 @@ def repair_visual_timeline_boundaries(
                     incoming_source_index=incoming.source_index,
                     result=result,
                     selected_visual_evidence=evidence,
+                    optimizer_edge_context=optimizer_edge_context,
+                    optimizer_edge_context_identity=(
+                        optimizer_edge_context_identity
+                    ),
+                    observed_edge_context=observed_edge_context,
+                    observed_edge_context_identity=(
+                        observed_edge_context_identity
+                    ),
+                    result_edge_context=result_edge_context,
+                    result_edge_context_identity=(
+                        result_edge_context_identity
+                    ),
+                    optimizer_edge_context_match=(
+                        optimizer_edge_context == observed_edge_context
+                    ),
                 )
             )
     finally:
@@ -1892,6 +2298,7 @@ def repair_visual_timeline_boundaries(
     )
     return VisualBoundaryRepairPlan(
         timeline=repaired_timeline,
+        attempt_input_timelines=(visual_timeline,),
         repairs=tuple(repairs),
         skipped_same_source_boundaries=same_source,
         failures=tuple(failures),

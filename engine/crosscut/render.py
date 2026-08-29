@@ -182,6 +182,12 @@ class PanCropTrack:
 
 
 EDITORIAL_TRANSFORM_EDGE_MARGIN = 0.003
+# This is the renderer's physical envelope, not the default editorial style.
+# Individual planners retain their narrower motion limits.  A decoded-output
+# inverse correction may use the wider envelope only when source resolution
+# proves the crop is lossless at delivery size.
+EDITORIAL_TRANSFORM_MAXIMUM_ZOOM = 2.0
+EDITORIAL_TRANSFORM_MAXIMUM_CENTER_SHIFT = 0.25
 
 
 def minimum_roll_safe_zoom(roll_degrees: float) -> float:
@@ -271,12 +277,18 @@ class EditorialTransformKeyframe:
             raise ValueError("group transform values must be finite")
         if self.time_seconds < 0.0:
             raise ValueError("group transform time must be non-negative")
-        if not 1.0 <= self.zoom <= 1.50:
-            raise ValueError("editorial transform zoom must be in [1.0, 1.50]")
+        if not 1.0 <= self.zoom <= EDITORIAL_TRANSFORM_MAXIMUM_ZOOM:
+            raise ValueError(
+                "editorial transform zoom must be in "
+                f"[1.0, {EDITORIAL_TRANSFORM_MAXIMUM_ZOOM:.2f}]"
+            )
         if not 0.0 <= self.center_x <= 1.0 or not 0.0 <= self.center_y <= 1.0:
             raise ValueError("editorial transform center must be normalized")
-        if math.hypot(self.center_x - 0.5, self.center_y - 0.5) > 0.160 + 1e-9:
-            raise ValueError("editorial transform pan exceeds the sixteen-percent cap")
+        if (
+            math.hypot(self.center_x - 0.5, self.center_y - 0.5)
+            > EDITORIAL_TRANSFORM_MAXIMUM_CENTER_SHIFT + 1e-9
+        ):
+            raise ValueError("editorial transform pan exceeds the quarter-frame cap")
         if abs(self.roll_degrees) > 1.60:
             raise ValueError("editorial transform roll exceeds the subtle-roll bound")
         if abs(self.roll_degrees) > 1e-9 and (
@@ -513,6 +525,7 @@ class SourceLookAdjustment:
     saturation: float = 1.0
     temperature_balance: float = 0.0
     tint_balance: float = 0.0
+    detail_enhancement: float = 0.0
 
     def __post_init__(self) -> None:
         values = (
@@ -521,6 +534,7 @@ class SourceLookAdjustment:
             self.saturation,
             self.temperature_balance,
             self.tint_balance,
+            self.detail_enhancement,
         )
         if any(not math.isfinite(value) for value in values):
             raise ValueError("source look adjustment values must be finite")
@@ -536,6 +550,10 @@ class SourceLookAdjustment:
             )
         if not -0.10 <= self.tint_balance <= 0.10:
             raise ValueError("source look tint balance exceeds the calibrated bound")
+        if not 0.0 <= self.detail_enhancement <= 1.0:
+            raise ValueError(
+                "source look detail enhancement exceeds the calibrated bound"
+            )
 
     @property
     def is_identity(self) -> bool:
@@ -545,6 +563,7 @@ class SourceLookAdjustment:
             and abs(self.saturation - 1.0) <= 1e-12
             and abs(self.temperature_balance) <= 1e-12
             and abs(self.tint_balance) <= 1e-12
+            and abs(self.detail_enhancement) <= 1e-12
         )
 
 
@@ -795,6 +814,55 @@ def _base_crop_values(
     return (positions[-1][1], positions[-1][2], width, height)
 
 
+def _tier_d_base_crop_discontinuity(
+    left: RenderSegment,
+    right: RenderSegment,
+    *,
+    left_frame_count: int,
+    right_frame_count: int,
+    fps: float,
+) -> str | None:
+    frame = 1.0 / fps
+    left_last_time = min(left.duration, (left_frame_count - 1) * frame)
+    outgoing = _base_crop_values(left, left_last_time)
+    authored_endpoint = _base_crop_values(left, left.duration)
+    incoming = _base_crop_values(right, 0.0)
+    # Tier D is an invisible continuation of one source-local shot.  Its
+    # authored crop must therefore meet exactly at the mathematical boundary;
+    # this distinguishes a real reset from the harmless variable-size final
+    # frame interval introduced by global frame-count quantization.
+    endpoint_deltas = tuple(
+        abs(left_value - right_value)
+        for left_value, right_value in zip(
+            authored_endpoint,
+            incoming,
+            strict=True,
+        )
+    )
+    if max(endpoint_deltas) > 1e-8:
+        return (
+            "authored_endpoint_delta="
+            f"{max(endpoint_deltas):.9f}"
+        )
+    maximum_steps = (
+        0.04 / (0.55 * fps),
+        0.04 / (0.55 * fps),
+        0.18 / (0.55 * fps),
+        0.18 / (0.55 * fps),
+    )
+    coordinate_names = ("x", "y", "width", "height")
+    for index, (coordinate_name, maximum_step) in enumerate(
+        zip(coordinate_names, maximum_steps, strict=True)
+    ):
+        cross_step = incoming[index] - outgoing[index]
+        if abs(cross_step) > maximum_step + 1e-8:
+            return (
+                f"frame_step_{coordinate_name}={abs(cross_step):.9f};"
+                f"maximum={maximum_step:.9f}"
+            )
+    return None
+
+
 def _tier_d_base_crop_is_frame_continuous(
     left: RenderSegment,
     right: RenderSegment,
@@ -803,38 +871,13 @@ def _tier_d_base_crop_is_frame_continuous(
     right_frame_count: int,
     fps: float,
 ) -> bool:
-    frame = 1.0 / fps
-    left_last_time = min(left.duration, (left_frame_count - 1) * frame)
-    left_previous_time = max(0.0, left_last_time - frame)
-    right_next_time = min(right.duration, frame if right_frame_count > 1 else 0.0)
-    before = _base_crop_values(left, left_previous_time)
-    outgoing = _base_crop_values(left, left_last_time)
-    incoming = _base_crop_values(right, 0.0)
-    after = _base_crop_values(right, right_next_time)
-    maximum_steps = (
-        0.04 / (0.55 * fps),
-        0.04 / (0.55 * fps),
-        0.18 / (0.55 * fps),
-        0.18 / (0.55 * fps),
-    )
-    for index, maximum_step in enumerate(maximum_steps):
-        previous_step = outgoing[index] - before[index]
-        cross_step = incoming[index] - outgoing[index]
-        next_step = after[index] - incoming[index]
-        if abs(cross_step) > maximum_step + 1e-8:
-            return False
-        closest_neighbor_error = min(
-            abs(cross_step - previous_step),
-            abs(cross_step - next_step),
-        )
-        reference_step = max(
-            abs(cross_step),
-            abs(previous_step),
-            abs(next_step),
-        )
-        if closest_neighbor_error > max(1e-5, 0.25 * reference_step):
-            return False
-    return True
+    return _tier_d_base_crop_discontinuity(
+        left,
+        right,
+        left_frame_count=left_frame_count,
+        right_frame_count=right_frame_count,
+        fps=fps,
+    ) is None
 
 
 class TransitionKind(str, Enum):
@@ -855,6 +898,12 @@ MEMBER_ZOOM_BRIDGE_REASON = (
 )
 MEMBER_BLUR_BRIDGE_REASON = (
     "official_target_member_required_horizontal_blur_bridge_v1"
+)
+DIRECT_MEMBER_POSE_DISSOLVE_REASON = (
+    "official_target_member_pose_matched_logistic_face_dissolve_v1"
+)
+MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY = (
+    "decoded_hardcut_output_endpoint_match_effect_proxy_revalidation_required_v1"
 )
 
 
@@ -894,6 +943,7 @@ class RenderTransition:
     appearance_min_cosine_similarity: float | None = None
     future_pose_max_mismatch: float | None = None
     future_silhouette_max_mismatch: float | None = None
+    transform_overlap_authority: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, TransitionKind):
@@ -910,6 +960,16 @@ class RenderTransition:
             raise ValueError("overlap transitions need at least three frames")
         if not self.reason:
             raise ValueError("transition reason cannot be blank")
+        if self.transform_overlap_authority is not None and not (
+            self.kind is TransitionKind.FACE_DISSOLVE
+            and self.reason == DIRECT_MEMBER_POSE_DISSOLVE_REASON
+            and self.transform_overlap_authority
+            == MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
+        ):
+            raise ValueError(
+                "transform overlap authority is valid only for a decoded-output "
+                "verified direct-member dissolve"
+            )
         if self.tier is not None and self.tier not in {"A", "B", "C", "D"}:
             raise ValueError("transition tier must be one of A, B, C, or D")
         if self.face_mismatch is not None and (
@@ -937,7 +997,7 @@ class RenderTransition:
         return self.frame_count / fps
 
     def to_dict(self, fps: float) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": self.kind.value,
             "frame_count": self.frame_count,
             "duration_seconds": self.duration_seconds(fps),
@@ -961,6 +1021,11 @@ class RenderTransition:
                 else None
             ),
         }
+        if self.transform_overlap_authority is not None:
+            payload["transform_overlap_authority"] = (
+                self.transform_overlap_authority
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -1068,7 +1133,7 @@ class RenderPlan:
             actual_member_dissolves = sum(
                 transition.kind is TransitionKind.FACE_DISSOLVE
                 and transition.reason
-                == "official_target_member_pose_matched_logistic_face_dissolve_v1"
+                == DIRECT_MEMBER_POSE_DISSOLVE_REASON
                 for transition in self.transitions
             )
             actual_face_dissolves = sum(
@@ -1133,14 +1198,22 @@ class RenderPlan:
                 - self.segments[index + 1].source_start
             ) > 1e-4:
                 raise ValueError("tier D transition requires a contiguous source clock")
-            if transition.tier == "D" and not _tier_d_base_crop_is_frame_continuous(
-                self.segments[index],
-                self.segments[index + 1],
-                left_frame_count=counts[index],
-                right_frame_count=counts[index + 1],
-                fps=self.fps,
-            ):
-                raise ValueError("same-source hold cannot reset its base crop")
+            crop_discontinuity = (
+                _tier_d_base_crop_discontinuity(
+                    self.segments[index],
+                    self.segments[index + 1],
+                    left_frame_count=counts[index],
+                    right_frame_count=counts[index + 1],
+                    fps=self.fps,
+                )
+                if transition.tier == "D"
+                else None
+            )
+            if crop_discontinuity is not None:
+                raise ValueError(
+                    "same-source hold cannot reset its base crop: "
+                    f"boundary={index}; {crop_discontinuity}"
+                )
             if transition.tier == "D" and not _tier_d_transform_is_frame_continuous(
                 self.segments[index].editorial_transform,
                 self.segments[index + 1].editorial_transform,
@@ -1165,6 +1238,8 @@ class RenderPlan:
                     overlap_frame_count=transition.frame_count,
                     fps=self.fps,
                 )
+                and transition.transform_overlap_authority
+                != MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
             ):
                 raise ValueError(
                     "overlap transition cannot use an unreviewed editorial transform"
@@ -1239,6 +1314,16 @@ class RenderPlan:
             ):
                 # Preserve exact replay/hash compatibility with v1-v2 plans.
                 serialized_look.pop("tint_balance", None)
+            if (
+                isinstance(serialized_look, dict)
+                and abs(
+                    float(serialized_look.get("detail_enhancement", 0.0))
+                )
+                <= 1e-12
+            ):
+                # Preserve exact replay/hash compatibility with plans written
+                # before decoded-output detail equalization existed.
+                serialized_look.pop("detail_enhancement", None)
             payload["effective_source_duration"] = segment.effective_source_duration
             payload["source_playback_rate"] = segment.source_playback_rate
             payload["source_local_start"] = segment.source_start
@@ -1532,6 +1617,12 @@ def _source_look_filters(
             f"cb='clip(cb(X,Y){cb_offset:+.6f},0,255)':"
             f"cr='clip(cr(X,Y){cr_offset:+.6f},0,255)'"
         )
+    if adjustment.detail_enhancement > 1e-12:
+        # Contrast Adaptive Sharpen raises local detail without the broad halos
+        # of a fixed unsharp mask. It is enabled only by decoded-output member
+        # calibration and the resulting pixels still have to pass the same
+        # perceptual proxy and final source-retention gates.
+        filters.append(f"cas=strength={adjustment.detail_enhancement:.6f}")
     return filters
 
 

@@ -11,8 +11,10 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from enum import Enum
 import hashlib
+import json
 import math
 from pathlib import Path
 from types import MappingProxyType
@@ -34,12 +36,14 @@ from .timeline import (
     BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH,
     BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH,
     BoundarySideStability,
+    NoCompleteTimelinePath,
     ShotType,
     TimelineCandidate,
     TimelineChoice,
     TimelineConfig,
     TimelineResult,
     comparable_group_formation_mismatch,
+    compile_timeline_no_good_constraint_index,
     cross_source_layout_mismatch,
     face_geometry_minimax_mismatch,
     select_timeline_candidates,
@@ -57,6 +61,11 @@ from .timeline import (
     PRODUCTION_MAX_SILHOUETTE_MISMATCH,
 )
 from .timeline_review import TimelineReview, review_timeline
+from .timeline_no_good import (
+    TimelineNoGoodEdgeKey,
+    TimelineNoGoodSet,
+    build_timeline_no_good_edge_key,
+)
 from .timewarp import TimeWarpMap
 from .section_director import SectionPlan, SectionRole
 from .visual_feature_cache import (
@@ -615,6 +624,7 @@ def _complete_path_reachable_candidate_keys(
     candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
     *,
     timeline_config: TimelineConfig,
+    forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
 ) -> set[tuple[int, str]]:
     """Find candidates lying on at least one full hard-gate-admitted path."""
 
@@ -631,12 +641,23 @@ def _complete_path_reachable_candidate_keys(
                     current,
                     config=timeline_config,
                 )
+                and (
+                    not forbidden_boundary_edges
+                    or build_timeline_no_good_edge_key(
+                        position - 1,
+                        segments[position - 1][previous_index],
+                        current,
+                    )
+                    not in forbidden_boundary_edges
+                )
                 for previous_index in forward[-1]
             ):
                 reachable.add(current_index)
         if not reachable:
-            raise ValueError(
-                "visual hard-gate graph has no complete forward path"
+            raise NoCompleteTimelinePath(
+                "visual hard-gate graph has no complete forward path",
+                reason_code="visual_hard_gate_forward_path_exhausted",
+                segment_index=segments[position][0].segment_index,
             )
         forward.append(reachable)
     backward: list[set[int]] = [set() for _ in segments]
@@ -650,12 +671,23 @@ def _complete_path_reachable_candidate_keys(
                     segments[position + 1][current_index],
                     config=timeline_config,
                 )
+                and (
+                    not forbidden_boundary_edges
+                    or build_timeline_no_good_edge_key(
+                        position,
+                        previous,
+                        segments[position + 1][current_index],
+                    )
+                    not in forbidden_boundary_edges
+                )
                 for current_index in backward[position + 1]
             ):
                 reachable.add(previous_index)
         if not reachable:
-            raise ValueError(
-                "visual hard-gate graph has no complete backward path"
+            raise NoCompleteTimelinePath(
+                "visual hard-gate graph has no complete backward path",
+                reason_code="visual_hard_gate_backward_path_exhausted",
+                segment_index=segments[position][0].segment_index,
             )
         backward[position] = reachable
     return {
@@ -952,10 +984,12 @@ def _role_conditioned_visual_controls(
     cadence_profile: str,
     subject_metadata_by_candidate: Mapping[str, "_CandidateSubjectMetadata"],
     timeline_config: TimelineConfig | None = None,
+    forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
 ) -> tuple[dict[tuple[int, str], float], dict[int, float], dict[str, Any]]:
     reachable_candidate_keys = _complete_path_reachable_candidate_keys(
         candidates_by_segment,
         timeline_config=timeline_config or TimelineConfig(),
+        forbidden_boundary_edges=forbidden_boundary_edges,
     )
     targets, audit = _role_target_categories(
         candidates_by_segment,
@@ -1354,6 +1388,7 @@ def _select_safe_cadence_candidates(
         str, "_CandidateSubjectMetadata"
     ] | None = None,
     role_conditioning_audit: list[dict[str, Any]] | None = None,
+    forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
 ) -> tuple[tuple[TimelineResult, ...], tuple[str, ...]]:
     """Generate profile-local alternatives, then interleave unique paths."""
 
@@ -1363,9 +1398,15 @@ def _select_safe_cadence_candidates(
             "section_plan and professional_montage_policy must be supplied together"
         )
     metadata = dict(subject_metadata_by_candidate or {})
+    compiled_no_good_constraints = compile_timeline_no_good_constraint_index(
+        candidates_by_segment,
+        forbidden_boundary_edges,
+    )
     pools: list[tuple[TimelineResult, ...]] = []
+    profile_failures: list[tuple[str, NoCompleteTimelinePath]] = []
     for profile in profiles:
         selection_kwargs: dict[str, Any] = {}
+        role_audit: dict[str, Any] | None = None
         if professional_montage_policy is not None:
             assert section_plan is not None
             adjustments, switch_bonus, audit = (
@@ -1377,6 +1418,7 @@ def _select_safe_cadence_candidates(
                     cadence_profile=profile.name,
                     subject_metadata_by_candidate=metadata,
                     timeline_config=profile.config,
+                    forbidden_boundary_edges=forbidden_boundary_edges,
                 )
             )
             selection_kwargs.update(
@@ -1385,19 +1427,31 @@ def _select_safe_cadence_candidates(
                     "source_switch_bonus_by_segment": switch_bonus,
                 }
             )
+            role_audit = audit
             if role_conditioning_audit is not None:
                 role_conditioning_audit.append(audit)
-        pools.append(
-            select_timeline_candidates(
-            candidates_by_segment,
-            config=profile.config,
-            preferred_source_ids=preferred_source_ids,
-            maximum_results=16,
-            diversity_penalty=0.12,
-            minimum_hamming_fraction=0.02,
-            **selection_kwargs,
-        )
-        )
+        try:
+            pool = select_timeline_candidates(
+                candidates_by_segment,
+                config=profile.config,
+                preferred_source_ids=preferred_source_ids,
+                maximum_results=16,
+                diversity_penalty=0.12,
+                minimum_hamming_fraction=0.02,
+                forbidden_boundary_edges=forbidden_boundary_edges,
+                compiled_no_good_constraints=compiled_no_good_constraints,
+                **selection_kwargs,
+            )
+        except NoCompleteTimelinePath as exc:
+            # The three cadence profiles intentionally use different soft
+            # sacrifices.  One constrained graph can therefore be infeasible
+            # for balanced while remaining feasible for reference/dense-safe.
+            # Keep profile exhaustion local instead of discarding survivors.
+            profile_failures.append((profile.name, exc))
+            if role_audit is not None:
+                role_audit["candidate_generation_exhaustion"] = exc.to_dict()
+            pool = ()
+        pools.append(pool)
     pooled = tuple(pools)
     candidates: list[TimelineResult] = []
     cadence_profiles: list[str] = []
@@ -1416,7 +1470,25 @@ def _select_safe_cadence_candidates(
             if len(candidates) >= maximum_results:
                 return (tuple(candidates), tuple(cadence_profiles))
     if not candidates:
-        raise ValueError("safe cadence candidate generation produced no result")
+        if profile_failures:
+            failure_summary = ",".join(
+                f"{profile}:{failure.reason_code}"
+                for profile, failure in profile_failures
+            )
+            rejection_counts = {
+                f"{profile}:{failure.reason_code}": 1
+                for profile, failure in profile_failures
+            }
+            raise NoCompleteTimelinePath(
+                "all safe cadence profiles exhausted; "
+                f"profile_failures={failure_summary}",
+                reason_code="all_safe_cadence_profiles_exhausted",
+                rejection_counts=rejection_counts,
+            )
+        raise NoCompleteTimelinePath(
+            "safe cadence candidate generation produced no result",
+            reason_code="safe_cadence_candidate_generation_empty",
+        )
     return (tuple(candidates), tuple(cadence_profiles))
 
 
@@ -1926,6 +1998,240 @@ class VisualTimelineCandidateRecord:
         return payload
 
 
+_VISUAL_OPTIMIZER_INPUT_IDENTITY_CONTRACT = (
+    "visual_optimizer_workspace_input_identity_v1"
+)
+
+
+def _optimizer_identity_value(value: object) -> object:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _optimizer_identity_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("optimizer identity mapping keys must be strings")
+        return {
+            key: _optimizer_identity_value(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, (tuple, list)):
+        return [_optimizer_identity_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("optimizer identity values must be finite")
+        return value
+    raise TypeError(
+        f"optimizer identity cannot encode {type(value).__name__}"
+    )
+
+
+def _visual_optimizer_input_identity(
+    candidates_by_segment: Sequence[Sequence[TimelineCandidate]],
+    *,
+    sources: Sequence[Path | str],
+    audio_offsets: Sequence[float],
+    source_timewarps: Sequence[TimeWarpMap | None],
+    source_clock_basis: str,
+    scene_cut_times: Sequence[Sequence[float]],
+    preferred_source_ids: Sequence[str | None] | None = None,
+    diversity: VisualDiversityConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_policy: ProfessionalMontageSelectionPolicy | None = None,
+    subject_metadata_by_candidate: Mapping[str, object] | None = None,
+    prescribed_source_ids: Sequence[str] | None = None,
+    maximum_results: int = 32,
+) -> str:
+    segments = tuple(tuple(segment) for segment in candidates_by_segment)
+    if not segments or any(not segment for segment in segments):
+        raise ValueError("optimizer input identity needs a non-empty lattice")
+    payload = {
+        "contract": _VISUAL_OPTIMIZER_INPUT_IDENTITY_CONTRACT,
+        "sources": [str(Path(path)) for path in sources],
+        "audio_offsets": [float(value) for value in audio_offsets],
+        "source_timewarps": [
+            None if timewarp is None else timewarp.to_dict()
+            for timewarp in source_timewarps
+        ],
+        "source_clock_basis": str(source_clock_basis),
+        "scene_cut_times": [
+            [float(value) for value in source_cuts]
+            for source_cuts in scene_cut_times
+        ],
+        "candidate_lattice": [
+            [_optimizer_identity_value(candidate) for candidate in segment]
+            for segment in segments
+        ],
+        "selection_context": {
+            "preferred_source_ids": _optimizer_identity_value(
+                None
+                if preferred_source_ids is None
+                else tuple(preferred_source_ids)
+            ),
+            "diversity": _optimizer_identity_value(
+                diversity or VisualDiversityConfig()
+            ),
+            "section_plan": _optimizer_identity_value(section_plan),
+            "phrase_times": _optimizer_identity_value(tuple(phrase_times)),
+            "professional_montage_policy": _optimizer_identity_value(
+                professional_montage_policy
+            ),
+            "subject_metadata_by_candidate": _optimizer_identity_value(
+                dict(subject_metadata_by_candidate or {})
+            ),
+            "prescribed_source_ids": _optimizer_identity_value(
+                None
+                if prescribed_source_ids is None
+                else tuple(prescribed_source_ids)
+            ),
+            "maximum_results": maximum_results,
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_sha256_identity(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class VisualTimelineOptimizerWorkspace:
+    """Transient descriptor lattice and every input needed to rerun the DP.
+
+    The workspace never enters :meth:`VisualTimelineCandidateSet.to_dict`.
+    Keeping it in process lets fresh splice failures feed exact no-good edges
+    back into the optimizer without decoding or describing any frame again.
+    """
+
+    candidates_by_segment: tuple[tuple[TimelineCandidate, ...], ...] = field(
+        repr=False
+    )
+    input_identity: str
+    preferred_source_ids: tuple[str | None, ...] | None = None
+    diversity: VisualDiversityConfig = field(default_factory=VisualDiversityConfig)
+    section_plan: SectionPlan | None = field(default=None, repr=False)
+    phrase_times: tuple[float, ...] = ()
+    professional_montage_policy: ProfessionalMontageSelectionPolicy | None = field(
+        default=None,
+        repr=False,
+    )
+    subject_metadata_by_candidate: Mapping[
+        str, "_CandidateSubjectMetadata"
+    ] = field(default_factory=dict, repr=False, compare=False)
+    prescribed_source_ids: tuple[str, ...] | None = None
+    maximum_results: int = 32
+
+    def __post_init__(self) -> None:
+        segments = tuple(
+            tuple(candidate for candidate in segment)
+            for segment in self.candidates_by_segment
+        )
+        if not segments or any(not segment for segment in segments):
+            raise ValueError("optimizer workspace needs non-empty candidate segments")
+        expected_segment_indices = tuple(
+            range(
+                segments[0][0].segment_index,
+                segments[0][0].segment_index + len(segments),
+            )
+        )
+        actual_segment_indices = tuple(segment[0].segment_index for segment in segments)
+        if actual_segment_indices != expected_segment_indices:
+            raise ValueError("optimizer workspace segment indices must be contiguous")
+        for segment in segments:
+            reference = segment[0]
+            if any(
+                not isinstance(candidate, TimelineCandidate)
+                or candidate.segment_index != reference.segment_index
+                or not math.isclose(
+                    candidate.start_seconds,
+                    reference.start_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    candidate.end_seconds,
+                    reference.end_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                for candidate in segment
+            ):
+                raise ValueError(
+                    "optimizer workspace candidates must share canonical spans"
+                )
+        preferred = (
+            None
+            if self.preferred_source_ids is None
+            else tuple(self.preferred_source_ids)
+        )
+        prescribed = (
+            None
+            if self.prescribed_source_ids is None
+            else tuple(self.prescribed_source_ids)
+        )
+        if preferred is not None and len(preferred) != len(segments):
+            raise ValueError("workspace preferences must match candidate segments")
+        if prescribed is not None and len(prescribed) != len(segments):
+            raise ValueError("workspace prescribed path must match candidate segments")
+        if preferred is not None and prescribed is not None:
+            raise ValueError(
+                "workspace cannot combine preferences with a prescribed path"
+            )
+        if (self.section_plan is None) != (
+            self.professional_montage_policy is None
+        ):
+            raise ValueError(
+                "workspace section plan and montage policy must be supplied together"
+            )
+        phrases = tuple(float(value) for value in self.phrase_times)
+        if any(not math.isfinite(value) for value in phrases):
+            raise ValueError("workspace phrase times must be finite")
+        if (
+            isinstance(self.maximum_results, bool)
+            or not isinstance(self.maximum_results, int)
+            or not 8 <= self.maximum_results <= 32
+        ):
+            raise ValueError("workspace maximum_results must be between 8 and 32")
+        object.__setattr__(self, "candidates_by_segment", segments)
+        object.__setattr__(
+            self,
+            "input_identity",
+            _validated_sha256_identity(
+                self.input_identity,
+                "optimizer workspace input_identity",
+            ),
+        )
+        object.__setattr__(self, "preferred_source_ids", preferred)
+        object.__setattr__(self, "prescribed_source_ids", prescribed)
+        object.__setattr__(self, "phrase_times", phrases)
+        object.__setattr__(
+            self,
+            "subject_metadata_by_candidate",
+            MappingProxyType(dict(self.subject_metadata_by_candidate)),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class VisualTimelineCandidateSet:
     """Deterministic top-N alternatives before selected-only post-processing."""
@@ -1953,6 +2259,12 @@ class VisualTimelineCandidateSet:
     )
     minimum_materialization_target: int = 8
     role_conditioned_selection: Mapping[str, Any] | None = None
+    optimizer_workspace: VisualTimelineOptimizerWorkspace | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    optimizer_input_identity: str | None = None
 
     def __post_init__(self) -> None:
         records = tuple(self.candidates)
@@ -1980,6 +2292,26 @@ class VisualTimelineCandidateSet:
         object.__setattr__(self, "face_metadata_by_candidate", face_metadata)
         object.__setattr__(self, "subject_metadata_by_candidate", subject_metadata)
         object.__setattr__(self, "role_conditioned_selection", role_conditioning)
+        optimizer_input_identity = (
+            None
+            if self.optimizer_input_identity is None
+            else _validated_sha256_identity(
+                self.optimizer_input_identity,
+                "candidate-set optimizer_input_identity",
+            )
+        )
+        object.__setattr__(
+            self,
+            "optimizer_input_identity",
+            optimizer_input_identity,
+        )
+        if self.optimizer_workspace is not None and not isinstance(
+            self.optimizer_workspace,
+            VisualTimelineOptimizerWorkspace,
+        ):
+            raise TypeError(
+                "optimizer_workspace must be a VisualTimelineOptimizerWorkspace"
+            )
         if (
             isinstance(self.requested_maximum_results, bool)
             or not isinstance(self.requested_maximum_results, int)
@@ -2071,6 +2403,43 @@ class VisualTimelineCandidateSet:
                     raise ValueError(
                         "visual candidate source_id is outside the source list"
                     )
+        if self.optimizer_workspace is not None:
+            if optimizer_input_identity is None:
+                raise ValueError(
+                    "candidate set with optimizer workspace needs input identity"
+                )
+            expected_workspace_identity = _visual_optimizer_input_identity(
+                self.optimizer_workspace.candidates_by_segment,
+                sources=sources,
+                audio_offsets=offsets,
+                source_timewarps=timewarps,
+                source_clock_basis=self.source_clock_basis,
+                scene_cut_times=scene_cuts,
+                preferred_source_ids=(
+                    self.optimizer_workspace.preferred_source_ids
+                ),
+                diversity=self.optimizer_workspace.diversity,
+                section_plan=self.optimizer_workspace.section_plan,
+                phrase_times=self.optimizer_workspace.phrase_times,
+                professional_montage_policy=(
+                    self.optimizer_workspace.professional_montage_policy
+                ),
+                subject_metadata_by_candidate=(
+                    self.optimizer_workspace.subject_metadata_by_candidate
+                ),
+                prescribed_source_ids=(
+                    self.optimizer_workspace.prescribed_source_ids
+                ),
+                maximum_results=self.optimizer_workspace.maximum_results,
+            )
+            if (
+                self.optimizer_workspace.input_identity
+                != expected_workspace_identity
+                or optimizer_input_identity != expected_workspace_identity
+            ):
+                raise ValueError(
+                    "optimizer workspace identity does not match candidate-set inputs"
+                )
 
     @property
     def selected(self) -> VisualTimelineCandidateRecord:
@@ -2230,6 +2599,7 @@ class VisualTimelineCandidateSet:
             "selected_candidate_index": self.selected_candidate_index,
             "source_count": len(self.sources),
             "source_clock_basis": self.source_clock_basis,
+            "optimizer_input_identity": self.optimizer_input_identity,
             "per_shot_quality_soft_floor": _quality_soft_floor_policy(),
             "role_conditioned_selection": (
                 deepcopy(dict(self.role_conditioned_selection))
@@ -2245,6 +2615,239 @@ class VisualTimelineCandidateSet:
             "candidates": [record.to_dict() for record in self.candidates],
             "raw_candidate_embeddings_persisted": False,
         }
+
+
+def _normalise_timeline_no_goods(
+    value: TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey],
+) -> TimelineNoGoodSet:
+    if isinstance(value, TimelineNoGoodSet):
+        return value
+    if isinstance(value, (str, bytes)):
+        raise TypeError("forbidden_boundary_edges must contain exact edge keys")
+    return TimelineNoGoodSet(tuple(value))
+
+
+def _select_optimizer_workspace_candidates(
+    workspace: VisualTimelineOptimizerWorkspace,
+    *,
+    forbidden_boundary_edges: TimelineNoGoodSet,
+) -> tuple[tuple[TimelineResult, ...], tuple[str, ...], list[dict[str, Any]]]:
+    role_conditioning_audit: list[dict[str, Any]] = []
+    if workspace.prescribed_source_ids is None:
+        selection_lattice = [
+            list(segment) for segment in workspace.candidates_by_segment
+        ]
+        timeline_candidates, cadence_profiles = _select_safe_cadence_candidates(
+            selection_lattice,
+            preferred_source_ids=workspace.preferred_source_ids,
+            diversity=workspace.diversity,
+            maximum_results=workspace.maximum_results,
+            section_plan=workspace.section_plan,
+            phrase_times=workspace.phrase_times,
+            professional_montage_policy=(
+                workspace.professional_montage_policy
+            ),
+            subject_metadata_by_candidate=(
+                workspace.subject_metadata_by_candidate
+            ),
+            role_conditioning_audit=role_conditioning_audit,
+            forbidden_boundary_edges=forbidden_boundary_edges,
+        )
+        return timeline_candidates, cadence_profiles, role_conditioning_audit
+
+    restricted_candidates: list[tuple[TimelineCandidate, ...]] = []
+    for segment, source_id in zip(
+        workspace.candidates_by_segment,
+        workspace.prescribed_source_ids,
+        strict=True,
+    ):
+        exact = tuple(
+            candidate for candidate in segment if candidate.source_id == source_id
+        )
+        if len(exact) != 1:
+            raise ValueError(
+                "prescribed source is not visually readable for segment "
+                f"{segment[0].segment_index}"
+            )
+        restricted_candidates.append(exact)
+    timeline_candidates = select_timeline_candidates(
+        restricted_candidates,
+        config=_safe_cadence_profiles(workspace.diversity)[0].config,
+        maximum_results=1,
+        diversity_penalty=0.12,
+        minimum_hamming_fraction=0.02,
+        forbidden_boundary_edges=forbidden_boundary_edges,
+    )
+    return (
+        timeline_candidates,
+        ("prescribed_balanced_hard_gates",),
+        role_conditioning_audit,
+    )
+
+
+def _review_visual_timeline_candidates(
+    timeline_candidates: Sequence[TimelineResult],
+    cadence_profiles: Sequence[str],
+    *,
+    available_source_count: int,
+) -> tuple[tuple[VisualTimelineCandidateRecord, ...], int]:
+    candidates = tuple(timeline_candidates)
+    profiles = tuple(cadence_profiles)
+    if not candidates or len(candidates) != len(profiles):
+        raise ValueError("timeline candidates and cadence profiles must align")
+    reviews = tuple(
+        review_timeline(
+            candidate,
+            available_source_count=available_source_count,
+        )
+        for candidate in candidates
+    )
+    ranked_indices = _review_ranked_candidate_indices(reviews)
+    selected_candidate_index = ranked_indices[0]
+    rank_by_index = {
+        candidate_index: review_rank
+        for review_rank, candidate_index in enumerate(ranked_indices)
+    }
+    records = tuple(
+        VisualTimelineCandidateRecord(
+            candidate_index=index,
+            cadence_profile=profiles[index],
+            timeline_result=candidate,
+            review=review,
+            review_rank=rank_by_index[index],
+            selected=index == selected_candidate_index,
+        )
+        for index, (candidate, review) in enumerate(
+            zip(candidates, reviews, strict=True)
+        )
+    )
+    return records, selected_candidate_index
+
+
+def _role_conditioned_selection_payload(
+    records: Sequence[VisualTimelineCandidateRecord],
+    *,
+    workspace: VisualTimelineOptimizerWorkspace,
+    role_conditioning_audit: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    policy = workspace.professional_montage_policy
+    if policy is None:
+        return None
+    section_plan = workspace.section_plan
+    if section_plan is None:  # pragma: no cover - workspace invariant
+        raise RuntimeError("montage policy lost its section plan")
+    return {
+        "contract": (
+            "human_reference_role_conditioned_visual_candidate_soft_controls_v1"
+        ),
+        "policy": policy.to_dict(),
+        "section_plan_analysis_basis": section_plan.analysis_basis,
+        "phrase_boundary_count": len(
+            tuple(sorted({float(value) for value in workspace.phrase_times}))
+        ),
+        "cadence_profiles": [deepcopy(dict(item)) for item in role_conditioning_audit],
+        "intentional_phrase_anchor_transition_authority": {
+            "analysis_basis": INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
+            "scope": ["build", "chorus_like", "bridge_like"],
+            "timing": "exact_acoustic_phrase_entry_only",
+            "authorized_mismatch_metrics": ["scale", "focus"],
+            "maximum_scale_mismatch": (
+                INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH
+            ),
+            "maximum_focus_mismatch": (
+                INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH
+            ),
+            "maximum_pose_mismatch": (
+                INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH
+            ),
+            "layout_silhouette_formation_gates_unchanged": True,
+            "scene_cut_and_boundary_side_gates_unchanged": True,
+            "ordinary_boundaries_relaxed": False,
+        },
+        "candidate_outcomes": list(
+            _role_conditioned_candidate_outcomes(
+                records,
+                section_plan=section_plan,
+                policy=policy,
+                subject_metadata_by_candidate=(
+                    workspace.subject_metadata_by_candidate
+                ),
+            )
+        ),
+        "raw_visual_descriptors_persisted": False,
+        "decoded_output_montage_gate_required": True,
+    }
+
+
+def regenerate_visual_timeline_candidate_set(
+    candidate_set: VisualTimelineCandidateSet,
+    *,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ),
+) -> VisualTimelineCandidateSet:
+    """Rerun candidate selection against exact failed edges, with no decode.
+
+    This function intentionally consumes only the transient descriptor lattice
+    retained by the original candidate set.  If a set came from a serialized
+    checkpoint and no longer has that workspace, regeneration fails closed
+    instead of silently rebuilding descriptors or ignoring the no-goods.
+    """
+
+    if not isinstance(candidate_set, VisualTimelineCandidateSet):
+        raise TypeError("candidate_set must be a VisualTimelineCandidateSet")
+    workspace = candidate_set.optimizer_workspace
+    if workspace is None:
+        raise ValueError(
+            "candidate set has no transient optimizer workspace; rebuild it once"
+        )
+    expected_workspace_identity = _visual_optimizer_input_identity(
+        workspace.candidates_by_segment,
+        sources=candidate_set.sources,
+        audio_offsets=candidate_set.audio_offsets,
+        source_timewarps=candidate_set.source_timewarps,
+        source_clock_basis=candidate_set.source_clock_basis,
+        scene_cut_times=candidate_set.scene_cut_times,
+        preferred_source_ids=workspace.preferred_source_ids,
+        diversity=workspace.diversity,
+        section_plan=workspace.section_plan,
+        phrase_times=workspace.phrase_times,
+        professional_montage_policy=workspace.professional_montage_policy,
+        subject_metadata_by_candidate=workspace.subject_metadata_by_candidate,
+        prescribed_source_ids=workspace.prescribed_source_ids,
+        maximum_results=workspace.maximum_results,
+    )
+    if (
+        workspace.input_identity != expected_workspace_identity
+        or candidate_set.optimizer_input_identity != expected_workspace_identity
+    ):
+        raise ValueError(
+            "optimizer workspace identity does not match candidate-set inputs"
+        )
+    no_goods = _normalise_timeline_no_goods(forbidden_boundary_edges)
+    timeline_candidates, cadence_profiles, role_audit = (
+        _select_optimizer_workspace_candidates(
+            workspace,
+            forbidden_boundary_edges=no_goods,
+        )
+    )
+    records, selected_candidate_index = _review_visual_timeline_candidates(
+        timeline_candidates,
+        cadence_profiles,
+        available_source_count=len(candidate_set.sources),
+    )
+    role_conditioning = _role_conditioned_selection_payload(
+        records,
+        workspace=workspace,
+        role_conditioning_audit=role_audit,
+    )
+    return replace(
+        candidate_set,
+        candidates=records,
+        selected_candidate_index=selected_candidate_index,
+        role_conditioned_selection=role_conditioning,
+        optimizer_workspace=workspace,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5695,75 +6298,16 @@ def _build_visual_timeline(
     candidate_generation_basis = (
         "three_safe_cadence_profiles_round_robin_dedup_then_reference_review_v5"
     )
-    minimum_materialization_target = 8
-    role_conditioning_audit: list[dict[str, Any]] = []
-    if prescribed_indices is None:
-        timeline_candidates, candidate_cadence_profiles = (
-            _select_safe_cadence_candidates(
-                candidates_by_segment,
-                preferred_source_ids=preferred_source_ids,
-                diversity=diversity,
-                maximum_results=maximum_candidate_results,
-                section_plan=section_plan,
-                phrase_times=phrase_times,
-                professional_montage_policy=(
-                    professional_montage_selection_policy
-                ),
-                subject_metadata_by_candidate=(
-                    subject_metadata_by_candidate
-                ),
-                role_conditioning_audit=role_conditioning_audit,
-            )
-        )
-        if professional_montage_selection_policy is not None:
-            candidate_generation_basis = (
-                "human_reference_role_conditioned_three_cadence_profiles_"
-                "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
-            )
-    else:
-        restricted_candidates: list[tuple[TimelineCandidate, ...]] = []
-        for segment_index, (candidates, source_index) in enumerate(
-            zip(candidates_by_segment, prescribed_indices, strict=True)
-        ):
-            exact = tuple(
-                candidate
-                for candidate in candidates
-                if candidate.source_id == str(source_index)
-            )
-            if len(exact) != 1:
-                raise ValueError(
-                    "prescribed source is not visually readable for segment "
-                    f"{segment_index}"
-                )
-            restricted_candidates.append(exact)
-        timeline_candidates = select_timeline_candidates(
-            restricted_candidates,
-            config=_safe_cadence_profiles(diversity)[0].config,
-            maximum_results=1,
-            diversity_penalty=0.12,
-            minimum_hamming_fraction=0.02,
-        )
-        candidate_cadence_profiles = ("prescribed_balanced_hard_gates",)
+    minimum_materialization_target = 1 if prescribed_indices is not None else 8
+    if prescribed_indices is not None:
         candidate_generation_basis = (
             "prescribed_source_path_visual_hard_gates_then_reference_review_v1"
         )
-        minimum_materialization_target = 1
-    candidate_reviews: tuple[TimelineReview, ...] = tuple(
-        review_timeline(
-            candidate,
-            available_source_count=source_count,
+    elif professional_montage_selection_policy is not None:
+        candidate_generation_basis = (
+            "human_reference_role_conditioned_three_cadence_profiles_"
+            "round_robin_phrase_anchor_contrast_decoded_montage_gate_v7"
         )
-        for candidate in timeline_candidates
-    )
-    ranked_candidate_indices = _review_ranked_candidate_indices(
-        candidate_reviews
-    )
-    selected_candidate_index = ranked_candidate_indices[0]
-    optimized: TimelineResult = timeline_candidates[selected_candidate_index]
-    review_rank_by_index = {
-        candidate_index: review_rank
-        for review_rank, candidate_index in enumerate(ranked_candidate_indices)
-    }
     source_clock_basis = (
         "local_monotonic_timewarp_with_per_source_scalar_fallback"
         if any(
@@ -5772,66 +6316,65 @@ def _build_visual_timeline(
         )
         else "global_scalar_offset"
     )
-    candidate_records = tuple(
-        VisualTimelineCandidateRecord(
-            candidate_index=index,
-            cadence_profile=candidate_cadence_profiles[index],
-            timeline_result=candidate,
-            review=review,
-            review_rank=review_rank_by_index[index],
-            selected=index == selected_candidate_index,
-        )
-        for index, (candidate, review) in enumerate(
-            zip(timeline_candidates, candidate_reviews, strict=True)
+    workspace_candidates = tuple(
+        tuple(segment) for segment in candidates_by_segment
+    )
+    workspace_scene_cut_times = tuple(
+        tuple(float(value) for value in source_cuts)
+        for source_cuts in scene_cut_times
+    )
+    workspace_phrase_times = tuple(float(value) for value in phrase_times)
+    workspace_prescribed_source_ids = (
+        tuple(str(value) for value in prescribed_indices)
+        if prescribed_indices is not None
+        else None
+    )
+    optimizer_input_identity = _visual_optimizer_input_identity(
+        workspace_candidates,
+        sources=sources,
+        audio_offsets=audio_offsets,
+        source_timewarps=clock_maps,
+        source_clock_basis=source_clock_basis,
+        scene_cut_times=workspace_scene_cut_times,
+        preferred_source_ids=preferred_source_ids,
+        diversity=diversity,
+        section_plan=section_plan,
+        phrase_times=workspace_phrase_times,
+        professional_montage_policy=professional_montage_selection_policy,
+        subject_metadata_by_candidate=subject_metadata_by_candidate,
+        prescribed_source_ids=workspace_prescribed_source_ids,
+        maximum_results=maximum_candidate_results,
+    )
+    optimizer_workspace = VisualTimelineOptimizerWorkspace(
+        candidates_by_segment=workspace_candidates,
+        input_identity=optimizer_input_identity,
+        preferred_source_ids=preferred_source_ids,
+        diversity=diversity,
+        section_plan=section_plan,
+        phrase_times=workspace_phrase_times,
+        professional_montage_policy=professional_montage_selection_policy,
+        subject_metadata_by_candidate=subject_metadata_by_candidate,
+        prescribed_source_ids=workspace_prescribed_source_ids,
+        maximum_results=maximum_candidate_results,
+    )
+    timeline_candidates, candidate_cadence_profiles, role_conditioning_audit = (
+        _select_optimizer_workspace_candidates(
+            optimizer_workspace,
+            forbidden_boundary_edges=TimelineNoGoodSet(),
         )
     )
-    role_conditioned_selection_payload: dict[str, Any] | None = None
-    if professional_montage_selection_policy is not None:
-        assert section_plan is not None
-        role_conditioned_selection_payload = {
-            "contract": (
-                "human_reference_role_conditioned_visual_candidate_"
-                "soft_controls_v1"
-            ),
-            "policy": professional_montage_selection_policy.to_dict(),
-            "section_plan_analysis_basis": section_plan.analysis_basis,
-            "phrase_boundary_count": len(
-                tuple(sorted({float(value) for value in phrase_times}))
-            ),
-            "cadence_profiles": role_conditioning_audit,
-            "intentional_phrase_anchor_transition_authority": {
-                "analysis_basis": (
-                    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
-                ),
-                "scope": ["build", "chorus_like", "bridge_like"],
-                "timing": "exact_acoustic_phrase_entry_only",
-                "authorized_mismatch_metrics": ["scale", "focus"],
-                "maximum_scale_mismatch": (
-                    INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH
-                ),
-                "maximum_focus_mismatch": (
-                    INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH
-                ),
-                "maximum_pose_mismatch": (
-                    INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH
-                ),
-                "layout_silhouette_formation_gates_unchanged": True,
-                "scene_cut_and_boundary_side_gates_unchanged": True,
-                "ordinary_boundaries_relaxed": False,
-            },
-            "candidate_outcomes": list(
-                _role_conditioned_candidate_outcomes(
-                    candidate_records,
-                    section_plan=section_plan,
-                    policy=professional_montage_selection_policy,
-                    subject_metadata_by_candidate=(
-                        subject_metadata_by_candidate
-                    ),
-                )
-            ),
-            "raw_visual_descriptors_persisted": False,
-            "decoded_output_montage_gate_required": True,
-        }
+    candidate_records, selected_candidate_index = (
+        _review_visual_timeline_candidates(
+            timeline_candidates,
+            candidate_cadence_profiles,
+            available_source_count=source_count,
+        )
+    )
+    role_conditioned_selection_payload = _role_conditioned_selection_payload(
+        candidate_records,
+        workspace=optimizer_workspace,
+        role_conditioning_audit=role_conditioning_audit,
+    )
     candidate_set = VisualTimelineCandidateSet(
         candidates=candidate_records,
         selected_candidate_index=selected_candidate_index,
@@ -5840,15 +6383,14 @@ def _build_visual_timeline(
         source_timewarps=clock_maps,
         source_clock_basis=source_clock_basis,
         requested_maximum_results=maximum_candidate_results,
-        scene_cut_times=tuple(
-            tuple(float(value) for value in source_cuts)
-            for source_cuts in scene_cut_times
-        ),
+        scene_cut_times=workspace_scene_cut_times,
         face_metadata_by_candidate=face_metadata_by_candidate,
         subject_metadata_by_candidate=subject_metadata_by_candidate,
         candidate_generation_basis=candidate_generation_basis,
         minimum_materialization_target=minimum_materialization_target,
         role_conditioned_selection=role_conditioned_selection_payload,
+        optimizer_workspace=optimizer_workspace,
+        optimizer_input_identity=optimizer_input_identity,
     )
     if candidate_set_only:
         return candidate_set
@@ -6000,6 +6542,7 @@ __all__ = [
     "VisualDiversityConfig",
     "VisualTimelineCandidateRecord",
     "VisualTimelineCandidateSet",
+    "VisualTimelineOptimizerWorkspace",
     "VisualTimelineChoice",
     "VisualTimelinePlan",
     "YUNET_EXPECTED_SHA256",
@@ -6011,6 +6554,7 @@ __all__ = [
     "describe_frame",
     "frame_visual_numeric_features",
     "materialize_visual_timeline_candidate",
+    "regenerate_visual_timeline_candidate_set",
     "rehydrate_visual_timeline_dissolve_evidence",
     "visual_analyzer_fingerprint_sha256",
     "yunet_model_asset_status",

@@ -18,7 +18,9 @@ from crosscut.rendered_candidate_selection import (
     RenderedCandidate,
     RenderedCandidateRankMetadata,
     SELECTION_BASIS,
+    render_one_candidate_review,
     review_rendered_candidates,
+    select_rendered_candidate_reviews,
 )
 from crosscut.stage_edit_learned_reviewer_adapter import (
     LEARNED_REVIEWER_RERANK_ANALYSIS_BASIS,
@@ -274,6 +276,52 @@ class RenderedCandidateSelectionTests(unittest.TestCase):
             evidence[2]["exclusion_reasons"],
         )
         self.assertFalse(audit["policy"]["learned_output_can_override_pass_fail"])
+
+    def test_incremental_reviews_are_ranked_without_rendering_again(self) -> None:
+        candidates = tuple(
+            RenderedCandidate(index, _plan(index), 100.0 - index)
+            for index in range(3)
+        )
+        payloads = {
+            0: _payload(passed=True, score=80.0, issues=0.1, p10=70.0),
+            1: _payload(passed=True, score=90.0, issues=0.0, p10=80.0),
+            2: _payload(passed=False, score=99.0, issues=0.0, p10=99.0),
+        }
+        render_calls: list[int] = []
+
+        def fake(plan: RenderPlan, _output: Path):
+            index = int(plan.output.stem.split("-")[-1])
+            render_calls.append(index)
+            return plan, RenderedProxyReview(payloads[index])
+
+        with tempfile.TemporaryDirectory() as directory:
+            reviews = tuple(
+                render_one_candidate_review(
+                    candidate,
+                    scratch_directory=Path(directory),
+                    render_review=fake,
+                )
+                for candidate in candidates
+            )
+            calls_after_render = tuple(render_calls)
+            result = select_rendered_candidate_reviews(
+                reviews,
+                requested_review_count=3,
+                minimum_required_candidate_count=3,
+            )
+
+        self.assertEqual(calls_after_render, (0, 1, 2))
+        self.assertEqual(render_calls, [0, 1, 2])
+        self.assertEqual(result.selected_candidate_index, 1)
+        self.assertEqual(result.successful_review_count, 3)
+        for review in result.reviews:
+            assert review.review_payload is not None
+            self.assertIsNone(review.review_payload["proxy"]["path"])
+            self.assertTrue(
+                review.review_payload["proxy"][
+                    "temporary_proxy_removed_after_review"
+                ]
+            )
 
     def test_learned_reviewer_cannot_expand_professional_active_pool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

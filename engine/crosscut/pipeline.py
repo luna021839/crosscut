@@ -15,7 +15,7 @@ import re
 import stat
 from statistics import median
 import tempfile
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from numpy.typing import NDArray
 import numpy as np
@@ -297,6 +297,18 @@ from .candidate_stream_verdict import (
     CandidateVerdictStatus,
     TerminalCandidateVerdict,
 )
+from .lazy_splice_feasibility_graph import (
+    LAZY_SPLICE_FEASIBILITY_GRAPH_CONTRACT,
+    LazySpliceFeasibilityGraph,
+    LazySpliceFeasibilityKey,
+)
+from .no_good_selector_identity import build_no_good_selector_identity
+from .timeline import NoCompleteTimelinePath
+from .timeline_no_good import (
+    TimelineNoGoodEdgeKey,
+    TimelineNoGoodSet,
+    build_timeline_no_good_edge_key,
+)
 from .tracking import (
     AnchoredTrackerConfig,
     MemberAnchor,
@@ -304,7 +316,7 @@ from .tracking import (
     TrackingState,
     track_anchored_member,
 )
-from .timeline_review import TimelineReview, review_timeline
+from .timeline_review import TimelineReview, TimelineReviewConfig, review_timeline
 from .timewarp import (
     TimeWarpAnchor,
     TimeWarpConfig,
@@ -330,9 +342,11 @@ from .visual_score import (
     VisualTimelinePlan,
     build_visual_timeline,
     build_visual_timeline_candidate_set,
+    regenerate_visual_timeline_candidate_set,
     rehydrate_visual_timeline_dissolve_evidence,
 )
 from .visual_boundary_repair import (
+    ANALYSIS_BASIS as VISUAL_BOUNDARY_REPAIR_ANALYSIS_BASIS,
     BoundaryDescriptorCache,
     VisualBoundaryRepairPlan,
     repair_visual_timeline_boundaries,
@@ -352,6 +366,22 @@ from .visual_local_source_repair import (
     build_local_source_repair_proposals,
     rank_divergent_local_source_repair_donors,
 )
+from .visual_splice_failure_feedback import (
+    SPLICE_FAILURE_FEEDBACK_CONTRACT,
+    build_splice_failure_feedback,
+    splice_feedback_edge_context_identity,
+    splice_feedback_plan_context,
+    splice_feedback_plan_identity,
+    splice_feedback_result_context_identity,
+)
+from .visual_splice_feasibility import (
+    DEFAULT_WIDE_FRAME_OFFSETS,
+    SPLICE_FEASIBILITY_CONTRACT,
+    SpliceFeasibilityAssessment,
+    SpliceFeasibilityStatus,
+    SpliceOffsetAssessment,
+    build_splice_feasibility_assessment,
+)
 
 
 ANALYSIS_SAMPLE_RATE = min(DEFAULT_ANALYSIS_SAMPLE_RATE, 4_000)
@@ -363,6 +393,10 @@ OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY = (
 AUTOMATIC_MEMBER_PORTRAIT_FILL_CONTRACT = (
     "automatic_official_member_lossless_portrait_fill_v1"
 )
+MAX_CONSTRAINT_REOPTIMIZATION_ROUNDS = 64
+MAX_CONSTRAINT_UNIQUE_BOUNDARY_SEARCHES = 256
+MAX_CONSTRAINT_OFFSET_EVALUATIONS = 4_096
+CONSTRAINT_FINALIST_STABILIZATION_ALLOWANCE = 16
 _MEMBER_PRODUCTION_WIDTH = 1080
 _MEMBER_PRODUCTION_HEIGHT = 1920
 AUTOMATIC_MEMBER_ALIGNMENT_PEER_CONSENSUS_CONTRACT = (
@@ -687,6 +721,1148 @@ def _direct_member_focal_boundary_reference_mapping(
                 captured_right_reference,
             )
     return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class _GloballyIndexedVisualCandidate:
+    """Preserve a materialized path while assigning one stream-global ID."""
+
+    materialized: Any
+    candidate_index: int
+
+    def __post_init__(self) -> None:
+        _exact_source_shot_path(self.materialized)
+        for name in ("review_rank", "cadence_profile", "candidate_record"):
+            if not hasattr(self.materialized, name):
+                raise TypeError(
+                    f"globally indexed candidate is missing {name}"
+                )
+        if (
+            isinstance(self.candidate_index, bool)
+            or not isinstance(self.candidate_index, int)
+            or self.candidate_index < 0
+        ):
+            raise ValueError("global candidate index must be non-negative")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.materialized, name)
+
+
+def _exact_source_shot_path(candidate: Any) -> tuple[tuple[str, str], ...]:
+    """Return the DP path identity without conflating shots from one source."""
+
+    visual_plan = getattr(candidate, "visual_plan", None)
+    choices = getattr(visual_plan, "choices", None)
+    if not isinstance(choices, tuple) or not choices:
+        raise TypeError("visual candidate must expose a non-empty visual path")
+    path: list[tuple[str, str]] = []
+    for choice in choices:
+        source_index = getattr(choice, "source_index", None)
+        shot_id = getattr(choice, "shot_id", None)
+        if (
+            isinstance(source_index, bool)
+            or not isinstance(source_index, int)
+            or source_index < 0
+            or not isinstance(shot_id, str)
+            or not shot_id
+            or shot_id != shot_id.strip()
+        ):
+            raise ValueError("visual candidate source/shot path is invalid")
+        path.append((str(source_index), shot_id))
+    return tuple(path)
+
+
+class _GlobalVisualCandidateStream:
+    """Allocate monotonic IDs and reject exact source+shot path replays."""
+
+    def __init__(self) -> None:
+        self._seen_paths: set[tuple[tuple[str, str], ...]] = set()
+        self._next_candidate_index = 0
+
+    @property
+    def seen_path_count(self) -> int:
+        return len(self._seen_paths)
+
+    @property
+    def next_candidate_index(self) -> int:
+        return self._next_candidate_index
+
+    def admit_unseen(
+        self,
+        candidate: Any,
+    ) -> _GloballyIndexedVisualCandidate | None:
+        path = _exact_source_shot_path(candidate)
+        if path in self._seen_paths:
+            return None
+        self._seen_paths.add(path)
+        candidate_index = self._next_candidate_index
+        self._next_candidate_index += 1
+        return _GloballyIndexedVisualCandidate(
+            materialized=candidate,
+            candidate_index=candidate_index,
+        )
+
+
+def _cross_source_timeline_edge_keys(
+    plan_or_choices: Any,
+) -> tuple[TimelineNoGoodEdgeKey, ...]:
+    choices = getattr(plan_or_choices, "choices", plan_or_choices)
+    if not isinstance(choices, tuple) or not choices:
+        raise TypeError("timeline edge extraction needs a non-empty tuple")
+    return tuple(
+        build_timeline_no_good_edge_key(
+            boundary_index,
+            outgoing,
+            incoming,
+        )
+        for boundary_index, (outgoing, incoming) in enumerate(
+            zip(choices, choices[1:])
+        )
+        if outgoing.source_index != incoming.source_index
+    )
+
+
+def _cross_source_timeline_edge_contexts(
+    plan: VisualTimelinePlan,
+) -> tuple[tuple[TimelineNoGoodEdgeKey, str], ...]:
+    """Bind each compact DP edge to its exact candidate clock/span context."""
+
+    if not isinstance(plan, VisualTimelinePlan):
+        raise TypeError("timeline edge contexts need a VisualTimelinePlan")
+    return tuple(
+        (
+            build_timeline_no_good_edge_key(
+                boundary_index,
+                outgoing,
+                incoming,
+            ),
+            splice_feedback_edge_context_identity(plan, boundary_index),
+        )
+        for boundary_index, (outgoing, incoming) in enumerate(
+            zip(plan.choices, plan.choices[1:])
+        )
+        if outgoing.source_index != incoming.source_index
+    )
+
+
+def _splice_graph_keys_for_plan(
+    plan: VisualTimelinePlan,
+) -> tuple[LazySpliceFeasibilityKey, ...]:
+    return tuple(
+        LazySpliceFeasibilityKey(edge, edge_context_identity)
+        for edge, edge_context_identity in (
+            _cross_source_timeline_edge_contexts(plan)
+        )
+    )
+
+
+def _splice_result_graph_keys_for_plan(
+    plan: VisualTimelinePlan,
+) -> tuple[LazySpliceFeasibilityKey, ...]:
+    return tuple(
+        LazySpliceFeasibilityKey(
+            build_timeline_no_good_edge_key(
+                boundary_index,
+                outgoing,
+                incoming,
+            ),
+            splice_feedback_result_context_identity(plan, boundary_index),
+        )
+        for boundary_index, (outgoing, incoming) in enumerate(
+            zip(plan.choices, plan.choices[1:])
+        )
+        if outgoing.source_index != incoming.source_index
+    )
+
+
+def _optimizer_blocked_set_for_contexts(
+    graph: LazySpliceFeasibilityGraph,
+    optimizer_context_keys: Iterable[LazySpliceFeasibilityKey],
+) -> TimelineNoGoodSet:
+    return graph.blocked_set_for_contexts(tuple(optimizer_context_keys))
+
+
+def _optimizer_workspace_cross_source_edge_bound(
+    candidate_set: VisualTimelineCandidateSet,
+) -> int:
+    """Count the complete finite exact-edge domain retained by the DP."""
+
+    workspace = candidate_set.optimizer_workspace
+    if workspace is None:
+        raise ValueError("candidate set has no optimizer workspace")
+    edge_keys: set[TimelineNoGoodEdgeKey] = set()
+    for boundary_index, (outgoing_candidates, incoming_candidates) in enumerate(
+        zip(
+            workspace.candidates_by_segment,
+            workspace.candidates_by_segment[1:],
+        )
+    ):
+        edge_keys.update(
+            build_timeline_no_good_edge_key(
+                boundary_index,
+                outgoing,
+                incoming,
+            )
+            for outgoing in outgoing_candidates
+            for incoming in incoming_candidates
+            if outgoing.source_id != incoming.source_id
+        )
+    return len(edge_keys)
+
+
+class _BoundarySearchBudgetExhausted(RuntimeError):
+    """Raised before an ordinary candidate search would exceed its audit cap."""
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        self.payload = deepcopy(dict(payload))
+        super().__init__(
+            "ordinary splice boundary-search budget exhausted; "
+            "production use is forbidden"
+        )
+
+
+class _BoundarySearchBudget:
+    """Bound decoded boundary searches by unique exact input context.
+
+    Descriptor-cache hits are still audited, but do not create a second unique
+    search token for the same exact edge, input clock/span, and radius.  This
+    prevents the constrained loop from scaling decoded work as
+    ``rounds * top-k * segment-count`` while keeping cheap graph/DP work free.
+    """
+
+    def __init__(self, *, structural_edge_bound: int) -> None:
+        if (
+            isinstance(structural_edge_bound, bool)
+            or not isinstance(structural_edge_bound, int)
+            or structural_edge_bound < 0
+        ):
+            raise ValueError(
+                "boundary-search structural edge bound must be non-negative"
+            )
+        self._structural_edge_bound = structural_edge_bound
+        self._maximum_unique_boundary_searches = min(
+            MAX_CONSTRAINT_UNIQUE_BOUNDARY_SEARCHES,
+            max(
+                CONSTRAINT_FINALIST_STABILIZATION_ALLOWANCE,
+                structural_edge_bound
+                + CONSTRAINT_FINALIST_STABILIZATION_ALLOWANCE,
+            ),
+        )
+        self._maximum_offset_evaluations = min(
+            MAX_CONSTRAINT_OFFSET_EVALUATIONS,
+            self._maximum_unique_boundary_searches
+            * len(DEFAULT_WIDE_FRAME_OFFSETS),
+        )
+        self._unique_search_tokens: set[
+            tuple[TimelineNoGoodEdgeKey, str, int]
+        ] = set()
+        self._planned_offset_evaluation_count = 0
+        self._repair_call_count = 0
+        self._requested_boundary_count = 0
+        self._descriptor_cache_hit_count = 0
+        self._descriptor_cache_miss_count = 0
+        self._geometry_provider_attempt_count = 0
+        self._phase_call_counts: dict[str, int] = {}
+        self._exhaustion: dict[str, Any] | None = None
+
+    def expand_structural_edge_bound(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                "boundary-search structural edge bound must be non-negative"
+            )
+        if value <= self._structural_edge_bound:
+            return
+        self._structural_edge_bound = value
+        self._maximum_unique_boundary_searches = min(
+            MAX_CONSTRAINT_UNIQUE_BOUNDARY_SEARCHES,
+            value + CONSTRAINT_FINALIST_STABILIZATION_ALLOWANCE,
+        )
+        self._maximum_offset_evaluations = min(
+            MAX_CONSTRAINT_OFFSET_EVALUATIONS,
+            self._maximum_unique_boundary_searches
+            * len(DEFAULT_WIDE_FRAME_OFFSETS),
+        )
+
+    @staticmethod
+    def _cache_counts(
+        descriptor_cache: BoundaryDescriptorCache | None,
+    ) -> tuple[int, int]:
+        if descriptor_cache is None:
+            return 0, 0
+        diagnostics = descriptor_cache.diagnostics()
+        return (
+            int(diagnostics["hit_count"]),
+            int(diagnostics["miss_count"]),
+        )
+
+    def reserve(
+        self,
+        *,
+        phase: str,
+        visual_timeline: VisualTimelinePlan,
+        boundary_indices: Sequence[int] | None,
+        search_radius_frames: int,
+    ) -> dict[str, Any]:
+        if not isinstance(phase, str) or not phase or phase != phase.strip():
+            raise ValueError("boundary-search phase must be an exact identifier")
+        if not isinstance(visual_timeline, VisualTimelinePlan):
+            raise TypeError("boundary-search timeline is invalid")
+        if (
+            isinstance(search_radius_frames, bool)
+            or not isinstance(search_radius_frames, int)
+            or search_radius_frames < 0
+        ):
+            raise ValueError("boundary-search radius must be non-negative")
+        all_contexts = {
+            edge.boundary_index: (edge, context_identity)
+            for edge, context_identity in (
+                _cross_source_timeline_edge_contexts(visual_timeline)
+            )
+        }
+        if boundary_indices is None:
+            requested = tuple(sorted(all_contexts))
+        else:
+            requested = tuple(boundary_indices)
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value + 1 >= len(visual_timeline.choices)
+                for value in requested
+            ):
+                raise ValueError("boundary-search indices are invalid")
+            if len(set(requested)) != len(requested):
+                raise ValueError("boundary-search indices cannot be duplicated")
+            requested = tuple(sorted(requested))
+        cross_source_requested = tuple(
+            boundary_index
+            for boundary_index in requested
+            if boundary_index in all_contexts
+        )
+        candidate_tokens = {
+            (
+                all_contexts[boundary_index][0],
+                all_contexts[boundary_index][1],
+                search_radius_frames,
+            )
+            for boundary_index in cross_source_requested
+        }
+        new_tokens = candidate_tokens.difference(self._unique_search_tokens)
+        offset_count = search_radius_frames * 2 + 1
+        new_offset_evaluations = len(new_tokens) * offset_count
+        projected_unique = len(self._unique_search_tokens) + len(new_tokens)
+        projected_offsets = (
+            self._planned_offset_evaluation_count + new_offset_evaluations
+        )
+        if (
+            projected_unique > self._maximum_unique_boundary_searches
+            or projected_offsets > self._maximum_offset_evaluations
+        ):
+            self._exhaustion = {
+                "contract": "ordinary_exact_boundary_search_budget_v1",
+                "phase": phase,
+                "requested_boundary_count": len(cross_source_requested),
+                "new_unique_boundary_search_count": len(new_tokens),
+                "projected_unique_boundary_search_count": projected_unique,
+                "maximum_unique_boundary_search_count": (
+                    self._maximum_unique_boundary_searches
+                ),
+                "projected_offset_evaluation_count": projected_offsets,
+                "maximum_offset_evaluation_count": (
+                    self._maximum_offset_evaluations
+                ),
+                "production_use_forbidden": True,
+                "thresholds_lowered": False,
+            }
+            raise _BoundarySearchBudgetExhausted(self._exhaustion)
+        self._unique_search_tokens.update(new_tokens)
+        self._planned_offset_evaluation_count = projected_offsets
+        self._repair_call_count += 1
+        self._requested_boundary_count += len(cross_source_requested)
+        self._phase_call_counts[phase] = self._phase_call_counts.get(phase, 0) + 1
+        return {
+            "phase": phase,
+            "requested_boundary_count": len(cross_source_requested),
+            "new_unique_boundary_search_count": len(new_tokens),
+            "new_offset_evaluation_count": new_offset_evaluations,
+        }
+
+    def observe(
+        self,
+        *,
+        descriptor_cache_before: tuple[int, int],
+        descriptor_cache_after: tuple[int, int],
+        repair_plan: VisualBoundaryRepairPlan | None,
+    ) -> None:
+        before_hits, before_misses = descriptor_cache_before
+        after_hits, after_misses = descriptor_cache_after
+        if after_hits < before_hits or after_misses < before_misses:
+            raise RuntimeError("boundary descriptor-cache counters regressed")
+        self._descriptor_cache_hit_count += after_hits - before_hits
+        self._descriptor_cache_miss_count += after_misses - before_misses
+        if repair_plan is not None:
+            self._geometry_provider_attempt_count += (
+                repair_plan.geometry_provider_attempt_count
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": "ordinary_exact_boundary_search_budget_v1",
+            "structural_edge_bound": self._structural_edge_bound,
+            "maximum_unique_boundary_search_count": (
+                self._maximum_unique_boundary_searches
+            ),
+            "maximum_offset_evaluation_count": (
+                self._maximum_offset_evaluations
+            ),
+            "repair_call_count": self._repair_call_count,
+            "requested_boundary_count": self._requested_boundary_count,
+            "unique_boundary_search_count": len(self._unique_search_tokens),
+            "planned_offset_evaluation_count": (
+                self._planned_offset_evaluation_count
+            ),
+            "descriptor_cache_hit_count": self._descriptor_cache_hit_count,
+            "descriptor_cache_miss_count": self._descriptor_cache_miss_count,
+            "geometry_provider_attempt_count": (
+                self._geometry_provider_attempt_count
+            ),
+            "phase_call_counts": dict(sorted(self._phase_call_counts.items())),
+            "exhausted": self._exhaustion is not None,
+            "exhaustion": deepcopy(self._exhaustion),
+            "production_use_forbidden": self._exhaustion is not None,
+            "thresholds_lowered": False,
+        }
+
+
+def _budgeted_repair_visual_timeline_boundaries(
+    *,
+    budget: _BoundarySearchBudget,
+    phase: str,
+    visual_timeline: VisualTimelinePlan,
+    sources: Sequence[Path],
+    audio_offsets: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    beat_period_seconds: float | None,
+    source_timewarps: Sequence[TimeWarpMap | None],
+    boundary_indices: Sequence[int] | None = None,
+    descriptor_cache: BoundaryDescriptorCache | None = None,
+    feature_cache_directory: Path | None = None,
+    config: BoundaryRepairConfig | None = None,
+) -> VisualBoundaryRepairPlan:
+    if not isinstance(budget, _BoundarySearchBudget):
+        raise TypeError("ordinary boundary repair needs a search budget")
+    settings = config or BoundaryRepairConfig()
+    budget.reserve(
+        phase=phase,
+        visual_timeline=visual_timeline,
+        boundary_indices=boundary_indices,
+        search_radius_frames=settings.search_radius_frames,
+    )
+    before = budget._cache_counts(descriptor_cache)
+    result: VisualBoundaryRepairPlan | None = None
+    try:
+        result = repair_visual_timeline_boundaries(
+            visual_timeline=visual_timeline,
+            sources=sources,
+            audio_offsets=audio_offsets,
+            scene_cut_times=scene_cut_times,
+            beat_period_seconds=beat_period_seconds,
+            source_timewarps=source_timewarps,
+            boundary_indices=boundary_indices,
+            descriptor_cache=descriptor_cache,
+            feature_cache_directory=feature_cache_directory,
+            config=settings,
+        )
+        return result
+    finally:
+        budget.observe(
+            descriptor_cache_before=before,
+            descriptor_cache_after=budget._cache_counts(descriptor_cache),
+            repair_plan=result,
+        )
+
+
+def _group_splice_analysis_basis_identity(
+    *,
+    selector_input_identity_sha256: str,
+    selector_input_identity_basis: str,
+    timeline_review_config: TimelineReviewConfig | None = None,
+    normal_boundary_repair_config: BoundaryRepairConfig | None = None,
+    wide_boundary_repair_config: BoundaryRepairConfig | None = None,
+    splice_feasibility_contract: str = SPLICE_FEASIBILITY_CONTRACT,
+    splice_failure_feedback_contract: str = (
+        SPLICE_FAILURE_FEEDBACK_CONTRACT
+    ),
+) -> str:
+    """Bind splice evidence to the exact verified optimizer/checkpoint input."""
+
+    review_config = timeline_review_config or TimelineReviewConfig()
+    normal_repair_config = (
+        normal_boundary_repair_config or BoundaryRepairConfig()
+    )
+    wide_repair_config = wide_boundary_repair_config or BoundaryRepairConfig(
+        search_radius_frames=8,
+        interior_scene_cut_guard_frames=9,
+    )
+    for value, name in (
+        (splice_feasibility_contract, "splice_feasibility_contract"),
+        (
+            splice_failure_feedback_contract,
+            "splice_failure_feedback_contract",
+        ),
+    ):
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{name} must be an exact non-blank string")
+    selector_identity = build_no_good_selector_identity(
+        base_candidate_input_identity_sha256=(
+            selector_input_identity_sha256
+        ),
+        base_identity_basis=selector_input_identity_basis,
+        timeline_no_goods=TimelineNoGoodSet(),
+    )
+    return canonical_json_sha256(
+        {
+            "contract": "group_boundary_repair_splice_analysis_basis_v3",
+            "selector_identity": selector_identity.to_dict(),
+            "timeline_review_config": asdict(review_config),
+            "normal_boundary_repair_config": asdict(normal_repair_config),
+            "wide_boundary_repair_config": asdict(wide_repair_config),
+            "constrained_preflight_frame_offsets": list(
+                DEFAULT_WIDE_FRAME_OFFSETS
+            ),
+            "splice_feasibility_contract": splice_feasibility_contract,
+            "splice_failure_feedback_contract": (
+                splice_failure_feedback_contract
+            ),
+            "lazy_splice_feasibility_graph_contract": (
+                LAZY_SPLICE_FEASIBILITY_GRAPH_CONTRACT
+            ),
+            "visual_boundary_repair_analysis_basis": (
+                VISUAL_BOUNDARY_REPAIR_ANALYSIS_BASIS
+            ),
+            "semantic_analyzer_contract": (
+                "exact_context_splice_evidence_analyzer_v1"
+            ),
+            "dependency_fingerprints": {
+                "timeline_review": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("timeline_review.py"),
+                    root_symbols=("review_timeline",),
+                ),
+                "boundary_repair": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("boundary_repair.py"),
+                    root_symbols=("repair_boundary",),
+                ),
+                "visual_boundary_repair": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("visual_boundary_repair.py"),
+                    root_symbols=("repair_visual_timeline_boundaries",),
+                ),
+                "splice_failure_feedback": python_symbol_dependency_sha256(
+                    Path(__file__).with_name(
+                        "visual_splice_failure_feedback.py"
+                    ),
+                    root_symbols=("build_splice_failure_feedback",),
+                ),
+                "splice_feasibility": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("visual_splice_feasibility.py"),
+                    root_symbols=(
+                        "classify_splice_evidence_audit",
+                        "merge_splice_feasibility_assessments",
+                    ),
+                ),
+            },
+            "transition_thresholds_lowered": False,
+        }
+    )
+
+
+def _boundary_repair_assessments(
+    repair_plan: VisualBoundaryRepairPlan,
+) -> tuple[
+    tuple[TimelineNoGoodEdgeKey, str, SpliceFeasibilityAssessment], ...
+]:
+    """Aggregate one complete normal+wide repair before graph insertion."""
+
+    if not isinstance(repair_plan, VisualBoundaryRepairPlan):
+        raise TypeError("repair_plan must be a VisualBoundaryRepairPlan")
+    if len(repair_plan.attempt_input_timelines) != 1:
+        raise ValueError(
+            "splice graph recording requires one atomic boundary repair attempt"
+        )
+    attempt_input_timeline = repair_plan.attempt_input_timelines[0]
+    feedback = build_splice_failure_feedback(
+        attempt_input_timeline,
+        repair_plan.failures,
+        expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+    )
+    assessments: list[
+        tuple[TimelineNoGoodEdgeKey, str, SpliceFeasibilityAssessment]
+    ] = [
+        (
+            item.edge,
+            item.edge_context_identity,
+            assessment,
+        )
+        for item in feedback.edges
+        for assessment in item.assessments
+    ]
+    choices = attempt_input_timeline.choices
+    for repair in repair_plan.repairs:
+        if not (
+            repair.selected_visual_evidence.evidence_coverage
+            .professional_gate_passed
+        ):
+            raise RuntimeError(
+                "successful boundary repair lacks professional gate evidence"
+            )
+        edge = build_timeline_no_good_edge_key(
+            repair.boundary_index,
+            choices[repair.boundary_index],
+            choices[repair.boundary_index + 1],
+        )
+        assessments.append(
+            (
+                edge,
+                repair.result_edge_context_identity,
+                build_splice_feasibility_assessment(
+                    expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+                    offsets=(
+                        SpliceOffsetAssessment(
+                            frame_offset=(
+                                repair.result.selected_frame_offset
+                            ),
+                            production_gate_passed=True,
+                            failure_codes=(),
+                            evidence_complete=True,
+                        ),
+                    ),
+                ),
+            )
+        )
+    # Preserve each feedback item's canonical assessment sequence.  The graph
+    # performs the monotonic offset-union; reducing or reprioritizing statuses
+    # here would lose the partial -> wide refinement evidence.
+    return tuple(assessments)
+
+
+def _record_boundary_repair_assessments(
+    graph: LazySpliceFeasibilityGraph,
+    repair_plan: VisualBoundaryRepairPlan | None,
+) -> int:
+    if repair_plan is None:
+        return 0
+    try:
+        assessments = _boundary_repair_assessments(repair_plan)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "boundary repair emitted invalid splice evidence"
+        ) from exc
+    changed = 0
+    for edge, edge_context_identity, assessment in assessments:
+        before = graph.assessment_for(edge, edge_context_identity)
+        try:
+            after = graph.record_assessment(
+                edge,
+                edge_context_identity,
+                assessment,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "conflicting exact splice evidence in one analysis basis"
+            ) from exc
+        if before != after:
+            changed += 1
+    return changed
+
+
+def _assessment_has_final_boundary_geometry_evidence(
+    assessment: SpliceFeasibilityAssessment,
+) -> bool:
+    """Accept output proof only for the nominal boundary being rendered."""
+
+    if not isinstance(assessment, SpliceFeasibilityAssessment):
+        raise TypeError("geometry authorization assessment is invalid")
+    return any(
+        offset.frame_offset == 0 and offset.geometry_proof_eligible
+        for offset in assessment.offsets
+    )
+
+
+_SPLICE_AUTHORIZATION_REFINEMENT_FAILURES = frozenset(
+    {
+        "fresh_candidate_edge_evidence_missing",
+        "fresh_candidate_edge_evidence_incomplete",
+        "analysis_graph_edge_evidence_missing",
+        "analysis_graph_edge_evidence_incomplete",
+    }
+)
+
+
+def _splice_authorization_refinement_boundary_indices(
+    authorization: Mapping[str, Any],
+) -> tuple[int, ...]:
+    """Return exact edges that need one terminal wide-domain refinement."""
+
+    if not isinstance(authorization, Mapping):
+        raise TypeError("splice authorization must be a mapping")
+    evidence = authorization.get("evidence")
+    if not isinstance(evidence, list):
+        raise RuntimeError("splice authorization evidence is malformed")
+    boundary_indices: set[int] = set()
+    for item in evidence:
+        if not isinstance(item, Mapping):
+            raise RuntimeError("splice authorization evidence item is malformed")
+        if (
+            item.get("authorization_failure")
+            not in _SPLICE_AUTHORIZATION_REFINEMENT_FAILURES
+        ):
+            continue
+        key = item.get("key")
+        edge = key.get("edge") if isinstance(key, Mapping) else None
+        boundary_index = (
+            edge.get("boundary_index")
+            if isinstance(edge, Mapping)
+            else None
+        )
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+        ):
+            raise RuntimeError(
+                "splice authorization refinement boundary is malformed"
+            )
+        boundary_indices.add(boundary_index)
+    return tuple(sorted(boundary_indices))
+
+
+def _candidate_local_splice_proxy_authorization(
+    graph: LazySpliceFeasibilityGraph,
+    *,
+    final_timeline: VisualTimelinePlan,
+    repair_plan: VisualBoundaryRepairPlan | None,
+) -> dict[str, Any]:
+    """Require fresh exact-context evidence before any decoded proxy work."""
+
+    final_raw_keys = _splice_graph_keys_for_plan(final_timeline)
+    final_result_keys = _splice_result_graph_keys_for_plan(final_timeline)
+    if len(final_raw_keys) != len(final_result_keys):
+        raise RuntimeError("final splice authorization key domains diverged")
+    if repair_plan is None:
+        fresh_assessments: tuple[
+            tuple[TimelineNoGoodEdgeKey, str, SpliceFeasibilityAssessment],
+            ...,
+        ] = ()
+    else:
+        attempts_by_identity = {
+            splice_feedback_plan_identity(attempt): attempt
+            for attempt in repair_plan.attempt_input_timelines
+        }
+        records: list[
+            tuple[TimelineNoGoodEdgeKey, str, SpliceFeasibilityAssessment]
+        ] = []
+        for attempt_identity, attempt in attempts_by_identity.items():
+            attempt_failures = tuple(
+                failure
+                for failure in repair_plan.failures
+                if failure.get("timeline_path_identity") == attempt_identity
+            )
+            feedback = build_splice_failure_feedback(
+                attempt,
+                attempt_failures,
+                expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+            )
+            records.extend(
+                (item.edge, item.edge_context_identity, assessment)
+                for item in feedback.edges
+                for assessment in item.assessments
+            )
+        for repair in repair_plan.repairs:
+            choices = final_timeline.choices
+            if repair.boundary_index + 1 >= len(choices):
+                raise RuntimeError(
+                    "candidate repair boundary is outside the final timeline"
+                )
+            outgoing = choices[repair.boundary_index]
+            incoming = choices[repair.boundary_index + 1]
+            if (
+                outgoing.source_index != repair.outgoing_source_index
+                or incoming.source_index != repair.incoming_source_index
+            ):
+                raise RuntimeError(
+                    "candidate repair source direction is stale"
+                )
+            if not (
+                repair.selected_visual_evidence.evidence_coverage
+                .professional_gate_passed
+            ):
+                raise RuntimeError(
+                    "candidate repair success lacks professional evidence"
+                )
+            records.append(
+                (
+                    build_timeline_no_good_edge_key(
+                        repair.boundary_index,
+                        outgoing,
+                        incoming,
+                    ),
+                    repair.result_edge_context_identity,
+                    build_splice_feasibility_assessment(
+                        expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+                        offsets=(
+                            SpliceOffsetAssessment(
+                                frame_offset=(
+                                    repair.result.selected_frame_offset
+                                ),
+                                production_gate_passed=True,
+                                failure_codes=(),
+                                evidence_complete=True,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        fresh_assessments = tuple(records)
+
+    fresh_graph = LazySpliceFeasibilityGraph(
+        f"candidate-local:{graph.analysis_basis_identity}"
+    )
+    for edge, edge_context_identity, assessment in fresh_assessments:
+        try:
+            fresh_graph.record_assessment(
+                edge,
+                edge_context_identity,
+                assessment,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "candidate-local splice evidence conflicts"
+            ) from exc
+
+    evidence: list[dict[str, Any]] = []
+    unauthorized: list[LazySpliceFeasibilityKey] = []
+    geometry_proof_boundary_indices: list[int] = []
+    for raw_key, result_key in zip(
+        final_raw_keys,
+        final_result_keys,
+        strict=True,
+    ):
+        if raw_key.edge != result_key.edge:
+            raise RuntimeError("final splice authorization edges diverged")
+        fresh_result = fresh_graph.assessment_for(
+            result_key.edge,
+            result_key.edge_context_identity,
+        )
+        retained_result = graph.assessment_for(
+            result_key.edge,
+            result_key.edge_context_identity,
+        )
+        fresh_raw = fresh_graph.assessment_for(
+            raw_key.edge,
+            raw_key.edge_context_identity,
+        )
+        retained_raw = graph.assessment_for(
+            raw_key.edge,
+            raw_key.edge_context_identity,
+        )
+        reason: str | None = None
+        if (
+            fresh_result is not None
+            and retained_result is not None
+            and fresh_result.status is SpliceFeasibilityStatus.RAW_PASS
+            and retained_result.status is SpliceFeasibilityStatus.RAW_PASS
+            and fresh_result.terminal_for_expected_domain
+            and retained_result.terminal_for_expected_domain
+        ):
+            pass
+        elif (
+            fresh_raw is not None
+            and retained_raw is not None
+            and fresh_raw.status
+            is SpliceFeasibilityStatus.RAW_GEOMETRY_PROOF_REQUIRED
+            and retained_raw.status
+            is SpliceFeasibilityStatus.RAW_GEOMETRY_PROOF_REQUIRED
+            and fresh_raw.terminal_for_expected_domain
+            and retained_raw.terminal_for_expected_domain
+            and _assessment_has_final_boundary_geometry_evidence(fresh_raw)
+            and _assessment_has_final_boundary_geometry_evidence(retained_raw)
+        ):
+            geometry_proof_boundary_indices.append(
+                raw_key.edge.boundary_index
+            )
+        elif (
+            fresh_raw is not None
+            and retained_raw is not None
+            and fresh_raw.status
+            is SpliceFeasibilityStatus.RAW_GEOMETRY_PROOF_REQUIRED
+            and retained_raw.status
+            is SpliceFeasibilityStatus.RAW_GEOMETRY_PROOF_REQUIRED
+        ):
+            reason = "final_boundary_geometry_evidence_missing"
+        elif fresh_result is not None and (
+            fresh_result.status is not SpliceFeasibilityStatus.RAW_PASS
+            or not fresh_result.terminal_for_expected_domain
+        ):
+            reason = "fresh_candidate_result_proof_invalid"
+        elif retained_result is not None and (
+            retained_result.status is not SpliceFeasibilityStatus.RAW_PASS
+            or not retained_result.terminal_for_expected_domain
+        ):
+            reason = "analysis_graph_result_proof_invalid"
+        elif fresh_raw is None:
+            reason = "fresh_candidate_edge_evidence_missing"
+        elif not fresh_raw.terminal_for_expected_domain:
+            reason = "fresh_candidate_edge_evidence_incomplete"
+        elif retained_raw is None:
+            reason = "analysis_graph_edge_evidence_missing"
+        elif not retained_raw.terminal_for_expected_domain:
+            reason = "analysis_graph_edge_evidence_incomplete"
+        else:
+            reason = f"fresh_candidate_edge_{fresh_raw.status.value}"
+        if reason is not None:
+            unauthorized.append(raw_key)
+        evidence.append(
+            {
+                "key": raw_key.to_dict(),
+                "result_key": result_key.to_dict(),
+                "fresh_result_status": (
+                    fresh_result.status.value
+                    if fresh_result is not None
+                    else None
+                ),
+                "retained_result_status": (
+                    retained_result.status.value
+                    if retained_result is not None
+                    else None
+                ),
+                "fresh_status": (
+                    fresh_raw.status.value if fresh_raw is not None else None
+                ),
+                "fresh_terminal": (
+                    fresh_raw.terminal_for_expected_domain
+                    if fresh_raw is not None
+                    else False
+                ),
+                "retained_status": (
+                    retained_raw.status.value
+                    if retained_raw is not None
+                    else None
+                ),
+                "retained_terminal": (
+                    retained_raw.terminal_for_expected_domain
+                    if retained_raw is not None
+                    else False
+                ),
+                "authorization_failure": reason,
+            }
+        )
+    return {
+        "contract": "fresh_candidate_exact_context_splice_authorization_v1",
+        "cross_source_edge_count": len(final_raw_keys),
+        "proxy_eligible": not unauthorized,
+        "unauthorized_keys": [key.to_dict() for key in unauthorized],
+        "geometry_proof_boundary_indices": sorted(
+            set(geometry_proof_boundary_indices)
+        ),
+        "fresh_evidence_record_count": len(fresh_assessments),
+        "evidence": evidence,
+        "thresholds_lowered": False,
+    }
+
+
+def _validate_constrained_precomputed_repair_origin(
+    materialized_plan: VisualTimelinePlan,
+    repair_plan: VisualBoundaryRepairPlan,
+) -> None:
+    if len(repair_plan.attempt_input_timelines) != 1:
+        raise RuntimeError(
+            "constrained preflight must provide one atomic repair plan"
+        )
+    preflight_input_timeline = repair_plan.attempt_input_timelines[0]
+    if (
+        splice_feedback_plan_identity(preflight_input_timeline)
+        != splice_feedback_plan_identity(materialized_plan)
+        or splice_feedback_plan_context(preflight_input_timeline)
+        != splice_feedback_plan_context(materialized_plan)
+    ):
+        raise RuntimeError(
+            "constrained preflight repair origin does not match the "
+            "materialized candidate"
+        )
+
+
+def _merge_visual_boundary_repair_plans(
+    earlier: VisualBoundaryRepairPlan,
+    later: VisualBoundaryRepairPlan,
+    *,
+    analysis_suffix: str,
+) -> VisualBoundaryRepairPlan:
+    """Combine renderer lineage after each atomic plan was graph-recorded."""
+
+    if not isinstance(earlier, VisualBoundaryRepairPlan) or not isinstance(
+        later,
+        VisualBoundaryRepairPlan,
+    ):
+        raise TypeError("boundary repair plans are invalid")
+    return VisualBoundaryRepairPlan(
+        timeline=later.timeline,
+        attempt_input_timelines=(
+            earlier.attempt_input_timelines
+            + later.attempt_input_timelines
+        ),
+        repairs=earlier.repairs + later.repairs,
+        skipped_same_source_boundaries=(
+            earlier.skipped_same_source_boundaries
+            + later.skipped_same_source_boundaries
+        ),
+        failures=earlier.failures + later.failures,
+        requested_boundary_indices=None,
+        geometry_provider_attempt_count=(
+            earlier.geometry_provider_attempt_count
+            + later.geometry_provider_attempt_count
+        ),
+        geometry_provider_failure_count=(
+            earlier.geometry_provider_failure_count
+            + later.geometry_provider_failure_count
+        ),
+        temporal_pose_motion_thresholds=later.temporal_pose_motion_thresholds,
+        temporal_pose_motion_preference_weight=(
+            later.temporal_pose_motion_preference_weight
+        ),
+        analysis_basis=f"{earlier.analysis_basis}+{analysis_suffix}",
+    )
+
+
+def _authorize_partial_reedit_splice_lineage(
+    graph: LazySpliceFeasibilityGraph,
+    *,
+    selected_repairs: VisualBoundaryRepairPlan,
+    targeted_repairs: VisualBoundaryRepairPlan,
+    final_timeline: VisualTimelinePlan,
+) -> tuple[VisualBoundaryRepairPlan, dict[str, Any]]:
+    """Reauthorize a targeted edit with prior proof for untouched edges."""
+
+    if not isinstance(graph, LazySpliceFeasibilityGraph):
+        raise TypeError("partial re-edit splice graph is invalid")
+    merged = _merge_visual_boundary_repair_plans(
+        selected_repairs,
+        targeted_repairs,
+        analysis_suffix="decoded_proxy_targeted_partial_reedit_v1",
+    )
+    authorization = _candidate_local_splice_proxy_authorization(
+        graph,
+        final_timeline=final_timeline,
+        repair_plan=merged,
+    )
+    return merged, authorization
+
+
+def _run_initial_edge_constrained_stream(
+    candidates: Sequence[Any],
+    *,
+    preflight: Callable[
+        [Any],
+        tuple[
+            tuple[TimelineNoGoodEdgeKey, ...],
+            VisualBoundaryRepairPlan | None,
+            int,
+        ],
+    ],
+    derive: Callable[[Any, VisualBoundaryRepairPlan | None], None],
+    reject: Callable[[Any, Sequence[TimelineNoGoodEdgeKey]], None],
+    should_stop: Callable[[], bool],
+) -> dict[str, int]:
+    """Cheap-check every remaining path after each graph-changing attempt."""
+
+    if not all(callable(value) for value in (preflight, derive, reject, should_stop)):
+        raise TypeError("initial constrained stream callbacks must be callable")
+    derived_count = 0
+    blocked_count = 0
+    evidence_change_count = 0
+    for candidate in candidates:
+        if should_stop():
+            break
+        blocked_edges, precomputed_repairs, changed = preflight(candidate)
+        evidence_change_count += int(changed)
+        if blocked_edges:
+            reject(candidate, blocked_edges)
+            blocked_count += 1
+            continue
+        derive(candidate, precomputed_repairs)
+        derived_count += 1
+    return {
+        "derived_count": derived_count,
+        "blocked_before_expensive_derivation_count": blocked_count,
+        "preflight_evidence_change_count": evidence_change_count,
+    }
+
+
+def _regenerate_visual_candidate_set_or_no_path(
+    candidate_set: VisualTimelineCandidateSet,
+    *,
+    forbidden_boundary_edges: TimelineNoGoodSet,
+) -> tuple[VisualTimelineCandidateSet | None, dict[str, object] | None]:
+    """Handle only typed graph exhaustion; every other error must propagate."""
+
+    try:
+        return (
+            regenerate_visual_timeline_candidate_set(
+                candidate_set,
+                forbidden_boundary_edges=forbidden_boundary_edges,
+            ),
+            None,
+        )
+    except NoCompleteTimelinePath as exc:
+        return None, exc.to_dict()
+
+
+def _resume_or_reset_splice_feasibility_graph(
+    payload: Mapping[str, Any],
+    *,
+    expected_analysis_basis_identity: str,
+) -> tuple[LazySpliceFeasibilityGraph, bool, str | None]:
+    """Discard known recreatable legacy caches; reject current tampering."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("persisted splice graph payload must be a mapping")
+    contract = payload.get("contract")
+    legacy_contracts = frozenset(
+        {
+            "analysis_bound_exact_splice_feasibility_graph_v1",
+            "analysis_bound_exact_splice_feasibility_graph_v2",
+            "analysis_bound_exact_splice_feasibility_graph_v3",
+        }
+    )
+    if contract in legacy_contracts:
+        return (
+            LazySpliceFeasibilityGraph(expected_analysis_basis_identity),
+            False,
+            f"known_legacy_recreatable_graph_contract:{contract}",
+        )
+    if contract != LAZY_SPLICE_FEASIBILITY_GRAPH_CONTRACT:
+        raise RuntimeError("persisted splice graph contract is unknown")
+    try:
+        resumed = LazySpliceFeasibilityGraph.from_dict(payload)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "persisted splice graph failed canonical validation"
+        ) from exc
+    if resumed.analysis_basis_identity != expected_analysis_basis_identity:
+        return (
+            LazySpliceFeasibilityGraph(expected_analysis_basis_identity),
+            False,
+            "stale_recreatable_graph_analysis_basis_mismatch",
+        )
+    reopened = resumed.for_new_run()
+    reopened_count = len(resumed) - len(reopened)
+    return (
+        reopened,
+        True,
+        (
+            f"dropped_run_local_indeterminate_contexts:{reopened_count}"
+            if reopened_count
+            else None
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -16454,6 +17630,7 @@ class _GroupRenderCandidateBundle:
     render_plan: RenderPlan
     boundary_look_match: BoundaryLookMatchResult | None = None
     output_geometry_deferral: Mapping[str, Any] | None = None
+    splice_graph_authorization: Mapping[str, Any] | None = None
     diagnostics: tuple[str, ...] = ()
     candidate_origin: str = "ordinary_visual_baseline"
     candidate_lineage: tuple[dict[str, Any], ...] = ()
@@ -16509,6 +17686,11 @@ class _GroupRenderCandidateBundle:
             "output_geometry_deferral": (
                 deepcopy(dict(self.output_geometry_deferral))
                 if self.output_geometry_deferral is not None
+                else None
+            ),
+            "splice_graph_authorization": (
+                deepcopy(dict(self.splice_graph_authorization))
+                if self.splice_graph_authorization is not None
                 else None
             ),
             "final_render_segments": _final_render_segments_payload(
@@ -17452,6 +18634,8 @@ def _derive_complete_group_candidate(
     source_look_match: SourceLookMatchResult | None = None,
     boundary_look_measurement_cache: BoundaryLookMeasurementCache | None = None,
     boundary_descriptor_cache: BoundaryDescriptorCache | None = None,
+    splice_feasibility_graph: LazySpliceFeasibilityGraph | None = None,
+    boundary_search_budget: _BoundarySearchBudget | None = None,
 ) -> _GroupRenderCandidateBundle:
     """Derive a renderer-ready plan without sharing mutable selected state."""
 
@@ -17468,6 +18652,20 @@ def _derive_complete_group_candidate(
     ):
         raise ValueError("complete group candidate source arrays must match")
     diagnostics: list[str] = []
+
+    def run_boundary_repair(
+        *,
+        phase: str,
+        **kwargs: Any,
+    ) -> VisualBoundaryRepairPlan:
+        if boundary_search_budget is None:
+            return repair_visual_timeline_boundaries(**kwargs)
+        return _budgeted_repair_visual_timeline_boundaries(
+            budget=boundary_search_budget,
+            phase=phase,
+            **kwargs,
+        )
+
     visual_timeline = (
         visual_timeline_override
         if visual_timeline_override is not None
@@ -17475,12 +18673,82 @@ def _derive_complete_group_candidate(
     )
     record = materialized.candidate_record
     boundary_repairs: VisualBoundaryRepairPlan | None = None
+    precomputed_boundary_indices: frozenset[int] = frozenset()
     if precomputed_boundary_repairs is not None:
         boundary_repairs = precomputed_boundary_repairs
         visual_timeline = precomputed_boundary_repairs.timeline
+        all_cross_source_boundary_indices = frozenset(
+            boundary_index
+            for boundary_index, (outgoing, incoming) in enumerate(
+                zip(
+                    visual_timeline.choices,
+                    visual_timeline.choices[1:],
+                )
+            )
+            if outgoing.source_index != incoming.source_index
+        )
+        if splice_feasibility_graph is None:
+            # Preserve the existing partial-reedit/StageEdit contract:
+            # externally precomputed repairs remain the complete repair input.
+            precomputed_boundary_indices = all_cross_source_boundary_indices
+        else:
+            _validate_constrained_precomputed_repair_origin(
+                materialized.visual_plan,
+                precomputed_boundary_repairs,
+            )
+            _record_boundary_repair_assessments(
+                splice_feasibility_graph,
+                precomputed_boundary_repairs,
+            )
+            requested_precomputed = (
+                precomputed_boundary_repairs.requested_boundary_indices
+            )
+            precomputed_boundary_indices = frozenset(
+                requested_precomputed
+                if requested_precomputed is not None
+                else all_cross_source_boundary_indices
+            )
+        remaining_boundary_indices = tuple(
+            boundary_index
+            for boundary_index in sorted(all_cross_source_boundary_indices)
+            if boundary_index not in precomputed_boundary_indices
+        )
+        if remaining_boundary_indices and splice_feasibility_graph is not None:
+            try:
+                remaining_repairs = run_boundary_repair(
+                    phase="candidate_remaining_default",
+                    visual_timeline=visual_timeline,
+                    sources=local_sources,
+                    audio_offsets=audio_offsets,
+                    scene_cut_times=scene_cut_times,
+                    beat_period_seconds=beat_period_seconds,
+                    source_timewarps=source_timewarps,
+                    boundary_indices=remaining_boundary_indices,
+                    descriptor_cache=boundary_descriptor_cache,
+                    feature_cache_directory=request.source_cache_directory,
+                )
+                if splice_feasibility_graph is not None:
+                    _record_boundary_repair_assessments(
+                        splice_feasibility_graph,
+                        remaining_repairs,
+                    )
+                visual_timeline = remaining_repairs.timeline
+                boundary_repairs = _merge_visual_boundary_repair_plans(
+                    precomputed_boundary_repairs,
+                    remaining_repairs,
+                    analysis_suffix=(
+                        "precomputed_wide_plus_remaining_default_repair_v1"
+                    ),
+                )
+            except (ValueError, cv2.error) as exc:
+                raise RuntimeError(
+                    "remaining boundary repair failed after constrained "
+                    "preflight"
+                ) from exc
     else:
         try:
-            boundary_repairs = repair_visual_timeline_boundaries(
+            boundary_repairs = run_boundary_repair(
+                phase="candidate_default",
                 visual_timeline=visual_timeline,
                 sources=local_sources,
                 audio_offsets=audio_offsets,
@@ -17490,8 +18758,17 @@ def _derive_complete_group_candidate(
                 descriptor_cache=boundary_descriptor_cache,
                 feature_cache_directory=request.source_cache_directory,
             )
+            if splice_feasibility_graph is not None:
+                _record_boundary_repair_assessments(
+                    splice_feasibility_graph,
+                    boundary_repairs,
+                )
             visual_timeline = boundary_repairs.timeline
         except (ValueError, cv2.error) as exc:
+            if splice_feasibility_graph is not None:
+                raise RuntimeError(
+                    "ordinary constrained boundary repair failed"
+                ) from exc
             diagnostics.append(f"boundary_repair_failed: {exc}")
 
     timeline_review: TimelineReview | None = None
@@ -17512,6 +18789,11 @@ def _derive_complete_group_candidate(
         visual_timeline=visual_timeline,
         boundary_repairs=boundary_repairs,
     )
+    adaptive_boundary_indices = tuple(
+        boundary_index
+        for boundary_index in adaptive_boundary_indices
+        if boundary_index not in precomputed_boundary_indices
+    )
     if unresolved_local_splice_boundary_indices:
         diagnostics.append(
             "local_source_splice_wide_boundary_repair_requested:"
@@ -17522,7 +18804,6 @@ def _derive_complete_group_candidate(
         )
     if (
         adaptive_boundary_indices
-        and precomputed_boundary_repairs is None
         and timeline_review is not None
     ):
         diagnostics.append(
@@ -17530,7 +18811,8 @@ def _derive_complete_group_candidate(
             + ",".join(str(value) for value in adaptive_boundary_indices)
         )
         try:
-            adaptive_repairs = repair_visual_timeline_boundaries(
+            adaptive_repairs = run_boundary_repair(
+                phase="candidate_adaptive_wide",
                 visual_timeline=visual_timeline,
                 sources=local_sources,
                 audio_offsets=audio_offsets,
@@ -17545,41 +18827,19 @@ def _derive_complete_group_candidate(
                     interior_scene_cut_guard_frames=9,
                 ),
             )
+            if splice_feasibility_graph is not None:
+                _record_boundary_repair_assessments(
+                    splice_feasibility_graph,
+                    adaptive_repairs,
+                )
             visual_timeline = adaptive_repairs.timeline
             if boundary_repairs is None:
                 boundary_repairs = adaptive_repairs
             else:
-                boundary_repairs = VisualBoundaryRepairPlan(
-                    timeline=adaptive_repairs.timeline,
-                    repairs=(
-                        boundary_repairs.repairs
-                        + adaptive_repairs.repairs
-                    ),
-                    skipped_same_source_boundaries=(
-                        boundary_repairs.skipped_same_source_boundaries
-                        + adaptive_repairs.skipped_same_source_boundaries
-                    ),
-                    failures=(
-                        boundary_repairs.failures
-                        + adaptive_repairs.failures
-                    ),
-                    requested_boundary_indices=None,
-                    geometry_provider_attempt_count=(
-                        boundary_repairs.geometry_provider_attempt_count
-                        + adaptive_repairs.geometry_provider_attempt_count
-                    ),
-                    geometry_provider_failure_count=(
-                        boundary_repairs.geometry_provider_failure_count
-                        + adaptive_repairs.geometry_provider_failure_count
-                    ),
-                    temporal_pose_motion_thresholds=(
-                        adaptive_repairs.temporal_pose_motion_thresholds
-                    ),
-                    temporal_pose_motion_preference_weight=(
-                        adaptive_repairs.temporal_pose_motion_preference_weight
-                    ),
-                    analysis_basis=(
-                        f"{boundary_repairs.analysis_basis}+"
+                boundary_repairs = _merge_visual_boundary_repair_plans(
+                    boundary_repairs,
+                    adaptive_repairs,
+                    analysis_suffix=(
                         "targeted_eight_frame_structural_repair_v1"
                     ),
                 )
@@ -17611,9 +18871,104 @@ def _derive_complete_group_candidate(
                     )
                 )
         except (ValueError, cv2.error) as exc:
+            if splice_feasibility_graph is not None:
+                raise RuntimeError(
+                    "adaptive constrained boundary repair failed"
+                ) from exc
             diagnostics.append(
                 "adaptive_wide_boundary_repair_failed:"
                 f"{type(exc).__name__}: {exc}"
+            )
+
+    splice_graph_authorization: Mapping[str, Any] | None = None
+    if splice_feasibility_graph is not None:
+        authorization = _candidate_local_splice_proxy_authorization(
+            splice_feasibility_graph,
+            final_timeline=visual_timeline,
+            repair_plan=boundary_repairs,
+        )
+        stabilization_rounds: list[dict[str, Any]] = []
+        maximum_stabilization_rounds = min(
+            8,
+            max(1, len(_splice_graph_keys_for_plan(visual_timeline)) + 1),
+        )
+        while (
+            authorization.get("proxy_eligible") is not True
+            and len(stabilization_rounds) < maximum_stabilization_rounds
+        ):
+            stale_boundary_indices = (
+                _splice_authorization_refinement_boundary_indices(
+                    authorization
+                )
+            )
+            if not stale_boundary_indices:
+                break
+            try:
+                stabilization_repairs = run_boundary_repair(
+                    phase="candidate_final_stabilization_wide",
+                    visual_timeline=visual_timeline,
+                    sources=local_sources,
+                    audio_offsets=audio_offsets,
+                    scene_cut_times=scene_cut_times,
+                    beat_period_seconds=beat_period_seconds,
+                    source_timewarps=source_timewarps,
+                    boundary_indices=stale_boundary_indices,
+                    descriptor_cache=boundary_descriptor_cache,
+                    feature_cache_directory=request.source_cache_directory,
+                    config=BoundaryRepairConfig(
+                        search_radius_frames=8,
+                        interior_scene_cut_guard_frames=9,
+                    ),
+                )
+            except (ValueError, cv2.error) as exc:
+                raise RuntimeError(
+                    "final exact-context boundary stabilization failed"
+                ) from exc
+            _record_boundary_repair_assessments(
+                splice_feasibility_graph,
+                stabilization_repairs,
+            )
+            visual_timeline = stabilization_repairs.timeline
+            if boundary_repairs is None:
+                boundary_repairs = stabilization_repairs
+            else:
+                boundary_repairs = _merge_visual_boundary_repair_plans(
+                    boundary_repairs,
+                    stabilization_repairs,
+                    analysis_suffix=(
+                        "final_exact_context_stabilization_v1"
+                    ),
+                )
+            timeline_review = review_timeline(
+                visual_timeline,
+                available_source_count=len(local_sources),
+            )
+            stabilization_rounds.append(
+                {
+                    "round_index": len(stabilization_rounds),
+                    "boundary_indices": list(stale_boundary_indices),
+                    "changed_count": stabilization_repairs.changed_count,
+                    "failure_count": len(stabilization_repairs.failures),
+                }
+            )
+            authorization = _candidate_local_splice_proxy_authorization(
+                splice_feasibility_graph,
+                final_timeline=visual_timeline,
+                repair_plan=boundary_repairs,
+            )
+        splice_graph_authorization = {
+            **authorization,
+            "final_context_stabilization": {
+                "round_limit": maximum_stabilization_rounds,
+                "round_count": len(stabilization_rounds),
+                "rounds": stabilization_rounds,
+                "converged": authorization.get("proxy_eligible") is True,
+            },
+        }
+        if splice_graph_authorization.get("proxy_eligible") is not True:
+            diagnostics.append(
+                "expensive_derivation_skipped:"
+                "fresh_exact_context_splice_authorization_failed"
             )
 
     local_splice_pre_proxy_evidence: dict[str, Any] | None = None
@@ -17636,7 +18991,10 @@ def _derive_complete_group_candidate(
     if timeline_review is None or (
         not timeline_review.passed
         and not output_geometry_deferred_indices
-    ) or local_splice_pre_proxy_blocked:
+    ) or local_splice_pre_proxy_blocked or (
+        splice_graph_authorization is not None
+        and splice_graph_authorization.get("proxy_eligible") is not True
+    ):
         if local_splice_pre_proxy_blocked:
             diagnostics.append(
                 "expensive_derivation_skipped:"
@@ -17702,6 +19060,7 @@ def _derive_complete_group_candidate(
             boundary_affine_plan=None,
             editorial_motion_plan=None,
             render_plan=rejected_plan,
+            splice_graph_authorization=splice_graph_authorization,
             diagnostics=tuple(diagnostics),
             stage_edit_exact_shot_clock=(
                 _deterministic_exact_shot_clock_from_timeline(
@@ -17920,6 +19279,7 @@ def _derive_complete_group_candidate(
         render_plan=plan,
         boundary_look_match=boundary_look_match,
         output_geometry_deferral=output_geometry_deferral,
+        splice_graph_authorization=splice_graph_authorization,
         diagnostics=tuple(diagnostics),
         stage_edit_exact_shot_clock=(
             _deterministic_exact_shot_clock_from_timeline(
@@ -18764,6 +20124,9 @@ def _attempt_proxy_triggered_partial_reedit(
     scratch_directory: Path,
     source_look_match: SourceLookMatchResult | None = None,
     boundary_look_measurement_cache: BoundaryLookMeasurementCache | None = None,
+    boundary_descriptor_cache: BoundaryDescriptorCache | None = None,
+    splice_feasibility_graph: LazySpliceFeasibilityGraph | None = None,
+    boundary_search_budget: _BoundarySearchBudget | None = None,
     professional_reference_profile: ProfessionalReferenceProfile | None = None,
     learned_issue_boundary_indices: Sequence[int] | None = None,
     candidate_bundle_postprocessor: Any | None = None,
@@ -18930,9 +20293,29 @@ def _attempt_proxy_triggered_partial_reedit(
         )
 
     audit["attempted"] = True
+    if (
+        boundary_descriptor_cache is None
+        or splice_feasibility_graph is None
+        or boundary_search_budget is None
+        or selected_bundle.boundary_repairs is None
+    ):
+        raise RuntimeError(
+            "ordinary partial re-edit requires the selected repair lineage, "
+            "shared descriptor cache, splice graph, and boundary-search budget"
+        )
+    selected_authorization = selected_bundle.splice_graph_authorization
+    if (
+        not isinstance(selected_authorization, Mapping)
+        or selected_authorization.get("proxy_eligible") is not True
+    ):
+        raise RuntimeError(
+            "ordinary partial re-edit selected input lacks splice authority"
+        )
     local_sources = tuple(request.sources[index] for index in eligible_indices)
     try:
-        targeted_repairs = repair_visual_timeline_boundaries(
+        targeted_repairs = _budgeted_repair_visual_timeline_boundaries(
+            budget=boundary_search_budget,
+            phase="decoded_proxy_targeted_partial_reedit_wide",
             visual_timeline=selected_bundle.visual_timeline,
             sources=local_sources,
             audio_offsets=audio_offsets,
@@ -18940,11 +20323,16 @@ def _attempt_proxy_triggered_partial_reedit(
             beat_period_seconds=beat_period_seconds,
             source_timewarps=source_timewarps,
             boundary_indices=issue_indices,
+            descriptor_cache=boundary_descriptor_cache,
             feature_cache_directory=request.source_cache_directory,
             config=BoundaryRepairConfig(
                 search_radius_frames=8,
                 interior_scene_cut_guard_frames=9,
             ),
+        )
+        _record_boundary_repair_assessments(
+            splice_feasibility_graph,
+            targeted_repairs,
         )
         changed_boundary_indices = [
             item.boundary_index
@@ -18987,7 +20375,84 @@ def _attempt_proxy_triggered_partial_reedit(
             precomputed_boundary_repairs=targeted_repairs,
             source_look_match=source_look_match,
             boundary_look_measurement_cache=boundary_look_measurement_cache,
+            boundary_descriptor_cache=boundary_descriptor_cache,
+            boundary_search_budget=boundary_search_budget,
         )
+        (
+            partial_repair_lineage,
+            partial_splice_authorization,
+        ) = _authorize_partial_reedit_splice_lineage(
+            splice_feasibility_graph,
+            selected_repairs=selected_bundle.boundary_repairs,
+            targeted_repairs=targeted_repairs,
+            final_timeline=partial_bundle.visual_timeline,
+        )
+        partial_bundle = replace(
+            partial_bundle,
+            boundary_repairs=partial_repair_lineage,
+            splice_graph_authorization=partial_splice_authorization,
+        )
+        audit["splice_graph_authorization"] = deepcopy(
+            partial_splice_authorization
+        )
+        if partial_splice_authorization.get("proxy_eligible") is not True:
+            audit["reason"] = (
+                "partial_reedit_exact_context_splice_authorization_failed_"
+                "original_retained"
+            )
+            audit["decoded_proxy_invoked"] = False
+            return _ProxyTriggeredPartialReeditResult(
+                selected_bundle,
+                original_review_payload,
+                audit,
+            )
+        raw_geometry_indices = partial_splice_authorization.get(
+            "geometry_proof_boundary_indices"
+        )
+        if not isinstance(raw_geometry_indices, list) or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in raw_geometry_indices
+        ):
+            raise RuntimeError(
+                "partial re-edit splice geometry authority is malformed"
+            )
+        required_geometry_indices = frozenset(raw_geometry_indices)
+        if required_geometry_indices:
+            deferral = partial_bundle.output_geometry_deferral
+            raw_requested_indices = (
+                deferral.get("requested_boundary_indices")
+                if isinstance(deferral, Mapping)
+                else None
+            )
+            requested_indices = (
+                frozenset(raw_requested_indices)
+                if isinstance(raw_requested_indices, list)
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in raw_requested_indices
+                )
+                else frozenset()
+            )
+            geometry_covered = bool(
+                isinstance(deferral, Mapping)
+                and deferral.get("pre_proxy_eligible") is True
+                and required_geometry_indices.issubset(requested_indices)
+            )
+            if not geometry_covered:
+                audit["reason"] = (
+                    "partial_reedit_output_geometry_authority_incomplete_"
+                    "original_retained"
+                )
+                audit["decoded_proxy_invoked"] = False
+                return _ProxyTriggeredPartialReeditResult(
+                    selected_bundle,
+                    original_review_payload,
+                    audit,
+                )
         if candidate_bundle_postprocessor is not None:
             partial_bundle = candidate_bundle_postprocessor(
                 partial_bundle,
@@ -19173,6 +20638,8 @@ def _attempt_proxy_triggered_partial_reedit(
                 audit,
             )
         audit["reason"] = "decoded_proxy_rank_did_not_improve"
+    except _BoundarySearchBudgetExhausted:
+        raise
     except (OSError, RuntimeError, TypeError, ValueError, cv2.error) as exc:
         audit["reason"] = "partial_reedit_failed_original_retained"
         audit["error"] = f"{type(exc).__name__}: {exc}"
@@ -23750,10 +25217,362 @@ def analyze(
                     BoundaryLookMeasurementCache()
                 )
                 boundary_descriptor_cache = BoundaryDescriptorCache()
+                constraint_optimizer_context_keys: set[
+                    LazySpliceFeasibilityKey
+                ] = set()
+                global_candidate_stream: _GlobalVisualCandidateStream | None
+                if stage_edit_visual_candidate_batch is None:
+                    global_candidate_stream = _GlobalVisualCandidateStream()
+                    globally_indexed_initial_candidates: list[
+                        _GloballyIndexedVisualCandidate
+                    ] = []
+                    for initial_candidate in materialized_group_candidates:
+                        try:
+                            globally_indexed = (
+                                global_candidate_stream.admit_unseen(
+                                    initial_candidate
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "initial visual candidate stream is invalid"
+                            ) from exc
+                        if globally_indexed is None:
+                            raise RuntimeError(
+                                "initial visual candidate stream repeats an "
+                                "exact source+shot path"
+                            )
+                        globally_indexed_initial_candidates.append(
+                            globally_indexed
+                        )
+                        constraint_optimizer_context_keys.update(
+                            _splice_graph_keys_for_plan(
+                                globally_indexed.visual_plan
+                            )
+                        )
+                    materialized_group_candidates = tuple(
+                        globally_indexed_initial_candidates
+                    )
+                else:
+                    global_candidate_stream = None
+                splice_feasibility_graph: (
+                    LazySpliceFeasibilityGraph | None
+                ) = None
+                constraint_selector_base_identity_sha256: str | None = None
+                constraint_selector_base_identity_basis: str | None = None
+                constraint_reoptimization_rounds: list[dict[str, Any]] = []
+                constraint_reoptimization_fixed_point = False
+                constraint_reoptimization_termination_reason: str | None = None
+                constraint_workspace_rebuilt_from_warm_cache = False
+                constraint_workspace_edge_bound: int | None = None
+                constraint_boundary_search_budget: (
+                    _BoundarySearchBudget | None
+                ) = None
+                constraint_reoptimization_round_limit: int | None = None
+                constraint_wide_edge_assessment_count = 0
+                constraint_graph_resumed = False
+                constraint_graph_resume_path: Path | None = None
+                constraint_graph_resume_discard_reason: str | None = None
+                initial_constraint_stream_audit: dict[str, int] | None = None
+                if stage_edit_visual_candidate_batch is None:
+                    if visual_candidate_checkpoint_reused:
+                        if (
+                            visual_candidate_checkpoint_input_identity_sha256
+                            is None
+                        ):
+                            raise RuntimeError(
+                                "reused candidate checkpoint lost its strong "
+                                "input identity"
+                            )
+                        constraint_selector_base_identity_basis = (
+                            "verified_visual_candidate_checkpoint_input_v1"
+                        )
+                        constraint_selector_base_identity_sha256 = (
+                            visual_candidate_checkpoint_input_identity_sha256
+                        )
+                    elif (
+                        visual_candidate_set is not None
+                        and visual_candidate_set.optimizer_workspace is not None
+                    ):
+                        constraint_selector_base_identity_basis = (
+                            "verified_visual_optimizer_workspace_input_v1"
+                        )
+                        constraint_selector_base_identity_sha256 = (
+                            visual_candidate_set.optimizer_workspace
+                            .input_identity
+                        )
+                    else:
+                        raise RuntimeError(
+                            "ordinary candidate stream needs a verified "
+                            "checkpoint or optimizer workspace identity"
+                        )
+                    splice_analysis_basis_identity = (
+                        _group_splice_analysis_basis_identity(
+                            selector_input_identity_sha256=(
+                                constraint_selector_base_identity_sha256
+                            ),
+                            selector_input_identity_basis=(
+                                constraint_selector_base_identity_basis
+                            ),
+                        )
+                    )
+                    prior_graph_payload: Mapping[str, Any] | None = None
+                    if (
+                        visual_candidate_checkpoint_reused
+                        and pre_derivation_candidate_selection_path is not None
+                    ):
+                        checkpoint_suffix = (
+                            "-pre-derivation-candidate-selection.json"
+                        )
+                        checkpoint_name = (
+                            pre_derivation_candidate_selection_path.name
+                        )
+                        if checkpoint_name.endswith(checkpoint_suffix):
+                            prior_progress_path = (
+                                pre_derivation_candidate_selection_path
+                                .with_name(
+                                    checkpoint_name[
+                                        : -len(checkpoint_suffix)
+                                    ]
+                                    + "-candidate-stream-progress.json"
+                                )
+                            )
+                            if prior_progress_path.exists():
+                                try:
+                                    prior_bytes, _prior_fingerprint = (
+                                        _read_stable_regular_file(
+                                            prior_progress_path
+                                        )
+                                    )
+                                    prior_progress_payload = json.loads(
+                                        prior_bytes.decode("utf-8")
+                                    )
+                                except (
+                                    OSError,
+                                    UnicodeError,
+                                    json.JSONDecodeError,
+                                    ValueError,
+                                ) as exc:
+                                    raise RuntimeError(
+                                        "persisted splice graph progress is "
+                                        "unreadable"
+                                    ) from exc
+                                prior_constraint_payload = (
+                                    prior_progress_payload.get(
+                                        "constraint_reoptimization"
+                                    )
+                                    if isinstance(
+                                        prior_progress_payload,
+                                        Mapping,
+                                    )
+                                    else None
+                                )
+                                candidate_graph_payload = (
+                                    prior_constraint_payload.get(
+                                        "splice_feasibility_graph"
+                                    )
+                                    if isinstance(
+                                        prior_constraint_payload,
+                                        Mapping,
+                                    )
+                                    else None
+                                )
+                                if candidate_graph_payload is not None:
+                                    if not isinstance(
+                                        candidate_graph_payload,
+                                        Mapping,
+                                    ):
+                                        raise RuntimeError(
+                                            "persisted splice graph payload "
+                                            "is malformed"
+                                        )
+                                    prior_graph_payload = (
+                                        candidate_graph_payload
+                                    )
+                                    constraint_graph_resume_path = (
+                                        prior_progress_path
+                                    )
+                    if prior_graph_payload is None:
+                        splice_feasibility_graph = (
+                            LazySpliceFeasibilityGraph(
+                                splice_analysis_basis_identity
+                            )
+                        )
+                    else:
+                        (
+                            splice_feasibility_graph,
+                            constraint_graph_resumed,
+                            constraint_graph_resume_discard_reason,
+                        ) = _resume_or_reset_splice_feasibility_graph(
+                            prior_graph_payload,
+                            expected_analysis_basis_identity=(
+                                splice_analysis_basis_identity
+                            ),
+                        )
+                    if (
+                        visual_candidate_set is not None
+                        and visual_candidate_set.optimizer_workspace is not None
+                    ):
+                        constraint_workspace_edge_bound = (
+                            _optimizer_workspace_cross_source_edge_bound(
+                                visual_candidate_set
+                            )
+                        )
+                    constraint_boundary_search_budget = _BoundarySearchBudget(
+                        structural_edge_bound=max(
+                            constraint_workspace_edge_bound or 0,
+                            len(constraint_optimizer_context_keys),
+                        )
+                    )
                 candidate_stream_progress_path = (
                     request.output_directory
                     / f"{base_filename}-candidate-stream-progress.json"
                 )
+
+                def constraint_reoptimization_payload() -> dict[str, Any]:
+                    if splice_feasibility_graph is None:
+                        return {
+                            "enabled": False,
+                            "reason": "explicit_stage_edit_candidate_pool",
+                        }
+                    assert constraint_selector_base_identity_sha256 is not None
+                    assert constraint_selector_base_identity_basis is not None
+                    selector_identity = build_no_good_selector_identity(
+                        base_candidate_input_identity_sha256=(
+                            constraint_selector_base_identity_sha256
+                        ),
+                        base_identity_basis=(
+                            constraint_selector_base_identity_basis
+                        ),
+                        timeline_no_goods=(
+                            _optimizer_blocked_set_for_contexts(
+                                splice_feasibility_graph,
+                                constraint_optimizer_context_keys,
+                            )
+                        ),
+                    )
+                    measured_context_count = len(splice_feasibility_graph)
+                    measured_raw_edge_count = len(
+                        {
+                            entry.edge
+                            for entry in splice_feasibility_graph.entries
+                        }
+                    )
+                    if (
+                        constraint_workspace_edge_bound is not None
+                        and measured_raw_edge_count
+                        > constraint_workspace_edge_bound
+                    ):
+                        raise RuntimeError(
+                            "measured raw splice edge domain exceeds retained "
+                            "workspace edge bound"
+                        )
+                    theoretical_context_entry_bound = (
+                        constraint_workspace_edge_bound
+                        * len(DEFAULT_WIDE_FRAME_OFFSETS) ** 3
+                        if constraint_workspace_edge_bound is not None
+                        else None
+                    )
+                    optimizer_projected_blocked_set = (
+                        _optimizer_blocked_set_for_contexts(
+                            splice_feasibility_graph,
+                            constraint_optimizer_context_keys,
+                        )
+                    )
+                    return {
+                        "enabled": True,
+                        "analysis_basis_identity": (
+                            splice_feasibility_graph.analysis_basis_identity
+                        ),
+                        "splice_feasibility_graph": (
+                            splice_feasibility_graph.to_dict()
+                        ),
+                        "no_good_selector_identity": (
+                            selector_identity.to_dict()
+                        ),
+                        "round_count": len(constraint_reoptimization_rounds),
+                        "audited_round_limit": (
+                            constraint_reoptimization_round_limit
+                        ),
+                        "rounds": deepcopy(constraint_reoptimization_rounds),
+                        "fixed_point_reached": (
+                            constraint_reoptimization_fixed_point
+                        ),
+                        "termination_reason": (
+                            constraint_reoptimization_termination_reason
+                        ),
+                        "initial_stream_edge_admission": deepcopy(
+                            initial_constraint_stream_audit
+                        ),
+                        "run_local_blocked_edge_count": len(
+                            optimizer_projected_blocked_set
+                        ),
+                        "run_local_blocked_context_count": len(
+                            splice_feasibility_graph.run_local_blocked_keys
+                        ),
+                        "optimizer_raw_context_key_count": len(
+                            constraint_optimizer_context_keys
+                        ),
+                        "optimizer_projected_blocked_edges": (
+                            optimizer_projected_blocked_set.to_dict()
+                        ),
+                        "hard_incompatible_edge_count": len(
+                            splice_feasibility_graph.hard_incompatible_edges
+                        ),
+                        "indeterminate_edge_count": len(
+                            splice_feasibility_graph.indeterminate_edges
+                        ),
+                        "geometry_proof_edge_count": len(
+                            splice_feasibility_graph
+                            .geometry_proof_required_edges
+                        ),
+                        "raw_pass_edge_count": len(
+                            splice_feasibility_graph.raw_pass_edges
+                        ),
+                        "workspace_rebuilt_once_from_warm_feature_cache": (
+                            constraint_workspace_rebuilt_from_warm_cache
+                        ),
+                        "graph_resumed_from_validated_progress": (
+                            constraint_graph_resumed
+                        ),
+                        "graph_resume_path": (
+                            str(constraint_graph_resume_path)
+                            if constraint_graph_resume_path is not None
+                            else None
+                        ),
+                        "graph_resume_discard_reason": (
+                            constraint_graph_resume_discard_reason
+                        ),
+                        "resource_audit": {
+                            "theoretical_exact_cross_source_edge_bound": (
+                                constraint_workspace_edge_bound
+                            ),
+                            "measured_exact_raw_edge_count": (
+                                measured_raw_edge_count
+                            ),
+                            "measured_exact_context_entry_count": (
+                                measured_context_count
+                            ),
+                            "theoretical_context_entry_bound": (
+                                theoretical_context_entry_bound
+                            ),
+                            "lazy_preflight_requested_wide_edge_count": (
+                                constraint_wide_edge_assessment_count
+                            ),
+                            "bound_respected": (
+                                constraint_workspace_edge_bound is None
+                                or measured_raw_edge_count
+                                <= constraint_workspace_edge_bound
+                            ),
+                            "thresholds_lowered": False,
+                            "descriptor_free_reoptimization": True,
+                            "boundary_search_budget": (
+                                constraint_boundary_search_budget.to_dict()
+                                if constraint_boundary_search_budget is not None
+                                else None
+                            ),
+                        },
+                    }
 
                 def local_source_repair_boundary_support() -> dict[int, int]:
                     support: dict[int, int] = {}
@@ -23814,6 +25633,9 @@ def analyze(
                             ),
                             "candidate_stream_verdicts": (
                                 candidate_stream_reducer.to_dict()
+                            ),
+                            "constraint_reoptimization": (
+                                constraint_reoptimization_payload()
                             ),
                             "local_source_repair": {
                                 "seed_count": len(local_source_repair_seeds),
@@ -23909,6 +25731,10 @@ def analyze(
 
                 def _derive_and_gate_candidate_verdict(
                     materialized: Any,
+                    *,
+                    precomputed_boundary_repairs: (
+                        VisualBoundaryRepairPlan | None
+                    ) = None,
                 ) -> TerminalCandidateVerdict:
                     nonlocal post_repair_structure_passing_complete_count
                     local_source_repair = isinstance(
@@ -23958,6 +25784,15 @@ def analyze(
                             boundary_descriptor_cache=(
                                 boundary_descriptor_cache
                             ),
+                            precomputed_boundary_repairs=(
+                                precomputed_boundary_repairs
+                            ),
+                            splice_feasibility_graph=(
+                                splice_feasibility_graph
+                            ),
+                            boundary_search_budget=(
+                                constraint_boundary_search_budget
+                            ),
                         )
                     except (
                         StageEditVisualCandidateError,
@@ -23982,6 +25817,116 @@ def analyze(
                                 ),
                             ),
                         )
+                    if splice_feasibility_graph is not None:
+                        splice_authorization = (
+                            bundle.splice_graph_authorization
+                        )
+                        if not isinstance(splice_authorization, Mapping):
+                            raise RuntimeError(
+                                "ordinary candidate lost splice graph "
+                                "authorization evidence"
+                            )
+                        raw_geometry_indices = splice_authorization.get(
+                            "geometry_proof_boundary_indices"
+                        )
+                        geometry_indices = (
+                            tuple(raw_geometry_indices)
+                            if isinstance(raw_geometry_indices, list)
+                            and all(
+                                isinstance(value, int)
+                                and not isinstance(value, bool)
+                                and value >= 0
+                                for value in raw_geometry_indices
+                            )
+                            else ()
+                        )
+                        deferral = bundle.output_geometry_deferral
+                        raw_deferral_indices = (
+                            deferral.get("requested_boundary_indices")
+                            if isinstance(deferral, Mapping)
+                            else None
+                        )
+                        deferral_indices = (
+                            frozenset(raw_deferral_indices)
+                            if isinstance(raw_deferral_indices, list)
+                            and all(
+                                isinstance(value, int)
+                                and not isinstance(value, bool)
+                                and value >= 0
+                                for value in raw_deferral_indices
+                            )
+                            else frozenset()
+                        )
+                        unresolved_geometry_proof = tuple(
+                            index
+                            for index in geometry_indices
+                            if index not in deferral_indices
+                        )
+                        splice_proxy_authorized = bool(
+                            splice_authorization.get("proxy_eligible") is True
+                            and (
+                                not geometry_indices
+                                or (
+                                    isinstance(deferral, Mapping)
+                                    and deferral.get("pre_proxy_eligible")
+                                    is True
+                                    and not unresolved_geometry_proof
+                                )
+                            )
+                        )
+                        if not splice_proxy_authorized:
+                            rejection_payload = {
+                                **_post_repair_review_rejection_payload(
+                                    materialized,
+                                    bundle,
+                                ),
+                                "delivery_lineage_failure": (
+                                    "fresh_exact_context_splice_"
+                                    "authorization_failed"
+                                ),
+                                "splice_graph_authorization": deepcopy(
+                                    dict(splice_authorization)
+                                ),
+                                "unresolved_geometry_proof_boundary_indices": (
+                                    list(unresolved_geometry_proof)
+                                ),
+                                "decoded_proxy_invoked": False,
+                            }
+                            candidate_post_repair_review_rejections.append(
+                                rejection_payload
+                            )
+                            unauthorized_keys = splice_authorization.get(
+                                "unauthorized_keys"
+                            )
+                            blocker_detail = json.dumps(
+                                {
+                                    "unauthorized_keys": (
+                                        unauthorized_keys
+                                        if isinstance(unauthorized_keys, list)
+                                        else []
+                                    ),
+                                    "unresolved_geometry_proof_boundary_indices": (
+                                        list(unresolved_geometry_proof)
+                                    ),
+                                },
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            return TerminalCandidateVerdict(
+                                materialized.candidate_index,
+                                CandidateVerdictStatus.SPLICE_BLOCKED,
+                                (
+                                    CandidateBlocker(
+                                        CandidateBlockerKind.SPLICE,
+                                        (
+                                            "fresh_exact_context_splice_"
+                                            "authorization_failed"
+                                        ),
+                                        blocker_detail,
+                                    ),
+                                ),
+                            )
                     if local_source_repair:
                         local_boundary_evidence = (
                             _local_source_repair_boundary_evidence(
@@ -24454,13 +26399,22 @@ def analyze(
                         ),
                     )
 
-                def derive_and_gate_candidate(materialized: Any) -> None:
+                def derive_and_gate_candidate(
+                    materialized: Any,
+                    *,
+                    precomputed_boundary_repairs: (
+                        VisualBoundaryRepairPlan | None
+                    ) = None,
+                ) -> None:
                     candidate_index = int(materialized.candidate_index)
                     if candidate_index in attempted_candidate_indices:
                         return
                     try:
                         verdict = _derive_and_gate_candidate_verdict(
-                            materialized
+                            materialized,
+                            precomputed_boundary_repairs=(
+                                precomputed_boundary_repairs
+                            ),
                         )
                         if not isinstance(verdict, TerminalCandidateVerdict):
                             raise TypeError(
@@ -24506,6 +26460,532 @@ def analyze(
                         )
                         raise
                     persist_candidate_stream_progress()
+
+                def reject_preflight_blocked_candidate(
+                    materialized: _GloballyIndexedVisualCandidate,
+                    blocked_edges: Sequence[TimelineNoGoodEdgeKey],
+                ) -> None:
+                    candidate_index = materialized.candidate_index
+                    if candidate_index in attempted_candidate_indices:
+                        raise RuntimeError(
+                            "preflight candidate was already attempted"
+                        )
+                    exact_edges = tuple(sorted(set(blocked_edges)))
+                    if not exact_edges:
+                        raise ValueError(
+                            "preflight rejection needs at least one blocked edge"
+                        )
+                    attempted_candidate_indices.add(candidate_index)
+                    attempted_materialized_candidates.append(materialized)
+                    candidate_post_repair_review_rejections.append(
+                        {
+                            "candidate_index": candidate_index,
+                            "review_rank": materialized.review_rank,
+                            "stage": (
+                                "constraint_reoptimization_lazy_splice_"
+                                "preflight"
+                            ),
+                            "blocked_exact_edges": [
+                                edge.to_dict() for edge in exact_edges
+                            ],
+                            "transition_thresholds_lowered": False,
+                            "full_derivation_skipped": True,
+                        }
+                    )
+                    candidate_stream_reducer.apply(
+                        TerminalCandidateVerdict(
+                            candidate_index,
+                            CandidateVerdictStatus.SPLICE_BLOCKED,
+                            tuple(
+                                CandidateBlocker(
+                                    CandidateBlockerKind.SPLICE,
+                                    "run_local_exact_splice_edge_blocked",
+                                    json.dumps(
+                                        edge.to_dict(),
+                                        ensure_ascii=True,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                )
+                                for edge in exact_edges
+                            ),
+                        )
+                    )
+                    persist_candidate_stream_progress()
+
+                def lazy_preflight_regenerated_candidate(
+                    materialized: _GloballyIndexedVisualCandidate,
+                    *,
+                    assess_unseen_edges: bool = True,
+                ) -> tuple[
+                    tuple[TimelineNoGoodEdgeKey, ...],
+                    VisualBoundaryRepairPlan | None,
+                    int,
+                ]:
+                    nonlocal constraint_wide_edge_assessment_count
+                    if splice_feasibility_graph is None:
+                        raise RuntimeError(
+                            "ordinary regenerated candidate lost splice graph"
+                        )
+                    path_edge_contexts = _cross_source_timeline_edge_contexts(
+                        materialized.visual_plan
+                    )
+                    path_graph_keys = _splice_graph_keys_for_plan(
+                        materialized.visual_plan
+                    )
+                    path_result_keys = _splice_result_graph_keys_for_plan(
+                        materialized.visual_plan
+                    )
+                    if len(path_graph_keys) != len(path_result_keys):
+                        raise RuntimeError(
+                            "preflight splice key domains diverged"
+                        )
+                    path_blocked_set = (
+                        splice_feasibility_graph.blocked_set_for_contexts(
+                            path_graph_keys
+                        )
+                    )
+                    blocked = tuple(
+                        edge
+                        for edge, _edge_context_identity in path_edge_contexts
+                        if edge in path_blocked_set
+                    )
+                    if blocked:
+                        return blocked, None, 0
+                    edges_needing_assessment_values: list[
+                        tuple[TimelineNoGoodEdgeKey, str]
+                    ] = []
+                    for raw_key, result_key in zip(
+                        path_graph_keys,
+                        path_result_keys,
+                        strict=True,
+                    ):
+                        if raw_key.edge != result_key.edge:
+                            raise RuntimeError(
+                                "preflight splice key edges diverged"
+                            )
+                        retained_result = (
+                            splice_feasibility_graph.assessment_for(
+                                result_key.edge,
+                                result_key.edge_context_identity,
+                            )
+                        )
+                        if (
+                            retained_result is not None
+                            and retained_result.status
+                            is SpliceFeasibilityStatus.RAW_PASS
+                            and retained_result.terminal_for_expected_domain
+                        ):
+                            continue
+                        retained_raw = (
+                            splice_feasibility_graph.assessment_for(
+                                raw_key.edge,
+                                raw_key.edge_context_identity,
+                            )
+                        )
+                        if (
+                            splice_feasibility_graph.needs_assessment(
+                                raw_key.edge,
+                                raw_key.edge_context_identity,
+                            )
+                            and (
+                                assess_unseen_edges
+                                or retained_raw is not None
+                            )
+                        ):
+                            edges_needing_assessment_values.append(
+                                (
+                                    raw_key.edge,
+                                    raw_key.edge_context_identity,
+                                )
+                            )
+                    edges_needing_assessment = tuple(
+                        edges_needing_assessment_values
+                    )
+                    preflight_repairs: VisualBoundaryRepairPlan | None = None
+                    evidence_change_count = 0
+                    if edges_needing_assessment:
+                        constraint_wide_edge_assessment_count += len(
+                            edges_needing_assessment
+                        )
+                        if constraint_boundary_search_budget is None:
+                            raise RuntimeError(
+                                "ordinary splice preflight lost its shared "
+                                "boundary-search budget"
+                            )
+                        assessment_boundary_indices = tuple(
+                            edge.boundary_index
+                            for edge, _edge_context_identity in (
+                                edges_needing_assessment
+                            )
+                        )
+                        try:
+                            preflight_repairs = (
+                                _budgeted_repair_visual_timeline_boundaries(
+                                    budget=(
+                                        constraint_boundary_search_budget
+                                    ),
+                                    phase="constraint_lazy_preflight_wide",
+                                    visual_timeline=materialized.visual_plan,
+                                    sources=tuple(
+                                        request.sources[index]
+                                        for index in eligible_indices
+                                    ),
+                                    audio_offsets=offsets,
+                                    scene_cut_times=scene_cut_times,
+                                    beat_period_seconds=(
+                                        group_draft.beat_period_seconds
+                                    ),
+                                    source_timewarps=eligible_timewarps,
+                                    boundary_indices=(
+                                        assessment_boundary_indices
+                                    ),
+                                    descriptor_cache=(
+                                        boundary_descriptor_cache
+                                    ),
+                                    feature_cache_directory=(
+                                        request.source_cache_directory
+                                    ),
+                                    config=BoundaryRepairConfig(
+                                        search_radius_frames=8,
+                                        interior_scene_cut_guard_frames=9,
+                                    ),
+                                )
+                            )
+                        except (ValueError, cv2.error) as exc:
+                            raise RuntimeError(
+                                "lazy splice preflight failed"
+                            ) from exc
+                        evidence_change_count = (
+                            _record_boundary_repair_assessments(
+                            splice_feasibility_graph,
+                            preflight_repairs,
+                            )
+                        )
+                    return (
+                        # Recompute after the wide verdict; the preflight may
+                        # have made one of these exact contexts terminal.
+                        tuple(
+                            edge
+                            for edge, _edge_context_identity in (
+                                path_edge_contexts
+                            )
+                            if edge
+                            in splice_feasibility_graph.blocked_set_for_contexts(
+                                path_graph_keys
+                            )
+                        ),
+                        preflight_repairs,
+                        evidence_change_count,
+                    )
+
+                def run_constraint_reoptimization() -> None:
+                    nonlocal constraint_reoptimization_fixed_point
+                    nonlocal constraint_reoptimization_termination_reason
+                    nonlocal constraint_reoptimization_round_limit
+                    nonlocal constraint_workspace_edge_bound
+                    nonlocal constraint_workspace_rebuilt_from_warm_cache
+                    nonlocal total_materialized_candidate_count
+                    nonlocal visual_candidate_set
+                    if (
+                        candidate_stream_reducer
+                        .required_passing_cohort_complete
+                        or stage_edit_visual_candidate_batch is not None
+                    ):
+                        return
+                    if splice_feasibility_graph is None:
+                        raise RuntimeError(
+                            "ordinary candidate recovery has no splice graph"
+                        )
+                    if global_candidate_stream is None:
+                        raise RuntimeError(
+                            "ordinary candidate recovery has no global ID stream"
+                        )
+                    if (
+                        constraint_selector_base_identity_sha256 is None
+                        or constraint_selector_base_identity_basis is None
+                    ):
+                        raise RuntimeError(
+                            "ordinary candidate recovery lost selector identity"
+                        )
+                    if (
+                        visual_candidate_set is None
+                        or visual_candidate_set.optimizer_workspace is None
+                    ):
+                        if constraint_workspace_rebuilt_from_warm_cache:
+                            raise RuntimeError(
+                                "optimizer workspace rebuild was requested twice"
+                            )
+                        reporter.status(
+                            "체크포인트의 transient DP workspace를 영속 feature "
+                            "cache에서 한 번 복구하는 중…"
+                        )
+                        try:
+                            visual_candidate_set = (
+                                build_visual_timeline_candidate_set(
+                                    **visual_builder_arguments,
+                                    maximum_results=32,
+                                )
+                            )
+                        except (ValueError, cv2.error) as exc:
+                            raise RuntimeError(
+                                "one-time optimizer workspace rebuild failed"
+                            ) from exc
+                        constraint_workspace_rebuilt_from_warm_cache = True
+                    constraint_workspace_edge_bound = (
+                        _optimizer_workspace_cross_source_edge_bound(
+                            visual_candidate_set
+                        )
+                    )
+                    if constraint_boundary_search_budget is None:
+                        raise RuntimeError(
+                            "ordinary constrained optimizer lost its shared "
+                            "boundary-search budget"
+                        )
+                    constraint_boundary_search_budget.expand_structural_edge_bound(
+                        constraint_workspace_edge_bound
+                    )
+                    theoretical_round_bound = (
+                        constraint_workspace_edge_bound + 1
+                    )
+                    constraint_reoptimization_round_limit = min(
+                        theoretical_round_bound,
+                        MAX_CONSTRAINT_REOPTIMIZATION_ROUNDS,
+                    )
+                    workspace = visual_candidate_set.optimizer_workspace
+                    assert workspace is not None
+                    while (
+                        not candidate_stream_reducer
+                        .required_passing_cohort_complete
+                    ):
+                        if (
+                            len(constraint_reoptimization_rounds)
+                            >= constraint_reoptimization_round_limit
+                        ):
+                            constraint_reoptimization_termination_reason = (
+                                "audited_resource_round_limit_incomplete"
+                            )
+                            constraint_reoptimization_rounds.append(
+                                {
+                                    "round_index": len(
+                                        constraint_reoptimization_rounds
+                                    ),
+                                    "resource_limit_reached": True,
+                                    "audited_round_limit": (
+                                        constraint_reoptimization_round_limit
+                                    ),
+                                    "theoretical_round_bound": (
+                                        theoretical_round_bound
+                                    ),
+                                    "fixed_point": False,
+                                    "thresholds_lowered": False,
+                                    "production_use_forbidden": True,
+                                }
+                            )
+                            persist_candidate_stream_progress(
+                                status=(
+                                    "candidate_stream_constraint_resource_"
+                                    "limit_incomplete"
+                                )
+                            )
+                            return
+                        blocked_before = _optimizer_blocked_set_for_contexts(
+                            splice_feasibility_graph,
+                            constraint_optimizer_context_keys,
+                        )
+                        selector_identity = build_no_good_selector_identity(
+                            base_candidate_input_identity_sha256=(
+                                constraint_selector_base_identity_sha256
+                            ),
+                            base_identity_basis=(
+                                constraint_selector_base_identity_basis
+                            ),
+                            timeline_no_goods=blocked_before,
+                        )
+                        try:
+                            (
+                                regenerated,
+                                no_complete_path_evidence,
+                            ) = (
+                                _regenerate_visual_candidate_set_or_no_path(
+                                    visual_candidate_set,
+                                    forbidden_boundary_edges=blocked_before,
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "constrained visual DP contract failed"
+                            ) from exc
+                        if regenerated is None:
+                            if no_complete_path_evidence is None:
+                                raise RuntimeError(
+                                    "typed no-path result lost its evidence"
+                                )
+                            constraint_reoptimization_termination_reason = (
+                                "no_complete_dp_path"
+                            )
+                            constraint_reoptimization_rounds.append(
+                                {
+                                    "round_index": len(
+                                        constraint_reoptimization_rounds
+                                    ),
+                                    "selector_identity": (
+                                        selector_identity.to_dict()
+                                    ),
+                                    "blocked_edge_count_before": len(
+                                        blocked_before
+                                    ),
+                                    "unseen_path_count": 0,
+                                    "no_complete_dp_path": True,
+                                    "no_complete_dp_path_evidence": (
+                                        no_complete_path_evidence
+                                    ),
+                                    "fixed_point": False,
+                                    "thresholds_lowered": False,
+                                }
+                            )
+                            persist_candidate_stream_progress(
+                                status=(
+                                    "candidate_stream_constraint_dp_"
+                                    "infeasible"
+                                )
+                            )
+                            return
+                        try:
+                            regenerated_materialized = (
+                                materialize_visual_timeline_candidates(
+                                    regenerated,
+                                    maximum_candidates=32,
+                                    passed_only=False,
+                                )
+                            )
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "constrained candidate materialization failed"
+                            ) from exc
+                        unseen = tuple(
+                            admitted
+                            for candidate in regenerated_materialized
+                            for admitted in (
+                                global_candidate_stream.admit_unseen(candidate),
+                            )
+                            if admitted is not None
+                        )
+                        for admitted in unseen:
+                            constraint_optimizer_context_keys.update(
+                                _splice_graph_keys_for_plan(
+                                    admitted.visual_plan
+                                )
+                            )
+                        if not unseen:
+                            constraint_reoptimization_fixed_point = True
+                            constraint_reoptimization_termination_reason = (
+                                "deterministic_path_fixed_point"
+                            )
+                            persist_candidate_stream_progress(
+                                status=(
+                                    "candidate_stream_constraint_fixed_point"
+                                )
+                            )
+                            return
+                        round_payload: dict[str, Any] = {
+                            "round_index": len(
+                                constraint_reoptimization_rounds
+                            ),
+                            "selector_identity": selector_identity.to_dict(),
+                            "blocked_edge_count_before": len(blocked_before),
+                            "unseen_path_count": len(unseen),
+                            "unseen_candidate_indices": [
+                                item.candidate_index for item in unseen
+                            ],
+                            "no_complete_dp_path": False,
+                            "thresholds_lowered": False,
+                        }
+                        for materialized in unseen:
+                            if (
+                                candidate_stream_reducer
+                                .required_passing_cohort_complete
+                            ):
+                                break
+                            total_materialized_candidate_count += 1
+                            (
+                                blocked_path_edges,
+                                preflight_repairs,
+                                preflight_evidence_change_count,
+                            ) = (
+                                lazy_preflight_regenerated_candidate(
+                                    materialized
+                                )
+                            )
+                            round_payload[
+                                "preflight_evidence_change_count"
+                            ] = int(
+                                round_payload.get(
+                                    "preflight_evidence_change_count",
+                                    0,
+                                )
+                            ) + preflight_evidence_change_count
+                            if blocked_path_edges:
+                                reject_preflight_blocked_candidate(
+                                    materialized,
+                                    blocked_path_edges,
+                                )
+                                continue
+                            # Geometry-proof-only edges remain admitted. The
+                            # exact +/-8 repaired plan is the full derivation
+                            # input; it must not be discarded and remeasured at
+                            # the narrower default radius.
+                            derive_and_gate_candidate(
+                                materialized,
+                                precomputed_boundary_repairs=(
+                                    preflight_repairs
+                                ),
+                            )
+                        blocked_after = _optimizer_blocked_set_for_contexts(
+                            splice_feasibility_graph,
+                            constraint_optimizer_context_keys,
+                        )
+                        round_payload.update(
+                            {
+                                "blocked_edge_count_after": len(
+                                    blocked_after
+                                ),
+                                "new_blocked_edge_count": len(
+                                    set(blocked_after.edges).difference(
+                                        blocked_before.edges
+                                    )
+                                ),
+                                "fixed_point": bool(
+                                    blocked_after == blocked_before
+                                    and not candidate_stream_reducer
+                                    .required_passing_cohort_complete
+                                ),
+                            }
+                        )
+                        constraint_reoptimization_rounds.append(
+                            round_payload
+                        )
+                        if (
+                            candidate_stream_reducer
+                            .required_passing_cohort_complete
+                        ):
+                            constraint_reoptimization_termination_reason = (
+                                "exact_eight_complete"
+                            )
+                            persist_candidate_stream_progress()
+                            return
+                        if blocked_after == blocked_before:
+                            constraint_reoptimization_fixed_point = True
+                            constraint_reoptimization_termination_reason = (
+                                "deterministic_path_fixed_point"
+                            )
+                            persist_candidate_stream_progress(
+                                status=(
+                                    "candidate_stream_constraint_fixed_point"
+                                )
+                            )
+                            return
+                        persist_candidate_stream_progress()
 
                 def try_local_source_repair(
                     *,
@@ -24613,127 +27093,94 @@ def analyze(
                         total_materialized_candidate_count += 1
                         derive_and_gate_candidate(materialized)
 
-                for materialized in materialized_group_candidates:
-                    derive_and_gate_candidate(materialized)
-                    try_local_source_repair(
-                        trigger_stage="initial_stream_recurring_boundary",
-                        minimum_recurring_boundary_support=2,
+                def abort_boundary_search_budget(
+                    exc: _BoundarySearchBudgetExhausted,
+                ) -> None:
+                    nonlocal constraint_reoptimization_termination_reason
+                    constraint_reoptimization_termination_reason = (
+                        "audited_boundary_search_budget_exhausted"
                     )
-                    if candidate_stream_reducer.required_passing_cohort_complete:
-                        break
+                    constraint_reoptimization_rounds.append(
+                        {
+                            "round_index": len(
+                                constraint_reoptimization_rounds
+                            ),
+                            "resource_limit_reached": True,
+                            "resource": "decoded_boundary_search",
+                            "budget_exhaustion": deepcopy(exc.payload),
+                            "fixed_point": False,
+                            "thresholds_lowered": False,
+                            "production_use_forbidden": True,
+                        }
+                    )
+                    persist_candidate_stream_progress(
+                        status=(
+                            "candidate_stream_constraint_boundary_search_"
+                            "budget_incomplete"
+                        )
+                    )
+                    raise RuntimeError(
+                        "ordinary candidate boundary-search budget exhausted; "
+                        "progress was persisted and production use is forbidden"
+                    ) from exc
 
-                try_local_source_repair(
-                    trigger_stage="initial_stream_complete",
-                    minimum_recurring_boundary_support=2,
-                )
+                if splice_feasibility_graph is not None:
+                    try:
+                        initial_constraint_stream_audit = (
+                            _run_initial_edge_constrained_stream(
+                                materialized_group_candidates,
+                                preflight=lambda candidate: (
+                                    lazy_preflight_regenerated_candidate(
+                                        candidate,
+                                        assess_unseen_edges=False,
+                                    )
+                                ),
+                                derive=lambda candidate, repairs: (
+                                    derive_and_gate_candidate(
+                                        candidate,
+                                        precomputed_boundary_repairs=repairs,
+                                    )
+                                ),
+                                reject=reject_preflight_blocked_candidate,
+                                should_stop=lambda: (
+                                    candidate_stream_reducer
+                                    .required_passing_cohort_complete
+                                ),
+                            )
+                        )
+                    except _BoundarySearchBudgetExhausted as exc:
+                        abort_boundary_search_budget(exc)
+                else:
+                    for materialized in materialized_group_candidates:
+                        derive_and_gate_candidate(materialized)
+                        if (
+                            candidate_stream_reducer
+                            .required_passing_cohort_complete
+                        ):
+                            break
 
                 if (
                     not candidate_stream_reducer.required_passing_cohort_complete
                     and stage_edit_visual_candidate_batch is None
                 ):
-                    checkpoint_recovery_active = bool(
-                        checkpoint_materialized_candidate_order
+                    reporter.log(
+                        "일반 후보 순차 스캔·donor splice를 중단하고 "
+                        "실측 경계 증거 no-good를 DP에 되먹임"
                     )
-                    if checkpoint_recovery_active:
-                        repair_eligible_candidate_count = sum(
-                            item.candidate_index
-                            not in attempted_candidate_indices
-                            and _is_boundary_repair_candidate(item)
-                            for item in ordered_recovery_candidates
-                        )
-                    for materialized in ordered_recovery_candidates:
-                        if candidate_stream_reducer.required_passing_cohort_complete:
-                            break
-                        if (
-                            materialized.candidate_index
-                            in attempted_candidate_indices
-                        ):
-                            continue
-                        crop_aware_structure_recovery_attempted_count += 1
-                        if (
-                            checkpoint_recovery_active
-                            and _is_boundary_repair_candidate(materialized)
-                        ):
-                            repair_eligible_attempted_count += 1
-                            repair_eligible_materialized_count += 1
-                        total_materialized_candidate_count += 1
-                        derive_and_gate_candidate(materialized)
-                    recovery_record_order = (
-                        stage_edit_candidate_rerank_result.ordered_records(
-                            visual_candidate_set
-                        )
-                        if stage_edit_candidate_rerank_result is not None
-                        and visual_candidate_set is not None
-                        else (
-                            visual_candidate_set.role_conditioned_ranked_candidates
-                            if visual_candidate_set is not None
-                            else ()
-                        )
-                    )
-                    repair_eligible_records = tuple(
-                        record
-                        for record in recovery_record_order
-                        if record.candidate_index not in attempted_candidate_indices
-                        and _is_boundary_repair_candidate(record)
-                    )
-                    repair_eligible_candidate_count = len(
-                        repair_eligible_records
-                    )
-                    if repair_eligible_records:
-                        reporter.log(
-                            "사전 초점·대형 경계만 탈락한 후보를 디코딩 경계 수선 후 "
-                            "최종 구조 QA로 재검증"
-                        )
-                    for record in repair_eligible_records:
-                        if candidate_stream_reducer.required_passing_cohort_complete:
-                            break
-                        repair_eligible_attempted_count += 1
-                        try:
-                            materialized = (
-                                materialize_visual_timeline_candidate_record(
-                                    visual_candidate_set,
-                                    record,
-                                )
-                            )
-                        except (ValueError, cv2.error) as exc:
-                            candidate_derivation_failures.append(
-                                {
-                                    "candidate_index": record.candidate_index,
-                                    "review_rank": record.review_rank,
-                                    "stage": "repair_eligible_materialization",
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                }
-                            )
-                            attempted_candidate_indices.add(
-                                record.candidate_index
-                            )
-                            candidate_stream_reducer.apply(
-                                TerminalCandidateVerdict(
-                                    record.candidate_index,
-                                    CandidateVerdictStatus.DERIVATION_REJECTED,
-                                    (
-                                        CandidateBlocker(
-                                            CandidateBlockerKind.DERIVATION,
-                                            (
-                                                "repair_eligible_"
-                                                "materialization_failed"
-                                            ),
-                                            f"{type(exc).__name__}: {exc}",
-                                        ),
-                                    ),
-                                )
-                            )
-                            persist_candidate_stream_progress()
-                            continue
-                        repair_eligible_materialized_count += 1
-                        total_materialized_candidate_count += 1
-                        derive_and_gate_candidate(materialized)
+                    try:
+                        run_constraint_reoptimization()
+                    except _BoundarySearchBudgetExhausted as exc:
+                        abort_boundary_search_budget(exc)
 
-                try_local_source_repair(
-                    trigger_stage="ordinary_recovery_recurring_boundary",
-                    minimum_recurring_boundary_support=2,
-                )
-
+                if (
+                    stage_edit_visual_candidate_batch is None
+                    and candidate_stream_reducer
+                    .required_passing_cohort_complete
+                    and constraint_reoptimization_termination_reason is None
+                ):
+                    constraint_reoptimization_termination_reason = (
+                        "initial_stream_exact_eight"
+                    )
                 materialized_group_candidates = tuple(
                     attempted_materialized_candidates
                 )
@@ -24813,6 +27260,9 @@ def analyze(
                         ),
                         "candidate_stream_verdicts": (
                             candidate_stream_reducer.to_dict()
+                        ),
+                        "constraint_reoptimization": (
+                            constraint_reoptimization_payload()
                         ),
                         "complete_candidate_count": complete_candidate_count,
                         "exact_complete_candidate_count_satisfied": False,
@@ -25228,6 +27678,9 @@ def analyze(
                     "candidate_stream_verdicts": (
                         candidate_stream_reducer.to_dict()
                     ),
+                    "constraint_reoptimization": (
+                        constraint_reoptimization_payload()
+                    ),
                     "exact_successful_decoded_review_count_satisfied": (
                         rendered_selection.passing_candidate_count == 8
                     ),
@@ -25423,6 +27876,11 @@ def analyze(
                     source_look_match=source_look_match_result,
                     boundary_look_measurement_cache=(
                         boundary_look_measurement_cache
+                    ),
+                    boundary_descriptor_cache=boundary_descriptor_cache,
+                    splice_feasibility_graph=splice_feasibility_graph,
+                    boundary_search_budget=(
+                        constraint_boundary_search_budget
                     ),
                     professional_reference_profile=(
                         professional_reference_profile

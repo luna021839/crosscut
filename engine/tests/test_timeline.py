@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -8,6 +9,7 @@ from crosscut.ive import EditMode
 from crosscut.pose import FormationPersonDescriptor
 from crosscut.timeline import (
     BoundarySideStability,
+    INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
     ShotType,
     TimelineCandidate,
     TimelineConfig,
@@ -18,6 +20,7 @@ from crosscut.timeline import (
     formation_assignment_mismatch,
     select_timeline,
     select_timeline_candidates,
+    timeline_transition_hard_gates_admit,
 )
 from crosscut.vision import (
     CameraFallback,
@@ -510,6 +513,41 @@ class TimelineOptimisationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source_switch_bonus"):
             TimelineConfig(source_switch_bonus=-0.01)
 
+    def test_source_switch_bonus_override_targets_one_music_segment(self) -> None:
+        segments = [
+            [
+                candidate(index, "A", 1.0),
+                candidate(index, "B", 0.96),
+            ]
+            for index in range(4)
+        ]
+
+        result = select_timeline(
+            segments,
+            config=continuity_gate_config(source_switch_bonus=0.0),
+            source_switch_bonus_by_segment={2: 0.06},
+        )
+
+        self.assertEqual(
+            [item.source_id for item in result.candidates],
+            ["A", "A", "B", "A"],
+        )
+        self.assertAlmostEqual(result.choices[2].transition_score, 0.06)
+        self.assertAlmostEqual(result.choices[3].transition_score, 0.0)
+
+    def test_source_switch_bonus_override_is_strictly_validated(self) -> None:
+        segments = [[candidate(0, "A", 1.0)]]
+        with self.assertRaisesRegex(ValueError, "timeline segment indices"):
+            select_timeline(
+                segments,
+                source_switch_bonus_by_segment={1: 0.1},
+            )
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            select_timeline(
+                segments,
+                source_switch_bonus_by_segment={0: -0.1},
+            )
+
     def test_adaptive_source_cap_rotates_a_nine_segment_edit(self) -> None:
         segments = [
             [
@@ -798,6 +836,11 @@ class TimelineOptimisationTests(unittest.TestCase):
                 segments,
                 emission_adjustments={(0, "A"): 0.1},
             )
+        with self.assertRaisesRegex(ValueError, "non-positive"):
+            select_timeline_candidates(
+                segments,
+                emission_adjustments={(0, "A"): 0.1},
+            )
 
     def test_coverage_preferences_rematch_an_unavailable_final_slot(self) -> None:
         source_ids = tuple(str(index) for index in range(9))
@@ -946,6 +989,73 @@ class TimelineOptimisationTests(unittest.TestCase):
         )
 
         self.assertEqual([item.source_id for item in result.candidates], ["A", "A"])
+
+    def test_phrase_anchor_allows_only_pose_proven_bounded_scale_contrast(
+        self,
+    ) -> None:
+        outgoing = candidate(
+            0,
+            "A",
+            0.5,
+            exit_shot_scale=0.10,
+            exit_structure_embedding=(0.0, 0.0, 0.0),
+            exit_silhouette_embedding=(0.0, 0.0, 0.0),
+            exit_person_layout_embedding=(0.0, 0.0, 0.0),
+        )
+        safe_anchor = candidate(
+            1,
+            "B",
+            0.5,
+            entry_shot_scale=0.68,
+            entry_structure_embedding=(0.10, 0.10, 0.10),
+            entry_silhouette_embedding=(0.10, 0.10, 0.10),
+            entry_person_layout_embedding=(0.10, 0.10, 0.10),
+            intentional_transition_anchor_basis=(
+                INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS
+            ),
+        )
+        config = continuity_gate_config(
+            maximum_cross_source_scale_delta=0.20,
+            maximum_cross_source_layout_mismatch=0.32,
+            maximum_cross_source_silhouette_mismatch=0.36,
+            require_cross_source_visual_evidence=True,
+            allow_intentional_phrase_anchor_transitions=True,
+        )
+
+        self.assertTrue(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                safe_anchor,
+                config=config,
+            )
+        )
+        self.assertFalse(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                replace(
+                    safe_anchor,
+                    intentional_transition_anchor_basis=None,
+                ),
+                config=config,
+            )
+        )
+        self.assertFalse(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                replace(
+                    safe_anchor,
+                    entry_structure_embedding=(0.26, 0.26, 0.26),
+                ),
+                config=config,
+            )
+        )
+        self.assertFalse(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                replace(safe_anchor, entry_shot_scale=0.75),
+                config=config,
+            )
+        )
 
     def test_closeup_gate_uses_boundary_shot_types(self) -> None:
         segments = [
@@ -1369,15 +1479,30 @@ class TimelineOptimisationTests(unittest.TestCase):
 
         mismatch = cross_source_layout_mismatch(outgoing, tempting_switch)
         self.assertAlmostEqual(mismatch or 0.0, 0.6039453493532286)
+        gate_config = continuity_gate_config(
+            maximum_cross_source_layout_mismatch=0.32,
+            require_cross_source_visual_evidence=True,
+        )
         result = select_timeline(
             ((outgoing,), (same_source, tempting_switch)),
-            config=continuity_gate_config(
-                maximum_cross_source_layout_mismatch=0.32,
-                require_cross_source_visual_evidence=True,
-            ),
+            config=gate_config,
         )
 
         self.assertEqual([item.source_id for item in result.candidates], ["A", "A"])
+        self.assertTrue(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                same_source,
+                config=gate_config,
+            )
+        )
+        self.assertFalse(
+            timeline_transition_hard_gates_admit(
+                outgoing,
+                tempting_switch,
+                config=gate_config,
+            )
+        )
 
     def test_incomplete_subject_bbox_remains_missing_layout_evidence(self) -> None:
         outgoing = candidate(

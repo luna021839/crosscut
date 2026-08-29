@@ -10,12 +10,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
+import json
 from math import ceil, isfinite, log, pi, sqrt
 from typing import Mapping, Sequence
 
 from .face_identity import cosine_similarity
 from .ive import EditMode, IVEMember
 from .pose import FormationPersonDescriptor
+from .timeline_no_good import (
+    TimelineNoGoodEdgeKey,
+    TimelineNoGoodSet,
+    build_timeline_no_good_edge_key,
+)
 
 
 def _score(value: float, name: str) -> float:
@@ -30,6 +37,50 @@ class TimelineMode(str, Enum):
     MEMBER = "member"
 
 
+class NoCompleteTimelinePath(ValueError):
+    """Typed, structured exhaustion of the constrained timeline graph."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str,
+        segment_index: int | None = None,
+        rejection_counts: Mapping[str, int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.segment_index = segment_index
+        self.rejection_counts = dict(sorted((rejection_counts or {}).items()))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reason_code": self.reason_code,
+            "segment_index": self.segment_index,
+            "rejection_counts": dict(self.rejection_counts),
+            "message": str(self),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TimelineNoGoodConstraintIndex:
+    """One-time validation of no-goods against an immutable candidate lattice."""
+
+    lattice_identity: str
+    no_goods: TimelineNoGoodSet
+
+    def assert_matches(
+        self,
+        candidates_by_segment: Sequence[Sequence["TimelineCandidate"]],
+    ) -> None:
+        if self.lattice_identity != _timeline_lattice_identity(
+            candidates_by_segment
+        ):
+            raise ValueError(
+                "compiled no-good constraints belong to a different timeline lattice"
+            )
+
+
 class ShotType(str, Enum):
     GROUP_WIDE = "group_wide"
     WIDE = "wide"
@@ -41,6 +92,89 @@ BOUNDARY_SIDE_MAX_SCALE_DELTA = 0.20
 BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH = 0.34
 BOUNDARY_SIDE_MAX_POSE_MISMATCH = 0.42
 BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH = 0.34
+
+# Ordinary cuts still use the strict production continuity gates below.  Human
+# stage edits also make deliberate wide/close or reframed-face contrasts at
+# phrase anchors, so one explicitly authored anchor may exceed only scale and
+# focus when pose, screen layout, and silhouette all prove continuity.  The
+# alternate scale ceiling stays just below the observed human-reference
+# silhouette-scale p75 (~0.64); this is not a global gate relaxation.
+PRODUCTION_MAX_SCALE_MISMATCH = 0.20
+PRODUCTION_MAX_FOCUS_MISMATCH = 0.24
+PRODUCTION_MAX_LAYOUT_MISMATCH = 0.32
+PRODUCTION_MAX_SILHOUETTE_MISMATCH = 0.36
+PRODUCTION_MAX_FORMATION_MISMATCH = 0.30
+PRODUCTION_MAX_POSE_MISMATCH = 0.42
+INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS = (
+    "human_reference_highlight_phrase_anchor_pose_layout_v1"
+)
+INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH = 0.62
+INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH = 0.40
+INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH = 0.18
+
+
+def intentional_phrase_anchor_authorized_mismatches(
+    *,
+    anchor_basis: str | None,
+    scale_mismatch: float | None,
+    focus_mismatch: float | None,
+    layout_mismatch: float | None,
+    silhouette_mismatch: float | None,
+    formation_mismatch: float | None,
+    pose_mismatch: float | None,
+) -> tuple[str, ...]:
+    """Return the only ordinary-gate mismatches one authored anchor may waive.
+
+    Missing continuity evidence fails closed.  Layout, silhouette, formation,
+    pose, scene-cut proximity, close-up identity, and same-side stability are
+    never waived; only a bounded scale and/or focus contrast can be authored.
+    """
+
+    if anchor_basis != INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS:
+        return ()
+    values = (
+        scale_mismatch,
+        focus_mismatch,
+        layout_mismatch,
+        silhouette_mismatch,
+        formation_mismatch,
+        pose_mismatch,
+    )
+    if any(value is not None and not isfinite(float(value)) for value in values):
+        return ()
+    if (
+        layout_mismatch is None
+        or silhouette_mismatch is None
+        or pose_mismatch is None
+        or layout_mismatch > PRODUCTION_MAX_LAYOUT_MISMATCH
+        or silhouette_mismatch > PRODUCTION_MAX_SILHOUETTE_MISMATCH
+        or pose_mismatch > INTENTIONAL_PHRASE_ANCHOR_MAX_POSE_MISMATCH
+        or (
+            formation_mismatch is not None
+            and formation_mismatch > PRODUCTION_MAX_FORMATION_MISMATCH
+        )
+        or (
+            scale_mismatch is not None
+            and scale_mismatch > INTENTIONAL_PHRASE_ANCHOR_MAX_SCALE_MISMATCH
+        )
+        or (
+            focus_mismatch is not None
+            and focus_mismatch > INTENTIONAL_PHRASE_ANCHOR_MAX_FOCUS_MISMATCH
+        )
+    ):
+        return ()
+    authorized: list[str] = []
+    if (
+        scale_mismatch is not None
+        and scale_mismatch > PRODUCTION_MAX_SCALE_MISMATCH
+    ):
+        authorized.append("scale")
+    if (
+        focus_mismatch is not None
+        and focus_mismatch > PRODUCTION_MAX_FOCUS_MISMATCH
+    ):
+        authorized.append("focus")
+    return tuple(authorized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +295,7 @@ class TimelineCandidate:
     exit_shot_type: ShotType | str | None = None
     entry_scene_cut_near: bool = False
     exit_scene_cut_near: bool = False
+    intentional_transition_anchor_basis: str | None = None
     internal_scene_cut_master_seconds: tuple[float, ...] = ()
     entry_boundary_side_stability: BoundarySideStability | None = None
     exit_boundary_side_stability: BoundarySideStability | None = None
@@ -247,6 +382,11 @@ class TimelineCandidate:
             self.exit_scene_cut_near, bool
         ):
             raise ValueError("scene-cut proximity flags must be booleans")
+        if self.intentional_transition_anchor_basis not in {
+            None,
+            INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS,
+        }:
+            raise ValueError("intentional transition anchor basis is invalid")
         internal_cut_times = tuple(
             float(value) for value in self.internal_scene_cut_master_seconds
         )
@@ -437,6 +577,7 @@ class TimelineConfig:
     maximum_cross_source_silhouette_mismatch: float | None = None
     minimum_cross_source_face_similarity: float | None = None
     require_cross_source_visual_evidence: bool = False
+    allow_intentional_phrase_anchor_transitions: bool = False
     maximum_boundary_side_scale_delta: float | None = None
     maximum_boundary_side_structure_mismatch: float | None = None
     maximum_boundary_side_pose_mismatch: float | None = None
@@ -528,8 +669,14 @@ class TimelineConfig:
             raise ValueError(
                 "minimum_cross_source_face_similarity must be cosine similarity or None"
             )
-        if not isinstance(self.require_cross_source_visual_evidence, bool) or not isinstance(
-            self.require_cross_source_boundary_side_stability, bool
+        if (
+            not isinstance(self.require_cross_source_visual_evidence, bool)
+            or not isinstance(
+                self.require_cross_source_boundary_side_stability, bool
+            )
+            or not isinstance(
+                self.allow_intentional_phrase_anchor_transitions, bool
+            )
         ):
             raise ValueError("cross-source evidence requirements must be booleans")
         _score(self.minimum_member_confidence, "minimum_member_confidence")
@@ -1355,6 +1502,48 @@ def _cross_source_transition_rejection_reasons(
             > config.maximum_cross_source_silhouette_mismatch
         ):
             reasons.append("silhouette")
+    previous_pose = (
+        previous.exit_pose_embedding
+        if previous_has_boundary_descriptor
+        else previous.pose_embedding
+    )
+    current_pose = (
+        current.entry_pose_embedding
+        if current_has_boundary_descriptor
+        else current.pose_embedding
+    )
+    pose_mismatch = _optional_normalised_distance(previous_pose, current_pose)
+    if pose_mismatch is None:
+        previous_structure = (
+            previous.exit_structure_embedding
+            if previous_has_boundary_descriptor
+            else previous.structure_embedding
+        )
+        current_structure = (
+            current.entry_structure_embedding
+            if current_has_boundary_descriptor
+            else current.structure_embedding
+        )
+        pose_mismatch = _optional_normalised_distance(
+            previous_structure,
+            current_structure,
+        )
+    if config.allow_intentional_phrase_anchor_transitions:
+        authorized = intentional_phrase_anchor_authorized_mismatches(
+            anchor_basis=current.intentional_transition_anchor_basis,
+            scale_mismatch=scale_delta,
+            focus_mismatch=focus_mismatch,
+            layout_mismatch=layout_mismatch,
+            silhouette_mismatch=silhouette_mismatch,
+            formation_mismatch=formation_mismatch,
+            pose_mismatch=pose_mismatch,
+        )
+        if "scale" in authorized:
+            reasons = [reason for reason in reasons if reason != "scale_delta"]
+        if "focus" in authorized:
+            reasons = [
+                reason for reason in reasons if reason != "focus_geometry"
+            ]
     if not evidence_available and config.require_cross_source_visual_evidence:
         reasons.append("missing_visual_evidence")
     return tuple(reasons)
@@ -1596,6 +1785,27 @@ def _transition_score(
     return (score, run_length)
 
 
+def timeline_transition_hard_gates_admit(
+    previous: TimelineCandidate,
+    current: TimelineCandidate,
+    *,
+    config: TimelineConfig | None = None,
+) -> bool:
+    """Return whether one edge survives the selector's visual hard gates.
+
+    Hold length only changes a soft early-cut/continuity score, so a fixed
+    admitted run length is sufficient for graph reachability diagnostics.
+    """
+
+    settings = config or TimelineConfig()
+    return _transition_score(
+        previous,
+        current,
+        max(1, settings.minimum_hold_segments),
+        settings,
+    ) is not None
+
+
 def _normalise_segments(
     candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
     | Sequence[Sequence[TimelineCandidate]],
@@ -1628,6 +1838,79 @@ def _normalise_segments(
     if indices != list(range(indices[0], indices[0] + len(indices))):
         raise ValueError("candidate groups must be ordered by contiguous segment_index")
     return groups
+
+
+def _timeline_lattice_identity(
+    candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
+    | Sequence[Sequence[TimelineCandidate]],
+) -> str:
+    segments = _normalise_segments(candidates_by_segment)
+    payload = {
+        "contract": "timeline_no_good_candidate_lattice_v1",
+        "segments": [
+            {
+                "segment_index": segment[0].segment_index,
+                "start_seconds": segment[0].start_seconds,
+                "end_seconds": segment[0].end_seconds,
+                "candidate_edges": [
+                    {
+                        "source_id": candidate.source_id,
+                        "shot_id": candidate.shot_id,
+                    }
+                    for candidate in segment
+                ],
+            }
+            for segment in segments
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compile_timeline_no_good_constraint_index(
+    candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
+    | Sequence[Sequence[TimelineCandidate]],
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
+) -> TimelineNoGoodConstraintIndex:
+    """Validate exact no-goods against a lattice once per optimizer round."""
+
+    segments = _normalise_segments(candidates_by_segment)
+    no_goods = (
+        forbidden_boundary_edges
+        if isinstance(forbidden_boundary_edges, TimelineNoGoodSet)
+        else TimelineNoGoodSet(tuple(forbidden_boundary_edges))
+    )
+    if no_goods:
+        graph_edges = {
+            build_timeline_no_good_edge_key(
+                boundary_index,
+                outgoing,
+                incoming,
+            )
+            for boundary_index, (outgoing_group, incoming_group) in enumerate(
+                zip(segments, segments[1:])
+            )
+            for outgoing in outgoing_group
+            for incoming in incoming_group
+        }
+        unknown_no_goods = tuple(edge for edge in no_goods if edge not in graph_edges)
+        if unknown_no_goods:
+            raise ValueError(
+                "forbidden boundary edge does not belong to the current "
+                f"timeline graph: {unknown_no_goods[0].to_dict()}"
+            )
+    return TimelineNoGoodConstraintIndex(
+        lattice_identity=_timeline_lattice_identity(segments),
+        no_goods=no_goods,
+    )
 
 
 def _resolved_preferred_sources(
@@ -1734,6 +2017,11 @@ def select_timeline(
     config: TimelineConfig | None = None,
     preferred_source_ids: Sequence[str | None] | None = None,
     emission_adjustments: Mapping[tuple[int, str], float] | None = None,
+    source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
+    compiled_no_good_constraints: TimelineNoGoodConstraintIndex | None = None,
 ) -> TimelineResult:
     """Select one candidate per segment with global DP/Viterbi optimisation.
 
@@ -1758,6 +2046,34 @@ def select_timeline(
         raise ValueError("target_member is required in member mode")
     settings = config or TimelineConfig()
     segments = _normalise_segments(candidates_by_segment)
+    supplied_no_goods = (
+        forbidden_boundary_edges
+        if isinstance(forbidden_boundary_edges, TimelineNoGoodSet)
+        else TimelineNoGoodSet(tuple(forbidden_boundary_edges))
+    )
+    if compiled_no_good_constraints is None:
+        compiled_constraints = compile_timeline_no_good_constraint_index(
+            segments,
+            supplied_no_goods,
+        )
+    else:
+        if not isinstance(
+            compiled_no_good_constraints,
+            TimelineNoGoodConstraintIndex,
+        ):
+            raise TypeError(
+                "compiled_no_good_constraints must be a "
+                "TimelineNoGoodConstraintIndex"
+            )
+        compiled_no_good_constraints.assert_matches(segments)
+        if supplied_no_goods and (
+            supplied_no_goods != compiled_no_good_constraints.no_goods
+        ):
+            raise ValueError(
+                "compiled and supplied timeline no-good constraints disagree"
+            )
+        compiled_constraints = compiled_no_good_constraints
+    no_goods = compiled_constraints.no_goods
     if settings.maximum_same_source_hold_seconds is not None:
         oversized_segment = next(
             (
@@ -1787,6 +2103,28 @@ def select_timeline(
             )
         if not isfinite(float(value)) or float(value) > 0.0:
             raise ValueError("emission adjustments must be finite non-positive values")
+    switch_bonus_overrides = dict(source_switch_bonus_by_segment or {})
+    valid_segment_indices = {
+        segment[0].segment_index for segment in segments
+    }
+    for segment_index, value in switch_bonus_overrides.items():
+        if (
+            isinstance(segment_index, bool)
+            or not isinstance(segment_index, int)
+            or segment_index not in valid_segment_indices
+        ):
+            raise ValueError(
+                "source-switch bonus override keys must be timeline segment indices"
+            )
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(
+                "source-switch bonus overrides must be finite and non-negative"
+            )
     ordered_source_ids = tuple(
         sorted({candidate.source_id for segment in segments for candidate in segment})
     )
@@ -1894,6 +2232,13 @@ def select_timeline(
                 segment_position
             ].items():
                 current_candidate = current_segment[current_index]
+                if no_goods and build_timeline_no_good_edge_key(
+                    segment_position - 1,
+                    previous_candidate,
+                    current_candidate,
+                ) in no_goods:
+                    record_rejection("exact_boundary_no_good")
+                    continue
                 transition_result = _transition_score(
                     previous_candidate,
                     current_candidate,
@@ -1991,7 +2336,14 @@ def select_timeline(
                 # hard gate.  Same-source shot changes are internal cuts and
                 # deliberately receive no source-switch cadence bonus.
                 cadence_score = (
-                    settings.source_switch_bonus if not same_source else 0.0
+                    float(
+                        switch_bonus_overrides.get(
+                            current_candidate.segment_index,
+                            settings.source_switch_bonus,
+                        )
+                    )
+                    if not same_source
+                    else 0.0
                 )
                 if (
                     same_source
@@ -2048,10 +2400,13 @@ def select_timeline(
                 f"{reason}:{count}"
                 for reason, count in sorted(rejection_counts.items())
             ) or "unknown:0"
-            raise ValueError(
+            raise NoCompleteTimelinePath(
                 f"segment {current_segment[0].segment_index} has no "
                 "cadence-safe candidate; rejection_counts="
-                f"{rejection_summary}"
+                f"{rejection_summary}",
+                reason_code="cadence_state_graph_exhausted",
+                segment_index=current_segment[0].segment_index,
+                rejection_counts=rejection_counts,
             )
         layers.append(current_layer)
 
@@ -2103,6 +2458,12 @@ def select_timeline_candidates(
     maximum_results: int = 8,
     diversity_penalty: float = 0.10,
     minimum_hamming_fraction: float = 0.035,
+    emission_adjustments: Mapping[tuple[int, str], float] | None = None,
+    source_switch_bonus_by_segment: Mapping[int, float] | None = None,
+    forbidden_boundary_edges: (
+        TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
+    ) = (),
+    compiled_no_good_constraints: TimelineNoGoodConstraintIndex | None = None,
 ) -> tuple[TimelineResult, ...]:
     """Generate several globally safe, meaningfully different edit paths.
 
@@ -2127,21 +2488,71 @@ def select_timeline_candidates(
     ):
         raise ValueError("minimum_hamming_fraction must be between zero and one")
 
-    adjustments: dict[tuple[int, str], float] = {}
+    segments = _normalise_segments(candidates_by_segment)
+    supplied_no_goods = (
+        forbidden_boundary_edges
+        if isinstance(forbidden_boundary_edges, TimelineNoGoodSet)
+        else TimelineNoGoodSet(tuple(forbidden_boundary_edges))
+    )
+    if compiled_no_good_constraints is None:
+        compiled_constraints = compile_timeline_no_good_constraint_index(
+            segments,
+            supplied_no_goods,
+        )
+    else:
+        if not isinstance(
+            compiled_no_good_constraints,
+            TimelineNoGoodConstraintIndex,
+        ):
+            raise TypeError(
+                "compiled_no_good_constraints must be a "
+                "TimelineNoGoodConstraintIndex"
+            )
+        compiled_no_good_constraints.assert_matches(segments)
+        if supplied_no_goods and (
+            supplied_no_goods != compiled_no_good_constraints.no_goods
+        ):
+            raise ValueError(
+                "compiled and supplied timeline no-good constraints disagree"
+            )
+        compiled_constraints = compiled_no_good_constraints
+
+    # Preserve the caller's role-conditioned soft penalties on every search
+    # pass, then accumulate only the deterministic diversity penalty locally.
+    # ``select_timeline`` validates that all values are non-positive and that
+    # switch-bonus overrides are finite, non-negative, and segment-bound.
+    adjustments: dict[tuple[int, str], float] = dict(
+        emission_adjustments or {}
+    )
     results: list[TimelineResult] = []
     signatures: list[tuple[str, ...]] = []
     attempts = 0
     maximum_attempts = maximum_results * 4
     while len(results) < maximum_results and attempts < maximum_attempts:
         attempts += 1
-        result = select_timeline(
-            candidates_by_segment,
-            mode=mode,
-            target_member=target_member,
-            config=config,
-            preferred_source_ids=preferred_source_ids,
-            emission_adjustments=adjustments,
-        )
+        try:
+            result = select_timeline(
+                segments,
+                mode=mode,
+                target_member=target_member,
+                config=config,
+                preferred_source_ids=preferred_source_ids,
+                emission_adjustments=adjustments,
+                source_switch_bonus_by_segment=(
+                    source_switch_bonus_by_segment
+                ),
+                compiled_no_good_constraints=compiled_constraints,
+            )
+        except NoCompleteTimelinePath:
+            # Diversity penalties deliberately perturb emissions after each
+            # accepted path.  They can make a later search infeasible under
+            # hard cadence constraints even though earlier results remain
+            # valid for the unchanged candidate lattice.  Exhaustion therefore
+            # terminates only the alternate search; it must not erase already
+            # proven paths.  The first-pass exception still propagates.
+            if results:
+                break
+            raise
         signature = tuple(candidate.source_id for candidate in result.candidates)
         minimum_distance = max(1, ceil(len(signature) * minimum_hamming_fraction))
         sufficiently_different = all(
@@ -2165,7 +2576,10 @@ def select_timeline_candidates(
             adjustments[key] = adjustments.get(key, 0.0) - phased_penalty
 
     if not results:
-        raise ValueError("timeline candidate generation produced no result")
+        raise NoCompleteTimelinePath(
+            "timeline candidate generation produced no result",
+            reason_code="timeline_candidate_generation_empty",
+        )
     return tuple(results)
 
 
@@ -2178,18 +2592,29 @@ __all__ = [
     "BOUNDARY_SIDE_MAX_SCALE_DELTA",
     "BOUNDARY_SIDE_MAX_SHOT_TYPE_MISMATCH",
     "BOUNDARY_SIDE_MAX_STRUCTURE_MISMATCH",
+    "INTENTIONAL_PHRASE_ANCHOR_TRANSITION_BASIS",
+    "PRODUCTION_MAX_FOCUS_MISMATCH",
+    "PRODUCTION_MAX_FORMATION_MISMATCH",
+    "PRODUCTION_MAX_LAYOUT_MISMATCH",
+    "PRODUCTION_MAX_POSE_MISMATCH",
+    "PRODUCTION_MAX_SCALE_MISMATCH",
+    "PRODUCTION_MAX_SILHOUETTE_MISMATCH",
     "BoundarySideStability",
+    "NoCompleteTimelinePath",
     "ShotType",
     "TimelineCandidate",
     "TimelineChoice",
     "TimelineConfig",
+    "TimelineNoGoodConstraintIndex",
     "TimelineMode",
     "TimelineResult",
     "boundary_side_stability_exceeded",
     "comparable_group_formation_mismatch",
+    "compile_timeline_no_good_constraint_index",
     "cross_source_layout_mismatch",
     "face_geometry_minimax_mismatch",
     "formation_assignment_mismatch",
+    "intentional_phrase_anchor_authorized_mismatches",
     "optimize_timeline",
     "screen_layout_mismatch",
     "select_timeline",
