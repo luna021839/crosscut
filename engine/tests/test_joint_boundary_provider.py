@@ -20,6 +20,7 @@ from crosscut.joint_timeline import (
     AuthorizedBoundaryOption,
     BoundaryMeasurementKey,
     BoundaryOffsetDisposition,
+    BoundaryOptionEvidenceScope,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
     SegmentBridgeProof,
@@ -574,6 +575,69 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
                 and option.scoring_incoming.entry_shot_scale == 0.4
                 for option in options.authorized_options
             )
+        )
+
+    def test_selection_options_defer_outer_proofs_until_exact_rehydration(
+        self,
+    ) -> None:
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5),
+        )
+
+        selection_set = provider.selection_options(_key())
+        self.assertIs(
+            selection_set.evidence_scope,
+            BoundaryOptionEvidenceScope.SELECTION_SCALAR,
+        )
+        provisional = selection_set.audit_for(0).authorized_option
+        assert provisional is not None
+        selection_audit = provider.to_dict()["selection_options"]
+        self.assertEqual(
+            selection_audit["evidence_scope"],
+            BoundaryOptionEvidenceScope.SELECTION_SCALAR.value,
+        )
+        self.assertEqual(selection_audit["measurement_count"], 1)
+        self.assertEqual(provider.measurement_count, 0)
+        self.assertEqual(provider.to_dict()["outer_track_audits"], [])
+        self.assertEqual(provider.to_dict()["materialization_proof_count"], 0)
+        self.assertEqual(
+            provider.to_dict()["segment_materialization_proof_count"],
+            0,
+        )
+
+        rehydrated = provider.rehydrate_selection_option(provisional)
+        self.assertIsNotNone(rehydrated)
+        assert rehydrated is not None
+        exact, exact_set = rehydrated
+        self.assertIs(
+            exact_set.evidence_scope,
+            BoundaryOptionEvidenceScope.EXACT,
+        )
+        self.assertNotEqual(exact.proof_identity, provisional.proof_identity)
+        self.assertEqual(exact.frame_offset, provisional.frame_offset)
+        self.assertEqual(exact.score_adjustment, provisional.score_adjustment)
+        self.assertEqual(
+            exact.outgoing_transform,
+            provisional.outgoing_transform,
+        )
+        self.assertEqual(
+            exact.incoming_transform,
+            provisional.incoming_transform,
+        )
+        self.assertIn(exact, exact_set.authorized_options)
+        with self.assertRaises(KeyError):
+            provider.materialization_proof(provisional.proof_identity)
+        materialization = provider.materialization_proof(exact.proof_identity)
+        self.assertEqual(len(materialization.outer_track_proof_identities), 2)
+        payload = provider.to_dict()
+        self.assertEqual(payload["measurement_count"], 1)
+        self.assertEqual(
+            payload["selection_options"]["rehydration_count"],
+            1,
+        )
+        self.assertEqual(
+            payload["selection_options"]["exact_rejection_count"],
+            0,
         )
 
     def test_plus_five_can_be_viable_while_zero_is_nonwaivably_hard(self) -> None:
@@ -2911,6 +2975,51 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             "outer_track_segment_source_scene_cut_breaks_track",
             zero.failure_codes,
         )
+
+    def test_selection_scalar_outer_failure_is_rejected_on_exact_rehydration(
+        self,
+    ) -> None:
+        outgoing = _descriptor(
+            0.5,
+            shot_scale=0.22,
+            face_bbox=(0.18, 0.30, 0.16, 0.22),
+        )
+        incoming = _descriptor(
+            0.5,
+            shot_scale=0.72,
+            face_bbox=(0.60, 0.22, 0.30, 0.40),
+        )
+        provider = _provider(
+            lambda source, _seconds: outgoing if source == 0 else incoming,
+            scene_cut_times=((), (10.5,)),
+            transformed_descriptor_provider=(
+                lambda _source, _seconds, _raw, _transform: _descriptor(
+                    0.5,
+                    shot_scale=0.72,
+                    face_bbox=(0.35, 0.28, 0.30, 0.40),
+                )
+            ),
+            face_identity_provider=(
+                lambda _source, _seconds, _descriptor: (1.0, 0.0)
+            ),
+        )
+
+        selection_set = provider.selection_options(_key())
+        provisional = selection_set.audit_for(0).authorized_option
+        self.assertIsNotNone(provisional)
+        assert provisional is not None
+        self.assertIsNone(provider.rehydrate_selection_option(provisional))
+        exact = provider(_key()).audit_for(0)
+        self.assertIs(
+            exact.disposition,
+            BoundaryOffsetDisposition.HARD_INCOMPATIBLE,
+        )
+        self.assertIn(
+            "outer_track_segment_source_scene_cut_breaks_track",
+            exact.failure_codes,
+        )
+        audit = provider.to_dict()["selection_options"]
+        self.assertEqual(audit["exact_rejection_count"], 1)
 
     def test_crop_track_samples_every_visible_half_frame_center(self) -> None:
         outgoing = _descriptor(

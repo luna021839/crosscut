@@ -258,7 +258,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "8004e6ff1e9813da730b07e3c031b940666cf27707cd1b231fc6af36d0d40aa2"
+                "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
             ),
             "crop_rerank_code_sha256": (
                 "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
@@ -301,7 +301,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "8004e6ff1e9813da730b07e3c031b940666cf27707cd1b231fc6af36d0d40aa2"
+                "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
             ),
         }
         unknown = {
@@ -335,7 +335,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "8004e6ff1e9813da730b07e3c031b940666cf27707cd1b231fc6af36d0d40aa2"
+                "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
             ),
         }
 
@@ -364,7 +364,36 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
+                "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+            ),
+        }
+
+        self.assertTrue(migration.matches(legacy, current))
+        self.assertFalse(migration.matches(current, legacy))
+
+    def test_production_migration_accepts_workspace_seed_predecessor(self) -> None:
+        migration = next(
+            item
+            for item in VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+            if item.legacy_selector_code_sha256.startswith("8004e6ff")
+        )
+        legacy = {
+            "sources": ["a", "b"],
+            "canonical_spans": [[0.0, 1.0]],
+            "selector_code_sha256": (
                 "8004e6ff1e9813da730b07e3c031b940666cf27707cd1b231fc6af36d0d40aa2"
+            ),
+            "crop_rerank_code_sha256": (
+                "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+            ),
+            "code_fingerprint_contract": (
+                "python_module_symbol_dependency_ast_v2"
+            ),
+        }
+        current = {
+            **legacy,
+            "selector_code_sha256": (
+                "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
             ),
         }
 

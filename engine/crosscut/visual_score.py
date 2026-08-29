@@ -2654,6 +2654,235 @@ class VisualTimelineCandidateSet:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class VisualTimelineOptimizerSeed:
+    """Transient visual lattice carrier for the decoded joint selector.
+
+    Unlike :class:`VisualTimelineCandidateSet`, this object deliberately has no
+    legacy DP result, selected path, or review ranking.  It carries only the
+    exact workspace and source-clock/materialization metadata consumed by the
+    joint selector.  The descriptor lattice remains process-local and is never
+    included in :meth:`to_dict`.
+    """
+
+    optimizer_workspace: VisualTimelineOptimizerWorkspace = field(
+        repr=False,
+        compare=False,
+    )
+    optimizer_input_identity: str
+    sources: tuple[Path, ...]
+    audio_offsets: tuple[float, ...]
+    source_timewarps: tuple[TimeWarpMap | None, ...]
+    source_clock_basis: str
+    requested_maximum_results: int
+    scene_cut_times: tuple[tuple[float, ...], ...] = ()
+    face_metadata_by_candidate: Mapping[str, _CandidateFaceMetadata] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    subject_metadata_by_candidate: Mapping[str, _CandidateSubjectMetadata] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    candidate_generation_basis: str = (
+        "joint_optimizer_workspace_only_no_legacy_dp_or_review_v1"
+    )
+    minimum_materialization_target: int = 8
+    feature_cache_directory: Path | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    feature_derived_cache_directory: Path | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    require_persistent_feature_cache: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.optimizer_workspace,
+            VisualTimelineOptimizerWorkspace,
+        ):
+            raise TypeError(
+                "optimizer_workspace must be a VisualTimelineOptimizerWorkspace"
+            )
+        optimizer_input_identity = _validated_sha256_identity(
+            self.optimizer_input_identity,
+            "optimizer seed input identity",
+        )
+        sources = tuple(Path(path) for path in self.sources)
+        offsets = tuple(float(value) for value in self.audio_offsets)
+        timewarps = tuple(self.source_timewarps)
+        scene_cuts = tuple(
+            tuple(float(value) for value in source_cuts)
+            for source_cuts in self.scene_cut_times
+        )
+        face_metadata = MappingProxyType(dict(self.face_metadata_by_candidate))
+        subject_metadata = MappingProxyType(
+            dict(self.subject_metadata_by_candidate)
+        )
+        if len(sources) < 2:
+            raise ValueError("visual optimizer seed needs at least two sources")
+        if len(offsets) != len(sources) or len(timewarps) != len(sources):
+            raise ValueError(
+                "optimizer seed source clock inputs must match sources"
+            )
+        if any(not math.isfinite(value) for value in offsets):
+            raise ValueError("optimizer seed audio offsets must be finite")
+        _source_clock_maps(
+            timewarps,
+            audio_offsets=offsets,
+            source_count=len(sources),
+        )
+        if scene_cuts and len(scene_cuts) != len(sources):
+            raise ValueError("optimizer seed scene cuts must match sources")
+        if any(
+            not math.isfinite(value)
+            or any(right <= left for left, right in zip(cuts, cuts[1:]))
+            for cuts in scene_cuts
+            for value in cuts
+        ):
+            raise ValueError(
+                "optimizer seed scene cuts must be finite and ordered"
+            )
+        if not self.source_clock_basis.strip():
+            raise ValueError("optimizer seed source_clock_basis cannot be blank")
+        if (
+            isinstance(self.requested_maximum_results, bool)
+            or not isinstance(self.requested_maximum_results, int)
+            or not 8 <= self.requested_maximum_results <= 32
+        ):
+            raise ValueError(
+                "optimizer seed requested_maximum_results must be between 8 and 32"
+            )
+        if (
+            isinstance(self.minimum_materialization_target, bool)
+            or not isinstance(self.minimum_materialization_target, int)
+            or self.minimum_materialization_target < 1
+        ):
+            raise ValueError(
+                "optimizer seed minimum_materialization_target must be positive"
+            )
+        if not self.candidate_generation_basis.strip():
+            raise ValueError(
+                "optimizer seed candidate_generation_basis cannot be blank"
+            )
+        if not isinstance(self.require_persistent_feature_cache, bool):
+            raise TypeError("require_persistent_feature_cache must be boolean")
+        if dict(subject_metadata) != dict(
+            self.optimizer_workspace.subject_metadata_by_candidate
+        ):
+            raise ValueError(
+                "optimizer seed subject metadata must match its workspace"
+            )
+        expected_workspace_identity = _visual_optimizer_input_identity(
+            self.optimizer_workspace.candidates_by_segment,
+            sources=sources,
+            audio_offsets=offsets,
+            source_timewarps=timewarps,
+            source_clock_basis=self.source_clock_basis,
+            scene_cut_times=scene_cuts,
+            preferred_source_ids=self.optimizer_workspace.preferred_source_ids,
+            diversity=self.optimizer_workspace.diversity,
+            section_plan=self.optimizer_workspace.section_plan,
+            phrase_times=self.optimizer_workspace.phrase_times,
+            professional_montage_policy=(
+                self.optimizer_workspace.professional_montage_policy
+            ),
+            subject_metadata_by_candidate=(
+                self.optimizer_workspace.subject_metadata_by_candidate
+            ),
+            prescribed_source_ids=self.optimizer_workspace.prescribed_source_ids,
+            maximum_results=self.optimizer_workspace.maximum_results,
+        )
+        if (
+            self.optimizer_workspace.input_identity
+            != expected_workspace_identity
+            or optimizer_input_identity != expected_workspace_identity
+        ):
+            raise ValueError(
+                "optimizer workspace identity does not match seed inputs"
+            )
+        object.__setattr__(
+            self,
+            "optimizer_input_identity",
+            optimizer_input_identity,
+        )
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "audio_offsets", offsets)
+        object.__setattr__(self, "source_timewarps", timewarps)
+        object.__setattr__(self, "scene_cut_times", scene_cuts)
+        object.__setattr__(self, "face_metadata_by_candidate", face_metadata)
+        object.__setattr__(
+            self,
+            "subject_metadata_by_candidate",
+            subject_metadata,
+        )
+        object.__setattr__(
+            self,
+            "feature_cache_directory",
+            (
+                None
+                if self.feature_cache_directory is None
+                else Path(self.feature_cache_directory)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "feature_derived_cache_directory",
+            (
+                None
+                if self.feature_derived_cache_directory is None
+                else Path(self.feature_derived_cache_directory)
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize scalar identity/audit only, never the transient lattice."""
+
+        return {
+            "contract": "visual_timeline_optimizer_seed_v1",
+            "workspace_only": True,
+            "candidate_generation_basis": self.candidate_generation_basis,
+            "candidate_count": 0,
+            "requested_maximum_results": self.requested_maximum_results,
+            "minimum_materialization_target": self.minimum_materialization_target,
+            "minimum_materialization_target_satisfied": False,
+            "selected_candidate_index": None,
+            "source_count": len(self.sources),
+            "source_clock_basis": self.source_clock_basis,
+            "optimizer_input_identity": self.optimizer_input_identity,
+            "legacy_timeline_dp_executed": False,
+            "legacy_timeline_review_executed": False,
+            "joint_selection_required": True,
+            "candidates": [],
+            "transient_materialization_metadata": {
+                "scene_cut_source_count": len(self.scene_cut_times),
+                "face_candidate_count": len(self.face_metadata_by_candidate),
+                "subject_candidate_count": len(
+                    self.subject_metadata_by_candidate
+                ),
+                "raw_metadata_persisted": False,
+            },
+            "raw_visual_descriptors_persisted": False,
+            "raw_candidate_embeddings_persisted": False,
+            "biometric_model_vectors_persisted": False,
+        }
+
+
+VisualTimelineOptimizerCarrier = (
+    VisualTimelineCandidateSet | VisualTimelineOptimizerSeed
+)
+
+
 def _normalise_timeline_no_goods(
     value: TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey],
 ) -> TimelineNoGoodSet:
@@ -6032,7 +6261,12 @@ def _build_visual_timeline(
     prescribed_source_indices: Sequence[int] | None = None,
     maximum_candidate_results: int,
     candidate_set_only: bool,
-) -> VisualTimelinePlan | VisualTimelineCandidateSet:
+    optimizer_seed_only: bool = False,
+) -> (
+    VisualTimelinePlan
+    | VisualTimelineCandidateSet
+    | VisualTimelineOptimizerSeed
+):
     """Score synchronized source options and globally select the edit.
 
     ``source_timewarps`` is optional and positional to the source arrays.  A
@@ -6046,6 +6280,15 @@ def _build_visual_timeline(
         or not 8 <= maximum_candidate_results <= 32
     ):
         raise ValueError("maximum_candidate_results must be between 8 and 32")
+    if not isinstance(candidate_set_only, bool) or not isinstance(
+        optimizer_seed_only,
+        bool,
+    ):
+        raise TypeError("visual timeline output mode flags must be boolean")
+    if optimizer_seed_only and not candidate_set_only:
+        raise ValueError(
+            "optimizer_seed_only requires candidate_set_only output mode"
+        )
     source_count = len(sources)
     if source_count < 2:
         raise ValueError("visual timeline needs at least two sources")
@@ -6631,6 +6874,23 @@ def _build_visual_timeline(
         prescribed_source_ids=workspace_prescribed_source_ids,
         maximum_results=maximum_candidate_results,
     )
+    if optimizer_seed_only:
+        return VisualTimelineOptimizerSeed(
+            optimizer_workspace=optimizer_workspace,
+            optimizer_input_identity=optimizer_input_identity,
+            sources=tuple(Path(path) for path in sources),
+            audio_offsets=tuple(float(value) for value in audio_offsets),
+            source_timewarps=clock_maps,
+            source_clock_basis=source_clock_basis,
+            requested_maximum_results=maximum_candidate_results,
+            scene_cut_times=workspace_scene_cut_times,
+            face_metadata_by_candidate=face_metadata_by_candidate,
+            subject_metadata_by_candidate=subject_metadata_by_candidate,
+            minimum_materialization_target=minimum_materialization_target,
+            feature_cache_directory=feature_cache_directory,
+            feature_derived_cache_directory=feature_derived_cache_directory,
+            require_persistent_feature_cache=require_persistent_feature_cache,
+        )
     timeline_candidates, candidate_cadence_profiles, role_conditioning_audit = (
         _select_optimizer_workspace_candidates(
             optimizer_workspace,
@@ -6779,6 +7039,65 @@ def build_visual_timeline_candidate_set(
     return result
 
 
+def build_visual_timeline_optimizer_seed(
+    *,
+    sources: Sequence[Path],
+    canonical_spans: Sequence[tuple[float, float]],
+    audio_offsets: Sequence[float],
+    sync_scores: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    preferred_source_indices: Sequence[int] | None = None,
+    diversity_config: VisualDiversityConfig | None = None,
+    section_plan: SectionPlan | None = None,
+    phrase_times: Sequence[float] = (),
+    professional_montage_selection_policy: (
+        ProfessionalMontageSelectionPolicy | None
+    ) = None,
+    source_timewarps: Sequence[TimeWarpMap | None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    feature_cache_directory: Path | None = None,
+    feature_derived_cache_directory: Path | None = None,
+    require_persistent_feature_cache: bool = False,
+    maximum_results: int = 32,
+) -> VisualTimelineOptimizerSeed:
+    """Build the exact transient lattice without running the legacy DP.
+
+    This entry point is reserved for callers, such as the decoded joint
+    selector, that immediately run their own complete cadence DP and review.
+    It preserves descriptor generation, hard-gate inputs, source clocks, and
+    optimizer identity while avoiding a discarded baseline selection pass.
+    """
+
+    result = _build_visual_timeline(
+        sources=sources,
+        canonical_spans=canonical_spans,
+        audio_offsets=audio_offsets,
+        sync_scores=sync_scores,
+        scene_cut_times=scene_cut_times,
+        preferred_source_indices=preferred_source_indices,
+        diversity_config=diversity_config,
+        section_plan=section_plan,
+        phrase_times=phrase_times,
+        professional_montage_selection_policy=(
+            professional_montage_selection_policy
+        ),
+        source_timewarps=source_timewarps,
+        progress_callback=progress_callback,
+        feature_cache_directory=feature_cache_directory,
+        feature_derived_cache_directory=feature_derived_cache_directory,
+        require_persistent_feature_cache=require_persistent_feature_cache,
+        maximum_candidate_results=maximum_results,
+        candidate_set_only=True,
+        optimizer_seed_only=True,
+    )
+    if not isinstance(
+        result,
+        VisualTimelineOptimizerSeed,
+    ):  # pragma: no cover - invariant
+        raise TypeError("optimizer-seed builder returned another output mode")
+    return result
+
+
 def build_prescribed_visual_timeline_candidate_set(
     *,
     sources: Sequence[Path],
@@ -6833,6 +7152,8 @@ __all__ = [
     "VisualDiversityConfig",
     "VisualTimelineCandidateRecord",
     "VisualTimelineCandidateSet",
+    "VisualTimelineOptimizerCarrier",
+    "VisualTimelineOptimizerSeed",
     "VisualTimelineOptimizerWorkspace",
     "VisualTimelineChoice",
     "VisualTimelinePlan",
@@ -6840,6 +7161,7 @@ __all__ = [
     "YUNET_MODEL_NAME",
     "build_visual_timeline",
     "build_visual_timeline_candidate_set",
+    "build_visual_timeline_optimizer_seed",
     "build_prescribed_visual_timeline_candidate_set",
     "describe_boundary_side_stability",
     "describe_frame",

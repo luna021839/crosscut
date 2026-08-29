@@ -356,9 +356,11 @@ from .visual_score import (
     ProfessionalMontageSelectionPolicy,
     VisualTimelineCandidateSet,
     VisualTimelineChoice,
+    VisualTimelineOptimizerSeed,
     VisualTimelinePlan,
     build_visual_timeline,
     build_visual_timeline_candidate_set,
+    build_visual_timeline_optimizer_seed,
     regenerate_visual_timeline_candidate_set,
     rehydrate_visual_timeline_dissolve_evidence,
 )
@@ -25151,7 +25153,9 @@ def analyze(
     source_derivative_persistent_cache_diagnostics: dict[str, Any] | None = None
     source_derivative_audit_path: Path | None = None
     boundary_look_match_result: BoundaryLookMatchResult | None = None
-    visual_candidate_set: VisualTimelineCandidateSet | None = None
+    visual_candidate_set: (
+        VisualTimelineCandidateSet | VisualTimelineOptimizerSeed | None
+    ) = None
     stage_edit_candidate_rerank_result: StageEditCandidateRerankResult | None = None
     crop_aware_candidate_rerank_result: (
         CropAwareCandidateRerankResult | None
@@ -25896,7 +25900,7 @@ def analyze(
                     # process-local, so both hit and miss rebuild the transient
                     # optimizer workspace exactly once through the persistent
                     # feature cache and never materialize a baseline candidate.
-                    visual_candidate_set = build_visual_timeline_candidate_set(
+                    visual_candidate_set = build_visual_timeline_optimizer_seed(
                         **visual_builder_arguments,
                         maximum_results=32,
                     )
@@ -26258,7 +26262,10 @@ def analyze(
                         item.candidate_index
                         for item in (
                             visual_candidate_set.candidates
-                            if visual_candidate_set is not None
+                            if isinstance(
+                                visual_candidate_set,
+                                VisualTimelineCandidateSet,
+                            )
                             else ()
                         )
                     ),

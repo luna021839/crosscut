@@ -18,7 +18,7 @@ long.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from math import isfinite
 from typing import TypeAlias
@@ -250,6 +250,13 @@ class BoundaryOffsetDisposition(str, Enum):
     EVIDENCE_INCOMPLETE = "evidence_incomplete"
 
 
+class BoundaryOptionEvidenceScope(str, Enum):
+    """Whether an option set contains final or selection-only evidence."""
+
+    EXACT = "exact"
+    SELECTION_SCALAR = "selection_scalar"
+
+
 @dataclass(frozen=True, slots=True)
 class BoundaryOffsetAudit:
     """Immutable evidence outcome for exactly one offset in ``-8..+8``."""
@@ -302,6 +309,9 @@ class BoundaryOptionSet:
 
     measurement_key: BoundaryMeasurementKey
     offset_audits: tuple[BoundaryOffsetAudit, ...]
+    evidence_scope: BoundaryOptionEvidenceScope | str = (
+        BoundaryOptionEvidenceScope.EXACT
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.measurement_key, BoundaryMeasurementKey):
@@ -322,6 +332,18 @@ class BoundaryOptionSet:
             if option is not None and option.measurement_key != self.measurement_key:
                 raise ValueError("authorized option belongs to another boundary key")
         object.__setattr__(self, "offset_audits", audits)
+        object.__setattr__(
+            self,
+            "evidence_scope",
+            (
+                self.evidence_scope
+                if isinstance(
+                    self.evidence_scope,
+                    BoundaryOptionEvidenceScope,
+                )
+                else BoundaryOptionEvidenceScope(self.evidence_scope)
+            ),
+        )
 
     @property
     def authorized_options(self) -> tuple[AuthorizedBoundaryOption, ...]:
@@ -528,6 +550,11 @@ class SegmentBridgeDisposition:
 BoundaryOptionProvider: TypeAlias = Callable[
     [BoundaryMeasurementKey], BoundaryOptionSet
 ]
+BoundaryOptionRehydrator: TypeAlias = Callable[
+    [AuthorizedBoundaryOption],
+    tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None,
+]
+_BoundarySelectionNoGood: TypeAlias = tuple[BoundaryMeasurementKey, int]
 SegmentBridgeProvider: TypeAlias = Callable[
     [
         TimelineCandidate,
@@ -695,6 +722,13 @@ class JointTimelineResult:
             self.selected_boundary_option_sets,
             strict=True,
         ):
+            if (
+                option_set.evidence_scope
+                is not BoundaryOptionEvidenceScope.EXACT
+            ):
+                raise ValueError(
+                    "selected boundary option set must contain exact evidence"
+                )
             if option.measurement_key != option_set.measurement_key:
                 raise ValueError("selected boundary option-set identity diverged")
             if option not in option_set.authorized_options:
@@ -703,6 +737,11 @@ class JointTimelineResult:
             self.measured_boundary_option_sets
         ):
             raise ValueError("joint option-provider call audit is inconsistent")
+        if any(
+            not isinstance(option_set, BoundaryOptionSet)
+            for option_set in self.measured_boundary_option_sets
+        ):
+            raise TypeError("joint measured boundary option sets are invalid")
         if self.bridge_provider_call_count < len(self.segment_bridge_proofs):
             raise ValueError("joint bridge-provider call audit is inconsistent")
         if (
@@ -785,6 +824,23 @@ class _JointNode:
     entering_boundary_option: AuthorizedBoundaryOption | None
     bridge_evidence_for_previous_segment: _SharedBridgeEvidence | None
     path_signature: tuple[tuple[str, ...], ...]
+
+
+@dataclass(slots=True)
+class _SelectionCumulativeAudit:
+    bridge_provider_call_count: int = 0
+    bridge_disposition_batch_call_count: int = 0
+    bridge_disposition_batch_request_count: int = 0
+    rejection_counts: dict[str, int] = field(default_factory=dict)
+
+
+class _BoundarySelectionRetry(RuntimeError):
+    def __init__(
+        self,
+        failures: frozenset[_BoundarySelectionNoGood],
+    ) -> None:
+        super().__init__("selected boundary evidence requires exact retry")
+        self.failures = failures
 
 
 @dataclass(frozen=True, slots=True)
@@ -1113,6 +1169,22 @@ def _measurement_sort_key(key: BoundaryMeasurementKey) -> tuple[object, ...]:
     )
 
 
+def _boundary_option_selection_scalar_state(
+    option: AuthorizedBoundaryOption,
+) -> tuple[object, ...]:
+    """Values an optimizer may consume before exact proof rehydration."""
+
+    return (
+        option.measurement_key,
+        option.frame_offset,
+        option.outgoing_transform,
+        option.incoming_transform,
+        option.score_adjustment,
+        option.scoring_outgoing,
+        option.scoring_incoming,
+    )
+
+
 def _candidate_signature(candidate: TimelineCandidate) -> tuple[str, ...]:
     return (
         "candidate",
@@ -1286,6 +1358,7 @@ def _no_path_reason(rejection_counts: Mapping[str, int]) -> str:
         or reason
         in {
             "boundary_option_timeline_hard_gate",
+            "boundary_selection_exact_rehydration_rejected",
             "exact_boundary_no_good",
             "segment_duration_below_two_frames",
         }
@@ -1302,6 +1375,7 @@ def _select_joint_timeline_candidates_core(
     | Sequence[Sequence[TimelineCandidate]],
     *,
     option_provider: BoundaryOptionProvider,
+    option_rehydrator: BoundaryOptionRehydrator | None = None,
     bridge_provider: SegmentBridgeProvider | None = None,
     bridge_disposition_batch_provider: (
         SegmentBridgeDispositionBatchProvider | None
@@ -1321,6 +1395,11 @@ def _select_joint_timeline_candidates_core(
     shared_bridge_evidence_cache: (
         JointTimelineSharedBridgeEvidenceCache | None
     ) = None,
+    _selection_no_goods: frozenset[_BoundarySelectionNoGood] = frozenset(),
+    _selection_option_cache: (
+        dict[BoundaryMeasurementKey, BoundaryOptionSet] | None
+    ) = None,
+    _selection_audit: _SelectionCumulativeAudit | None = None,
 ) -> tuple[JointTimelineResult, ...]:
     """Select ranked candidates and exact boundary options in one finite DP.
 
@@ -1340,6 +1419,8 @@ def _select_joint_timeline_candidates_core(
 
     if not callable(option_provider):
         raise TypeError("option_provider must be callable")
+    if option_rehydrator is not None and not callable(option_rehydrator):
+        raise TypeError("option_rehydrator must be callable or None")
     if bridge_provider is not None and not callable(bridge_provider):
         raise TypeError("bridge_provider must be callable or None")
     if bridge_disposition_batch_provider is not None and not callable(
@@ -1541,7 +1622,12 @@ def _select_joint_timeline_candidates_core(
                 bridge_disposition_batch_provider
             ),
         )
-    option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+    option_cache = (
+        _selection_option_cache
+        if _selection_option_cache is not None
+        else {}
+    )
+    selection_audit = _selection_audit or _SelectionCumulativeAudit()
     # One immutable authorized option can be reached from many renderer and
     # cadence states.  Its visual transition decision depends only on the
     # option's exact scoring candidates and the incoming shot-run length.
@@ -1570,12 +1656,12 @@ def _select_joint_timeline_candidates_core(
         _ExactBridgeRequestKey,
         SegmentBridgeProof,
     ] = {}
-    bridge_provider_call_count = 0
-    bridge_disposition_batch_call_count = 0
-    bridge_disposition_batch_request_count = 0
-    rejection_counts: dict[str, int] = {}
+    rejection_counts = selection_audit.rejection_counts
     layer_rejection_counts: dict[str, int] = {}
     total_boundary_layers = max(0, len(segments) - 1)
+    state_result_limit = maximum_results + (
+        1 if option_rehydrator is not None else 0
+    )
 
     def report_progress(phase: str, completed_boundary_layers: int) -> None:
         if progress_callback is None:
@@ -1586,12 +1672,14 @@ def _select_joint_timeline_candidates_core(
                 completed_boundary_layers=completed_boundary_layers,
                 total_boundary_layers=total_boundary_layers,
                 option_key_count=len(option_cache),
-                bridge_provider_call_count=bridge_provider_call_count,
+                bridge_provider_call_count=(
+                    selection_audit.bridge_provider_call_count
+                ),
                 bridge_disposition_batch_call_count=(
-                    bridge_disposition_batch_call_count
+                    selection_audit.bridge_disposition_batch_call_count
                 ),
                 bridge_disposition_batch_request_count=(
-                    bridge_disposition_batch_request_count
+                    selection_audit.bridge_disposition_batch_request_count
                 ),
                 **(
                     shared_bridge_evidence_cache._progress_counts()
@@ -1607,6 +1695,11 @@ def _select_joint_timeline_candidates_core(
             layer_rejection_counts.get(reason, 0) + 1
         )
 
+    def reject_layer_only(reason: str) -> None:
+        layer_rejection_counts[reason] = (
+            layer_rejection_counts.get(reason, 0) + 1
+        )
+
     def locate_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
         cached = option_cache.get(key)
         if cached is not None:
@@ -1616,8 +1709,29 @@ def _select_joint_timeline_candidates_core(
             raise TypeError("option_provider returned an invalid option set")
         if measured.measurement_key != key:
             raise RuntimeError("option_provider returned evidence for another key")
+        if (
+            measured.evidence_scope
+            is BoundaryOptionEvidenceScope.SELECTION_SCALAR
+            and option_rehydrator is None
+        ):
+            raise RuntimeError(
+                "selection-scalar boundary evidence requires an exact "
+                "option_rehydrator"
+            )
         option_cache[key] = measured
         return measured
+
+    def selectable_options(
+        option_set: BoundaryOptionSet,
+    ) -> tuple[AuthorizedBoundaryOption, ...]:
+        if not _selection_no_goods:
+            return option_set.authorized_options
+        return tuple(
+            option
+            for option in option_set.authorized_options
+            if (option.measurement_key, option.frame_offset)
+            not in _selection_no_goods
+        )
 
     def locate_transition(
         option: AuthorizedBoundaryOption,
@@ -1641,7 +1755,6 @@ def _select_joint_timeline_candidates_core(
         exit_option: AuthorizedBoundaryOption,
         duration_frames: float,
     ) -> SegmentBridgeProof:
-        nonlocal bridge_provider_call_count
         assert bridge_provider is not None
         proof = bridge_provider(
             candidate,
@@ -1658,7 +1771,7 @@ def _select_joint_timeline_candidates_core(
             or abs(proof.duration_frames - duration_frames) > 1e-9
         ):
             raise RuntimeError("bridge_provider returned proof for another request")
-        bridge_provider_call_count += 1
+        selection_audit.bridge_provider_call_count += 1
         return proof
 
     def bridge_semantic_key(
@@ -1800,8 +1913,6 @@ def _select_joint_timeline_candidates_core(
         response has validated successfully.
         """
 
-        nonlocal bridge_disposition_batch_call_count
-        nonlocal bridge_disposition_batch_request_count
         if segment_position < 2:
             return {}
         previous_segment = segments[segment_position - 1]
@@ -1891,7 +2002,7 @@ def _select_joint_timeline_candidates_core(
                     previous_candidate,
                     current_candidate,
                 )
-                options = locate_options(measurement_key).authorized_options
+                options = selectable_options(locate_options(measurement_key))
                 if not options:
                     continue
                 for option in options:
@@ -2007,8 +2118,10 @@ def _select_joint_timeline_candidates_core(
                     ),
                 )
             )
-        bridge_disposition_batch_call_count += 1
-        bridge_disposition_batch_request_count += len(requests)
+        selection_audit.bridge_disposition_batch_call_count += 1
+        selection_audit.bridge_disposition_batch_request_count += len(
+            requests
+        )
         semantic_bridge_cache.update(shared_hits)
         for evidence in shared_hits.values():
             cache_fast_bridge_evidence(evidence)
@@ -2139,13 +2252,18 @@ def _select_joint_timeline_candidates_core(
                     current_candidate,
                 )
                 option_set = locate_options(measurement_key)
-                options = option_set.authorized_options
+                options = selectable_options(option_set)
                 if not options:
-                    reject(
-                        "boundary_evidence_incomplete"
-                        if option_set.evidence_incomplete
-                        else "boundary_hard_incompatible"
-                    )
+                    if option_set.authorized_options:
+                        reject_layer_only(
+                            "boundary_selection_exact_rehydration_rejected"
+                        )
+                    else:
+                        reject(
+                            "boundary_evidence_incomplete"
+                            if option_set.evidence_incomplete
+                            else "boundary_hard_incompatible"
+                        )
                     continue
                 source_run = (
                     previous_state.source_run + 1
@@ -2372,7 +2490,7 @@ def _select_joint_timeline_candidates_core(
                     _retain_ranked_node_stream(
                         stream_bucket,
                         stream,
-                        maximum_results=maximum_results,
+                        maximum_results=state_result_limit,
                     )
                 else:
                     # Ambiguous public lattices may repeat the same logical
@@ -2384,10 +2502,23 @@ def _select_joint_timeline_candidates_core(
         current_layer = {
             state: _materialize_ranked_node_streams(
                 streams,
-                maximum_results=maximum_results,
+                maximum_results=state_result_limit,
             )
             for state, streams in current_streams.items()
         }
+        if option_rehydrator is not None:
+            for nodes in current_layer.values():
+                if len(nodes) <= maximum_results:
+                    continue
+                if abs(
+                    nodes[maximum_results - 1].cumulative_score
+                    - nodes[maximum_results].cumulative_score
+                ) <= 1e-12:
+                    raise RuntimeError(
+                        "provisional boundary proof identity reached an "
+                        "unresolved exact top-K tie"
+                    )
+                del nodes[maximum_results:]
         if not current_layer:
             reason_code = _no_path_reason(layer_rejection_counts)
             summary = ",".join(
@@ -2420,6 +2551,148 @@ def _select_joint_timeline_candidates_core(
     ranked_final_nodes = tuple(
         sorted(final_by_signature.values(), key=_node_rank_key)[:maximum_results]
     )
+    rehydration_cache: dict[
+        tuple[BoundaryMeasurementKey, int, str],
+        tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None,
+    ] = {}
+    selection_failures: set[_BoundarySelectionNoGood] = set()
+    rehydrated_backtraces: list[
+        tuple[
+            _JointNode,
+            tuple[_JointNode, ...],
+            tuple[AuthorizedBoundaryOption, ...],
+            tuple[BoundaryOptionSet, ...],
+            tuple[tuple[str, ...], ...],
+        ]
+    ] = []
+    for final_node in ranked_final_nodes:
+        selected_nodes: list[_JointNode] = []
+        node: _JointNode | None = final_node
+        while node is not None:
+            selected_nodes.append(node)
+            node = node.previous_node
+        selected_nodes.reverse()
+        if len(selected_nodes) != len(segments):
+            raise RuntimeError("joint timeline backtrace ended prematurely")
+
+        exact_options: list[AuthorizedBoundaryOption] = []
+        exact_option_sets: list[BoundaryOptionSet] = []
+        path_failed = False
+        for selected_node in selected_nodes[1:]:
+            provisional = selected_node.entering_boundary_option
+            if provisional is None:
+                raise RuntimeError(
+                    "joint DP backtrace lost a selected boundary option"
+                )
+            if option_rehydrator is None:
+                rehydrated = (
+                    provisional,
+                    option_cache[provisional.measurement_key],
+                )
+            else:
+                rehydration_key = (
+                    provisional.measurement_key,
+                    provisional.frame_offset,
+                    provisional.proof_identity,
+                )
+                if rehydration_key not in rehydration_cache:
+                    rehydration_cache[rehydration_key] = option_rehydrator(
+                        provisional
+                    )
+                rehydrated = rehydration_cache[rehydration_key]
+            if rehydrated is None:
+                selection_failures.add(
+                    (provisional.measurement_key, provisional.frame_offset)
+                )
+                path_failed = True
+                continue
+            if (
+                not isinstance(rehydrated, tuple)
+                or len(rehydrated) != 2
+                or not isinstance(rehydrated[0], AuthorizedBoundaryOption)
+                or not isinstance(rehydrated[1], BoundaryOptionSet)
+            ):
+                raise TypeError(
+                    "option_rehydrator returned an invalid exact option/set"
+                )
+            exact_option, exact_option_set = rehydrated
+            if (
+                exact_option.measurement_key != provisional.measurement_key
+                or exact_option.frame_offset != provisional.frame_offset
+                or exact_option_set.measurement_key
+                != provisional.measurement_key
+                or exact_option_set.evidence_scope
+                is not BoundaryOptionEvidenceScope.EXACT
+                or exact_option not in exact_option_set.authorized_options
+            ):
+                raise RuntimeError(
+                    "option_rehydrator returned evidence for another option"
+                )
+            if _boundary_option_selection_scalar_state(
+                exact_option
+            ) != _boundary_option_selection_scalar_state(provisional):
+                selection_failures.add(
+                    (provisional.measurement_key, provisional.frame_offset)
+                )
+                path_failed = True
+                continue
+            exact_options.append(exact_option)
+            exact_option_sets.append(exact_option_set)
+        if path_failed:
+            continue
+        exact_signature: list[tuple[str, ...]] = [
+            _candidate_signature(selected_nodes[0].candidate)
+        ]
+        for selected_node, exact_option in zip(
+            selected_nodes[1:],
+            exact_options,
+            strict=True,
+        ):
+            exact_signature.extend(
+                (
+                    (
+                        "boundary",
+                        str(exact_option.measurement_key.boundary_index),
+                        exact_option.proof_identity,
+                        str(exact_option.frame_offset),
+                    ),
+                    _candidate_signature(selected_node.candidate),
+                )
+            )
+        rehydrated_backtraces.append(
+            (
+                final_node,
+                tuple(selected_nodes),
+                tuple(exact_options),
+                tuple(exact_option_sets),
+                tuple(exact_signature),
+            )
+        )
+    if selection_failures:
+        new_failures = frozenset(
+            selection_failures - set(_selection_no_goods)
+        )
+        if not new_failures:
+            raise RuntimeError(
+                "selected boundary exact rehydration made no progress"
+            )
+        rejection_counts[
+            "boundary_selection_exact_rehydration_rejected"
+        ] = (
+            rejection_counts.get(
+                "boundary_selection_exact_rehydration_rejected",
+                0,
+            )
+            + len(new_failures)
+        )
+        raise _BoundarySelectionRetry(new_failures)
+    rehydrated_backtraces.sort(
+        key=lambda item: (
+            -item[0].cumulative_score,
+            _state_sort_key(item[0].state),
+            item[4],
+        )
+    )
     measured_option_sets = tuple(
         option_cache[key]
         for key in sorted(option_cache, key=_measurement_sort_key)
@@ -2433,18 +2706,15 @@ def _select_joint_timeline_candidates_core(
             tuple[SegmentBridgeProof, ...],
         ]
     ] = []
-    for final_node in ranked_final_nodes:
-        selected_nodes: list[_JointNode] = []
-        node: _JointNode | None = final_node
-        while node is not None:
-            selected_nodes.append(node)
-            node = node.previous_node
-        selected_nodes.reverse()
-        if len(selected_nodes) != len(segments):
-            raise RuntimeError("joint timeline backtrace ended prematurely")
-
+    for (
+        final_node,
+        selected_nodes,
+        exact_boundary_options,
+        exact_boundary_option_sets,
+        _exact_signature,
+    ) in rehydrated_backtraces:
         choices: list[TimelineChoice] = []
-        boundary_options: list[AuthorizedBoundaryOption] = []
+        boundary_options = list(exact_boundary_options)
         bridge_proofs: list[SegmentBridgeProof] = []
         for selected_position, selected_node in enumerate(selected_nodes):
             choices.append(
@@ -2456,10 +2726,6 @@ def _select_joint_timeline_candidates_core(
                     used_group_wide_fallback=selected_node.used_fallback,
                 )
             )
-            if selected_node.entering_boundary_option is not None:
-                boundary_options.append(
-                    selected_node.entering_boundary_option
-                )
             bridge_evidence = (
                 selected_node.bridge_evidence_for_previous_segment
             )
@@ -2468,14 +2734,8 @@ def _select_joint_timeline_candidates_core(
                     raise RuntimeError(
                         "joint DP attached bridge evidence before a middle segment"
                     )
-                entry_option = selected_nodes[
-                    selected_position - 1
-                ].entering_boundary_option
-                exit_option = selected_node.entering_boundary_option
-                if entry_option is None or exit_option is None:
-                    raise RuntimeError(
-                        "joint DP backtrace lost exact bridge boundary options"
-                    )
+                entry_option = boundary_options[selected_position - 2]
+                exit_option = boundary_options[selected_position - 1]
                 middle_candidate = selected_nodes[
                     selected_position - 1
                 ].candidate
@@ -2507,10 +2767,7 @@ def _select_joint_timeline_candidates_core(
             choices=tuple(choices),
             total_score=choices[-1].cumulative_score,
         )
-        selected_option_sets = tuple(
-            option_cache[option.measurement_key]
-            for option in boundary_options
-        )
+        selected_option_sets = exact_boundary_option_sets
         pending_results.append(
             (
                 timeline,
@@ -2528,12 +2785,14 @@ def _select_joint_timeline_candidates_core(
             measured_boundary_option_sets=measured_option_sets,
             rejection_counts=tuple(sorted(rejection_counts.items())),
             option_provider_call_count=len(option_cache),
-            bridge_provider_call_count=bridge_provider_call_count,
+            bridge_provider_call_count=(
+                selection_audit.bridge_provider_call_count
+            ),
             bridge_disposition_batch_call_count=(
-                bridge_disposition_batch_call_count
+                selection_audit.bridge_disposition_batch_call_count
             ),
             bridge_disposition_batch_request_count=(
-                bridge_disposition_batch_request_count
+                selection_audit.bridge_disposition_batch_request_count
             ),
         )
         for (
@@ -2552,6 +2811,7 @@ def select_joint_timeline(
     | Sequence[Sequence[TimelineCandidate]],
     *,
     option_provider: BoundaryOptionProvider,
+    option_rehydrator: BoundaryOptionRehydrator | None = None,
     bridge_provider: SegmentBridgeProvider | None = None,
     bridge_disposition_batch_provider: (
         SegmentBridgeDispositionBatchProvider | None
@@ -2576,6 +2836,7 @@ def select_joint_timeline(
     return select_joint_timeline_candidates(
         candidates_by_segment,
         option_provider=option_provider,
+        option_rehydrator=option_rehydrator,
         bridge_provider=bridge_provider,
         bridge_disposition_batch_provider=bridge_disposition_batch_provider,
         fps=fps,
@@ -2597,6 +2858,7 @@ def select_joint_timeline_candidates(
     | Sequence[Sequence[TimelineCandidate]],
     *,
     option_provider: BoundaryOptionProvider,
+    option_rehydrator: BoundaryOptionRehydrator | None = None,
     bridge_provider: SegmentBridgeProvider | None = None,
     bridge_disposition_batch_provider: (
         SegmentBridgeDispositionBatchProvider | None
@@ -2625,23 +2887,76 @@ def select_joint_timeline_candidates(
     exact request.
     """
 
-    return _select_joint_timeline_candidates_core(
-        candidates_by_segment,
-        option_provider=option_provider,
-        bridge_provider=bridge_provider,
-        bridge_disposition_batch_provider=bridge_disposition_batch_provider,
-        fps=fps,
-        mode=mode,
-        target_member=target_member,
-        config=config,
-        preferred_source_ids=preferred_source_ids,
-        maximum_results=maximum_results,
-        emission_adjustments=emission_adjustments,
-        source_switch_bonus_by_segment=source_switch_bonus_by_segment,
-        forbidden_boundary_edges=forbidden_boundary_edges,
-        progress_callback=progress_callback,
-        shared_bridge_evidence_cache=shared_bridge_evidence_cache,
-    )
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
+    selection_no_goods: frozenset[_BoundarySelectionNoGood] = frozenset()
+    selection_option_cache: dict[
+        BoundaryMeasurementKey,
+        BoundaryOptionSet,
+    ] = {}
+    selection_audit = _SelectionCumulativeAudit()
+    progress_started = False
+    progress_floor = 0
+
+    def forward_monotonic_progress(progress: JointTimelineProgress) -> None:
+        nonlocal progress_started
+        nonlocal progress_floor
+        if progress_callback is None:
+            return
+        if progress.phase == "selection_start":
+            if progress_started:
+                return
+            progress_started = True
+            progress_floor = progress.completed_boundary_layers
+        elif progress.phase == "boundary_layer_complete":
+            if progress.completed_boundary_layers <= progress_floor:
+                return
+            progress_floor = progress.completed_boundary_layers
+        elif progress.completed_boundary_layers < progress_floor:
+            progress = replace(
+                progress,
+                completed_boundary_layers=progress_floor,
+            )
+        progress_callback(progress)
+
+    while True:
+        try:
+            return _select_joint_timeline_candidates_core(
+                candidates_by_segment,
+                option_provider=option_provider,
+                option_rehydrator=option_rehydrator,
+                bridge_provider=bridge_provider,
+                bridge_disposition_batch_provider=(
+                    bridge_disposition_batch_provider
+                ),
+                fps=fps,
+                mode=mode,
+                target_member=target_member,
+                config=config,
+                preferred_source_ids=preferred_source_ids,
+                maximum_results=maximum_results,
+                emission_adjustments=emission_adjustments,
+                source_switch_bonus_by_segment=(
+                    source_switch_bonus_by_segment
+                ),
+                forbidden_boundary_edges=forbidden_boundary_edges,
+                progress_callback=(
+                    forward_monotonic_progress
+                    if progress_callback is not None
+                    else None
+                ),
+                shared_bridge_evidence_cache=shared_bridge_evidence_cache,
+                _selection_no_goods=selection_no_goods,
+                _selection_option_cache=selection_option_cache,
+                _selection_audit=selection_audit,
+            )
+        except _BoundarySelectionRetry as retry:
+            updated = frozenset(set(selection_no_goods) | retry.failures)
+            if updated == selection_no_goods:
+                raise RuntimeError(
+                    "selected boundary exact retry made no progress"
+                ) from retry
+            selection_no_goods = updated
 
 
 __all__ = [
@@ -2649,7 +2964,9 @@ __all__ = [
     "BoundaryMeasurementKey",
     "BoundaryOffsetAudit",
     "BoundaryOffsetDisposition",
+    "BoundaryOptionEvidenceScope",
     "BoundaryOptionProvider",
+    "BoundaryOptionRehydrator",
     "BoundaryOptionSet",
     "BoundaryTransformState",
     "JOINT_BOUNDARY_FRAME_OFFSETS",

@@ -19,6 +19,7 @@ from crosscut.joint_timeline import (
     BoundaryMeasurementKey,
     BoundaryOffsetAudit,
     BoundaryOffsetDisposition,
+    BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
@@ -62,6 +63,7 @@ from crosscut.visual_score import (
     ProfessionalMontageSelectionPolicy,
     VisualTimelineCandidateRecord,
     VisualTimelineCandidateSet,
+    VisualTimelineOptimizerSeed,
     VisualTimelineOptimizerWorkspace,
     _review_ranked_candidate_indices,
     _visual_optimizer_input_identity,
@@ -104,6 +106,9 @@ class CountingStubDecodedProvider(StubDecodedProvider):
     def __init__(self) -> None:
         super().__init__()
         self.option_calls: dict[BoundaryMeasurementKey, int] = {}
+        self.selection_option_sets: dict[
+            BoundaryMeasurementKey, BoundaryOptionSet
+        ] = {}
         self.bridge_calls = 0
         self.bridge_batch_calls: list[
             tuple[SegmentBridgeDispositionRequest, ...]
@@ -117,6 +122,32 @@ class CountingStubDecodedProvider(StubDecodedProvider):
             variant="shared-profile",
         )
         return measured
+
+    def selection_options(
+        self,
+        key: BoundaryMeasurementKey,
+    ) -> BoundaryOptionSet:
+        measured = replace(
+            self(key),
+            evidence_scope=(
+                BoundaryOptionEvidenceScope.SELECTION_SCALAR
+            ),
+        )
+        self.selection_option_sets[key] = measured
+        return measured
+
+    def rehydrate_selection_option(
+        self,
+        option: AuthorizedBoundaryOption,
+    ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+        option_set = replace(
+            self.selection_option_sets[option.measurement_key],
+            evidence_scope=BoundaryOptionEvidenceScope.EXACT,
+        )
+        exact = option_set.audit_for(option.frame_offset).authorized_option
+        if exact is None:
+            return None
+        return exact, option_set
 
     def bridge_provider(
         self,
@@ -699,6 +730,32 @@ def _candidate_set(*, role_conditioned: bool = False) -> VisualTimelineCandidate
     )
 
 
+def _optimizer_seed(
+    candidate_set: VisualTimelineCandidateSet,
+) -> VisualTimelineOptimizerSeed:
+    workspace = candidate_set.optimizer_workspace
+    assert workspace is not None
+    optimizer_input_identity = candidate_set.optimizer_input_identity
+    assert optimizer_input_identity is not None
+    return VisualTimelineOptimizerSeed(
+        optimizer_workspace=workspace,
+        optimizer_input_identity=optimizer_input_identity,
+        sources=candidate_set.sources,
+        audio_offsets=candidate_set.audio_offsets,
+        source_timewarps=candidate_set.source_timewarps,
+        source_clock_basis=candidate_set.source_clock_basis,
+        requested_maximum_results=candidate_set.requested_maximum_results,
+        scene_cut_times=candidate_set.scene_cut_times,
+        face_metadata_by_candidate=candidate_set.face_metadata_by_candidate,
+        subject_metadata_by_candidate=(
+            candidate_set.subject_metadata_by_candidate
+        ),
+        minimum_materialization_target=(
+            candidate_set.minimum_materialization_target
+        ),
+    )
+
+
 def _profile_pools(
     candidate_set: VisualTimelineCandidateSet,
 ) -> tuple[tuple[JointTimelineResult, ...], ...]:
@@ -740,6 +797,61 @@ def _profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_optimizer_seed_and_full_candidate_set_produce_same_joint_result(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        seed = _optimizer_seed(candidate_set)
+        pools = _profile_pools(candidate_set)
+
+        def select(carrier, provider):  # type: ignore[no-untyped-def]
+            with patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=pools,
+            ):
+                return select_joint_visual_candidates(
+                    carrier,
+                    provider=provider,
+                    fps=10.0,
+                )
+
+        full_provider = StubMaterializingProvider(fps=10.0)
+        seed_provider = StubMaterializingProvider(fps=10.0)
+        selected_full = select(candidate_set, full_provider)
+        selected_seed = select(seed, seed_provider)
+
+        self.assertEqual(selected_seed.to_dict(), selected_full.to_dict())
+        self.assertEqual(selected_seed.selections, selected_full.selections)
+        self.assertEqual(
+            selected_seed.candidate_records,
+            selected_full.candidate_records,
+        )
+        materialized_full = materialize_joint_visual_candidates(
+            selected_full,
+            provider=full_provider,
+            fps=10.0,
+            maximum_candidates=8,
+        )
+        materialized_seed = materialize_joint_visual_candidates(
+            selected_seed,
+            provider=seed_provider,
+            fps=10.0,
+            maximum_candidates=8,
+        )
+        self.assertEqual(
+            [item.candidate_history_entry for item in materialized_seed],
+            [item.candidate_history_entry for item in materialized_full],
+        )
+        self.assertEqual(
+            [item.visual_plan.to_dict() for item in materialized_seed],
+            [item.visual_plan.to_dict() for item in materialized_full],
+        )
+        self.assertEqual(
+            [item.segments for item in materialized_seed],
+            [item.segments for item in materialized_full],
+        )
+
     def test_real_three_profile_search_reuses_scalar_bridges_and_keeps_exact_calls(
         self,
     ) -> None:
@@ -896,6 +1008,10 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             selected.shared_option_evidence_cache_audit[
                 "raw_visual_evidence_persisted"
             ]
+        )
+        self.assertEqual(
+            selected.shared_option_evidence_cache_audit["evidence_scope"],
+            BoundaryOptionEvidenceScope.SELECTION_SCALAR.value,
         )
         self.assertEqual(
             selected.shared_bridge_evidence_cache_audit[

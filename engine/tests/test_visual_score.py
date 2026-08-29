@@ -32,6 +32,7 @@ from crosscut.visual_score import (
     ProfessionalMontageSelectionPolicy,
     VisualDiversityConfig,
     VisualTimelineCandidateRecord,
+    VisualTimelineOptimizerSeed,
     YUNET_EXPECTED_SHA256,
     _DissolveEvidence,
     _DetectedFace,
@@ -40,13 +41,17 @@ from crosscut.visual_score import (
     _candidate_role_shot_samples,
     _normalized_face_metadata,
     _professional_intentional_transition_anchor_basis,
+    _review_visual_timeline_candidates,
     _role_conditioned_candidate_outcomes,
+    _role_conditioned_selection_payload,
     _role_conditioned_visual_controls,
     _role_target_categories,
     _safe_cadence_profiles,
     _select_safe_cadence_candidates,
     _VideoSampler,
     build_visual_timeline,
+    build_visual_timeline_candidate_set,
+    build_visual_timeline_optimizer_seed,
     describe_boundary_side_stability,
     describe_frame,
     yunet_model_asset_status,
@@ -937,6 +942,126 @@ class VisualScoreTests(unittest.TestCase):
                     for seconds in instance.sface_times
                 )
             )
+
+    def test_optimizer_seed_matches_full_workspace_without_legacy_selection(
+        self,
+    ) -> None:
+        descriptor = FrameVisualDescriptor(
+            quality_score=0.8,
+            composition_score=0.7,
+            shot_scale=0.4,
+            shot_type=ShotType.MEDIUM,
+            face_count=0,
+            structure_embedding=(0.0,) * 96,
+        )
+
+        class Sampler:
+            def __init__(self, _path: Path, **_kwargs: object) -> None:
+                pass
+
+            def feature_descriptor_at(  # type: ignore[no-untyped-def]
+                self,
+                _seconds: float,
+                **_kwargs: object,
+            ) -> FrameVisualDescriptor:
+                return descriptor
+
+            def sface_embedding_at(  # type: ignore[no-untyped-def]
+                self,
+                _seconds: float,
+                _descriptor: FrameVisualDescriptor,
+            ) -> tuple[float, ...]:
+                return ()
+
+            def close(self) -> None:
+                pass
+
+        def select_once(workspace, **_kwargs):  # type: ignore[no-untyped-def]
+            candidate = workspace.candidates_by_segment[0][0]
+            result = TimelineResult(
+                mode=TimelineMode.GENERAL,
+                target_member=None,
+                choices=(
+                    TimelineChoice(
+                        candidate=candidate,
+                        emission_score=1.0,
+                        transition_score=0.0,
+                        cumulative_score=1.0,
+                        used_group_wide_fallback=False,
+                    ),
+                ),
+                total_score=1.0,
+            )
+            return ((result,), ("balanced",), [])
+
+        arguments = {
+            "sources": (Path("source-a.mp4"), Path("source-b.mp4")),
+            "canonical_spans": ((1.0, 1.1),),
+            "audio_offsets": (0.0, 0.0),
+            "sync_scores": (0.9, 0.8),
+            "scene_cut_times": ((), ()),
+        }
+        with (
+            patch("crosscut.visual_score._VideoSampler", Sampler),
+            patch(
+                "crosscut.visual_score._select_optimizer_workspace_candidates",
+                side_effect=select_once,
+            ) as legacy_select,
+            patch(
+                "crosscut.visual_score._review_visual_timeline_candidates",
+                wraps=_review_visual_timeline_candidates,
+            ) as legacy_review,
+            patch(
+                "crosscut.visual_score._role_conditioned_selection_payload",
+                wraps=_role_conditioned_selection_payload,
+            ) as legacy_role_payload,
+        ):
+            full = build_visual_timeline_candidate_set(
+                **arguments,
+                maximum_results=8,
+            )
+            seed = build_visual_timeline_optimizer_seed(
+                **arguments,
+                maximum_results=8,
+            )
+
+        self.assertIsInstance(seed, VisualTimelineOptimizerSeed)
+        self.assertEqual(legacy_select.call_count, 1)
+        self.assertEqual(legacy_review.call_count, 1)
+        self.assertEqual(legacy_role_payload.call_count, 1)
+        self.assertIsNotNone(full.optimizer_workspace)
+        self.assertEqual(seed.optimizer_workspace, full.optimizer_workspace)
+        self.assertEqual(
+            seed.optimizer_workspace.candidates_by_segment,
+            full.optimizer_workspace.candidates_by_segment,
+        )
+        self.assertEqual(
+            dict(seed.optimizer_workspace.subject_metadata_by_candidate),
+            dict(full.optimizer_workspace.subject_metadata_by_candidate),
+        )
+        self.assertEqual(
+            dict(seed.face_metadata_by_candidate),
+            dict(full.face_metadata_by_candidate),
+        )
+        self.assertEqual(
+            dict(seed.subject_metadata_by_candidate),
+            dict(full.subject_metadata_by_candidate),
+        )
+        self.assertEqual(
+            seed.optimizer_input_identity,
+            full.optimizer_input_identity,
+        )
+        self.assertEqual(seed.sources, full.sources)
+        self.assertEqual(seed.audio_offsets, full.audio_offsets)
+        self.assertEqual(seed.source_timewarps, full.source_timewarps)
+        self.assertEqual(seed.scene_cut_times, full.scene_cut_times)
+        self.assertEqual(seed.source_clock_basis, full.source_clock_basis)
+        audit = seed.to_dict()
+        self.assertTrue(audit["workspace_only"])
+        self.assertEqual(audit["candidate_count"], 0)
+        self.assertEqual(audit["candidates"], [])
+        self.assertFalse(audit["legacy_timeline_dp_executed"])
+        self.assertFalse(audit["legacy_timeline_review_executed"])
 
     def test_legacy_optional_cache_initialization_fallback_is_preserved(
         self,

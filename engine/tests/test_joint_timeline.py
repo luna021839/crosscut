@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import product
+import sys
 import unittest
 
 from crosscut.joint_timeline import (
@@ -9,6 +10,7 @@ from crosscut.joint_timeline import (
     BoundaryMeasurementKey,
     BoundaryOffsetAudit,
     BoundaryOffsetDisposition,
+    BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
@@ -195,6 +197,45 @@ def option_set(
     return BoundaryOptionSet(key, tuple(audits))
 
 
+def selection_scalar_option_set(
+    key: BoundaryMeasurementKey,
+    *,
+    authorized: dict[int, float],
+) -> BoundaryOptionSet:
+    return replace(
+        option_set(key, authorized=authorized),
+        evidence_scope=BoundaryOptionEvidenceScope.SELECTION_SCALAR,
+    )
+
+
+def exact_rehydrated_option_set(
+    provisional: AuthorizedBoundaryOption,
+    provisional_set: BoundaryOptionSet,
+    *,
+    score_adjustment: float | None = None,
+) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet]:
+    exact = replace(
+        provisional,
+        proof_identity=provisional.proof_identity + ":exact",
+        score_adjustment=(
+            provisional.score_adjustment
+            if score_adjustment is None
+            else score_adjustment
+        ),
+    )
+    audits = tuple(
+        replace(
+            audit,
+            evidence_identity=exact.proof_identity,
+            authorized_option=exact,
+        )
+        if audit.frame_offset == provisional.frame_offset
+        else audit
+        for audit in provisional_set.offset_audits
+    )
+    return exact, BoundaryOptionSet(provisional.measurement_key, audits)
+
+
 def valid_bridge(
     middle: TimelineCandidate,
     entry: AuthorizedBoundaryOption,
@@ -323,6 +364,367 @@ def zero_offset_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
 
 
 class JointTimelineTests(unittest.TestCase):
+    def test_selected_scalar_rehydration_rejects_once_and_reselects_exact(
+        self,
+    ) -> None:
+        preferred = candidate(0, "preferred", 1.0)
+        fallback = candidate(0, "fallback", 0.5)
+        incoming = candidate(1, "incoming", 0.5)
+        provisional_sets: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+        rehydrated_keys: list[BoundaryMeasurementKey] = []
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            measured = selection_scalar_option_set(
+                key,
+                authorized={0: 0.0},
+            )
+            provisional_sets[key] = measured
+            return measured
+
+        def exact_option_set(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet]:
+            return exact_rehydrated_option_set(
+                provisional,
+                provisional_sets[provisional.measurement_key],
+            )
+
+        def rehydrate(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+            rehydrated_keys.append(provisional.measurement_key)
+            if provisional.measurement_key.outgoing is preferred:
+                return None
+            return exact_option_set(provisional)
+
+        result = select_joint_timeline(
+            ((preferred, fallback), (incoming,)),
+            option_provider=provide_options,
+            option_rehydrator=rehydrate,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+
+        self.assertIs(result.candidates[0], fallback)
+        self.assertTrue(result.boundary_options[0].proof_identity.endswith(":exact"))
+        self.assertIn(
+            result.boundary_options[0],
+            result.selected_boundary_option_sets[0].authorized_options,
+        )
+        self.assertIs(
+            result.selected_boundary_option_sets[0].evidence_scope,
+            BoundaryOptionEvidenceScope.EXACT,
+        )
+        self.assertTrue(
+            all(
+                option_set_.evidence_scope
+                is BoundaryOptionEvidenceScope.SELECTION_SCALAR
+                for option_set_ in result.measured_boundary_option_sets
+            )
+        )
+        self.assertEqual(
+            tuple(key.outgoing for key in rehydrated_keys),
+            (preferred, fallback),
+        )
+        self.assertEqual(
+            dict(result.rejection_counts)[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            1,
+        )
+
+    def test_selection_scalar_options_require_exact_rehydrator(self) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires an exact option_rehydrator",
+        ):
+            select_joint_timeline(
+                ((outgoing,), (incoming,)),
+                option_provider=lambda key: selection_scalar_option_set(
+                    key,
+                    authorized={0: 0.0},
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+
+    def test_exact_rehydration_exhaustion_reports_hard_incompatibility(
+        self,
+    ) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_timeline(
+                ((outgoing,), (incoming,)),
+                option_provider=lambda key: selection_scalar_option_set(
+                    key,
+                    authorized={0: 0.0},
+                ),
+                option_rehydrator=lambda _option: None,
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_timeline_hard_incompatible",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            1,
+        )
+
+    def test_exact_scalar_parity_divergence_becomes_a_no_good(self) -> None:
+        preferred = candidate(0, "preferred", 1.0)
+        fallback = candidate(0, "fallback", 0.5)
+        incoming = candidate(1, "incoming", 0.5)
+        measured: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            result = selection_scalar_option_set(
+                key,
+                authorized={0: 0.0},
+            )
+            measured[key] = result
+            return result
+
+        def rehydrate(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet]:
+            return exact_rehydrated_option_set(
+                provisional,
+                measured[provisional.measurement_key],
+                score_adjustment=(
+                    -0.25
+                    if provisional.measurement_key.outgoing is preferred
+                    else None
+                ),
+            )
+
+        result = select_joint_timeline(
+            ((preferred, fallback), (incoming,)),
+            option_provider=provide_options,
+            option_rehydrator=rehydrate,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+
+        self.assertIs(result.candidates[0], fallback)
+        self.assertEqual(
+            dict(result.rejection_counts)[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            1,
+        )
+
+    def test_retry_progress_and_bridge_batch_audit_remain_monotonic(
+        self,
+    ) -> None:
+        preferred = candidate(0, "preferred", 1.0)
+        fallback = candidate(0, "fallback", 0.5)
+        middle = candidate(1, "middle", 0.5)
+        last = candidate(2, "last", 0.5)
+        measured: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+        progress: list[JointTimelineProgress] = []
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            result = selection_scalar_option_set(
+                key,
+                authorized={0: 0.0},
+            )
+            measured[key] = result
+            return result
+
+        def rehydrate(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+            if (
+                provisional.measurement_key.boundary_index == 0
+                and provisional.measurement_key.outgoing is preferred
+            ):
+                return None
+            return exact_rehydrated_option_set(
+                provisional,
+                measured[provisional.measurement_key],
+            )
+
+        class BridgeProvider:
+            def __init__(self) -> None:
+                self.batch_call_count = 0
+                self.exact_call_count = 0
+
+            def bridge(
+                self,
+                bridge_candidate: TimelineCandidate,
+                entry: AuthorizedBoundaryOption,
+                exit_: AuthorizedBoundaryOption,
+                duration_frames: float,
+            ) -> SegmentBridgeProof:
+                self.exact_call_count += 1
+                return valid_bridge(
+                    bridge_candidate,
+                    entry,
+                    exit_,
+                    duration_frames,
+                )
+
+            def batch(
+                self,
+                requests: tuple[SegmentBridgeDispositionRequest, ...],
+            ) -> tuple[SegmentBridgeDisposition, ...]:
+                self.batch_call_count += 1
+                return tuple(
+                    SegmentBridgeDisposition(
+                        request=request,
+                        evidence_complete=True,
+                        crop_compatible=True,
+                        track_compatible=True,
+                        failure_codes=(),
+                    )
+                    for request in requests
+                )
+
+        bridges = BridgeProvider()
+        result = select_joint_timeline(
+            ((preferred, fallback), (middle,), (last,)),
+            option_provider=provide_options,
+            option_rehydrator=rehydrate,
+            bridge_provider=bridges.bridge,
+            bridge_disposition_batch_provider=bridges.batch,
+            fps=30.0,
+            config=isolated_score_config(),
+            progress_callback=progress.append,
+            shared_bridge_evidence_cache=(
+                JointTimelineSharedBridgeEvidenceCache(maximum_entries=128)
+            ),
+        )
+
+        self.assertIs(result.candidates[0], fallback)
+        self.assertEqual(bridges.batch_call_count, 1)
+        self.assertEqual(bridges.exact_call_count, 1)
+        self.assertEqual(result.bridge_disposition_batch_call_count, 1)
+        self.assertGreater(result.bridge_disposition_batch_request_count, 0)
+        self.assertEqual(
+            [item.completed_boundary_layers for item in progress],
+            [0, 1, 2, 2],
+        )
+        self.assertEqual(
+            [item.phase for item in progress],
+            [
+                "selection_start",
+                "boundary_layer_complete",
+                "boundary_layer_complete",
+                "selection_complete",
+            ],
+        )
+        self.assertEqual(
+            progress[-1].bridge_disposition_batch_call_count,
+            1,
+        )
+        self.assertEqual(
+            dict(result.rejection_counts)[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            1,
+        )
+
+    def test_exact_no_good_retry_loop_exceeds_python_recursion_depth(
+        self,
+    ) -> None:
+        invalid_count = sys.getrecursionlimit() + 5
+        outgoing = tuple(
+            candidate(
+                0,
+                f"source-{index:04d}",
+                1.0 - index * 1e-7,
+            )
+            for index in range(invalid_count + 1)
+        )
+        incoming = candidate(1, "incoming", 0.5)
+        final_outgoing = outgoing[-1]
+        measured: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+        option_provider_calls = 0
+        rehydration_count = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal option_provider_calls
+            option_provider_calls += 1
+            result = selection_scalar_option_set(
+                key,
+                authorized={0: 0.0},
+            )
+            measured[key] = result
+            return result
+
+        def rehydrate(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+            nonlocal rehydration_count
+            rehydration_count += 1
+            if provisional.measurement_key.outgoing is not final_outgoing:
+                return None
+            return exact_rehydrated_option_set(
+                provisional,
+                measured[provisional.measurement_key],
+            )
+
+        result = select_joint_timeline(
+            (outgoing, (incoming,)),
+            option_provider=provide_options,
+            option_rehydrator=rehydrate,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+
+        self.assertIs(result.candidates[0], final_outgoing)
+        self.assertEqual(option_provider_calls, len(outgoing))
+        self.assertEqual(result.option_provider_call_count, len(outgoing))
+        self.assertEqual(rehydration_count, len(outgoing))
+        self.assertEqual(
+            dict(result.rejection_counts)[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            invalid_count,
+        )
+
+    def test_selection_scalar_top_k_score_tie_fails_closed(self) -> None:
+        first = candidate(0, "same", 0.8)
+        second = replace(
+            first,
+            candidate_id="candidate:0:same:duplicate",
+        )
+        incoming = candidate(1, "incoming", 0.8)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "unresolved exact top-K tie",
+        ):
+            select_joint_timeline(
+                ((first, second), (incoming,)),
+                option_provider=lambda key: selection_scalar_option_set(
+                    key,
+                    authorized={0: 0.0},
+                ),
+                option_rehydrator=lambda option: (
+                    option,
+                    BoundaryOptionSet(
+                        option.measurement_key,
+                        option_set(
+                            option.measurement_key,
+                            authorized={0: 0.0},
+                        ).offset_audits,
+                    ),
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+
     def test_tiny_dynamic_program_matches_brute_force_optimum(self) -> None:
         segments = (
             (candidate(0, "A", 0.80), candidate(0, "B", 0.62)),

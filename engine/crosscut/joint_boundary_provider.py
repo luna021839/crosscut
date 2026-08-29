@@ -33,6 +33,7 @@ from .joint_timeline import (
     BoundaryMeasurementKey,
     BoundaryOffsetAudit,
     BoundaryOffsetDisposition,
+    BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
@@ -1151,10 +1152,17 @@ class DecodedBoundaryOptionProvider:
         self._active_descriptor_cache_transaction: (
             _BoundaryDescriptorCacheTransaction | None
         ) = None
+        self._selection_measurement_active = False
         self.request_count = 0
         self.measurement_count = 0
         self.measurement_failure_count = 0
         self.memo_hit_count = 0
+        self.selection_option_request_count = 0
+        self.selection_option_measurement_count = 0
+        self.selection_option_measurement_failure_count = 0
+        self.selection_option_rehydration_count = 0
+        self.selection_option_rejection_count = 0
+        self.selection_option_parity_failure_count = 0
         self.bridge_request_count = 0
         self.bridge_measurement_count = 0
         self.bridge_measurement_failure_count = 0
@@ -1297,6 +1305,7 @@ class DecodedBoundaryOptionProvider:
         self._last_selected_segment_records = ()
         self._active_transaction_journal = None
         self._active_descriptor_cache_transaction = None
+        self._selection_measurement_active = False
         self._descriptor_provider = None
         self._face_identity_provider = None
         self._transformed_descriptor_provider = None
@@ -1304,6 +1313,12 @@ class DecodedBoundaryOptionProvider:
         self.measurement_count = 0
         self.measurement_failure_count = 0
         self.memo_hit_count = 0
+        self.selection_option_request_count = 0
+        self.selection_option_measurement_count = 0
+        self.selection_option_measurement_failure_count = 0
+        self.selection_option_rehydration_count = 0
+        self.selection_option_rejection_count = 0
+        self.selection_option_parity_failure_count = 0
         self.bridge_request_count = 0
         self.bridge_measurement_count = 0
         self.bridge_measurement_failure_count = 0
@@ -1485,6 +1500,13 @@ class DecodedBoundaryOptionProvider:
         cache_name: str,
         pinned_keys: set[Any] | None = None,
     ) -> None:
+        if (
+            self._selection_measurement_active
+            and mapping is self._materialization_by_proof
+        ):
+            # Selection measurements retain exact scalar gate/score state but
+            # never retain renderer proof objects for unselected boundaries.
+            return
         self._transactional_set(mapping, key, value)
         # A transactional insert of a new key is already the MRU item.  Do not
         # reorder replacements or evict until commit: both operations would
@@ -1925,6 +1947,154 @@ class DecodedBoundaryOptionProvider:
         self.measurement_count += 1
         self._enforce_transient_cache_limits()
         return option_set
+
+    def selection_options(
+        self,
+        key: BoundaryMeasurementKey,
+    ) -> BoundaryOptionSet:
+        """Measure exact local scalars while deferring outer renderer proofs.
+
+        This API is optimizer-only.  It preserves the complete 17-offset
+        audit and every scalar/transform value consumed by the DP, but treats
+        first/last segment outer-track authorization optimistically and does
+        not retain boundary materialization objects.  A caller must pass each
+        selected option through :meth:`rehydrate_selection_option` before
+        publishing it or requesting an exact bridge/materialization proof.
+
+        Boundary-local transformed descriptors are intentionally still
+        measured here: they decide the exact crop, hard gate, and scalar score
+        that the DP consumes.  Deferring them would make a provisional score
+        capable of changing the selected path before exact validation.
+        """
+
+        self._require_open()
+        if not isinstance(key, BoundaryMeasurementKey):
+            raise TypeError("joint boundary provider key is invalid")
+        self._assert_required_persistent_cache_available(
+            self._source_index(key.outgoing.source_id),
+            self._source_index(key.incoming.source_id),
+        )
+        self.selection_option_request_count += 1
+        if self._active_transaction_journal is not None:
+            raise RuntimeError("decoded boundary measurement cannot be re-entered")
+        journal: list[
+            tuple[MutableMapping[Any, Any], Any, bool, Any]
+        ] = []
+        counter_snapshot = (
+            self.descriptor_decode_count,
+            self.transformed_descriptor_decode_count,
+            self.face_identity_model_call_count,
+            self.raw_descriptor_cache_hit_count,
+            self.raw_descriptor_cache_miss_count,
+            self.transformed_descriptor_cache_hit_count,
+            self.face_identity_cache_hit_count,
+            dict(self._cache_eviction_counts),
+            dict(self._cache_peak_counts),
+            self._outer_audit_registration_count,
+            self._outer_audit_digest,
+            dict(self._outer_failure_code_counts),
+        )
+        self._active_transaction_journal = journal
+        descriptor_cache_transaction = self.descriptor_cache.begin_transaction()
+        self._active_descriptor_cache_transaction = descriptor_cache_transaction
+        self._selection_measurement_active = True
+        try:
+            option_set, _audit = self._measure(key)
+            option_set = replace(
+                option_set,
+                evidence_scope=(
+                    BoundaryOptionEvidenceScope.SELECTION_SCALAR
+                ),
+            )
+            self.descriptor_cache.commit_transaction(
+                descriptor_cache_transaction
+            )
+        except BaseException:
+            self._rollback_transaction(journal)
+            if descriptor_cache_transaction.active:
+                self.descriptor_cache.rollback_transaction(
+                    descriptor_cache_transaction
+                )
+            (
+                self.descriptor_decode_count,
+                self.transformed_descriptor_decode_count,
+                self.face_identity_model_call_count,
+                self.raw_descriptor_cache_hit_count,
+                self.raw_descriptor_cache_miss_count,
+                self.transformed_descriptor_cache_hit_count,
+                self.face_identity_cache_hit_count,
+                eviction_counts,
+                peak_counts,
+                self._outer_audit_registration_count,
+                self._outer_audit_digest,
+                outer_failure_code_counts,
+            ) = counter_snapshot
+            self._cache_eviction_counts.update(eviction_counts)
+            self._cache_peak_counts.update(peak_counts)
+            self._outer_failure_code_counts.clear()
+            self._outer_failure_code_counts.update(
+                outer_failure_code_counts
+            )
+            self._active_transaction_journal = None
+            self._active_descriptor_cache_transaction = None
+            self._selection_measurement_active = False
+            self.selection_option_measurement_failure_count += 1
+            raise
+        self._active_transaction_journal = None
+        self._active_descriptor_cache_transaction = None
+        self._selection_measurement_active = False
+        self.selection_option_measurement_count += 1
+        self._enforce_transient_cache_limits()
+        return option_set
+
+    def rehydrate_selection_option(
+        self,
+        option: AuthorizedBoundaryOption,
+    ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+        """Return the exact option/set when the optimistic scalar is sound.
+
+        Exact outer-track failure, authorization loss, or any scalar/transform
+        divergence returns ``None``.  The joint selector turns that outcome
+        into an exact no-good and reruns the finite DP.  Storage/model errors
+        deliberately propagate instead of silently authorizing a path.
+        """
+
+        self._require_open()
+        if not isinstance(option, AuthorizedBoundaryOption):
+            raise TypeError("selection option must be AuthorizedBoundaryOption")
+        self.selection_option_rehydration_count += 1
+        exact_set = self(option.measurement_key)
+        if (
+            exact_set.evidence_scope
+            is not BoundaryOptionEvidenceScope.EXACT
+        ):
+            raise RuntimeError("exact boundary provider returned provisional evidence")
+        exact_option = exact_set.audit_for(option.frame_offset).authorized_option
+        if exact_option is None:
+            self.selection_option_rejection_count += 1
+            return None
+        provisional_scalar = (
+            option.measurement_key,
+            option.frame_offset,
+            option.outgoing_transform,
+            option.incoming_transform,
+            option.score_adjustment,
+            option.scoring_outgoing,
+            option.scoring_incoming,
+        )
+        exact_scalar = (
+            exact_option.measurement_key,
+            exact_option.frame_offset,
+            exact_option.outgoing_transform,
+            exact_option.incoming_transform,
+            exact_option.score_adjustment,
+            exact_option.scoring_outgoing,
+            exact_option.scoring_incoming,
+        )
+        if exact_scalar != provisional_scalar:
+            self.selection_option_parity_failure_count += 1
+            return None
+        return exact_option, exact_set
 
     def _raw_context(
         self,
@@ -2961,6 +3131,11 @@ class DecodedBoundaryOptionProvider:
         outgoing_transform: BoundaryTransformState,
         incoming_transform: BoundaryTransformState,
     ) -> tuple[_TransformPathEvidence, ...]:
+        if self._selection_measurement_active:
+            # The optimizer treats the unmeasured outer path optimistically.
+            # Every selected option is rehydrated through the exact public
+            # provider before it may appear in a result.
+            return ()
         proofs: list[_TransformPathEvidence] = []
         if key.boundary_index == 0:
             entry_identity = _identity_transform(
@@ -6423,6 +6598,30 @@ class DecodedBoundaryOptionProvider:
             "measurement_count": self.measurement_count,
             "measurement_failure_count": self.measurement_failure_count,
             "memo_hit_count": self.memo_hit_count,
+            "selection_options": {
+                "contract": "decoded-boundary-selection-scalar-v1",
+                "evidence_scope": (
+                    BoundaryOptionEvidenceScope.SELECTION_SCALAR.value
+                ),
+                "request_count": self.selection_option_request_count,
+                "measurement_count": self.selection_option_measurement_count,
+                "measurement_failure_count": (
+                    self.selection_option_measurement_failure_count
+                ),
+                "rehydration_count": (
+                    self.selection_option_rehydration_count
+                ),
+                "exact_rejection_count": (
+                    self.selection_option_rejection_count
+                ),
+                "scalar_parity_failure_count": (
+                    self.selection_option_parity_failure_count
+                ),
+                "outer_track_proofs_deferred": True,
+                "boundary_materializations_created": False,
+                "boundary_local_transform_gate_exact": True,
+                "selected_options_require_exact_rehydration": True,
+            },
             "same_source_measurement_count": (
                 self._same_source_measurement_count
             ),

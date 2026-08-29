@@ -32,6 +32,7 @@ from .joint_boundary_provider import (
 from .joint_timeline import (
     AuthorizedBoundaryOption,
     BoundaryMeasurementKey,
+    BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
     JOINT_BOUNDARY_FRAME_OFFSETS,
     JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
@@ -63,6 +64,8 @@ from .visual_score import (
     VisualTimelineCandidateRecord,
     VisualTimelineCandidateSet,
     VisualTimelineChoice,
+    VisualTimelineOptimizerCarrier,
+    VisualTimelineOptimizerSeed,
     VisualTimelinePlan,
     _candidate_review_summary,
     _embedding_rms_distance,
@@ -79,7 +82,10 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "joint_visual_candidate_adapter_v1+"
     "three_existing_safe_cadence_profiles_v1+"
     "exact_source_shot_proof_variant_coalescing_v1+"
-    "minimum_eight_unique_paths_fail_closed_v1"
+    "minimum_eight_unique_paths_fail_closed_v1+"
+    "workspace_only_optimizer_seed_v1+"
+    "selection_scalar_exact_rehydration_v1+"
+    "finite_exact_boundary_nogood_retry_v1"
 )
 JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
@@ -175,7 +181,7 @@ class JointVisualSelectionRecord:
 class JointVisualSelectionSet:
     """Round-robin profile output with exact decoded proof variants retained."""
 
-    candidate_set: VisualTimelineCandidateSet = field(repr=False)
+    candidate_set: VisualTimelineOptimizerCarrier = field(repr=False)
     selections: tuple[JointVisualSelectionRecord, ...]
     candidate_records: tuple[VisualTimelineCandidateRecord, ...]
     selected_candidate_index: int
@@ -193,8 +199,13 @@ class JointVisualSelectionSet:
     analysis_basis: str = JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS
 
     def __post_init__(self) -> None:
-        if not isinstance(self.candidate_set, VisualTimelineCandidateSet):
-            raise TypeError("candidate_set must be a VisualTimelineCandidateSet")
+        if not isinstance(
+            self.candidate_set,
+            (VisualTimelineCandidateSet, VisualTimelineOptimizerSeed),
+        ):
+            raise TypeError(
+                "candidate_set must carry a visual optimizer workspace"
+            )
         selections = tuple(self.selections)
         records = tuple(self.candidate_records)
         if len(selections) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
@@ -424,7 +435,7 @@ def _coalesce_profile_results(
 
 
 def _assert_provider_binding(
-    candidate_set: VisualTimelineCandidateSet,
+    candidate_set: VisualTimelineOptimizerCarrier,
     provider: DecodedBoundaryOptionProvider,
     *,
     fps: float,
@@ -462,7 +473,7 @@ def _assert_provider_binding(
 
 
 def select_joint_visual_candidates(
-    candidate_set: VisualTimelineCandidateSet,
+    candidate_set: VisualTimelineOptimizerCarrier,
     *,
     provider: DecodedBoundaryOptionProvider,
     fps: float = 29.97,
@@ -478,8 +489,11 @@ def select_joint_visual_candidates(
     evidence must not be projected into this argument.
     """
 
-    if not isinstance(candidate_set, VisualTimelineCandidateSet):
-        raise TypeError("candidate_set must be a VisualTimelineCandidateSet")
+    if not isinstance(
+        candidate_set,
+        (VisualTimelineCandidateSet, VisualTimelineOptimizerSeed),
+    ):
+        raise TypeError("candidate_set must carry a visual optimizer workspace")
     workspace = candidate_set.optimizer_workspace
     if workspace is None:
         raise ValueError(
@@ -565,11 +579,18 @@ def select_joint_visual_candidates(
             shared_option_cache_hit_count += 1
             return cached
         shared_option_cache_miss_count += 1
-        measured = provider(key)
+        measured = provider.selection_options(key)
         if not isinstance(measured, BoundaryOptionSet):
             raise TypeError("decoded provider returned an invalid option set")
         if measured.measurement_key != key:
             raise RuntimeError("decoded provider returned evidence for another key")
+        if (
+            measured.evidence_scope
+            is not BoundaryOptionEvidenceScope.SELECTION_SCALAR
+        ):
+            raise RuntimeError(
+                "decoded selection provider returned non-scalar evidence"
+            )
         shared_option_cache[key] = measured
         return measured
 
@@ -685,6 +706,7 @@ def select_joint_visual_candidates(
             results = select_joint_timeline_candidates(
                 lattice,
                 option_provider=shared_option_provider,
+                option_rehydrator=provider.rehydrate_selection_option,
                 bridge_provider=provider.bridge_provider,
                 bridge_disposition_batch_provider=(
                     provider.bridge_disposition_batch
@@ -808,6 +830,9 @@ def select_joint_visual_candidates(
             "entry_count": len(shared_option_cache),
             "hit_count": shared_option_cache_hit_count,
             "miss_count": shared_option_cache_miss_count,
+            "evidence_scope": (
+                BoundaryOptionEvidenceScope.SELECTION_SCALAR.value
+            ),
             "immutable_boundary_option_sets": True,
             "raw_visual_evidence_persisted": False,
         },
@@ -1023,7 +1048,7 @@ class JointVisualBoundaryProofBundle:
 def _transition_annotations(
     candidates: Sequence[TimelineCandidate],
     index: int,
-    candidate_set: VisualTimelineCandidateSet,
+    candidate_set: VisualTimelineOptimizerCarrier,
 ) -> dict[str, object]:
     if index == 0:
         return {
@@ -1420,7 +1445,7 @@ class JointMaterializedVisualCandidate:
         return self.candidate_record.cadence_profile
 
     @property
-    def candidate_set(self) -> VisualTimelineCandidateSet:
+    def candidate_set(self) -> VisualTimelineOptimizerCarrier:
         return self.selection_set.candidate_set
 
     @property
@@ -1642,7 +1667,7 @@ def materialize_joint_visual_candidates(
 
 
 def build_joint_visual_candidates(
-    candidate_set: VisualTimelineCandidateSet,
+    candidate_set: VisualTimelineOptimizerCarrier,
     *,
     provider: DecodedBoundaryOptionProvider,
     fps: float = 29.97,
