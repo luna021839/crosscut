@@ -12,6 +12,9 @@ from crosscut.joint_timeline import (
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+    JointTimelineProgress,
+    JointTimelineSharedBridgeEvidenceCache,
     SegmentBridgeProof,
     select_joint_timeline,
     select_joint_timeline_candidates,
@@ -212,6 +215,14 @@ def valid_bridge(
         track_compatible=True,
         score_adjustment=score_adjustment,
     )
+
+
+def three_segment_fixture() -> tuple[tuple[TimelineCandidate, ...], ...]:
+    return tuple((candidate(index, source, 0.8),) for index, source in enumerate("ABC"))
+
+
+def zero_offset_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+    return option_set(key, authorized={0: 0.0})
 
 
 class JointTimelineTests(unittest.TestCase):
@@ -512,6 +523,231 @@ class JointTimelineTests(unittest.TestCase):
         self.assertEqual(len(call_counts), 2)
         self.assertEqual(result.option_provider_call_count, 2)
         self.assertEqual(len(result.measured_boundary_option_sets), 2)
+
+    def test_shared_bridge_scalars_suppress_semantic_redecode_but_keep_exact_proof(
+        self,
+    ) -> None:
+        segments = three_segment_fixture()
+
+        class BridgeCounter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def provide(
+                self,
+                middle: TimelineCandidate,
+                entry: AuthorizedBoundaryOption,
+                exit: AuthorizedBoundaryOption,
+                duration_frames: float,
+            ) -> SegmentBridgeProof:
+                self.calls += 1
+                return valid_bridge(middle, entry, exit, duration_frames)
+
+        baseline_provider = BridgeCounter()
+        baseline = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=baseline_provider.provide,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        self.assertEqual(baseline_provider.calls, 2)
+
+        shared_provider = BridgeCounter()
+        shared_cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+        select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=shared_provider.provide,
+            shared_bridge_evidence_cache=shared_cache,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        second_progress: list[JointTimelineProgress] = []
+        second = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=shared_provider.provide,
+            shared_bridge_evidence_cache=shared_cache,
+            fps=30.0,
+            config=isolated_score_config(),
+            progress_callback=second_progress.append,
+        )
+
+        self.assertEqual(shared_provider.calls, 3)
+        self.assertEqual(second.bridge_provider_call_count, 1)
+        self.assertEqual(second.timeline, baseline.timeline)
+        self.assertEqual(second.boundary_options, baseline.boundary_options)
+        self.assertEqual(
+            second.segment_bridge_proofs,
+            baseline.segment_bridge_proofs,
+        )
+        audit = shared_cache.to_dict()
+        self.assertEqual(
+            (audit["hit_count"], audit["miss_count"], audit["admission_count"]),
+            (1, 1, 1),
+        )
+        self.assertFalse(audit["proof_identities_retained"])
+        self.assertEqual(second_progress[-1].shared_bridge_cache_hit_count, 1)
+        self.assertEqual(
+            [item.completed_boundary_layers for item in second_progress],
+            [0, 1, 2, 2],
+        )
+        self.assertEqual(
+            [item.option_key_count for item in second_progress],
+            [0, 1, 2, 2],
+        )
+
+        other_provider = BridgeCounter()
+        option_calls = 0
+
+        def rejected_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal option_calls
+            option_calls += 1
+            return zero_offset_options(key)
+
+        with self.assertRaisesRegex(ValueError, "another provider or fps"):
+            select_joint_timeline(
+                segments,
+                option_provider=rejected_options,
+                bridge_provider=other_provider.provide,
+                shared_bridge_evidence_cache=shared_cache,
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+        self.assertEqual(option_calls, 0)
+
+        preflight_cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+        invalid_provider = BridgeCounter()
+        valid_provider = BridgeCounter()
+        with self.assertRaisesRegex(ValueError, "between 1 and 8"):
+            select_joint_timeline_candidates(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=invalid_provider.provide,
+                shared_bridge_evidence_cache=preflight_cache,
+                maximum_results=9,
+            )
+        select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=valid_provider.provide,
+            shared_bridge_evidence_cache=preflight_cache,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        self.assertEqual(invalid_provider.calls, 0)
+        self.assertEqual(valid_provider.calls, 2)
+        self.assertEqual(other_provider.calls, 0)
+        with self.assertRaisesRegex(ValueError, "another provider or fps"):
+            select_joint_timeline(
+                segments,
+                option_provider=rejected_options,
+                bridge_provider=shared_provider.provide,
+                shared_bridge_evidence_cache=shared_cache,
+                fps=24.0,
+                config=isolated_score_config(),
+            )
+        self.assertEqual(option_calls, 0)
+
+    def test_shared_bridge_hit_still_revalidates_exact_backtrace_scalars(self) -> None:
+        segments = three_segment_fixture()
+
+        class DivergingProvider:
+            diverge = False
+
+            def provide(
+                self,
+                middle: TimelineCandidate,
+                entry: AuthorizedBoundaryOption,
+                exit: AuthorizedBoundaryOption,
+                duration_frames: float,
+            ) -> SegmentBridgeProof:
+                return valid_bridge(
+                    middle,
+                    entry,
+                    exit,
+                    duration_frames,
+                    score_adjustment=-0.1 if self.diverge else 0.0,
+                )
+
+        provider = DivergingProvider()
+        cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+        select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=provider.provide,
+            shared_bridge_evidence_cache=cache,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        provider.diverge = True
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "diverged within one renderer-semantic state",
+        ):
+            select_joint_timeline(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=provider.provide,
+                shared_bridge_evidence_cache=cache,
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+
+    def test_failed_bridge_measurement_is_never_admitted(self) -> None:
+        segments = three_segment_fixture()
+        for mismatch in (False, True):
+            def failing_provider(
+                middle: TimelineCandidate,
+                entry: AuthorizedBoundaryOption,
+                exit: AuthorizedBoundaryOption,
+                duration_frames: float,
+            ) -> SegmentBridgeProof:
+                if not mismatch:
+                    raise RuntimeError("synthetic decode failure")
+                return valid_bridge(
+                    middle,
+                    entry,
+                    exit,
+                    duration_frames + 1.0,
+                )
+            with self.subTest(mismatch=mismatch):
+                cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+                with self.assertRaises((RuntimeError, TypeError)):
+                    select_joint_timeline(
+                        segments,
+                        option_provider=zero_offset_options,
+                        bridge_provider=failing_provider,
+                        shared_bridge_evidence_cache=cache,
+                        fps=30.0,
+                        config=isolated_score_config(),
+                    )
+                self.assertEqual(cache.entry_count, 0)
+                self.assertEqual(cache.admission_count, 0)
+
+    def test_shared_bridge_cache_cap_is_admission_only_without_eviction(self) -> None:
+        self.assertEqual(JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES, 300_000)
+        first = three_segment_fixture()
+        second = (first[0], (candidate(1, "D", 0.8),), first[2])
+        cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+
+        for segments in (first, second, first):
+            select_joint_timeline(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=valid_bridge,
+                shared_bridge_evidence_cache=cache,
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+
+        self.assertEqual(cache.entry_count, 1)
+        self.assertEqual(cache.miss_count, 2)
+        self.assertEqual(cache.hit_count, 1)
+        self.assertEqual(cache.admission_count, 1)
+        self.assertEqual(cache.saturation_count, 1)
 
     def test_exact_no_good_rejects_before_option_provider_decoding(self) -> None:
         segments = (

@@ -47,6 +47,7 @@ from .vision import IVEMember
 
 JOINT_BOUNDARY_FRAME_OFFSETS = tuple(range(-8, 9))
 MINIMUM_JOINT_SEGMENT_DURATION_FRAMES = 2.0
+JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES = 300_000
 BOUNDARY_TRANSFORM_SUBJECT_BASES = frozenset(
     {"dominant_face", "subject_silhouette", "full_frame_identity"}
 )
@@ -449,6 +450,110 @@ SegmentBridgeProvider: TypeAlias = Callable[
 
 
 @dataclass(frozen=True, slots=True)
+class JointTimelineProgress:
+    """Immutable, privacy-safe progress for a core or profiled joint search.
+
+    Boundary measurements and proofs stay process-local.  Shared-cache counts
+    are globally monotonic; layer, option, and bridge counts are monotonic
+    within ``profile_index`` and reset only when that index advances.  Callback
+    failures propagate, so no partially observed selection is returned.
+    """
+
+    phase: str
+    completed_boundary_layers: int
+    total_boundary_layers: int
+    option_key_count: int
+    bridge_provider_call_count: int
+    shared_bridge_cache_hit_count: int = 0
+    shared_bridge_cache_miss_count: int = 0
+    shared_bridge_cache_admission_count: int = 0
+    shared_bridge_cache_saturation_count: int = 0
+    shared_bridge_cache_entry_count: int = 0
+    cadence_profile: str | None = None
+    profile_index: int = 0
+    total_profiles: int = 0
+    shared_option_cache_hit_count: int = 0
+    shared_option_cache_miss_count: int = 0
+    shared_option_cache_entry_count: int = 0
+    profile_status: str = "in_progress"
+    contract: str = "joint_selection_progress_v1"
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            self.contract != "joint_selection_progress_v1"
+            or isinstance(self.version, bool)
+            or self.version != 1
+        ):
+            raise ValueError("joint selection progress contract is invalid")
+        if self.phase not in {
+            "selection_start",
+            "boundary_layer_complete",
+            "selection_failed",
+            "selection_complete",
+            "profile_start",
+            "profile_complete",
+        }:
+            raise ValueError("joint selection progress phase is invalid")
+        integer_fields = (
+            item
+            for item in fields(self)
+            if item.name.endswith("_count")
+            or item.name
+            in {
+                "completed_boundary_layers",
+                "total_boundary_layers",
+                "profile_index",
+                "total_profiles",
+            }
+        )
+        if any(
+            isinstance(value := getattr(self, item.name), bool)
+            or not isinstance(value, int)
+            or value < 0
+            for item in integer_fields
+        ):
+            raise ValueError("joint selection progress counts must be non-negative")
+        if self.completed_boundary_layers > self.total_boundary_layers:
+            raise ValueError("completed boundary layers exceed the total")
+        if self.shared_bridge_cache_entry_count > (
+            self.shared_bridge_cache_admission_count
+        ):
+            raise ValueError("shared bridge cache entries exceed admissions")
+        if self.shared_option_cache_entry_count > self.shared_option_cache_miss_count:
+            raise ValueError("shared option cache entries exceed misses")
+        if self.cadence_profile is None:
+            if self.profile_index != 0 or self.total_profiles != 0:
+                raise ValueError("unprofiled progress cannot carry a profile index")
+        elif (
+            not isinstance(self.cadence_profile, str)
+            or not self.cadence_profile
+            or self.cadence_profile != self.cadence_profile.strip()
+            or not 1 <= self.profile_index <= self.total_profiles
+        ):
+            raise ValueError("profiled progress identity is invalid")
+        if self.profile_status not in {
+            "in_progress",
+            "completed",
+            "no_complete_path",
+        }:
+            raise ValueError("joint selection progress status is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        payload = {item.name: getattr(self, item.name) for item in fields(self)}
+        payload["current_profile_option_key_count"] = payload.pop(
+            "option_key_count"
+        )
+        payload["current_profile_bridge_provider_call_count"] = payload.pop(
+            "bridge_provider_call_count"
+        )
+        return payload
+
+
+JointTimelineProgressCallback: TypeAlias = Callable[[JointTimelineProgress], None]
+
+
+@dataclass(frozen=True, slots=True)
 class JointTimelineResult:
     """Selected timeline plus every exact proof used by the joint DP."""
 
@@ -584,6 +689,153 @@ class _SharedBridgeEvidence:
             self.evidence_complete
             and not (self.crop_compatible and self.track_compatible)
         )
+
+
+class JointTimelineSharedBridgeEvidenceCache:
+    """Adapter-lifetime admission-only cache of scalar bridge dispositions.
+
+    The caller bounds admission under the 300,000-entry hard cap; entries are
+    never evicted or promoted.  Values retain only scalar compatibility, never
+    proof identities, boundary options, materializations, or audit payloads.
+    """
+
+    __slots__ = (
+        "_admission_count",
+        "_binding",
+        "_entries",
+        "_hit_count",
+        "_maximum_entries",
+        "_miss_count",
+        "_saturation_count",
+    )
+
+    def __init__(
+        self,
+        *,
+        maximum_entries: int = JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+    ) -> None:
+        if (
+            isinstance(maximum_entries, bool)
+            or not isinstance(maximum_entries, int)
+            or not 0
+            <= maximum_entries
+            <= JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES
+        ):
+            raise ValueError("shared bridge cache maximum_entries is invalid")
+        self._entries: dict[_BridgeSemanticKey, _SharedBridgeEvidence] = {}
+        self._maximum_entries = maximum_entries
+        self._binding: tuple[tuple[object, ...], float] | None = None
+        self._hit_count = 0
+        self._miss_count = 0
+        self._admission_count = 0
+        self._saturation_count = 0
+
+    def _bind(self, bridge_provider: SegmentBridgeProvider, *, fps: float) -> None:
+        if not callable(bridge_provider):
+            raise TypeError("shared bridge cache provider binding is invalid")
+        resolved_fps = _finite_number(fps, "shared bridge cache fps")
+        if resolved_fps <= 0.0:
+            raise ValueError("shared bridge cache fps must be positive")
+        bound_self = getattr(bridge_provider, "__self__", None)
+        bound_function = getattr(bridge_provider, "__func__", None)
+        callable_identity = (
+            (bound_self, bound_function)
+            if bound_self is not None and bound_function is not None
+            else (bridge_provider,)
+        )
+        binding = (callable_identity, resolved_fps)
+        if self._binding is None:
+            self._binding = binding
+            return
+        previous_identity, previous_fps = self._binding
+        same_callable = len(previous_identity) == len(callable_identity) and all(
+            left is right
+            for left, right in zip(
+                previous_identity,
+                callable_identity,
+                strict=True,
+            )
+        )
+        if not same_callable or previous_fps != resolved_fps:
+            raise ValueError(
+                "shared bridge cache is bound to another provider or fps"
+            )
+
+    def _locate(
+        self,
+        key: _BridgeSemanticKey,
+    ) -> _SharedBridgeEvidence | None:
+        if self._binding is None:
+            raise RuntimeError("shared bridge cache must be bound before lookup")
+        if not isinstance(key, _BridgeSemanticKey):
+            raise TypeError("shared bridge cache key is invalid")
+        cached = self._entries.get(key)
+        if cached is None:
+            self._miss_count += 1
+            return None
+        self._hit_count += 1
+        return cached
+
+    def _admit(self, evidence: _SharedBridgeEvidence) -> bool:
+        if self._binding is None:
+            raise RuntimeError("shared bridge cache must be bound before admission")
+        if not isinstance(evidence, _SharedBridgeEvidence):
+            raise TypeError("shared bridge cache evidence is invalid")
+        key = evidence.semantic_key
+        if len(self._entries) >= self._maximum_entries:
+            self._saturation_count += 1
+            return False
+        self._entries[key] = evidence
+        self._admission_count += 1
+        return True
+
+    @property
+    def hit_count(self) -> int:
+        return self._hit_count
+
+    @property
+    def miss_count(self) -> int:
+        return self._miss_count
+
+    @property
+    def admission_count(self) -> int:
+        return self._admission_count
+
+    @property
+    def saturation_count(self) -> int:
+        return self._saturation_count
+
+    @property
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    def _progress_counts(self) -> dict[str, int]:
+        return {
+            "shared_bridge_cache_hit_count": self.hit_count,
+            "shared_bridge_cache_miss_count": self.miss_count,
+            "shared_bridge_cache_admission_count": self.admission_count,
+            "shared_bridge_cache_saturation_count": self.saturation_count,
+            "shared_bridge_cache_entry_count": self.entry_count,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contract": "joint_timeline_shared_bridge_evidence_cache_v1",
+            "admission_policy": "fixed_cap_no_eviction_v1",
+            "maximum_entry_count": self._maximum_entries,
+            "hard_maximum_entry_count": (
+                JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES
+            ),
+            "entry_count": self.entry_count,
+            "hit_count": self.hit_count,
+            "miss_count": self.miss_count,
+            "admission_count": self.admission_count,
+            "saturation_count": self.saturation_count,
+            "scalar_evidence_only": True,
+            "proof_identities_retained": False,
+            "boundary_options_retained": False,
+            "materializations_retained": False,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +1024,10 @@ def _select_joint_timeline_candidates_core(
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
+    progress_callback: JointTimelineProgressCallback | None = None,
+    shared_bridge_evidence_cache: (
+        JointTimelineSharedBridgeEvidenceCache | None
+    ) = None,
 ) -> tuple[JointTimelineResult, ...]:
     """Select ranked candidates and exact boundary options in one finite DP.
 
@@ -791,6 +1047,16 @@ def _select_joint_timeline_candidates_core(
         raise TypeError("option_provider must be callable")
     if bridge_provider is not None and not callable(bridge_provider):
         raise TypeError("bridge_provider must be callable or None")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
+    if shared_bridge_evidence_cache is not None and not isinstance(
+        shared_bridge_evidence_cache,
+        JointTimelineSharedBridgeEvidenceCache,
+    ):
+        raise TypeError(
+            "shared_bridge_evidence_cache must be a "
+            "JointTimelineSharedBridgeEvidenceCache or None"
+        )
     resolved_fps = _finite_number(fps, "fps")
     if resolved_fps <= 0.0:
         raise ValueError("fps must be positive")
@@ -929,6 +1195,11 @@ def _select_joint_timeline_candidates_core(
                         used_fallback,
                     )
 
+    if shared_bridge_evidence_cache is not None and bridge_provider is not None:
+        shared_bridge_evidence_cache._bind(
+            bridge_provider,
+            fps=resolved_fps,
+        )
     option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
     semantic_bridge_cache: dict[
         _BridgeSemanticKey,
@@ -941,6 +1212,25 @@ def _select_joint_timeline_candidates_core(
     bridge_provider_call_count = 0
     rejection_counts: dict[str, int] = {}
     layer_rejection_counts: dict[str, int] = {}
+    total_boundary_layers = max(0, len(segments) - 1)
+
+    def report_progress(phase: str, completed_boundary_layers: int) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            JointTimelineProgress(
+                phase=phase,
+                completed_boundary_layers=completed_boundary_layers,
+                total_boundary_layers=total_boundary_layers,
+                option_key_count=len(option_cache),
+                bridge_provider_call_count=bridge_provider_call_count,
+                **(
+                    shared_bridge_evidence_cache._progress_counts()
+                    if shared_bridge_evidence_cache is not None
+                    else {}
+                ),
+            )
+        )
 
     def reject(reason: str) -> None:
         rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -1026,6 +1316,11 @@ def _select_joint_timeline_candidates_core(
         cached = semantic_bridge_cache.get(semantic_key)
         if cached is not None:
             return cached
+        if shared_bridge_evidence_cache is not None:
+            shared = shared_bridge_evidence_cache._locate(semantic_key)
+            if shared is not None:
+                semantic_bridge_cache[semantic_key] = shared
+                return shared
         proof = call_bridge_provider(
             candidate,
             entry_option,
@@ -1041,6 +1336,8 @@ def _select_joint_timeline_candidates_core(
             score_adjustment=proof.score_adjustment,
         )
         semantic_bridge_cache[semantic_key] = evidence
+        if shared_bridge_evidence_cache is not None:
+            shared_bridge_evidence_cache._admit(evidence)
         return evidence
 
     def locate_selected_exact_bridge(
@@ -1080,7 +1377,7 @@ def _select_joint_timeline_candidates_core(
             or proof.crop_compatible != evidence.crop_compatible
             or proof.track_compatible != evidence.track_compatible
             or proof.failure_codes != evidence.failure_codes
-            or abs(proof.score_adjustment - evidence.score_adjustment) > 1e-12
+            or proof.score_adjustment != evidence.score_adjustment
         ):
             raise RuntimeError(
                 "bridge_provider diverged within one renderer-semantic state"
@@ -1116,6 +1413,7 @@ def _select_joint_timeline_candidates_core(
             )
         ]
     frontier = first_layer
+    report_progress("selection_start", 0)
 
     for segment_position in range(1, len(segments)):
         layer_rejection_counts = {}
@@ -1419,6 +1717,7 @@ def _select_joint_timeline_candidates_core(
                 f"{reason}:{count}"
                 for reason, count in sorted(layer_rejection_counts.items())
             ) or "unknown:0"
+            report_progress("selection_failed", segment_position - 1)
             raise NoCompleteTimelinePath(
                 f"segment {current_segment[0].segment_index} has no joint-safe "
                 f"candidate; rejection_counts={summary}",
@@ -1427,6 +1726,7 @@ def _select_joint_timeline_candidates_core(
                 rejection_counts=layer_rejection_counts,
             )
         frontier = current_layer
+        report_progress("boundary_layer_complete", segment_position)
 
     final_by_signature: dict[
         tuple[tuple[str, ...], ...],
@@ -1542,7 +1842,7 @@ def _select_joint_timeline_candidates_core(
                 tuple(bridge_proofs),
             )
         )
-    return tuple(
+    results = tuple(
         JointTimelineResult(
             timeline=timeline,
             boundary_options=boundary_options,
@@ -1560,6 +1860,8 @@ def _select_joint_timeline_candidates_core(
             bridge_proofs,
         ) in pending_results
     )
+    report_progress("selection_complete", total_boundary_layers)
+    return results
 
 
 def select_joint_timeline(
@@ -1578,6 +1880,10 @@ def select_joint_timeline(
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
+    progress_callback: JointTimelineProgressCallback | None = None,
+    shared_bridge_evidence_cache: (
+        JointTimelineSharedBridgeEvidenceCache | None
+    ) = None,
 ) -> JointTimelineResult:
     """Return the single best fully authorized joint timeline."""
 
@@ -1594,6 +1900,8 @@ def select_joint_timeline(
         emission_adjustments=emission_adjustments,
         source_switch_bonus_by_segment=source_switch_bonus_by_segment,
         forbidden_boundary_edges=forbidden_boundary_edges,
+        progress_callback=progress_callback,
+        shared_bridge_evidence_cache=shared_bridge_evidence_cache,
     )[0]
 
 
@@ -1614,6 +1922,10 @@ def select_joint_timeline_candidates(
     forbidden_boundary_edges: (
         TimelineNoGoodSet | Sequence[TimelineNoGoodEdgeKey]
     ) = (),
+    progress_callback: JointTimelineProgressCallback | None = None,
+    shared_bridge_evidence_cache: (
+        JointTimelineSharedBridgeEvidenceCache | None
+    ) = None,
 ) -> tuple[JointTimelineResult, ...]:
     """Return up to eight distinct source/shot/boundary-proof paths.
 
@@ -1636,6 +1948,8 @@ def select_joint_timeline_candidates(
         emission_adjustments=emission_adjustments,
         source_switch_bonus_by_segment=source_switch_bonus_by_segment,
         forbidden_boundary_edges=forbidden_boundary_edges,
+        progress_callback=progress_callback,
+        shared_bridge_evidence_cache=shared_bridge_evidence_cache,
     )
 
 
@@ -1648,7 +1962,11 @@ __all__ = [
     "BoundaryOptionSet",
     "BoundaryTransformState",
     "JOINT_BOUNDARY_FRAME_OFFSETS",
+    "JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES",
     "JointTimelineResult",
+    "JointTimelineProgress",
+    "JointTimelineProgressCallback",
+    "JointTimelineSharedBridgeEvidenceCache",
     "MINIMUM_JOINT_SEGMENT_DURATION_FRAMES",
     "SegmentBridgeProof",
     "SegmentBridgeProvider",

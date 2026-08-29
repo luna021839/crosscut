@@ -22,6 +22,7 @@ from crosscut.joint_timeline import (
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    JointTimelineProgress,
     JointTimelineResult,
     SegmentBridgeProof,
 )
@@ -87,6 +88,41 @@ class StubDecodedProvider(DecodedBoundaryOptionProvider):
 
     def bridge_provider(self, *args: object) -> SegmentBridgeProof:
         raise AssertionError("selector stub must not invoke bridge_provider")
+
+
+class CountingStubDecodedProvider(StubDecodedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.option_calls: dict[BoundaryMeasurementKey, int] = {}
+        self.bridge_calls = 0
+
+    def __call__(self, key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+        self.option_calls[key] = self.option_calls.get(key, 0) + 1
+        measured, _selected = _option_set(
+            key,
+            selected_offset=0,
+            variant="shared-profile",
+        )
+        return measured
+
+    def bridge_provider(
+        self,
+        candidate: TimelineCandidate,
+        entry: AuthorizedBoundaryOption,
+        exit: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> SegmentBridgeProof:
+        self.bridge_calls += 1
+        return SegmentBridgeProof(
+            candidate,
+            entry,
+            exit,
+            duration_frames,
+            f"bridge:{candidate.candidate_id}:{entry.proof_identity}:{exit.proof_identity}",
+            True,
+            True,
+            True,
+        )
 
 
 class StubMaterializingProvider(StubDecodedProvider):
@@ -675,6 +711,196 @@ def _profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_real_three_profile_search_reuses_scalar_bridges_and_keeps_exact_calls(
+        self,
+    ) -> None:
+        provider = CountingStubDecodedProvider()
+        progress: list[JointTimelineProgress] = []
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_visual_candidates(
+                _candidate_set(),
+                provider=provider,
+                fps=10.0,
+                progress_callback=progress.append,
+            )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_unique_path_floor_not_met",
+        )
+        self.assertEqual(len(provider.option_calls), 8)
+        self.assertEqual(set(provider.option_calls.values()), {1})
+        completed = [item for item in progress if item.phase == "profile_complete"]
+        self.assertEqual(
+            [item.cadence_profile for item in completed],
+            ["balanced", "reference", "dense_safe"],
+        )
+        self.assertEqual(
+            [item.bridge_provider_call_count for item in completed],
+            [4, 2, 2],
+        )
+        self.assertEqual(
+            [item.shared_bridge_cache_hit_count for item in completed],
+            [0, 2, 4],
+        )
+        self.assertEqual(provider.bridge_calls, 8)
+
+    def test_boundary_option_evidence_is_shared_across_all_profiles_with_progress(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        provider = CountingStubDecodedProvider()
+        progress: list[JointTimelineProgress] = []
+        pools = _profile_pools(candidate_set)
+        selector_call_count = 0
+        shared_bridge_cache_ids: list[int] = []
+        option_set_ids: list[int] = []
+
+        def selector(
+            lattice: tuple[tuple[TimelineCandidate, ...], ...],
+            **kwargs: object,
+        ) -> tuple[JointTimelineResult, ...]:
+            nonlocal selector_call_count
+            option_provider = kwargs["option_provider"]
+            core_progress = kwargs["progress_callback"]
+            assert callable(option_provider)
+            assert callable(core_progress)
+            shared_bridge_cache_ids.append(
+                id(kwargs["shared_bridge_evidence_cache"])
+            )
+            core_progress(
+                JointTimelineProgress(
+                    phase="selection_start",
+                    completed_boundary_layers=0,
+                    total_boundary_layers=2,
+                    option_key_count=0,
+                    bridge_provider_call_count=0,
+                )
+            )
+            key = BoundaryMeasurementKey(0, lattice[0][0], lattice[1][0])
+            measured = option_provider(key)
+            self.assertIsInstance(measured, BoundaryOptionSet)
+            option_set_ids.append(id(measured))
+            for boundary_index in range(2):
+                core_progress(
+                    JointTimelineProgress(
+                        phase="boundary_layer_complete",
+                        completed_boundary_layers=boundary_index + 1,
+                        total_boundary_layers=2,
+                        option_key_count=1,
+                        bridge_provider_call_count=boundary_index * 4,
+                    )
+                )
+            core_progress(
+                JointTimelineProgress(
+                    phase="selection_complete",
+                    completed_boundary_layers=2,
+                    total_boundary_layers=2,
+                    option_key_count=1,
+                    bridge_provider_call_count=5,
+                )
+            )
+            result = pools[selector_call_count]
+            selector_call_count += 1
+            return result
+
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=selector,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+                progress_callback=progress.append,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(len(set(shared_bridge_cache_ids)), 1)
+        self.assertEqual(len(set(option_set_ids)), 1)
+        self.assertEqual(list(provider.option_calls.values()), [1])
+        self.assertEqual(
+            [item.cadence_profile for item in progress if item.phase == "profile_start"],
+            ["balanced", "reference", "dense_safe"],
+        )
+        self.assertEqual(
+            [item.phase for item in progress],
+            [
+                "profile_start",
+                "boundary_layer_complete",
+                "boundary_layer_complete",
+                "profile_complete",
+            ]
+            * 3,
+        )
+        self.assertEqual(
+            [item.completed_boundary_layers for item in progress],
+            [0, 1, 2, 2] * 3,
+        )
+        final_progress = progress[-1]
+        self.assertEqual(final_progress.total_profiles, 3)
+        self.assertEqual(final_progress.shared_option_cache_miss_count, 1)
+        self.assertEqual(final_progress.shared_option_cache_hit_count, 2)
+        self.assertEqual(final_progress.shared_option_cache_entry_count, 1)
+        self.assertEqual(final_progress.option_key_count, 1)
+        self.assertEqual(
+            (
+                selected.shared_option_evidence_cache_audit["entry_count"],
+                selected.shared_option_evidence_cache_audit["hit_count"],
+                selected.shared_option_evidence_cache_audit["miss_count"],
+            ),
+            (1, 2, 1),
+        )
+        self.assertFalse(
+            selected.shared_option_evidence_cache_audit[
+                "raw_visual_evidence_persisted"
+            ]
+        )
+        self.assertEqual(
+            selected.shared_bridge_evidence_cache_audit[
+                "maximum_entry_count"
+            ],
+            2 * len(JOINT_BOUNDARY_FRAME_OFFSETS) ** 2,
+        )
+
+    def test_progress_callback_failure_aborts_before_partial_selection(self) -> None:
+        provider = CountingStubDecodedProvider()
+
+        def fail_closed(_progress: JointTimelineProgress) -> None:
+            raise RuntimeError("synthetic adapter progress sink failure")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "synthetic adapter progress sink failure",
+        ):
+            select_joint_visual_candidates(
+                _candidate_set(),
+                provider=provider,
+                fps=10.0,
+                progress_callback=fail_closed,
+            )
+        self.assertEqual(provider.option_calls, {})
+
+        callback_failure = NoCompleteTimelinePath(
+            "synthetic no-path progress sink failure",
+            reason_code="synthetic_progress_sink_failure",
+        )
+
+        def fail_during_search(progress: JointTimelineProgress) -> None:
+            if progress.phase == "boundary_layer_complete":
+                raise callback_failure
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_visual_candidates(
+                _candidate_set(),
+                provider=CountingStubDecodedProvider(),
+                fps=10.0,
+                progress_callback=fail_during_search,
+            )
+        self.assertIs(caught.exception, callback_failure)
+
     def test_offsets_shift_clocks_and_highest_proof_variant_wins(self) -> None:
         candidate_set = _candidate_set()
         pools = _profile_pools(candidate_set)

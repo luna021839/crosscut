@@ -31,7 +31,14 @@ from .joint_boundary_provider import (
 )
 from .joint_timeline import (
     AuthorizedBoundaryOption,
+    BoundaryMeasurementKey,
+    BoundaryOptionSet,
+    JOINT_BOUNDARY_FRAME_OFFSETS,
+    JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+    JointTimelineProgress,
+    JointTimelineProgressCallback,
     JointTimelineResult,
+    JointTimelineSharedBridgeEvidenceCache,
     select_joint_timeline_candidates,
 )
 from .timeline import (
@@ -177,6 +184,12 @@ class JointVisualSelectionSet:
         repr=False,
     )
     role_control_audits: tuple[Mapping[str, Any], ...] = ()
+    shared_option_evidence_cache_audit: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+    shared_bridge_evidence_cache_audit: Mapping[str, Any] = field(
+        default_factory=dict
+    )
     analysis_basis: str = JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS
 
     def __post_init__(self) -> None:
@@ -213,6 +226,16 @@ class JointVisualSelectionSet:
             self,
             "role_control_audits",
             tuple(MappingProxyType(dict(item)) for item in self.role_control_audits),
+        )
+        object.__setattr__(
+            self,
+            "shared_option_evidence_cache_audit",
+            MappingProxyType(dict(self.shared_option_evidence_cache_audit)),
+        )
+        object.__setattr__(
+            self,
+            "shared_bridge_evidence_cache_audit",
+            MappingProxyType(dict(self.shared_bridge_evidence_cache_audit)),
         )
 
     @property
@@ -264,6 +287,12 @@ class JointVisualSelectionSet:
                 for profile, failure in self.profile_failures
             ],
             "role_control_audits": [dict(item) for item in self.role_control_audits],
+            "shared_option_evidence_cache": dict(
+                self.shared_option_evidence_cache_audit
+            ),
+            "shared_bridge_evidence_cache": dict(
+                self.shared_bridge_evidence_cache_audit
+            ),
             "raw_visual_descriptors_persisted": False,
             "raw_candidate_embeddings_persisted": False,
             "biometric_model_vectors_persisted": False,
@@ -440,6 +469,7 @@ def select_joint_visual_candidates(
     hard_forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
     minimum_unique_paths: int = MINIMUM_PRODUCTION_JOINT_CANDIDATES,
     maximum_candidates: int | None = None,
+    progress_callback: JointTimelineProgressCallback | None = None,
 ) -> JointVisualSelectionSet:
     """Run the existing professional controls through the decoded joint DP.
 
@@ -457,6 +487,8 @@ def select_joint_visual_candidates(
         )
     if not isinstance(provider, DecodedBoundaryOptionProvider):
         raise TypeError("provider must be a DecodedBoundaryOptionProvider")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
     if not isinstance(hard_forbidden_boundary_edges, TimelineNoGoodSet):
         raise TypeError("hard forbidden edges must be a TimelineNoGoodSet")
     if (
@@ -504,11 +536,113 @@ def select_joint_visual_candidates(
         lattice = tuple(restricted)
         preferred_source_ids = None
 
+    profiles = tuple(_safe_cadence_profiles(workspace.diversity))
+    if len(profiles) != 3:
+        raise RuntimeError(
+            "joint visual selection requires exactly three cadence profiles"
+        )
+    total_boundary_layers = max(0, len(lattice) - 1)
+    shared_option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+    shared_bridge_evidence_cache = JointTimelineSharedBridgeEvidenceCache(
+        maximum_entries=min(
+            JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+            sum(
+                len(lattice[index]) * len(JOINT_BOUNDARY_FRAME_OFFSETS) ** 2
+                for index in range(1, len(lattice) - 1)
+            ),
+        )
+    )
+    shared_option_cache_hit_count = 0
+    shared_option_cache_miss_count = 0
+
+    def shared_option_provider(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+        nonlocal shared_option_cache_hit_count
+        nonlocal shared_option_cache_miss_count
+        if not isinstance(key, BoundaryMeasurementKey):
+            raise TypeError("shared option cache key is invalid")
+        cached = shared_option_cache.get(key)
+        if cached is not None:
+            shared_option_cache_hit_count += 1
+            return cached
+        shared_option_cache_miss_count += 1
+        measured = provider(key)
+        if not isinstance(measured, BoundaryOptionSet):
+            raise TypeError("decoded provider returned an invalid option set")
+        if measured.measurement_key != key:
+            raise RuntimeError("decoded provider returned evidence for another key")
+        shared_option_cache[key] = measured
+        return measured
+
+    def emit_progress(
+        *,
+        phase: str,
+        profile_name: str,
+        profile_index: int,
+        core: JointTimelineProgress | None = None,
+        profile_status: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        completed = core.completed_boundary_layers if core is not None else 0
+        option_keys = core.option_key_count if core is not None else 0
+        bridge_calls = core.bridge_provider_call_count if core is not None else 0
+        progress_callback(
+            JointTimelineProgress(
+                phase=phase,
+                cadence_profile=profile_name,
+                profile_index=profile_index,
+                total_profiles=len(profiles),
+                completed_boundary_layers=completed,
+                total_boundary_layers=total_boundary_layers,
+                shared_option_cache_hit_count=(
+                    shared_option_cache_hit_count
+                ),
+                shared_option_cache_miss_count=(
+                    shared_option_cache_miss_count
+                ),
+                shared_option_cache_entry_count=len(shared_option_cache),
+                option_key_count=option_keys,
+                bridge_provider_call_count=bridge_calls,
+                **shared_bridge_evidence_cache._progress_counts(),
+                profile_status=profile_status,
+            )
+        )
+
     profile_results: list[tuple[str, tuple[JointTimelineResult, ...]]] = []
     profile_failures: list[tuple[str, NoCompleteTimelinePath]] = []
     role_audits: list[Mapping[str, Any]] = []
     role_audit_by_profile: dict[str, Mapping[str, Any]] = {}
-    for profile in _safe_cadence_profiles(workspace.diversity):
+    for zero_based_profile_index, profile in enumerate(profiles):
+        profile_index = zero_based_profile_index + 1
+        latest_core_progress: JointTimelineProgress | None = None
+        callback_no_path_failure: NoCompleteTimelinePath | None = None
+        emit_progress(
+            phase="profile_start",
+            profile_name=profile.name,
+            profile_index=profile_index,
+            profile_status="in_progress",
+        )
+
+        def report_core_progress(progress: JointTimelineProgress) -> None:
+            nonlocal latest_core_progress
+            nonlocal callback_no_path_failure
+            if not isinstance(progress, JointTimelineProgress):
+                raise TypeError("joint timeline progress payload is invalid")
+            latest_core_progress = progress
+            if progress.phase != "boundary_layer_complete":
+                return
+            try:
+                emit_progress(
+                    phase="boundary_layer_complete",
+                    profile_name=profile.name,
+                    profile_index=profile_index,
+                    core=progress,
+                    profile_status="in_progress",
+                )
+            except NoCompleteTimelinePath as exc:
+                callback_no_path_failure = exc
+                raise
+
         selection_kwargs: dict[str, Any] = {}
         if workspace.professional_montage_policy is not None:
             if workspace.section_plan is None:  # pragma: no cover - invariant
@@ -536,21 +670,47 @@ def select_joint_visual_candidates(
         try:
             results = select_joint_timeline_candidates(
                 lattice,
-                option_provider=provider,
+                option_provider=shared_option_provider,
                 bridge_provider=provider.bridge_provider,
                 fps=fps,
                 config=profile.config,
                 preferred_source_ids=preferred_source_ids,
                 maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
                 forbidden_boundary_edges=hard_forbidden_boundary_edges,
+                progress_callback=(
+                    report_core_progress if progress_callback is not None else None
+                ),
+                shared_bridge_evidence_cache=shared_bridge_evidence_cache,
                 **selection_kwargs,
             )
         except NoCompleteTimelinePath as exc:
+            if exc is callback_no_path_failure:
+                raise
             profile_failures.append((profile.name, exc))
             audit = role_audit_by_profile.get(profile.name)
             if isinstance(audit, dict):
                 audit["candidate_generation_exhaustion"] = exc.to_dict()
             results = ()
+            emit_progress(
+                phase="profile_complete",
+                profile_name=profile.name,
+                profile_index=profile_index,
+                core=latest_core_progress,
+                profile_status="no_complete_path",
+            )
+        else:
+            if progress_callback is not None and (
+                latest_core_progress is None
+                or latest_core_progress.phase != "selection_complete"
+            ):
+                raise RuntimeError("joint timeline emitted no terminal progress")
+            emit_progress(
+                phase="profile_complete",
+                profile_name=profile.name,
+                profile_index=profile_index,
+                core=latest_core_progress,
+                profile_status="completed",
+            )
         profile_results.append((profile.name, tuple(results)))
 
     coalesced = _coalesce_profile_results(profile_results)
@@ -621,6 +781,17 @@ def select_joint_visual_candidates(
         selected_candidate_index=selected_candidate_index,
         profile_failures=tuple(profile_failures),
         role_control_audits=tuple(role_audits),
+        shared_option_evidence_cache_audit={
+            "contract": "joint_visual_shared_boundary_option_cache_v1",
+            "entry_count": len(shared_option_cache),
+            "hit_count": shared_option_cache_hit_count,
+            "miss_count": shared_option_cache_miss_count,
+            "immutable_boundary_option_sets": True,
+            "raw_visual_evidence_persisted": False,
+        },
+        shared_bridge_evidence_cache_audit=(
+            shared_bridge_evidence_cache.to_dict()
+        ),
     )
 
 

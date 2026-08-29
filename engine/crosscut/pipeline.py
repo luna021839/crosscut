@@ -314,6 +314,7 @@ from .joint_visual_candidate_adapter import (
     materialize_joint_visual_candidates,
     select_joint_visual_candidates,
 )
+from .joint_timeline import JointTimelineProgress
 from .no_good_selector_identity import build_no_good_selector_identity
 from .timeline import NoCompleteTimelinePath
 from .timeline_no_good import (
@@ -25812,6 +25813,27 @@ def analyze(
                         ),
                     )
                     provider_audit_before_close: dict[str, Any] | None = None
+
+                    def report_joint_visual_selection_progress(
+                        progress: JointTimelineProgress,
+                    ) -> None:
+                        if not isinstance(progress, JointTimelineProgress):
+                            raise TypeError(
+                                "joint visual selection progress payload is invalid"
+                            )
+                        completed = progress.completed_boundary_layers
+                        total = progress.total_boundary_layers
+                        if (
+                            progress.phase == "boundary_layer_complete"
+                            and completed not in {1, total}
+                            and completed % 4 != 0
+                        ):
+                            return
+                        reporter.emit(
+                            "joint_visual_selection_progress",
+                            **progress.to_dict(),
+                        )
+
                     try:
                         joint_visual_selection_set = (
                             select_joint_visual_candidates(
@@ -25820,6 +25842,9 @@ def analyze(
                                 fps=29.97,
                                 minimum_unique_paths=8,
                                 maximum_candidates=24,
+                                progress_callback=(
+                                    report_joint_visual_selection_progress
+                                ),
                             )
                         )
                         materialized_group_candidates = (
@@ -25876,6 +25901,14 @@ def analyze(
                                 .role_control_audits
                             )
                         ],
+                        "shared_bridge_evidence_cache": dict(
+                            joint_visual_selection_set
+                            .shared_bridge_evidence_cache_audit
+                        ),
+                        "shared_option_evidence_cache": dict(
+                            joint_visual_selection_set
+                            .shared_option_evidence_cache_audit
+                        ),
                         "profile_failures": [
                             {
                                 "cadence_profile": profile,
