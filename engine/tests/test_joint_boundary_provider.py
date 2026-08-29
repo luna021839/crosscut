@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import numpy as np
+
 from crosscut.joint_boundary_provider import (
     DecodedBoundaryOptionProvider,
     PersistentScalarBridgeCacheWriteError,
@@ -1390,7 +1392,7 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
         self.assertEqual(provider.face_identity_model_call_count, 0)
         sampler.sface_embedding_at.assert_not_called()
 
-    def test_production_face_cache_uses_exact_canonical_frame_identity(
+    def test_production_face_cache_reuses_identical_working_frame_content(
         self,
     ) -> None:
         descriptor = replace(
@@ -1414,7 +1416,9 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
         )
         provider._descriptor_provider = None
         sampler = mock.Mock()
-        sampler.frame_identity.side_effect = lambda _seconds: "frame:30"
+        sampler.frame_identity.side_effect = lambda seconds: f"request:{seconds}"
+        sampler.frame_at.return_value = object()
+        sampler.frame_digest_at.return_value = "a" * 64
         sampler.sface_embedding_at.return_value = (1.0, 0.0)
 
         with mock.patch.object(provider, "_sampler", return_value=sampler):
@@ -1424,8 +1428,104 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
         self.assertEqual(first, (1.0, 0.0))
         self.assertEqual(second, first)
         self.assertEqual(sampler.sface_embedding_at.call_count, 1)
+        self.assertEqual(sampler.frame_at.call_count, 2)
         self.assertEqual(provider.face_identity_model_call_count, 1)
         self.assertEqual(provider.face_identity_cache_hit_count, 1)
+
+    def test_production_face_cache_reuses_empty_working_frame_identity(
+        self,
+    ) -> None:
+        descriptor = replace(
+            _descriptor(
+                0.5,
+                pose_value=0.1,
+                face_bbox=(0.42, 0.30, 0.16, 0.22),
+            ),
+            face_detector_backend="yunet",
+            primary_face_landmarks_xy=(
+                (0.46, 0.37),
+                (0.54, 0.37),
+                (0.50, 0.42),
+                (0.47, 0.47),
+                (0.53, 0.47),
+            ),
+        )
+        provider = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        provider._descriptor_provider = None
+        sampler = mock.Mock()
+        sampler.frame_identity.side_effect = lambda seconds: f"request:{seconds}"
+        sampler.frame_at.return_value = object()
+        sampler.frame_digest_at.return_value = "c" * 64
+        sampler.sface_embedding_at.return_value = ()
+
+        with mock.patch.object(provider, "_sampler", return_value=sampler):
+            first = provider._sample_face_identity(1, 1.0000, descriptor)
+            second = provider._sample_face_identity(1, 1.0010, descriptor)
+
+        self.assertEqual(first, ())
+        self.assertEqual(second, ())
+        self.assertEqual(sampler.sface_embedding_at.call_count, 1)
+        self.assertEqual(sampler.frame_at.call_count, 2)
+        self.assertEqual(provider.face_identity_model_call_count, 1)
+        self.assertEqual(provider.face_identity_cache_hit_count, 1)
+
+    def test_production_transformed_cache_reuses_identical_working_frame_content(
+        self,
+    ) -> None:
+        descriptor = _descriptor(
+            0.5,
+            pose_value=0.1,
+            face_bbox=(0.42, 0.30, 0.16, 0.22),
+        )
+        provider = _provider(
+            lambda _source, _seconds: descriptor,
+            total_segment_count=3,
+        )
+        provider._descriptor_provider = None
+        provider._transformed_descriptor_provider = None
+        sampler = mock.Mock()
+        sampler.frame_at.return_value = np.full(
+            (48, 64, 3),
+            96,
+            dtype=np.uint8,
+        )
+        sampler.frame_digest_at.return_value = "b" * 64
+        transform = BoundaryTransformState(
+            transform_identity="content-cache-transform",
+            crop_xywh=(0.1, 0.1, 0.8, 0.8),
+            track_id="content-cache-track",
+            subject_basis="dominant_face",
+        )
+
+        with (
+            mock.patch.object(provider, "_sampler", return_value=sampler),
+            mock.patch(
+                "crosscut.joint_boundary_provider.describe_frame",
+                return_value=descriptor,
+            ) as describe,
+        ):
+            first = provider._sample_transformed_descriptor(
+                1,
+                1.0000,
+                descriptor,
+                transform,
+            )
+            second = provider._sample_transformed_descriptor(
+                1,
+                1.0010,
+                descriptor,
+                transform,
+            )
+
+        self.assertEqual(first, descriptor)
+        self.assertEqual(second, descriptor)
+        self.assertEqual(describe.call_count, 1)
+        self.assertEqual(sampler.frame_at.call_count, 2)
+        self.assertEqual(provider.transformed_descriptor_decode_count, 1)
+        self.assertEqual(provider.transformed_descriptor_cache_hit_count, 1)
 
     def test_required_direct_scalar_bridge_cache_is_cold_then_decode_free_warm(
         self,

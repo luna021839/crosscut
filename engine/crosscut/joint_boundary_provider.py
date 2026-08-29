@@ -1071,13 +1071,12 @@ class DecodedBoundaryOptionProvider:
         self._audit_by_key: OrderedDict[
             tuple[str, str, BoundaryMeasurementKey], _MeasurementAuditRecord
         ] = OrderedDict()
+        # Request aliases and decoded-pixel identities share one bounded LRU.
+        # The alias avoids a repeated seek for the same exact source clock;
+        # the content key prevents another full pose/formation/face inference
+        # when distinct exact clocks decode to the same working frame.
         self._transformed_descriptor_cache: OrderedDict[
-            tuple[
-                int,
-                float,
-                tuple[float, float, float, float] | None,
-                float,
-            ],
+            tuple[object, ...],
             FrameVisualDescriptor | None,
         ] = OrderedDict()
         self._bridge_memo: OrderedDict[
@@ -1697,18 +1696,23 @@ class DecodedBoundaryOptionProvider:
         raw_descriptor: FrameVisualDescriptor,
         transform: BoundaryTransformState,
     ) -> FrameVisualDescriptor | None:
-        key = (
+        request_key = (
+            "request-v2",
             self._cache_source_indices[source_index],
             round(float(seconds), 7),
             transform.crop_xywh,
             round(float(transform.rotation_degrees), 7),
         )
-        if key in self._transformed_descriptor_cache:
+        if request_key in self._transformed_descriptor_cache:
             self.transformed_descriptor_cache_hit_count += 1
-            self._touch_lru(self._transformed_descriptor_cache, key)
-            return self._transformed_descriptor_cache[key]
-        self.transformed_descriptor_decode_count += 1
+            self._touch_lru(
+                self._transformed_descriptor_cache,
+                request_key,
+            )
+            return self._transformed_descriptor_cache[request_key]
+        content_key: tuple[object, ...] | None = None
         if self._transformed_descriptor_provider is not None:
+            self.transformed_descriptor_decode_count += 1
             descriptor = self._transformed_descriptor_provider(
                 source_index,
                 seconds,
@@ -1718,9 +1722,33 @@ class DecodedBoundaryOptionProvider:
         elif self._descriptor_provider is not None:
             descriptor = None
         else:
-            frame = self._sampler(source_index).frame_at(seconds)
+            sampler = self._sampler(source_index)
+            frame = sampler.frame_at(seconds)
             descriptor = None
             if frame is not None:
+                content_key = (
+                    "decoded-working-frame-v2",
+                    self._cache_source_indices[source_index],
+                    sampler.frame_digest_at(seconds, frame),
+                    transform.crop_xywh,
+                    float(transform.rotation_degrees),
+                )
+                if content_key in self._transformed_descriptor_cache:
+                    self.transformed_descriptor_cache_hit_count += 1
+                    self._touch_lru(
+                        self._transformed_descriptor_cache,
+                        content_key,
+                    )
+                    descriptor = self._transformed_descriptor_cache[
+                        content_key
+                    ]
+                else:
+                    self.transformed_descriptor_decode_count += 1
+            if frame is not None and descriptor is None and (
+                content_key not in self._transformed_descriptor_cache
+                if content_key is not None
+                else True
+            ):
                 height, width = frame.shape[:2]
                 crop = transform.crop_xywh or (0.0, 0.0, 1.0, 1.0)
                 x, y, crop_width, crop_height = crop
@@ -1776,9 +1804,17 @@ class DecodedBoundaryOptionProvider:
             raise TypeError(
                 "transformed descriptor provider returned an invalid descriptor"
             )
+        if content_key is not None:
+            self._bounded_transactional_set(
+                self._transformed_descriptor_cache,
+                content_key,
+                descriptor,
+                maximum_entries=_TRANSFORMED_DESCRIPTOR_CACHE_LIMIT,
+                cache_name="transformed_descriptor",
+            )
         self._bounded_transactional_set(
             self._transformed_descriptor_cache,
-            key,
+            request_key,
             descriptor,
             maximum_entries=_TRANSFORMED_DESCRIPTOR_CACHE_LIMIT,
             cache_name="transformed_descriptor",
@@ -1812,19 +1848,46 @@ class DecodedBoundaryOptionProvider:
         production_sampler = (
             self._sampler(source_index) if production_backend else None
         )
-        key = (
+        request_key = (
             source_index,
             (
-                production_sampler.frame_identity(seconds)
+                (
+                    "request-v2",
+                    production_sampler.frame_identity(seconds),
+                )
                 if production_sampler is not None
                 else round(float(seconds), 7)
             ),
         )
-        cached = self._face_identity_cache.get(key)
-        if cached is not None:
+        if request_key in self._face_identity_cache:
+            cached = self._face_identity_cache[request_key]
             self.face_identity_cache_hit_count += 1
-            self._touch_lru(self._face_identity_cache, key)
+            self._touch_lru(self._face_identity_cache, request_key)
             return cached
+        content_key: tuple[int, object] | None = None
+        if production_sampler is not None:
+            frame = production_sampler.frame_at(seconds)
+            if frame is None:
+                return ()
+            content_key = (
+                source_index,
+                (
+                    "decoded-working-frame-v2",
+                    production_sampler.frame_digest_at(seconds, frame),
+                ),
+            )
+            if content_key in self._face_identity_cache:
+                cached = self._face_identity_cache[content_key]
+                self.face_identity_cache_hit_count += 1
+                self._touch_lru(self._face_identity_cache, content_key)
+                self._bounded_transactional_set(
+                    self._face_identity_cache,
+                    request_key,
+                    cached,
+                    maximum_entries=_FACE_IDENTITY_CACHE_LIMIT,
+                    cache_name="face_identity",
+                )
+                return cached
         self.face_identity_model_call_count += 1
         if self._face_identity_provider is not None:
             identity = tuple(
@@ -1847,9 +1910,17 @@ class DecodedBoundaryOptionProvider:
             identity = ()
         if any(not math.isfinite(value) for value in identity):
             raise ValueError("face identity provider returned non-finite evidence")
+        if content_key is not None:
+            self._bounded_transactional_set(
+                self._face_identity_cache,
+                content_key,
+                identity,
+                maximum_entries=_FACE_IDENTITY_CACHE_LIMIT,
+                cache_name="face_identity",
+            )
         self._bounded_transactional_set(
             self._face_identity_cache,
-            key,
+            request_key,
             identity,
             maximum_entries=_FACE_IDENTITY_CACHE_LIMIT,
             cache_name="face_identity",

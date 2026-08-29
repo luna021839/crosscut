@@ -6684,7 +6684,18 @@ def _build_visual_timeline(
                         exit_descriptor.silhouette_confidence,
                     ),
                 )
-                if duration >= 4.0 * _BOUNDARY_FRAME_STEP_SECONDS:
+                # The decoded joint selector replaces both endpoint candidates
+                # with provider-owned, exact boundary descriptors before any
+                # transition is scored.  Building face windows and SFace
+                # vectors here would therefore decode/model the same endpoint
+                # evidence once for the seed and again for the provider.  Keep
+                # the ordinary candidate-set path unchanged, while the
+                # optimizer-only seed carries deliberately empty endpoint
+                # appearance state that cannot be consumed before replacement.
+                if (
+                    not optimizer_seed_only
+                    and duration >= 4.0 * _BOUNDARY_FRAME_STEP_SECONDS
+                ):
                     entry_face_window = _face_geometry_boundary_window(
                         sampler,
                         boundary_seconds=source_start,
@@ -6700,16 +6711,24 @@ def _build_visual_timeline(
                 else:
                     entry_face_window = ()
                     exit_face_window = ()
-                entry_identity = sampler.sface_embedding_at(entry_time, entry)
+                entry_identity = (
+                    ()
+                    if optimizer_seed_only
+                    else sampler.sface_embedding_at(entry_time, entry)
+                )
                 # This builder always supplies entry/exit shot-scale evidence,
                 # so every transition takes the boundary-specific identity
                 # branch in ``timeline``.  A midpoint SFace vector is never
                 # consulted by emission, joint selection, review, or render;
                 # keep it empty rather than paying one random decode per cell.
                 middle_identity: tuple[float, ...] = ()
-                exit_identity = sampler.sface_embedding_at(
-                    exit_time,
-                    exit_descriptor,
+                exit_identity = (
+                    ()
+                    if optimizer_seed_only
+                    else sampler.sface_embedding_at(
+                        exit_time,
+                        exit_descriptor,
+                    )
                 )
                 quality = (entry.quality_score + middle.quality_score + exit_descriptor.quality_score) / 3.0
                 composition = (

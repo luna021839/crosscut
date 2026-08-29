@@ -956,8 +956,11 @@ class VisualScoreTests(unittest.TestCase):
         )
 
         class Sampler:
+            instances: list["Sampler"] = []
+
             def __init__(self, _path: Path, **_kwargs: object) -> None:
-                pass
+                self.sface_call_count = 0
+                self.instances.append(self)
 
             def feature_descriptor_at(  # type: ignore[no-untyped-def]
                 self,
@@ -971,6 +974,7 @@ class VisualScoreTests(unittest.TestCase):
                 _seconds: float,
                 _descriptor: FrameVisualDescriptor,
             ) -> tuple[float, ...]:
+                self.sface_call_count += 1
                 return ()
 
             def close(self) -> None:
@@ -1020,15 +1024,25 @@ class VisualScoreTests(unittest.TestCase):
                 **arguments,
                 maximum_results=8,
             )
+            full_samplers = tuple(Sampler.instances)
             seed = build_visual_timeline_optimizer_seed(
                 **arguments,
                 maximum_results=8,
             )
+            seed_samplers = tuple(Sampler.instances[len(full_samplers) :])
 
         self.assertIsInstance(seed, VisualTimelineOptimizerSeed)
         self.assertEqual(legacy_select.call_count, 1)
         self.assertEqual(legacy_review.call_count, 1)
         self.assertEqual(legacy_role_payload.call_count, 1)
+        self.assertTrue(full_samplers)
+        self.assertTrue(seed_samplers)
+        self.assertTrue(
+            all(item.sface_call_count == 2 for item in full_samplers)
+        )
+        self.assertTrue(
+            all(item.sface_call_count == 0 for item in seed_samplers)
+        )
         self.assertIsNotNone(full.optimizer_workspace)
         self.assertEqual(seed.optimizer_workspace, full.optimizer_workspace)
         self.assertEqual(
