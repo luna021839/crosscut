@@ -1096,29 +1096,36 @@ class BoundaryDescriptorCache:
             raise RuntimeError(
                 "descriptor cache changed while a transaction was active"
             )
+        # Validate and replay against a shadow LRU first.  Replaying directly
+        # into ``self._values`` made a late visibility/eviction mismatch leave
+        # earlier lookups and stores applied even though commit raised.  The
+        # bounded cache contains immutable descriptor references, so this copy
+        # is shallow and the final mapping swap is the only base mutation.
+        shadow_values = OrderedDict(self._values)
         observed_evictions = 0
         for operation, key, descriptor, expected_hit in transaction.operations:
             if operation == "lookup":
-                hit = key in self._values
+                hit = key in shadow_values
                 if hit != expected_hit:
                     raise RuntimeError(
                         "descriptor transaction replay changed cache visibility"
                     )
                 if hit:
-                    value = self._values.pop(key)
-                    self._values[key] = value
+                    value = shadow_values.pop(key)
+                    shadow_values[key] = value
                 continue
             if operation != "store":  # pragma: no cover - token invariant
                 raise RuntimeError("descriptor transaction operation is invalid")
-            self._values.pop(key, None)
-            self._values[key] = descriptor
-            while len(self._values) > self.maximum_entries:
-                self._values.popitem(last=False)
+            shadow_values.pop(key, None)
+            shadow_values[key] = descriptor
+            while len(shadow_values) > self.maximum_entries:
+                shadow_values.popitem(last=False)
                 observed_evictions += 1
         if observed_evictions != transaction.eviction_count:
             raise RuntimeError(
                 "descriptor transaction replay changed eviction semantics"
             )
+        self._values = shadow_values
         self.hit_count += transaction.hit_count
         self.miss_count += transaction.miss_count
         self.eviction_count += transaction.eviction_count

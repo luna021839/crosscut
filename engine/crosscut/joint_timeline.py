@@ -18,7 +18,7 @@ long.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from math import isfinite
 from typing import TypeAlias
@@ -435,6 +435,96 @@ class SegmentBridgeProof:
         return bool(self.evidence_complete and not self.authorized)
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentBridgeDispositionRequest:
+    """Exact scalar-only bridge request for deterministic batch admission."""
+
+    candidate: TimelineCandidate = field(repr=False)
+    entry_option: AuthorizedBoundaryOption = field(repr=False)
+    exit_option: AuthorizedBoundaryOption = field(repr=False)
+    duration_frames: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, TimelineCandidate):
+            raise TypeError("bridge disposition candidate is invalid")
+        if not isinstance(
+            self.entry_option, AuthorizedBoundaryOption
+        ) or not isinstance(self.exit_option, AuthorizedBoundaryOption):
+            raise TypeError("bridge disposition boundary options are invalid")
+        if self.entry_option.measurement_key.incoming != self.candidate:
+            raise ValueError("bridge disposition entry does not enter its candidate")
+        if self.exit_option.measurement_key.outgoing != self.candidate:
+            raise ValueError("bridge disposition exit does not leave its candidate")
+        if (
+            self.exit_option.measurement_key.boundary_index
+            != self.entry_option.measurement_key.boundary_index + 1
+        ):
+            raise ValueError("bridge disposition options must be adjacent boundaries")
+        duration = _finite_number(
+            self.duration_frames,
+            "bridge disposition duration_frames",
+        )
+        if duration < 0.0:
+            raise ValueError(
+                "bridge disposition duration_frames cannot be negative"
+            )
+        object.__setattr__(self, "duration_frames", duration)
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentBridgeDisposition:
+    """Scalar evidence plus a repr-hidden process-local request binding.
+
+    The binding exists only to validate ordered one-for-one batch results.  It
+    is never cached or serialized; only the five scalar disposition fields are
+    admitted to semantic caches.
+    """
+
+    request: SegmentBridgeDispositionRequest = field(repr=False)
+    evidence_complete: bool
+    crop_compatible: bool
+    track_compatible: bool
+    failure_codes: tuple[str, ...]
+    score_adjustment: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, SegmentBridgeDispositionRequest):
+            raise TypeError("bridge disposition request is invalid")
+        for name in (
+            "evidence_complete",
+            "crop_compatible",
+            "track_compatible",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"bridge disposition {name} must be a bool")
+        codes = _canonical_failure_codes(self.failure_codes)
+        object.__setattr__(self, "failure_codes", codes)
+        if self.authorized and codes:
+            raise ValueError("authorized bridge disposition cannot carry failure codes")
+        if not self.authorized and not codes:
+            raise ValueError(
+                "unauthorized bridge disposition requires explicit failure codes"
+            )
+        adjustment = _finite_number(
+            self.score_adjustment,
+            "bridge disposition score_adjustment",
+        )
+        if adjustment > 0.0:
+            raise ValueError(
+                "bridge disposition score_adjustment cannot boost or relax "
+                "the timeline score"
+            )
+        object.__setattr__(self, "score_adjustment", adjustment)
+
+    @property
+    def authorized(self) -> bool:
+        return bool(
+            self.evidence_complete
+            and self.crop_compatible
+            and self.track_compatible
+        )
+
+
 BoundaryOptionProvider: TypeAlias = Callable[
     [BoundaryMeasurementKey], BoundaryOptionSet
 ]
@@ -446,6 +536,10 @@ SegmentBridgeProvider: TypeAlias = Callable[
         float,
     ],
     SegmentBridgeProof,
+]
+SegmentBridgeDispositionBatchProvider: TypeAlias = Callable[
+    [tuple[SegmentBridgeDispositionRequest, ...]],
+    tuple[SegmentBridgeDisposition, ...],
 ]
 
 
@@ -464,6 +558,8 @@ class JointTimelineProgress:
     total_boundary_layers: int
     option_key_count: int
     bridge_provider_call_count: int
+    bridge_disposition_batch_call_count: int = 0
+    bridge_disposition_batch_request_count: int = 0
     shared_bridge_cache_hit_count: int = 0
     shared_bridge_cache_miss_count: int = 0
     shared_bridge_cache_admission_count: int = 0
@@ -522,6 +618,14 @@ class JointTimelineProgress:
             raise ValueError("shared bridge cache entries exceed admissions")
         if self.shared_option_cache_entry_count > self.shared_option_cache_miss_count:
             raise ValueError("shared option cache entries exceed misses")
+        if (
+            self.bridge_disposition_batch_call_count == 0
+            and self.bridge_disposition_batch_request_count != 0
+        ) or (
+            self.bridge_disposition_batch_request_count
+            < self.bridge_disposition_batch_call_count
+        ):
+            raise ValueError("joint selection batch progress counts are invalid")
         if self.cadence_profile is None:
             if self.profile_index != 0 or self.total_profiles != 0:
                 raise ValueError("unprofiled progress cannot carry a profile index")
@@ -547,6 +651,12 @@ class JointTimelineProgress:
         payload["current_profile_bridge_provider_call_count"] = payload.pop(
             "bridge_provider_call_count"
         )
+        payload["current_profile_bridge_disposition_batch_call_count"] = (
+            payload.pop("bridge_disposition_batch_call_count")
+        )
+        payload["current_profile_bridge_disposition_batch_request_count"] = (
+            payload.pop("bridge_disposition_batch_request_count")
+        )
         return payload
 
 
@@ -565,6 +675,8 @@ class JointTimelineResult:
     rejection_counts: tuple[tuple[str, int], ...]
     option_provider_call_count: int
     bridge_provider_call_count: int
+    bridge_disposition_batch_call_count: int = 0
+    bridge_disposition_batch_request_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.timeline, TimelineResult):
@@ -593,6 +705,29 @@ class JointTimelineResult:
             raise ValueError("joint option-provider call audit is inconsistent")
         if self.bridge_provider_call_count < len(self.segment_bridge_proofs):
             raise ValueError("joint bridge-provider call audit is inconsistent")
+        if (
+            isinstance(self.bridge_disposition_batch_call_count, bool)
+            or not isinstance(self.bridge_disposition_batch_call_count, int)
+            or self.bridge_disposition_batch_call_count < 0
+            or isinstance(self.bridge_disposition_batch_request_count, bool)
+            or not isinstance(self.bridge_disposition_batch_request_count, int)
+            or self.bridge_disposition_batch_request_count < 0
+        ):
+            raise ValueError("joint bridge-disposition batch audit is invalid")
+        if (
+            self.bridge_disposition_batch_call_count == 0
+            and self.bridge_disposition_batch_request_count != 0
+        ):
+            raise ValueError(
+                "joint bridge-disposition requests require a batch call"
+            )
+        if (
+            self.bridge_disposition_batch_request_count
+            < self.bridge_disposition_batch_call_count
+        ):
+            raise ValueError(
+                "each bridge-disposition batch call requires a request"
+            )
         if any(
             not isinstance(name, str)
             or not name
@@ -724,39 +859,73 @@ class JointTimelineSharedBridgeEvidenceCache:
             raise ValueError("shared bridge cache maximum_entries is invalid")
         self._entries: dict[_BridgeSemanticKey, _SharedBridgeEvidence] = {}
         self._maximum_entries = maximum_entries
-        self._binding: tuple[tuple[object, ...], float] | None = None
+        self._binding: (
+            tuple[
+                tuple[object, ...],
+                tuple[object, ...] | None,
+                float,
+            ]
+            | None
+        ) = None
         self._hit_count = 0
         self._miss_count = 0
         self._admission_count = 0
         self._saturation_count = 0
 
-    def _bind(self, bridge_provider: SegmentBridgeProvider, *, fps: float) -> None:
+    def _bind(
+        self,
+        bridge_provider: SegmentBridgeProvider,
+        *,
+        fps: float,
+        bridge_disposition_batch_provider: (
+            SegmentBridgeDispositionBatchProvider | None
+        ) = None,
+    ) -> None:
         if not callable(bridge_provider):
             raise TypeError("shared bridge cache provider binding is invalid")
+        if bridge_disposition_batch_provider is not None and not callable(
+            bridge_disposition_batch_provider
+        ):
+            raise TypeError("shared bridge batch cache binding is invalid")
         resolved_fps = _finite_number(fps, "shared bridge cache fps")
         if resolved_fps <= 0.0:
             raise ValueError("shared bridge cache fps must be positive")
-        bound_self = getattr(bridge_provider, "__self__", None)
-        bound_function = getattr(bridge_provider, "__func__", None)
-        callable_identity = (
-            (bound_self, bound_function)
-            if bound_self is not None and bound_function is not None
-            else (bridge_provider,)
+
+        def callable_identity(provider: object) -> tuple[object, ...]:
+            bound_self = getattr(provider, "__self__", None)
+            bound_function = getattr(provider, "__func__", None)
+            return (
+                (bound_self, bound_function)
+                if bound_self is not None and bound_function is not None
+                else (provider,)
+            )
+
+        exact_identity = callable_identity(bridge_provider)
+        batch_identity = (
+            callable_identity(bridge_disposition_batch_provider)
+            if bridge_disposition_batch_provider is not None
+            else None
         )
-        binding = (callable_identity, resolved_fps)
+        binding = (exact_identity, batch_identity, resolved_fps)
         if self._binding is None:
             self._binding = binding
             return
-        previous_identity, previous_fps = self._binding
-        same_callable = len(previous_identity) == len(callable_identity) and all(
-            left is right
-            for left, right in zip(
-                previous_identity,
-                callable_identity,
-                strict=True,
+        previous_exact, previous_batch, previous_fps = self._binding
+
+        def same_identity(
+            previous: tuple[object, ...] | None,
+            current: tuple[object, ...] | None,
+        ) -> bool:
+            if previous is None or current is None:
+                return previous is current
+            return len(previous) == len(current) and all(
+                left is right
+                for left, right in zip(previous, current, strict=True)
             )
-        )
-        if not same_callable or previous_fps != resolved_fps:
+
+        same_exact = same_identity(previous_exact, exact_identity)
+        same_batch = same_identity(previous_batch, batch_identity)
+        if not same_exact or not same_batch or previous_fps != resolved_fps:
             raise ValueError(
                 "shared bridge cache is bound to another provider or fps"
             )
@@ -765,16 +934,29 @@ class JointTimelineSharedBridgeEvidenceCache:
         self,
         key: _BridgeSemanticKey,
     ) -> _SharedBridgeEvidence | None:
-        if self._binding is None:
-            raise RuntimeError("shared bridge cache must be bound before lookup")
-        if not isinstance(key, _BridgeSemanticKey):
-            raise TypeError("shared bridge cache key is invalid")
-        cached = self._entries.get(key)
+        cached = self._peek(key)
         if cached is None:
             self._miss_count += 1
             return None
         self._hit_count += 1
         return cached
+
+    def _peek(
+        self,
+        key: _BridgeSemanticKey,
+    ) -> _SharedBridgeEvidence | None:
+        if self._binding is None:
+            raise RuntimeError("shared bridge cache must be bound before lookup")
+        if not isinstance(key, _BridgeSemanticKey):
+            raise TypeError("shared bridge cache key is invalid")
+        return self._entries.get(key)
+
+    def _record_lookups(self, *, hit_count: int, miss_count: int) -> None:
+        for value in (hit_count, miss_count):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("shared bridge cache lookup count is invalid")
+        self._hit_count += hit_count
+        self._miss_count += miss_count
 
     def _admit(self, evidence: _SharedBridgeEvidence) -> bool:
         if self._binding is None:
@@ -1013,6 +1195,9 @@ def _select_joint_timeline_candidates_core(
     *,
     option_provider: BoundaryOptionProvider,
     bridge_provider: SegmentBridgeProvider | None = None,
+    bridge_disposition_batch_provider: (
+        SegmentBridgeDispositionBatchProvider | None
+    ) = None,
     fps: float = 29.97,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
@@ -1038,7 +1223,9 @@ def _select_joint_timeline_candidates_core(
     candidate clocks and numeric crop/rotation/track endpoint states.  That
     semantic evidence is shared during optimization, while each selected
     backtrace is re-requested with its exact boundary options so proof
-    provenance is never collapsed.  ``forbidden_boundary_edges`` is reserved
+    provenance is never collapsed.  An optional provider-bound disposition
+    batch can fill one DP layer's scalar semantic cache atomically before the
+    unchanged replay.  ``forbidden_boundary_edges`` is reserved
     for exact edges already proven hard-incompatible; every key is validated
     against this lattice and rejected before the option provider can decode it.
     """
@@ -1047,6 +1234,39 @@ def _select_joint_timeline_candidates_core(
         raise TypeError("option_provider must be callable")
     if bridge_provider is not None and not callable(bridge_provider):
         raise TypeError("bridge_provider must be callable or None")
+    if bridge_disposition_batch_provider is not None and not callable(
+        bridge_disposition_batch_provider
+    ):
+        raise TypeError(
+            "bridge_disposition_batch_provider must be callable or None"
+        )
+    if bridge_disposition_batch_provider is not None:
+        if bridge_provider is None:
+            raise ValueError(
+                "bridge disposition batching requires an exact bridge provider"
+            )
+        exact_owner = getattr(bridge_provider, "__self__", None)
+        exact_function = getattr(bridge_provider, "__func__", None)
+        batch_owner = getattr(
+            bridge_disposition_batch_provider,
+            "__self__",
+            None,
+        )
+        batch_function = getattr(
+            bridge_disposition_batch_provider,
+            "__func__",
+            None,
+        )
+        if (
+            exact_owner is None
+            or exact_function is None
+            or batch_owner is not exact_owner
+            or batch_function is None
+        ):
+            raise ValueError(
+                "bridge disposition batching requires provider-bound exact "
+                "and batch methods"
+            )
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
     if shared_bridge_evidence_cache is not None and not isinstance(
@@ -1199,6 +1419,9 @@ def _select_joint_timeline_candidates_core(
         shared_bridge_evidence_cache._bind(
             bridge_provider,
             fps=resolved_fps,
+            bridge_disposition_batch_provider=(
+                bridge_disposition_batch_provider
+            ),
         )
     option_cache: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
     semantic_bridge_cache: dict[
@@ -1210,6 +1433,8 @@ def _select_joint_timeline_candidates_core(
         SegmentBridgeProof,
     ] = {}
     bridge_provider_call_count = 0
+    bridge_disposition_batch_call_count = 0
+    bridge_disposition_batch_request_count = 0
     rejection_counts: dict[str, int] = {}
     layer_rejection_counts: dict[str, int] = {}
     total_boundary_layers = max(0, len(segments) - 1)
@@ -1224,6 +1449,12 @@ def _select_joint_timeline_candidates_core(
                 total_boundary_layers=total_boundary_layers,
                 option_key_count=len(option_cache),
                 bridge_provider_call_count=bridge_provider_call_count,
+                bridge_disposition_batch_call_count=(
+                    bridge_disposition_batch_call_count
+                ),
+                bridge_disposition_batch_request_count=(
+                    bridge_disposition_batch_request_count
+                ),
                 **(
                     shared_bridge_evidence_cache._progress_counts()
                     if shared_bridge_evidence_cache is not None
@@ -1321,6 +1552,10 @@ def _select_joint_timeline_candidates_core(
             if shared is not None:
                 semantic_bridge_cache[semantic_key] = shared
                 return shared
+        if bridge_disposition_batch_provider is not None:
+            raise RuntimeError(
+                "bridge disposition batch prepass missed a semantic request"
+            )
         proof = call_bridge_provider(
             candidate,
             entry_option,
@@ -1339,6 +1574,203 @@ def _select_joint_timeline_candidates_core(
         if shared_bridge_evidence_cache is not None:
             shared_bridge_evidence_cache._admit(evidence)
         return evidence
+
+    def prime_bridge_evidence_for_layer(
+        segment_position: int,
+        frontier: Mapping[_JointState, Sequence[_JointNode]],
+    ) -> None:
+        """Batch every first-seen semantic bridge request for one DP layer.
+
+        This deterministic prepass mirrors every cheap gate before the replay's
+        bridge lookup.  It intentionally records no rejection counts.  No
+        scalar from a batch enters either cache until the complete ordered
+        response has validated successfully.
+        """
+
+        nonlocal bridge_disposition_batch_call_count
+        nonlocal bridge_disposition_batch_request_count
+        if bridge_disposition_batch_provider is None or segment_position < 2:
+            return
+        previous_segment = segments[segment_position - 1]
+        current_segment = segments[segment_position]
+        shared_hits: dict[_BridgeSemanticKey, _SharedBridgeEvidence] = {}
+        deferred_shared_hit_count = 0
+        deferred_shared_miss_count = 0
+        pending: dict[
+            _BridgeSemanticKey,
+            SegmentBridgeDispositionRequest,
+        ] = {}
+        for previous_state, previous_nodes in sorted(
+            frontier.items(),
+            key=lambda item: _state_sort_key(item[0]),
+        ):
+            previous_candidate = previous_segment[
+                previous_state.candidate_index
+            ]
+            ranked_previous_nodes = tuple(
+                sorted(previous_nodes, key=_node_rank_key)
+            )
+            expected_entry_state = previous_state.endpoint_renderer_state
+            expected_entry_offset = previous_state.previous_boundary_offset
+            if expected_entry_state is None or expected_entry_offset is None:
+                raise RuntimeError(
+                    "joint DP lost its previous renderer endpoint state"
+                )
+            for previous_node in ranked_previous_nodes:
+                entry_option = previous_node.entering_boundary_option
+                if entry_option is None:
+                    raise RuntimeError(
+                        "joint DP lost an exact previous boundary option"
+                    )
+                if (
+                    entry_option.frame_offset != expected_entry_offset
+                    or _renderer_semantic_state(
+                        entry_option.incoming_transform
+                    )
+                    != expected_entry_state
+                ):
+                    raise RuntimeError(
+                        "joint DP renderer-semantic state is not exact"
+                    )
+            representative_entry_option = (
+                ranked_previous_nodes[0].entering_boundary_option
+            )
+            assert representative_entry_option is not None
+            for current_index in emissions[segment_position]:
+                current_candidate = current_segment[current_index]
+                if no_goods and build_timeline_no_good_edge_key(
+                    segment_position - 1,
+                    previous_candidate,
+                    current_candidate,
+                ) in no_goods:
+                    continue
+                measurement_key = BoundaryMeasurementKey.from_candidates(
+                    segment_position - 1,
+                    previous_candidate,
+                    current_candidate,
+                )
+                options = locate_options(measurement_key).authorized_options
+                if not options:
+                    continue
+                for option in options:
+                    last_duration_frames = (
+                        current_candidate.duration_seconds * resolved_fps
+                        - option.frame_offset
+                    )
+                    if (
+                        segment_position == len(segments) - 1
+                        and last_duration_frames
+                        < MINIMUM_JOINT_SEGMENT_DURATION_FRAMES - 1e-9
+                    ):
+                        continue
+                    assert option.scoring_outgoing is not None
+                    assert option.scoring_incoming is not None
+                    if _transition_score(
+                        option.scoring_outgoing,
+                        option.scoring_incoming,
+                        previous_state.shot_run,
+                        settings,
+                    ) is None:
+                        continue
+                    duration_frames = (
+                        previous_candidate.duration_seconds * resolved_fps
+                        + option.frame_offset
+                        - representative_entry_option.frame_offset
+                    )
+                    if (
+                        duration_frames
+                        < MINIMUM_JOINT_SEGMENT_DURATION_FRAMES - 1e-9
+                    ):
+                        continue
+                    semantic_key = bridge_semantic_key(
+                        previous_candidate,
+                        representative_entry_option,
+                        option,
+                        duration_frames,
+                    )
+                    if semantic_key in semantic_bridge_cache:
+                        continue
+                    if semantic_key in shared_hits:
+                        continue
+                    if semantic_key in pending:
+                        continue
+                    if shared_bridge_evidence_cache is not None:
+                        shared = shared_bridge_evidence_cache._peek(
+                            semantic_key
+                        )
+                        if shared is not None:
+                            deferred_shared_hit_count += 1
+                            shared_hits[semantic_key] = shared
+                            continue
+                        deferred_shared_miss_count += 1
+                    pending[semantic_key] = SegmentBridgeDispositionRequest(
+                        candidate=previous_candidate,
+                        entry_option=representative_entry_option,
+                        exit_option=option,
+                        duration_frames=duration_frames,
+                    )
+        if not pending:
+            semantic_bridge_cache.update(shared_hits)
+            if shared_bridge_evidence_cache is not None:
+                shared_bridge_evidence_cache._record_lookups(
+                    hit_count=deferred_shared_hit_count,
+                    miss_count=deferred_shared_miss_count,
+                )
+            return
+
+        requests = tuple(pending.values())
+        dispositions = bridge_disposition_batch_provider(requests)
+        if type(dispositions) is not tuple:
+            raise TypeError(
+                "bridge_disposition_batch_provider returned an invalid batch"
+            )
+        if len(dispositions) != len(requests):
+            raise RuntimeError(
+                "bridge_disposition_batch_provider returned the wrong count"
+            )
+        validated: list[
+            tuple[_BridgeSemanticKey, _SharedBridgeEvidence]
+        ] = []
+        for (semantic_key, request), disposition in zip(
+            pending.items(),
+            dispositions,
+            strict=True,
+        ):
+            if type(disposition) is not SegmentBridgeDisposition:
+                raise TypeError(
+                    "bridge_disposition_batch_provider returned an invalid "
+                    "disposition"
+                )
+            if disposition.request != request:
+                raise RuntimeError(
+                    "bridge_disposition_batch_provider returned evidence for "
+                    "another request"
+                )
+            validated.append(
+                (
+                    semantic_key,
+                    _SharedBridgeEvidence(
+                        semantic_key=semantic_key,
+                        evidence_complete=disposition.evidence_complete,
+                        crop_compatible=disposition.crop_compatible,
+                        track_compatible=disposition.track_compatible,
+                        failure_codes=disposition.failure_codes,
+                        score_adjustment=disposition.score_adjustment,
+                    ),
+                )
+            )
+        bridge_disposition_batch_call_count += 1
+        bridge_disposition_batch_request_count += len(requests)
+        semantic_bridge_cache.update(shared_hits)
+        if shared_bridge_evidence_cache is not None:
+            shared_bridge_evidence_cache._record_lookups(
+                hit_count=deferred_shared_hit_count,
+                miss_count=deferred_shared_miss_count,
+            )
+        for semantic_key, evidence in validated:
+            semantic_bridge_cache[semantic_key] = evidence
+            if shared_bridge_evidence_cache is not None:
+                shared_bridge_evidence_cache._admit(evidence)
 
     def locate_selected_exact_bridge(
         evidence: _SharedBridgeEvidence,
@@ -1420,6 +1852,7 @@ def _select_joint_timeline_candidates_core(
         previous_segment = segments[segment_position - 1]
         current_segment = segments[segment_position]
         current_layer: dict[_JointState, list[_JointNode]] = {}
+        prime_bridge_evidence_for_layer(segment_position, frontier)
         for previous_state, previous_nodes in sorted(
             frontier.items(),
             key=lambda item: _state_sort_key(item[0]),
@@ -1852,6 +2285,12 @@ def _select_joint_timeline_candidates_core(
             rejection_counts=tuple(sorted(rejection_counts.items())),
             option_provider_call_count=len(option_cache),
             bridge_provider_call_count=bridge_provider_call_count,
+            bridge_disposition_batch_call_count=(
+                bridge_disposition_batch_call_count
+            ),
+            bridge_disposition_batch_request_count=(
+                bridge_disposition_batch_request_count
+            ),
         )
         for (
             timeline,
@@ -1870,6 +2309,9 @@ def select_joint_timeline(
     *,
     option_provider: BoundaryOptionProvider,
     bridge_provider: SegmentBridgeProvider | None = None,
+    bridge_disposition_batch_provider: (
+        SegmentBridgeDispositionBatchProvider | None
+    ) = None,
     fps: float = 29.97,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
@@ -1891,6 +2333,7 @@ def select_joint_timeline(
         candidates_by_segment,
         option_provider=option_provider,
         bridge_provider=bridge_provider,
+        bridge_disposition_batch_provider=bridge_disposition_batch_provider,
         fps=fps,
         mode=mode,
         target_member=target_member,
@@ -1911,6 +2354,9 @@ def select_joint_timeline_candidates(
     *,
     option_provider: BoundaryOptionProvider,
     bridge_provider: SegmentBridgeProvider | None = None,
+    bridge_disposition_batch_provider: (
+        SegmentBridgeDispositionBatchProvider | None
+    ) = None,
     fps: float = 29.97,
     mode: TimelineMode | EditMode | str = TimelineMode.GENERAL,
     target_member: IVEMember | str | None = None,
@@ -1939,6 +2385,7 @@ def select_joint_timeline_candidates(
         candidates_by_segment,
         option_provider=option_provider,
         bridge_provider=bridge_provider,
+        bridge_disposition_batch_provider=bridge_disposition_batch_provider,
         fps=fps,
         mode=mode,
         target_member=target_member,
@@ -1968,6 +2415,9 @@ __all__ = [
     "JointTimelineProgressCallback",
     "JointTimelineSharedBridgeEvidenceCache",
     "MINIMUM_JOINT_SEGMENT_DURATION_FRAMES",
+    "SegmentBridgeDisposition",
+    "SegmentBridgeDispositionBatchProvider",
+    "SegmentBridgeDispositionRequest",
     "SegmentBridgeProof",
     "SegmentBridgeProvider",
     "select_joint_timeline",

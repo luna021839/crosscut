@@ -172,6 +172,40 @@ class VisualBoundaryRepairTests(unittest.TestCase):
             tuple(direct._values.items()),
         )
 
+    def test_descriptor_cache_failed_commit_leaves_base_lru_unchanged(self) -> None:
+        cache = BoundaryDescriptorCache(maximum_entries=3)
+        cache.store(10, 1.0, _descriptor(0.3))
+        cache.store(11, 2.0, None)
+        cache.store(12, 3.0, _descriptor(0.5))
+        transaction = cache.begin_transaction()
+
+        self.assertEqual(
+            cache.lookup(10, 1.0, transaction=transaction),
+            (True, _descriptor(0.3)),
+        )
+        self.assertEqual(
+            cache.lookup(11, 2.0, transaction=transaction),
+            (True, None),
+        )
+        operation, key, descriptor, _expected_hit = transaction.operations[-1]
+        transaction.operations[-1] = (operation, key, descriptor, False)
+        values_before = tuple(cache._values.items())
+        diagnostics_before = cache.diagnostics()
+        revision_before = cache._revision
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "replay changed cache visibility",
+        ):
+            cache.commit_transaction(transaction)
+
+        self.assertEqual(tuple(cache._values.items()), values_before)
+        self.assertEqual(cache.diagnostics(), diagnostics_before)
+        self.assertEqual(cache._revision, revision_before)
+        self.assertTrue(transaction.active)
+        cache.rollback_transaction(transaction)
+        self.assertFalse(transaction.active)
+
     def test_full_ram_descriptor_cache_hit_opens_no_video_sampler(self) -> None:
         descriptor = _descriptor(0.5)
 

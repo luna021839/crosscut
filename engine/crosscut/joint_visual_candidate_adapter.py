@@ -586,6 +586,16 @@ def select_joint_visual_candidates(
         completed = core.completed_boundary_layers if core is not None else 0
         option_keys = core.option_key_count if core is not None else 0
         bridge_calls = core.bridge_provider_call_count if core is not None else 0
+        batch_calls = (
+            core.bridge_disposition_batch_call_count
+            if core is not None
+            else 0
+        )
+        batch_requests = (
+            core.bridge_disposition_batch_request_count
+            if core is not None
+            else 0
+        )
         progress_callback(
             JointTimelineProgress(
                 phase=phase,
@@ -603,6 +613,8 @@ def select_joint_visual_candidates(
                 shared_option_cache_entry_count=len(shared_option_cache),
                 option_key_count=option_keys,
                 bridge_provider_call_count=bridge_calls,
+                bridge_disposition_batch_call_count=batch_calls,
+                bridge_disposition_batch_request_count=batch_requests,
                 **shared_bridge_evidence_cache._progress_counts(),
                 profile_status=profile_status,
             )
@@ -612,6 +624,8 @@ def select_joint_visual_candidates(
     profile_failures: list[tuple[str, NoCompleteTimelinePath]] = []
     role_audits: list[Mapping[str, Any]] = []
     role_audit_by_profile: dict[str, Mapping[str, Any]] = {}
+    bridge_disposition_batch_call_count = 0
+    bridge_disposition_batch_request_count = 0
     for zero_based_profile_index, profile in enumerate(profiles):
         profile_index = zero_based_profile_index + 1
         latest_core_progress: JointTimelineProgress | None = None
@@ -672,14 +686,15 @@ def select_joint_visual_candidates(
                 lattice,
                 option_provider=shared_option_provider,
                 bridge_provider=provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    provider.bridge_disposition_batch
+                ),
                 fps=fps,
                 config=profile.config,
                 preferred_source_ids=preferred_source_ids,
                 maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
                 forbidden_boundary_edges=hard_forbidden_boundary_edges,
-                progress_callback=(
-                    report_core_progress if progress_callback is not None else None
-                ),
+                progress_callback=report_core_progress,
                 shared_bridge_evidence_cache=shared_bridge_evidence_cache,
                 **selection_kwargs,
             )
@@ -710,6 +725,13 @@ def select_joint_visual_candidates(
                 profile_index=profile_index,
                 core=latest_core_progress,
                 profile_status="completed",
+            )
+        if latest_core_progress is not None:
+            bridge_disposition_batch_call_count += (
+                latest_core_progress.bridge_disposition_batch_call_count
+            )
+            bridge_disposition_batch_request_count += (
+                latest_core_progress.bridge_disposition_batch_request_count
             )
         profile_results.append((profile.name, tuple(results)))
 
@@ -790,7 +812,15 @@ def select_joint_visual_candidates(
             "raw_visual_evidence_persisted": False,
         },
         shared_bridge_evidence_cache_audit=(
-            shared_bridge_evidence_cache.to_dict()
+            {
+                **shared_bridge_evidence_cache.to_dict(),
+                "bridge_disposition_batch_call_count": (
+                    bridge_disposition_batch_call_count
+                ),
+                "bridge_disposition_batch_request_count": (
+                    bridge_disposition_batch_request_count
+                ),
+            }
         ),
     )
 

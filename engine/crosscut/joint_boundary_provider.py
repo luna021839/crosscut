@@ -36,6 +36,8 @@ from .joint_timeline import (
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    SegmentBridgeDisposition,
+    SegmentBridgeDispositionRequest,
     SegmentBridgeProof,
 )
 from .render import (
@@ -1100,6 +1102,13 @@ class DecodedBoundaryOptionProvider:
         self.bridge_memo_hit_count = 0
         self.bridge_alias_registration_count = 0
         self.bridge_semantic_memo_hit_count = 0
+        self.scalar_bridge_batch_call_count = 0
+        self.scalar_bridge_batch_request_count = 0
+        self.scalar_bridge_disposition_count = 0
+        self.scalar_bridge_descriptor_snapshot_hit_count = 0
+        self.scalar_bridge_descriptor_snapshot_miss_count = 0
+        self.scalar_bridge_face_identity_snapshot_hit_count = 0
+        self.scalar_bridge_face_identity_snapshot_miss_count = 0
         self.selection_request_count = 0
         self.selection_materialization_count = 0
         self.selection_failure_count = 0
@@ -1210,6 +1219,13 @@ class DecodedBoundaryOptionProvider:
         self.bridge_memo_hit_count = 0
         self.bridge_alias_registration_count = 0
         self.bridge_semantic_memo_hit_count = 0
+        self.scalar_bridge_batch_call_count = 0
+        self.scalar_bridge_batch_request_count = 0
+        self.scalar_bridge_disposition_count = 0
+        self.scalar_bridge_descriptor_snapshot_hit_count = 0
+        self.scalar_bridge_descriptor_snapshot_miss_count = 0
+        self.scalar_bridge_face_identity_snapshot_hit_count = 0
+        self.scalar_bridge_face_identity_snapshot_miss_count = 0
         self.selection_request_count = 0
         self.selection_materialization_count = 0
         self.selection_failure_count = 0
@@ -4157,6 +4173,583 @@ class DecodedBoundaryOptionProvider:
             self._bridge_transform_semantic_state(exit_transform),
         )
 
+    def _transform_path_scalar_disposition(
+        self,
+        *,
+        candidate: TimelineCandidate,
+        entry_transform: BoundaryTransformState,
+        exit_transform: BoundaryTransformState,
+        start_master_seconds: float,
+        end_master_seconds: float,
+        duration_frames: float,
+        descriptor_resolver: Callable[
+            [int, float], FrameVisualDescriptor | None
+        ],
+        face_identity_resolver: Callable[
+            [int, float, FrameVisualDescriptor], tuple[float, ...]
+        ],
+    ) -> tuple[bool, bool, bool, tuple[str, ...], float]:
+        """Evaluate the exact bridge gates without constructing proof state.
+
+        This is the scalar-only counterpart of ``_transform_path_evidence``.
+        Gate order, endpoint clocks, half-frame centres, crop coverage, and
+        dominant-face continuity thresholds intentionally match that exact
+        oracle line for line.  The resolvers are lazy so an early rejection
+        never causes later frames to be decoded.  This path does not create a
+        proof identity, audit record, transform-path sample, or materialization.
+        """
+
+        expected_duration_frames = (
+            end_master_seconds - start_master_seconds
+        ) * self.output_fps
+        if not math.isclose(
+            expected_duration_frames,
+            duration_frames,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise RuntimeError(
+                "segment bridge duration disagrees with endpoint clocks"
+            )
+        source_index = self._source_index(candidate.source_id)
+
+        def outcome(
+            *,
+            evidence_complete: bool,
+            crop_compatible: bool,
+            track_compatible: bool,
+            failure_codes: Sequence[str],
+        ) -> tuple[bool, bool, bool, tuple[str, ...], float]:
+            return (
+                evidence_complete,
+                crop_compatible,
+                track_compatible,
+                tuple(sorted(set(failure_codes))),
+                0.0,
+            )
+
+        if duration_frames < _MINIMUM_SEGMENT_FRAMES - _EPSILON:
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=("segment_duration_below_two_frames",),
+            )
+
+        expected_frame_center_count = int(
+            math.ceil(
+                max(
+                    0.0,
+                    duration_frames - 0.5 - _EPSILON,
+                )
+            )
+        )
+        frame_centers = tuple(
+            start_master_seconds + (index + 0.5) / self.output_fps
+            for index in range(expected_frame_center_count)
+            if start_master_seconds + (index + 0.5) / self.output_fps
+            < end_master_seconds - _EPSILON
+        )
+        sample_times = (
+            start_master_seconds,
+            *frame_centers,
+            end_master_seconds,
+        )
+
+        if entry_transform.track_id is None or exit_transform.track_id is None:
+            return outcome(
+                evidence_complete=False,
+                crop_compatible=False,
+                track_compatible=False,
+                failure_codes=("segment_track_identity_evidence_incomplete",),
+            )
+        if entry_transform.track_id != exit_transform.track_id:
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=False,
+                failure_codes=("segment_track_identity_mismatch",),
+            )
+        if (
+            abs(entry_transform.rotation_degrees) > _EPSILON
+            or abs(exit_transform.rotation_degrees) > _EPSILON
+        ):
+            return outcome(
+                evidence_complete=False,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=("segment_rotation_path_evidence_incomplete",),
+            )
+        try:
+            editorial_track = self._renderer_track(
+                candidate=candidate,
+                entry_transform=entry_transform,
+                exit_transform=exit_transform,
+                duration_seconds=duration_frames / self.output_fps,
+            )
+        except ValueError as exc:
+            failure = (
+                "segment_too_short_for_exact_boundary_transform_holds"
+                if "too short" in str(exc)
+                else "segment_renderer_transform_envelope_violation"
+            )
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=(failure,),
+            )
+
+        bases = {entry_transform.subject_basis, exit_transform.subject_basis}
+        if "dominant_face" in bases:
+            subject_basis = "dominant_face"
+        elif "subject_silhouette" in bases:
+            subject_basis = "subject_silhouette"
+        else:
+            subject_basis = "full_frame_identity"
+        track_geometry_required = bool(
+            entry_transform.crop_xywh is not None
+            or exit_transform.crop_xywh is not None
+        )
+        source_endpoint_times = (
+            self._source_time(source_index, start_master_seconds),
+            self._source_time(source_index, end_master_seconds),
+        )
+        if min(source_endpoint_times) < 0.0:
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=("segment_negative_source_local_time",),
+            )
+        if track_geometry_required:
+            source_low = min(source_endpoint_times)
+            source_high = max(source_endpoint_times)
+            if any(
+                source_low + _EPSILON < cut < source_high - _EPSILON
+                for cut in self.scene_cut_times[source_index]
+            ):
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=False,
+                    track_compatible=False,
+                    failure_codes=("segment_source_scene_cut_breaks_track",),
+                )
+
+        anchor_face_identity: tuple[float, ...] = ()
+        previous_face_identity: tuple[float, ...] = ()
+        for master_seconds in sample_times:
+            source_seconds = self._source_time(source_index, master_seconds)
+            renderer_keyframe = editorial_track.evaluate(
+                max(0.0, master_seconds - start_master_seconds)
+            )
+            sample_crop = self._renderer_crop(renderer_keyframe)
+            if source_seconds < 0.0:
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_negative_source_local_time",),
+                )
+            descriptor = descriptor_resolver(source_index, source_seconds)
+            if descriptor is None:
+                return outcome(
+                    evidence_complete=False,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_descriptor_evidence_incomplete",),
+                )
+            if not track_geometry_required:
+                bbox = None
+            elif subject_basis == "dominant_face":
+                bbox = descriptor.primary_face_bbox
+            elif subject_basis == "subject_silhouette":
+                bbox = descriptor.silhouette_bbox_xywh
+            else:
+                bbox = descriptor.silhouette_bbox_xywh
+            if track_geometry_required and bbox is None:
+                return outcome(
+                    evidence_complete=False,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_subject_track_evidence_incomplete",),
+                )
+            crop = sample_crop or (0.0, 0.0, 1.0, 1.0)
+            if (
+                crop[0] < -_EPSILON
+                or crop[1] < -_EPSILON
+                or crop[2] <= 0.0
+                or crop[3] <= 0.0
+                or crop[0] + crop[2] > 1.0 + _EPSILON
+                or crop[1] + crop[3] > 1.0 + _EPSILON
+            ):
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_crop_path_out_of_frame",),
+                )
+            coverage = (
+                self._bbox_crop_coverage(bbox, crop)
+                if bbox is not None
+                else None
+            )
+            face_identity: tuple[float, ...] = ()
+            similarity_to_anchor: float | None = None
+            similarity_to_previous: float | None = None
+            if subject_basis == "dominant_face":
+                face_identity = face_identity_resolver(
+                    source_index,
+                    source_seconds,
+                    descriptor,
+                )
+                if face_identity:
+                    if not anchor_face_identity:
+                        anchor_face_identity = face_identity
+                    if not previous_face_identity:
+                        previous_face_identity = face_identity
+                    similarity_to_anchor = cosine_similarity(
+                        anchor_face_identity,
+                        face_identity,
+                    )
+                    similarity_to_previous = cosine_similarity(
+                        previous_face_identity,
+                        face_identity,
+                    )
+            if coverage is not None and coverage < 0.95 - _EPSILON:
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=False,
+                    track_compatible=True,
+                    failure_codes=("segment_subject_exits_crop_track",),
+                )
+            if subject_basis == "dominant_face" and (
+                not face_identity
+                or similarity_to_anchor is None
+                or similarity_to_previous is None
+            ):
+                return outcome(
+                    evidence_complete=False,
+                    crop_compatible=True,
+                    track_compatible=False,
+                    failure_codes=(
+                        "segment_dominant_face_identity_evidence_incomplete",
+                    ),
+                )
+            if subject_basis == "dominant_face" and (
+                similarity_to_anchor
+                < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
+                or similarity_to_previous
+                < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
+            ):
+                return outcome(
+                    evidence_complete=True,
+                    crop_compatible=True,
+                    track_compatible=False,
+                    failure_codes=(
+                        "segment_dominant_face_track_identity_mismatch",
+                    ),
+                )
+            if face_identity:
+                previous_face_identity = face_identity
+        return outcome(
+            evidence_complete=True,
+            crop_compatible=True,
+            track_compatible=True,
+            failure_codes=(),
+        )
+
+    def _validate_bridge_disposition_request(
+        self,
+        request: SegmentBridgeDispositionRequest,
+    ) -> None:
+        if type(request) is not SegmentBridgeDispositionRequest:
+            raise TypeError("bridge disposition batch request is invalid")
+        candidate = request.candidate
+        entry_option = request.entry_option
+        exit_option = request.exit_option
+        if entry_option.measurement_key.incoming != candidate:
+            raise ValueError("entry option does not enter bridge candidate")
+        if exit_option.measurement_key.outgoing != candidate:
+            raise ValueError("exit option does not leave bridge candidate")
+        entry_boundary = entry_option.measurement_key.boundary_index
+        exit_boundary = exit_option.measurement_key.boundary_index
+        if exit_boundary != entry_boundary + 1:
+            raise ValueError("bridge options must be adjacent boundaries")
+        if (
+            candidate.segment_index != entry_boundary + 1
+            or exit_boundary != candidate.segment_index
+            or not 0 <= entry_boundary < self.total_segment_count - 2
+        ):
+            raise ValueError(
+                "bridge candidate and boundary identities are not in this provider"
+            )
+        self._source_index(candidate.source_id)
+        for option in (entry_option, exit_option):
+            for endpoint in (
+                option.measurement_key.outgoing,
+                option.measurement_key.incoming,
+            ):
+                self._source_index(endpoint.source_id)
+        start_master_seconds = (
+            candidate.start_seconds
+            + entry_option.frame_offset / self.output_fps
+        )
+        end_master_seconds = (
+            candidate.end_seconds
+            + exit_option.frame_offset / self.output_fps
+        )
+        expected_duration = (
+            end_master_seconds - start_master_seconds
+        ) * self.output_fps
+        if not math.isclose(
+            request.duration_frames,
+            expected_duration,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "bridge duration identity disagrees with exact endpoint clocks"
+            )
+
+    def bridge_disposition_batch(
+        self,
+        requests: tuple[SegmentBridgeDispositionRequest, ...],
+    ) -> tuple[SegmentBridgeDisposition, ...]:
+        """Return scalar bridge dispositions in one rollback-safe transaction."""
+
+        self._require_open()
+        if type(requests) is not tuple:
+            raise TypeError("bridge disposition batch requests must be a tuple")
+        if not requests:
+            raise ValueError("bridge disposition batch cannot be empty")
+        if self._active_transaction_journal is not None:
+            raise RuntimeError("bridge disposition batch cannot be re-entered")
+        for request in requests:
+            self._validate_bridge_disposition_request(request)
+
+        journal: list[
+            tuple[MutableMapping[Any, Any], Any, bool, Any]
+        ] = []
+        descriptor_cache_transaction = self.descriptor_cache.begin_transaction()
+        counter_names = (
+            "request_count",
+            "measurement_count",
+            "measurement_failure_count",
+            "memo_hit_count",
+            "bridge_request_count",
+            "bridge_measurement_count",
+            "bridge_measurement_failure_count",
+            "bridge_memo_hit_count",
+            "bridge_alias_registration_count",
+            "bridge_semantic_memo_hit_count",
+            "selection_request_count",
+            "selection_materialization_count",
+            "selection_failure_count",
+            "descriptor_decode_count",
+            "raw_descriptor_cache_hit_count",
+            "raw_descriptor_cache_miss_count",
+            "transformed_descriptor_decode_count",
+            "transformed_descriptor_cache_hit_count",
+            "face_identity_model_call_count",
+            "face_identity_cache_hit_count",
+            "boundary_materialization_rehydration_count",
+            "bridge_materialization_rehydration_count",
+            "scalar_bridge_batch_call_count",
+            "scalar_bridge_batch_request_count",
+            "scalar_bridge_disposition_count",
+            "scalar_bridge_descriptor_snapshot_hit_count",
+            "scalar_bridge_descriptor_snapshot_miss_count",
+            "scalar_bridge_face_identity_snapshot_hit_count",
+            "scalar_bridge_face_identity_snapshot_miss_count",
+        )
+        counter_snapshot = {
+            name: getattr(self, name) for name in counter_names
+        }
+        audit_snapshot = (
+            self._measurement_audit_digest,
+            self._measurement_audit_total_count,
+            dict(self._measurement_offset_disposition_counts),
+            dict(self._measurement_failure_code_counts),
+            self._same_source_measurement_count,
+            self._cross_source_measurement_count,
+            self._bridge_audit_digest,
+            self._bridge_audit_registration_count,
+            dict(self._bridge_failure_code_counts),
+            self._outer_audit_digest,
+            self._outer_audit_registration_count,
+            dict(self._outer_failure_code_counts),
+            dict(self._cache_eviction_counts),
+            dict(self._cache_peak_counts),
+        )
+        sampler_indices_before = frozenset(self._samplers)
+        descriptor_snapshot: dict[
+            tuple[int, float],
+            tuple[float, FrameVisualDescriptor | None],
+        ] = {}
+        face_identity_snapshot: dict[
+            tuple[int, float],
+            tuple[float, tuple[float, ...]],
+        ] = {}
+        descriptor_snapshot_hits = 0
+        descriptor_snapshot_misses = 0
+        face_snapshot_hits = 0
+        face_snapshot_misses = 0
+
+        def resolve_descriptor(
+            source_index: int,
+            seconds: float,
+        ) -> FrameVisualDescriptor | None:
+            nonlocal descriptor_snapshot_hits, descriptor_snapshot_misses
+            key = (
+                self._cache_source_indices[source_index],
+                round(float(seconds), 7),
+            )
+            if key in descriptor_snapshot:
+                descriptor_snapshot_hits += 1
+                return descriptor_snapshot[key][1]
+            descriptor_snapshot_misses += 1
+            descriptor = self._sample_descriptor(source_index, seconds)
+            descriptor_snapshot[key] = (float(seconds), descriptor)
+            return descriptor
+
+        def resolve_face_identity(
+            source_index: int,
+            seconds: float,
+            descriptor: FrameVisualDescriptor,
+        ) -> tuple[float, ...]:
+            nonlocal face_snapshot_hits, face_snapshot_misses
+            key = (source_index, round(float(seconds), 7))
+            if key in face_identity_snapshot:
+                face_snapshot_hits += 1
+                return face_identity_snapshot[key][1]
+            face_snapshot_misses += 1
+            identity = self._sample_face_identity(
+                source_index,
+                seconds,
+                descriptor,
+            )
+            face_identity_snapshot[key] = (float(seconds), identity)
+            return identity
+
+        self._active_transaction_journal = journal
+        self._active_descriptor_cache_transaction = descriptor_cache_transaction
+        try:
+            dispositions: list[SegmentBridgeDisposition] = []
+            for request in requests:
+                candidate = request.candidate
+                entry_option = request.entry_option
+                exit_option = request.exit_option
+                start_master_seconds = (
+                    candidate.start_seconds
+                    + entry_option.frame_offset / self.output_fps
+                )
+                end_master_seconds = (
+                    candidate.end_seconds
+                    + exit_option.frame_offset / self.output_fps
+                )
+                (
+                    evidence_complete,
+                    crop_compatible,
+                    track_compatible,
+                    failure_codes,
+                    score_adjustment,
+                ) = self._transform_path_scalar_disposition(
+                    candidate=candidate,
+                    entry_transform=entry_option.incoming_transform,
+                    exit_transform=exit_option.outgoing_transform,
+                    start_master_seconds=start_master_seconds,
+                    end_master_seconds=end_master_seconds,
+                    duration_frames=request.duration_frames,
+                    descriptor_resolver=resolve_descriptor,
+                    face_identity_resolver=resolve_face_identity,
+                )
+                dispositions.append(
+                    SegmentBridgeDisposition(
+                        request=request,
+                        evidence_complete=evidence_complete,
+                        crop_compatible=crop_compatible,
+                        track_compatible=track_compatible,
+                        failure_codes=failure_codes,
+                        score_adjustment=score_adjustment,
+                    )
+                )
+            result = tuple(dispositions)
+            if len(result) != len(requests) or any(
+                disposition.request is not request
+                for disposition, request in zip(result, requests, strict=True)
+            ):
+                raise RuntimeError(
+                    "bridge disposition batch lost exact request identities"
+                )
+            self.descriptor_cache.commit_transaction(
+                descriptor_cache_transaction
+            )
+        except BaseException:
+            self._rollback_transaction(journal)
+            if descriptor_cache_transaction.active:
+                self.descriptor_cache.rollback_transaction(
+                    descriptor_cache_transaction
+                )
+            for source_index in tuple(self._samplers):
+                if source_index in sampler_indices_before:
+                    continue
+                self._samplers.pop(source_index).close()
+            for name, value in counter_snapshot.items():
+                setattr(self, name, value)
+            (
+                self._measurement_audit_digest,
+                self._measurement_audit_total_count,
+                measurement_disposition_counts,
+                measurement_failure_counts,
+                self._same_source_measurement_count,
+                self._cross_source_measurement_count,
+                self._bridge_audit_digest,
+                self._bridge_audit_registration_count,
+                bridge_failure_counts,
+                self._outer_audit_digest,
+                self._outer_audit_registration_count,
+                outer_failure_counts,
+                cache_eviction_counts,
+                cache_peak_counts,
+            ) = audit_snapshot
+            self._measurement_offset_disposition_counts.clear()
+            self._measurement_offset_disposition_counts.update(
+                measurement_disposition_counts
+            )
+            self._measurement_failure_code_counts.clear()
+            self._measurement_failure_code_counts.update(
+                measurement_failure_counts
+            )
+            self._bridge_failure_code_counts.clear()
+            self._bridge_failure_code_counts.update(bridge_failure_counts)
+            self._outer_failure_code_counts.clear()
+            self._outer_failure_code_counts.update(outer_failure_counts)
+            self._cache_eviction_counts.clear()
+            self._cache_eviction_counts.update(cache_eviction_counts)
+            self._cache_peak_counts.clear()
+            self._cache_peak_counts.update(cache_peak_counts)
+            self._active_transaction_journal = None
+            self._active_descriptor_cache_transaction = None
+            raise
+        self._active_transaction_journal = None
+        self._active_descriptor_cache_transaction = None
+        self.scalar_bridge_batch_call_count += 1
+        self.scalar_bridge_batch_request_count += len(requests)
+        self.scalar_bridge_disposition_count += len(result)
+        self.scalar_bridge_descriptor_snapshot_hit_count += (
+            descriptor_snapshot_hits
+        )
+        self.scalar_bridge_descriptor_snapshot_miss_count += (
+            descriptor_snapshot_misses
+        )
+        self.scalar_bridge_face_identity_snapshot_hit_count += face_snapshot_hits
+        self.scalar_bridge_face_identity_snapshot_miss_count += (
+            face_snapshot_misses
+        )
+        self._enforce_transient_cache_limits()
+        return result
+
     def bridge_provider(
         self,
         candidate: TimelineCandidate,
@@ -5183,6 +5776,33 @@ class DecodedBoundaryOptionProvider:
             "bridge_semantic_memo_hit_count": (
                 self.bridge_semantic_memo_hit_count
             ),
+            "scalar_bridge_batch": {
+                "contract": "decoded-bridge-scalar-batch-audit-v1",
+                "batch_call_count": self.scalar_bridge_batch_call_count,
+                "request_count": self.scalar_bridge_batch_request_count,
+                "disposition_count": self.scalar_bridge_disposition_count,
+                "descriptor_snapshot_hit_count": (
+                    self.scalar_bridge_descriptor_snapshot_hit_count
+                ),
+                "descriptor_snapshot_miss_count": (
+                    self.scalar_bridge_descriptor_snapshot_miss_count
+                ),
+                "face_identity_snapshot_hit_count": (
+                    self.scalar_bridge_face_identity_snapshot_hit_count
+                ),
+                "face_identity_snapshot_miss_count": (
+                    self.scalar_bridge_face_identity_snapshot_miss_count
+                ),
+                "scalar_evidence_only": True,
+                "proof_identities_created": False,
+                "exact_aliases_created": False,
+                "audit_records_created": False,
+                "sha_chains_created": False,
+                "transform_path_samples_created": False,
+                "materializations_created": False,
+                "raw_frames_persisted": False,
+                "biometric_model_vectors_persisted": False,
+            },
             "boundary_materialization_rehydration_count": (
                 self.boundary_materialization_rehydration_count
             ),

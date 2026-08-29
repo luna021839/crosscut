@@ -15,6 +15,8 @@ from crosscut.joint_timeline import (
     JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
     JointTimelineProgress,
     JointTimelineSharedBridgeEvidenceCache,
+    SegmentBridgeDisposition,
+    SegmentBridgeDispositionRequest,
     SegmentBridgeProof,
     select_joint_timeline,
     select_joint_timeline_candidates,
@@ -215,6 +217,101 @@ def valid_bridge(
         track_compatible=True,
         score_adjustment=score_adjustment,
     )
+
+
+class BatchedBridgeProvider:
+    def __init__(self, *, malformed: str | None = None) -> None:
+        self.malformed = malformed
+        self.exact_requests: list[SegmentBridgeDispositionRequest] = []
+        self.batch_requests: list[
+            tuple[SegmentBridgeDispositionRequest, ...]
+        ] = []
+
+    @staticmethod
+    def _scalars(
+        request: SegmentBridgeDispositionRequest,
+    ) -> tuple[bool, bool, bool, tuple[str, ...], float]:
+        rejected = request.candidate.source_id.startswith("reject")
+        return (
+            True,
+            not rejected,
+            True,
+            ("synthetic_crop_incompatible",) if rejected else (),
+            (
+                -0.01
+                if request.entry_option.frame_offset
+                != request.exit_option.frame_offset
+                else 0.0
+            ),
+        )
+
+    def bridge_provider(
+        self,
+        candidate_: TimelineCandidate,
+        entry: AuthorizedBoundaryOption,
+        exit: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> SegmentBridgeProof:
+        request = SegmentBridgeDispositionRequest(
+            candidate_,
+            entry,
+            exit,
+            duration_frames,
+        )
+        self.exact_requests.append(request)
+        complete, crop, track, codes, adjustment = self._scalars(request)
+        return SegmentBridgeProof(
+            candidate=candidate_,
+            entry_option=entry,
+            exit_option=exit,
+            duration_frames=duration_frames,
+            proof_identity=(
+                f"batch-exact:{candidate_.candidate_id}:"
+                f"{entry.proof_identity}:{exit.proof_identity}"
+            ),
+            evidence_complete=complete,
+            crop_compatible=crop,
+            track_compatible=track,
+            failure_codes=codes,
+            score_adjustment=adjustment,
+        )
+
+    def bridge_disposition_batch(
+        self,
+        requests: tuple[SegmentBridgeDispositionRequest, ...],
+    ) -> tuple[SegmentBridgeDisposition, ...]:
+        self.batch_requests.append(requests)
+        if self.malformed == "exception":
+            raise RuntimeError("synthetic batch failure")
+        dispositions = tuple(
+            SegmentBridgeDisposition(
+                request=request,
+                evidence_complete=values[0],
+                crop_compatible=values[1],
+                track_compatible=values[2],
+                failure_codes=values[3],
+                score_adjustment=values[4],
+            )
+            for request in requests
+            for values in (self._scalars(request),)
+        )
+        if self.malformed == "missing":
+            return dispositions[:-1]
+        if self.malformed == "extra":
+            return dispositions + (dispositions[-1],)
+        if self.malformed == "wrong_request":
+            wrong_request = replace(
+                requests[0],
+                duration_frames=requests[0].duration_frames + 1.0,
+            )
+            return (
+                replace(dispositions[0], request=wrong_request),
+            ) + dispositions[1:]
+        if self.malformed == "wrong_type":
+            return (object(),) + dispositions[1:]  # type: ignore[return-value]
+        if self.malformed == "list":
+            return list(dispositions)  # type: ignore[return-value]
+        return dispositions
 
 
 def three_segment_fixture() -> tuple[tuple[TimelineCandidate, ...], ...]:
@@ -523,6 +620,456 @@ class JointTimelineTests(unittest.TestCase):
         self.assertEqual(len(call_counts), 2)
         self.assertEqual(result.option_provider_call_count, 2)
         self.assertEqual(len(result.measured_boundary_option_sets), 2)
+
+    def test_bridge_disposition_batch_matches_legacy_order_scores_and_rejections(
+        self,
+    ) -> None:
+        segments = (
+            (candidate(0, "A", 0.82), candidate(0, "B", 0.77)),
+            (
+                candidate(1, "reject-high", 0.99),
+                candidate(1, "C", 0.81),
+            ),
+            (candidate(2, "D", 0.86), candidate(2, "E", 0.75)),
+            (candidate(3, "F", 0.84), candidate(3, "G", 0.73)),
+        )
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            return option_set(key, authorized={0: 0.0, 2: -0.02})
+
+        legacy_provider = BatchedBridgeProvider()
+        legacy = select_joint_timeline_candidates(
+            segments,
+            option_provider=provide_options,
+            bridge_provider=legacy_provider.bridge_provider,
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+        batch_provider = BatchedBridgeProvider()
+        batched = select_joint_timeline_candidates(
+            segments,
+            option_provider=provide_options,
+            bridge_provider=batch_provider.bridge_provider,
+            bridge_disposition_batch_provider=(
+                batch_provider.bridge_disposition_batch
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+
+        self.assertEqual(len(batch_provider.batch_requests), 2)
+        self.assertTrue(all(batch_provider.batch_requests))
+        flattened_batch_requests = tuple(
+            request
+            for requests in batch_provider.batch_requests
+            for request in requests
+        )
+        self.assertEqual(
+            flattened_batch_requests,
+            tuple(
+                legacy_provider.exact_requests[: len(flattened_batch_requests)]
+            ),
+        )
+        self.assertEqual(len(legacy), len(batched))
+        for legacy_item, batch_item in zip(legacy, batched, strict=True):
+            self.assertEqual(batch_item.timeline, legacy_item.timeline)
+            self.assertEqual(
+                batch_item.boundary_options,
+                legacy_item.boundary_options,
+            )
+            self.assertEqual(
+                batch_item.segment_bridge_proofs,
+                legacy_item.segment_bridge_proofs,
+            )
+            self.assertEqual(
+                batch_item.rejection_counts,
+                legacy_item.rejection_counts,
+            )
+            self.assertEqual(batch_item.bridge_disposition_batch_call_count, 2)
+            self.assertEqual(
+                batch_item.bridge_disposition_batch_request_count,
+                sum(len(requests) for requests in batch_provider.batch_requests),
+            )
+        expected_exact_requests = {
+            SegmentBridgeDispositionRequest(
+                proof.candidate,
+                proof.entry_option,
+                proof.exit_option,
+                proof.duration_frames,
+            )
+            for item in batched
+            for proof in item.segment_bridge_proofs
+        }
+        self.assertEqual(
+            set(batch_provider.exact_requests),
+            expected_exact_requests,
+        )
+
+        repeat_provider = BatchedBridgeProvider()
+        select_joint_timeline_candidates(
+            segments,
+            option_provider=provide_options,
+            bridge_provider=repeat_provider.bridge_provider,
+            bridge_disposition_batch_provider=(
+                repeat_provider.bridge_disposition_batch
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+        request_signature = lambda request: (
+            request.candidate.candidate_id,
+            request.entry_option.proof_identity,
+            request.exit_option.proof_identity,
+            request.duration_frames,
+        )
+        self.assertEqual(
+            tuple(
+                tuple(request_signature(request) for request in batch)
+                for batch in batch_provider.batch_requests
+            ),
+            tuple(
+                tuple(request_signature(request) for request in batch)
+                for batch in repeat_provider.batch_requests
+            ),
+        )
+
+    def test_batch_dedupes_semantic_aliases_but_revalidates_exact_backtraces(
+        self,
+    ) -> None:
+        first_segment = tuple(
+            replace(
+                candidate(0, "A", 0.8),
+                candidate_id=f"candidate:0:A:alias:{index}",
+                shot_id=f"shot:0:A:alias:{index}",
+            )
+            for index in range(8)
+        )
+        segments = (
+            first_segment,
+            (candidate(1, "B", 0.8),),
+            (candidate(2, "C", 0.8),),
+        )
+        provider = BatchedBridgeProvider()
+        ranked = select_joint_timeline_candidates(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=provider.bridge_provider,
+            bridge_disposition_batch_provider=provider.bridge_disposition_batch,
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+
+        self.assertEqual(len(ranked), 8)
+        self.assertEqual(len(provider.batch_requests), 1)
+        self.assertEqual(len(provider.batch_requests[0]), 1)
+        self.assertEqual(len(provider.exact_requests), 8)
+        self.assertEqual(
+            len({request.entry_option for request in provider.exact_requests}),
+            8,
+        )
+        self.assertTrue(
+            all(
+                item.segment_bridge_proofs[0].entry_option
+                is item.boundary_options[0]
+                for item in ranked
+            )
+        )
+
+    def test_batch_shared_cache_suppresses_second_and_third_profile_batches(
+        self,
+    ) -> None:
+        segments = three_segment_fixture()
+        provider = BatchedBridgeProvider()
+        cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+
+        results = tuple(
+            select_joint_timeline(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    provider.bridge_disposition_batch
+                ),
+                shared_bridge_evidence_cache=cache,
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+            for _ in range(3)
+        )
+
+        self.assertEqual(len(provider.batch_requests), 1)
+        self.assertEqual(len(provider.exact_requests), 3)
+        self.assertEqual(
+            [item.bridge_disposition_batch_call_count for item in results],
+            [1, 0, 0],
+        )
+        self.assertEqual(
+            [item.bridge_disposition_batch_request_count for item in results],
+            [1, 0, 0],
+        )
+        audit = cache.to_dict()
+        self.assertEqual(
+            (
+                audit["entry_count"],
+                audit["hit_count"],
+                audit["miss_count"],
+                audit["admission_count"],
+            ),
+            (1, 2, 1, 1),
+        )
+
+    def test_batch_shared_cache_cap_preserves_first_seen_admission_order(
+        self,
+    ) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8), candidate(1, "C", 0.8)),
+            (candidate(2, "D", 0.8),),
+        )
+        provider = BatchedBridgeProvider()
+        cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=1)
+        select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=provider.bridge_provider,
+            bridge_disposition_batch_provider=provider.bridge_disposition_batch,
+            shared_bridge_evidence_cache=cache,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        first_batch = provider.batch_requests[0]
+        self.assertEqual(len(first_batch), 2)
+
+        select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            bridge_provider=provider.bridge_provider,
+            bridge_disposition_batch_provider=provider.bridge_disposition_batch,
+            shared_bridge_evidence_cache=cache,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        self.assertEqual(provider.batch_requests[1], first_batch[1:])
+        audit = cache.to_dict()
+        self.assertEqual(
+            (
+                audit["entry_count"],
+                audit["hit_count"],
+                audit["miss_count"],
+                audit["admission_count"],
+                audit["saturation_count"],
+            ),
+            (1, 1, 3, 1, 2),
+        )
+
+    def test_malformed_batch_is_transactional_and_admits_no_scalars(self) -> None:
+        for malformed in (
+            "missing",
+            "extra",
+            "wrong_request",
+            "wrong_type",
+            "list",
+            "exception",
+        ):
+            with self.subTest(malformed=malformed):
+                provider = BatchedBridgeProvider(malformed=malformed)
+                cache = JointTimelineSharedBridgeEvidenceCache(maximum_entries=8)
+                before = cache.to_dict()
+                with self.assertRaises((RuntimeError, TypeError)):
+                    select_joint_timeline(
+                        three_segment_fixture(),
+                        option_provider=zero_offset_options,
+                        bridge_provider=provider.bridge_provider,
+                        bridge_disposition_batch_provider=(
+                            provider.bridge_disposition_batch
+                        ),
+                        shared_bridge_evidence_cache=cache,
+                        fps=30.0,
+                        config=isolated_score_config(),
+                    )
+                self.assertEqual(cache.to_dict(), before)
+                self.assertEqual(provider.exact_requests, [])
+                self.assertEqual(len(provider.batch_requests), 1)
+
+    def test_batch_preflight_rejects_unrelated_callables_before_option_decode(
+        self,
+    ) -> None:
+        exact_provider = BatchedBridgeProvider()
+        other_provider = BatchedBridgeProvider()
+        option_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal option_calls
+            option_calls += 1
+            return zero_offset_options(key)
+
+        with self.assertRaisesRegex(ValueError, "provider-bound"):
+            select_joint_timeline(
+                three_segment_fixture(),
+                option_provider=provide_options,
+                bridge_provider=exact_provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    other_provider.bridge_disposition_batch
+                ),
+            )
+        self.assertEqual(option_calls, 0)
+
+        with self.assertRaisesRegex(ValueError, "provider-bound"):
+            select_joint_timeline(
+                three_segment_fixture(),
+                option_provider=provide_options,
+                bridge_provider=valid_bridge,
+                bridge_disposition_batch_provider=lambda requests: (),
+            )
+        self.assertEqual(option_calls, 0)
+
+    def test_batch_no_path_and_callback_failure_match_legacy_control_flow(
+        self,
+    ) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "reject-only", 0.8),),
+            (candidate(2, "C", 0.8),),
+        )
+        legacy_provider = BatchedBridgeProvider()
+        batch_provider = BatchedBridgeProvider()
+        legacy_progress: list[JointTimelineProgress] = []
+        batch_progress: list[JointTimelineProgress] = []
+        with self.assertRaises(NoCompleteTimelinePath) as legacy_error:
+            select_joint_timeline(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=legacy_provider.bridge_provider,
+                fps=30.0,
+                config=isolated_score_config(),
+                progress_callback=legacy_progress.append,
+            )
+        with self.assertRaises(NoCompleteTimelinePath) as batch_error:
+            select_joint_timeline(
+                segments,
+                option_provider=zero_offset_options,
+                bridge_provider=batch_provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    batch_provider.bridge_disposition_batch
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+                progress_callback=batch_progress.append,
+            )
+        self.assertEqual(
+            (
+                batch_error.exception.reason_code,
+                batch_error.exception.segment_index,
+                batch_error.exception.rejection_counts,
+            ),
+            (
+                legacy_error.exception.reason_code,
+                legacy_error.exception.segment_index,
+                legacy_error.exception.rejection_counts,
+            ),
+        )
+        self.assertEqual(
+            [
+                (item.phase, item.completed_boundary_layers)
+                for item in batch_progress
+            ],
+            [
+                (item.phase, item.completed_boundary_layers)
+                for item in legacy_progress
+            ],
+        )
+        self.assertEqual(len(batch_provider.batch_requests), 1)
+        self.assertEqual(batch_provider.exact_requests, [])
+
+        callback_provider = BatchedBridgeProvider()
+        callback_failure = RuntimeError("synthetic callback abort")
+
+        def abort(progress: JointTimelineProgress) -> None:
+            if progress.phase == "boundary_layer_complete":
+                raise callback_failure
+
+        with self.assertRaises(RuntimeError) as caught:
+            select_joint_timeline(
+                three_segment_fixture(),
+                option_provider=zero_offset_options,
+                bridge_provider=callback_provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    callback_provider.bridge_disposition_batch
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+                progress_callback=abort,
+            )
+        self.assertIs(caught.exception, callback_failure)
+        self.assertEqual(callback_provider.batch_requests, [])
+
+    def test_batch_scalar_must_match_selected_exact_backtrace(self) -> None:
+        class DivergingBatchProvider(BatchedBridgeProvider):
+            def bridge_provider(
+                self,
+                candidate_: TimelineCandidate,
+                entry: AuthorizedBoundaryOption,
+                exit: AuthorizedBoundaryOption,
+                duration_frames: float,
+            ) -> SegmentBridgeProof:
+                proof = super().bridge_provider(
+                    candidate_,
+                    entry,
+                    exit,
+                    duration_frames,
+                )
+                return replace(proof, score_adjustment=-0.25)
+
+        provider = DivergingBatchProvider()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "diverged within one renderer-semantic state",
+        ):
+            select_joint_timeline(
+                three_segment_fixture(),
+                option_provider=zero_offset_options,
+                bridge_provider=provider.bridge_provider,
+                bridge_disposition_batch_provider=(
+                    provider.bridge_disposition_batch
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+            )
+        self.assertEqual(len(provider.batch_requests), 1)
+        self.assertEqual(len(provider.exact_requests), 1)
+
+    def test_batch_request_and_disposition_repr_hide_exact_provenance(self) -> None:
+        segments = three_segment_fixture()
+        entry = zero_offset_options(
+            BoundaryMeasurementKey(0, segments[0][0], segments[1][0])
+        ).authorized_options[0]
+        exit_ = zero_offset_options(
+            BoundaryMeasurementKey(1, segments[1][0], segments[2][0])
+        ).authorized_options[0]
+        request = SegmentBridgeDispositionRequest(
+            segments[1][0],
+            entry,
+            exit_,
+            30.0,
+        )
+        disposition = SegmentBridgeDisposition(
+            request,
+            True,
+            True,
+            True,
+            (),
+        )
+        for secret in (
+            segments[1][0].candidate_id,
+            entry.proof_identity,
+            exit_.proof_identity,
+        ):
+            self.assertNotIn(secret, repr(request))
+            self.assertNotIn(secret, repr(disposition))
 
     def test_shared_bridge_scalars_suppress_semantic_redecode_but_keep_exact_proof(
         self,

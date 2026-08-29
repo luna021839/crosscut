@@ -4,7 +4,10 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
+import random
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from crosscut.joint_boundary_provider import (
     DecodedBoundaryOptionProvider,
@@ -16,6 +19,8 @@ from crosscut.joint_timeline import (
     BoundaryOffsetDisposition,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    SegmentBridgeDisposition,
+    SegmentBridgeDispositionRequest,
     select_joint_timeline,
 )
 from crosscut.pose import FormationPersonDescriptor, POSE_BACKEND
@@ -112,6 +117,7 @@ def _provider(
     descriptor_cache=None,
     sources=(Path("source-a.mp4"), Path("source-b.mp4")),
     total_segment_count=2,
+    output_fps=FPS,
     beat_period_seconds=None,
     beat_intensity=None,
     face_identity_provider=None,
@@ -126,7 +132,7 @@ def _provider(
             if descriptor_cache is not None
             else BoundaryDescriptorCache(maximum_entries=4096)
         ),
-        output_fps=FPS,
+        output_fps=output_fps,
         total_segment_count=total_segment_count,
         beat_period_seconds=beat_period_seconds,
         beat_intensity=beat_intensity,
@@ -170,6 +176,77 @@ def _timewarp(rate: float) -> TimeWarpMap:
         scalar_fallback=False,
         fallback_reason=None,
     )
+
+
+def _bridge_fixture(
+    provider: DecodedBoundaryOptionProvider,
+) -> tuple[
+    TimelineCandidate,
+    tuple[AuthorizedBoundaryOption, ...],
+    tuple[AuthorizedBoundaryOption, ...],
+]:
+    first = _candidate(0, "0")
+    middle = _candidate(1, "1")
+    last = TimelineCandidate(
+        segment_index=2,
+        source_id="0",
+        start_seconds=11.0,
+        end_seconds=12.0,
+        quality_score=0.8,
+        candidate_id="candidate:2:0",
+        shot_id="shot:2:0",
+    )
+    entries = provider(
+        BoundaryMeasurementKey(0, first, middle)
+    ).authorized_options
+    exits = provider(
+        BoundaryMeasurementKey(1, middle, last)
+    ).authorized_options
+    return middle, entries, exits
+
+
+def _bridge_request(
+    candidate: TimelineCandidate,
+    entry: AuthorizedBoundaryOption,
+    exit_: AuthorizedBoundaryOption,
+    *,
+    fps: float = FPS,
+) -> SegmentBridgeDispositionRequest:
+    return SegmentBridgeDispositionRequest(
+        candidate=candidate,
+        entry_option=entry,
+        exit_option=exit_,
+        duration_frames=(
+            candidate.duration_seconds * fps
+            + exit_.frame_offset
+            - entry.frame_offset
+        ),
+    )
+
+
+class _CountingBoundaryDescriptorCache(BoundaryDescriptorCache):
+    def __init__(self, *, maximum_entries: int = 4096) -> None:
+        super().__init__(maximum_entries=maximum_entries)
+        self.begin_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
+
+    def begin_transaction(self):
+        self.begin_count += 1
+        return super().begin_transaction()
+
+    def commit_transaction(self, transaction) -> None:
+        self.commit_count += 1
+        super().commit_transaction(transaction)
+
+    def rollback_transaction(self, transaction) -> None:
+        self.rollback_count += 1
+        super().rollback_transaction(transaction)
+
+    def reset_transaction_counts(self) -> None:
+        self.begin_count = 0
+        self.commit_count = 0
+        self.rollback_count = 0
 
 
 class DecodedBoundaryOptionProviderTests(unittest.TestCase):
@@ -708,6 +785,864 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_scalar_batch_matches_exact_oracle_for_all_seventeen_by_seventeen(
+        self,
+    ) -> None:
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5, pose_value=0.1),
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        self.assertEqual(len(entries), 17)
+        self.assertEqual(len(exits), 17)
+        requests = tuple(
+            _bridge_request(middle, entry, exit_)
+            for entry in entries
+            for exit_ in exits
+        )
+        bridge_state_before = (
+            len(provider._bridge_memo),
+            len(provider._semantic_bridge_path_memo),
+            len(provider._bridge_audit),
+            len(provider._segment_materialization_by_proof),
+            provider.bridge_request_count,
+            provider.bridge_measurement_count,
+            provider._bridge_audit_registration_count,
+            provider._bridge_audit_digest,
+        )
+
+        scalar = provider.bridge_disposition_batch(requests)
+
+        self.assertEqual(len(scalar), 17 * 17)
+        self.assertTrue(
+            all(
+                isinstance(item, SegmentBridgeDisposition)
+                and item.request is request
+                for item, request in zip(scalar, requests, strict=True)
+            )
+        )
+        self.assertEqual(
+            (
+                len(provider._bridge_memo),
+                len(provider._semantic_bridge_path_memo),
+                len(provider._bridge_audit),
+                len(provider._segment_materialization_by_proof),
+                provider.bridge_request_count,
+                provider.bridge_measurement_count,
+                provider._bridge_audit_registration_count,
+                provider._bridge_audit_digest,
+            ),
+            bridge_state_before,
+        )
+
+        exact = tuple(
+            provider.bridge_provider(
+                request.candidate,
+                request.entry_option,
+                request.exit_option,
+                request.duration_frames,
+            )
+            for request in requests
+        )
+        for scalar_item, exact_item in zip(scalar, exact, strict=True):
+            self.assertEqual(
+                (
+                    scalar_item.evidence_complete,
+                    scalar_item.crop_compatible,
+                    scalar_item.track_compatible,
+                    scalar_item.failure_codes,
+                    scalar_item.score_adjustment,
+                ),
+                (
+                    exact_item.evidence_complete,
+                    exact_item.crop_compatible,
+                    exact_item.track_compatible,
+                    exact_item.failure_codes,
+                    exact_item.score_adjustment,
+                ),
+            )
+
+    def test_scalar_batch_uses_one_transaction_lazy_snapshots_and_no_proofs(
+        self,
+    ) -> None:
+        cache = _CountingBoundaryDescriptorCache()
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(
+                0.5,
+                pose_value=0.1,
+                face_bbox=(0.42, 0.30, 0.16, 0.22),
+            ),
+            descriptor_cache=cache,
+            face_identity_provider=(
+                lambda _source, _seconds, _descriptor: (1.0, 0.0)
+            ),
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        crop = (0.1, 0.1, 0.8, 0.8)
+        entry = replace(
+            entries[8],
+            incoming_transform=BoundaryTransformState(
+                transform_identity="batch-entry-transform",
+                crop_xywh=crop,
+                track_id="batch-track",
+                subject_basis="dominant_face",
+            ),
+        )
+        exit_ = replace(
+            exits[8],
+            outgoing_transform=BoundaryTransformState(
+                transform_identity="batch-exit-transform",
+                crop_xywh=crop,
+                track_id="batch-track",
+                subject_basis="dominant_face",
+            ),
+        )
+        request = _bridge_request(middle, entry, exit_)
+        proof_state_before = (
+            tuple(provider._bridge_memo.items()),
+            tuple(provider._semantic_bridge_path_memo.items()),
+            tuple(provider._bridge_audit.items()),
+            tuple(provider._segment_materialization_by_proof.items()),
+            provider._bridge_audit_registration_count,
+            provider._bridge_audit_digest,
+        )
+        cache.reset_transaction_counts()
+
+        with mock.patch(
+            "crosscut.joint_boundary_provider._sha256_json",
+            side_effect=AssertionError("scalar batch attempted SHA proof work"),
+        ), mock.patch(
+            "crosscut.joint_boundary_provider.SegmentTransformPathSample",
+            side_effect=AssertionError("scalar batch attempted sample materialization"),
+        ):
+            result = provider.bridge_disposition_batch((request, request))
+
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(item.authorized for item in result))
+        self.assertEqual(cache.begin_count, 1)
+        self.assertEqual(cache.commit_count, 1)
+        self.assertEqual(cache.rollback_count, 0)
+        self.assertEqual(
+            (
+                tuple(provider._bridge_memo.items()),
+                tuple(provider._semantic_bridge_path_memo.items()),
+                tuple(provider._bridge_audit.items()),
+                tuple(provider._segment_materialization_by_proof.items()),
+                provider._bridge_audit_registration_count,
+                provider._bridge_audit_digest,
+            ),
+            proof_state_before,
+        )
+        audit = provider.to_dict()["scalar_bridge_batch"]
+        self.assertEqual(audit["batch_call_count"], 1)
+        self.assertEqual(audit["request_count"], 2)
+        self.assertGreater(audit["descriptor_snapshot_hit_count"], 0)
+        self.assertGreater(audit["face_identity_snapshot_hit_count"], 0)
+        for key in (
+            "proof_identities_created",
+            "exact_aliases_created",
+            "audit_records_created",
+            "sha_chains_created",
+            "transform_path_samples_created",
+            "materializations_created",
+        ):
+            self.assertFalse(audit[key], key)
+
+        exact = provider.bridge_provider(
+            middle,
+            entry,
+            exit_,
+            request.duration_frames,
+        )
+        self.assertEqual(
+            (
+                result[0].evidence_complete,
+                result[0].crop_compatible,
+                result[0].track_compatible,
+                result[0].failure_codes,
+                result[0].score_adjustment,
+            ),
+            (
+                exact.evidence_complete,
+                exact.crop_compatible,
+                exact.track_compatible,
+                exact.failure_codes,
+                exact.score_adjustment,
+            ),
+        )
+
+    def test_scalar_batch_parity_across_timewarp_fps_and_offset_cases(self) -> None:
+        randomizer = random.Random(20260829)
+        for fps, rate in ((24.0, 1.003), (29.97, 0.997), (60.0, 1.005)):
+            with self.subTest(fps=fps, rate=rate):
+                provider = _provider(
+                    lambda _source, seconds: _descriptor(
+                        0.45 + 0.02 * math.sin(seconds),
+                        pose_value=0.1,
+                    ),
+                    source_timewarps=(_timewarp(rate), _timewarp(rate)),
+                    output_fps=fps,
+                    total_segment_count=3,
+                )
+                middle, entries, exits = _bridge_fixture(provider)
+                pairs = tuple(
+                    (
+                        randomizer.randrange(len(entries)),
+                        randomizer.randrange(len(exits)),
+                    )
+                    for _ in range(24)
+                )
+                requests = tuple(
+                    _bridge_request(
+                        middle,
+                        entries[entry_index],
+                        exits[exit_index],
+                        fps=fps,
+                    )
+                    for entry_index, exit_index in pairs
+                )
+
+                scalar = provider.bridge_disposition_batch(requests)
+                exact = tuple(
+                    provider.bridge_provider(
+                        request.candidate,
+                        request.entry_option,
+                        request.exit_option,
+                        request.duration_frames,
+                    )
+                    for request in requests
+                )
+
+                self.assertEqual(
+                    tuple(
+                        (
+                            item.evidence_complete,
+                            item.crop_compatible,
+                            item.track_compatible,
+                            item.failure_codes,
+                            item.score_adjustment,
+                        )
+                        for item in scalar
+                    ),
+                    tuple(
+                        (
+                            item.evidence_complete,
+                            item.crop_compatible,
+                            item.track_compatible,
+                            item.failure_codes,
+                            item.score_adjustment,
+                        )
+                        for item in exact
+                    ),
+                )
+
+    def test_scalar_batch_matches_exact_oracle_at_every_segment_gate(self) -> None:
+        descriptor_with_face = _descriptor(
+            0.5,
+            pose_value=0.1,
+            face_bbox=(0.42, 0.30, 0.16, 0.22),
+        )
+        donor = _provider(
+            lambda _source, _seconds: descriptor_with_face,
+            face_identity_provider=(
+                lambda _source, _seconds, _descriptor: (1.0, 0.0)
+            ),
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(donor)
+        base_entry = entries[8]
+        base_exit = exits[8]
+
+        def transform(
+            identity: str,
+            *,
+            crop=(0.1, 0.1, 0.8, 0.8),
+            rotation=0.0,
+            track="segment-track",
+            basis="dominant_face",
+        ) -> BoundaryTransformState:
+            return BoundaryTransformState(
+                transform_identity=identity,
+                crop_xywh=crop,
+                rotation_degrees=rotation,
+                track_id=track,
+                subject_basis=basis,
+            )
+
+        def request_with_transforms(
+            entry_transform: BoundaryTransformState,
+            exit_transform: BoundaryTransformState,
+        ) -> SegmentBridgeDispositionRequest:
+            return _bridge_request(
+                middle,
+                replace(base_entry, incoming_transform=entry_transform),
+                replace(base_exit, outgoing_transform=exit_transform),
+            )
+
+        def assert_parity(
+            provider: DecodedBoundaryOptionProvider,
+            request: SegmentBridgeDispositionRequest,
+            expected_code: str | None,
+        ) -> None:
+            scalar = provider.bridge_disposition_batch((request,))[0]
+            exact = provider.bridge_provider(
+                request.candidate,
+                request.entry_option,
+                request.exit_option,
+                request.duration_frames,
+            )
+            self.assertEqual(
+                (
+                    scalar.evidence_complete,
+                    scalar.crop_compatible,
+                    scalar.track_compatible,
+                    scalar.failure_codes,
+                    scalar.score_adjustment,
+                ),
+                (
+                    exact.evidence_complete,
+                    exact.crop_compatible,
+                    exact.track_compatible,
+                    exact.failure_codes,
+                    exact.score_adjustment,
+                ),
+            )
+            if expected_code is None:
+                self.assertTrue(scalar.authorized)
+            else:
+                self.assertIn(expected_code, scalar.failure_codes)
+
+        ordinary_provider = _provider(
+            lambda _source, _seconds: descriptor_with_face,
+            face_identity_provider=(
+                lambda _source, _seconds, _descriptor: (1.0, 0.0)
+            ),
+            total_segment_count=3,
+        )
+        transform_cases = (
+            (
+                transform("authorized-entry"),
+                transform("authorized-exit"),
+                None,
+            ),
+            (
+                transform("missing-track-entry", track=None),
+                transform("missing-track-exit"),
+                "segment_track_identity_evidence_incomplete",
+            ),
+            (
+                transform("mismatch-entry", track="track-a"),
+                transform("mismatch-exit", track="track-b"),
+                "segment_track_identity_mismatch",
+            ),
+            (
+                transform("rotation-entry", rotation=1.0),
+                transform("rotation-exit"),
+                "segment_rotation_path_evidence_incomplete",
+            ),
+            (
+                transform("envelope-entry", crop=(0.1, 0.1, 0.8, 0.7)),
+                transform("envelope-exit", crop=(0.1, 0.1, 0.8, 0.7)),
+                "segment_renderer_transform_envelope_violation",
+            ),
+            (
+                transform("out-entry", crop=(0.5, 0.1, 0.8, 0.8)),
+                transform("out-exit", crop=(0.5, 0.1, 0.8, 0.8)),
+                "segment_renderer_transform_envelope_violation",
+            ),
+            (
+                transform("coverage-entry", crop=(0.0, 0.25, 0.5, 0.5)),
+                transform("coverage-exit", crop=(0.0, 0.25, 0.5, 0.5)),
+                "segment_subject_exits_crop_track",
+            ),
+        )
+        for entry_transform, exit_transform, expected_code in transform_cases:
+            with self.subTest(segment_gate=expected_code or "authorized"):
+                assert_parity(
+                    ordinary_provider,
+                    request_with_transforms(entry_transform, exit_transform),
+                    expected_code,
+                )
+
+        unsafe_frame = SimpleNamespace(
+            time_seconds=0.0,
+            zoom=1.25,
+            center_x=0.9,
+            center_y=0.5,
+            roll_degrees=0.0,
+        )
+        unsafe_track = SimpleNamespace(
+            reason="injected-out-of-frame-track",
+            keyframes=(unsafe_frame,),
+            evaluate=lambda _seconds: unsafe_frame,
+        )
+        unsafe_request = request_with_transforms(
+            transform(
+                "unsafe-entry",
+                crop=(0.12, 0.12, 0.76, 0.76),
+                track="unsafe-track",
+            ),
+            transform(
+                "unsafe-exit",
+                crop=(0.12, 0.12, 0.76, 0.76),
+                track="unsafe-track",
+            ),
+        )
+        with mock.patch.object(
+            ordinary_provider,
+            "_renderer_track",
+            return_value=unsafe_track,
+        ):
+            assert_parity(
+                ordinary_provider,
+                unsafe_request,
+                "segment_crop_path_out_of_frame",
+            )
+
+        specialized_cases: list[
+            tuple[
+                str,
+                DecodedBoundaryOptionProvider,
+                SegmentBridgeDispositionRequest,
+                str,
+            ]
+        ] = []
+        cropped_request = request_with_transforms(
+            transform("special-entry"),
+            transform("special-exit"),
+        )
+        specialized_cases.append(
+            (
+                "scene-cut",
+                _provider(
+                    lambda _source, _seconds: descriptor_with_face,
+                    scene_cut_times=((), (10.5,)),
+                    face_identity_provider=(
+                        lambda _source, _seconds, _descriptor: (1.0, 0.0)
+                    ),
+                    total_segment_count=3,
+                ),
+                cropped_request,
+                "segment_source_scene_cut_breaks_track",
+            )
+        )
+        specialized_cases.append(
+            (
+                "descriptor-none",
+                _provider(
+                    lambda source, seconds: (
+                        None
+                        if source == 1 and 10.45 < seconds < 10.55
+                        else descriptor_with_face
+                    ),
+                    face_identity_provider=(
+                        lambda _source, _seconds, _descriptor: (1.0, 0.0)
+                    ),
+                    total_segment_count=3,
+                ),
+                cropped_request,
+                "segment_descriptor_evidence_incomplete",
+            )
+        )
+        descriptor_without_face = replace(
+            descriptor_with_face,
+            primary_face_bbox=None,
+            face_count=0,
+        )
+        specialized_cases.append(
+            (
+                "missing-geometry",
+                _provider(
+                    lambda _source, _seconds: descriptor_without_face,
+                    total_segment_count=3,
+                ),
+                cropped_request,
+                "segment_subject_track_evidence_incomplete",
+            )
+        )
+        specialized_cases.append(
+            (
+                "face-empty",
+                _provider(
+                    lambda _source, _seconds: descriptor_with_face,
+                    face_identity_provider=(
+                        lambda _source, _seconds, _descriptor: ()
+                    ),
+                    total_segment_count=3,
+                ),
+                cropped_request,
+                "segment_dominant_face_identity_evidence_incomplete",
+            )
+        )
+        specialized_cases.append(
+            (
+                "negative-endpoint",
+                _provider(
+                    lambda _source, _seconds: descriptor_with_face,
+                    audio_offsets=(0.0, -20.0),
+                    total_segment_count=3,
+                ),
+                cropped_request,
+                "segment_negative_source_local_time",
+            )
+        )
+        for name, provider, request, expected_code in specialized_cases:
+            with self.subTest(segment_gate=name):
+                assert_parity(provider, request, expected_code)
+
+        for similarity, expected_code in (
+            (0.549, "segment_dominant_face_track_identity_mismatch"),
+            (0.551, None),
+        ):
+            identity_after_anchor = (
+                similarity,
+                math.sqrt(1.0 - similarity * similarity),
+            )
+            identity_provider = _provider(
+                lambda _source, _seconds: descriptor_with_face,
+                face_identity_provider=(
+                    lambda _source, seconds, _descriptor, later=(
+                        identity_after_anchor
+                    ): (1.0, 0.0) if seconds < 10.1 else later
+                ),
+                total_segment_count=3,
+            )
+            with self.subTest(face_similarity=similarity):
+                assert_parity(identity_provider, cropped_request, expected_code)
+
+        def manual_request(
+            *,
+            duration_frames: float,
+            entry_transform: BoundaryTransformState,
+            exit_transform: BoundaryTransformState,
+        ) -> SegmentBridgeDispositionRequest:
+            duration_seconds = duration_frames / FPS
+            short_middle = TimelineCandidate(
+                segment_index=1,
+                source_id="1",
+                start_seconds=10.0,
+                end_seconds=10.0 + duration_seconds,
+                candidate_id=f"short-middle:{duration_frames}",
+                shot_id=f"short-middle-shot:{duration_frames}",
+            )
+            first = TimelineCandidate(
+                segment_index=0,
+                source_id="0",
+                start_seconds=9.0,
+                end_seconds=10.0,
+                candidate_id=f"short-first:{duration_frames}",
+                shot_id=f"short-first-shot:{duration_frames}",
+            )
+            last = TimelineCandidate(
+                segment_index=2,
+                source_id="0",
+                start_seconds=short_middle.end_seconds,
+                end_seconds=short_middle.end_seconds + 1.0,
+                candidate_id=f"short-last:{duration_frames}",
+                shot_id=f"short-last-shot:{duration_frames}",
+            )
+            entry = AuthorizedBoundaryOption(
+                measurement_key=BoundaryMeasurementKey(0, first, short_middle),
+                frame_offset=0,
+                outgoing_transform=transform(
+                    f"short-outer-entry:{duration_frames}",
+                    crop=None,
+                    track="outer-track",
+                    basis="full_frame_identity",
+                ),
+                incoming_transform=entry_transform,
+                proof_identity=f"short-entry-proof:{duration_frames}",
+            )
+            exit_ = AuthorizedBoundaryOption(
+                measurement_key=BoundaryMeasurementKey(1, short_middle, last),
+                frame_offset=0,
+                outgoing_transform=exit_transform,
+                incoming_transform=transform(
+                    f"short-outer-exit:{duration_frames}",
+                    crop=None,
+                    track="outer-track",
+                    basis="full_frame_identity",
+                ),
+                proof_identity=f"short-exit-proof:{duration_frames}",
+            )
+            return SegmentBridgeDispositionRequest(
+                candidate=short_middle,
+                entry_option=entry,
+                exit_option=exit_,
+                duration_frames=duration_frames,
+            )
+
+        short_provider = _provider(
+            lambda _source, _seconds: descriptor_with_face,
+            total_segment_count=3,
+        )
+        assert_parity(
+            short_provider,
+            manual_request(
+                duration_frames=1.0,
+                entry_transform=transform("one-frame-entry"),
+                exit_transform=transform("one-frame-exit"),
+            ),
+            "segment_duration_below_two_frames",
+        )
+        assert_parity(
+            short_provider,
+            manual_request(
+                duration_frames=6.0,
+                entry_transform=transform(
+                    "short-hold-entry",
+                    crop=(0.1, 0.1, 0.8, 0.8),
+                ),
+                exit_transform=transform(
+                    "short-hold-exit",
+                    crop=(0.15, 0.15, 0.7, 0.7),
+                ),
+            ),
+            "segment_too_short_for_exact_boundary_transform_holds",
+        )
+
+        interior_negative_provider = _provider(
+            lambda _source, _seconds: descriptor_with_face,
+            face_identity_provider=(
+                lambda _source, _seconds, _descriptor: (1.0, 0.0)
+            ),
+            total_segment_count=3,
+        )
+
+        def interior_negative_time(_source_index: int, master_seconds: float) -> float:
+            if 10.0 + _EPSILON_FOR_TEST < master_seconds < 11.0 - _EPSILON_FOR_TEST:
+                return -1.0
+            return master_seconds
+
+        _EPSILON_FOR_TEST = 1e-9
+        with mock.patch.object(
+            interior_negative_provider,
+            "_source_time",
+            side_effect=interior_negative_time,
+        ):
+            assert_parity(
+                interior_negative_provider,
+                cropped_request,
+                "segment_negative_source_local_time",
+            )
+
+    def test_scalar_batch_rounded_timestamp_snapshots_keep_first_value_and_none(
+        self,
+    ) -> None:
+        state = {"none": False}
+        descriptor_calls: list[float] = []
+        face_calls: list[float] = []
+        descriptor_value = _descriptor(
+            0.5,
+            pose_value=0.1,
+            face_bbox=(0.42, 0.30, 0.16, 0.22),
+        )
+
+        def descriptor(_source: int, seconds: float):
+            descriptor_calls.append(seconds)
+            return None if state["none"] else descriptor_value
+
+        def face_identity(
+            _source: int,
+            seconds: float,
+            _descriptor_value: FrameVisualDescriptor,
+        ) -> tuple[float, ...]:
+            face_calls.append(seconds)
+            return (1.0, seconds)
+
+        provider = _provider(
+            descriptor,
+            face_identity_provider=face_identity,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        crop = (0.1, 0.1, 0.8, 0.8)
+        entry = replace(
+            entries[8],
+            incoming_transform=BoundaryTransformState(
+                transform_identity="collision-entry",
+                crop_xywh=crop,
+                track_id="collision-track",
+                subject_basis="dominant_face",
+            ),
+        )
+        exit_ = replace(
+            exits[8],
+            outgoing_transform=BoundaryTransformState(
+                transform_identity="collision-exit",
+                crop_xywh=crop,
+                track_id="collision-track",
+                subject_basis="dominant_face",
+            ),
+        )
+        request = _bridge_request(middle, entry, exit_)
+        descriptor_calls.clear()
+        face_calls.clear()
+
+        def colliding_time(
+            _source_index: int,
+            master_seconds: float,
+        ) -> float:
+            return 1.00000001 + (master_seconds - 10.0) * 1e-8
+
+        before = provider.to_dict()["scalar_bridge_batch"]
+        with mock.patch.object(
+            provider,
+            "_source_time",
+            side_effect=colliding_time,
+        ):
+            dispositions = provider.bridge_disposition_batch((request, request))
+
+        self.assertTrue(all(item.authorized for item in dispositions))
+        self.assertEqual(len(descriptor_calls), 1)
+        self.assertEqual(len(face_calls), 1)
+        self.assertAlmostEqual(descriptor_calls[0], 1.00000001, places=12)
+        self.assertAlmostEqual(face_calls[0], 1.00000001, places=12)
+        after = provider.to_dict()["scalar_bridge_batch"]
+        self.assertEqual(
+            after["descriptor_snapshot_miss_count"]
+            - before["descriptor_snapshot_miss_count"],
+            1,
+        )
+        self.assertGreaterEqual(
+            after["descriptor_snapshot_hit_count"]
+            - before["descriptor_snapshot_hit_count"],
+            63,
+        )
+        self.assertEqual(
+            after["face_identity_snapshot_miss_count"]
+            - before["face_identity_snapshot_miss_count"],
+            1,
+        )
+        self.assertGreaterEqual(
+            after["face_identity_snapshot_hit_count"]
+            - before["face_identity_snapshot_hit_count"],
+            63,
+        )
+
+        state["none"] = True
+        descriptor_calls.clear()
+        face_calls.clear()
+
+        def colliding_none_time(
+            _source_index: int,
+            master_seconds: float,
+        ) -> float:
+            return 2.00000001 + (master_seconds - 10.0) * 1e-8
+
+        with mock.patch.object(
+            provider,
+            "_source_time",
+            side_effect=colliding_none_time,
+        ):
+            missing = provider.bridge_disposition_batch((request, request))
+
+        self.assertTrue(all(not item.evidence_complete for item in missing))
+        self.assertTrue(
+            all(
+                item.failure_codes
+                == ("segment_descriptor_evidence_incomplete",)
+                for item in missing
+            )
+        )
+        self.assertEqual(len(descriptor_calls), 1)
+        self.assertEqual(face_calls, [])
+        self.assertAlmostEqual(descriptor_calls[0], 2.00000001, places=12)
+
+    def test_scalar_batch_failure_and_malformed_inputs_restore_all_state(
+        self,
+    ) -> None:
+        state = {"fail": False}
+
+        def descriptor(
+            source: int,
+            seconds: float,
+        ) -> FrameVisualDescriptor:
+            if state["fail"] and source == 1 and 12.45 < seconds < 12.55:
+                raise RuntimeError("injected scalar batch descriptor failure")
+            return _descriptor(0.5, pose_value=0.1)
+
+        cache = _CountingBoundaryDescriptorCache()
+        provider = _provider(
+            descriptor,
+            descriptor_cache=cache,
+            total_segment_count=3,
+        )
+        middle, entries, exits = _bridge_fixture(provider)
+        request = _bridge_request(middle, entries[8], exits[8])
+        later_first = TimelineCandidate(
+            segment_index=0,
+            source_id="0",
+            start_seconds=11.0,
+            end_seconds=12.0,
+            candidate_id="later-first",
+            shot_id="later-first-shot",
+        )
+        later_middle = TimelineCandidate(
+            segment_index=1,
+            source_id="1",
+            start_seconds=12.0,
+            end_seconds=13.0,
+            candidate_id="later-middle",
+            shot_id="later-middle-shot",
+        )
+        later_last = TimelineCandidate(
+            segment_index=2,
+            source_id="0",
+            start_seconds=13.0,
+            end_seconds=14.0,
+            candidate_id="later-last",
+            shot_id="later-last-shot",
+        )
+        later_entry = provider(
+            BoundaryMeasurementKey(0, later_first, later_middle)
+        ).audit_for(0).authorized_option
+        later_exit = provider(
+            BoundaryMeasurementKey(1, later_middle, later_last)
+        ).audit_for(0).authorized_option
+        assert later_entry is not None and later_exit is not None
+        later_request = _bridge_request(
+            later_middle,
+            later_entry,
+            later_exit,
+        )
+        before = provider.to_dict()
+        cache.reset_transaction_counts()
+        state["fail"] = True
+
+        with self.assertRaisesRegex(RuntimeError, "injected scalar batch"):
+            provider.bridge_disposition_batch((request, later_request))
+
+        self.assertEqual(provider.to_dict(), before)
+        self.assertEqual(cache.begin_count, 1)
+        self.assertEqual(cache.commit_count, 0)
+        self.assertEqual(cache.rollback_count, 1)
+        state["fail"] = False
+
+        malformed = replace(
+            request,
+            duration_frames=request.duration_frames + 1.0,
+        )
+        cache.reset_transaction_counts()
+        before_malformed = provider.to_dict()
+        with self.assertRaisesRegex(ValueError, "duration identity"):
+            provider.bridge_disposition_batch((request, malformed))
+        with self.assertRaisesRegex(ValueError, "cannot be empty"):
+            provider.bridge_disposition_batch(())
+        self.assertEqual(provider.to_dict(), before_malformed)
+        self.assertEqual(cache.begin_count, 0)
+        self.assertEqual(cache.commit_count, 0)
+        self.assertEqual(cache.rollback_count, 0)
+
+        exact = provider.bridge_provider(
+            middle,
+            request.entry_option,
+            request.exit_option,
+            request.duration_frames,
+        )
+        self.assertTrue(exact.authorized)
 
     def test_semantic_bridge_aliases_share_scalar_measurement_and_selected_rehydrate(
         self,

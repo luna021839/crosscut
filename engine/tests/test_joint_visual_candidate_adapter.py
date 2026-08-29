@@ -24,6 +24,8 @@ from crosscut.joint_timeline import (
     JOINT_BOUNDARY_FRAME_OFFSETS,
     JointTimelineProgress,
     JointTimelineResult,
+    SegmentBridgeDisposition,
+    SegmentBridgeDispositionRequest,
     SegmentBridgeProof,
 )
 from crosscut.joint_visual_candidate_adapter import (
@@ -89,12 +91,23 @@ class StubDecodedProvider(DecodedBoundaryOptionProvider):
     def bridge_provider(self, *args: object) -> SegmentBridgeProof:
         raise AssertionError("selector stub must not invoke bridge_provider")
 
+    def bridge_disposition_batch(
+        self,
+        requests: tuple[SegmentBridgeDispositionRequest, ...],
+    ) -> tuple[SegmentBridgeDisposition, ...]:
+        raise AssertionError(
+            "selector stub must not invoke bridge_disposition_batch"
+        )
+
 
 class CountingStubDecodedProvider(StubDecodedProvider):
     def __init__(self) -> None:
         super().__init__()
         self.option_calls: dict[BoundaryMeasurementKey, int] = {}
         self.bridge_calls = 0
+        self.bridge_batch_calls: list[
+            tuple[SegmentBridgeDispositionRequest, ...]
+        ] = []
 
     def __call__(self, key: BoundaryMeasurementKey) -> BoundaryOptionSet:
         self.option_calls[key] = self.option_calls.get(key, 0) + 1
@@ -122,6 +135,22 @@ class CountingStubDecodedProvider(StubDecodedProvider):
             True,
             True,
             True,
+        )
+
+    def bridge_disposition_batch(
+        self,
+        requests: tuple[SegmentBridgeDispositionRequest, ...],
+    ) -> tuple[SegmentBridgeDisposition, ...]:
+        self.bridge_batch_calls.append(requests)
+        return tuple(
+            SegmentBridgeDisposition(
+                request=request,
+                evidence_complete=True,
+                crop_compatible=True,
+                track_compatible=True,
+                failure_codes=(),
+            )
+            for request in requests
         )
 
 
@@ -738,13 +767,23 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.bridge_provider_call_count for item in completed],
-            [4, 2, 2],
+            [2, 2, 2],
+        )
+        self.assertEqual(
+            [item.bridge_disposition_batch_call_count for item in completed],
+            [1, 0, 0],
+        )
+        self.assertEqual(
+            [item.bridge_disposition_batch_request_count for item in completed],
+            [2, 0, 0],
         )
         self.assertEqual(
             [item.shared_bridge_cache_hit_count for item in completed],
             [0, 2, 4],
         )
-        self.assertEqual(provider.bridge_calls, 8)
+        self.assertEqual(provider.bridge_calls, 6)
+        self.assertEqual(len(provider.bridge_batch_calls), 1)
+        self.assertEqual(len(provider.bridge_batch_calls[0]), 2)
 
     def test_boundary_option_evidence_is_shared_across_all_profiles_with_progress(
         self,
@@ -863,6 +902,18 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 "maximum_entry_count"
             ],
             2 * len(JOINT_BOUNDARY_FRAME_OFFSETS) ** 2,
+        )
+        self.assertEqual(
+            selected.shared_bridge_evidence_cache_audit[
+                "bridge_disposition_batch_call_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            selected.shared_bridge_evidence_cache_audit[
+                "bridge_disposition_batch_request_count"
+            ],
+            0,
         )
 
     def test_progress_callback_failure_aborts_before_partial_selection(self) -> None:
