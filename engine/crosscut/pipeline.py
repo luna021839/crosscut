@@ -353,12 +353,16 @@ from .visual_boundary_repair import (
 )
 from .visual_candidate_checkpoint import (
     VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS,
+    VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS,
     VISUAL_CANDIDATE_CHECKPOINT_CONTRACT,
     canonical_json_sha256,
     find_latest_matching_visual_candidate_checkpoint,
     materialized_candidate_checkpoint_payload,
 )
-from .visual_feature_cache import python_symbol_dependency_sha256
+from .visual_feature_cache import (
+    PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    python_symbol_dependency_sha256,
+)
 from .visual_local_source_repair import (
     LocalSourceRepairDonor,
     LocalSourceRepairMaterializedCandidate,
@@ -381,6 +385,7 @@ from .visual_splice_feasibility import (
     SpliceFeasibilityStatus,
     SpliceOffsetAssessment,
     build_splice_feasibility_assessment,
+    classify_splice_evidence_audit,
 )
 
 
@@ -397,6 +402,17 @@ MAX_CONSTRAINT_REOPTIMIZATION_ROUNDS = 64
 MAX_CONSTRAINT_UNIQUE_BOUNDARY_SEARCHES = 256
 MAX_CONSTRAINT_OFFSET_EVALUATIONS = 4_096
 CONSTRAINT_FINALIST_STABILIZATION_ALLOWANCE = 16
+CONSTRAINT_TERMINAL_PROOF_CONTRACT = (
+    "ordinary_group_candidate_constraint_terminal_proof_v1"
+)
+CONSTRAINT_TERMINAL_STATUSES = frozenset(
+    {
+        "structural_hard_no_path",
+        "evidence_incomplete_before_authorized_cohort",
+        "resource_incomplete",
+        "authorized_path_count_insufficient",
+    }
+)
 _MEMBER_PRODUCTION_WIDTH = 1080
 _MEMBER_PRODUCTION_HEIGHT = 1920
 AUTOMATIC_MEMBER_ALIGNMENT_PEER_CONSENSUS_CONTRACT = (
@@ -879,7 +895,103 @@ def _optimizer_blocked_set_for_contexts(
     graph: LazySpliceFeasibilityGraph,
     optimizer_context_keys: Iterable[LazySpliceFeasibilityKey],
 ) -> TimelineNoGoodSet:
-    return graph.blocked_set_for_contexts(tuple(optimizer_context_keys))
+    # Only a complete non-waivable visual failure may alter the cheap DP
+    # graph. Missing descriptors and other indeterminate contexts can stop
+    # expensive work in this run, but can never prove structural infeasibility.
+    return graph.hard_no_goods_for_contexts(tuple(optimizer_context_keys))
+
+
+def _incomplete_splice_context_keys(
+    graph: LazySpliceFeasibilityGraph,
+    optimizer_context_keys: Iterable[LazySpliceFeasibilityKey],
+) -> tuple[LazySpliceFeasibilityKey, ...]:
+    """Return exact contexts that are missing or still indeterminate."""
+
+    keys = tuple(optimizer_context_keys)
+    if any(not isinstance(key, LazySpliceFeasibilityKey) for key in keys):
+        raise TypeError("optimizer splice context keys are invalid")
+    return tuple(
+        sorted(
+            key
+            for key in keys
+            for assessment in (
+                graph.assessment_for(
+                    key.edge,
+                    key.edge_context_identity,
+                ),
+            )
+            if assessment is None
+            or assessment.status is SpliceFeasibilityStatus.INDETERMINATE
+        )
+    )
+
+
+def _splice_authorization_evidence_incomplete(
+    authorization: object,
+) -> bool:
+    """Separate missing/indeterminate proof from complete hard rejection."""
+
+    if not isinstance(authorization, Mapping):
+        return True
+    raw_evidence = authorization.get("evidence")
+    if not isinstance(raw_evidence, list) or not raw_evidence:
+        return True
+    for item in raw_evidence:
+        if not isinstance(item, Mapping):
+            return True
+        reason = item.get("authorization_failure")
+        if reason is None:
+            continue
+        if not isinstance(reason, str) or not reason:
+            return True
+        if "missing" in reason or "incomplete" in reason:
+            return True
+        if reason == "fresh_candidate_result_proof_invalid":
+            if not (
+                item.get("fresh_result_status")
+                == SpliceFeasibilityStatus.HARD_INCOMPATIBLE.value
+                and item.get("fresh_result_terminal") is True
+            ):
+                return True
+            continue
+        if reason == "analysis_graph_result_proof_invalid":
+            if not (
+                item.get("retained_result_status")
+                == SpliceFeasibilityStatus.HARD_INCOMPATIBLE.value
+                and item.get("retained_result_terminal") is True
+            ):
+                return True
+            continue
+        if reason.startswith("fresh_candidate_edge_"):
+            if not (
+                item.get("fresh_status")
+                == SpliceFeasibilityStatus.HARD_INCOMPATIBLE.value
+                and item.get("fresh_terminal") is True
+            ):
+                return True
+            continue
+        return True
+    return False
+
+
+def _claim_exact_splice_refinement_keys(
+    attempted: set[LazySpliceFeasibilityKey],
+    requested: Sequence[LazySpliceFeasibilityKey],
+) -> tuple[LazySpliceFeasibilityKey, ...]:
+    """Claim one exact raw-context/domain search at most once per candidate."""
+
+    if not isinstance(attempted, set):
+        raise TypeError("attempted splice refinement keys must be a set")
+    keys = tuple(requested)
+    if not keys or any(
+        not isinstance(key, LazySpliceFeasibilityKey) for key in keys
+    ):
+        raise TypeError("requested splice refinement keys are invalid")
+    if len(set(keys)) != len(keys):
+        raise ValueError("requested splice refinement keys cannot repeat")
+    claimed = tuple(key for key in keys if key not in attempted)
+    attempted.update(claimed)
+    return claimed
 
 
 def _optimizer_workspace_cross_source_edge_bound(
@@ -910,6 +1022,45 @@ def _optimizer_workspace_cross_source_edge_bound(
     return len(edge_keys)
 
 
+def _constraint_terminal_status(
+    *,
+    structural_hard_no_path: bool,
+    resource_incomplete: bool,
+    incomplete_exact_context_count: int,
+    authorized_path_count: int,
+    required_authorized_path_count: int = 8,
+) -> str:
+    """Classify one incomplete stream without conflating proof domains."""
+
+    for name, value in (
+        ("incomplete_exact_context_count", incomplete_exact_context_count),
+        ("authorized_path_count", authorized_path_count),
+        ("required_authorized_path_count", required_authorized_path_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if required_authorized_path_count < 1:
+        raise ValueError("required authorized path count must be positive")
+    if not isinstance(structural_hard_no_path, bool) or not isinstance(
+        resource_incomplete,
+        bool,
+    ):
+        raise TypeError("constraint terminal proof flags must be booleans")
+    if structural_hard_no_path and resource_incomplete:
+        raise ValueError(
+            "structural and resource terminal proofs are mutually exclusive"
+        )
+    if resource_incomplete:
+        return "resource_incomplete"
+    if structural_hard_no_path:
+        return "structural_hard_no_path"
+    if incomplete_exact_context_count:
+        return "evidence_incomplete_before_authorized_cohort"
+    if authorized_path_count < required_authorized_path_count:
+        return "authorized_path_count_insufficient"
+    raise ValueError("complete authorized cohort has no terminal failure")
+
+
 class _BoundarySearchBudgetExhausted(RuntimeError):
     """Raised before an ordinary candidate search would exceed its audit cap."""
 
@@ -918,6 +1069,17 @@ class _BoundarySearchBudgetExhausted(RuntimeError):
         super().__init__(
             "ordinary splice boundary-search budget exhausted; "
             "production use is forbidden"
+        )
+
+
+class _BoundarySearchNoProgress(RuntimeError):
+    """Raised before re-decoding an already measured exact raw context."""
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        self.payload = deepcopy(dict(payload))
+        super().__init__(
+            "exact boundary context was already measured under this domain; "
+            "the branch made no new evidence and production use is forbidden"
         )
 
 
@@ -964,6 +1126,31 @@ class _BoundarySearchBudget:
         self._geometry_provider_attempt_count = 0
         self._phase_call_counts: dict[str, int] = {}
         self._exhaustion: dict[str, Any] | None = None
+        self._repair_result_memo: dict[
+            str, VisualBoundaryRepairPlan
+        ] = {}
+        self._repair_result_memo_hit_count = 0
+
+    def memoized_repair(
+        self,
+        request_identity: str,
+    ) -> VisualBoundaryRepairPlan | None:
+        result = self._repair_result_memo.get(request_identity)
+        if result is not None:
+            self._repair_result_memo_hit_count += 1
+        return result
+
+    def remember_repair(
+        self,
+        request_identity: str,
+        repair_plan: VisualBoundaryRepairPlan,
+    ) -> None:
+        if not isinstance(repair_plan, VisualBoundaryRepairPlan):
+            raise TypeError("boundary repair memo value is invalid")
+        existing = self._repair_result_memo.get(request_identity)
+        if existing is not None and existing != repair_plan:
+            raise RuntimeError("boundary repair memo identity collision")
+        self._repair_result_memo[request_identity] = repair_plan
 
     def expand_structural_edge_bound(self, value: int) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1048,6 +1235,31 @@ class _BoundarySearchBudget:
             for boundary_index in cross_source_requested
         }
         new_tokens = candidate_tokens.difference(self._unique_search_tokens)
+        existing_tokens = candidate_tokens.intersection(
+            self._unique_search_tokens
+        )
+        if existing_tokens:
+            no_progress = {
+                "contract": "ordinary_exact_boundary_search_no_progress_v1",
+                "phase": phase,
+                "reason": "exact_context_no_progress",
+                "requested_boundary_count": len(cross_source_requested),
+                "previously_measured_boundary_count": len(existing_tokens),
+                "new_unique_boundary_search_count": len(new_tokens),
+                "previously_measured_contexts": [
+                    {
+                        "edge": edge.to_dict(),
+                        "edge_context_identity": context_identity,
+                        "search_radius_frames": radius,
+                    }
+                    for edge, context_identity, radius in sorted(
+                        existing_tokens
+                    )
+                ],
+                "production_use_forbidden": True,
+                "thresholds_lowered": False,
+            }
+            raise _BoundarySearchNoProgress(no_progress)
         offset_count = search_radius_frames * 2 + 1
         new_offset_evaluations = len(new_tokens) * offset_count
         projected_unique = len(self._unique_search_tokens) + len(new_tokens)
@@ -1127,11 +1339,59 @@ class _BoundarySearchBudget:
                 self._geometry_provider_attempt_count
             ),
             "phase_call_counts": dict(sorted(self._phase_call_counts.items())),
+            "repair_result_memo_entry_count": len(
+                self._repair_result_memo
+            ),
+            "repair_result_memo_hit_count": (
+                self._repair_result_memo_hit_count
+            ),
             "exhausted": self._exhaustion is not None,
             "exhaustion": deepcopy(self._exhaustion),
             "production_use_forbidden": self._exhaustion is not None,
             "thresholds_lowered": False,
         }
+
+
+def _boundary_repair_request_identity(
+    *,
+    visual_timeline: VisualTimelinePlan,
+    sources: Sequence[Path],
+    audio_offsets: Sequence[float],
+    scene_cut_times: Sequence[Sequence[float]],
+    beat_period_seconds: float | None,
+    source_timewarps: Sequence[TimeWarpMap | None],
+    boundary_indices: Sequence[int] | None,
+    config: BoundaryRepairConfig,
+) -> str:
+    """Bind an immutable repair memo to every result-affecting input."""
+
+    return canonical_json_sha256(
+        {
+            "contract": "exact_boundary_repair_request_identity_v1",
+            "visual_timeline": visual_timeline.to_dict(),
+            "sources": [str(Path(path).resolve()) for path in sources],
+            "audio_offsets": [float(value) for value in audio_offsets],
+            "scene_cut_times": [
+                [float(value) for value in values]
+                for values in scene_cut_times
+            ],
+            "beat_period_seconds": (
+                float(beat_period_seconds)
+                if beat_period_seconds is not None
+                else None
+            ),
+            "source_timewarps": [
+                value.to_dict() if value is not None else None
+                for value in source_timewarps
+            ],
+            "boundary_indices": (
+                sorted(int(value) for value in boundary_indices)
+                if boundary_indices is not None
+                else None
+            ),
+            "boundary_repair_config": asdict(config),
+        }
+    )
 
 
 def _budgeted_repair_visual_timeline_boundaries(
@@ -1152,6 +1412,19 @@ def _budgeted_repair_visual_timeline_boundaries(
     if not isinstance(budget, _BoundarySearchBudget):
         raise TypeError("ordinary boundary repair needs a search budget")
     settings = config or BoundaryRepairConfig()
+    request_identity = _boundary_repair_request_identity(
+        visual_timeline=visual_timeline,
+        sources=sources,
+        audio_offsets=audio_offsets,
+        scene_cut_times=scene_cut_times,
+        beat_period_seconds=beat_period_seconds,
+        source_timewarps=source_timewarps,
+        boundary_indices=boundary_indices,
+        config=settings,
+    )
+    memoized = budget.memoized_repair(request_identity)
+    if memoized is not None:
+        return memoized
     budget.reserve(
         phase=phase,
         visual_timeline=visual_timeline,
@@ -1173,6 +1446,7 @@ def _budgeted_repair_visual_timeline_boundaries(
             feature_cache_directory=feature_cache_directory,
             config=settings,
         )
+        budget.remember_repair(request_identity, result)
         return result
     finally:
         budget.observe(
@@ -1222,7 +1496,7 @@ def _group_splice_analysis_basis_identity(
     )
     return canonical_json_sha256(
         {
-            "contract": "group_boundary_repair_splice_analysis_basis_v3",
+            "contract": "group_boundary_repair_splice_analysis_basis_v4",
             "selector_identity": selector_identity.to_dict(),
             "timeline_review_config": asdict(review_config),
             "normal_boundary_repair_config": asdict(normal_repair_config),
@@ -1318,6 +1592,16 @@ def _boundary_repair_assessments(
             repair.boundary_index,
             choices[repair.boundary_index],
             choices[repair.boundary_index + 1],
+        )
+        assessments.append(
+            (
+                edge,
+                repair.observed_edge_context_identity,
+                classify_splice_evidence_audit(
+                    repair.candidate_evidence_audit,
+                    expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+                ),
+            )
         )
         assessments.append(
             (
@@ -1505,6 +1789,20 @@ def _candidate_local_splice_proxy_authorization(
                         outgoing,
                         incoming,
                     ),
+                    repair.observed_edge_context_identity,
+                    classify_splice_evidence_audit(
+                        repair.candidate_evidence_audit,
+                        expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
+                    ),
+                )
+            )
+            records.append(
+                (
+                    build_timeline_no_good_edge_key(
+                        repair.boundary_index,
+                        outgoing,
+                        incoming,
+                    ),
                     repair.result_edge_context_identity,
                     build_splice_feasibility_assessment(
                         expected_frame_offsets=DEFAULT_WIDE_FRAME_OFFSETS,
@@ -1629,10 +1927,20 @@ def _candidate_local_splice_proxy_authorization(
                     if fresh_result is not None
                     else None
                 ),
+                "fresh_result_terminal": (
+                    fresh_result.terminal_for_expected_domain
+                    if fresh_result is not None
+                    else False
+                ),
                 "retained_result_status": (
                     retained_result.status.value
                     if retained_result is not None
                     else None
+                ),
+                "retained_result_terminal": (
+                    retained_result.terminal_for_expected_domain
+                    if retained_result is not None
+                    else False
                 ),
                 "fresh_status": (
                     fresh_raw.status.value if fresh_raw is not None else None
@@ -1656,7 +1964,7 @@ def _candidate_local_splice_proxy_authorization(
             }
         )
     return {
-        "contract": "fresh_candidate_exact_context_splice_authorization_v1",
+        "contract": "fresh_candidate_exact_context_splice_authorization_v2",
         "cross_source_edge_count": len(final_raw_keys),
         "proxy_eligible": not unauthorized,
         "unauthorized_keys": [key.to_dict() for key in unauthorized],
@@ -1812,7 +2120,58 @@ def _regenerate_visual_candidate_set_or_no_path(
             None,
         )
     except NoCompleteTimelinePath as exc:
-        return None, exc.to_dict()
+        evidence = deepcopy(exc.to_dict())
+        nested_profile_diagnostics: list[dict[str, Any]] = []
+        raw_nested = getattr(exc, "profile_failures", ())
+        if isinstance(raw_nested, Sequence) and not isinstance(
+            raw_nested,
+            (str, bytes),
+        ):
+            for item in raw_nested:
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[0], str)
+                    and isinstance(item[1], NoCompleteTimelinePath)
+                ):
+                    nested_profile_diagnostics.append(
+                        {
+                            "cadence_profile": item[0],
+                            "no_complete_path": deepcopy(
+                                item[1].to_dict()
+                            ),
+                        }
+                    )
+        if not nested_profile_diagnostics:
+            rejection_counts = evidence.get("rejection_counts")
+            if isinstance(rejection_counts, Mapping):
+                for compound_reason, count in sorted(
+                    rejection_counts.items(),
+                    key=lambda item: str(item[0]),
+                ):
+                    if (
+                        not isinstance(compound_reason, str)
+                        or ":" not in compound_reason
+                        or isinstance(count, bool)
+                        or not isinstance(count, int)
+                        or count < 0
+                    ):
+                        continue
+                    profile, reason_code = compound_reason.split(":", 1)
+                    nested_profile_diagnostics.append(
+                        {
+                            "cadence_profile": profile,
+                            "no_complete_path": {
+                                "reason_code": reason_code,
+                                "occurrence_count": count,
+                            },
+                        }
+                    )
+        if nested_profile_diagnostics:
+            evidence["nested_profile_diagnostics"] = (
+                nested_profile_diagnostics
+            )
+        return None, evidence
 
 
 def _resume_or_reset_splice_feasibility_graph(
@@ -2999,6 +3358,9 @@ def _visual_candidate_checkpoint_input_identity(
         ),
         "aspect_ratio": aspect_ratio.value,
         "maximum_candidate_results": 32,
+        "code_fingerprint_contract": (
+            PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT
+        ),
         "selector_code_sha256": python_symbol_dependency_sha256(
             Path(__file__).with_name("visual_score.py"),
             root_symbols=("build_visual_timeline_candidate_set",),
@@ -18888,6 +19250,10 @@ def _derive_complete_group_candidate(
             repair_plan=boundary_repairs,
         )
         stabilization_rounds: list[dict[str, Any]] = []
+        stabilization_attempted_raw_keys: set[
+            LazySpliceFeasibilityKey
+        ] = set()
+        stabilization_stop_reason: str | None = None
         maximum_stabilization_rounds = min(
             8,
             max(1, len(_splice_graph_keys_for_plan(visual_timeline)) + 1),
@@ -18902,7 +19268,36 @@ def _derive_complete_group_candidate(
                 )
             )
             if not stale_boundary_indices:
+                stabilization_stop_reason = (
+                    "authorization_has_no_refinable_raw_context"
+                )
                 break
+            raw_key_by_boundary = {
+                key.edge.boundary_index: key
+                for key in _splice_graph_keys_for_plan(visual_timeline)
+            }
+            stale_raw_keys = tuple(
+                raw_key_by_boundary[boundary_index]
+                for boundary_index in stale_boundary_indices
+                if boundary_index in raw_key_by_boundary
+            )
+            if len(stale_raw_keys) != len(stale_boundary_indices):
+                raise RuntimeError(
+                    "splice stabilization requested a non-cross-source boundary"
+                )
+            claimed_raw_keys = _claim_exact_splice_refinement_keys(
+                stabilization_attempted_raw_keys,
+                stale_raw_keys,
+            )
+            if not claimed_raw_keys:
+                stabilization_stop_reason = (
+                    "exact_raw_context_domain_already_assessed"
+                )
+                break
+            stale_raw_keys = claimed_raw_keys
+            stale_boundary_indices = tuple(
+                key.edge.boundary_index for key in stale_raw_keys
+            )
             try:
                 stabilization_repairs = run_boundary_repair(
                     phase="candidate_final_stabilization_wide",
@@ -18924,9 +19319,11 @@ def _derive_complete_group_candidate(
                 raise RuntimeError(
                     "final exact-context boundary stabilization failed"
                 ) from exc
-            _record_boundary_repair_assessments(
-                splice_feasibility_graph,
-                stabilization_repairs,
+            stabilization_evidence_change_count = (
+                _record_boundary_repair_assessments(
+                    splice_feasibility_graph,
+                    stabilization_repairs,
+                )
             )
             visual_timeline = stabilization_repairs.timeline
             if boundary_repairs is None:
@@ -18936,7 +19333,7 @@ def _derive_complete_group_candidate(
                     boundary_repairs,
                     stabilization_repairs,
                     analysis_suffix=(
-                        "final_exact_context_stabilization_v1"
+                        "final_exact_context_stabilization_v2"
                     ),
                 )
             timeline_review = review_timeline(
@@ -18949,6 +19346,12 @@ def _derive_complete_group_candidate(
                     "boundary_indices": list(stale_boundary_indices),
                     "changed_count": stabilization_repairs.changed_count,
                     "failure_count": len(stabilization_repairs.failures),
+                    "new_graph_evidence_count": (
+                        stabilization_evidence_change_count
+                    ),
+                    "raw_context_keys": [
+                        key.to_dict() for key in stale_raw_keys
+                    ],
                 }
             )
             authorization = _candidate_local_splice_proxy_authorization(
@@ -18956,6 +19359,18 @@ def _derive_complete_group_candidate(
                 final_timeline=visual_timeline,
                 repair_plan=boundary_repairs,
             )
+            if (
+                authorization.get("proxy_eligible") is not True
+                and stabilization_evidence_change_count == 0
+            ):
+                stabilization_stop_reason = (
+                    "zero_new_exact_context_evidence"
+                )
+                break
+        if authorization.get("proxy_eligible") is True:
+            stabilization_stop_reason = "authorized"
+        elif stabilization_stop_reason is None:
+            stabilization_stop_reason = "stabilization_round_limit_reached"
         splice_graph_authorization = {
             **authorization,
             "final_context_stabilization": {
@@ -18963,6 +19378,8 @@ def _derive_complete_group_candidate(
                 "round_count": len(stabilization_rounds),
                 "rounds": stabilization_rounds,
                 "converged": authorization.get("proxy_eligible") is True,
+                "stop_reason": stabilization_stop_reason,
+                "same_exact_context_search_repeated": False,
             },
         }
         if splice_graph_authorization.get("proxy_eligible") is not True:
@@ -24273,6 +24690,10 @@ def analyze(
     stage_edit_visual_candidate_batch: StageEditVisualCandidateBatch | None = None
     pre_derivation_candidate_selection_path: Path | None = None
     visual_candidate_checkpoint_input_identity_sha256: str | None = None
+    visual_candidate_checkpoint_stored_input_identity_sha256: str | None = (
+        None
+    )
+    visual_candidate_checkpoint_code_fingerprint_migration: str | None = None
     visual_candidate_checkpoint_reused = False
     checkpoint_materialized_candidate_order: tuple[Any, ...] = ()
     candidate_stream_progress_path: Path | None = None
@@ -24933,6 +25354,12 @@ def analyze(
                                     visual_candidate_checkpoint_input_identity_sha256
                                 ),
                                 expected_source_count=len(eligible_indices),
+                                expected_input_identity=(
+                                    visual_candidate_checkpoint_input_identity
+                                ),
+                                code_fingerprint_migrations=(
+                                    VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+                                ),
                             )
                         )
                     else:
@@ -24948,11 +25375,33 @@ def analyze(
                             loaded_candidate_checkpoint.candidates
                         )
                         visual_candidate_checkpoint_reused = True
-                        reporter.log(
-                            "입력·정책·코드 지문이 같은 완전 후보 체크포인트 "
-                            f"{len(checkpoint_materialized_candidate_order)}개 재사용 · "
-                            "120구간 descriptor와 32후보 최적화 생략"
+                        visual_candidate_checkpoint_stored_input_identity_sha256 = (
+                            loaded_candidate_checkpoint
+                            .stored_input_identity_sha256
                         )
+                        visual_candidate_checkpoint_code_fingerprint_migration = (
+                            loaded_candidate_checkpoint
+                            .code_fingerprint_migration
+                        )
+                        migration_name = (
+                            visual_candidate_checkpoint_code_fingerprint_migration
+                        )
+                        if migration_name is None:
+                            reporter.log(
+                                "입력·정책·코드 지문이 같은 완전 후보 "
+                                "체크포인트 "
+                                f"{len(checkpoint_materialized_candidate_order)}개 "
+                                "재사용 · 120구간 descriptor와 32후보 "
+                                "최적화 생략"
+                            )
+                        else:
+                            reporter.log(
+                                "입력·정책은 완전 일치하고 코드 지문은 "
+                                "검증된 단방향 이관과 일치한 후보 "
+                                f"{len(checkpoint_materialized_candidate_order)}개 "
+                                f"재사용 · {migration_name} · 120구간 descriptor와 "
+                                "32후보 최적화 생략"
+                            )
                     else:
                         visual_candidate_set = (
                             build_visual_timeline_candidate_set(
@@ -25263,6 +25712,9 @@ def analyze(
                 constraint_reoptimization_rounds: list[dict[str, Any]] = []
                 constraint_reoptimization_fixed_point = False
                 constraint_reoptimization_termination_reason: str | None = None
+                constraint_reoptimization_terminal_proof: (
+                    dict[str, Any] | None
+                ) = None
                 constraint_workspace_rebuilt_from_warm_cache = False
                 constraint_workspace_edge_bound: int | None = None
                 constraint_boundary_search_budget: (
@@ -25429,6 +25881,108 @@ def analyze(
                     / f"{base_filename}-candidate-stream-progress.json"
                 )
 
+                def set_constraint_terminal_proof(
+                    status: str,
+                    *,
+                    cause: str,
+                    evidence: Mapping[str, Any] | None = None,
+                ) -> None:
+                    nonlocal constraint_reoptimization_termination_reason
+                    nonlocal constraint_reoptimization_terminal_proof
+                    if status not in CONSTRAINT_TERMINAL_STATUSES:
+                        raise ValueError(
+                            "constraint terminal status is not recognized"
+                        )
+                    if (
+                        not isinstance(cause, str)
+                        or not cause
+                        or cause != cause.strip()
+                    ):
+                        raise ValueError(
+                            "constraint terminal cause must be exact"
+                        )
+                    payload = {
+                        "contract": CONSTRAINT_TERMINAL_PROOF_CONTRACT,
+                        "status": status,
+                        "cause": cause,
+                        "hard_only_dp_proof": (
+                            status == "structural_hard_no_path"
+                        ),
+                        "production_use_forbidden": True,
+                        "thresholds_lowered": False,
+                        "evidence": deepcopy(dict(evidence or {})),
+                    }
+                    if constraint_reoptimization_terminal_proof is not None:
+                        if constraint_reoptimization_terminal_proof != payload:
+                            raise RuntimeError(
+                                "constraint terminal proof was reassigned"
+                            )
+                        return
+                    constraint_reoptimization_termination_reason = status
+                    constraint_reoptimization_terminal_proof = payload
+
+                def incomplete_optimizer_context_keys() -> tuple[
+                    LazySpliceFeasibilityKey, ...
+                ]:
+                    if splice_feasibility_graph is None:
+                        return ()
+                    return _incomplete_splice_context_keys(
+                        splice_feasibility_graph,
+                        constraint_optimizer_context_keys,
+                    )
+
+                def authorization_incomplete_rejections() -> tuple[
+                    Mapping[str, Any], ...
+                ]:
+                    return tuple(
+                        item
+                        for item in candidate_post_repair_review_rejections
+                        if item.get("delivery_lineage_failure")
+                        == (
+                            "fresh_exact_context_splice_"
+                            "authorization_failed"
+                        )
+                        and _splice_authorization_evidence_incomplete(
+                            item.get("splice_graph_authorization", {})
+                        )
+                    )
+
+                def set_nonstructural_constraint_exhaustion(
+                    *,
+                    cause: str,
+                ) -> None:
+                    incomplete_keys = incomplete_optimizer_context_keys()
+                    incomplete_rejections = (
+                        authorization_incomplete_rejections()
+                    )
+                    incomplete_count = len(incomplete_keys) + len(
+                        incomplete_rejections
+                    )
+                    status = _constraint_terminal_status(
+                        structural_hard_no_path=False,
+                        resource_incomplete=False,
+                        incomplete_exact_context_count=incomplete_count,
+                        authorized_path_count=len(derived),
+                    )
+                    set_constraint_terminal_proof(
+                        status,
+                        cause=cause,
+                        evidence={
+                            "incomplete_exact_context_count": len(
+                                incomplete_keys
+                            ),
+                            "authorization_incomplete_candidate_count": len(
+                                incomplete_rejections
+                            ),
+                            "incomplete_exact_context_keys": [
+                                key.to_dict() for key in incomplete_keys
+                            ],
+                            "authorized_candidate_count": len(derived),
+                            "required_authorized_candidate_count": 8,
+                            "hard_only_dp_proof": False,
+                        },
+                    )
+
                 def constraint_reoptimization_payload() -> dict[str, Any]:
                     if splice_feasibility_graph is None:
                         return {
@@ -25500,6 +26054,9 @@ def analyze(
                         ),
                         "termination_reason": (
                             constraint_reoptimization_termination_reason
+                        ),
+                        "terminal_proof": deepcopy(
+                            constraint_reoptimization_terminal_proof
                         ),
                         "initial_stream_edge_admission": deepcopy(
                             initial_constraint_stream_audit
@@ -25697,6 +26254,12 @@ def analyze(
                             ),
                             "visual_candidate_checkpoint_input_identity_sha256": (
                                 visual_candidate_checkpoint_input_identity_sha256
+                            ),
+                            "visual_candidate_checkpoint_stored_input_identity_sha256": (
+                                visual_candidate_checkpoint_stored_input_identity_sha256
+                            ),
+                            "visual_candidate_checkpoint_code_fingerprint_migration": (
+                                visual_candidate_checkpoint_code_fingerprint_migration
                             ),
                             "restartable_candidate_plan_count": len(
                                 checkpoint_materialized_candidate_order
@@ -26658,8 +27221,8 @@ def analyze(
                             ) from exc
                         evidence_change_count = (
                             _record_boundary_repair_assessments(
-                            splice_feasibility_graph,
-                            preflight_repairs,
+                                splice_feasibility_graph,
+                                preflight_repairs,
                             )
                         )
                     return (
@@ -26762,8 +27325,28 @@ def analyze(
                             len(constraint_reoptimization_rounds)
                             >= constraint_reoptimization_round_limit
                         ):
-                            constraint_reoptimization_termination_reason = (
-                                "audited_resource_round_limit_incomplete"
+                            set_constraint_terminal_proof(
+                                _constraint_terminal_status(
+                                    structural_hard_no_path=False,
+                                    resource_incomplete=True,
+                                    incomplete_exact_context_count=0,
+                                    authorized_path_count=len(derived),
+                                ),
+                                cause=(
+                                    "audited_reoptimization_round_limit_"
+                                    "reached"
+                                ),
+                                evidence={
+                                    "audited_round_limit": (
+                                        constraint_reoptimization_round_limit
+                                    ),
+                                    "theoretical_round_bound": (
+                                        theoretical_round_bound
+                                    ),
+                                    "completed_round_count": len(
+                                        constraint_reoptimization_rounds
+                                    ),
+                                },
                             )
                             constraint_reoptimization_rounds.append(
                                 {
@@ -26821,8 +27404,35 @@ def analyze(
                                 raise RuntimeError(
                                     "typed no-path result lost its evidence"
                                 )
-                            constraint_reoptimization_termination_reason = (
-                                "no_complete_dp_path"
+                            set_constraint_terminal_proof(
+                                _constraint_terminal_status(
+                                    structural_hard_no_path=True,
+                                    resource_incomplete=False,
+                                    incomplete_exact_context_count=0,
+                                    authorized_path_count=len(derived),
+                                ),
+                                cause="hard_only_constrained_dp_no_path",
+                                evidence={
+                                    "selector_identity": (
+                                        selector_identity.to_dict()
+                                    ),
+                                    "hard_no_goods": blocked_before.to_dict(),
+                                    "hard_no_good_count": len(blocked_before),
+                                    "no_complete_dp_path": (
+                                        no_complete_path_evidence
+                                    ),
+                                    "nested_profile_diagnostics": (
+                                        no_complete_path_evidence.get(
+                                            "nested_profile_diagnostics",
+                                            [],
+                                        )
+                                        if isinstance(
+                                            no_complete_path_evidence,
+                                            Mapping,
+                                        )
+                                        else []
+                                    ),
+                                },
                             )
                             constraint_reoptimization_rounds.append(
                                 {
@@ -26879,8 +27489,11 @@ def analyze(
                             )
                         if not unseen:
                             constraint_reoptimization_fixed_point = True
-                            constraint_reoptimization_termination_reason = (
-                                "deterministic_path_fixed_point"
+                            set_nonstructural_constraint_exhaustion(
+                                cause=(
+                                    "global_candidate_path_identity_fixed_"
+                                    "point"
+                                )
                             )
                             persist_candidate_stream_progress(
                                 status=(
@@ -26976,8 +27589,11 @@ def analyze(
                             return
                         if blocked_after == blocked_before:
                             constraint_reoptimization_fixed_point = True
-                            constraint_reoptimization_termination_reason = (
-                                "deterministic_path_fixed_point"
+                            set_nonstructural_constraint_exhaustion(
+                                cause=(
+                                    "hard_no_good_projection_added_no_new_"
+                                    "edge"
+                                )
                             )
                             persist_candidate_stream_progress(
                                 status=(
@@ -27093,21 +27709,67 @@ def analyze(
                         total_materialized_candidate_count += 1
                         derive_and_gate_candidate(materialized)
 
-                def abort_boundary_search_budget(
-                    exc: _BoundarySearchBudgetExhausted,
+                def abort_boundary_search_failure(
+                    exc: (
+                        _BoundarySearchBudgetExhausted
+                        | _BoundarySearchNoProgress
+                    ),
                 ) -> None:
-                    nonlocal constraint_reoptimization_termination_reason
-                    constraint_reoptimization_termination_reason = (
-                        "audited_boundary_search_budget_exhausted"
+                    no_progress = isinstance(
+                        exc,
+                        _BoundarySearchNoProgress,
                     )
+                    if no_progress:
+                        set_constraint_terminal_proof(
+                            _constraint_terminal_status(
+                                structural_hard_no_path=False,
+                                resource_incomplete=False,
+                                incomplete_exact_context_count=1,
+                                authorized_path_count=len(derived),
+                            ),
+                            cause="exact_context_no_progress",
+                            evidence={
+                                "exact_context_no_progress": deepcopy(
+                                    exc.payload
+                                ),
+                                "authorized_candidate_count": len(derived),
+                            },
+                        )
+                    else:
+                        set_constraint_terminal_proof(
+                            _constraint_terminal_status(
+                                structural_hard_no_path=False,
+                                resource_incomplete=True,
+                                incomplete_exact_context_count=0,
+                                authorized_path_count=len(derived),
+                            ),
+                            cause="decoded_boundary_search_budget_exhausted",
+                            evidence={
+                                "resource": "decoded_boundary_search",
+                                "budget_exhaustion": deepcopy(exc.payload),
+                            },
+                        )
                     constraint_reoptimization_rounds.append(
                         {
                             "round_index": len(
                                 constraint_reoptimization_rounds
                             ),
-                            "resource_limit_reached": True,
-                            "resource": "decoded_boundary_search",
-                            "budget_exhaustion": deepcopy(exc.payload),
+                            "resource_limit_reached": not no_progress,
+                            "resource": (
+                                None
+                                if no_progress
+                                else "decoded_boundary_search"
+                            ),
+                            "exact_context_no_progress": (
+                                deepcopy(exc.payload)
+                                if no_progress
+                                else None
+                            ),
+                            "budget_exhaustion": (
+                                None
+                                if no_progress
+                                else deepcopy(exc.payload)
+                            ),
                             "fixed_point": False,
                             "thresholds_lowered": False,
                             "production_use_forbidden": True,
@@ -27115,12 +27777,17 @@ def analyze(
                     )
                     persist_candidate_stream_progress(
                         status=(
-                            "candidate_stream_constraint_boundary_search_"
-                            "budget_incomplete"
+                            "candidate_stream_constraint_exact_context_"
+                            "no_progress"
+                            if no_progress
+                            else (
+                                "candidate_stream_constraint_boundary_search_"
+                                "budget_incomplete"
+                            )
                         )
                     )
                     raise RuntimeError(
-                        "ordinary candidate boundary-search budget exhausted; "
+                        "ordinary candidate boundary search stopped; "
                         "progress was persisted and production use is forbidden"
                     ) from exc
 
@@ -27148,8 +27815,11 @@ def analyze(
                                 ),
                             )
                         )
-                    except _BoundarySearchBudgetExhausted as exc:
-                        abort_boundary_search_budget(exc)
+                    except (
+                        _BoundarySearchBudgetExhausted,
+                        _BoundarySearchNoProgress,
+                    ) as exc:
+                        abort_boundary_search_failure(exc)
                 else:
                     for materialized in materialized_group_candidates:
                         derive_and_gate_candidate(materialized)
@@ -27169,8 +27839,11 @@ def analyze(
                     )
                     try:
                         run_constraint_reoptimization()
-                    except _BoundarySearchBudgetExhausted as exc:
-                        abort_boundary_search_budget(exc)
+                    except (
+                        _BoundarySearchBudgetExhausted,
+                        _BoundarySearchNoProgress,
+                    ) as exc:
+                        abort_boundary_search_failure(exc)
 
                 if (
                     stage_edit_visual_candidate_batch is None
@@ -27186,6 +27859,10 @@ def analyze(
                 )
                 complete_group_candidates = tuple(derived)
                 if len(complete_group_candidates) != 8:
+                    if constraint_reoptimization_terminal_proof is None:
+                        set_nonstructural_constraint_exhaustion(
+                            cause="candidate_stream_exhausted_before_exact_eight"
+                        )
                     persist_candidate_stream_progress(
                         status="candidate_stream_exhausted_before_exact_eight"
                     )
@@ -27269,8 +27946,15 @@ def analyze(
                         "exact_successful_decoded_review_count_satisfied": False,
                         "passed": False,
                         "blocking_reason": (
-                            "automatic_group_requires_exactly_eight_successful_"
-                            "immediate_decoded_candidate_reviews"
+                            constraint_reoptimization_termination_reason
+                            or (
+                                "automatic_group_requires_exactly_eight_"
+                                "successful_immediate_decoded_candidate_"
+                                "reviews"
+                            )
+                        ),
+                        "constraint_terminal_proof": deepcopy(
+                            constraint_reoptimization_terminal_proof
                         ),
                         "source_index_mapping": _source_index_mapping(
                             request.sources,

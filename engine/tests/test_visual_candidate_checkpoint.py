@@ -7,14 +7,18 @@ import tempfile
 import unittest
 
 from crosscut.timeline import ShotType
+from crosscut import crop_aware_candidate_rerank, visual_score
 from crosscut.visual_candidate_checkpoint import (
+    CheckpointCodeFingerprintMigration,
     VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS,
+    VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS,
     VISUAL_CANDIDATE_CHECKPOINT_CONTRACT,
     canonical_json_sha256,
     find_latest_matching_visual_candidate_checkpoint,
     load_visual_candidate_checkpoint,
     materialized_candidate_checkpoint_payload,
 )
+from crosscut.visual_feature_cache import python_symbol_dependency_sha256
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
 
 
@@ -72,6 +76,31 @@ def _candidate(index: int) -> SimpleNamespace:
 
 
 class VisualCandidateCheckpointTests(unittest.TestCase):
+    @staticmethod
+    def _write_checkpoint(path: Path, identity: dict[str, object]) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "checkpoint_contract": (
+                        VISUAL_CANDIDATE_CHECKPOINT_CONTRACT
+                    ),
+                    "analysis_basis": (
+                        VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS
+                    ),
+                    "input_identity": identity,
+                    "input_identity_sha256": canonical_json_sha256(identity),
+                    "materialized_candidate_plans": [
+                        materialized_candidate_checkpoint_payload(
+                            _candidate(index),
+                            selected_for_initial_stream=True,
+                        )
+                        for index in range(8)
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_round_trip_reconstructs_full_plans_and_exact_initial_eight(self) -> None:
         identity = {"sources": ["a", "b"], "policy": "v1"}
         digest = canonical_json_sha256(identity)
@@ -148,6 +177,248 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
                     expected_input_identity_sha256="f" * 64,
                     expected_source_count=2,
                 )
+
+    def test_exact_directional_code_fingerprint_migration_reuses_plan(self) -> None:
+        legacy_selector = "1" * 64
+        current_selector = "2" * 64
+        legacy_crop = "3" * 64
+        current_crop = "4" * 64
+        legacy = {
+            "sources": ["a", "b"],
+            "canonical_spans": [[0.0, 1.0]],
+            "selector_code_sha256": legacy_selector,
+            "crop_rerank_code_sha256": legacy_crop,
+        }
+        current = {
+            **legacy,
+            "selector_code_sha256": current_selector,
+            "crop_rerank_code_sha256": current_crop,
+            "code_fingerprint_contract": "python_module_symbol_dependency_ast_v2",
+        }
+        migration = CheckpointCodeFingerprintMigration(
+            contract="test_exact_code_hash_v1_to_v2",
+            legacy_selector_code_sha256=legacy_selector,
+            current_selector_code_sha256=current_selector,
+            legacy_crop_rerank_code_sha256=legacy_crop,
+            current_crop_rerank_code_sha256=current_crop,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = (
+                root
+                / "IVE-XOXZ-pre-derivation-candidate-selection.json"
+            )
+            self._write_checkpoint(path, legacy)
+
+            loaded = load_visual_candidate_checkpoint(
+                path,
+                expected_input_identity_sha256=canonical_json_sha256(current),
+                expected_source_count=2,
+                expected_input_identity=current,
+                code_fingerprint_migrations=(migration,),
+            )
+            latest = find_latest_matching_visual_candidate_checkpoint(
+                root,
+                expected_input_identity_sha256=canonical_json_sha256(current),
+                expected_source_count=2,
+                expected_input_identity=current,
+                code_fingerprint_migrations=(migration,),
+            )
+
+        self.assertEqual(
+            loaded.input_identity_sha256,
+            canonical_json_sha256(current),
+        )
+        self.assertEqual(
+            loaded.stored_input_identity_sha256,
+            canonical_json_sha256(legacy),
+        )
+        self.assertEqual(
+            loaded.code_fingerprint_migration,
+            "test_exact_code_hash_v1_to_v2",
+        )
+        self.assertIsNotNone(latest)
+
+    def test_production_migration_is_bound_to_the_audited_checkpoint(self) -> None:
+        migration, = VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+        legacy = {
+            "sources": ["a", "b"],
+            "canonical_spans": [[0.0, 1.0]],
+            "selector_code_sha256": (
+                "363acfa826d846bfc62396f483ce1adc6d0b1ff903ffd32c39630dc2db70e857"
+            ),
+            "crop_rerank_code_sha256": (
+                "23aa118ec3a822544ca36d90ba72c821a6e9157175efe863b7c181b6e73a97ba"
+            ),
+        }
+        current = {
+            **legacy,
+            "selector_code_sha256": (
+                "9ad134a8bac4a4946bb56d5ca4d161ee226320fe2504b826fda6ad1c5abc5982"
+            ),
+            "crop_rerank_code_sha256": (
+                "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+            ),
+            "code_fingerprint_contract": (
+                "python_module_symbol_dependency_ast_v2"
+            ),
+        }
+        earlier_selector = {
+            **legacy,
+            "selector_code_sha256": (
+                "f94d6868cc1cbdc9cfb3a8733057873a5664b769462fc2bc996a91d7d5e66f7a"
+            ),
+        }
+
+        self.assertTrue(migration.matches(legacy, current))
+        self.assertFalse(migration.matches(earlier_selector, current))
+
+    def test_production_migration_current_hashes_match_runtime_code(self) -> None:
+        migration, = VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+        self.assertEqual(
+            migration.current_selector_code_sha256,
+            python_symbol_dependency_sha256(
+                Path(visual_score.__file__),
+                root_symbols=("build_visual_timeline_candidate_set",),
+            ),
+        )
+        self.assertEqual(
+            migration.current_crop_rerank_code_sha256,
+            python_symbol_dependency_sha256(
+                Path(crop_aware_candidate_rerank.__file__),
+                root_symbols=(
+                    "rerank_materialized_visual_candidates_for_safe_crops",
+                ),
+            ),
+        )
+
+    def test_code_migration_rejects_non_code_reverse_unknown_and_tamper(self) -> None:
+        legacy_selector = "1" * 64
+        current_selector = "2" * 64
+        legacy_crop = "3" * 64
+        current_crop = "4" * 64
+        legacy = {
+            "sources": ["a", "b"],
+            "canonical_spans": [[0.0, 1.0]],
+            "selector_code_sha256": legacy_selector,
+            "crop_rerank_code_sha256": legacy_crop,
+        }
+        current = {
+            **legacy,
+            "selector_code_sha256": current_selector,
+            "crop_rerank_code_sha256": current_crop,
+            "code_fingerprint_contract": "python_module_symbol_dependency_ast_v2",
+        }
+        migration = CheckpointCodeFingerprintMigration(
+            contract="test_exact_code_hash_v1_to_v2",
+            legacy_selector_code_sha256=legacy_selector,
+            current_selector_code_sha256=current_selector,
+            legacy_crop_rerank_code_sha256=legacy_crop,
+            current_crop_rerank_code_sha256=current_crop,
+        )
+        mutations = (
+            {**current, "sources": ["a", "foreign"]},
+            {
+                **legacy,
+                "selector_code_sha256": "9" * 64,
+                "crop_rerank_code_sha256": current_crop,
+                "code_fingerprint_contract": (
+                    "python_module_symbol_dependency_ast_v2"
+                ),
+            },
+            {
+                **legacy,
+                "selector_code_sha256": legacy_selector,
+                "crop_rerank_code_sha256": legacy_crop,
+                "code_fingerprint_contract": (
+                    "python_module_symbol_dependency_ast_v2"
+                ),
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            self._write_checkpoint(path, legacy)
+            for mutated in mutations:
+                with self.subTest(mutated=mutated):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "input identity mismatch",
+                    ):
+                        load_visual_candidate_checkpoint(
+                            path,
+                            expected_input_identity_sha256=(
+                                canonical_json_sha256(mutated)
+                            ),
+                            expected_source_count=2,
+                            expected_input_identity=mutated,
+                            code_fingerprint_migrations=(migration,),
+                        )
+
+            self._write_checkpoint(path, current)
+            with self.assertRaisesRegex(ValueError, "input identity mismatch"):
+                load_visual_candidate_checkpoint(
+                    path,
+                    expected_input_identity_sha256=(
+                        canonical_json_sha256(legacy)
+                    ),
+                    expected_source_count=2,
+                    expected_input_identity=legacy,
+                    code_fingerprint_migrations=(migration,),
+                )
+
+            self._write_checkpoint(path, legacy)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["input_identity"]["sources"] = ["tampered"]
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                load_visual_candidate_checkpoint(
+                    path,
+                    expected_input_identity_sha256=canonical_json_sha256(current),
+                    expected_source_count=2,
+                    expected_input_identity=current,
+                    code_fingerprint_migrations=(migration,),
+                )
+
+    def test_code_migration_non_code_comparison_is_canonical_json_exact(self) -> None:
+        migration = CheckpointCodeFingerprintMigration(
+            contract="test_canonical_json_exact",
+            legacy_selector_code_sha256="1" * 64,
+            current_selector_code_sha256="2" * 64,
+            legacy_crop_rerank_code_sha256="3" * 64,
+            current_crop_rerank_code_sha256="4" * 64,
+        )
+        legacy = {
+            "maximum_results": 32,
+            "enabled": False,
+            "selector_code_sha256": "1" * 64,
+            "crop_rerank_code_sha256": "3" * 64,
+        }
+        current = {
+            "maximum_results": 32,
+            "enabled": False,
+            "selector_code_sha256": "2" * 64,
+            "crop_rerank_code_sha256": "4" * 64,
+            "code_fingerprint_contract": (
+                "python_module_symbol_dependency_ast_v2"
+            ),
+        }
+
+        self.assertTrue(migration.matches(legacy, current))
+        self.assertFalse(
+            migration.matches(
+                legacy,
+                {**current, "maximum_results": 32.0},
+            )
+        )
+        self.assertFalse(
+            migration.matches(legacy, {**current, "enabled": 0})
+        )
+        self.assertFalse(
+            migration.matches(
+                {**legacy, "code_fingerprint_contract": None},
+                current,
+            )
+        )
 
 
 if __name__ == "__main__":

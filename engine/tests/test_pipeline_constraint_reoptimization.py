@@ -1,28 +1,36 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from crosscut.lazy_splice_feasibility_graph import LazySpliceFeasibilityGraph
+from crosscut.boundary_repair import BoundaryRepairConfig
 from crosscut.pipeline import (
     _BoundarySearchBudget,
     _BoundarySearchBudgetExhausted,
+    _BoundarySearchNoProgress,
     _GlobalVisualCandidateStream,
     _assessment_has_final_boundary_geometry_evidence,
     _authorize_partial_reedit_splice_lineage,
     _boundary_repair_assessments,
+    _budgeted_repair_visual_timeline_boundaries,
     _candidate_local_splice_proxy_authorization,
+    _claim_exact_splice_refinement_keys,
+    _constraint_terminal_status,
     _cross_source_timeline_edge_contexts,
     _cross_source_timeline_edge_keys,
     _group_splice_analysis_basis_identity,
+    _incomplete_splice_context_keys,
     _optimizer_workspace_cross_source_edge_bound,
     _optimizer_blocked_set_for_contexts,
     _record_boundary_repair_assessments,
     _regenerate_visual_candidate_set_or_no_path,
     _resume_or_reset_splice_feasibility_graph,
     _run_initial_edge_constrained_stream,
+    _splice_authorization_evidence_incomplete,
     _splice_authorization_refinement_boundary_indices,
     _splice_graph_keys_for_plan,
     _validate_constrained_precomputed_repair_origin,
@@ -225,6 +233,19 @@ def _successful_repair(
             splice_feedback_result_context_identity(plan, boundary_index)
         ),
         result=SimpleNamespace(selected_frame_offset=frame_offset),
+        candidate_evidence_audit=tuple(
+            (
+                {
+                    "frame_offset": offset,
+                    "professional_gate_passed": True,
+                    "production_transition_gate_passed": True,
+                    "visual_evidence": {},
+                }
+                if offset == frame_offset
+                else _audit(offset, silhouette=0.60)
+            )
+            for offset in DEFAULT_WIDE_FRAME_OFFSETS
+        ),
         selected_visual_evidence=SimpleNamespace(
             evidence_coverage=SimpleNamespace(professional_gate_passed=True)
         ),
@@ -406,6 +427,37 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             hard_graph.blocked_set_for_contexts(
                 _splice_graph_keys_for_plan(plan)
             ),
+        )
+
+    def test_success_records_full_raw_audit_and_separate_result_proof(
+        self,
+    ) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        repair = _successful_repair(plan, 0, 5)
+        repair_plan = _repair_plan(
+            plan,
+            repairs=(repair,),
+            requested=(0,),
+        )
+
+        assessments = _boundary_repair_assessments(repair_plan)
+        by_context = {
+            context_identity: assessment
+            for _edge, context_identity, assessment in assessments
+        }
+        raw = by_context[repair.observed_edge_context_identity]
+        result = by_context[repair.result_edge_context_identity]
+
+        self.assertEqual(
+            raw.observed_frame_offsets,
+            DEFAULT_WIDE_FRAME_OFFSETS,
+        )
+        self.assertIs(raw.status, SpliceFeasibilityStatus.RAW_PASS)
+        self.assertEqual(result.observed_frame_offsets, (5,))
+        self.assertIs(result.status, SpliceFeasibilityStatus.RAW_PASS)
+        self.assertNotEqual(
+            repair.observed_edge_context_identity,
+            repair.result_edge_context_identity,
         )
 
     def test_changed_span_positive_is_reassessed_and_transient_hard_not_projected(
@@ -700,7 +752,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
 
         wide_pass = _repair_plan(
             plan,
-            repairs=(_successful_repair(plan, 0, 0),),
+            repairs=(_successful_repair(plan, 0, 5),),
             requested=(0,),
         )
         _record_boundary_repair_assessments(graph, wide_pass)
@@ -841,6 +893,57 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                     SimpleNamespace(),  # type: ignore[arg-type]
                     forbidden_boundary_edges=TimelineNoGoodSet(),
                 )
+
+        balanced_failure = NoCompleteTimelinePath(
+            "balanced exhausted",
+            reason_code="forward_reachability_exhausted",
+            segment_index=4,
+            rejection_counts={"exact_boundary_no_good": 3},
+        )
+        dense_failure = NoCompleteTimelinePath(
+            "dense exhausted",
+            reason_code="forward_reachability_exhausted",
+            segment_index=7,
+            rejection_counts={"exact_boundary_no_good": 5},
+        )
+        profile_no_path = NoCompleteTimelinePath(
+            "all profiles exhausted",
+            reason_code="all_safe_cadence_profiles_exhausted",
+            rejection_counts={
+                "balanced:forward_reachability_exhausted": 1,
+                "dense_safe:forward_reachability_exhausted": 1,
+            },
+            profile_failures=(
+                ("balanced", balanced_failure),
+                ("dense_safe", dense_failure),
+            ),
+        )
+        with patch(
+            "crosscut.pipeline.regenerate_visual_timeline_candidate_set",
+            side_effect=profile_no_path,
+        ):
+            _regenerated, profile_evidence = (
+                _regenerate_visual_candidate_set_or_no_path(
+                    SimpleNamespace(),  # type: ignore[arg-type]
+                    forbidden_boundary_edges=TimelineNoGoodSet(),
+                )
+            )
+        assert profile_evidence is not None
+        self.assertEqual(
+            [
+                item["cadence_profile"]
+                for item in profile_evidence[
+                    "nested_profile_diagnostics"
+                ]
+            ],
+            ["balanced", "dense_safe"],
+        )
+        self.assertEqual(
+            profile_evidence["nested_profile_diagnostics"][0][
+                "no_complete_path"
+            ],
+            balanced_failure.to_dict(),
+        )
 
     def test_legacy_graph_is_discarded_but_malformed_current_graph_aborts(
         self,
@@ -1008,14 +1111,13 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 boundary_indices=(0,),
                 search_radius_frames=8,
             )
-            # An identical request is telemetry-only reuse, not another unique
-            # decoded search token.
-            budget.reserve(
-                phase="test_wide_reuse",
-                visual_timeline=plan,
-                boundary_indices=(0,),
-                search_radius_frames=8,
-            )
+            with self.assertRaises(_BoundarySearchNoProgress):
+                budget.reserve(
+                    phase="test_wide_reuse_without_result_memo",
+                    visual_timeline=plan,
+                    boundary_indices=(0,),
+                    search_radius_frames=8,
+                )
 
         exhausted_boundary = 0.95
         exhausted_plan = replace(
@@ -1045,6 +1147,218 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         self.assertEqual(audit["planned_offset_evaluation_count"], 272)
         self.assertTrue(audit["exhausted"])
         self.assertTrue(audit["production_use_forbidden"])
+
+    def test_exact_repair_request_uses_result_memo_without_redecode(self) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        repair_plan = _repair_plan(plan, requested=(0,))
+        budget = _BoundarySearchBudget(structural_edge_bound=1)
+        settings = BoundaryRepairConfig(
+            search_radius_frames=8,
+            interior_scene_cut_guard_frames=9,
+        )
+        arguments = {
+            "budget": budget,
+            "phase": "test_exact_memo",
+            "visual_timeline": plan,
+            "sources": (Path("/tmp/source-a.mp4"), Path("/tmp/source-b.mp4")),
+            "audio_offsets": (0.0, 0.0),
+            "scene_cut_times": ((), ()),
+            "beat_period_seconds": 0.5,
+            "source_timewarps": (None, None),
+            "boundary_indices": (0,),
+            "config": settings,
+        }
+        with patch(
+            "crosscut.pipeline.repair_visual_timeline_boundaries",
+            return_value=repair_plan,
+        ) as repair:
+            first = _budgeted_repair_visual_timeline_boundaries(**arguments)
+            second = _budgeted_repair_visual_timeline_boundaries(**arguments)
+
+        self.assertIs(first, repair_plan)
+        self.assertIs(second, repair_plan)
+        self.assertEqual(repair.call_count, 1)
+        audit = budget.to_dict()
+        self.assertEqual(audit["repair_call_count"], 1)
+        self.assertEqual(audit["repair_result_memo_entry_count"], 1)
+        self.assertEqual(audit["repair_result_memo_hit_count"], 1)
+
+    def test_094259_boundary65_exact_raw_context_search_count_is_one(
+        self,
+    ) -> None:
+        plan = _plan(
+            *tuple(
+                _choice(index % 2, f"{index % 2}:shot-{index}")
+                for index in range(67)
+            )
+        )
+        key = next(
+            item
+            for item in _splice_graph_keys_for_plan(plan)
+            if item.edge.boundary_index == 65
+        )
+        attempted = set()
+
+        self.assertEqual(
+            _claim_exact_splice_refinement_keys(attempted, (key,)),
+            (key,),
+        )
+        self.assertEqual(
+            _claim_exact_splice_refinement_keys(attempted, (key,)),
+            (),
+        )
+        self.assertEqual(attempted, {key})
+
+    def test_terminal_status_keeps_structural_evidence_and_resource_split(
+        self,
+    ) -> None:
+        cases = (
+            (
+                dict(
+                    structural_hard_no_path=True,
+                    resource_incomplete=False,
+                    incomplete_exact_context_count=0,
+                    authorized_path_count=0,
+                ),
+                "structural_hard_no_path",
+            ),
+            (
+                dict(
+                    structural_hard_no_path=False,
+                    resource_incomplete=False,
+                    incomplete_exact_context_count=1,
+                    authorized_path_count=0,
+                ),
+                "evidence_incomplete_before_authorized_cohort",
+            ),
+            (
+                dict(
+                    structural_hard_no_path=False,
+                    resource_incomplete=True,
+                    incomplete_exact_context_count=0,
+                    authorized_path_count=0,
+                ),
+                "resource_incomplete",
+            ),
+            (
+                dict(
+                    structural_hard_no_path=False,
+                    resource_incomplete=False,
+                    incomplete_exact_context_count=0,
+                    authorized_path_count=3,
+                ),
+                "authorized_path_count_insufficient",
+            ),
+        )
+        for arguments, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    _constraint_terminal_status(**arguments),
+                    expected,
+                )
+
+    def test_splice_authorization_separates_hard_from_incomplete_evidence(
+        self,
+    ) -> None:
+        complete_hard = {
+            "evidence": [
+                {
+                    "authorization_failure": (
+                        "fresh_candidate_edge_hard_incompatible"
+                    ),
+                    "fresh_status": "hard_incompatible",
+                    "fresh_terminal": True,
+                }
+            ]
+        }
+        missing = {
+            "evidence": [
+                {
+                    "authorization_failure": (
+                        "fresh_candidate_edge_evidence_missing"
+                    ),
+                }
+            ]
+        }
+        hard_result = {
+            "evidence": [
+                {
+                    "authorization_failure": (
+                        "fresh_candidate_result_proof_invalid"
+                    ),
+                    "fresh_result_status": "hard_incompatible",
+                    "fresh_result_terminal": True,
+                }
+            ]
+        }
+        indeterminate_result = {
+            "evidence": [
+                {
+                    "authorization_failure": (
+                        "fresh_candidate_result_proof_invalid"
+                    ),
+                    "fresh_result_status": "indeterminate",
+                    "fresh_result_terminal": False,
+                }
+            ]
+        }
+
+        self.assertFalse(
+            _splice_authorization_evidence_incomplete(complete_hard)
+        )
+        self.assertFalse(
+            _splice_authorization_evidence_incomplete(hard_result)
+        )
+        self.assertTrue(
+            _splice_authorization_evidence_incomplete(missing)
+        )
+        self.assertTrue(
+            _splice_authorization_evidence_incomplete(indeterminate_result)
+        )
+        self.assertTrue(_splice_authorization_evidence_incomplete({}))
+
+    def test_094259_terminal_indeterminate_is_never_structural_dp_no_good(
+        self,
+    ) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        repair_plan = _repair_plan(
+            plan,
+            failures=(
+                _failure(
+                    plan,
+                    0,
+                    tuple(
+                        _missing_audit(offset)
+                        for offset in DEFAULT_WIDE_FRAME_OFFSETS
+                    ),
+                ),
+            ),
+            requested=(0,),
+        )
+        graph = LazySpliceFeasibilityGraph("indeterminate-not-structural")
+        _record_boundary_repair_assessments(graph, repair_plan)
+        keys = _splice_graph_keys_for_plan(plan)
+        edge = keys[0].edge
+
+        self.assertIn(edge, graph.blocked_set_for_contexts(keys))
+        self.assertNotIn(
+            edge,
+            _optimizer_blocked_set_for_contexts(graph, keys),
+        )
+        self.assertEqual(
+            _incomplete_splice_context_keys(graph, keys),
+            keys,
+        )
+
+    def test_unmeasured_context_is_evidence_incomplete(self) -> None:
+        plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))
+        graph = LazySpliceFeasibilityGraph("unmeasured-is-incomplete")
+        keys = _splice_graph_keys_for_plan(plan)
+
+        self.assertEqual(
+            _incomplete_splice_context_keys(graph, keys),
+            keys,
+        )
 
     def test_failure_assessments_are_retained_instead_of_status_collapsed(self) -> None:
         plan = _plan(_choice(0, "0:a"), _choice(1, "1:b"))

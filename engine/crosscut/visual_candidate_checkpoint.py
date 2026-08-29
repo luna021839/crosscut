@@ -18,6 +18,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .failed_candidate_replay import deserialize_visual_timeline_plan
+from .visual_feature_cache import PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT
 from .visual_score import VisualTimelinePlan
 
 
@@ -29,6 +30,10 @@ VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS = (
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAXIMUM_CHECKPOINT_BYTES = 512 * 1024 * 1024
+_CODE_FINGERPRINT_FIELDS = (
+    "selector_code_sha256",
+    "crop_rerank_code_sha256",
+)
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:
@@ -110,6 +115,8 @@ class CheckpointMaterializedVisualCandidate:
 class LoadedVisualCandidateCheckpoint:
     path: Path
     input_identity_sha256: str
+    stored_input_identity_sha256: str
+    code_fingerprint_migration: str | None
     candidates: tuple[CheckpointMaterializedVisualCandidate, ...]
 
     @property
@@ -122,6 +129,143 @@ class LoadedVisualCandidateCheckpoint:
         if len(selected) != 8:
             raise ValueError("checkpoint must select exactly eight initial candidates")
         return selected
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointCodeFingerprintMigration:
+    """One exact, direction-specific code-hash equivalence migration.
+
+    Candidate checkpoints bind every media, clock, policy, and selector input.
+    A dependency-fingerprint implementation change can alter the two code
+    digests without changing executable selector semantics.  This object
+    allows only an audited old->new pair while requiring every other raw
+    identity field to remain byte-for-byte canonical-JSON equivalent.
+    """
+
+    contract: str
+    legacy_selector_code_sha256: str
+    current_selector_code_sha256: str
+    legacy_crop_rerank_code_sha256: str
+    current_crop_rerank_code_sha256: str
+    legacy_fingerprint_contract: str | None = None
+    current_fingerprint_contract: str = PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT
+
+    def __post_init__(self) -> None:
+        if not self.contract.strip() or self.contract != self.contract.strip():
+            raise ValueError("checkpoint code migration contract is invalid")
+        for name in (
+            "legacy_selector_code_sha256",
+            "current_selector_code_sha256",
+            "legacy_crop_rerank_code_sha256",
+            "current_crop_rerank_code_sha256",
+        ):
+            if _SHA256.fullmatch(getattr(self, name)) is None:
+                raise ValueError("checkpoint code migration digest is invalid")
+        if self.legacy_fingerprint_contract is not None and (
+            not self.legacy_fingerprint_contract.strip()
+            or self.legacy_fingerprint_contract
+            != self.legacy_fingerprint_contract.strip()
+        ):
+            raise ValueError("legacy fingerprint contract is invalid")
+        if (
+            not self.current_fingerprint_contract.strip()
+            or self.current_fingerprint_contract
+            != self.current_fingerprint_contract.strip()
+        ):
+            raise ValueError("current fingerprint contract is invalid")
+
+    def matches(
+        self,
+        legacy: Mapping[str, Any],
+        current: Mapping[str, Any],
+    ) -> bool:
+        legacy_values = dict(legacy)
+        current_values = dict(current)
+        if legacy_values.get("selector_code_sha256") != (
+            self.legacy_selector_code_sha256
+        ) or current_values.get("selector_code_sha256") != (
+            self.current_selector_code_sha256
+        ):
+            return False
+        if legacy_values.get("crop_rerank_code_sha256") != (
+            self.legacy_crop_rerank_code_sha256
+        ) or current_values.get("crop_rerank_code_sha256") != (
+            self.current_crop_rerank_code_sha256
+        ):
+            return False
+        legacy_has_contract = "code_fingerprint_contract" in legacy_values
+        if self.legacy_fingerprint_contract is None:
+            if legacy_has_contract:
+                return False
+        elif (
+            not legacy_has_contract
+            or legacy_values["code_fingerprint_contract"]
+            != self.legacy_fingerprint_contract
+        ):
+            return False
+        if (
+            "code_fingerprint_contract" not in current_values
+            or current_values["code_fingerprint_contract"]
+            != self.current_fingerprint_contract
+        ):
+            return False
+        ignored = {
+            *_CODE_FINGERPRINT_FIELDS,
+            "code_fingerprint_contract",
+        }
+        legacy_non_code = {
+            key: value
+            for key, value in legacy_values.items()
+            if key not in ignored
+        }
+        current_non_code = {
+            key: value
+            for key, value in current_values.items()
+            if key not in ignored
+        }
+        try:
+            return hmac.compare_digest(
+                canonical_json_sha256(legacy_non_code),
+                canonical_json_sha256(current_non_code),
+            )
+        except (TypeError, ValueError):
+            return False
+
+
+VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
+    CheckpointCodeFingerprintMigration(
+        contract=(
+            "whole_import_node_ast_v1_to_alias_ast_v2_20260829"
+        ),
+        legacy_selector_code_sha256=(
+            "363acfa826d846bfc62396f483ce1adc6d0b1ff903ffd32c39630dc2db70e857"
+        ),
+        current_selector_code_sha256=(
+            "9ad134a8bac4a4946bb56d5ca4d161ee226320fe2504b826fda6ad1c5abc5982"
+        ),
+        legacy_crop_rerank_code_sha256=(
+            "23aa118ec3a822544ca36d90ba72c821a6e9157175efe863b7c181b6e73a97ba"
+        ),
+        current_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+    ),
+)
+
+
+def _resolved_checkpoint_identity_migration(
+    legacy: Mapping[str, Any],
+    current: Mapping[str, Any],
+    migrations: Sequence[CheckpointCodeFingerprintMigration],
+) -> CheckpointCodeFingerprintMigration | None:
+    matches = tuple(
+        migration
+        for migration in migrations
+        if migration.matches(legacy, current)
+    )
+    if len(matches) > 1:
+        raise ValueError("checkpoint code migration is ambiguous")
+    return matches[0] if matches else None
 
 
 def materialized_candidate_checkpoint_payload(
@@ -206,6 +350,10 @@ def load_visual_candidate_checkpoint(
     *,
     expected_input_identity_sha256: str,
     expected_source_count: int,
+    expected_input_identity: Mapping[str, Any] | None = None,
+    code_fingerprint_migrations: Sequence[
+        CheckpointCodeFingerprintMigration
+    ] = (),
 ) -> LoadedVisualCandidateCheckpoint:
     source = Path(path)
     if _SHA256.fullmatch(expected_input_identity_sha256) is None:
@@ -223,17 +371,34 @@ def load_visual_candidate_checkpoint(
     if payload.get("analysis_basis") != VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS:
         raise ValueError("visual candidate checkpoint analysis basis changed")
     actual_identity = payload.get("input_identity_sha256")
-    if not isinstance(actual_identity, str) or not hmac.compare_digest(
+    raw_identity = payload.get("input_identity")
+    if (
+        not isinstance(actual_identity, str)
+        or _SHA256.fullmatch(actual_identity) is None
+        or not isinstance(raw_identity, Mapping)
+        or not hmac.compare_digest(
+            canonical_json_sha256(raw_identity),
+            actual_identity,
+        )
+    ):
+        raise ValueError("visual candidate checkpoint identity checksum mismatch")
+    migration: CheckpointCodeFingerprintMigration | None = None
+    if not hmac.compare_digest(
         actual_identity,
         expected_input_identity_sha256,
     ):
-        raise ValueError("visual candidate checkpoint input identity mismatch")
-    raw_identity = payload.get("input_identity")
-    if not isinstance(raw_identity, Mapping) or not hmac.compare_digest(
-        canonical_json_sha256(raw_identity),
-        actual_identity,
-    ):
-        raise ValueError("visual candidate checkpoint identity checksum mismatch")
+        if expected_input_identity is None or not hmac.compare_digest(
+            canonical_json_sha256(expected_input_identity),
+            expected_input_identity_sha256,
+        ):
+            raise ValueError("visual candidate checkpoint input identity mismatch")
+        migration = _resolved_checkpoint_identity_migration(
+            raw_identity,
+            expected_input_identity,
+            tuple(code_fingerprint_migrations),
+        )
+        if migration is None:
+            raise ValueError("visual candidate checkpoint input identity mismatch")
     raw_candidates = payload.get("materialized_candidate_plans")
     if not isinstance(raw_candidates, list) or not 8 <= len(raw_candidates) <= 32:
         raise ValueError("visual candidate checkpoint needs 8 to 32 plans")
@@ -249,7 +414,11 @@ def load_visual_candidate_checkpoint(
         raise ValueError("visual candidate checkpoint indices are duplicated")
     loaded = LoadedVisualCandidateCheckpoint(
         path=source.resolve(strict=True),
-        input_identity_sha256=actual_identity,
+        input_identity_sha256=expected_input_identity_sha256,
+        stored_input_identity_sha256=actual_identity,
+        code_fingerprint_migration=(
+            migration.contract if migration is not None else None
+        ),
         candidates=candidates,
     )
     loaded.initial_candidates
@@ -261,6 +430,10 @@ def find_latest_matching_visual_candidate_checkpoint(
     *,
     expected_input_identity_sha256: str,
     expected_source_count: int,
+    expected_input_identity: Mapping[str, Any] | None = None,
+    code_fingerprint_migrations: Sequence[
+        CheckpointCodeFingerprintMigration
+    ] = (),
 ) -> LoadedVisualCandidateCheckpoint | None:
     root = Path(output_directory)
     if root.is_symlink() or not root.is_dir():
@@ -280,6 +453,8 @@ def find_latest_matching_visual_candidate_checkpoint(
                 path,
                 expected_input_identity_sha256=expected_input_identity_sha256,
                 expected_source_count=expected_source_count,
+                expected_input_identity=expected_input_identity,
+                code_fingerprint_migrations=code_fingerprint_migrations,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             continue
@@ -287,9 +462,11 @@ def find_latest_matching_visual_candidate_checkpoint(
 
 
 __all__ = [
+    "CheckpointCodeFingerprintMigration",
     "CheckpointMaterializedVisualCandidate",
     "LoadedVisualCandidateCheckpoint",
     "VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS",
+    "VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS",
     "VISUAL_CANDIDATE_CHECKPOINT_CONTRACT",
     "canonical_json_sha256",
     "find_latest_matching_visual_candidate_checkpoint",

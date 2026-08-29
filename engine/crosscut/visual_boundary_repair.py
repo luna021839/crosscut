@@ -65,7 +65,8 @@ from .visual_splice_failure_feedback import (
 
 ANALYSIS_BASIS = (
     "decoded_plus_minus_three_frame_formation_layout_and_actual_pose_boundary_"
-    "repair_v3+temporal_pose_motion_audit_v1"
+    "repair_v4+complete_success_offset_audit_v1+"
+    "temporal_pose_motion_audit_v1"
 )
 _PRODUCTION_REVIEW_GATES = TimelineReviewConfig()
 _NEAREST_TEMPORAL_POSE_RADIUS_FRAMES = 3
@@ -434,6 +435,7 @@ class VisualBoundaryRepair:
     incoming_source_index: int
     result: BoundaryRepairResult
     selected_visual_evidence: BoundaryVisualEvidence
+    candidate_evidence_audit: tuple[Mapping[str, Any], ...]
     optimizer_edge_context: Mapping[str, Any]
     optimizer_edge_context_identity: str
     observed_edge_context: Mapping[str, Any]
@@ -443,6 +445,64 @@ class VisualBoundaryRepair:
     optimizer_edge_context_match: bool
 
     def __post_init__(self) -> None:
+        frozen_candidate_audit = tuple(
+            _freeze_audit_value(item)
+            for item in self.candidate_evidence_audit
+        )
+        if not frozen_candidate_audit or any(
+            not isinstance(item, Mapping)
+            for item in frozen_candidate_audit
+        ):
+            raise TypeError(
+                "successful boundary repair needs per-offset audit mappings"
+            )
+        audit_offsets = tuple(
+            item.get("frame_offset") for item in frozen_candidate_audit
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in audit_offsets
+        ):
+            raise ValueError("boundary repair audit offsets are invalid")
+        if (
+            len(set(audit_offsets)) != len(audit_offsets)
+            or audit_offsets != tuple(sorted(audit_offsets))
+            or audit_offsets
+            != tuple(range(audit_offsets[0], audit_offsets[-1] + 1))
+            or audit_offsets[0] != -audit_offsets[-1]
+            or audit_offsets[-1] > 8
+        ):
+            raise ValueError(
+                "boundary repair audit must cover one complete symmetric "
+                "requested offset domain"
+            )
+        selected_audit = tuple(
+            item
+            for item in frozen_candidate_audit
+            if item.get("frame_offset") == self.result.selected_frame_offset
+        )
+        if len(selected_audit) != 1:
+            raise ValueError(
+                "boundary repair audit lost its selected frame offset"
+            )
+        if selected_audit[0].get("production_transition_gate_passed") is not True:
+            raise ValueError(
+                "selected boundary repair offset did not pass production gates"
+            )
+        selected_visual_payload = selected_audit[0].get("visual_evidence")
+        if (
+            not isinstance(selected_visual_payload, Mapping)
+            or _thaw_audit_value(selected_visual_payload)
+            != self.selected_visual_evidence.to_dict()
+        ):
+            raise ValueError(
+                "selected boundary repair evidence disagrees with its audit"
+            )
+        object.__setattr__(
+            self,
+            "candidate_evidence_audit",
+            frozen_candidate_audit,
+        )
         optimizer_context = _freeze_audit_value(
             self.optimizer_edge_context
         )
@@ -489,6 +549,10 @@ class VisualBoundaryRepair:
             "incoming_source_index": self.incoming_source_index,
             "result": self.result.to_dict(),
             "selected_visual_evidence": self.selected_visual_evidence.to_dict(),
+            "candidate_evidence_audit": [
+                _thaw_audit_value(item)
+                for item in self.candidate_evidence_audit
+            ],
             "optimizer_edge_context": _thaw_audit_value(
                 self.optimizer_edge_context
             ),
@@ -1937,6 +2001,60 @@ def repair_visual_timeline_boundaries(
                 tuple[BoundaryVisualEvidence, FrameVisualDescriptor, FrameVisualDescriptor],
             ] = {}
 
+            def candidate_evidence_audit() -> tuple[dict[str, Any], ...]:
+                """Serialize every requested offset, including decode gaps."""
+
+                audit: list[dict[str, Any]] = []
+                for frame_offset in range(
+                    -settings.search_radius_frames,
+                    settings.search_radius_frames + 1,
+                ):
+                    item = evidence_by_offset.get(frame_offset)
+                    if item is None:
+                        audit.append(
+                            {
+                                "frame_offset": frame_offset,
+                                "pose_basis": "missing",
+                                "professional_evidence_basis": (
+                                    "missing_combined_geometry_descriptor"
+                                ),
+                                "professional_gate_passed": False,
+                                "production_transition_gate_passed": False,
+                                "missing_mask": [
+                                    "combined_geometry_descriptor"
+                                ],
+                                "temporal_pose_motion": None,
+                                "visual_evidence": {},
+                            }
+                        )
+                        continue
+                    evidence = item[0]
+                    audit.append(
+                        {
+                            "frame_offset": frame_offset,
+                            "pose_basis": evidence.pose_basis,
+                            "professional_evidence_basis": (
+                                evidence.evidence_coverage
+                                .professional_evidence_basis
+                            ),
+                            "professional_gate_passed": (
+                                evidence.evidence_coverage
+                                .professional_gate_passed
+                            ),
+                            "production_transition_gate_passed": (
+                                _passes_production_transition_gates(evidence)
+                            ),
+                            "missing_mask": list(
+                                evidence.evidence_coverage.missing_mask
+                            ),
+                            "temporal_pose_motion": (
+                                evidence.temporal_pose_motion.to_dict()
+                            ),
+                            "visual_evidence": evidence.to_dict(),
+                        }
+                    )
+                return tuple(audit)
+
             def visual_cost(context: BoundaryCandidateContext) -> float | None:
                 frame_seconds = 1.0 / output_fps
                 side_sample_span_seconds = 3.0 * frame_seconds
@@ -2084,55 +2202,9 @@ def repair_visual_timeline_boundaries(
                     "incoming_source_index": incoming.source_index,
                     "reason": str(exc),
                 }
-                evidence_audit: list[dict[str, Any]] = []
-                for frame_offset in range(
-                    -settings.search_radius_frames,
-                    settings.search_radius_frames + 1,
-                ):
-                    item = evidence_by_offset.get(frame_offset)
-                    if item is None:
-                        evidence_audit.append(
-                            {
-                                "frame_offset": frame_offset,
-                                "pose_basis": "missing",
-                                "professional_evidence_basis": (
-                                    "missing_combined_geometry_descriptor"
-                                ),
-                                "professional_gate_passed": False,
-                                "production_transition_gate_passed": False,
-                                "missing_mask": [
-                                    "combined_geometry_descriptor"
-                                ],
-                                "temporal_pose_motion": None,
-                                "visual_evidence": {},
-                            }
-                        )
-                        continue
-                    evidence_audit.append(
-                        {
-                            "frame_offset": frame_offset,
-                            "pose_basis": item[0].pose_basis,
-                            "professional_evidence_basis": (
-                                item[0].evidence_coverage
-                                .professional_evidence_basis
-                            ),
-                            "professional_gate_passed": (
-                                item[0].evidence_coverage
-                                .professional_gate_passed
-                            ),
-                            "production_transition_gate_passed": (
-                                _passes_production_transition_gates(item[0])
-                            ),
-                            "missing_mask": list(
-                                item[0].evidence_coverage.missing_mask
-                            ),
-                            "temporal_pose_motion": (
-                                item[0].temporal_pose_motion.to_dict()
-                            ),
-                            "visual_evidence": item[0].to_dict(),
-                        }
-                    )
-                failure["candidate_evidence_audit"] = evidence_audit
+                failure["candidate_evidence_audit"] = (
+                    candidate_evidence_audit()
+                )
                 failures.append(
                     bind_failure_to_attempt(
                         failure,
@@ -2263,6 +2335,9 @@ def repair_visual_timeline_boundaries(
                     incoming_source_index=incoming.source_index,
                     result=result,
                     selected_visual_evidence=evidence,
+                    candidate_evidence_audit=(
+                        candidate_evidence_audit()
+                    ),
                     optimizer_edge_context=optimizer_edge_context,
                     optimizer_edge_context_identity=(
                         optimizer_edge_context_identity
@@ -2288,7 +2363,8 @@ def repair_visual_timeline_boundaries(
         choices=tuple(choices),
         optimizer_score=visual_timeline.optimizer_score,
         analysis_basis=(
-            f"{visual_timeline.analysis_basis}+local_boundary_repair_v3+"
+            f"{visual_timeline.analysis_basis}+local_boundary_repair_v4+"
+            "complete_success_offset_audit_v1+"
             "temporal_pose_motion_audit_v1"
         ),
         selected_candidate_index=visual_timeline.selected_candidate_index,

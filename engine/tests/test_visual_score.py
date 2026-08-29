@@ -320,6 +320,20 @@ class VisualScoreTests(unittest.TestCase):
                 "dense_safe:cadence_state_graph_exhausted",
             },
         )
+        self.assertEqual(
+            tuple(
+                (profile, failure.segment_index)
+                for profile, failure in caught.exception.profile_failures
+            ),
+            (("balanced", 0), ("reference", 1), ("dense_safe", 2)),
+        )
+        self.assertEqual(
+            [
+                item["no_complete_path"]["segment_index"]
+                for item in caught.exception.to_dict()["profile_failures"]
+            ],
+            [0, 1, 2],
+        )
 
     def test_role_conditioning_builds_chorus_anchor_burst_and_cadence_controls(
         self,

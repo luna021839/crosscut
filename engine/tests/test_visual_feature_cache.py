@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ from crosscut.visual_feature_cache import (
     DescriptorRequestIdentity,
     DescriptorRequestLocator,
     PersistentVisualFeatureCache,
+    PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
     build_analyzer_fingerprint,
     python_symbol_dependency_sha256,
 )
@@ -32,6 +34,84 @@ from crosscut.visual_score import (
     _VideoSampler,
     build_visual_timeline,
 )
+
+
+_AUDITED_LEGACY_ANALYZER_DIGEST = (
+    "648cfb9801b2de54d4325a7c838e31bbadfbeaa8d71a68c37163d8c41f27b19c"
+)
+_AUDITED_CURRENT_ANALYZER_DIGEST = (
+    "14fff1f9ee74dbaed4023c6fbbbd4cd94b67e078a94f3d272885669cfe0e6b30"
+)
+_AUDITED_LEGACY_DESCRIPTOR_DIGEST = (
+    "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
+)
+_AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
+    "c0de5b604e22d12c713b02edfe2b5a0de8d19a80475b1547b861f975d8978d89"
+)
+
+
+def _audited_analyzer_components(descriptor_digest: str) -> dict[str, object]:
+    return {
+        "cache_contract": "ive_source_local_visual_features_v1",
+        "feature_schema_version": 1,
+        "descriptor_schema": (
+            "frame_visual_descriptor_v1_numeric_geometry_pose_silhouette_"
+            "nanodet_formation_motion_no_sface_no_raw_frame"
+        ),
+        "code_sha256": {
+            "pose.py": (
+                "2d0fbf3e426039c281a5331e93e567a652f3ee50d5be3744446e07038e741870"
+            ),
+            "visual_score_descriptor_ast_v1": descriptor_digest,
+        },
+        "model_asset_sha256_or_state": {
+            "face:face_detection_yunet_2023mar.onnx": (
+                "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4:"
+                "loadable=True"
+            ),
+            "face:haarcascade_frontalface_default.xml": (
+                "0f7d4527844eb514d4a4948e822da90fbb16a34a0bbbbc6adc6498747a5aafb0"
+            ),
+            "pose:human_segmentation_pphumanseg_2023mar.onnx": (
+                "552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24:"
+                "loadable=True"
+            ),
+            "pose:object_detection_nanodet_2022nov.onnx": (
+                "4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186:"
+                "loadable=True"
+            ),
+            "pose:person_detection_mediapipe_2023mar.onnx": (
+                "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f:"
+                "loadable=True"
+            ),
+            "pose:pose_estimation_mediapipe_2023mar.onnx": (
+                "9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f:"
+                "loadable=True"
+            ),
+        },
+        "runtime": {
+            "numpy": "2.2.6",
+            "opencv": "4.10.0",
+            "opencv_build_sha256": (
+                "1b2c40cbb30ac378cdcbcd4aeeb68ddbe8727bee4a5ea1a784103455d79d0133"
+            ),
+            "python_implementation": "CPython",
+            "python_version": "3.11.9",
+        },
+    }
+
+
+def _analyzer_from_components(components: dict[str, object]) -> AnalyzerFingerprint:
+    digest = hashlib.sha256(
+        json.dumps(
+            components,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return AnalyzerFingerprint(digest=digest, components=components)
 
 
 def _analyzer(salt: str = "a") -> AnalyzerFingerprint:
@@ -189,6 +269,14 @@ class _FakeCapture:
 
 
 class VisualFeatureCacheTests(unittest.TestCase):
+    def test_symbol_dependency_fingerprint_uses_versioned_alias_contract(
+        self,
+    ) -> None:
+        self.assertEqual(
+            PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+            "python_module_symbol_dependency_ast_v2",
+        )
+
     def test_canonical_frame_identity_removes_rounded_millisecond_collision(
         self,
     ) -> None:
@@ -265,6 +353,156 @@ class VisualFeatureCacheTests(unittest.TestCase):
 
             self.assertEqual(first, selector_changed)
             self.assertNotEqual(first, descriptor_changed)
+
+    def test_symbol_dependency_fingerprint_ignores_unreferenced_import_alias(
+        self,
+    ) -> None:
+        variants = (
+            (
+                "from .dependency import descriptor_helper as helper\n",
+                "from .dependency import (\n"
+                "    descriptor_helper as helper,\n"
+                "    selector_helper as selector,\n"
+                ")\n",
+            ),
+            (
+                "import descriptor_dependency as helper\n",
+                "import descriptor_dependency as helper, selector_dependency as selector\n",
+            ),
+        )
+        for initial_import, import_with_selector in variants:
+            with self.subTest(initial_import=initial_import):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    module = Path(temporary_directory) / "combined.py"
+                    module.write_text(
+                        initial_import
+                        + "def descriptor(value):\n    return helper(value)\n",
+                        encoding="utf-8",
+                    )
+                    before = python_symbol_dependency_sha256(
+                        module,
+                        root_symbols=("descriptor",),
+                    )
+                    module.write_text(
+                        import_with_selector
+                        + "def descriptor(value):\n    return helper(value)\n",
+                        encoding="utf-8",
+                    )
+                    after = python_symbol_dependency_sha256(
+                        module,
+                        root_symbols=("descriptor",),
+                    )
+                    self.assertEqual(before, after)
+
+    def test_symbol_dependency_fingerprint_binds_referenced_import_semantics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            module = Path(temporary_directory) / "combined.py"
+
+            def fingerprint(import_statement: str, loaded_name: str) -> str:
+                module.write_text(
+                    import_statement
+                    + f"def descriptor(value):\n    return {loaded_name}(value)\n",
+                    encoding="utf-8",
+                )
+                return python_symbol_dependency_sha256(
+                    module,
+                    root_symbols=("descriptor",),
+                )
+
+            baseline = fingerprint(
+                "from .dependency import descriptor_helper as helper\n",
+                "helper",
+            )
+            changed_module = fingerprint(
+                "from .other_dependency import descriptor_helper as helper\n",
+                "helper",
+            )
+            changed_name = fingerprint(
+                "from .dependency import alternate_helper as helper\n",
+                "helper",
+            )
+            changed_asname = fingerprint(
+                "from .dependency import descriptor_helper\n",
+                "descriptor_helper",
+            )
+            explicit_same_asname = fingerprint(
+                "from .dependency import descriptor_helper as descriptor_helper\n",
+                "descriptor_helper",
+            )
+            changed_level = fingerprint(
+                "from ..dependency import descriptor_helper as helper\n",
+                "helper",
+            )
+            changed_import_name = fingerprint(
+                "import alternate_dependency as helper\n",
+                "helper",
+            )
+
+            self.assertEqual(
+                len(
+                    {
+                        baseline,
+                        changed_module,
+                        changed_name,
+                        changed_asname,
+                        changed_import_name,
+                    }
+                ),
+                5,
+            )
+            self.assertNotEqual(changed_asname, explicit_same_asname)
+            self.assertNotEqual(baseline, changed_level)
+
+    def test_current_descriptor_dependency_digest_matches_migration_endpoint(
+        self,
+    ) -> None:
+        visual_score_path = (
+            Path(__file__).resolve().parents[1] / "crosscut" / "visual_score.py"
+        )
+        self.assertEqual(
+            python_symbol_dependency_sha256(
+                visual_score_path,
+                root_symbols=(
+                    "FrameVisualDescriptor",
+                    "_VideoSampler",
+                    "_descriptor_cache_payload",
+                    "_descriptor_from_cache_payload",
+                    "describe_frame",
+                ),
+            ),
+            _AUDITED_CURRENT_DESCRIPTOR_DIGEST,
+        )
+
+    def test_symbol_dependency_fingerprint_binds_helper_body_and_constant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            module = Path(temporary_directory) / "combined.py"
+
+            def fingerprint(constant: int, operator: str) -> str:
+                module.write_text(
+                    "CONST = "
+                    f"{constant}\n"
+                    "def helper(value):\n"
+                    f"    return value {operator} CONST\n"
+                    "def descriptor(value):\n"
+                    "    return helper(value)\n",
+                    encoding="utf-8",
+                )
+                return python_symbol_dependency_sha256(
+                    module,
+                    root_symbols=("descriptor",),
+                )
+
+            baseline = fingerprint(2, "*")
+            changed_body = fingerprint(2, "+")
+            changed_constant = fingerprint(3, "*")
+            self.assertEqual(
+                len({baseline, changed_body, changed_constant}),
+                3,
+            )
 
     def test_atomic_round_trip_binds_source_frame_options_and_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -526,94 +764,137 @@ class VisualFeatureCacheTests(unittest.TestCase):
     def test_exactly_audited_cache_only_analyzer_migration_reuses_record(
         self,
     ) -> None:
-        migrations = (
-            (
-                "ac7de83aac79715f25f4a7c93f2d861b93047e5a92e89694496c2d7b3d3fb47d",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "e3196dd457bfcf0d3227475e21083d04b808fd331e1c2a1dfe7890510ee2e8e4",
-                "dd214dcfe13d3af7c5119a5ea3067fe7ec703fd8ff864b7fa34c11f95622f433",
-            ),
-            (
-                "48f2ed8ef454539ac3e8502c905c325b1113158c7bd840de6aefac83105ce3d1",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "b7d906f1578b0bb967ad9c331a1c6ad3c7147cb596e0ba155af41c80f667a7a4",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "976479db2b02b46830aa53e55c20b03aabd5bdb660aee9795d81e2587b2cab93",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "5d32ea38abfbad7fac015c91f00e8957ac2db95a460778e3a207c16ae3ca9fe2",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "c44b51f780f0d2b6e37751c2053f8630b63d3e799cd617936333ecace435da8b",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "19740a80bc18933032e9265a747a74678a4ff7cfa22e26ddb0ea14528705d6d1",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "ba991e083dd4e94ef7d4a251bc05538d1bb2feaf0582408249090d2908e0b23b",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "b7e9ad896ed5403819b8fa31772a97b4f82365ba5f65a032c22d024233f83d4a",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
-            (
-                "e09b787bf407c2eacc09f1d1f52a0318dc8b1e981b70eaf199c863cf67af0829",
-                "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-            ),
+        legacy = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
         )
-        for current_digest, legacy_digest in migrations:
-            with self.subTest(current_digest=current_digest):
+        current = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        self.assertEqual(legacy.digest, _AUDITED_LEGACY_ANALYZER_DIGEST)
+        self.assertEqual(current.digest, _AUDITED_CURRENT_ANALYZER_DIGEST)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=current,
+            )
+
+            self.assertEqual(
+                warm.get_by_locator(request.locator),
+                {"value": 1.0},
+            )
+            diagnostics = warm.diagnostics()
+            self.assertEqual(diagnostics["decode_free_hit_count"], 1)
+            self.assertEqual(diagnostics["decode_free_legacy_hit_count"], 1)
+
+    def test_analyzer_migration_rejects_unknown_and_reverse_directions(
+        self,
+    ) -> None:
+        legacy = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        )
+        current = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        unknown = _analyzer_from_components(
+            _audited_analyzer_components("f" * 64)
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            legacy_cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "legacy-cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(legacy_cache.put(request, {"value": 1.0}))
+            unknown_cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "legacy-cache",
+                source_path=source,
+                analyzer=unknown,
+            )
+            self.assertIsNone(unknown_cache.get_by_locator(request.locator))
+
+            current_cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "reverse-cache",
+                source_path=source,
+                analyzer=current,
+            )
+            self.assertTrue(current_cache.put(request, {"value": 2.0}))
+            reverse_cache = PersistentVisualFeatureCache(
+                source_cache_directory=root / "reverse-cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertIsNone(reverse_cache.get_by_locator(request.locator))
+
+    def test_analyzer_migration_rejects_every_non_descriptor_tamper(
+        self,
+    ) -> None:
+        mutations = {
+            "cache_contract": lambda value: value.__setitem__(
+                "cache_contract", "tampered-cache-contract"
+            ),
+            "schema": lambda value: value.__setitem__(
+                "descriptor_schema", "tampered-schema"
+            ),
+            "feature_schema": lambda value: value.__setitem__(
+                "feature_schema_version", 2
+            ),
+            "model": lambda value: value[
+                "model_asset_sha256_or_state"
+            ].__setitem__(
+                "face:haarcascade_frontalface_default.xml", "f" * 64
+            ),
+            "runtime": lambda value: value["runtime"].__setitem__(
+                "opencv", "tampered-runtime"
+            ),
+            "pose_code": lambda value: value["code_sha256"].__setitem__(
+                "pose.py", "f" * 64
+            ),
+            "descriptor_code": lambda value: value["code_sha256"].__setitem__(
+                "visual_score_descriptor_ast_v1", "f" * 64
+            ),
+        }
+        current = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        for label, mutate in mutations.items():
+            with self.subTest(tamper=label):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     root = Path(temporary_directory)
                     source = root / "source.mp4"
                     source.write_bytes(b"source-content-v1")
-                    shared_components = {
-                        "cache_contract": "ive_source_local_visual_features_v1",
-                        "feature_schema_version": 1,
-                        "descriptor_schema": "test_numeric_descriptor_v1",
-                        "model_asset_sha256_or_state": {"test": "present"},
-                        "runtime": {"opencv": cv2.__version__},
-                    }
-                    legacy = AnalyzerFingerprint(
-                        digest=legacy_digest,
-                        components={
-                            **shared_components,
-                            "code_sha256": {
-                                "pose.py": "3" * 64,
-                                "visual_score.py": "1" * 64,
-                            },
-                        },
-                    )
-                    current_code = {
-                        "pose.py": "3" * 64,
-                        "visual_score_descriptor_ast_v1": "2" * 64,
-                    } if current_digest.startswith("ac7de83a") else {
-                        "pose.py": "3" * 64,
-                        "visual_score.py": "2" * 64,
-                    }
-                    current = AnalyzerFingerprint(
-                        digest=current_digest,
-                        components={
-                            **shared_components,
-                            "code_sha256": current_code,
-                        },
-                    )
                     request = _request()
+                    legacy_components = json.loads(
+                        json.dumps(
+                            _audited_analyzer_components(
+                                _AUDITED_LEGACY_DESCRIPTOR_DIGEST
+                            )
+                        )
+                    )
+                    mutate(legacy_components)
+                    tampered_legacy = AnalyzerFingerprint(
+                        digest=_AUDITED_LEGACY_ANALYZER_DIGEST,
+                        components=legacy_components,
+                    )
                     cold = PersistentVisualFeatureCache(
                         source_cache_directory=root / "cache",
                         source_path=source,
-                        analyzer=legacy,
+                        analyzer=tampered_legacy,
                     )
                     self.assertTrue(cold.put(request, {"value": 1.0}))
                     warm = PersistentVisualFeatureCache(
@@ -621,17 +902,46 @@ class VisualFeatureCacheTests(unittest.TestCase):
                         source_path=source,
                         analyzer=current,
                     )
-
-                    self.assertEqual(
+                    self.assertIsNone(
                         warm.get_by_locator(request.locator),
-                        {"value": 1.0},
                     )
-                    diagnostics = warm.diagnostics()
-                    self.assertEqual(diagnostics["decode_free_hit_count"], 1)
                     self.assertEqual(
-                        diagnostics["decode_free_legacy_hit_count"],
+                        warm.diagnostics()["invalid_record_count"],
                         1,
                     )
+
+    def test_analyzer_migration_rejects_tampered_current_endpoint(
+        self,
+    ) -> None:
+        legacy = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_LEGACY_DESCRIPTOR_DIGEST)
+        )
+        tampered_current_components = _audited_analyzer_components(
+            _AUDITED_CURRENT_DESCRIPTOR_DIGEST
+        )
+        tampered_current_components["runtime"]["opencv"] = "tampered-runtime"
+        tampered_current = AnalyzerFingerprint(
+            digest=_AUDITED_CURRENT_ANALYZER_DIGEST,
+            components=tampered_current_components,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=legacy,
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=tampered_current,
+            )
+            self.assertIsNone(warm.get_by_locator(request.locator))
+            self.assertEqual(warm.diagnostics()["invalid_record_count"], 1)
 
     def test_direct_member_provider_reuses_interrupted_run_features(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

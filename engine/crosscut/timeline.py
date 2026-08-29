@@ -47,19 +47,43 @@ class NoCompleteTimelinePath(ValueError):
         reason_code: str,
         segment_index: int | None = None,
         rejection_counts: Mapping[str, int] | None = None,
+        profile_failures: Sequence[
+            tuple[str, "NoCompleteTimelinePath"]
+        ] = (),
     ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
         self.segment_index = segment_index
         self.rejection_counts = dict(sorted((rejection_counts or {}).items()))
+        failures = tuple(profile_failures)
+        if any(
+            not isinstance(profile, str)
+            or not profile
+            or profile != profile.strip()
+            or not isinstance(failure, NoCompleteTimelinePath)
+            for profile, failure in failures
+        ):
+            raise TypeError("profile no-path diagnostics are invalid")
+        if len({profile for profile, _failure in failures}) != len(failures):
+            raise ValueError("profile no-path diagnostics cannot repeat")
+        self.profile_failures = failures
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "reason_code": self.reason_code,
             "segment_index": self.segment_index,
             "rejection_counts": dict(self.rejection_counts),
             "message": str(self),
         }
+        if self.profile_failures:
+            payload["profile_failures"] = [
+                {
+                    "cadence_profile": profile,
+                    "no_complete_path": failure.to_dict(),
+                }
+                for profile, failure in self.profile_failures
+            ]
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

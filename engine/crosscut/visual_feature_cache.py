@@ -31,6 +31,9 @@ import uuid
 
 VISUAL_FEATURE_CACHE_CONTRACT = "ive_source_local_visual_features_v1"
 VISUAL_FEATURE_SCHEMA_VERSION = 1
+PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT = (
+    "python_module_symbol_dependency_ast_v2"
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAXIMUM_RECORD_BYTES = 16 * 1024 * 1024
 _FORBIDDEN_PAYLOAD_KEY_PARTS = (
@@ -49,56 +52,53 @@ _STABLE_FILE_DIGEST_PROCESS_CACHE: dict[
 _STABLE_FILE_DIGEST_PROCESS_CACHE_LIMIT = 64
 _MAXIMUM_DECODE_FREE_LOCATOR_RECORDS = 4_096
 _LOCATOR_INDEX_OVER_BUDGET_PROCESS_ROOTS: set[str] = set()
-# These exact visual-score changes were audited as descriptor-equivalent: one
-# moves an already-persisted lookup ahead of frame decoding and the other adds
-# section-role candidate-selection controls.  Neither alters numeric feature
-# extraction.  Bind each migration to the exact post-change analyzer digest so
-# any future visual-score edit automatically disables legacy reuse.
-_DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[str, tuple[str, ...]] = {
-    # First descriptor-AST fingerprint.  The exact legacy visual_score digest
-    # was audited before switching from whole-module to dependency-only code
-    # identity; future selector edits retain this analyzer digest automatically.
-    "ac7de83aac79715f25f4a7c93f2d861b93047e5a92e89694496c2d7b3d3fb47d": (
-        "e09b787bf407c2eacc09f1d1f52a0318dc8b1e981b70eaf199c863cf67af0829",
-        "b7e9ad896ed5403819b8fa31772a97b4f82365ba5f65a032c22d024233f83d4a",
-        "ba991e083dd4e94ef7d4a251bc05538d1bb2feaf0582408249090d2908e0b23b",
-        "19740a80bc18933032e9265a747a74678a4ff7cfa22e26ddb0ea14528705d6d1",
-        "c44b51f780f0d2b6e37751c2053f8630b63d3e799cd617936333ecace435da8b",
-        "5d32ea38abfbad7fac015c91f00e8957ac2db95a460778e3a207c16ae3ca9fe2",
-        "976479db2b02b46830aa53e55c20b03aabd5bdb660aee9795d81e2587b2cab93",
-        "b7d906f1578b0bb967ad9c331a1c6ad3c7147cb596e0ba155af41c80f667a7a4",
-        "48f2ed8ef454539ac3e8502c905c325b1113158c7bd840de6aefac83105ce3d1",
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "e3196dd457bfcf0d3227475e21083d04b808fd331e1c2a1dfe7890510ee2e8e4": (
-        "dd214dcfe13d3af7c5119a5ea3067fe7ec703fd8ff864b7fa34c11f95622f433",
-    ),
-    "48f2ed8ef454539ac3e8502c905c325b1113158c7bd840de6aefac83105ce3d1": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "b7d906f1578b0bb967ad9c331a1c6ad3c7147cb596e0ba155af41c80f667a7a4": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "976479db2b02b46830aa53e55c20b03aabd5bdb660aee9795d81e2587b2cab93": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "5d32ea38abfbad7fac015c91f00e8957ac2db95a460778e3a207c16ae3ca9fe2": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "c44b51f780f0d2b6e37751c2053f8630b63d3e799cd617936333ecace435da8b": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "19740a80bc18933032e9265a747a74678a4ff7cfa22e26ddb0ea14528705d6d1": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "ba991e083dd4e94ef7d4a251bc05538d1bb2feaf0582408249090d2908e0b23b": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "b7e9ad896ed5403819b8fa31772a97b4f82365ba5f65a032c22d024233f83d4a": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
-    ),
-    "e09b787bf407c2eacc09f1d1f52a0318dc8b1e981b70eaf199c863cf67af0829": (
-        "809393a519d0699ec8aaed96e161cc275c823bd3164a180343cfd7f67ccfc4ee",
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodeEquivalentAnalyzerMigration:
+    """One audited, one-way analyzer migration with exact code identities."""
+
+    legacy_analyzer_digest: str
+    descriptor_component_name: str
+    legacy_descriptor_digest: str
+    current_descriptor_digest: str
+
+    def __post_init__(self) -> None:
+        for digest in (
+            self.legacy_analyzer_digest,
+            self.legacy_descriptor_digest,
+            self.current_descriptor_digest,
+        ):
+            if _SHA256.fullmatch(digest) is None:
+                raise ValueError("analyzer migration digest is invalid")
+        if not self.descriptor_component_name.strip():
+            raise ValueError("analyzer migration component name is blank")
+        if self.legacy_descriptor_digest == self.current_descriptor_digest:
+            raise ValueError("analyzer migration must change descriptor code")
+
+
+# Alias-level AST v2 changes only the dependency fingerprint representation;
+# the descriptor implementation and every decoded numeric feature are
+# unchanged.  Reuse is deliberately restricted to the exact XOXZ analyzer
+# generation that produced the current complete descriptor set.  The reverse
+# direction and every unknown intermediate generation remain incompatible.
+_DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
+    str,
+    tuple[_DecodeEquivalentAnalyzerMigration, ...],
+] = {
+    "14fff1f9ee74dbaed4023c6fbbbd4cd94b67e078a94f3d272885669cfe0e6b30": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "648cfb9801b2de54d4325a7c838e31bbadfbeaa8d71a68c37163d8c41f27b19c"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
+            ),
+            current_descriptor_digest=(
+                "c0de5b604e22d12c713b02edfe2b5a0de8d19a80475b1547b861f975d8978d89"
+            ),
+        ),
     ),
 }
 
@@ -164,6 +164,22 @@ def _file_digest(path: Path) -> str:
     return digest
 
 
+def _analyzer_components_sha256(components: Mapping[str, Any]) -> str | None:
+    """Return the canonical analyzer digest, or None for invalid components."""
+
+    try:
+        encoded = json.dumps(
+            dict(components),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class AnalyzerFingerprint:
     """Stable analyzer identity included in every cache record and path."""
@@ -224,15 +240,10 @@ def build_analyzer_fingerprint(
         "model_asset_sha256_or_state": models,
         "runtime": runtime,
     }
-    encoded = json.dumps(
-        components,
-        ensure_ascii=True,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    digest = _analyzer_components_sha256(components)
+    assert digest is not None
     return AnalyzerFingerprint(
-        digest=hashlib.sha256(encoded).hexdigest(),
+        digest=digest,
         components=components,
     )
 
@@ -263,7 +274,27 @@ def python_symbol_dependency_sha256(
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 local_name = alias.asname or alias.name.split(".", 1)[0]
-                definitions[local_name] = node
+                # Bind an imported dependency to the one alias actually loaded
+                # by the analyzer.  Hashing the complete import node made an
+                # unrelated selector alias invalidate every persisted frame
+                # descriptor merely because both aliases shared one statement.
+                # Preserve the module and relative level for ImportFrom, and
+                # preserve the imported name/asname for both forms, so every
+                # semantic change to the referenced alias still invalidates.
+                canonical_alias = ast.alias(
+                    name=alias.name,
+                    asname=alias.asname,
+                )
+                if isinstance(node, ast.ImportFrom):
+                    definitions[local_name] = ast.ImportFrom(
+                        module=node.module,
+                        names=[canonical_alias],
+                        level=node.level,
+                    )
+                else:
+                    definitions[local_name] = ast.Import(
+                        names=[canonical_alias],
+                    )
             continue
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -309,7 +340,7 @@ def python_symbol_dependency_sha256(
 
     encoded = json.dumps(
         {
-            "contract": "python_module_symbol_dependency_ast_v1",
+            "contract": PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
             "module_name": resolved.name,
             "root_symbols": sorted(set(roots)),
             "symbol_ast": {key: included[key] for key in sorted(included)},
@@ -604,9 +635,17 @@ class PersistentVisualFeatureCache:
         )
         source_root = self._safe_directory(source_root, self.source_sha256)
         self._root = self._safe_directory(source_root, analyzer.digest)
-        self._compatible_legacy_analyzer_digests = tuple(
+        self._compatible_legacy_analyzer_migrations = tuple(
             _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS.get(analyzer.digest, ())
         )
+        self._compatible_legacy_analyzer_digests = tuple(
+            migration.legacy_analyzer_digest
+            for migration in self._compatible_legacy_analyzer_migrations
+        )
+        if len(set(self._compatible_legacy_analyzer_digests)) != len(
+            self._compatible_legacy_analyzer_digests
+        ):
+            raise ValueError("legacy analyzer migration digests must be unique")
         lookup_roots = [self._root]
         for legacy_digest in self._compatible_legacy_analyzer_digests:
             if _SHA256.fullmatch(legacy_digest) is None:
@@ -710,7 +749,15 @@ class PersistentVisualFeatureCache:
         }:
             return False
         legacy_digest = actual_analyzer.get("fingerprint_sha256")
-        if legacy_digest not in self._compatible_legacy_analyzer_digests:
+        migration = next(
+            (
+                candidate
+                for candidate in self._compatible_legacy_analyzer_migrations
+                if candidate.legacy_analyzer_digest == legacy_digest
+            ),
+            None,
+        )
+        if migration is None:
             return False
         actual_components = actual_analyzer.get("components")
         expected_components = expected_analyzer["components"]
@@ -734,27 +781,33 @@ class PersistentVisualFeatureCache:
             Mapping,
         ):
             return False
-        actual_names = set(actual_code)
-        expected_names = set(expected_code)
-        if actual_names == expected_names:
-            return all(
-                actual_code.get(name) == expected_code.get(name)
-                for name in expected_code
-                if name != "visual_score.py"
-            )
-        if (
-            actual_names - expected_names == {"visual_score.py"}
-            and expected_names - actual_names
-            == {"visual_score_descriptor_ast_v1"}
+        if set(actual_code) != set(expected_code):
+            return False
+        descriptor_name = migration.descriptor_component_name
+        if descriptor_name not in actual_code:
+            return False
+        if actual_code.get(descriptor_name) != migration.legacy_descriptor_digest:
+            return False
+        if expected_code.get(descriptor_name) != migration.current_descriptor_digest:
+            return False
+        if any(
+            actual_code.get(name) != expected_code.get(name)
+            for name in expected_code
+            if name != descriptor_name
         ):
-            # The exact analyzer-digest migration above is the explicit audit
-            # authority for replacing the old whole-file hash.  Every shared
-            # dependency (currently pose.py) must still match byte-for-byte.
-            return all(
-                actual_code.get(name) == expected_code.get(name)
-                for name in actual_names & expected_names
-            )
-        return False
+            return False
+        # The allowlist is not authority to manufacture either endpoint.  Both
+        # complete component objects must hash to their stated full analyzer
+        # identities, so schema/model/runtime/pose tampering fails closed even
+        # when a caller supplies one of the two allowlisted digest strings.
+        if _analyzer_components_sha256(actual_components) != legacy_digest:
+            return False
+        if (
+            _analyzer_components_sha256(expected_components)
+            != self.analyzer.digest
+        ):
+            return False
+        return True
 
     def _record_path(self, request: DescriptorRequestIdentity) -> Path:
         identity = self._record_identity(request)
@@ -1137,6 +1190,7 @@ __all__ = [
     "DescriptorRequestIdentity",
     "DescriptorRequestLocator",
     "PersistentVisualFeatureCache",
+    "PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT",
     "VISUAL_FEATURE_CACHE_CONTRACT",
     "VISUAL_FEATURE_SCHEMA_VERSION",
     "build_analyzer_fingerprint",

@@ -696,6 +696,25 @@ class VisualBoundaryRepairTests(unittest.TestCase):
             repaired.repairs[0].result_edge_context_identity,
             splice_feedback_result_context_identity(repaired.timeline, 0),
         )
+        success_audit = repaired.to_dict()["repairs"][0][
+            "candidate_evidence_audit"
+        ]
+        self.assertEqual(
+            tuple(item["frame_offset"] for item in success_audit),
+            tuple(range(-3, 4)),
+        )
+        selected_audit = next(
+            item
+            for item in success_audit
+            if item["frame_offset"] == 2
+        )
+        self.assertTrue(
+            selected_audit["production_transition_gate_passed"]
+        )
+        self.assertEqual(
+            selected_audit["visual_evidence"],
+            repaired.repairs[0].selected_visual_evidence.to_dict(),
+        )
 
     def test_same_source_boundary_is_not_retimed(self) -> None:
         plan = VisualTimelinePlan((_choice(0, 0), _choice(1, 0)), 2.0)

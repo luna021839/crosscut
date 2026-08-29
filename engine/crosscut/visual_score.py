@@ -1484,6 +1484,7 @@ def _select_safe_cadence_candidates(
                 f"profile_failures={failure_summary}",
                 reason_code="all_safe_cadence_profiles_exhausted",
                 rejection_counts=rejection_counts,
+                profile_failures=tuple(profile_failures),
             )
         raise NoCompleteTimelinePath(
             "safe cadence candidate generation produced no result",
