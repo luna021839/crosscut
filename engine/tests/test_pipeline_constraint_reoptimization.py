@@ -23,6 +23,10 @@ from crosscut.joint_timeline import (
     JointTimelineCandidateClock,
     JointTimelinePathSignature,
 )
+from crosscut.joint_decoded_budget import (
+    JointDecodedBudgetLedger,
+    JointDecodedLookRefinementEligibility,
+)
 from crosscut.pipeline import (
     ELIGIBLE_SOURCE_INDEX_DOMAIN,
     _BoundarySearchBudget,
@@ -56,11 +60,17 @@ from crosscut.pipeline import (
     _joint_complete_path_signature,
     _joint_complete_path_no_good_allowed_from_feedback,
     _joint_decoded_look_already_passed_audit_fields,
+    _joint_decoded_materialized_candidate_attempt_allowed,
     _joint_decoded_render_variant_signature,
+    _joint_group_look_boundary_reason_contract,
     _joint_group_look_refinement_acceptance,
+    _joint_group_look_refinement_eligibility,
+    _joint_group_look_sensitive_visible_audit,
+    _joint_group_exact_decoded_path_invariant_reasons,
     _joint_group_nonlook_regression_reasons,
     _joint_look_refinement_complete_path_no_good_allowed,
     _joint_localized_decoded_boundary_no_goods,
+    _joint_look_variant_boundary_failure_count,
     _joint_neutral_interior_motion_overlay,
     _joint_nonlocal_render_contract_failure_fingerprints,
     _joint_selection_proof_materialization_call_count,
@@ -304,6 +314,7 @@ def _joint_bound_feedback_review(
     evidence["evidence_sha256"] = _canonical_sha256(evidence)
     return {
         "passed": False,
+        "introduced_cross_source_technical_issue_reasons": [],
         "proxy": proxy_identity,
         "segment_interior_geometry": evidence,
         "perceptual_source_admission": {
@@ -332,9 +343,54 @@ def _joint_nonlook_review_payload() -> dict[str, object]:
             "issue_fraction": 0.0,
         },
         "segment_interior_geometry": {
+            "schema_version": SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
+            "contract": SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+            "analysis_basis": SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
+            "source_index_domain": "render_plan_sources_array_index",
+            "output_frame_index_domain": "decoded_proxy_output_frame_index",
             "complete": True,
             "geometry_provider_failure_count": 0,
             "render_timeline_binding_sha256": "a" * 64,
+            "sampling_schedule_sha256": "b" * 64,
+            "sampling_policy": {
+                "sample_fractions": [0.25, 0.5, 0.75],
+                "rounding": "nearest_output_frame_half_up_unique",
+            },
+            "segment_count": 2,
+            "sample_count": 6,
+            "geometry_backend_provenance": {
+                "face_backends": ["yunet"],
+                "silhouette_backends": [
+                    "opencv_zoo_pphumanseg_2023mar"
+                ],
+            },
+            "proxy_identity": {
+                "width": 854,
+                "height": 480,
+                "fps": 29.97,
+                "decoded_frame_count": 60,
+                "duration_seconds": 2.0,
+                "render_codec": "h264",
+                "content_sha256": "c" * 64,
+            },
+            "segments": [
+                {
+                    "segment_index": 0,
+                    "source_index": 0,
+                    "segment_frame_start": 0,
+                    "segment_frame_end": 30,
+                    "segment_frame_count": 30,
+                    "source_content_sha256": "d" * 64,
+                },
+                {
+                    "segment_index": 1,
+                    "source_index": 1,
+                    "segment_frame_start": 30,
+                    "segment_frame_end": 60,
+                    "segment_frame_count": 30,
+                    "source_content_sha256": "e" * 64,
+                },
+            ],
         },
         "technical_proxy_passed_before_montage_grammar": True,
         "professional_reference_gate": {"passed": True},
@@ -345,6 +401,17 @@ def _joint_nonlook_review_payload() -> dict[str, object]:
                 "review_domain": "introduced_cross_source",
                 "outgoing_source_index": 0,
                 "incoming_source_index": 1,
+                "cut_frame_index": 30,
+                "frame_indices": [28, 29, 30, 31],
+                "sample_offsets": [-2, -1, 0, 1],
+                "transition_reason": (
+                    "joint_decoded_pose_motion_matched_hard_cut"
+                ),
+                "transition_tier": "C",
+                "transition_kind": "hard_cut",
+                "transition_frame_count": 0,
+                "transition_duration_seconds": 0.0,
+                "source_clock_contiguous": False,
                 "passed": True,
                 "issue_reasons": [],
                 "technical_integrity_issue_reasons": [],
@@ -582,7 +649,20 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         with patch(
             "crosscut.pipeline.build_editorial_motion_plan",
             return_value=proposed,
-        ):
+        ), patch(
+            "crosscut.pipeline.merge_joint_interior_motion_overlay",
+            return_value=SimpleNamespace(
+                plan=proposed,
+                segments=(
+                    replace(
+                        materialized.segments[0],
+                        editorial_transform=pulse,
+                    ),
+                    materialized.segments[1],
+                ),
+                applied=True,
+            ),
+        ) as merger:
             motion, segments, applied = _joint_neutral_interior_motion_overlay(
                 materialized,  # type: ignore[arg-type]
                 provider_plan=provider,
@@ -594,7 +674,11 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         self.assertTrue(applied)
         self.assertIs(motion, proposed)
         self.assertIs(segments[0].editorial_transform, pulse)
-        self.assertIsNone(segments[1].editorial_transform)
+        self.assertIs(segments[1].editorial_transform, identity)
+        self.assertEqual(
+            merger.call_args.kwargs["output_fps"],
+            materialized.output_fps,
+        )
 
     def test_joint_non_neutral_provider_never_stacks_generic_motion(self) -> None:
         corrective = EditorialTransformTrack(
@@ -626,7 +710,10 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             segments=(segment,),
         )
 
-        with patch("crosscut.pipeline.build_editorial_motion_plan") as builder:
+        with patch(
+            "crosscut.pipeline.build_editorial_motion_plan",
+            return_value=provider,
+        ) as builder:
             motion, segments, applied = _joint_neutral_interior_motion_overlay(
                 materialized,  # type: ignore[arg-type]
                 provider_plan=provider,
@@ -635,7 +722,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 section_plan=None,
             )
 
-        builder.assert_not_called()
+        builder.assert_called_once()
         self.assertFalse(applied)
         self.assertIs(motion, provider)
         self.assertEqual(segments, (segment,))
@@ -2510,7 +2597,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             0,
         )
 
-    def test_joint_localized_feedback_excludes_aggregate_and_same_source(
+    def test_joint_localized_feedback_separates_look_from_path_cause(
         self,
     ) -> None:
         candidate = _joint_materialized_mock("local")
@@ -2551,7 +2638,40 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             eligible_indices=(2, 7),
         )
 
+        self.assertEqual(no_goods, frozenset())
+        self.assertEqual(
+            _joint_look_variant_boundary_failure_count(payload),
+            1,
+        )
+        technical_look = json.loads(json.dumps(payload))
+        technical_look["boundaries"][0][
+            "technical_integrity_issue_reasons"
+        ] = ["color_shock"]
+        self.assertEqual(
+            _joint_look_variant_boundary_failure_count(technical_look),
+            0,
+        )
+        mixed_unknown = json.loads(json.dumps(payload))
+        mixed_unknown["boundaries"][0]["issue_reasons"].append(
+            "future_aesthetic_code"
+        )
+        self.assertEqual(
+            _joint_look_variant_boundary_failure_count(mixed_unknown),
+            0,
+        )
+        payload["boundaries"][0]["issue_reasons"].append(
+            "structure_shock"
+        )
+        no_goods = _joint_localized_decoded_boundary_no_goods(
+            candidate,
+            payload,
+            eligible_indices=(2, 7),
+        )
         self.assertEqual(len(no_goods), 1)
+        self.assertEqual(
+            _joint_look_variant_boundary_failure_count(payload),
+            0,
+        )
         key, offset = next(iter(no_goods))
         self.assertIs(key, candidate.joint_result.boundary_options[0].measurement_key)
         self.assertEqual(offset, 0)
@@ -2657,13 +2777,150 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             )
 
             self.assertTrue(classification["feedback_binding_valid"])
-            self.assertEqual(len(forbidden_boundaries), 1)
-            self.assertIsNone(shared_failure)
+            self.assertEqual(len(forbidden_boundaries), 0)
+            self.assertEqual(
+                classification["look_variant_boundary_failure_count"],
+                1,
+            )
             self.assertTrue(
+                classification[
+                    "complete_path_no_good_deferred_for_render_variant"
+                ]
+            )
+            self.assertIsNone(shared_failure)
+            self.assertFalse(
                 _joint_complete_path_no_good_allowed_from_feedback(
                     classification
                 )
             )
+
+    def test_joint_feedback_unknown_or_malformed_technical_code_authors_nothing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            for label, technical_reasons, global_reasons in (
+                (
+                    "unknown",
+                    ["future_decoded_integrity_fault"],
+                    [],
+                ),
+                (
+                    "malformed",
+                    "future_decoded_integrity_fault",
+                    [],
+                ),
+                (
+                    "global-unknown",
+                    [],
+                    ["future_global_integrity_fault"],
+                ),
+            ):
+                with self.subTest(label=label):
+                    review_payload = _joint_bound_feedback_review(render_plan)
+                    boundaries = review_payload["boundaries"]
+                    assert isinstance(boundaries, list)
+                    boundaries[0][
+                        "technical_integrity_issue_reasons"
+                    ] = technical_reasons
+                    review_payload[
+                        "introduced_cross_source_technical_issue_reasons"
+                    ] = global_reasons
+                    candidate = _joint_materialized_mock(label)
+                    forbidden_boundaries = set()
+                    classifications = {}
+                    nonlocal_failure_paths = {}
+
+                    classification, shared_failure = (
+                        _record_bound_joint_decoded_feedback(
+                            candidate,
+                            SimpleNamespace(render_plan=render_plan),
+                            review_payload,
+                            eligible_indices=(2, 7),
+                            forbidden_boundary_selections=(
+                                forbidden_boundaries
+                            ),
+                            feedback_classifications=classifications,
+                            nonlocal_contract_failure_paths=(
+                                nonlocal_failure_paths
+                            ),
+                        )
+                    )
+
+                    self.assertTrue(classification["feedback_binding_valid"])
+                    self.assertFalse(
+                        classification["feedback_authoring_allowed"]
+                    )
+                    self.assertTrue(
+                        classification[
+                            "complete_path_no_good_deferred_for_render_variant"
+                        ]
+                    )
+                    self.assertTrue(
+                        classification["feedback_authoring_block_reasons"]
+                    )
+                    self.assertEqual(forbidden_boundaries, set())
+                    self.assertEqual(nonlocal_failure_paths, {})
+                    self.assertIsNone(shared_failure)
+                    self.assertFalse(
+                        _joint_complete_path_no_good_allowed_from_feedback(
+                            classification
+                        )
+                    )
+                    audit = classification["feedback_authoring_audit"]
+                    assert isinstance(audit, dict)
+                    self.assertFalse(
+                        audit[
+                            "unknown_or_malformed_reason_promoted_to_no_good"
+                        ]
+                    )
+                    if label == "unknown":
+                        self.assertEqual(
+                            audit["unknown_technical_codes"][0]["code"],
+                            "future_decoded_integrity_fault",
+                        )
+                    if label == "global-unknown":
+                        self.assertEqual(
+                            audit["unknown_technical_codes"][0]["code"],
+                            "future_global_integrity_fault",
+                        )
+
+    def test_joint_feedback_known_localized_code_authors_exact_boundary_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            review_payload = _joint_bound_feedback_review(render_plan)
+            boundaries = review_payload["boundaries"]
+            assert isinstance(boundaries, list)
+            boundaries[0]["issue_reasons"] = ["structure_shock"]
+            candidate = _joint_materialized_mock("known-localized")
+            forbidden_boundaries = set()
+            classifications = {}
+
+            classification, shared_failure = (
+                _record_bound_joint_decoded_feedback(
+                    candidate,
+                    SimpleNamespace(render_plan=render_plan),
+                    review_payload,
+                    eligible_indices=(2, 7),
+                    forbidden_boundary_selections=forbidden_boundaries,
+                    feedback_classifications=classifications,
+                    nonlocal_contract_failure_paths={},
+                )
+            )
+
+        self.assertTrue(classification["feedback_authoring_allowed"])
+        self.assertEqual(len(forbidden_boundaries), 1)
+        self.assertEqual(
+            classification["localized_boundary_no_good_count"],
+            1,
+        )
+        self.assertEqual(
+            classification["look_variant_boundary_failure_count"],
+            0,
+        )
+        self.assertIsNone(shared_failure)
 
     def test_same_source_zero_tolerance_failure_has_shared_contract_fingerprint(
         self,
@@ -2822,14 +3079,160 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             baseline,
             regressed,
         )
-        self.assertIn("visible_boundary_p10_regressed", reasons)
+        self.assertNotIn("visible_boundary_p10_regressed", reasons)
         self.assertIn("rendered_montage_grammar_review_regressed", reasons)
         self.assertIn(
             "boundary_0_technical_integrity_regressed",
             reasons,
         )
 
-    def test_joint_look_rejects_visible_issue_fraction_regression(self) -> None:
+    def test_joint_look_eligibility_uses_exact_nonlook_contract_only(
+        self,
+    ) -> None:
+        payload = _joint_nonlook_review_payload()
+        payload["technical_proxy_passed_before_montage_grammar"] = False
+        payload["visible_boundary_score"] = {
+            "p10": 0.0,
+            "issue_fraction": 1.0,
+        }
+
+        eligibility, diagnostics = (
+            _joint_group_look_refinement_eligibility(
+                payload,
+                exact_evidence=True,
+                look_admission_passed=False,
+                decoded_review_passed=False,
+            )
+        )
+
+        self.assertTrue(eligibility.authorized)
+        self.assertTrue(eligibility.nonlook_gates_passed)
+        self.assertFalse(diagnostics["visible_boundary_score_used"])
+        self.assertFalse(diagnostics["technical_proxy_boolean_used"])
+        self.assertFalse(diagnostics["look_or_color_threshold_changed"])
+
+    def test_joint_look_eligibility_rejects_unknown_boundary_technical_code(
+        self,
+    ) -> None:
+        payload = _joint_nonlook_review_payload()
+        boundaries = payload["boundaries"]
+        assert isinstance(boundaries, list)
+        boundaries[0]["technical_integrity_issue_reasons"] = [
+            "future_decoded_integrity_fault"
+        ]
+        boundaries[0]["passed"] = False
+
+        eligibility, diagnostics = (
+            _joint_group_look_refinement_eligibility(
+                payload,
+                exact_evidence=True,
+                look_admission_passed=False,
+                decoded_review_passed=False,
+            )
+        )
+        boundary_contract = diagnostics["boundary_reason_contract"]
+        self.assertFalse(eligibility.authorized)
+        self.assertFalse(eligibility.evidence_complete)
+        self.assertEqual(
+            eligibility.reason_code,
+            "decoded_look_evidence_incomplete",
+        )
+        self.assertEqual(
+            boundary_contract["unknown_reason_codes"],
+            ["future_decoded_integrity_fault"],
+        )
+        self.assertIn(
+            "boundary_0_technical_reason_not_empty",
+            boundary_contract["block_reasons"],
+        )
+
+        ledger = JointDecodedBudgetLedger()
+        ledger.claim_base_render(candidate_index=0, path_identity="path-0")
+        self.assertIsNone(
+            ledger.claim_look_refinement(
+                candidate_index=0,
+                path_identity="path-0",
+                eligibility=eligibility,
+            )
+        )
+        self.assertEqual(ledger.look_refinement_render_count, 0)
+
+    def test_joint_look_boundary_reason_contract_rejects_malformed_issue_list(
+        self,
+    ) -> None:
+        payload = _joint_nonlook_review_payload()
+        boundaries = payload["boundaries"]
+        assert isinstance(boundaries, list)
+        boundaries[0]["issue_reasons"] = "color_shock"
+        boundaries[0]["passed"] = False
+
+        audit = _joint_group_look_boundary_reason_contract(payload)
+
+        self.assertFalse(audit["contract_complete"])
+        self.assertFalse(audit["nonlook_boundary_gates_passed"])
+        self.assertIn(
+            "boundary_0_issue_reason_contract_invalid",
+            audit["block_reasons"],
+        )
+
+    def test_pre_render_rejections_preserve_all_24_base_render_slots(
+        self,
+    ) -> None:
+        attempted = 0
+        base_renders = 0
+
+        for _candidate in range(8):
+            self.assertTrue(
+                _joint_decoded_materialized_candidate_attempt_allowed(
+                    attempted_materialized_candidate_count=attempted,
+                    base_render_count=base_renders,
+                )
+            )
+            attempted += 1  # derivation/timeline rejection before rendering
+
+        for _candidate in range(24):
+            self.assertTrue(
+                _joint_decoded_materialized_candidate_attempt_allowed(
+                    attempted_materialized_candidate_count=attempted,
+                    base_render_count=base_renders,
+                )
+            )
+            attempted += 1
+            base_renders += 1
+
+        self.assertEqual(attempted, 32)
+        self.assertEqual(base_renders, 24)
+        self.assertFalse(
+            _joint_decoded_materialized_candidate_attempt_allowed(
+                attempted_materialized_candidate_count=attempted,
+                base_render_count=base_renders,
+            )
+        )
+
+    def test_joint_look_eligibility_rejects_montage_failure_without_claim(
+        self,
+    ) -> None:
+        payload = _joint_nonlook_review_payload()
+        payload["rendered_montage_grammar_review"] = {"passed": False}
+
+        eligibility, diagnostics = (
+            _joint_group_look_refinement_eligibility(
+                payload,
+                exact_evidence=True,
+                look_admission_passed=False,
+                decoded_review_passed=False,
+            )
+        )
+
+        self.assertFalse(eligibility.authorized)
+        self.assertTrue(eligibility.evidence_complete)
+        self.assertFalse(eligibility.nonlook_gates_passed)
+        self.assertEqual(eligibility.reason_code, "nonlook_gate_failed")
+        self.assertFalse(
+            diagnostics["rendered_montage_grammar_gate_passed"]
+        )
+
+    def test_joint_look_audits_visible_issue_fraction_without_rollback(self) -> None:
         baseline = _joint_nonlook_review_payload()
         regressed = json.loads(json.dumps(baseline))
         visible = regressed["visible_boundary_score"]
@@ -2841,36 +3244,123 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             regressed,
         )
 
-        self.assertIn("visible_boundary_issue_fraction_regressed", reasons)
+        audit = _joint_group_look_sensitive_visible_audit(baseline, regressed)
+
+        self.assertEqual(reasons, ())
+        self.assertTrue(audit["contract_valid"])
+        self.assertTrue(audit["issue_fraction_regressed"])
+        self.assertFalse(audit["acceptance_blocker"])
+        self.assertNotIn("visible_boundary_issue_fraction_regressed", reasons)
         self.assertNotIn("visible_boundary_p10_regressed", reasons)
 
-    def test_joint_look_rejects_boundary_pass_regression(self) -> None:
+    def test_joint_look_visible_contract_is_audit_only_when_malformed(self) -> None:
+        baseline = _joint_nonlook_review_payload()
+        proposed = json.loads(json.dumps(baseline))
+        proposed["visible_boundary_score"] = {"p10": "invalid"}
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            proposed,
+        )
+        audit = _joint_group_look_sensitive_visible_audit(
+            baseline,
+            proposed,
+        )
+
+        self.assertEqual(reasons, ())
+        self.assertFalse(audit["contract_valid"])
+        self.assertTrue(audit["contract_issues"])
+        self.assertFalse(audit["used_for_nonlook_rollback"])
+
+    def test_joint_look_exact_path_invariants_bind_clock_transition_and_geometry(
+        self,
+    ) -> None:
+        baseline = _joint_nonlook_review_payload()
+        same_path_look = json.loads(json.dumps(baseline))
+        previous_binding = "a" * 64
+        proposed_binding = "f" * 64
+        same_path_look["segment_interior_geometry"][
+            "render_timeline_binding_sha256"
+        ] = proposed_binding
+
+        reasons = _joint_group_exact_decoded_path_invariant_reasons(
+            baseline,
+            same_path_look,
+            previous_render_timeline_binding_sha256=previous_binding,
+            proposed_render_timeline_binding_sha256=proposed_binding,
+        )
+        self.assertEqual(reasons, ())
+
+        mutations = {
+            "cut_frame": lambda payload: payload["boundaries"][0].update(
+                {"cut_frame_index": 31}
+            ),
+            "frame_indices": lambda payload: payload["boundaries"][0].update(
+                {"frame_indices": [29, 30, 31, 32]}
+            ),
+            "transition_kind": lambda payload: payload["boundaries"][0].update(
+                {"transition_kind": "dissolve"}
+            ),
+            "source_clock": lambda payload: payload["boundaries"][0].update(
+                {"source_clock_contiguous": True}
+            ),
+            "sampling_schedule": lambda payload: payload[
+                "segment_interior_geometry"
+            ].update({"sampling_schedule_sha256": "9" * 64}),
+            "segment_source": lambda payload: payload[
+                "segment_interior_geometry"
+            ]["segments"][1].update({"source_index": 7}),
+            "proxy_clock": lambda payload: payload[
+                "segment_interior_geometry"
+            ]["proxy_identity"].update({"fps": 30.0}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(same_path_look))
+                mutate(changed)
+                changed_reasons = (
+                    _joint_group_exact_decoded_path_invariant_reasons(
+                        baseline,
+                        changed,
+                        previous_render_timeline_binding_sha256=(
+                            previous_binding
+                        ),
+                        proposed_render_timeline_binding_sha256=(
+                            proposed_binding
+                        ),
+                    )
+                )
+                self.assertTrue(changed_reasons)
+
+        binding_mismatch = json.loads(json.dumps(same_path_look))
+        reasons = _joint_group_exact_decoded_path_invariant_reasons(
+            baseline,
+            binding_mismatch,
+            previous_render_timeline_binding_sha256=previous_binding,
+            proposed_render_timeline_binding_sha256="8" * 64,
+        )
+        self.assertIn("proposed_render_timeline_binding_mismatch", reasons)
+
+    def test_joint_look_uses_aggregate_gate_for_boundary_aesthetic_jitter(
+        self,
+    ) -> None:
         baseline = _joint_nonlook_review_payload()
         regressed = json.loads(json.dumps(baseline))
         boundaries = regressed["boundaries"]
         assert isinstance(boundaries, list)
         boundaries[0]["passed"] = False
-
-        reasons = _joint_group_nonlook_regression_reasons(
-            baseline,
-            regressed,
-        )
-
-        self.assertIn("boundary_0_pass_regressed", reasons)
-
-    def test_joint_look_rejects_new_general_boundary_issue(self) -> None:
-        baseline = _joint_nonlook_review_payload()
-        regressed = json.loads(json.dumps(baseline))
-        boundaries = regressed["boundaries"]
-        assert isinstance(boundaries, list)
         boundaries[0]["issue_reasons"] = ["color_shock"]
+        discontinuities = boundaries[0]["discontinuities"]
+        assert isinstance(discontinuities, dict)
+        discontinuities.pop("face_scale_discontinuity")
+        discontinuities["face_position_discontinuity"] = 0.40
 
         reasons = _joint_group_nonlook_regression_reasons(
             baseline,
             regressed,
         )
 
-        self.assertIn("boundary_0_issue_set_regressed", reasons)
+        self.assertEqual(reasons, ())
 
     def test_joint_look_rejects_missing_gate_pass_contract(self) -> None:
         baseline = _joint_nonlook_review_payload()
@@ -2887,7 +3377,9 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             reasons,
         )
 
-    def test_joint_look_rejects_malformed_prior_geometry_scalar(self) -> None:
+    def test_joint_look_ignores_optional_boundary_geometry_scalar_shape(
+        self,
+    ) -> None:
         malformed = _joint_nonlook_review_payload()
         boundaries = malformed["boundaries"]
         assert isinstance(boundaries, list)
@@ -2901,10 +3393,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             proposed,
         )
 
-        self.assertIn(
-            "boundary_0_face_scale_discontinuity_contract_missing",
-            reasons,
-        )
+        self.assertEqual(reasons, ())
 
     def test_joint_refined_variant_lineage_mismatch_is_invalid_evidence(
         self,
@@ -3065,7 +3554,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             )
         )
 
-    def test_joint_look_accepts_production_visible_schema_and_rolls_back_regression(
+    def test_xoxz_candidate_3_4_replay_accepts_look_gain_despite_visible_regression(
         self,
     ) -> None:
         def review(
@@ -3074,8 +3563,8 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             penalty: float,
             montage_passed: bool = True,
         ) -> dict[str, object]:
-            return {
-                "perceptual_source_admission": {
+            payload = _joint_nonlook_review_payload()
+            payload["perceptual_source_admission"] = {
                     "analysis_basis": (
                         PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS
                     ),
@@ -3110,42 +3599,25 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                         "passed": False,
                         "selection_penalty_points": penalty,
                     },
-                },
-                "geometry_provider_failure_count": 0,
-                "introduced_cross_source_technical_issue_reasons": [],
-                "visible_boundary_score": {
-                    "p10": 0.84,
-                    "issue_fraction": 0.0,
-                },
-                "segment_interior_geometry": {
-                    "complete": True,
-                    "geometry_provider_failure_count": 0,
-                },
-                "technical_proxy_passed_before_montage_grammar": True,
-                "professional_reference_gate": {"passed": True},
-                "rendered_montage_grammar_review": {
-                    "passed": montage_passed
-                },
-                "boundaries": [
-                    {
-                        "boundary_index": 0,
-                        "review_domain": "introduced_cross_source",
-                        "outgoing_source_index": 0,
-                        "incoming_source_index": 1,
-                        "passed": True,
-                        "issue_reasons": [],
-                        "technical_integrity_issue_reasons": [],
-                        "discontinuities": {
-                            "face_scale_discontinuity": 0.08
-                        },
-                    }
-                ],
             }
+            payload["rendered_montage_grammar_review"] = {
+                "passed": montage_passed
+            }
+            return payload
 
         before = review(luma_value=0.30, penalty=18.0)
         improved = review(luma_value=0.21, penalty=9.0)
         visible = before["visible_boundary_score"]
         assert isinstance(visible, dict)
+        visible["p10"] = 58.998268739180276
+        visible["issue_fraction"] = 0.9111111111111111
+        improved_visible = improved["visible_boundary_score"]
+        assert isinstance(improved_visible, dict)
+        # Replay the old XOXZ candidate-3/4 aggregate shape, then make the
+        # look-sensitive aggregate deliberately worse.  Exact path and
+        # structural gates remain unchanged while the look objective improves.
+        improved_visible["p10"] = 57.75
+        improved_visible["issue_fraction"] = 0.9333333333333333
         self.assertNotIn("passed", visible)
         previous_objective = pipeline_module.decoded_look_objective(before)
         _objective, reasons, accepted = (
@@ -3157,6 +3629,13 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         )
         self.assertTrue(accepted)
         self.assertEqual(reasons, ())
+        visible_audit = _joint_group_look_sensitive_visible_audit(
+            before,
+            improved,
+        )
+        self.assertTrue(visible_audit["p10_regressed"])
+        self.assertTrue(visible_audit["issue_fraction_regressed"])
+        self.assertFalse(visible_audit["acceptance_blocker"])
 
         regressed = review(
             luma_value=0.21,
@@ -3257,7 +3736,13 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         forbidden_paths = set()
         materialized_paths = set()
         cumulative_proof_calls = 0
-        decoded_render_attempt_count = 0
+        decoded_budget = JointDecodedBudgetLedger()
+        look_only_eligibility = JointDecodedLookRefinementEligibility(
+            evidence_complete=True,
+            nonlook_gates_passed=True,
+            look_admission_passed=False,
+            decoded_review_passed=False,
+        )
         all_wrapped = []
 
         first_selection, first_materialized = (
@@ -3287,7 +3772,16 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
             _joint_complete_path_signature(item) for item in first_wrapped
         )
         for item in first_wrapped:
-            decoded_render_attempt_count += 1
+            path_identity = _joint_complete_path_signature(item)
+            decoded_budget.claim_base_render(
+                candidate_index=item.candidate_index,
+                path_identity=path_identity,
+            )
+            decoded_budget.claim_look_refinement(
+                candidate_index=item.candidate_index,
+                path_identity=path_identity,
+                eligibility=look_only_eligibility,
+            )
             payload = {
                 "passed": False,
                 "boundaries": [
@@ -3297,7 +3791,7 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                         "outgoing_source_index": 2,
                         "incoming_source_index": 7,
                         "passed": False,
-                        "issue_reasons": ["color_shock"],
+                        "issue_reasons": ["structure_shock"],
                         "technical_integrity_issue_reasons": [],
                     }
                 ],
@@ -3342,7 +3836,17 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         bundles = []
         reviews = []
         for item in second_wrapped:
-            decoded_render_attempt_count += 1
+            path_identity = _joint_complete_path_signature(item)
+            decoded_budget.claim_base_render(
+                candidate_index=item.candidate_index,
+                path_identity=path_identity,
+            )
+            for _iteration in range(2):
+                decoded_budget.claim_look_refinement(
+                    candidate_index=item.candidate_index,
+                    path_identity=path_identity,
+                    eligibility=look_only_eligibility,
+                )
             bundle = Mock(spec=_GroupRenderCandidateBundle)
             bundle.candidate_index = item.candidate_index
             bundle.pre_render_score = 100.0 - item.candidate_index
@@ -3375,8 +3879,14 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
         )
         self.assertEqual(cumulative_proof_calls, 16)
         self.assertLessEqual(cumulative_proof_calls, 32)
-        self.assertEqual(decoded_render_attempt_count, 16)
-        self.assertLessEqual(decoded_render_attempt_count, 24)
+        self.assertEqual(decoded_budget.base_render_count, 16)
+        self.assertEqual(decoded_budget.look_refinement_render_count, 24)
+        self.assertEqual(decoded_budget.total_render_count, 40)
+        self.assertEqual(decoded_budget.remaining_distinct_candidate_count, 8)
+        self.assertEqual(
+            decoded_budget.remaining_look_refinement_render_count,
+            0,
+        )
         self.assertEqual(len(cohort), 8)
         cohort_paths = {
             _exact_source_shot_path(bundle)
@@ -3400,11 +3910,19 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 "forbidden_boundary_selections",
                 "forbidden_complete_paths",
                 "maximum_proof_materialization_calls",
+                "decoded_montage_feedback",
             }.issubset(keywords)
         )
         source = Path(pipeline_module.__file__).read_text(encoding="utf-8")
         self.assertIn("shared_render_contract_failure", source)
-        self.assertIn("시도 {joint_decoded_render_attempt_count}/", source)
+        self.assertIn("joint_decoded_budget.claim_base_render", source)
+        self.assertIn("joint_decoded_budget.claim_look_refinement", source)
+        self.assertIn(
+            "joint_decoded_montage_observations_from_bound_review",
+            source,
+        )
+        self.assertIn("merge_joint_decoded_montage_observations", source)
+        self.assertIn("decoded_render_budget", source)
         self.assertIn("통과 {min(len(derived), 8)}/", source)
 
 

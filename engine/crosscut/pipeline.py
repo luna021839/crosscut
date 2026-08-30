@@ -315,7 +315,24 @@ from .lazy_splice_feasibility_graph import (
     LazySpliceFeasibilityKey,
 )
 from .joint_boundary_provider import DecodedBoundaryOptionProvider
+from .joint_decoded_budget import (
+    JOINT_DECODED_DISTINCT_CANDIDATE_LIMIT,
+    JointDecodedBudgetExhausted,
+    JointDecodedBudgetExhaustionReason,
+    JointDecodedBudgetLedger,
+    JointDecodedLookRefinementEligibility,
+    JointDecodedRenderKind,
+)
+from .joint_decoded_montage_feedback import (
+    joint_decoded_montage_observations_from_bound_review,
+    merge_joint_decoded_montage_observations,
+)
+from .joint_editorial_motion_overlay import (
+    merge_joint_interior_motion_overlay,
+)
 from .joint_visual_candidate_adapter import (
+    JointDecodedMontageFeedback,
+    JointDecodedMontageSegmentObservation,
     JointMaterializedVisualCandidate,
     JointVisualSelectionSet,
     MINIMUM_PRODUCTION_JOINT_CANDIDATES,
@@ -824,16 +841,12 @@ def _exact_source_shot_path(candidate: Any) -> tuple[tuple[str, str], ...]:
     return tuple(path)
 
 
-_JOINT_DECODED_ATTEMPT_LIMIT = 24
 _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT = 32
 _JOINT_REQUIRED_DECODED_PASS_COUNT = 8
 _JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH = 2
 
 _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES = frozenset(
     {
-        "sharpness_discontinuity",
-        "exposure_discontinuity",
-        "color_shock",
         "structure_shock",
         "face_scale_discontinuity",
         "face_position_discontinuity",
@@ -842,6 +855,25 @@ _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES = frozenset(
         "motion_direction_discontinuity",
         "introduced_cross_source_duplicate_or_freeze",
         "introduced_cross_source_black_frame",
+    }
+)
+_JOINT_LOOK_VARIANT_BOUNDARY_FAILURE_CODES = frozenset(
+    {
+        "sharpness_discontinuity",
+        "exposure_discontinuity",
+        "color_shock",
+    }
+)
+_JOINT_LOOK_REFINEMENT_AESTHETIC_BOUNDARY_CODES = frozenset(
+    {
+        *_JOINT_LOOK_VARIANT_BOUNDARY_FAILURE_CODES,
+        "weighted_boundary_score",
+    }
+)
+_JOINT_KNOWN_CROSS_SOURCE_BOUNDARY_ISSUE_CODES = frozenset(
+    {
+        *_JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES,
+        *_JOINT_LOOK_REFINEMENT_AESTHETIC_BOUNDARY_CODES,
     }
 )
 _JOINT_NONLOCAL_RENDER_CONTRACT_DOMAINS = frozenset(
@@ -853,6 +885,222 @@ _JOINT_NONLOCAL_ZERO_TOLERANCE_TOKENS = (
     "decoded_frame_unavailable",
     "render_contract_mismatch",
 )
+
+
+def _joint_decoded_materialized_candidate_attempt_allowed(
+    *,
+    attempted_materialized_candidate_count: int,
+    base_render_count: int,
+    maximum_materialized_candidate_count: int = (
+        _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+    ),
+    maximum_base_render_count: int = JOINT_DECODED_DISTINCT_CANDIDATE_LIMIT,
+) -> bool:
+    """Keep pre-render rejection capacity separate from decoded render budget.
+
+    Materializing/deriving a candidate is bounded by the existing proof budget,
+    while only a candidate that reaches the decoded renderer consumes the base
+    render ledger.  A derivation or timeline rejection therefore cannot steal
+    one of the 24 decoded base-render opportunities.
+    """
+
+    values = {
+        "attempted materialized candidate count": (
+            attempted_materialized_candidate_count
+        ),
+        "base render count": base_render_count,
+        "maximum materialized candidate count": (
+            maximum_materialized_candidate_count
+        ),
+        "maximum base render count": maximum_base_render_count,
+    }
+    for name, value in values.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be a non-negative integer")
+    if maximum_materialized_candidate_count <= 0:
+        raise ValueError(
+            "maximum materialized candidate count must be positive"
+        )
+    if maximum_base_render_count <= 0:
+        raise ValueError("maximum base render count must be positive")
+    if attempted_materialized_candidate_count > (
+        maximum_materialized_candidate_count
+    ):
+        raise ValueError("materialized candidate accounting exceeded its cap")
+    if base_render_count > maximum_base_render_count:
+        raise ValueError("base render accounting exceeded its cap")
+    return bool(
+        attempted_materialized_candidate_count
+        < maximum_materialized_candidate_count
+        and base_render_count < maximum_base_render_count
+    )
+
+
+def _joint_exact_boundary_reason_list(
+    boundary: Mapping[str, Any],
+    field: str,
+) -> tuple[str, ...] | None:
+    """Return one exact decoded reason list, rejecting lossy coercion."""
+
+    value = boundary.get(field)
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item or item != item.strip()
+        for item in value
+    ):
+        return None
+    return tuple(value)
+
+
+def _joint_decoded_feedback_authoring_audit(
+    candidate: Any,
+    review_payload: Mapping[str, Any],
+    *,
+    eligible_indices: Sequence[int],
+) -> dict[str, Any]:
+    """Fail closed before decoded reasons can author an exact no-good.
+
+    New or malformed technical-integrity codes are evidence that the causal
+    vocabulary has changed, not proof that a selected cut is structurally
+    impossible.  Keep the exact path eligible and expose the cause for audit.
+    """
+
+    reasons: list[str] = []
+    unknown_technical_codes: list[dict[str, Any]] = []
+    underlying = _underlying_joint_materialized_candidate(candidate)
+    if underlying is None:
+        reasons.append("joint_candidate_contract_missing")
+        choices: tuple[Any, ...] = ()
+    else:
+        choices = underlying.visual_plan.choices
+    if not isinstance(review_payload.get("passed"), bool):
+        reasons.append("decoded_review_pass_contract_missing")
+    global_technical_reasons = review_payload.get(
+        "introduced_cross_source_technical_issue_reasons"
+    )
+    if not isinstance(global_technical_reasons, list) or any(
+        not isinstance(item, str) or not item or item != item.strip()
+        for item in global_technical_reasons
+    ):
+        reasons.append("global_technical_reason_contract_invalid")
+        global_technical_reasons = []
+    for technical_reason in global_technical_reasons:
+        if technical_reason in _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES:
+            continue
+        unknown_technical_codes.append(
+            {
+                "boundary_index": None,
+                "review_domain": INTRODUCED_CROSS_SOURCE_DOMAIN,
+                "code": technical_reason,
+            }
+        )
+        reasons.append(
+            "global_unknown_technical_integrity_code:"
+            f"{technical_reason}"
+        )
+    boundaries = review_payload.get("boundaries")
+    if not isinstance(boundaries, list):
+        reasons.append("decoded_boundary_contract_missing")
+        boundaries = []
+    expected_boundary_count = max(0, len(choices) - 1)
+    if len(boundaries) != expected_boundary_count:
+        reasons.append("decoded_boundary_count_mismatch")
+    seen_indices: set[int] = set()
+    for position, boundary in enumerate(boundaries):
+        if not isinstance(boundary, Mapping):
+            reasons.append(f"boundary_{position}_contract_malformed")
+            continue
+        boundary_index = boundary.get("boundary_index")
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+            or boundary_index in seen_indices
+        ):
+            reasons.append(f"boundary_{position}_index_contract_malformed")
+            continue
+        seen_indices.add(boundary_index)
+        if boundary_index != position or boundary_index >= expected_boundary_count:
+            reasons.append(f"boundary_{boundary_index}_index_domain_mismatch")
+            continue
+        if not isinstance(boundary.get("passed"), bool):
+            reasons.append(f"boundary_{boundary_index}_pass_contract_missing")
+        issue_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "issue_reasons",
+        )
+        technical_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "technical_integrity_issue_reasons",
+        )
+        if issue_reasons is None:
+            reasons.append(f"boundary_{boundary_index}_issue_reason_contract_invalid")
+        if technical_reasons is None:
+            reasons.append(
+                f"boundary_{boundary_index}_technical_reason_contract_invalid"
+            )
+            technical_reasons = ()
+        if boundary_index >= len(choices) - 1:
+            continue
+        outgoing = choices[boundary_index]
+        incoming = choices[boundary_index + 1]
+        expected_outgoing_source = _joint_report_source_index(
+            outgoing.source_index,
+            eligible_indices,
+        )
+        expected_incoming_source = _joint_report_source_index(
+            incoming.source_index,
+            eligible_indices,
+        )
+        if (
+            boundary.get("outgoing_source_index") != expected_outgoing_source
+            or boundary.get("incoming_source_index") != expected_incoming_source
+        ):
+            reasons.append(f"boundary_{boundary_index}_source_binding_mismatch")
+        cross_source = outgoing.source_index != incoming.source_index
+        domain = boundary.get("review_domain")
+        if cross_source:
+            domain_valid = domain == INTRODUCED_CROSS_SOURCE_DOMAIN
+        else:
+            domain_valid = domain in _JOINT_NONLOCAL_RENDER_CONTRACT_DOMAINS
+        if not domain_valid:
+            reasons.append(f"boundary_{boundary_index}_review_domain_mismatch")
+        for technical_reason in technical_reasons:
+            known = (
+                technical_reason in _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES
+                if cross_source
+                else any(
+                    token in technical_reason
+                    for token in _JOINT_NONLOCAL_ZERO_TOLERANCE_TOKENS
+                )
+            )
+            if known:
+                continue
+            unknown_technical_codes.append(
+                {
+                    "boundary_index": boundary_index,
+                    "review_domain": domain,
+                    "code": technical_reason,
+                }
+            )
+            reasons.append(
+                f"boundary_{boundary_index}_unknown_technical_integrity_code:"
+                f"{technical_reason}"
+            )
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    return {
+        "contract": "joint_decoded_feedback_authoring_audit_v1",
+        "authoring_allowed": not unique_reasons,
+        "block_reasons": list(unique_reasons),
+        "unknown_technical_codes": unknown_technical_codes,
+        "known_localized_structural_codes": sorted(
+            _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES
+        ),
+        "unknown_or_malformed_reason_promoted_to_no_good": False,
+    }
 
 
 def _underlying_joint_materialized_candidate(
@@ -1128,13 +1376,23 @@ def _joint_localized_decoded_boundary_no_goods(
             != expected_incoming_source
         ):
             continue
-        reasons: set[str] = set()
-        for field in ("issue_reasons", "technical_integrity_issue_reasons"):
-            raw_reasons = boundary.get(field)
-            if isinstance(raw_reasons, list):
-                reasons.update(
-                    reason for reason in raw_reasons if isinstance(reason, str)
-                )
+        issue_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "issue_reasons",
+        )
+        technical_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "technical_integrity_issue_reasons",
+        )
+        if issue_reasons is None or technical_reasons is None:
+            continue
+        if any(
+            reason not in _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES
+            for reason in technical_reasons
+        ):
+            # A new technical code is not exact structural impossibility proof.
+            continue
+        reasons = set(issue_reasons).union(technical_reasons)
         if not reasons.intersection(_JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES):
             continue
         option = options[boundary_index]
@@ -1151,6 +1409,42 @@ def _joint_localized_decoded_boundary_no_goods(
             )
         no_goods.add((key, option.frame_offset))
     return frozenset(no_goods)
+
+
+def _joint_look_variant_boundary_failure_count(
+    review_payload: Mapping[str, Any],
+) -> int:
+    """Count look-only boundary failures that must not poison cut-path search."""
+
+    boundaries = review_payload.get("boundaries")
+    if not isinstance(boundaries, list):
+        return 0
+    count = 0
+    for boundary in boundaries:
+        if (
+            not isinstance(boundary, Mapping)
+            or boundary.get("review_domain")
+            != INTRODUCED_CROSS_SOURCE_DOMAIN
+            or boundary.get("passed") is not False
+        ):
+            continue
+        issue_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "issue_reasons",
+        )
+        technical_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "technical_integrity_issue_reasons",
+        )
+        if (
+            issue_reasons
+            and technical_reasons == ()
+            and set(issue_reasons).issubset(
+                _JOINT_LOOK_VARIANT_BOUNDARY_FAILURE_CODES
+            )
+        ):
+            count += 1
+    return count
 
 
 def _joint_nonlocal_render_contract_failure_fingerprints(
@@ -1312,6 +1606,8 @@ def _record_bound_joint_decoded_feedback(
         "feedback_binding_valid": False,
         "feedback_authoring_allowed": False,
         "localized_boundary_no_good_count": 0,
+        "look_variant_boundary_failure_count": 0,
+        "look_variant_boundary_promoted_to_path_no_good": False,
         "nonlocal_render_contract_failure_count": 0,
         "perceptual_source_admission_failed": False,
         "complete_path_no_good_deferred_for_render_variant": True,
@@ -1319,6 +1615,8 @@ def _record_bound_joint_decoded_feedback(
         "aggregate_look_or_montage_promoted_to_boundary_no_good": False,
         "same_source_duplicate_or_freeze_promoted_to_boundary_no_good": False,
         "render_variant_signature": None,
+        "feedback_authoring_audit": None,
+        "feedback_authoring_block_reasons": [],
     }
     try:
         if not isinstance(review_payload, Mapping):
@@ -1345,10 +1643,27 @@ def _record_bound_joint_decoded_feedback(
         return classification, None
 
     exact_path = _joint_complete_path_signature(candidate)
-    localized = _joint_localized_decoded_boundary_no_goods(
+    feedback_authoring_audit = _joint_decoded_feedback_authoring_audit(
         candidate,
         review_payload,
         eligible_indices=eligible_indices,
+    )
+    feedback_authoring_allowed = bool(
+        feedback_authoring_audit.get("authoring_allowed") is True
+    )
+    localized = (
+        _joint_localized_decoded_boundary_no_goods(
+            candidate,
+            review_payload,
+            eligible_indices=eligible_indices,
+        )
+        if feedback_authoring_allowed
+        else frozenset()
+    )
+    look_variant_boundary_failure_count = (
+        _joint_look_variant_boundary_failure_count(review_payload)
+        if feedback_authoring_allowed
+        else 0
     )
     nonlocal_fingerprints = (
         _joint_nonlocal_render_contract_failure_fingerprints(
@@ -1356,6 +1671,8 @@ def _record_bound_joint_decoded_feedback(
             review_payload,
             eligible_indices=eligible_indices,
         )
+        if feedback_authoring_allowed
+        else ()
     )
     perceptual = review_payload.get("perceptual_source_admission")
     perceptual_admission_failed = bool(
@@ -1365,19 +1682,30 @@ def _record_bound_joint_decoded_feedback(
     )
     classification = {
         "feedback_binding_valid": True,
-        "feedback_authoring_allowed": True,
+        "feedback_authoring_allowed": feedback_authoring_allowed,
         "binding_error": None,
+        "feedback_authoring_audit": feedback_authoring_audit,
+        "feedback_authoring_block_reasons": list(
+            feedback_authoring_audit.get("block_reasons", [])
+        ),
         "localized_boundary_no_good_count": len(localized),
+        "look_variant_boundary_failure_count": (
+            look_variant_boundary_failure_count
+        ),
+        "look_variant_boundary_promoted_to_path_no_good": False,
         "nonlocal_render_contract_failure_count": len(
             nonlocal_fingerprints
         ),
         "perceptual_source_admission_failed": perceptual_admission_failed,
         "complete_path_no_good_deferred_for_render_variant": (
-            review_payload.get("passed") is False
-            and not localized
-            and not nonlocal_fingerprints
+            not feedback_authoring_allowed
+            or (
+                review_payload.get("passed") is False
+                and not localized
+                and not nonlocal_fingerprints
+            )
         ),
-        "complete_path_no_good_allowed": True,
+        "complete_path_no_good_allowed": feedback_authoring_allowed,
         "aggregate_look_or_montage_promoted_to_boundary_no_good": False,
         "same_source_duplicate_or_freeze_promoted_to_boundary_no_good": False,
         "render_variant_signature": render_variant,
@@ -1449,6 +1777,289 @@ def _joint_decoded_look_already_passed_audit_fields(
         ),
         "complete_path_no_good_allowed": aggregate_nonlook_failure,
     }
+
+
+def _joint_group_look_boundary_reason_contract(
+    review_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate exact cross-source boundary reasons before look rerendering.
+
+    A look-only repair may proceed only when every introduced cross-source
+    boundary has a typed reason contract, no unknown reason code, no structural
+    issue, and an exactly empty technical-integrity list.  This is deliberately
+    independent of the later no-good authoring audit.
+    """
+
+    boundaries = review_payload.get("boundaries")
+    if not isinstance(boundaries, list):
+        return {
+            "contract": "joint_group_look_boundary_reason_contract_v1",
+            "contract_complete": False,
+            "nonlook_boundary_gates_passed": False,
+            "introduced_cross_source_boundary_count": 0,
+            "unknown_reason_codes": [],
+            "structural_reason_codes": [],
+            "technical_reason_codes": [],
+            "block_reasons": ["decoded_boundary_contract_missing"],
+        }
+
+    block_reasons: list[str] = []
+    unknown_reason_codes: list[str] = []
+    structural_reason_codes: list[str] = []
+    technical_reason_codes: list[str] = []
+    introduced_count = 0
+    seen_indices: set[int] = set()
+    for position, boundary in enumerate(boundaries):
+        if not isinstance(boundary, Mapping):
+            block_reasons.append(f"boundary_{position}_contract_malformed")
+            continue
+        boundary_index = boundary.get("boundary_index")
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+            or boundary_index in seen_indices
+        ):
+            block_reasons.append(f"boundary_{position}_index_contract_malformed")
+            continue
+        seen_indices.add(boundary_index)
+        if boundary_index != position:
+            block_reasons.append(
+                f"boundary_{boundary_index}_index_domain_mismatch"
+            )
+        review_domain = boundary.get("review_domain")
+        if not isinstance(review_domain, str) or not review_domain:
+            block_reasons.append(
+                f"boundary_{boundary_index}_review_domain_contract_malformed"
+            )
+            continue
+        if review_domain not in {
+            INTRODUCED_CROSS_SOURCE_DOMAIN,
+            *_JOINT_NONLOCAL_RENDER_CONTRACT_DOMAINS,
+        }:
+            block_reasons.append(
+                f"boundary_{boundary_index}_unknown_review_domain"
+            )
+            continue
+        if review_domain != INTRODUCED_CROSS_SOURCE_DOMAIN:
+            continue
+        introduced_count += 1
+        outgoing_source = boundary.get("outgoing_source_index")
+        incoming_source = boundary.get("incoming_source_index")
+        if (
+            isinstance(outgoing_source, bool)
+            or not isinstance(outgoing_source, int)
+            or outgoing_source < 0
+            or isinstance(incoming_source, bool)
+            or not isinstance(incoming_source, int)
+            or incoming_source < 0
+            or outgoing_source == incoming_source
+        ):
+            block_reasons.append(
+                f"boundary_{boundary_index}_cross_source_binding_contract_invalid"
+            )
+        passed = boundary.get("passed")
+        issue_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "issue_reasons",
+        )
+        technical_reasons = _joint_exact_boundary_reason_list(
+            boundary,
+            "technical_integrity_issue_reasons",
+        )
+        if not isinstance(passed, bool):
+            block_reasons.append(
+                f"boundary_{boundary_index}_pass_contract_missing"
+            )
+        if issue_reasons is None:
+            block_reasons.append(
+                f"boundary_{boundary_index}_issue_reason_contract_invalid"
+            )
+            issue_reasons = ()
+        if technical_reasons is None:
+            block_reasons.append(
+                f"boundary_{boundary_index}_technical_reason_contract_invalid"
+            )
+            technical_reasons = ()
+        unknown = tuple(
+            reason
+            for reason in (*issue_reasons, *technical_reasons)
+            if reason not in _JOINT_KNOWN_CROSS_SOURCE_BOUNDARY_ISSUE_CODES
+        )
+        if unknown:
+            unknown_reason_codes.extend(unknown)
+            block_reasons.append(
+                f"boundary_{boundary_index}_unknown_reason_code"
+            )
+        if technical_reasons:
+            technical_reason_codes.extend(technical_reasons)
+            block_reasons.append(
+                f"boundary_{boundary_index}_technical_reason_not_empty"
+            )
+        structural = tuple(
+            reason
+            for reason in issue_reasons
+            if reason in _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES
+        )
+        if structural:
+            structural_reason_codes.extend(structural)
+            block_reasons.append(
+                f"boundary_{boundary_index}_structural_reason_present"
+            )
+        if passed is True and (issue_reasons or technical_reasons):
+            block_reasons.append(
+                f"boundary_{boundary_index}_passing_reason_contract_inconsistent"
+            )
+        if (
+            passed is False
+            and not issue_reasons
+            and not technical_reasons
+        ):
+            block_reasons.append(
+                f"boundary_{boundary_index}_failing_reason_contract_empty"
+            )
+
+    unique_block_reasons = tuple(dict.fromkeys(block_reasons))
+    contract_incomplete = any(
+        "contract" in reason
+        or "unknown" in reason
+        or "index_domain_mismatch" in reason
+        for reason in unique_block_reasons
+    )
+    return {
+        "contract": "joint_group_look_boundary_reason_contract_v1",
+        "contract_complete": not contract_incomplete,
+        "nonlook_boundary_gates_passed": not unique_block_reasons,
+        "introduced_cross_source_boundary_count": introduced_count,
+        "unknown_reason_codes": sorted(set(unknown_reason_codes)),
+        "structural_reason_codes": sorted(set(structural_reason_codes)),
+        "technical_reason_codes": sorted(set(technical_reason_codes)),
+        "block_reasons": list(unique_block_reasons),
+    }
+
+
+def _joint_group_look_refinement_eligibility(
+    review_payload: Mapping[str, Any],
+    *,
+    exact_evidence: bool,
+    look_admission_passed: bool,
+    decoded_review_passed: bool,
+) -> tuple[JointDecodedLookRefinementEligibility, dict[str, Any]]:
+    """Authorize rerenders only for complete, look-only decoded failures.
+
+    Visible/color scores and the aggregate technical-proxy boolean are not
+    eligibility inputs: source-level look correction may legitimately change
+    them.  Exact binding, geometry-provider integrity, global technical
+    issues, interior completeness, and the professional/montage gates remain
+    fail-closed.
+    """
+
+    if not isinstance(review_payload, Mapping):
+        raise TypeError("joint look eligibility review must be a mapping")
+    for name, value in (
+        ("exact_evidence", exact_evidence),
+        ("look_admission_passed", look_admission_passed),
+        ("decoded_review_passed", decoded_review_passed),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be boolean")
+
+    def exact_nonnegative_integer(value: Any) -> int | None:
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            else None
+        )
+
+    def exact_issue_list(value: Any) -> list[str] | None:
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            return None
+        return value
+
+    def exact_gate(value: Any) -> bool | None:
+        resolved = value.get("passed") if isinstance(value, Mapping) else value
+        return resolved if isinstance(resolved, bool) else None
+
+    geometry_failure_count = exact_nonnegative_integer(
+        review_payload.get("geometry_provider_failure_count")
+    )
+    global_technical_issues = exact_issue_list(
+        review_payload.get(
+            "introduced_cross_source_technical_issue_reasons"
+        )
+    )
+    interior = review_payload.get("segment_interior_geometry")
+    interior_complete = (
+        interior.get("complete") if isinstance(interior, Mapping) else None
+    )
+    interior_failure_count = exact_nonnegative_integer(
+        interior.get("geometry_provider_failure_count")
+        if isinstance(interior, Mapping)
+        else None
+    )
+    professional_gate_passed = exact_gate(
+        review_payload.get("professional_reference_gate")
+    )
+    montage_gate_passed = exact_gate(
+        review_payload.get("rendered_montage_grammar_review")
+    )
+    boundary_reason_contract = _joint_group_look_boundary_reason_contract(
+        review_payload
+    )
+    contracts_complete = bool(
+        exact_evidence
+        and geometry_failure_count is not None
+        and global_technical_issues is not None
+        and isinstance(interior_complete, bool)
+        and interior_failure_count is not None
+        and professional_gate_passed is not None
+        and montage_gate_passed is not None
+        and boundary_reason_contract["contract_complete"] is True
+    )
+    nonlook_gates_passed = bool(
+        contracts_complete
+        and geometry_failure_count == 0
+        and not global_technical_issues
+        and interior_complete is True
+        and interior_failure_count == 0
+        and professional_gate_passed is True
+        and montage_gate_passed is True
+        and boundary_reason_contract[
+            "nonlook_boundary_gates_passed"
+        ]
+        is True
+    )
+    eligibility = JointDecodedLookRefinementEligibility(
+        evidence_complete=contracts_complete,
+        nonlook_gates_passed=nonlook_gates_passed,
+        look_admission_passed=look_admission_passed,
+        decoded_review_passed=decoded_review_passed,
+    )
+    diagnostics = {
+        **eligibility.to_dict(),
+        "exact_evidence": exact_evidence,
+        "geometry_provider_failure_count": geometry_failure_count,
+        "global_technical_issue_count": (
+            len(global_technical_issues)
+            if global_technical_issues is not None
+            else None
+        ),
+        "segment_interior_complete": interior_complete,
+        "segment_interior_geometry_provider_failure_count": (
+            interior_failure_count
+        ),
+        "professional_reference_gate_passed": professional_gate_passed,
+        "rendered_montage_grammar_gate_passed": montage_gate_passed,
+        "boundary_reason_contract": boundary_reason_contract,
+        "visible_boundary_score_used": False,
+        "technical_proxy_boolean_used": False,
+        "look_or_color_threshold_changed": False,
+    }
+    return eligibility, diagnostics
 
 
 def _joint_look_refinement_complete_path_no_good_allowed(
@@ -1531,11 +2142,425 @@ def _joint_apply_look_refinement_feedback_classification(
         ] = False
 
 
+def _joint_group_look_sensitive_visible_audit(
+    previous_review: Mapping[str, Any],
+    proposed_review: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Audit look-sensitive aggregate scores without using them as rollback."""
+
+    def finite_scalar(value: Any) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return None
+        return float(value)
+
+    def decode(
+        review: Mapping[str, Any],
+        label: str,
+    ) -> tuple[dict[str, float | None], tuple[str, ...]]:
+        raw = review.get("visible_boundary_score")
+        issues: list[str] = []
+        if not isinstance(raw, Mapping):
+            return {"p10": None, "issue_fraction": None}, (
+                f"{label}_visible_boundary_score_contract_missing",
+            )
+        p10 = finite_scalar(raw.get("p10"))
+        issue_fraction = finite_scalar(raw.get("issue_fraction"))
+        if p10 is None:
+            issues.append(f"{label}_visible_boundary_p10_invalid")
+        if issue_fraction is None or not 0.0 <= issue_fraction <= 1.0:
+            issues.append(f"{label}_visible_boundary_issue_fraction_invalid")
+            issue_fraction = None
+        return {"p10": p10, "issue_fraction": issue_fraction}, tuple(issues)
+
+    previous, previous_issues = decode(previous_review, "previous")
+    proposed, proposed_issues = decode(proposed_review, "proposed")
+    contract_issues = (*previous_issues, *proposed_issues)
+    p10_regressed = (
+        proposed["p10"] < previous["p10"] - 1e-9
+        if previous["p10"] is not None and proposed["p10"] is not None
+        else None
+    )
+    issue_fraction_regressed = (
+        proposed["issue_fraction"] > previous["issue_fraction"] + 1e-9
+        if previous["issue_fraction"] is not None
+        and proposed["issue_fraction"] is not None
+        else None
+    )
+    return {
+        "contract": "joint_group_look_sensitive_visible_audit_v1",
+        "contract_valid": not contract_issues,
+        "contract_issues": list(contract_issues),
+        "previous": previous,
+        "proposed": proposed,
+        "p10_regressed": p10_regressed,
+        "issue_fraction_regressed": issue_fraction_regressed,
+        "acceptance_blocker": False,
+        "used_for_nonlook_rollback": False,
+    }
+
+
+def _joint_group_exact_decoded_path_invariant_reasons(
+    previous_review: Mapping[str, Any],
+    proposed_review: Mapping[str, Any],
+    *,
+    previous_render_timeline_binding_sha256: str | None = None,
+    proposed_render_timeline_binding_sha256: str | None = None,
+) -> tuple[str, ...]:
+    """Compare exact decoded cut, clock, transition, and geometry identities."""
+
+    reasons: list[str] = []
+
+    def exact_integer(value: Any, *, positive: bool = False) -> int | None:
+        minimum = 1 if positive else 0
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= minimum
+            else None
+        )
+
+    def finite_scalar(value: Any, *, positive: bool = False) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return None
+        scalar = float(value)
+        if scalar < (1e-12 if positive else 0.0):
+            return None
+        return scalar
+
+    def exact_text(value: Any) -> str | None:
+        return (
+            value
+            if isinstance(value, str) and value and value == value.strip()
+            else None
+        )
+
+    def exact_sha256(value: Any) -> str | None:
+        return (
+            value
+            if isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            else None
+        )
+
+    def exact_integer_tuple(
+        value: Any,
+        *,
+        nonnegative: bool = True,
+    ) -> tuple[int, ...] | None:
+        if not isinstance(value, list) or not value or any(
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or (nonnegative and item < 0)
+            for item in value
+        ):
+            return None
+        return tuple(value)
+
+    def indexed_boundaries(
+        review: Mapping[str, Any],
+        label: str,
+    ) -> dict[int, Mapping[str, Any]] | None:
+        raw = review.get("boundaries")
+        if not isinstance(raw, list):
+            reasons.append(f"{label}_decoded_boundary_contract_missing")
+            return None
+        indexed: dict[int, Mapping[str, Any]] = {}
+        for item in raw:
+            boundary_index = (
+                item.get("boundary_index")
+                if isinstance(item, Mapping)
+                else None
+            )
+            if (
+                exact_integer(boundary_index) is None
+                or boundary_index in indexed
+            ):
+                reasons.append(f"{label}_decoded_boundary_contract_invalid")
+                return None
+            assert isinstance(boundary_index, int)
+            indexed[boundary_index] = item
+        if set(indexed) != set(range(len(raw))):
+            reasons.append(f"{label}_decoded_boundary_index_domain_invalid")
+            return None
+        return indexed
+
+    previous_by_index = indexed_boundaries(previous_review, "previous")
+    proposed_by_index = indexed_boundaries(proposed_review, "proposed")
+    if previous_by_index is not None and proposed_by_index is not None:
+        if len(previous_by_index) != len(proposed_by_index):
+            reasons.append("decoded_boundary_count_changed")
+        if previous_by_index.keys() != proposed_by_index.keys():
+            reasons.append("decoded_boundary_index_domain_changed")
+        for boundary_index in sorted(
+            previous_by_index.keys() & proposed_by_index.keys()
+        ):
+            previous_boundary = previous_by_index[boundary_index]
+            proposed_boundary = proposed_by_index[boundary_index]
+            field_specs = (
+                ("review_domain", exact_text),
+                ("outgoing_source_index", exact_integer),
+                ("incoming_source_index", exact_integer),
+                ("cut_frame_index", exact_integer),
+                ("frame_indices", exact_integer_tuple),
+                (
+                    "sample_offsets",
+                    lambda value: exact_integer_tuple(
+                        value,
+                        nonnegative=False,
+                    ),
+                ),
+                ("transition_reason", exact_text),
+                ("transition_tier", exact_text),
+                ("transition_kind", exact_text),
+                ("transition_frame_count", exact_integer),
+                ("transition_duration_seconds", finite_scalar),
+                (
+                    "source_clock_contiguous",
+                    lambda value: value if isinstance(value, bool) else None,
+                ),
+            )
+            for field, validator in field_specs:
+                previous_value = validator(previous_boundary.get(field))
+                proposed_value = validator(proposed_boundary.get(field))
+                if previous_value is None or proposed_value is None:
+                    reasons.append(
+                        f"boundary_{boundary_index}_{field}_contract_missing"
+                    )
+                elif previous_value != proposed_value:
+                    reasons.append(f"boundary_{boundary_index}_{field}_changed")
+            for label, boundary in (
+                ("previous", previous_boundary),
+                ("proposed", proposed_boundary),
+            ):
+                cut_frame_index = exact_integer(
+                    boundary.get("cut_frame_index")
+                )
+                frame_indices = exact_integer_tuple(
+                    boundary.get("frame_indices")
+                )
+                sample_offsets = exact_integer_tuple(
+                    boundary.get("sample_offsets"),
+                    nonnegative=False,
+                )
+                if (
+                    cut_frame_index is not None
+                    and frame_indices is not None
+                    and sample_offsets is not None
+                    and frame_indices
+                    != tuple(cut_frame_index + offset for offset in sample_offsets)
+                ):
+                    reasons.append(
+                        f"{label}_boundary_{boundary_index}_source_clock_binding_invalid"
+                    )
+            previous_technical = _joint_exact_boundary_reason_list(
+                previous_boundary,
+                "technical_integrity_issue_reasons",
+            )
+            proposed_technical = _joint_exact_boundary_reason_list(
+                proposed_boundary,
+                "technical_integrity_issue_reasons",
+            )
+            if previous_technical is None or proposed_technical is None:
+                reasons.append(
+                    f"boundary_{boundary_index}_technical_contract_missing"
+                )
+            elif not set(proposed_technical).issubset(previous_technical):
+                reasons.append(
+                    f"boundary_{boundary_index}_technical_integrity_regressed"
+                )
+
+    def interior_identity(
+        review: Mapping[str, Any],
+        label: str,
+        expected_binding: str | None,
+    ) -> dict[str, Any] | None:
+        raw = review.get("segment_interior_geometry")
+        if not isinstance(raw, Mapping):
+            reasons.append(f"{label}_segment_interior_geometry_missing")
+            return None
+        identity: dict[str, Any] = {}
+        scalar_specs = (
+            ("schema_version", lambda value: exact_integer(value, positive=True)),
+            ("contract", exact_text),
+            ("analysis_basis", exact_text),
+            ("source_index_domain", exact_text),
+            ("output_frame_index_domain", exact_text),
+            ("sampling_schedule_sha256", exact_sha256),
+            ("segment_count", exact_integer),
+            ("sample_count", exact_integer),
+        )
+        for field, validator in scalar_specs:
+            value = validator(raw.get(field))
+            if value is None:
+                reasons.append(f"{label}_segment_interior_{field}_invalid")
+            identity[field] = value
+        for field in ("sampling_policy", "geometry_backend_provenance"):
+            value = raw.get(field)
+            if not isinstance(value, Mapping):
+                reasons.append(f"{label}_segment_interior_{field}_invalid")
+                identity[field] = None
+            else:
+                identity[field] = deepcopy(dict(value))
+        provenance = identity.get("geometry_backend_provenance")
+        if isinstance(provenance, Mapping):
+            for backend_field in ("face_backends", "silhouette_backends"):
+                backends = provenance.get(backend_field)
+                if not isinstance(backends, list) or any(
+                    not isinstance(item, str)
+                    or not item
+                    or item != item.strip()
+                    for item in backends
+                ):
+                    reasons.append(
+                        f"{label}_geometry_backend_{backend_field}_invalid"
+                    )
+        binding = exact_sha256(raw.get("render_timeline_binding_sha256"))
+        if binding is None:
+            reasons.append(f"{label}_render_timeline_binding_invalid")
+        identity["render_timeline_binding_sha256"] = binding
+        if expected_binding is not None:
+            exact_expected = exact_sha256(expected_binding)
+            if exact_expected is None:
+                reasons.append(f"{label}_expected_render_timeline_binding_invalid")
+            elif binding != exact_expected:
+                reasons.append(f"{label}_render_timeline_binding_mismatch")
+
+        proxy = raw.get("proxy_identity")
+        proxy_identity: dict[str, Any] = {}
+        if not isinstance(proxy, Mapping):
+            reasons.append(f"{label}_proxy_clock_identity_missing")
+        else:
+            proxy_specs = (
+                ("width", lambda value: exact_integer(value, positive=True)),
+                ("height", lambda value: exact_integer(value, positive=True)),
+                ("fps", lambda value: finite_scalar(value, positive=True)),
+                (
+                    "decoded_frame_count",
+                    lambda value: exact_integer(value, positive=True),
+                ),
+                (
+                    "duration_seconds",
+                    lambda value: finite_scalar(value, positive=True),
+                ),
+                ("render_codec", exact_text),
+            )
+            for field, validator in proxy_specs:
+                value = validator(proxy.get(field))
+                if value is None:
+                    reasons.append(f"{label}_proxy_{field}_invalid")
+                proxy_identity[field] = value
+        identity["proxy_clock_identity"] = proxy_identity
+
+        raw_segments = raw.get("segments")
+        segment_identity: list[tuple[Any, ...]] = []
+        if not isinstance(raw_segments, list) or not raw_segments:
+            reasons.append(f"{label}_segment_identity_contract_missing")
+        else:
+            previous_segment_end: int | None = None
+            for position, segment in enumerate(raw_segments):
+                if not isinstance(segment, Mapping):
+                    reasons.append(f"{label}_segment_{position}_contract_invalid")
+                    continue
+                values = (
+                    exact_integer(segment.get("segment_index")),
+                    exact_integer(segment.get("source_index")),
+                    exact_integer(segment.get("segment_frame_start")),
+                    exact_integer(segment.get("segment_frame_end")),
+                    exact_integer(segment.get("segment_frame_count"), positive=True),
+                    exact_sha256(segment.get("source_content_sha256")),
+                )
+                if any(value is None for value in values):
+                    reasons.append(f"{label}_segment_{position}_identity_invalid")
+                elif values[0] != position:
+                    reasons.append(f"{label}_segment_{position}_index_invalid")
+                else:
+                    segment_start = values[2]
+                    segment_end = values[3]
+                    segment_count = values[4]
+                    assert isinstance(segment_start, int)
+                    assert isinstance(segment_end, int)
+                    assert isinstance(segment_count, int)
+                    if segment_end - segment_start != segment_count:
+                        reasons.append(
+                            f"{label}_segment_{position}_frame_clock_invalid"
+                        )
+                    if (
+                        (position == 0 and segment_start != 0)
+                        or (
+                            position > 0
+                            and previous_segment_end != segment_start
+                        )
+                    ):
+                        reasons.append(
+                            f"{label}_segment_{position}_continuity_invalid"
+                        )
+                    previous_segment_end = segment_end
+                segment_identity.append(values)
+        if identity.get("segment_count") != len(segment_identity):
+            reasons.append(f"{label}_segment_count_binding_mismatch")
+        identity["segments"] = tuple(segment_identity)
+        decoded_frame_count = proxy_identity.get("decoded_frame_count")
+        if (
+            isinstance(decoded_frame_count, int)
+            and segment_identity
+            and segment_identity[-1][3] != decoded_frame_count
+        ):
+            reasons.append(f"{label}_segment_output_clock_binding_mismatch")
+        return identity
+
+    previous_interior = interior_identity(
+        previous_review,
+        "previous",
+        previous_render_timeline_binding_sha256,
+    )
+    proposed_interior = interior_identity(
+        proposed_review,
+        "proposed",
+        proposed_render_timeline_binding_sha256,
+    )
+    if previous_interior is not None and proposed_interior is not None:
+        for field in (
+            "schema_version",
+            "contract",
+            "analysis_basis",
+            "source_index_domain",
+            "output_frame_index_domain",
+            "sampling_schedule_sha256",
+            "segment_count",
+            "sample_count",
+            "sampling_policy",
+            "geometry_backend_provenance",
+            "proxy_clock_identity",
+            "segments",
+        ):
+            if previous_interior.get(field) != proposed_interior.get(field):
+                reasons.append(f"segment_interior_{field}_changed")
+    return tuple(dict.fromkeys(reasons))
+
+
 def _joint_group_nonlook_regression_reasons(
     previous_review: Mapping[str, Any],
     proposed_review: Mapping[str, Any],
+    *,
+    previous_render_timeline_binding_sha256: str | None = None,
+    proposed_render_timeline_binding_sha256: str | None = None,
 ) -> tuple[str, ...]:
-    """Keep technical, geometry, and montage gates monotonic during look repair."""
+    """Keep exact path identity and non-look gates safe during look repair.
+
+    Aggregate visible p10/issue-fraction values remain audited, but their
+    monotonic movement is intentionally not an acceptance blocker because look
+    correction changes the pixels those aggregate metrics measure.
+    """
 
     reasons: list[str] = []
 
@@ -1551,8 +2576,7 @@ def _joint_group_nonlook_regression_reasons(
 
     def issue_set(value: Any) -> frozenset[str] | None:
         if not isinstance(value, list) or any(
-            not isinstance(item, str) or not item
-            for item in value
+            not isinstance(item, str) or not item for item in value
         ):
             return None
         return frozenset(value)
@@ -1561,15 +2585,6 @@ def _joint_group_nonlook_regression_reasons(
         raw = payload.get(name)
         value = raw.get("passed") if isinstance(raw, Mapping) else raw
         return value if isinstance(value, bool) else None
-
-    def finite_scalar(value: Any) -> float | None:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-        ):
-            return None
-        return float(value)
 
     previous_geometry = integer_count(
         previous_review,
@@ -1587,54 +2602,19 @@ def _joint_group_nonlook_regression_reasons(
         reasons.append("geometry_provider_failure_count_regressed")
 
     previous_global_technical = issue_set(
-        previous_review.get(
-            "introduced_cross_source_technical_issue_reasons"
-        )
+        previous_review.get("introduced_cross_source_technical_issue_reasons")
     )
     proposed_global_technical = issue_set(
-        proposed_review.get(
-            "introduced_cross_source_technical_issue_reasons"
-        )
+        proposed_review.get("introduced_cross_source_technical_issue_reasons")
     )
     if previous_global_technical is None or proposed_global_technical is None:
         reasons.append("global_technical_integrity_contract_missing")
     elif not proposed_global_technical.issubset(previous_global_technical):
         reasons.append("global_technical_integrity_issue_set_regressed")
 
-    previous_visible = previous_review.get("visible_boundary_score")
-    proposed_visible = proposed_review.get("visible_boundary_score")
-    if not isinstance(previous_visible, Mapping) or not isinstance(
-        proposed_visible,
-        Mapping,
-    ):
-        reasons.append("visible_boundary_score_contract_missing")
-    else:
-        previous_p10 = finite_scalar(previous_visible.get("p10"))
-        proposed_p10 = finite_scalar(proposed_visible.get("p10"))
-        previous_issue_fraction = finite_scalar(
-            previous_visible.get("issue_fraction")
-        )
-        proposed_issue_fraction = finite_scalar(
-            proposed_visible.get("issue_fraction")
-        )
-        visible_contract_valid = bool(
-            previous_p10 is not None
-            and proposed_p10 is not None
-            and previous_issue_fraction is not None
-            and proposed_issue_fraction is not None
-            and 0.0 <= previous_issue_fraction <= 1.0
-            and 0.0 <= proposed_issue_fraction <= 1.0
-        )
-        if not visible_contract_valid:
-            reasons.append("visible_boundary_score_contract_missing")
-        else:
-            assert previous_p10 is not None and proposed_p10 is not None
-            if proposed_p10 < previous_p10 - 1e-9:
-                reasons.append("visible_boundary_p10_regressed")
-            assert previous_issue_fraction is not None
-            assert proposed_issue_fraction is not None
-            if proposed_issue_fraction > previous_issue_fraction + 1e-9:
-                reasons.append("visible_boundary_issue_fraction_regressed")
+    # Contract validity and score movement are retained in the iteration audit.
+    # They are deliberately absent from this acceptance-blocker list.
+    _joint_group_look_sensitive_visible_audit(previous_review, proposed_review)
 
     previous_interior = previous_review.get("segment_interior_geometry")
     proposed_interior = proposed_review.get("segment_interior_geometry")
@@ -1680,119 +2660,18 @@ def _joint_group_nonlook_regression_reasons(
         elif previous_passed and not proposed_passed:
             reasons.append(f"{gate_name}_regressed")
 
-    previous_boundaries = previous_review.get("boundaries")
-    proposed_boundaries = proposed_review.get("boundaries")
-    if not isinstance(previous_boundaries, list) or not isinstance(
-        proposed_boundaries,
-        list,
-    ):
-        reasons.append("decoded_boundary_contract_missing")
-        return tuple(dict.fromkeys(reasons))
-    def indexed_boundaries(
-        raw: list[Any],
-    ) -> dict[int, Mapping[str, Any]] | None:
-        indexed: dict[int, Mapping[str, Any]] = {}
-        for item in raw:
-            boundary_index = (
-                item.get("boundary_index")
-                if isinstance(item, Mapping)
-                else None
-            )
-            if (
-                isinstance(boundary_index, bool)
-                or not isinstance(boundary_index, int)
-                or boundary_index < 0
-                or boundary_index in indexed
-            ):
-                return None
-            indexed[boundary_index] = item
-        return indexed
-
-    previous_by_index = indexed_boundaries(previous_boundaries)
-    proposed_by_index = indexed_boundaries(proposed_boundaries)
-    if previous_by_index is None or proposed_by_index is None:
-        reasons.append("decoded_boundary_contract_missing")
-        return tuple(dict.fromkeys(reasons))
-    if previous_by_index.keys() != proposed_by_index.keys():
-        reasons.append("decoded_boundary_index_domain_changed")
-        return tuple(dict.fromkeys(reasons))
-    geometry_metrics = (
-        "face_scale_discontinuity",
-        "face_position_discontinuity",
-        "silhouette_scale_discontinuity",
-        "silhouette_position_discontinuity",
-        "motion_direction_discontinuity",
+    reasons.extend(
+        _joint_group_exact_decoded_path_invariant_reasons(
+            previous_review,
+            proposed_review,
+            previous_render_timeline_binding_sha256=(
+                previous_render_timeline_binding_sha256
+            ),
+            proposed_render_timeline_binding_sha256=(
+                proposed_render_timeline_binding_sha256
+            ),
+        )
     )
-    for boundary_index in sorted(previous_by_index):
-        previous_boundary = previous_by_index[boundary_index]
-        proposed_boundary = proposed_by_index[boundary_index]
-        identity_fields = (
-            "review_domain",
-            "outgoing_source_index",
-            "incoming_source_index",
-        )
-        if any(
-            previous_boundary.get(name) != proposed_boundary.get(name)
-            for name in identity_fields
-        ):
-            reasons.append(
-                f"boundary_{boundary_index}_identity_changed"
-            )
-            continue
-        previous_passed = previous_boundary.get("passed")
-        proposed_passed = proposed_boundary.get("passed")
-        if not isinstance(previous_passed, bool) or not isinstance(
-            proposed_passed,
-            bool,
-        ):
-            reasons.append(
-                f"boundary_{boundary_index}_pass_contract_missing"
-            )
-        elif previous_passed and not proposed_passed:
-            reasons.append(f"boundary_{boundary_index}_pass_regressed")
-        previous_technical = issue_set(
-            previous_boundary.get("technical_integrity_issue_reasons")
-        )
-        proposed_technical = issue_set(
-            proposed_boundary.get("technical_integrity_issue_reasons")
-        )
-        if previous_technical is None or proposed_technical is None:
-            reasons.append(
-                f"boundary_{boundary_index}_technical_contract_missing"
-            )
-        elif not proposed_technical.issubset(previous_technical):
-            reasons.append(
-                f"boundary_{boundary_index}_technical_integrity_regressed"
-            )
-        previous_issues = issue_set(previous_boundary.get("issue_reasons"))
-        proposed_issues = issue_set(proposed_boundary.get("issue_reasons"))
-        if previous_issues is None or proposed_issues is None:
-            reasons.append(f"boundary_{boundary_index}_issue_contract_missing")
-        elif not proposed_issues.issubset(previous_issues):
-            reasons.append(f"boundary_{boundary_index}_issue_set_regressed")
-        previous_discontinuities = previous_boundary.get("discontinuities")
-        proposed_discontinuities = proposed_boundary.get("discontinuities")
-        if not isinstance(previous_discontinuities, Mapping):
-            continue
-        for metric in geometry_metrics:
-            if metric not in previous_discontinuities:
-                continue
-            previous_value = previous_discontinuities.get(metric)
-            proposed_value = (
-                proposed_discontinuities.get(metric)
-                if isinstance(proposed_discontinuities, Mapping)
-                else None
-            )
-            previous_scalar = finite_scalar(previous_value)
-            proposed_scalar = finite_scalar(proposed_value)
-            if previous_scalar is None or proposed_scalar is None:
-                reasons.append(
-                    f"boundary_{boundary_index}_{metric}_contract_missing"
-                )
-            elif proposed_scalar > previous_scalar + 1e-9:
-                reasons.append(
-                    f"boundary_{boundary_index}_{metric}_regressed"
-                )
     return tuple(dict.fromkeys(reasons))
 
 
@@ -1800,6 +2679,9 @@ def _joint_group_look_refinement_acceptance(
     previous_objective: DecodedLookObjective,
     previous_review: Mapping[str, Any],
     proposed_review: Mapping[str, Any],
+    *,
+    previous_render_timeline_binding_sha256: str | None = None,
+    proposed_render_timeline_binding_sha256: str | None = None,
 ) -> tuple[DecodedLookObjective, tuple[str, ...], bool]:
     """Apply the production strict-improvement plus non-look rollback gate."""
 
@@ -1809,6 +2691,12 @@ def _joint_group_look_refinement_acceptance(
     nonlook_regressions = _joint_group_nonlook_regression_reasons(
         previous_review,
         proposed_review,
+        previous_render_timeline_binding_sha256=(
+            previous_render_timeline_binding_sha256
+        ),
+        proposed_render_timeline_binding_sha256=(
+            proposed_render_timeline_binding_sha256
+        ),
     )
     accepted = bool(
         proposed_objective.strictly_improves(previous_objective)
@@ -20182,24 +21070,6 @@ def _validate_joint_editorial_motion_plan(
     return plan
 
 
-def _joint_keyframe_is_exactly_neutral(item: Any) -> bool:
-    return bool(
-        math.isclose(item.zoom, 1.0, rel_tol=0.0, abs_tol=1e-9)
-        and math.isclose(item.center_x, 0.5, rel_tol=0.0, abs_tol=1e-9)
-        and math.isclose(item.center_y, 0.5, rel_tol=0.0, abs_tol=1e-9)
-        and math.isclose(item.roll_degrees, 0.0, rel_tol=0.0, abs_tol=1e-9)
-    )
-
-
-def _joint_track_is_exactly_neutral(track: Any) -> bool:
-    """Prove that a provider track is the identity for its whole curve."""
-
-    return track is None or bool(track.keyframes) and all(
-        _joint_keyframe_is_exactly_neutral(item)
-        for item in track.keyframes
-    )
-
-
 def _joint_neutral_interior_motion_overlay(
     materialized: JointMaterializedVisualCandidate,
     *,
@@ -20208,20 +21078,13 @@ def _joint_neutral_interior_motion_overlay(
     phrase_times: Sequence[float],
     section_plan: SectionPlan | None,
 ) -> tuple[EditorialMotionPlan, tuple[RenderSegment, ...], bool]:
-    """Replace an all-neutral provider plan with boundary-neutral motion.
+    """Merge safe run-local pulses without vetoing unrelated provider crops.
 
     Decoded boundary proofs own the first and final rendered frame of every
-    segment.  The ordinary planner may therefore contribute only a same-shot
-    interior zoom pulse: every segment endpoint must remain exact identity,
-    roll remains disabled for GROUP, and provider-authored non-neutral tracks
-    are never composed with a second transform layer.
+    visible cut.  The merger independently proves the actual output-frame
+    clock, planner pulse shape, Tier-D continuity, and provider-track identity
+    before adopting any proposal segment.
     """
-
-    if any(
-        not _joint_track_is_exactly_neutral(segment.editorial_transform)
-        for segment in materialized.segments
-    ):
-        return provider_plan, materialized.segments, False
 
     proposed = build_editorial_motion_plan(
         visual_timeline=materialized.visual_plan,
@@ -20233,75 +21096,14 @@ def _joint_neutral_interior_motion_overlay(
         section_plan=section_plan,
         fps=materialized.output_fps,
     )
-    proposed_by_segment = {
-        item.segment_index: item for item in proposed.segments
-    }
-    if set(proposed_by_segment) != set(range(len(materialized.segments))):
-        return provider_plan, materialized.segments, False
-
-    visible_motion = False
-    for index, segment in enumerate(materialized.segments):
-        item = proposed_by_segment[index]
-        track = item.track
-        if item.source_index != segment.source_index:
-            return provider_plan, materialized.segments, False
-        if track is None:
-            continue
-        if not track.keyframes:
-            return provider_plan, materialized.segments, False
-        first = track.keyframes[0]
-        last = track.keyframes[-1]
-        if not (
-            _joint_keyframe_is_exactly_neutral(first)
-            and _joint_keyframe_is_exactly_neutral(last)
-            and all(
-                math.isclose(
-                    keyframe.roll_degrees,
-                    0.0,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-                for keyframe in track.keyframes
-            )
-            and (
-                "reference_calibrated_same_source_interior_zoom_pulse"
-                in item.reasons
-            )
-        ):
-            return provider_plan, materialized.segments, False
-        visible_motion = visible_motion or any(
-            not (
-                math.isclose(
-                    keyframe.zoom,
-                    1.0,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-                and math.isclose(
-                    keyframe.center_x,
-                    0.5,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-                and math.isclose(
-                    keyframe.center_y,
-                    0.5,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-            )
-            for keyframe in track.keyframes
-        )
-    if not visible_motion:
-        return provider_plan, materialized.segments, False
-    overlaid_segments = tuple(
-        replace(
-            segment,
-            editorial_transform=proposed_by_segment[index].track,
-        )
-        for index, segment in enumerate(materialized.segments)
+    result = merge_joint_interior_motion_overlay(
+        provider_plan=provider_plan,
+        provider_segments=materialized.segments,
+        transitions=transitions,
+        proposal_plan=proposed,
+        output_fps=materialized.output_fps,
     )
-    return proposed, overlaid_segments, True
+    return result.plan, result.segments, result.applied
 
 
 def _joint_group_hard_cut_transition(
@@ -20488,6 +21290,8 @@ def _derive_complete_joint_group_candidate(
     editorial_motion_plan = provider_editorial_motion_plan
     authorized_segments = materialized.segments
     joint_interior_motion_applied = False
+    joint_interior_motion_pulse_count = 0
+    joint_interior_motion_segment_count = 0
     if (
         request.aspect_ratio is AspectRatio.LANDSCAPE
         and source_aspects_are_editorial_safe
@@ -20503,6 +21307,25 @@ def _derive_complete_joint_group_candidate(
             phrase_times=phrase_times,
             section_plan=section_plan,
         )
+        joint_interior_motion_pulse_count = (
+            editorial_motion_plan.interior_zoom_pulse_count
+            - provider_editorial_motion_plan.interior_zoom_pulse_count
+        )
+        joint_interior_motion_segment_count = sum(
+            final.editorial_transform is not original.editorial_transform
+            for final, original in zip(
+                authorized_segments,
+                materialized.segments,
+                strict=True,
+            )
+        )
+        if joint_interior_motion_applied != bool(
+            joint_interior_motion_pulse_count
+            and joint_interior_motion_segment_count
+        ):
+            raise RuntimeError(
+                "joint interior-motion overlay audit diverged from its tracks"
+            )
     remapped_segments = tuple(
         replace(
             segment,
@@ -20542,10 +21365,10 @@ def _derive_complete_joint_group_candidate(
         "unsafe_dissolve_disabled_for_joint_candidate",
     ]
     diagnostics.append(
-        "joint_neutral_provider_track_replaced_by_section_directed_"
+        "joint_provider_track_merged_with_frame_bound_section_directed_"
         "interior_group_motion_v1"
         if joint_interior_motion_applied
-        else "joint_provider_track_retained_without_unverified_overlay"
+        else "joint_provider_track_retained_without_safe_interior_pulse"
     )
     boundary_look_match: BoundaryLookMatchResult | None = None
     if (
@@ -20609,6 +21432,12 @@ def _derive_complete_joint_group_candidate(
                 "candidate_history": materialized.candidate_history_entry,
                 "joint_interior_motion_overlay_applied": (
                     joint_interior_motion_applied
+                ),
+                "joint_interior_motion_overlay_pulse_count": (
+                    joint_interior_motion_pulse_count
+                ),
+                "joint_interior_motion_overlay_segment_count": (
+                    joint_interior_motion_segment_count
                 ),
                 "legacy_local_source_repair_allowed": False,
                 "legacy_constraint_reoptimization_allowed": False,
@@ -26411,9 +27240,16 @@ def analyze(
     joint_decoded_forbidden_complete_paths: set[
         JointTimelinePathSignature
     ] = set()
+    joint_materialized_complete_paths: set[
+        JointTimelinePathSignature
+    ] = set()
     joint_decoded_forbidden_boundary_selections: set[
         BoundarySelectionNoGood
     ] = set()
+    joint_decoded_montage_observations: tuple[
+        JointDecodedMontageSegmentObservation, ...
+    ] = ()
+    joint_decoded_montage_feedback_errors: list[dict[str, Any]] = []
     joint_decoded_cumulative_proof_materialization_calls = 0
     joint_visual_selection_active = False
     joint_visual_selection_attempted = False
@@ -27224,6 +28060,15 @@ def analyze(
                                 maximum_proof_materialization_calls=(
                                     proof_budget
                                 ),
+                                decoded_montage_feedback=(
+                                    JointDecodedMontageFeedback(
+                                        observations=(
+                                            joint_decoded_montage_observations
+                                        )
+                                    )
+                                    if joint_decoded_montage_observations
+                                    else None
+                                ),
                                 progress_callback=(
                                     report_joint_visual_selection_progress
                                 ),
@@ -27255,6 +28100,7 @@ def analyze(
                                 ),
                                 forbidden_complete_paths=(
                                     joint_decoded_forbidden_complete_paths
+                                    | joint_materialized_complete_paths
                                 ),
                                 maximum_proof_materialization_calls=(
                                     available_proof_budget
@@ -27447,6 +28293,13 @@ def analyze(
                                 "external_complete_path_no_good_count": len(
                                     joint_decoded_forbidden_complete_paths
                                 ),
+                                "run_local_previous_materialization_exclusion_count": len(
+                                    joint_materialized_complete_paths
+                                ),
+                                "selector_complete_path_exclusion_count": len(
+                                    joint_decoded_forbidden_complete_paths
+                                    | joint_materialized_complete_paths
+                                ),
                                 "external_boundary_no_good_count": len(
                                     joint_decoded_forbidden_boundary_selections
                                 ),
@@ -27507,8 +28360,11 @@ def analyze(
                                 "external_boundary_no_good_count": len(
                                     joint_decoded_forbidden_boundary_selections
                                 ),
-                                "maximum_decoded_attempt_count": (
-                                    _JOINT_DECODED_ATTEMPT_LIMIT
+                                "maximum_base_render_count": (
+                                    JOINT_DECODED_DISTINCT_CANDIDATE_LIMIT
+                                ),
+                                "maximum_materialized_candidate_count": (
+                                    _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
                                 ),
                                 "final_cohort_path_variant_cap": (
                                     _JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH
@@ -27710,9 +28566,6 @@ def analyze(
                 )
                 attempted_candidate_indices: set[int] = set()
                 attempted_materialized_candidates: list[Any] = []
-                joint_materialized_complete_paths: set[
-                    JointTimelinePathSignature
-                ] = set()
                 joint_nonlocal_contract_failure_paths: dict[
                     tuple[str, int, int, str],
                     set[JointTimelinePathSignature],
@@ -27726,7 +28579,8 @@ def analyze(
                 joint_decoded_look_refinement_audits: dict[
                     int, dict[str, Any]
                 ] = {}
-                joint_decoded_render_attempt_count = 0
+                joint_decoded_budget = JointDecodedBudgetLedger()
+                joint_decoded_budget_exhaustions: list[dict[str, Any]] = []
                 local_source_repair_seeds: list[LocalSourceRepairSeed] = []
                 local_source_repair_proposal_count = 0
                 local_source_repair_attempted_count = 0
@@ -28153,14 +29007,21 @@ def analyze(
                                     constraint_reoptimization_terminal_proof
                                 ),
                                 "decoded_feedback_loop": {
-                                    "maximum_distinct_attempt_count": (
-                                        _JOINT_DECODED_ATTEMPT_LIMIT
+                                    "maximum_base_render_count": (
+                                        joint_decoded_budget.limits
+                                        .distinct_candidate_limit
                                     ),
-                                    "attempted_distinct_candidate_count": len(
+                                    "maximum_materialized_candidate_attempt_count": (
+                                        _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                                    ),
+                                    "attempted_materialized_candidate_count": len(
                                         attempted_candidate_indices
                                     ),
-                                    "decoded_render_attempt_count": (
-                                        joint_decoded_render_attempt_count
+                                    "decoded_render_budget": (
+                                        joint_decoded_budget.report_payload()
+                                    ),
+                                    "decoded_budget_exhaustions": deepcopy(
+                                        joint_decoded_budget_exhaustions
                                     ),
                                     "decoded_pass_count": len(derived),
                                     "diverse_exact_eight_complete": bool(
@@ -28177,6 +29038,9 @@ def analyze(
                                     ),
                                     "forbidden_complete_path_count": len(
                                         joint_decoded_forbidden_complete_paths
+                                    ),
+                                    "run_local_materialized_complete_path_count": len(
+                                        joint_materialized_complete_paths
                                     ),
                                     "localized_boundary_no_good_count": len(
                                         joint_decoded_forbidden_boundary_selections
@@ -28388,14 +29252,21 @@ def analyze(
                     ):
                         joint_visual_selection_audit.update(
                             {
-                                "decoded_attempt_count": len(
+                                "attempted_materialized_candidate_count": len(
                                     attempted_candidate_indices
                                 ),
-                                "decoded_render_attempt_count": (
-                                    joint_decoded_render_attempt_count
+                                "decoded_render_budget": (
+                                    joint_decoded_budget.report_payload()
                                 ),
-                                "maximum_decoded_attempt_count": (
-                                    _JOINT_DECODED_ATTEMPT_LIMIT
+                                "decoded_budget_exhaustions": deepcopy(
+                                    joint_decoded_budget_exhaustions
+                                ),
+                                "maximum_base_render_count": (
+                                    joint_decoded_budget.limits
+                                    .distinct_candidate_limit
+                                ),
+                                "maximum_materialized_candidate_count": (
+                                    _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
                                 ),
                                 "decoded_pass_count": len(derived),
                                 "required_decoded_pass_count": (
@@ -28413,6 +29284,35 @@ def analyze(
                                 "decoded_feedback_classifications": deepcopy(
                                     joint_decoded_feedback_classifications
                                 ),
+                                "decoded_montage_feedback": {
+                                    **(
+                                        JointDecodedMontageFeedback(
+                                            observations=(
+                                                joint_decoded_montage_observations
+                                            )
+                                        ).to_dict()
+                                        if joint_decoded_montage_observations
+                                        else {
+                                            "contract": (
+                                                "joint_decoded_montage_"
+                                                "soft_role_feedback_v1"
+                                            ),
+                                            "observation_count": 0,
+                                            "candidate_clock_count": 0,
+                                            "render_variant_count": 0,
+                                            "hard_no_good_authoring_allowed": (
+                                                False
+                                            ),
+                                            "thresholds_lowered": False,
+                                        }
+                                    ),
+                                    "extraction_error_count": len(
+                                        joint_decoded_montage_feedback_errors
+                                    ),
+                                    "extraction_errors": deepcopy(
+                                        joint_decoded_montage_feedback_errors
+                                    ),
+                                },
                                 "shared_render_contract_failure": deepcopy(
                                     joint_shared_render_contract_failure
                                 ),
@@ -28616,24 +29516,81 @@ def analyze(
                         constraint_reoptimization_termination_reason = (
                             "shared_render_contract_failure"
                         )
-                        constraint_reoptimization_terminal_proof = deepcopy(
-                            joint_shared_render_contract_failure
-                        )
+                        constraint_reoptimization_terminal_proof = {
+                            **deepcopy(joint_shared_render_contract_failure),
+                            "decoded_render_budget": (
+                                joint_decoded_budget.report_payload()
+                            ),
+                            "decoded_budget_exhaustions": deepcopy(
+                                joint_decoded_budget_exhaustions
+                            ),
+                        }
                     return True
+
+                def record_joint_decoded_budget_exhaustion(
+                    error: JointDecodedBudgetExhausted,
+                ) -> None:
+                    if not isinstance(error, JointDecodedBudgetExhausted):
+                        raise TypeError(
+                            "joint decoded budget exhaustion is invalid"
+                        )
+                    payload = {
+                        "cause": error.reason.value,
+                        "budget": deepcopy(error.report_payload),
+                        "thresholds_lowered": False,
+                    }
+                    if payload not in joint_decoded_budget_exhaustions:
+                        joint_decoded_budget_exhaustions.append(payload)
 
                 def decode_and_review_complete_group_bundle(
                     bundle: _GroupRenderCandidateBundle,
+                    *,
+                    materialized: Any,
+                    render_kind: JointDecodedRenderKind,
+                    look_refinement_eligibility: (
+                        JointDecodedLookRefinementEligibility | None
+                    ) = None,
                 ) -> RenderedCandidateReview:
-                    nonlocal joint_decoded_render_attempt_count
+                    nonlocal joint_decoded_montage_observations
+                    if not isinstance(render_kind, JointDecodedRenderKind):
+                        raise TypeError(
+                            "joint decoded render kind is invalid"
+                        )
                     if joint_visual_selection_active:
+                        candidate_index = int(materialized.candidate_index)
+                        path_identity = _joint_complete_path_signature(
+                            materialized
+                        )
                         if (
-                            joint_decoded_render_attempt_count
-                            >= _JOINT_DECODED_ATTEMPT_LIMIT
+                            render_kind
+                            is JointDecodedRenderKind.BASE_CANDIDATE
                         ):
-                            raise RuntimeError(
-                                "joint decoded render attempt budget was exhausted"
+                            if look_refinement_eligibility is not None:
+                                raise ValueError(
+                                    "base render cannot carry look eligibility"
+                                )
+                            joint_decoded_budget.claim_base_render(
+                                candidate_index=candidate_index,
+                                path_identity=path_identity,
                             )
-                        joint_decoded_render_attempt_count += 1
+                        else:
+                            if look_refinement_eligibility is None:
+                                raise ValueError(
+                                    "look rerender requires exact eligibility"
+                                )
+                            claim = (
+                                joint_decoded_budget.claim_look_refinement(
+                                    candidate_index=candidate_index,
+                                    path_identity=path_identity,
+                                    eligibility=(
+                                        look_refinement_eligibility
+                                    ),
+                                )
+                            )
+                            if claim is None:
+                                raise RuntimeError(
+                                    "ineligible look rerender reached renderer"
+                                )
                     single_selection = _review_complete_group_candidates(
                         (bundle,),
                         scratch_directory=request.output_directory,
@@ -28679,7 +29636,76 @@ def analyze(
                             else None
                         ),
                     )
-                    return single_selection.reviews[0]
+                    decoded_review = single_selection.reviews[0]
+                    if (
+                        joint_visual_selection_active
+                        and decoded_review.review_payload is not None
+                    ):
+                        try:
+                            underlying = (
+                                _underlying_joint_materialized_candidate(
+                                    materialized
+                                )
+                            )
+                            if underlying is None:
+                                raise TypeError(
+                                    "decoded montage feedback requires a joint "
+                                    "materialized candidate"
+                                )
+                            render_variant_signature = (
+                                _joint_decoded_render_variant_signature(
+                                    decoded_review.review_payload
+                                )
+                            )
+                            bound_render_variant = (
+                                _bound_decoded_proxy_identity(
+                                    decoded_review.review_payload,
+                                    render_plan=bundle.render_plan,
+                                )[0]
+                            )
+                            if (
+                                bound_render_variant
+                                != render_variant_signature
+                            ):
+                                raise ValueError(
+                                    "decoded montage feedback render binding "
+                                    "changed"
+                                )
+                            observations = (
+                                joint_decoded_montage_observations_from_bound_review(
+                                    timeline_choices=(
+                                        underlying.joint_result.timeline.choices
+                                    ),
+                                    render_plan=bundle.render_plan,
+                                    review_payload=(
+                                        decoded_review.review_payload
+                                    ),
+                                    render_variant_signature=(
+                                        render_variant_signature
+                                    ),
+                                )
+                            )
+                            joint_decoded_montage_observations = (
+                                merge_joint_decoded_montage_observations(
+                                    joint_decoded_montage_observations,
+                                    observations,
+                                )
+                            )
+                        except (OSError, TypeError, ValueError) as exc:
+                            joint_decoded_montage_feedback_errors.append(
+                                {
+                                    "candidate_index": int(
+                                        materialized.candidate_index
+                                    ),
+                                    "render_kind": render_kind.value,
+                                    "error": (
+                                        f"{type(exc).__name__}: {exc}"
+                                    ),
+                                    "hard_no_good_authored": False,
+                                    "thresholds_lowered": False,
+                                }
+                            )
+                    return decoded_review
 
                 def refine_joint_candidate_look_from_decoded_output(
                     materialized: Any,
@@ -28755,11 +29781,58 @@ def analyze(
                             current_objective.selection_penalty_points
                         ),
                     }
+                    (
+                        current_eligibility,
+                        current_eligibility_diagnostics,
+                    ) = _joint_group_look_refinement_eligibility(
+                        initial_payload,
+                        exact_evidence=True,
+                        look_admission_passed=(
+                            current_objective.admission_passed
+                        ),
+                        decoded_review_passed=decoded_review.passed,
+                    )
+                    audit["eligibility_checks"] = [
+                        {
+                            "iteration": 1,
+                            **current_eligibility_diagnostics,
+                        }
+                    ]
                     if current_objective.admission_passed:
                         audit.update(
                             _joint_decoded_look_already_passed_audit_fields(
                                 decoded_review_passed=decoded_review.passed,
                             )
+                        )
+                        joint_decoded_look_refinement_audits[
+                            candidate_index
+                        ] = audit
+                        return bundle, decoded_review
+                    if not current_eligibility.authorized:
+                        path_invariant_nonlook_failure = bool(
+                            current_eligibility.evidence_complete
+                            and not current_eligibility.nonlook_gates_passed
+                        )
+                        audit.update(
+                            {
+                                "applicable": False,
+                                "evidence_complete": (
+                                    current_eligibility.evidence_complete
+                                ),
+                                "exhausted": True,
+                                "budget_exhausted": False,
+                                "look_rerender_required": False,
+                                "path_invariant_nonlook_failure": (
+                                    path_invariant_nonlook_failure
+                                ),
+                                "reason": (
+                                    current_eligibility.reason_code
+                                ),
+                                "complete_path_no_good_allowed": (
+                                    path_invariant_nonlook_failure
+                                    and not decoded_review.passed
+                                ),
+                            }
                         )
                         joint_decoded_look_refinement_audits[
                             candidate_index
@@ -28774,13 +29847,30 @@ def analyze(
                     exhausted = False
                     budget_exhausted = False
                     for iteration in (1, 2):
-                        if (
-                            joint_decoded_render_attempt_count
-                            >= _JOINT_DECODED_ATTEMPT_LIMIT
-                        ):
-                            budget_exhausted = True
-                            break
                         assert current_review.review_payload is not None
+                        if iteration > 1:
+                            (
+                                current_eligibility,
+                                current_eligibility_diagnostics,
+                            ) = _joint_group_look_refinement_eligibility(
+                                current_review.review_payload,
+                                exact_evidence=True,
+                                look_admission_passed=(
+                                    current_objective.admission_passed
+                                ),
+                                decoded_review_passed=(
+                                    current_review.passed
+                                ),
+                            )
+                            audit["eligibility_checks"].append(
+                                {
+                                    "iteration": iteration,
+                                    **current_eligibility_diagnostics,
+                                }
+                            )
+                            if not current_eligibility.authorized:
+                                exhausted = True
+                                break
                         try:
                             proposal = (
                                 refine_group_render_plan_from_decoded_proxy(
@@ -28835,22 +29925,54 @@ def analyze(
                         reporter.status(
                             "joint 동일 경로 출력 색감 재보정·"
                             "디코딩 QA 중… "
-                            f"시도 {joint_decoded_render_attempt_count + 1}/"
-                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            "후보 "
+                            f"{joint_decoded_budget.base_render_count}/"
+                            f"{joint_decoded_budget.limits.distinct_candidate_limit} · "
+                            "색감 "
+                            f"{joint_decoded_budget.look_refinement_render_count + 1}/"
+                            f"{joint_decoded_budget.limits.look_refinement_render_limit} · "
                             f"라운드 {iteration}/2"
                         )
-                        proposed_review = (
-                            decode_and_review_complete_group_bundle(
-                                proposal_bundle
+                        try:
+                            proposed_review = (
+                                decode_and_review_complete_group_bundle(
+                                    proposal_bundle,
+                                    materialized=materialized,
+                                    render_kind=(
+                                        JointDecodedRenderKind
+                                        .LOOK_REFINEMENT
+                                    ),
+                                    look_refinement_eligibility=(
+                                        current_eligibility
+                                    ),
+                                )
                             )
-                        )
+                        except JointDecodedBudgetExhausted as exc:
+                            record_joint_decoded_budget_exhaustion(exc)
+                            budget_exhausted = True
+                            audit["iterations"].append(
+                                {
+                                    "iteration": iteration,
+                                    "proposal_created": True,
+                                    "applied": False,
+                                    "accepted": False,
+                                    "rollback": True,
+                                    "budget_exhaustion_cause": (
+                                        exc.reason.value
+                                    ),
+                                    "budget": deepcopy(
+                                        exc.report_payload
+                                    ),
+                                }
+                            )
+                            break
                         iteration_audit: dict[str, Any] = {
                             "iteration": iteration,
                             "proposal_created": True,
                             "applied": True,
                             "refinement": proposal.to_dict(),
-                            "decoded_render_attempt_count": (
-                                joint_decoded_render_attempt_count
+                            "decoded_render_budget": (
+                                joint_decoded_budget.report_payload()
                             ),
                         }
                         if proposed_review.review_payload is None:
@@ -28868,15 +29990,21 @@ def analyze(
                             audit["iterations"].append(iteration_audit)
                             break
                         try:
-                            (
-                                proposed_objective,
-                                base_nonlook_regressions,
-                                _base_accepted,
-                            ) = _joint_group_look_refinement_acceptance(
-                                current_objective,
-                                current_review.review_payload,
-                                proposed_review.review_payload,
+                            current_render_variant = (
+                                _joint_decoded_render_variant_signature(
+                                    current_review.review_payload
+                                )
                             )
+                            current_bound_variant = (
+                                _bound_decoded_proxy_identity(
+                                    current_review.review_payload,
+                                    render_plan=current_bundle.render_plan,
+                                )[0]
+                            )
+                            if current_bound_variant != current_render_variant:
+                                raise ValueError(
+                                    "current decoded render variant binding changed"
+                                )
                             proposed_render_variant = (
                                 _joint_decoded_render_variant_signature(
                                     proposed_review.review_payload
@@ -28895,12 +30023,45 @@ def analyze(
                                 raise ValueError(
                                     "refined decoded render variant binding changed"
                                 )
-                            nonlook_regressions = list(
-                                base_nonlook_regressions
-                            )
                             _joint_require_refined_render_variant_lineage(
                                 proposal,
                                 proposed_render_variant,
+                            )
+                            look_sensitive_visible_audit = (
+                                _joint_group_look_sensitive_visible_audit(
+                                    current_review.review_payload,
+                                    proposed_review.review_payload,
+                                )
+                            )
+                            exact_path_invariant_reasons = (
+                                _joint_group_exact_decoded_path_invariant_reasons(
+                                    current_review.review_payload,
+                                    proposed_review.review_payload,
+                                    previous_render_timeline_binding_sha256=(
+                                        current_bound_variant
+                                    ),
+                                    proposed_render_timeline_binding_sha256=(
+                                        proposed_bound_variant
+                                    ),
+                                )
+                            )
+                            (
+                                proposed_objective,
+                                base_nonlook_regressions,
+                                _base_accepted,
+                            ) = _joint_group_look_refinement_acceptance(
+                                current_objective,
+                                current_review.review_payload,
+                                proposed_review.review_payload,
+                                previous_render_timeline_binding_sha256=(
+                                    current_bound_variant
+                                ),
+                                proposed_render_timeline_binding_sha256=(
+                                    proposed_bound_variant
+                                ),
+                            )
+                            nonlook_regressions = list(
+                                base_nonlook_regressions
                             )
                             decoded_geometry_comparison: (
                                 dict[str, Any] | None
@@ -28968,6 +30129,12 @@ def analyze(
                                 ),
                                 "nonlook_regression_reasons": list(
                                     nonlook_regressions
+                                ),
+                                "look_sensitive_visible_audit": (
+                                    look_sensitive_visible_audit
+                                ),
+                                "exact_decoded_path_invariant_reasons": list(
+                                    exact_path_invariant_reasons
                                 ),
                                 "decoded_output_geometry_comparison": (
                                     decoded_geometry_comparison
@@ -29064,19 +30231,37 @@ def analyze(
                         )
                     if (
                         joint_visual_selection_active
-                        and len(attempted_candidate_indices)
-                        >= _JOINT_DECODED_ATTEMPT_LIMIT
+                        and not _joint_decoded_materialized_candidate_attempt_allowed(
+                            attempted_materialized_candidate_count=len(
+                                attempted_candidate_indices
+                            ),
+                            base_render_count=(
+                                joint_decoded_budget.base_render_count
+                            ),
+                            maximum_base_render_count=(
+                                joint_decoded_budget.limits
+                                .distinct_candidate_limit
+                            ),
+                        )
                     ):
                         raise RuntimeError(
-                            "joint decoded candidate attempt limit was exceeded"
+                            "joint decoded materialization or base-render "
+                            "capacity was exhausted"
                         )
                     attempted_candidate_indices.add(materialized.candidate_index)
                     attempted_materialized_candidates.append(materialized)
                     if joint_visual_selection_active:
                         reporter.status(
                             "joint 후보 경계 보정·완전 파생 중… "
-                            f"시도 {min(joint_decoded_render_attempt_count + 1, 24)}/"
-                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            "후보 "
+                            f"{len(attempted_candidate_indices)}/"
+                            f"{_JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT} · "
+                            "base "
+                            f"{joint_decoded_budget.base_render_count}/"
+                            f"{joint_decoded_budget.limits.distinct_candidate_limit} · "
+                            "총렌더 "
+                            f"{joint_decoded_budget.total_render_count}/"
+                            f"{joint_decoded_budget.limits.total_render_safety_limit} · "
                             f"통과 {min(len(derived), 8)}/"
                             f"{_JOINT_REQUIRED_DECODED_PASS_COUNT}"
                         )
@@ -29547,8 +30732,12 @@ def analyze(
                     if joint_visual_selection_active:
                         reporter.status(
                             "joint 후보 480p 렌더·디코딩 QA 중… "
-                            f"시도 {min(joint_decoded_render_attempt_count + 1, 24)}/"
-                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            "후보 "
+                            f"{joint_decoded_budget.base_render_count + 1}/"
+                            f"{joint_decoded_budget.limits.distinct_candidate_limit} · "
+                            "색감 "
+                            f"{joint_decoded_budget.look_refinement_render_count}/"
+                            f"{joint_decoded_budget.limits.look_refinement_render_limit} · "
                             f"통과 {min(len(derived), 8)}/"
                             f"{_JOINT_REQUIRED_DECODED_PASS_COUNT} "
                             f"(후보 {materialized.candidate_index})"
@@ -29559,9 +30748,40 @@ def analyze(
                             f"{len(streamed_group_candidate_reviews) + 1}/8 "
                             f"(후보 {materialized.candidate_index})"
                         )
-                    decoded_review = decode_and_review_complete_group_bundle(
-                        bundle
-                    )
+                    try:
+                        decoded_review = (
+                            decode_and_review_complete_group_bundle(
+                                bundle,
+                                materialized=materialized,
+                                render_kind=(
+                                    JointDecodedRenderKind.BASE_CANDIDATE
+                                ),
+                            )
+                        )
+                    except JointDecodedBudgetExhausted as exc:
+                        record_joint_decoded_budget_exhaustion(exc)
+                        candidate_decoded_review_failures.append(
+                            {
+                                "candidate_index": (
+                                    materialized.candidate_index
+                                ),
+                                "review_rank": materialized.review_rank,
+                                "stage": "decoded_render_budget",
+                                "error": exc.reason.value,
+                                "budget": deepcopy(exc.report_payload),
+                            }
+                        )
+                        return TerminalCandidateVerdict(
+                            materialized.candidate_index,
+                            CandidateVerdictStatus.PROXY_EXECUTION_ERROR,
+                            (
+                                CandidateBlocker(
+                                    CandidateBlockerKind.PROXY_EXECUTION,
+                                    exc.reason.value,
+                                ),
+                            ),
+                            geometry_deferral_pre_proxy_eligible,
+                        )
                     if decoded_review.review_payload is None:
                         candidate_decoded_review_failures.append(
                             {
@@ -29756,8 +30976,12 @@ def analyze(
                     if joint_visual_selection_active:
                         reporter.log(
                             f"후보 {materialized.candidate_index} 즉시 디코딩 QA 완료 · "
-                            f"시도 {joint_decoded_render_attempt_count}/"
-                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            "후보 "
+                            f"{joint_decoded_budget.base_render_count}/"
+                            f"{joint_decoded_budget.limits.distinct_candidate_limit} · "
+                            "색감 "
+                            f"{joint_decoded_budget.look_refinement_render_count}/"
+                            f"{joint_decoded_budget.limits.look_refinement_render_limit} · "
                             f"통과 {min(len(streamed_group_candidate_reviews), 8)}/"
                             f"{_JOINT_REQUIRED_DECODED_PASS_COUNT} · "
                             "임시 프록시 제거"
@@ -30662,6 +31886,22 @@ def analyze(
                         abort_boundary_search_failure(exc)
                 else:
                     for materialized in materialized_group_candidates:
+                        if (
+                            joint_visual_selection_active
+                            and not _joint_decoded_materialized_candidate_attempt_allowed(
+                                attempted_materialized_candidate_count=len(
+                                    attempted_candidate_indices
+                                ),
+                                base_render_count=(
+                                    joint_decoded_budget.base_render_count
+                                ),
+                                maximum_base_render_count=(
+                                    joint_decoded_budget.limits
+                                    .distinct_candidate_limit
+                                ),
+                            )
+                        ):
+                            break
                         derive_and_gate_candidate(materialized)
                         if joint_visual_selection_active and (
                             joint_diverse_passing_cohort()
@@ -30693,11 +31933,18 @@ def analyze(
                         "attempted_candidate_count": len(
                             attempted_candidate_indices
                         ),
-                        "decoded_render_attempt_count": (
-                            joint_decoded_render_attempt_count
+                        "maximum_materialized_candidate_attempt_count": (
+                            _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
                         ),
-                        "maximum_attempted_candidate_count": (
-                            _JOINT_DECODED_ATTEMPT_LIMIT
+                        "decoded_render_budget": (
+                            joint_decoded_budget.report_payload()
+                        ),
+                        "decoded_budget_exhaustions": deepcopy(
+                            joint_decoded_budget_exhaustions
+                        ),
+                        "maximum_base_render_count": (
+                            joint_decoded_budget.limits
+                            .distinct_candidate_limit
                         ),
                         "authorized_candidate_count": len(derived),
                         "required_authorized_candidate_count": (
@@ -30730,14 +31977,6 @@ def analyze(
                         not joint_diverse_passing_cohort()
                         and joint_shared_render_contract_failure is None
                     ):
-                        if (
-                            joint_decoded_render_attempt_count
-                            >= _JOINT_DECODED_ATTEMPT_LIMIT
-                        ):
-                            set_joint_decoded_feedback_terminal_proof(
-                                "joint_decoded_attempt_limit_exhausted"
-                            )
-                            break
                         pending_render_variant_indices = sorted(
                             candidate_index
                             for candidate_index, classification in (
@@ -30747,14 +31986,21 @@ def analyze(
                                 "complete_path_no_good_deferred_for_render_variant"
                             )
                         )
-                        if pending_render_variant_indices:
+                        if (
+                            joint_decoded_budget.remaining_distinct_candidate_count
+                            <= 0
+                        ):
                             set_joint_decoded_feedback_terminal_proof(
-                                "joint_decoded_render_variant_refinement_required",
+                                JointDecodedBudgetExhaustionReason
+                                .DISTINCT_CANDIDATE_LIMIT.value,
                                 evidence={
                                     "pending_candidate_indices": (
                                         pending_render_variant_indices
                                     ),
-                                    "exact_path_no_good_added": False,
+                                    "exact_path_no_good_added_for_pending": False,
+                                    "decoded_render_budget": (
+                                        joint_decoded_budget.report_payload()
+                                    ),
                                 },
                             )
                             break
@@ -30783,16 +32029,31 @@ def analyze(
                         if (
                             first_global_candidate_index
                             + MINIMUM_PRODUCTION_JOINT_CANDIDATES
-                            > _JOINT_DECODED_ATTEMPT_LIMIT
+                            > _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
                         ):
                             set_joint_decoded_feedback_terminal_proof(
-                                "joint_decoded_materialized_pool_limit_exhausted"
+                                "joint_decoded_proof_materialization_budget_exhausted",
+                                evidence={
+                                    "pending_candidate_indices": (
+                                        pending_render_variant_indices
+                                    ),
+                                    "exact_path_no_good_added_for_pending": (
+                                        False
+                                    ),
+                                    "decoded_render_budget": (
+                                        joint_decoded_budget.report_payload()
+                                    ),
+                                },
                             )
                             break
                         reporter.status(
                             "decoded QA 피드백으로 joint 후보 재선택 중… "
-                            f"시도 {joint_decoded_render_attempt_count}/"
-                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            "후보 "
+                            f"{len(attempted_candidate_indices)}/"
+                            f"{joint_decoded_budget.limits.distinct_candidate_limit} · "
+                            "렌더 "
+                            f"{joint_decoded_budget.total_render_count}/"
+                            f"{joint_decoded_budget.limits.total_render_safety_limit} · "
                             f"통과 {min(len(derived), 8)}/"
                             f"{_JOINT_REQUIRED_DECODED_PASS_COUNT}"
                         )
@@ -30913,8 +32174,18 @@ def analyze(
                         )
                         for materialized in globally_indexed_feedback:
                             if (
-                                joint_decoded_render_attempt_count
-                                >= _JOINT_DECODED_ATTEMPT_LIMIT
+                                not _joint_decoded_materialized_candidate_attempt_allowed(
+                                    attempted_materialized_candidate_count=len(
+                                        attempted_candidate_indices
+                                    ),
+                                    base_render_count=(
+                                        joint_decoded_budget.base_render_count
+                                    ),
+                                    maximum_base_render_count=(
+                                        joint_decoded_budget.limits
+                                        .distinct_candidate_limit
+                                    ),
+                                )
                                 or joint_diverse_passing_cohort()
                                 or joint_shared_render_contract_failure
                                 is not None
