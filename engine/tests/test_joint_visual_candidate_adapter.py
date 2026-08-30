@@ -1324,12 +1324,64 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             1,
         )
 
-    def test_five_unique_paths_fail_even_with_many_render_variants(self) -> None:
+    def test_five_unique_paths_retain_three_distinct_render_variants(self) -> None:
         candidate_set = _candidate_set()
         pools = _limited_profile_pools(
             candidate_set,
             unique_path_count=5,
-            alternate_paths=(0, 1, 2, 3, 4),
+            alternate_paths=(0, 1, 2),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(
+            selected.unique_source_shot_path_count,
+            5,
+        )
+        self.assertEqual(
+            selected.proof_variant_supplement_count,
+            3,
+        )
+
+    def test_four_unique_paths_are_the_mathematical_render_cohort_floor(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(selected.unique_source_shot_path_count, 4)
+        self.assertEqual(selected.proof_variant_supplement_count, 4)
+
+    def test_three_unique_paths_fail_even_with_render_variants(self) -> None:
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=3,
+            alternate_paths=(0, 1, 2),
         )
         with patch(
             "crosscut.joint_visual_candidate_adapter."
@@ -1349,7 +1401,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             caught.exception.rejection_counts["unique_source_shot_path_count"],
-            5,
+            3,
         )
 
     def test_six_unique_paths_fail_without_two_eligible_supplements(self) -> None:

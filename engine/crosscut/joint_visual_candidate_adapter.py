@@ -82,7 +82,7 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "joint_visual_candidate_adapter_v1+"
     "three_existing_safe_cadence_profiles_v1+"
     "exact_source_shot_proof_variant_coalescing_v2+"
-    "minimum_six_unique_paths_minimum_eight_render_variants_v1+"
+    "mathematical_unique_path_floor_minimum_eight_render_variants_v2+"
     "workspace_only_optimizer_seed_v1+"
     "selection_scalar_exact_rehydration_v1+"
     "finite_exact_boundary_nogood_retry_v1"
@@ -91,8 +91,11 @@ JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
 )
 MINIMUM_PRODUCTION_JOINT_CANDIDATES = 8
-MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS = 6
 MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH = 2
+MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS = math.ceil(
+    MINIMUM_PRODUCTION_JOINT_CANDIDATES
+    / MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH
+)
 MAXIMUM_PROFILE_JOINT_CANDIDATES = 8
 
 
@@ -250,7 +253,8 @@ class JointVisualSelectionSet:
         unique_path_count = len(set(paths))
         if unique_path_count < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS:
             raise ValueError(
-                "joint selection set requires at least six unique source/shot paths"
+                "joint selection set does not retain the mathematical minimum "
+                "of unique source/shot paths"
             )
         supplement_count = len(paths) - unique_path_count
         required_supplement_count = max(
@@ -633,7 +637,9 @@ def select_joint_visual_candidates(
         or not isinstance(minimum_unique_paths, int)
         or minimum_unique_paths < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
     ):
-        raise ValueError("minimum_unique_paths must be an integer of at least six")
+        raise ValueError(
+            "minimum_unique_paths is below the mathematical render cohort floor"
+        )
     requested_maximum = (
         min(workspace.maximum_results, 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES)
         if maximum_candidates is None
