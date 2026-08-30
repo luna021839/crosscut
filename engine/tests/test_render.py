@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import math
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 from crosscut.ive import AspectRatio
@@ -299,12 +302,37 @@ class RenderTests(unittest.TestCase):
         )
 
     def test_identity_same_source_tier_d_and_native_boundaries_share_one_clock(self) -> None:
+        identity_track = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0, 0.5, 0.5, 0.0),
+                EditorialTransformKeyframe(0.3, 1.0, 0.5, 0.5, 0.0),
+            ),
+            reason="decoded_joint_identity_track",
+        )
         plan = RenderPlan(
             sources=(Path("one.mp4"),),
             segments=(
-                RenderSegment(0, 0.0, 0.4, 0.0),
-                RenderSegment(0, 0.4, 0.3, 0.4),
-                RenderSegment(0, 0.7, 0.5, 0.7),
+                RenderSegment(
+                    0,
+                    0.0,
+                    0.4,
+                    0.0,
+                    editorial_transform=identity_track,
+                ),
+                RenderSegment(
+                    0,
+                    0.4,
+                    0.3,
+                    0.4,
+                    editorial_transform=identity_track,
+                ),
+                RenderSegment(
+                    0,
+                    0.7,
+                    0.5,
+                    0.7,
+                    editorial_transform=identity_track,
+                ),
             ),
             reference_source=0,
             aspect_ratio=AspectRatio.LANDSCAPE,
@@ -326,7 +354,9 @@ class RenderTests(unittest.TestCase):
         # boundaries remain available to QA and provenance.
         self.assertEqual(len(plan.to_json()["transitions"]), 2)  # type: ignore[arg-type]
 
-    def test_same_source_coalescing_fails_closed_for_clock_or_geometry_change(self) -> None:
+    def test_same_source_clock_sharing_preserves_geometry_but_rejects_discontinuity(
+        self,
+    ) -> None:
         clock_gap = RenderPlan(
             sources=(Path("one.mp4"),),
             segments=(
@@ -361,9 +391,324 @@ class RenderTests(unittest.TestCase):
                 RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
             ),
         )
+        timewarp_discontinuity = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    0.5,
+                    0.0,
+                    source_duration=0.505,
+                ),
+                RenderSegment(
+                    0,
+                    0.505,
+                    0.5,
+                    0.5,
+                    source_duration=0.495,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("timewarp-discontinuity.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
 
         self.assertEqual(build_filter_graph(clock_gap).count("[0:v]trim="), 2)
-        self.assertEqual(build_filter_graph(geometry_change).count("[0:v]trim="), 2)
+        self.assertEqual(
+            build_filter_graph(timewarp_discontinuity).count("[0:v]trim="),
+            2,
+        )
+        graph = build_filter_graph(geometry_change)
+        self.assertEqual(graph.count("[0:v]trim="), 1)
+        self.assertIn("[vc0]split=2[vcs0_0][vcs0_1]", graph)
+        self.assertIn(
+            "[vcs0_0]trim=start_frame=0:end_frame=15",
+            graph,
+        )
+        self.assertIn(
+            "[vcs0_1]trim=start_frame=15:end_frame=30",
+            graph,
+        )
+        second_segment_chain = graph.split("[vcs0_1]", 1)[1]
+        self.assertIn(
+            "crop=w=trunc(iw*0.80000000/2)*2",
+            second_segment_chain,
+        )
+        self.assertIn("[vsp0_0][vsp0_1]concat=n=2:v=1:a=0[v0]", graph)
+
+    def test_nonidentity_editorial_and_look_tracks_share_one_decode_clock(
+        self,
+    ) -> None:
+        first_transform = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.04, 0.50, 0.50),
+                EditorialTransformKeyframe(0.4, 1.08, 0.52, 0.48),
+            ),
+            reason="first_segment_push",
+        )
+        second_transform = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.10, 0.48, 0.50),
+                EditorialTransformKeyframe(0.6, 1.05, 0.50, 0.50),
+            ),
+            reason="second_segment_settle",
+        )
+        first_boundary_look = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(0.0, brightness=0.01),
+                BoundaryLookKeyframe(0.4),
+            )
+        )
+        second_boundary_look = BoundaryLookTrack(
+            (
+                BoundaryLookKeyframe(0.0, brightness=-0.01),
+                BoundaryLookKeyframe(0.6),
+            )
+        )
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    0.4,
+                    0.0,
+                    editorial_transform=first_transform,
+                    look_adjustment=SourceLookAdjustment(brightness=0.02),
+                    boundary_look_track=first_boundary_look,
+                ),
+                RenderSegment(
+                    0,
+                    0.4,
+                    0.6,
+                    0.4,
+                    editorial_transform=second_transform,
+                    look_adjustment=SourceLookAdjustment(brightness=-0.02),
+                    boundary_look_track=second_boundary_look,
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("editorial-look-clock.mp4"),
+            fps=30.0,
+            transitions=(
+                RenderTransition(tier="C", reason="same_source_internal_camera_cut"),
+            ),
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertEqual(graph.count("[0:v]trim="), 1)
+        self.assertIn(
+            "[0:v]trim=start=0.000000:duration=1.000000,"
+            "setpts=PTS-STARTPTS,fps=30.000000,",
+            graph,
+        )
+        self.assertIn("[vc0]split=2[vcs0_0][vcs0_1]", graph)
+        self.assertIn(
+            "[vcs0_0]trim=start_frame=0:end_frame=12",
+            graph,
+        )
+        self.assertIn(
+            "[vcs0_1]trim=start_frame=12:end_frame=30",
+            graph,
+        )
+        self.assertEqual(graph.count("zoompan="), 2)
+        self.assertNotIn("setsar=1,fps=30.000000,zoompan=", graph)
+        self.assertIn(
+            "eq=brightness=0.020000:contrast=1.000000:saturation=1.000000",
+            graph,
+        )
+        self.assertIn(
+            "eq=brightness=-0.020000:contrast=1.000000:saturation=1.000000",
+            graph,
+        )
+        self.assertEqual(graph.count(":eval=frame"), 2)
+        self.assertIn("[vsp0_0][vsp0_1]concat=n=2:v=1:a=0[v0]", graph)
+
+    def test_shared_clock_collapses_adjacent_identity_post_clock_slices(
+        self,
+    ) -> None:
+        frame_duration = 2.0 / 30.0
+        segments = tuple(
+            RenderSegment(
+                0,
+                index * frame_duration,
+                frame_duration,
+                index * frame_duration,
+                crop=(
+                    NormalizedCrop(0.1, 0.0, 0.8, 1.0)
+                    if index == 25
+                    else None
+                ),
+            )
+            for index in range(50)
+        )
+        plan = RenderPlan(
+            sources=(Path("one.mp4"),),
+            segments=segments,
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("bounded-post-clock-slices.mp4"),
+            fps=30.0,
+        )
+
+        graph = build_filter_graph(plan)
+
+        self.assertEqual(graph.count("[0:v]trim="), 1)
+        self.assertIn("[vc0]split=3[vcs0_0][vcs0_1][vcs0_2]", graph)
+        self.assertIn(
+            "[vcs0_0]trim=start_frame=0:end_frame=50",
+            graph,
+        )
+        self.assertIn(
+            "[vcs0_1]trim=start_frame=50:end_frame=52",
+            graph,
+        )
+        self.assertIn(
+            "[vcs0_2]trim=start_frame=52:end_frame=100",
+            graph,
+        )
+        self.assertEqual(
+            graph.count("force_original_aspect_ratio=decrease"),
+            3,
+        )
+        self.assertEqual(len(plan.transitions), 49)
+
+    def test_shared_clock_ffmpeg_decode_has_no_duplicate_boundary_frame(
+        self,
+    ) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            self.skipTest("ffmpeg is unavailable")
+        first_transform = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.02),
+                EditorialTransformKeyframe(0.5, 1.04),
+            ),
+            reason="ffmpeg_clock_first_transform",
+        )
+        second_transform = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.06),
+                EditorialTransformKeyframe(0.5, 1.03),
+            ),
+            reason="ffmpeg_clock_second_transform",
+        )
+        plan = RenderPlan(
+            sources=(Path("synthetic-counting-source"),),
+            segments=(
+                RenderSegment(
+                    0,
+                    0.0,
+                    0.5,
+                    0.0,
+                    editorial_transform=first_transform,
+                    look_adjustment=SourceLookAdjustment(saturation=0.96),
+                ),
+                RenderSegment(
+                    0,
+                    0.5,
+                    0.5,
+                    0.5,
+                    editorial_transform=second_transform,
+                    look_adjustment=SourceLookAdjustment(saturation=1.04),
+                ),
+            ),
+            reference_source=0,
+            aspect_ratio=AspectRatio.LANDSCAPE,
+            output=Path("synthetic-clock-output.mkv"),
+            fps=30.0,
+            width=64,
+            height=36,
+            transitions=(
+                RenderTransition(
+                    tier="C",
+                    reason="same_source_internal_camera_cut",
+                ),
+            ),
+        )
+        video_graph = build_filter_graph(plan).rsplit(";\n[0:a]", 1)[0]
+        source = (
+            "nullsrc=size=64x36:rate=30:duration=1,"
+            "geq=lum='16+4*N':cb=128:cr=128,format=yuv420p"
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            encoded = Path(temp) / "clock.mkv"
+            render_command = (
+                ffmpeg,
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-filter_complex",
+                video_graph,
+                "-map",
+                "[vout]",
+                "-an",
+                "-c:v",
+                "ffv1",
+                "-y",
+                str(encoded),
+            )
+            try:
+                subprocess.run(
+                    render_command,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                )
+                decoded = subprocess.run(
+                    (
+                        ffmpeg,
+                        "-v",
+                        "error",
+                        "-i",
+                        str(encoded),
+                        "-map",
+                        "0:v:0",
+                        "-vsync",
+                        "0",
+                        "-pix_fmt",
+                        "gray",
+                        "-f",
+                        "rawvideo",
+                        "pipe:1",
+                    ),
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                ).stdout
+            except subprocess.CalledProcessError as error:
+                self.fail(error.stderr.decode("utf-8", errors="replace"))
+
+        frame_size = 64 * 36
+        self.assertEqual(len(decoded) % frame_size, 0)
+        frame_count = len(decoded) // frame_size
+        self.assertEqual(frame_count, 30)
+        means = tuple(
+            sum(decoded[index * frame_size : (index + 1) * frame_size])
+            / frame_size
+            for index in range(frame_count)
+        )
+        frame_deltas = tuple(
+            right - left for left, right in zip(means, means[1:])
+        )
+        self.assertTrue(
+            all(delta > 1.0 for delta in frame_deltas),
+            msg=f"non-increasing decoded frame markers: {frame_deltas}",
+        )
+        self.assertGreater(frame_deltas[14], 1.0)
 
     def test_cross_cut_look_ramps_merge_with_adjacent_same_source_clocks(self) -> None:
         last_frame = 5.0 / 30.0

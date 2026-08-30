@@ -17,10 +17,11 @@ from .timewarp import TimeWarpMap
 
 RENDER_PLAN_SOURCE_INDEX_DOMAIN = "render_plan_sources_array_index"
 MAXIMUM_RENDER_TIMEWARP_RATE_DELTA = 0.02
-# Joining an identity same-source run may replace several locally linear
-# time-warps with one linear clock.  Keep every serialized internal endpoint
-# within 1/500th of one output frame so the optimization cannot hide a real
-# source-clock edit or meaningfully move a broadcaster-native camera cut.
+# Joining a contiguous same-source run may replace several locally linear
+# time-warps with one linear decode clock.  Keep every serialized internal
+# endpoint within 1/500th of one output frame so the optimization cannot hide
+# a real source-clock edit or meaningfully move a broadcaster-native camera
+# cut.
 MAXIMUM_COALESCED_INTERNAL_CLOCK_ERROR_FRAMES = 0.002
 MAXIMUM_COALESCED_SOURCE_GAP_SECONDS = 1e-6
 
@@ -1495,6 +1496,7 @@ def _editorial_transform_filters(
     width: int,
     height: int,
     fps: float,
+    input_clock_is_canonical: bool = False,
 ) -> list[str]:
     """Build a one-frame-in/one-frame-out authored camera transform."""
 
@@ -1552,11 +1554,12 @@ def _editorial_transform_filters(
         ),
         f"crop={working_width}:{working_height}",
         "setsar=1",
+    ]
+    if not input_clock_is_canonical:
         # Canonicalize after local time-warp before zoompan. zoompan emits one
         # output frame per input frame, so the small source-rate correction is
         # retained instead of being silently replaced by source cadence.
-        f"fps={fps:.6f}",
-    ]
+        filters.append(f"fps={fps:.6f}")
     if any(abs(keyframe.roll_degrees) > 1e-9 for keyframe in track.keyframes):
         roll_expression = _escape_filter_expression(
             _piecewise_linear_expression(samples, 4)
@@ -1691,12 +1694,8 @@ def _boundary_look_filters(
     return filters
 
 
-def _video_chain(
+def _video_post_clock_filters(
     *,
-    source_index: int,
-    source_start: float,
-    source_duration: float,
-    timeline_duration: float,
     crop: NormalizedCrop | None,
     pan_crop: PanCropTrack | None,
     editorial_transform: EditorialTransformTrack | None,
@@ -1706,18 +1705,11 @@ def _video_chain(
     height: int,
     fps: float,
     frame_count: int,
-    output_label: str,
-) -> str:
-    playback_pts_scale = timeline_duration / source_duration
-    setpts = (
-        "setpts=PTS-STARTPTS"
-        if math.isclose(playback_pts_scale, 1.0, rel_tol=0.0, abs_tol=1e-9)
-        else f"setpts={playback_pts_scale:.12f}*(PTS-STARTPTS)"
-    )
-    chain = [
-        f"[{source_index}:v]trim=start={source_start:.6f}:duration={source_duration:.6f}",
-        setpts,
-    ]
+    input_clock_is_canonical: bool,
+) -> list[str]:
+    """Apply one segment's authored pixels on its local output clock."""
+
+    chain: list[str] = []
     if crop is not None:
         chain.append(
             "crop="
@@ -1748,6 +1740,7 @@ def _video_chain(
                 width=width,
                 height=height,
                 fps=fps,
+                input_clock_is_canonical=input_clock_is_canonical,
             )
         )
     else:
@@ -1756,9 +1749,10 @@ def _video_chain(
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease",
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
                 "setsar=1",
-                f"fps={fps:.6f}",
             ]
         )
+        if not input_clock_is_canonical:
+            chain.append(f"fps={fps:.6f}")
     # Source and boundary look operations are spatially uniform and do not
     # alter geometry or cadence.  Apply them after crop/scale/zoompan so a
     # 480px review does not run affine chroma ``geq`` over every 4K source
@@ -1776,7 +1770,134 @@ def _video_chain(
             "format=yuv420p",
         ]
     )
+    return chain
+
+
+def _video_chain(
+    *,
+    source_index: int,
+    source_start: float,
+    source_duration: float,
+    timeline_duration: float,
+    crop: NormalizedCrop | None,
+    pan_crop: PanCropTrack | None,
+    editorial_transform: EditorialTransformTrack | None,
+    look_adjustment: SourceLookAdjustment | None,
+    boundary_look_track: BoundaryLookTrack | None,
+    width: int,
+    height: int,
+    fps: float,
+    frame_count: int,
+    output_label: str,
+) -> str:
+    playback_pts_scale = timeline_duration / source_duration
+    setpts = (
+        "setpts=PTS-STARTPTS"
+        if math.isclose(playback_pts_scale, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        else f"setpts={playback_pts_scale:.12f}*(PTS-STARTPTS)"
+    )
+    chain = [
+        f"[{source_index}:v]trim=start={source_start:.6f}:duration={source_duration:.6f}",
+        setpts,
+    ]
+    chain.extend(
+        _video_post_clock_filters(
+            crop=crop,
+            pan_crop=pan_crop,
+            editorial_transform=editorial_transform,
+            look_adjustment=look_adjustment,
+            boundary_look_track=boundary_look_track,
+            width=width,
+            height=height,
+            fps=fps,
+            frame_count=frame_count,
+            input_clock_is_canonical=False,
+        )
+    )
     return ",".join(chain) + f"[{output_label}]"
+
+
+def _video_source_clock_chain(
+    *,
+    source_index: int,
+    source_start: float,
+    source_duration: float,
+    timeline_duration: float,
+    fps: float,
+    frame_count: int,
+    output_label: str,
+) -> str:
+    """Decode and quantize one continuous source interval exactly once."""
+
+    playback_pts_scale = timeline_duration / source_duration
+    setpts = (
+        "setpts=PTS-STARTPTS"
+        if math.isclose(playback_pts_scale, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        else f"setpts={playback_pts_scale:.12f}*(PTS-STARTPTS)"
+    )
+    chain = [
+        f"[{source_index}:v]trim=start={source_start:.6f}:duration={source_duration:.6f}",
+        setpts,
+        f"fps={fps:.6f}",
+        "tpad=stop_mode=clone:stop_duration=1",
+        f"trim=end_frame={frame_count}",
+        f"setpts=N/({fps:.6f}*TB)",
+        "settb=AVTB",
+    ]
+    return ",".join(chain) + f"[{output_label}]"
+
+
+def _dissolve_handle_video_chain(
+    index: int,
+    segment: RenderSegment,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    extension_frames: int,
+) -> str:
+    """Render one separately sought outgoing overlap handle."""
+
+    handle_crop = segment.crop
+    handle_editorial_transform: EditorialTransformTrack | None = None
+    if segment.pan_crop is not None:
+        track = segment.pan_crop.simplified()
+        crop_width, crop_height = track.fixed_crop_size
+        _time, left, top = track.fixed_crop_positions()[-1]
+        handle_crop = NormalizedCrop(left, top, crop_width, crop_height)
+    if segment.editorial_transform is not None:
+        final = segment.editorial_transform.final_keyframe
+        handle_editorial_transform = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(
+                    0.0,
+                    final.zoom,
+                    final.center_x,
+                    final.center_y,
+                    final.roll_degrees,
+                ),
+            ),
+            reason=f"{segment.editorial_transform.reason}_dissolve_handle_hold",
+        )
+    return _video_chain(
+        source_index=segment.source_index,
+        source_start=segment.source_start + segment.effective_source_duration,
+        source_duration=(extension_frames / fps) * segment.source_playback_rate,
+        timeline_duration=extension_frames / fps,
+        crop=handle_crop,
+        pan_crop=None,
+        editorial_transform=handle_editorial_transform,
+        look_adjustment=segment.look_adjustment,
+        # A dissolve handle is outside the nominal hard-cut segment.  Reusing
+        # a local time expression here would restart an incoming ramp at t=0;
+        # hold the source-global look only instead.
+        boundary_look_track=None,
+        width=width,
+        height=height,
+        fps=fps,
+        frame_count=extension_frames,
+        output_label=f"vh{index}",
+    )
 
 
 def _video_filter(
@@ -1825,45 +1946,13 @@ def _video_filter(
         frame_count=frame_count,
         output_label=f"vb{index}",
     )
-    handle_crop = segment.crop
-    handle_editorial_transform: EditorialTransformTrack | None = None
-    if segment.pan_crop is not None:
-        track = segment.pan_crop.simplified()
-        crop_width, crop_height = track.fixed_crop_size
-        _time, left, top = track.fixed_crop_positions()[-1]
-        handle_crop = NormalizedCrop(left, top, crop_width, crop_height)
-    if segment.editorial_transform is not None:
-        final = segment.editorial_transform.final_keyframe
-        handle_editorial_transform = EditorialTransformTrack(
-            (
-                EditorialTransformKeyframe(
-                    0.0,
-                    final.zoom,
-                    final.center_x,
-                    final.center_y,
-                    final.roll_degrees,
-                ),
-            ),
-            reason=f"{segment.editorial_transform.reason}_dissolve_handle_hold",
-        )
-    handle = _video_chain(
-        source_index=segment.source_index,
-        source_start=segment.source_start + segment.effective_source_duration,
-        source_duration=(extension_frames / fps) * segment.source_playback_rate,
-        timeline_duration=extension_frames / fps,
-        crop=handle_crop,
-        pan_crop=None,
-        editorial_transform=handle_editorial_transform,
-        look_adjustment=segment.look_adjustment,
-        # A dissolve handle is outside the nominal hard-cut segment.  Reusing
-        # a local time expression here would restart an incoming ramp at t=0;
-        # hold the source-global look only instead.
-        boundary_look_track=None,
+    handle = _dissolve_handle_video_chain(
+        index,
+        segment,
         width=width,
         height=height,
         fps=fps,
-        frame_count=extension_frames,
-        output_label=f"vh{index}",
+        extension_frames=extension_frames,
     )
     return (
         f"{base};\n{handle};\n"
@@ -1872,19 +1961,31 @@ def _video_filter(
 
 
 @dataclass(frozen=True, slots=True)
+class _VideoPostClockSlice:
+    """One render-equivalent slice cut from a shared source clock."""
+
+    segment: RenderSegment
+    frame_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _VideoRenderUnit:
-    """One independently timed FFmpeg chain.
+    """One independently decoded FFmpeg source clock.
 
     ``RenderPlan`` keeps every authored boundary for QA and provenance.  The
-    renderer may nevertheless decode a pixel-identical, contiguous same-source
-    run as one unit.  This prevents each local ``trim -> setpts -> fps`` chain
-    from independently rounding the shared endpoint and emitting the preceding
-    source frame twice.
+    renderer may nevertheless decode a contiguous same-source run as one unit.
+    This prevents each local ``trim -> setpts -> fps`` chain from independently
+    rounding the shared endpoint and emitting the preceding source frame twice.
+    Pixel-identical runs retain the compact combined-segment fast path; other
+    runs split this shared clock at exact output-frame boundaries before each
+    segment's authored geometry and look are applied.
     """
 
     first_segment_index: int
     last_segment_index: int
-    segment: RenderSegment
+    segments: tuple[RenderSegment, ...]
+    segment_frame_counts: tuple[int, ...]
+    coalesced_segment: RenderSegment | None
     frame_count: int
 
 
@@ -1896,11 +1997,52 @@ def _coalescing_look(
     return adjustment
 
 
+def _editorial_transform_track_is_identity(
+    track: EditorialTransformTrack | None,
+) -> bool:
+    """Return whether an authored track renders the identity at every frame.
+
+    Joint decoded candidates deliberately retain a process-bound renderer
+    track even when every authorized keyframe is neutral.  Treating the mere
+    presence of that object as geometry prevented otherwise continuous
+    same-source runs from sharing one decode clock and could duplicate the
+    split frame.  Linear interpolation between neutral keyframes is neutral,
+    so checking every keyframe is an exact proof for the complete track.
+    """
+
+    if track is None:
+        return True
+    return all(
+        math.isclose(keyframe.zoom, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(
+            keyframe.center_x,
+            0.5,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        and math.isclose(
+            keyframe.center_y,
+            0.5,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        and math.isclose(
+            keyframe.roll_degrees,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for keyframe in track.keyframes
+    )
+
+
 def _has_identity_geometry(segment: RenderSegment) -> bool:
     return (
         segment.crop is None
         and segment.pan_crop is None
-        and segment.editorial_transform is None
+        and _editorial_transform_track_is_identity(
+            segment.editorial_transform
+        )
     )
 
 
@@ -1935,36 +2077,27 @@ def _boundary_look_is_frame_continuous(
     )
 
 
-def _can_coalesce_identity_run(
+def _can_share_source_clock(
     plan: RenderPlan,
-    frame_counts: tuple[int, ...],
     *,
     first_index: int,
     candidate_last_index: int,
 ) -> bool:
-    """Return whether one same-source run is provably pixel-equivalent.
+    """Return whether a same-source run has one provably linear clock.
 
-    Only hard-cut boundaries with a continuous source clock and no per-segment
-    geometry are eligible.  Static source look must be identical, and local
-    boundary-look tracks must meet at the same frame-evaluated state so their
-    keyframes can be shifted onto the shared clock.  A very small internal
-    linear-clock error allowance covers measured piecewise time-warp noise
-    while remaining far below a source or output frame.
+    Geometry and look are deliberately irrelevant here because they are
+    applied only after the shared canonical clock is split.  Hard cuts, source
+    continuity, and one linear playback rate remain mandatory.  A very small
+    internal error allowance covers measured time-warp noise while remaining
+    far below a source or output frame.
     """
 
     if candidate_last_index <= first_index:
         return True
     segments = plan.segments[first_index : candidate_last_index + 1]
     first = segments[0]
-    if not _has_identity_geometry(first):
-        return False
-    first_look = _coalescing_look(first.look_adjustment)
     for offset, segment in enumerate(segments):
-        if (
-            segment.source_index != first.source_index
-            or not _has_identity_geometry(segment)
-            or _coalescing_look(segment.look_adjustment) != first_look
-        ):
+        if segment.source_index != first.source_index:
             return False
         if offset == 0:
             continue
@@ -1975,12 +2108,6 @@ def _can_coalesce_identity_run(
             transition.kind is not TransitionKind.HARD_CUT
             or abs(previous.source_end - segment.source_start)
             > MAXIMUM_COALESCED_SOURCE_GAP_SECONDS
-            or not _boundary_look_is_frame_continuous(
-                previous,
-                segment,
-                left_frame_count=frame_counts[boundary_index],
-                fps=plan.fps,
-            )
         ):
             return False
 
@@ -1997,6 +2124,44 @@ def _can_coalesce_identity_run(
             + source_duration * cumulative_timeline / timeline_duration
         )
         if abs(linear_source_boundary - segment.source_end) > maximum_clock_error:
+            return False
+    return True
+
+
+def _can_coalesce_identity_run(
+    plan: RenderPlan,
+    frame_counts: tuple[int, ...],
+    *,
+    first_index: int,
+    candidate_last_index: int,
+) -> bool:
+    """Return whether one shared-clock run is also pixel-equivalent."""
+
+    if not _can_share_source_clock(
+        plan,
+        first_index=first_index,
+        candidate_last_index=candidate_last_index,
+    ):
+        return False
+    segments = plan.segments[first_index : candidate_last_index + 1]
+    first = segments[0]
+    first_look = _coalescing_look(first.look_adjustment)
+    for offset, segment in enumerate(segments):
+        if (
+            not _has_identity_geometry(segment)
+            or _coalescing_look(segment.look_adjustment) != first_look
+        ):
+            return False
+        if offset == 0:
+            continue
+        boundary_index = first_index + offset - 1
+        previous = segments[offset - 1]
+        if not _boundary_look_is_frame_continuous(
+            previous,
+            segment,
+            left_frame_count=frame_counts[boundary_index],
+            fps=plan.fps,
+        ):
             return False
     return True
 
@@ -2041,11 +2206,103 @@ def _combined_boundary_look_track(
     return None if combined.is_identity else combined
 
 
+def _combined_identity_segment(
+    segments: tuple[RenderSegment, ...],
+) -> RenderSegment:
+    """Represent one pixel-equivalent identity run without its boundaries."""
+
+    first = segments[0]
+    last = segments[-1]
+    return RenderSegment(
+        source_index=first.source_index,
+        source_start=first.source_start,
+        duration=sum(segment.duration for segment in segments),
+        master_start=first.master_start,
+        source_duration=last.source_end - first.source_start,
+        look_adjustment=_coalescing_look(first.look_adjustment),
+        boundary_look_track=_combined_boundary_look_track(segments),
+    )
+
+
+def _can_coalesce_post_clock_identity_slice(
+    segments: tuple[RenderSegment, ...],
+    frame_counts: tuple[int, ...],
+    *,
+    first_offset: int,
+    candidate_last_offset: int,
+    fps: float,
+) -> bool:
+    """Prove pixel equivalence after a source clock is already canonical."""
+
+    selected = segments[first_offset : candidate_last_offset + 1]
+    first = selected[0]
+    first_look = _coalescing_look(first.look_adjustment)
+    for offset, segment in enumerate(selected):
+        if (
+            not _has_identity_geometry(segment)
+            or _coalescing_look(segment.look_adjustment) != first_look
+        ):
+            return False
+        if offset == 0:
+            continue
+        previous_offset = first_offset + offset - 1
+        if not _boundary_look_is_frame_continuous(
+            selected[offset - 1],
+            segment,
+            left_frame_count=frame_counts[previous_offset],
+            fps=fps,
+        ):
+            return False
+    return True
+
+
+def _post_clock_slices(
+    unit: _VideoRenderUnit,
+    *,
+    fps: float,
+) -> tuple[_VideoPostClockSlice, ...]:
+    """Collapse only adjacent pixel-equivalent identity segments."""
+
+    slices: list[_VideoPostClockSlice] = []
+    first_offset = 0
+    while first_offset < len(unit.segments):
+        last_offset = first_offset
+        while (
+            last_offset + 1 < len(unit.segments)
+            and _can_coalesce_post_clock_identity_slice(
+                unit.segments,
+                unit.segment_frame_counts,
+                first_offset=first_offset,
+                candidate_last_offset=last_offset + 1,
+                fps=fps,
+            )
+        ):
+            last_offset += 1
+        selected = unit.segments[first_offset : last_offset + 1]
+        segment = (
+            selected[0]
+            if len(selected) == 1
+            else _combined_identity_segment(selected)
+        )
+        slices.append(
+            _VideoPostClockSlice(
+                segment=segment,
+                frame_count=sum(
+                    unit.segment_frame_counts[
+                        first_offset : last_offset + 1
+                    ]
+                ),
+            )
+        )
+        first_offset = last_offset + 1
+    return tuple(slices)
+
+
 def _video_render_units(
     plan: RenderPlan,
     frame_counts: tuple[int, ...],
 ) -> tuple[_VideoRenderUnit, ...]:
-    """Coalesce only safely equivalent identity same-source hard-cut runs."""
+    """Group only continuous, linear same-source hard-cut clocks."""
 
     units: list[_VideoRenderUnit] = []
     first_index = 0
@@ -2053,58 +2310,168 @@ def _video_render_units(
         last_index = first_index
         while (
             last_index + 1 < len(plan.segments)
-            and _can_coalesce_identity_run(
+            and _can_share_source_clock(
                 plan,
-                frame_counts,
                 first_index=first_index,
                 candidate_last_index=last_index + 1,
             )
         ):
             last_index += 1
         first = plan.segments[first_index]
-        last = plan.segments[last_index]
+        unit_segments = plan.segments[first_index : last_index + 1]
+        unit_frame_counts = frame_counts[first_index : last_index + 1]
         if last_index == first_index:
             combined = first
+        elif _can_coalesce_identity_run(
+            plan,
+            frame_counts,
+            first_index=first_index,
+            candidate_last_index=last_index,
+        ):
+            combined = _combined_identity_segment(unit_segments)
         else:
-            combined_segments = plan.segments[first_index : last_index + 1]
-            combined = RenderSegment(
-                source_index=first.source_index,
-                source_start=first.source_start,
-                duration=sum(
-                    segment.duration
-                    for segment in combined_segments
-                ),
-                master_start=first.master_start,
-                source_duration=last.source_end - first.source_start,
-                look_adjustment=_coalescing_look(first.look_adjustment),
-                boundary_look_track=_combined_boundary_look_track(
-                    combined_segments
-                ),
-            )
+            combined = None
         units.append(
             _VideoRenderUnit(
                 first_segment_index=first_index,
                 last_segment_index=last_index,
-                segment=combined,
-                frame_count=sum(frame_counts[first_index : last_index + 1]),
+                segments=unit_segments,
+                segment_frame_counts=unit_frame_counts,
+                coalesced_segment=combined,
+                frame_count=sum(unit_frame_counts),
             )
         )
         first_index = last_index + 1
     return tuple(units)
 
 
+def _shared_clock_video_filter(
+    unit: _VideoRenderUnit,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    extension_frames: int,
+) -> str:
+    """Split one canonical decode clock, then apply segment-local pixels."""
+
+    first = unit.segments[0]
+    last = unit.segments[-1]
+    post_clock_slices = _post_clock_slices(unit, fps=fps)
+    clock_label = f"vc{unit.first_segment_index}"
+    parts = [
+        _video_source_clock_chain(
+            source_index=first.source_index,
+            source_start=first.source_start,
+            source_duration=last.source_end - first.source_start,
+            timeline_duration=sum(segment.duration for segment in unit.segments),
+            fps=fps,
+            frame_count=unit.frame_count,
+            output_label=clock_label,
+        )
+    ]
+    split_labels = tuple(
+        f"vcs{unit.first_segment_index}_{offset}"
+        for offset in range(len(post_clock_slices))
+    )
+    parts.append(
+        f"[{clock_label}]split={len(split_labels)}"
+        + "".join(f"[{label}]" for label in split_labels)
+    )
+
+    pixel_labels: list[str] = []
+    start_frame = 0
+    for offset, post_clock_slice in enumerate(post_clock_slices):
+        segment = post_clock_slice.segment
+        end_frame = start_frame + post_clock_slice.frame_count
+        pixel_label = f"vsp{unit.first_segment_index}_{offset}"
+        chain = [
+            f"[{split_labels[offset]}]trim="
+            f"start_frame={start_frame}:end_frame={end_frame}",
+            "setpts=PTS-STARTPTS",
+        ]
+        chain.extend(
+            _video_post_clock_filters(
+                crop=segment.crop,
+                pan_crop=segment.pan_crop,
+                editorial_transform=segment.editorial_transform,
+                look_adjustment=segment.look_adjustment,
+                boundary_look_track=segment.boundary_look_track,
+                width=width,
+                height=height,
+                fps=fps,
+                frame_count=post_clock_slice.frame_count,
+                input_clock_is_canonical=True,
+            )
+        )
+        parts.append(",".join(chain) + f"[{pixel_label}]")
+        pixel_labels.append(pixel_label)
+        start_frame = end_frame
+
+    nominal_label = (
+        f"vb{unit.first_segment_index}"
+        if extension_frames
+        else f"v{unit.first_segment_index}"
+    )
+    parts.append(
+        "".join(f"[{label}]" for label in pixel_labels)
+        + f"concat=n={len(pixel_labels)}:v=1:a=0[{nominal_label}]"
+    )
+    if extension_frames:
+        parts.append(
+            _dissolve_handle_video_chain(
+                unit.first_segment_index,
+                last,
+                width=width,
+                height=height,
+                fps=fps,
+                extension_frames=extension_frames,
+            )
+        )
+        parts.append(
+            f"[{nominal_label}][vh{unit.first_segment_index}]"
+            f"concat=n=2:v=1:a=0[v{unit.first_segment_index}]"
+        )
+    return ";\n".join(parts)
+
+
+def _video_render_unit_filter(
+    unit: _VideoRenderUnit,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    extension_frames: int,
+) -> str:
+    if unit.coalesced_segment is not None:
+        return _video_filter(
+            unit.first_segment_index,
+            unit.coalesced_segment,
+            width,
+            height,
+            fps,
+            unit.frame_count,
+            extension_frames,
+        )
+    return _shared_clock_video_filter(
+        unit,
+        width=width,
+        height=height,
+        fps=fps,
+        extension_frames=extension_frames,
+    )
+
+
 def build_filter_graph(plan: RenderPlan) -> str:
     frame_counts = segment_frame_counts(plan)
     units = _video_render_units(plan, frame_counts)
     parts = [
-        _video_filter(
-            unit.first_segment_index,
-            unit.segment,
-            plan.width,
-            plan.height,
-            plan.fps,
-            unit.frame_count,
-            (
+        _video_render_unit_filter(
+            unit,
+            width=plan.width,
+            height=plan.height,
+            fps=plan.fps,
+            extension_frames=(
                 plan.transitions[unit.last_segment_index].frame_count
                 if unit.last_segment_index < len(plan.transitions)
                 and plan.transitions[unit.last_segment_index].kind.uses_overlap
