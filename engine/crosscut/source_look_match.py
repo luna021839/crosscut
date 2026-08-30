@@ -22,7 +22,7 @@ from .render import SourceLookAdjustment
 from .timewarp import TimeWarpMap
 
 
-SOURCE_LOOK_MATCH_VERSION = 2
+SOURCE_LOOK_MATCH_VERSION = 3
 SOURCE_LOOK_SAMPLE_FRACTIONS = (
     0.08,
     0.185,
@@ -546,7 +546,8 @@ def match_source_look_samples(
             )
         )
         component_large_directional = tuple(
-            stable
+            target_mode == "cross_source_consensus"
+            and stable
             and abs(median) > plausible_limit
             and _directional_residual_is_reliable(
                 tuple(item[index] for item in residuals),

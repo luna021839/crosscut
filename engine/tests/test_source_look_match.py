@@ -123,7 +123,7 @@ class SourceLookMatchTests(unittest.TestCase):
         self.assertEqual(result.evidence[1].reason, "stable_bounded_static_match")
         self.assertTrue(result.adjustment_for_source(2).is_identity)
 
-    def test_large_stable_luma_residual_uses_existing_bounded_directional_step(
+    def test_consensus_large_stable_luma_residual_uses_bounded_directional_step(
         self,
     ) -> None:
         reference = tuple(
@@ -139,10 +139,12 @@ class SourceLookMatchTests(unittest.TestCase):
         result = match_source_look_samples(
             (reference, dark, bright),
             canonical_sample_times_seconds=self.times,
-            reference_source=0,
+            reference_source=None,
             config=self.config,
         )
 
+        self.assertEqual(result.to_dict()["version"], 3)
+        self.assertEqual(result.target_mode, "cross_source_consensus")
         self.assertEqual(
             result.adjustment_for_source(1).brightness,
             self.config.maximum_brightness,
@@ -158,6 +160,26 @@ class SourceLookMatchTests(unittest.TestCase):
         self.assertEqual(
             dict(result.evidence[2].component_status)["luma"],
             "bounded_directional_step_applied_large_stable_residual",
+        )
+
+    def test_explicit_reference_large_residual_keeps_plausibility_cap(self) -> None:
+        reference = tuple(
+            _metric(0.50, 0.40, 0.40, 0.0) for _ in range(6)
+        )
+        dark = tuple(
+            _metric(0.20, 0.40, 0.40, 0.0) for _ in range(6)
+        )
+        result = match_source_look_samples(
+            (reference, dark),
+            canonical_sample_times_seconds=self.times,
+            reference_source=0,
+            config=self.config,
+        )
+
+        self.assertTrue(result.adjustment_for_source(1).is_identity)
+        self.assertEqual(
+            dict(result.evidence[1].component_status)["luma"],
+            "required_correction_exceeds_safe_evidence_range",
         )
 
     def test_consensus_is_order_invariant_and_does_not_pin_visual_outlier(
