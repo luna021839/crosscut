@@ -48,6 +48,7 @@ from .joint_timeline import (
 )
 from .timeline import (
     NoCompleteTimelinePath,
+    ShotType,
     TimelineCandidate,
     TimelineChoice,
     TimelineResult,
@@ -67,6 +68,7 @@ from .render import (
     output_size,
 )
 from .visual_score import (
+    _CandidateSubjectMetadata,
     VisualTimelineCandidateRecord,
     VisualTimelineCandidateSet,
     VisualTimelineChoice,
@@ -98,7 +100,8 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "selection_materialization_review_parity_v1+"
     "same_source_exact_renderer_clock_continuity_projection_v2+"
     "authoritative_passing_cohort_retry_v2+"
-    "bounded_exact_proof_materialization_v1"
+    "bounded_exact_proof_materialization_v1+"
+    "exact_decoded_montage_soft_role_feedback_v1"
 )
 JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
@@ -113,6 +116,396 @@ MAXIMUM_PROFILE_JOINT_CANDIDATES = 8
 _SCENE_CUT_INTERIOR_EPSILON_SECONDS = 1e-6
 MAXIMUM_JOINT_VISUAL_RETRY_ROUNDS = 2
 MAXIMUM_JOINT_VISUAL_PROOF_CALLS = 32
+MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS = 2
+_DECODED_MONTAGE_SHOT_CLASSES = frozenset(
+    {"wide", "medium", "close", "unknown"}
+)
+_DECODED_MONTAGE_PROMOTABLE_CLASSES = frozenset({"wide", "unknown"})
+
+
+def _validated_sha256(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class JointDecodedMontageSegmentObservation:
+    """One exact rendered-segment observation from a bound proxy review.
+
+    The pipeline owns RenderPlan/review binding before constructing this value.
+    This adapter additionally binds the observation to one exact optimizer
+    candidate clock and requires a distinct rendered-plan identity.  The three
+    shot classes correspond to the rendered entry/interior/exit samples.
+    """
+
+    candidate_clock: JointTimelineCandidateClock
+    render_variant_signature: str
+    sampled_proxy_shot_classes: tuple[str, str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_clock, JointTimelineCandidateClock):
+            raise TypeError(
+                "decoded montage observation requires an exact candidate clock"
+            )
+        object.__setattr__(
+            self,
+            "render_variant_signature",
+            _validated_sha256(
+                self.render_variant_signature,
+                "decoded montage render variant signature",
+            ),
+        )
+        samples = tuple(self.sampled_proxy_shot_classes)
+        if len(samples) != 3 or any(
+            not isinstance(value, str)
+            or value not in _DECODED_MONTAGE_SHOT_CLASSES
+            for value in samples
+        ):
+            raise ValueError(
+                "decoded montage observation needs three canonical shot classes"
+            )
+        object.__setattr__(self, "sampled_proxy_shot_classes", samples)
+
+    @classmethod
+    def from_candidate(
+        cls,
+        candidate: TimelineCandidate,
+        *,
+        render_variant_signature: str,
+        sampled_proxy_shot_classes: Sequence[str],
+    ) -> "JointDecodedMontageSegmentObservation":
+        """Build the public feedback value after caller-side review binding."""
+
+        if not isinstance(candidate, TimelineCandidate):
+            raise TypeError(
+                "decoded montage observation requires a TimelineCandidate"
+            )
+        return cls(
+            candidate_clock=JointTimelineCandidateClock.from_candidate(candidate),
+            render_variant_signature=render_variant_signature,
+            sampled_proxy_shot_classes=tuple(sampled_proxy_shot_classes),
+        )
+
+    @classmethod
+    def from_choice(
+        cls,
+        choice: TimelineChoice,
+        *,
+        render_variant_signature: str,
+        sampled_proxy_shot_classes: Sequence[str],
+    ) -> "JointDecodedMontageSegmentObservation":
+        """Bind feedback to an unshifted choice from ``joint_result.timeline``."""
+
+        if not isinstance(choice, TimelineChoice):
+            raise TypeError("decoded montage observation requires a TimelineChoice")
+        return cls.from_candidate(
+            choice.candidate,
+            render_variant_signature=render_variant_signature,
+            sampled_proxy_shot_classes=sampled_proxy_shot_classes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JointDecodedMontageFeedback:
+    """Bound same-run decoded evidence used only by soft role controls.
+
+    A single rendered observation can retire its exact complete path upstream,
+    but it cannot alter candidate availability here.  Only the same wide or
+    unknown sample observed in at least two distinct render variants is stable
+    enough to replace stale metadata for the next selector batch.
+    """
+
+    observations: tuple[JointDecodedMontageSegmentObservation, ...]
+
+    def __post_init__(self) -> None:
+        observations = tuple(self.observations)
+        if any(
+            not isinstance(item, JointDecodedMontageSegmentObservation)
+            for item in observations
+        ):
+            raise TypeError(
+                "decoded montage feedback contains an invalid observation"
+            )
+        identities = tuple(
+            (item.candidate_clock, item.render_variant_signature)
+            for item in observations
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError(
+                "decoded montage feedback repeats one clock/render variant"
+            )
+        object.__setattr__(self, "observations", observations)
+
+    def to_dict(self) -> dict[str, object]:
+        clocks = {item.candidate_clock for item in self.observations}
+        variants = {item.render_variant_signature for item in self.observations}
+        return {
+            "contract": "joint_decoded_montage_soft_role_feedback_v1",
+            "observation_count": len(self.observations),
+            "candidate_clock_count": len(clocks),
+            "render_variant_count": len(variants),
+            "minimum_distinct_render_variant_count": (
+                MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
+            ),
+            "hard_no_good_authoring_allowed": False,
+            "thresholds_lowered": False,
+            "raw_frames_persisted": False,
+        }
+
+
+def _empty_subject_metadata(
+    *,
+    shot_scale_bases: tuple[str, str, str],
+) -> _CandidateSubjectMetadata:
+    return _CandidateSubjectMetadata(
+        pose_backends=("none", "none", "none"),
+        pose_confidences=(0.0, 0.0, 0.0),
+        person_counts=(0, 0, 0),
+        formation_person_counts=(0, 0, 0),
+        formation_upper_body_counts=(0, 0, 0),
+        shot_scale_bases=shot_scale_bases,
+        silhouette_boxes=(None, None, None),
+        silhouette_centroids=(None, None, None),
+        silhouette_backends=("none", "none", "none"),
+        silhouette_confidences=(0.0, 0.0, 0.0),
+    )
+
+
+def _candidate_role_sample_types(
+    candidate: TimelineCandidate,
+) -> tuple[ShotType, ShotType, ShotType]:
+    return (
+        candidate.entry_shot_type or candidate.shot_type,
+        candidate.shot_type,
+        candidate.exit_shot_type or candidate.shot_type,
+    )
+
+
+def _candidate_role_face_boxes(
+    candidate: TimelineCandidate,
+) -> tuple[
+    tuple[float, float, float, float] | None,
+    tuple[float, float, float, float] | None,
+    tuple[float, float, float, float] | None,
+]:
+    return (
+        candidate.entry_focus_bbox_xywh or candidate.focus_bbox_xywh,
+        candidate.focus_bbox_xywh,
+        candidate.exit_focus_bbox_xywh or candidate.focus_bbox_xywh,
+    )
+
+
+def _canonical_decoded_montage_feedback(
+    lattice: Sequence[Sequence[TimelineCandidate]],
+    feedback: JointDecodedMontageFeedback | None,
+) -> tuple[
+    dict[JointTimelineCandidateClock, tuple[str | None, str | None, str | None]],
+    dict[str, object],
+]:
+    """Validate feedback against the exact lattice and promote stable samples."""
+
+    if feedback is not None and not isinstance(
+        feedback,
+        JointDecodedMontageFeedback,
+    ):
+        raise TypeError(
+            "decoded_montage_feedback must be JointDecodedMontageFeedback or None"
+        )
+    observations = () if feedback is None else feedback.observations
+    lattice_by_clock: dict[JointTimelineCandidateClock, TimelineCandidate] = {}
+    source_slot_by_clock: dict[
+        JointTimelineCandidateClock,
+        tuple[int, str],
+    ] = {}
+    source_slot_counts: dict[tuple[int, str], int] = {}
+    for segment in lattice:
+        for candidate in segment:
+            clock = JointTimelineCandidateClock.from_candidate(candidate)
+            if clock in lattice_by_clock:
+                raise ValueError("candidate lattice repeats an exact clock")
+            lattice_by_clock[clock] = candidate
+            source_slot = (candidate.segment_index, candidate.source_id)
+            source_slot_by_clock[clock] = source_slot
+            source_slot_counts[source_slot] = (
+                source_slot_counts.get(source_slot, 0) + 1
+            )
+
+    observed: dict[
+        JointTimelineCandidateClock,
+        list[dict[str, set[str]]],
+    ] = {}
+    for item in observations:
+        if item.candidate_clock not in lattice_by_clock:
+            raise ValueError(
+                "decoded montage feedback clock does not belong to the lattice"
+            )
+        if source_slot_counts[source_slot_by_clock[item.candidate_clock]] != 1:
+            raise ValueError(
+                "decoded montage feedback cannot target an ambiguous source slot"
+            )
+        slots = observed.setdefault(
+            item.candidate_clock,
+            [dict(), dict(), dict()],
+        )
+        for position, shot_class in enumerate(
+            item.sampled_proxy_shot_classes
+        ):
+            slots[position].setdefault(shot_class, set()).add(
+                item.render_variant_signature
+            )
+
+    promoted: dict[
+        JointTimelineCandidateClock,
+        tuple[str | None, str | None, str | None],
+    ] = {}
+    promoted_counts = {"wide": 0, "unknown": 0}
+    insufficient_sample_count = 0
+    conflicting_sample_count = 0
+    redundant_wide_sample_count = 0
+    for clock, sample_slots in observed.items():
+        original_samples = _candidate_role_sample_types(lattice_by_clock[clock])
+        promoted_samples: list[str | None] = [None, None, None]
+        for position, variants_by_class in enumerate(sample_slots):
+            supported = tuple(
+                sorted(
+                    shot_class
+                    for shot_class, variants in variants_by_class.items()
+                    if shot_class in _DECODED_MONTAGE_PROMOTABLE_CLASSES
+                    and len(variants)
+                    >= MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
+                )
+            )
+            if len(supported) > 1:
+                conflicting_sample_count += 1
+                continue
+            if not supported:
+                if any(
+                    shot_class in _DECODED_MONTAGE_PROMOTABLE_CLASSES
+                    for shot_class in variants_by_class
+                ):
+                    insufficient_sample_count += 1
+                continue
+            shot_class = supported[0]
+            if shot_class == "wide" and original_samples[position] in {
+                ShotType.WIDE,
+                ShotType.GROUP_WIDE,
+            }:
+                redundant_wide_sample_count += 1
+                continue
+            promoted_samples[position] = shot_class
+            promoted_counts[shot_class] += 1
+        if any(value is not None for value in promoted_samples):
+            promoted[clock] = tuple(promoted_samples)  # type: ignore[arg-type]
+
+    return promoted, {
+        "contract": "joint_decoded_montage_soft_role_feedback_application_v1",
+        "feedback_supplied": feedback is not None,
+        "observation_count": len(observations),
+        "observed_candidate_clock_count": len(observed),
+        "promoted_candidate_clock_count": len(promoted),
+        "promoted_wide_sample_count": promoted_counts["wide"],
+        "promoted_unknown_sample_count": promoted_counts["unknown"],
+        "insufficient_distinct_variant_sample_count": insufficient_sample_count,
+        "conflicting_repeated_sample_count": conflicting_sample_count,
+        "redundant_wide_sample_count": redundant_wide_sample_count,
+        "minimum_distinct_render_variant_count": (
+            MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
+        ),
+        "exact_candidate_clock_binding_valid": True,
+        "hard_no_good_count": 0,
+        "hard_no_good_authoring_allowed": False,
+        "optimizer_effect": "existing_non_positive_emission_adjustments_only",
+        "thresholds_lowered": False,
+        "raw_frames_persisted": False,
+    }
+
+
+def _decoded_montage_role_control_inputs(
+    lattice: Sequence[Sequence[TimelineCandidate]],
+    subject_metadata_by_candidate: Mapping[str, _CandidateSubjectMetadata],
+    feedback: JointDecodedMontageFeedback | None,
+) -> tuple[
+    tuple[tuple[TimelineCandidate, ...], ...],
+    Mapping[str, _CandidateSubjectMetadata],
+    dict[str, object],
+]:
+    """Build a scoring-only lattice without changing provider proof identity."""
+
+    promoted, audit = _canonical_decoded_montage_feedback(lattice, feedback)
+    metadata = dict(subject_metadata_by_candidate)
+    shadow_segments: list[tuple[TimelineCandidate, ...]] = []
+    cold_start_close_demotion_count = 0
+    changed_candidate_count = 0
+    for segment in lattice:
+        shadow_segment: list[TimelineCandidate] = []
+        for candidate in segment:
+            clock = JointTimelineCandidateClock.from_candidate(candidate)
+            sample_types = list(_candidate_role_sample_types(candidate))
+            face_boxes = _candidate_role_face_boxes(candidate)
+            bases = list(
+                metadata[candidate.candidate_id].shot_scale_bases
+                if candidate.candidate_id in metadata
+                else ("legacy", "legacy", "legacy")
+            )
+            changed = False
+            promoted_samples = promoted.get(clock, (None, None, None))
+            for position, decoded_class in enumerate(promoted_samples):
+                if decoded_class == "wide":
+                    sample_types[position] = ShotType.WIDE
+                    changed = True
+                elif decoded_class == "unknown":
+                    sample_types[position] = ShotType.MEDIUM
+                    bases[position] = "unknown_no_subject_geometry"
+                    changed = True
+            for position, (shot_type, face_box) in enumerate(
+                zip(sample_types, face_boxes, strict=True)
+            ):
+                if shot_type is ShotType.CLOSE_UP and face_box is None:
+                    sample_types[position] = ShotType.MEDIUM
+                    cold_start_close_demotion_count += 1
+                    changed = True
+            shadow = (
+                replace(
+                    candidate,
+                    entry_shot_type=sample_types[0],
+                    shot_type=sample_types[1],
+                    exit_shot_type=sample_types[2],
+                )
+                if changed
+                else candidate
+            )
+            if bases != list(
+                metadata[candidate.candidate_id].shot_scale_bases
+                if candidate.candidate_id in metadata
+                else ("legacy", "legacy", "legacy")
+            ):
+                current = metadata.get(candidate.candidate_id)
+                metadata[candidate.candidate_id] = (
+                    replace(current, shot_scale_bases=tuple(bases))
+                    if current is not None
+                    else _empty_subject_metadata(
+                        shot_scale_bases=tuple(bases)  # type: ignore[arg-type]
+                    )
+                )
+            changed_candidate_count += int(changed)
+            shadow_segment.append(shadow)
+        shadow_segments.append(tuple(shadow_segment))
+    audit.update(
+        {
+            "cold_start_metadata_close_without_bbox_demoted_sample_count": (
+                cold_start_close_demotion_count
+            ),
+            "role_control_shadow_candidate_count": changed_candidate_count,
+            "original_candidate_objects_mutated": False,
+            "availability_override_applied": bool(changed_candidate_count),
+        }
+    )
+    return tuple(shadow_segments), MappingProxyType(metadata), audit
 
 
 def _canonical_external_boundary_no_goods(
@@ -1182,6 +1575,7 @@ def select_joint_visual_candidates(
     maximum_proof_materialization_calls: int = (
         MAXIMUM_JOINT_VISUAL_PROOF_CALLS
     ),
+    decoded_montage_feedback: JointDecodedMontageFeedback | None = None,
     progress_callback: JointTimelineProgressCallback | None = None,
 ) -> JointVisualSelectionSet:
     """Run the existing professional controls through the decoded joint DP.
@@ -1190,8 +1584,11 @@ def select_joint_visual_candidates(
     classified :class:`TimelineNoGoodSet`.  Missing or indeterminate boundary
     evidence must not be projected into this argument.  Exact boundary and
     complete-path feedback is validated against this candidate lattice before
-    being forwarded unchanged to every cadence profile.  The proof budget is
-    per call, allowing a caller to pass its remaining bounded-session budget.
+    being forwarded unchanged to every cadence profile.  Decoded montage
+    feedback is separately restricted to exact candidate clocks and the
+    existing role-control soft scoring hooks; it never authors hard no-goods.
+    The proof budget is per call, allowing a caller to pass its remaining
+    bounded-session budget.
     """
 
     if not isinstance(
@@ -1210,6 +1607,13 @@ def select_joint_visual_candidates(
         raise TypeError("progress_callback must be callable or None")
     if not isinstance(hard_forbidden_boundary_edges, TimelineNoGoodSet):
         raise TypeError("hard forbidden edges must be a TimelineNoGoodSet")
+    if decoded_montage_feedback is not None and not isinstance(
+        decoded_montage_feedback,
+        JointDecodedMontageFeedback,
+    ):
+        raise TypeError(
+            "decoded_montage_feedback must be JointDecodedMontageFeedback or None"
+        )
     if (
         isinstance(minimum_unique_paths, bool)
         or not isinstance(minimum_unique_paths, int)
@@ -1271,6 +1675,54 @@ def select_joint_visual_candidates(
             restricted.append(exact)
         lattice = tuple(restricted)
         preferred_source_ids = None
+
+    if (
+        decoded_montage_feedback is not None
+        and workspace.professional_montage_policy is None
+    ):
+        raise ValueError(
+            "decoded montage feedback requires a professional montage policy"
+        )
+    role_control_lattice: tuple[tuple[TimelineCandidate, ...], ...] = lattice
+    role_control_subject_metadata: Mapping[
+        str, _CandidateSubjectMetadata
+    ] = workspace.subject_metadata_by_candidate
+    if workspace.professional_montage_policy is not None:
+        if workspace.section_plan is None:  # pragma: no cover
+            raise RuntimeError("montage policy lost its section plan")
+        (
+            role_control_lattice,
+            role_control_subject_metadata,
+            decoded_montage_feedback_audit,
+        ) = _decoded_montage_role_control_inputs(
+            lattice,
+            workspace.subject_metadata_by_candidate,
+            decoded_montage_feedback,
+        )
+        decoded_montage_feedback_audit.update(
+            {
+                "professional_montage_policy_available": True,
+                "existing_role_control_hooks_reused": [
+                    "emission_adjustments",
+                    "source_switch_bonus_by_segment",
+                ],
+            }
+        )
+    else:
+        _, decoded_montage_feedback_audit = (
+            _canonical_decoded_montage_feedback(lattice, None)
+        )
+        decoded_montage_feedback_audit.update(
+            {
+                "cold_start_metadata_close_without_bbox_demoted_sample_count": 0,
+                "role_control_shadow_candidate_count": 0,
+                "original_candidate_objects_mutated": False,
+                "availability_override_applied": False,
+                "professional_montage_policy_available": False,
+                "existing_role_control_hooks_reused": [],
+                "optimizer_effect": "none_without_professional_montage_policy",
+            }
+        )
 
     external_boundary_no_goods = _canonical_external_boundary_no_goods(
         lattice,
@@ -1482,20 +1934,32 @@ def select_joint_visual_candidates(
                     raise RuntimeError("montage policy lost its section plan")
                 adjustments, switch_bonus, raw_role_audit = (
                     _role_conditioned_visual_controls(
-                        lattice,
+                        role_control_lattice,
                         section_plan=workspace.section_plan,
                         phrase_times=workspace.phrase_times,
                         policy=workspace.professional_montage_policy,
                         cadence_profile=profile.name,
                         subject_metadata_by_candidate=(
-                            workspace.subject_metadata_by_candidate
+                            role_control_subject_metadata
                         ),
                         timeline_config=profile.config,
                         forbidden_boundary_edges=hard_forbidden_boundary_edges,
                     )
                 )
+                if any(
+                    not math.isfinite(float(value)) or float(value) > 0.0
+                    for value in adjustments.values()
+                ):
+                    raise RuntimeError(
+                        "role-control emission adjustments must be finite and "
+                        "non-positive"
+                    )
                 role_audit = {
                     **dict(raw_role_audit),
+                    "decoded_montage_feedback": dict(
+                        decoded_montage_feedback_audit
+                    ),
+                    "emission_adjustments_non_positive": True,
                     "retry_round": retry_round,
                     "global_profile_attempt_index": (
                         global_profile_attempt_index
@@ -1958,6 +2422,9 @@ def select_joint_visual_candidates(
             "events": retry_events,
             "profile_failure_events": profile_failure_events,
             "coverage_failure_events": coverage_failure_events,
+            "decoded_montage_feedback": dict(
+                decoded_montage_feedback_audit
+            ),
             "raw_frames_persisted": False,
             "raw_visual_descriptors_persisted": False,
         },
@@ -2941,6 +3408,8 @@ def build_joint_visual_candidates(
 __all__ = [
     "JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS",
     "JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS",
+    "JointDecodedMontageFeedback",
+    "JointDecodedMontageSegmentObservation",
     "JointMaterializedVisualCandidate",
     "JointVisualBoundaryProofBundle",
     "JointVisualSelectionRecord",

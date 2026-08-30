@@ -35,9 +35,12 @@ from crosscut.joint_timeline import (
 from crosscut.joint_visual_candidate_adapter import (
     JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS,
     MAXIMUM_JOINT_VISUAL_PROOF_CALLS,
+    JointDecodedMontageFeedback,
+    JointDecodedMontageSegmentObservation,
     JointVisualEvidenceCoverageError,
     JointVisualBoundaryProofBundle,
     JointVisualSelectionRecord,
+    _decoded_montage_role_control_inputs,
     _proof_bundle,
     _project_visual_plan_from_joint_proof,
     _shift_joint_timeline_result,
@@ -1012,6 +1015,168 @@ def _limited_profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_one_off_decoded_wide_observation_stays_audited_only(self) -> None:
+        candidate_set = _candidate_set(role_conditioned=True)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        lattice = workspace.candidates_by_segment
+        target = lattice[0][0]
+        feedback = JointDecodedMontageFeedback(
+            observations=(
+                JointDecodedMontageSegmentObservation.from_choice(
+                    candidate_set.candidates[0].timeline_result.choices[0],
+                    render_variant_signature="a" * 64,
+                    sampled_proxy_shot_classes=(
+                        "wide",
+                        "medium",
+                        "medium",
+                    ),
+                ),
+            )
+        )
+
+        shadow, metadata, audit = _decoded_montage_role_control_inputs(
+            lattice,
+            workspace.subject_metadata_by_candidate,
+            feedback,
+        )
+
+        self.assertIs(shadow[0][0], target)
+        self.assertEqual(metadata, workspace.subject_metadata_by_candidate)
+        self.assertEqual(audit["promoted_wide_sample_count"], 0)
+        self.assertEqual(
+            audit["insufficient_distinct_variant_sample_count"],
+            1,
+        )
+        self.assertEqual(audit["hard_no_good_count"], 0)
+        self.assertFalse(audit["availability_override_applied"])
+
+    def test_repeated_distinct_decoded_wide_and_unknown_override_shadow_only(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set(role_conditioned=True)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        lattice = workspace.candidates_by_segment
+        target = lattice[0][0]
+        feedback = JointDecodedMontageFeedback(
+            observations=tuple(
+                JointDecodedMontageSegmentObservation.from_candidate(
+                    target,
+                    render_variant_signature=signature * 64,
+                    sampled_proxy_shot_classes=(
+                        "wide",
+                        "unknown",
+                        "medium",
+                    ),
+                )
+                for signature in ("a", "b")
+            )
+        )
+
+        shadow, metadata, audit = _decoded_montage_role_control_inputs(
+            lattice,
+            workspace.subject_metadata_by_candidate,
+            feedback,
+        )
+
+        self.assertIs(target.shot_type, ShotType.MEDIUM)
+        self.assertIsNone(target.entry_shot_type)
+        self.assertIs(shadow[0][0].entry_shot_type, ShotType.WIDE)
+        self.assertIs(shadow[0][0].shot_type, ShotType.MEDIUM)
+        self.assertEqual(
+            metadata[target.candidate_id].shot_scale_bases,
+            ("legacy", "unknown_no_subject_geometry", "legacy"),
+        )
+        self.assertEqual(audit["promoted_wide_sample_count"], 1)
+        self.assertEqual(audit["promoted_unknown_sample_count"], 1)
+        self.assertEqual(audit["role_control_shadow_candidate_count"], 1)
+        self.assertEqual(audit["hard_no_good_count"], 0)
+        self.assertTrue(audit["availability_override_applied"])
+
+    def test_decoded_feedback_rejects_a_foreign_exact_candidate_clock(self) -> None:
+        candidate_set = _candidate_set(role_conditioned=True)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        feedback = JointDecodedMontageFeedback(
+            observations=(
+                JointDecodedMontageSegmentObservation.from_candidate(
+                    _candidate(9, "0"),
+                    render_variant_signature="a" * 64,
+                    sampled_proxy_shot_classes=(
+                        "wide",
+                        "medium",
+                        "medium",
+                    ),
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            _decoded_montage_role_control_inputs(
+                workspace.candidates_by_segment,
+                workspace.subject_metadata_by_candidate,
+                feedback,
+            )
+
+    def test_metadata_only_close_is_not_counted_as_cold_start_availability(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set(role_conditioned=True)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        lattice = workspace.candidates_by_segment
+        close_without_bbox = replace(
+            lattice[0][0],
+            shot_type=ShotType.CLOSE_UP,
+            entry_shot_type=ShotType.CLOSE_UP,
+            exit_shot_type=ShotType.CLOSE_UP,
+        )
+        close_lattice = (
+            (close_without_bbox, lattice[0][1]),
+            *lattice[1:],
+        )
+
+        shadow, _metadata, audit = _decoded_montage_role_control_inputs(
+            close_lattice,
+            workspace.subject_metadata_by_candidate,
+            None,
+        )
+
+        self.assertIs(close_without_bbox.shot_type, ShotType.CLOSE_UP)
+        self.assertIs(shadow[0][0].entry_shot_type, ShotType.MEDIUM)
+        self.assertIs(shadow[0][0].shot_type, ShotType.MEDIUM)
+        self.assertIs(shadow[0][0].exit_shot_type, ShotType.MEDIUM)
+        self.assertEqual(
+            audit[
+                "cold_start_metadata_close_without_bbox_demoted_sample_count"
+            ],
+            3,
+        )
+
+        close_with_bbox = replace(
+            close_without_bbox,
+            focus_bbox_xywh=(0.25, 0.20, 0.30, 0.50),
+        )
+        bbox_lattice = (
+            (close_with_bbox, lattice[0][1]),
+            *lattice[1:],
+        )
+        bbox_shadow, _bbox_metadata, bbox_audit = (
+            _decoded_montage_role_control_inputs(
+                bbox_lattice,
+                workspace.subject_metadata_by_candidate,
+                None,
+            )
+        )
+        self.assertIs(bbox_shadow[0][0], close_with_bbox)
+        self.assertEqual(
+            bbox_audit[
+                "cold_start_metadata_close_without_bbox_demoted_sample_count"
+            ],
+            0,
+        )
+
     def test_selection_set_rejects_failed_review_with_two_source_fixture(
         self,
     ) -> None:
@@ -2741,6 +2906,135 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             self.assertEqual(call["emission_adjustments"], {(0, "1"): -index})
             self.assertEqual(call["source_switch_bonus_by_segment"], {1: index})
             self.assertEqual(call["maximum_results"], 8)
+
+    def test_decoded_feedback_uses_shadow_role_controls_and_original_joint_lattice(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set(role_conditioned=True)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        lattice = workspace.candidates_by_segment
+        target = lattice[0][0]
+        feedback = JointDecodedMontageFeedback(
+            observations=tuple(
+                JointDecodedMontageSegmentObservation.from_candidate(
+                    target,
+                    render_variant_signature=signature * 64,
+                    sampled_proxy_shot_classes=(
+                        "wide",
+                        "unknown",
+                        "medium",
+                    ),
+                )
+                for signature in ("a", "b")
+            )
+        )
+        pools = _profile_pools(candidate_set)
+        control_lattices: list[
+            tuple[tuple[TimelineCandidate, ...], ...]
+        ] = []
+        control_metadata: list[object] = []
+        selector_lattices: list[object] = []
+        selector_calls: list[dict[str, object]] = []
+
+        def controls(
+            candidates: tuple[tuple[TimelineCandidate, ...], ...],
+            **kwargs: object,
+        ):
+            control_lattices.append(candidates)
+            control_metadata.append(kwargs["subject_metadata_by_candidate"])
+            return (
+                {(0, "0"): -4.0},
+                {1: 3.0},
+                {"cadence_profile": kwargs["cadence_profile"]},
+            )
+
+        def selector(*args: object, **kwargs: object):
+            selector_lattices.append(args[0])
+            selector_calls.append(dict(kwargs))
+            return pools[len(selector_calls) - 1]
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "_role_conditioned_visual_controls",
+                side_effect=controls,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=selector,
+            ),
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+                decoded_montage_feedback=feedback,
+            )
+
+        self.assertEqual(len(control_lattices), 3)
+        self.assertEqual(len(selector_lattices), 3)
+        for role_lattice, metadata in zip(
+            control_lattices,
+            control_metadata,
+            strict=True,
+        ):
+            self.assertIs(role_lattice[0][0].entry_shot_type, ShotType.WIDE)
+            self.assertIs(role_lattice[0][0].shot_type, ShotType.MEDIUM)
+            self.assertEqual(
+                metadata[target.candidate_id].shot_scale_bases,
+                ("legacy", "unknown_no_subject_geometry", "legacy"),
+            )
+        for joint_lattice, call in zip(
+            selector_lattices,
+            selector_calls,
+            strict=True,
+        ):
+            self.assertIs(joint_lattice, lattice)
+            self.assertIs(joint_lattice[0][0], target)
+            self.assertIsNone(joint_lattice[0][0].entry_shot_type)
+            self.assertEqual(call["emission_adjustments"], {(0, "0"): -4.0})
+            self.assertEqual(call["source_switch_bonus_by_segment"], {1: 3.0})
+        for role_audit in selected.role_control_audits:
+            decoded_audit = role_audit["decoded_montage_feedback"]
+            self.assertEqual(decoded_audit["promoted_wide_sample_count"], 1)
+            self.assertEqual(decoded_audit["promoted_unknown_sample_count"], 1)
+            self.assertEqual(decoded_audit["hard_no_good_count"], 0)
+            self.assertFalse(decoded_audit["thresholds_lowered"])
+            self.assertTrue(role_audit["emission_adjustments_non_positive"])
+        retry_audit = selected.selection_retry_audit[
+            "decoded_montage_feedback"
+        ]
+        self.assertEqual(retry_audit["promoted_candidate_clock_count"], 1)
+        self.assertEqual(retry_audit["hard_no_good_count"], 0)
+
+    def test_decoded_feedback_requires_the_existing_montage_policy(self) -> None:
+        candidate_set = _candidate_set(role_conditioned=False)
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        target = workspace.candidates_by_segment[0][0]
+        feedback = JointDecodedMontageFeedback(
+            observations=(
+                JointDecodedMontageSegmentObservation.from_candidate(
+                    target,
+                    render_variant_signature="a" * 64,
+                    sampled_proxy_shot_classes=(
+                        "wide",
+                        "medium",
+                        "medium",
+                    ),
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "professional montage policy"):
+            select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+                decoded_montage_feedback=feedback,
+            )
 
     def test_materialization_binds_all_outer_and_middle_tracks_without_decode(
         self,
