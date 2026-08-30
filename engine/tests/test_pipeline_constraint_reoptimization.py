@@ -16,6 +16,12 @@ from crosscut.editorial_motion import EditorialMotionPlan, EditorialMotionSegmen
 from crosscut.ive import AspectRatio, EditMode, SourceMode
 from crosscut.joint_visual_candidate_adapter import (
     JointMaterializedVisualCandidate,
+    JointVisualSelectionSet,
+)
+from crosscut.joint_timeline import (
+    JointTimelineBoundaryProofIdentity,
+    JointTimelineCandidateClock,
+    JointTimelinePathSignature,
 )
 from crosscut.pipeline import (
     ELIGIBLE_SOURCE_INDEX_DOMAIN,
@@ -23,6 +29,9 @@ from crosscut.pipeline import (
     _BoundarySearchBudgetExhausted,
     _BoundarySearchNoProgress,
     _GlobalVisualCandidateStream,
+    _GloballyIndexedVisualCandidate,
+    _GroupRenderCandidateBundle,
+    _joint_apply_look_refinement_feedback_classification,
     _assessment_has_final_boundary_geometry_evidence,
     _authorize_partial_reedit_splice_lineage,
     _boundary_repair_assessments,
@@ -34,13 +43,30 @@ from crosscut.pipeline import (
     _cross_source_timeline_edge_keys,
     _derive_complete_group_candidate,
     _derive_complete_joint_group_candidate,
+    _exact_source_shot_path,
     _enforce_automatic_group_stage_edit_requirement,
     _group_splice_analysis_basis_identity,
     _incomplete_splice_context_keys,
     _optimizer_workspace_cross_source_edge_bound,
     _optimizer_blocked_set_for_contexts,
     _record_boundary_repair_assessments,
+    _record_bound_joint_decoded_feedback,
+    _record_joint_shared_render_contract_failure,
     _joint_group_hard_cut_transition,
+    _joint_complete_path_signature,
+    _joint_complete_path_no_good_allowed_from_feedback,
+    _joint_decoded_look_already_passed_audit_fields,
+    _joint_decoded_render_variant_signature,
+    _joint_group_look_refinement_acceptance,
+    _joint_group_nonlook_regression_reasons,
+    _joint_look_refinement_complete_path_no_good_allowed,
+    _joint_localized_decoded_boundary_no_goods,
+    _joint_neutral_interior_motion_overlay,
+    _joint_nonlocal_render_contract_failure_fingerprints,
+    _joint_selection_proof_materialization_call_count,
+    _joint_require_refined_render_variant_lineage,
+    _joint_record_invalid_look_refinement_evidence,
+    _globally_index_joint_visual_candidate_batch,
     _raise_joint_visual_selection_failure,
     _regenerate_visual_candidate_set_or_no_path,
     _route_visual_timeline_selection_failure,
@@ -53,13 +79,27 @@ from crosscut.pipeline import (
     _validate_constrained_precomputed_repair_origin,
     _visual_feature_cache_arguments,
     _merge_visual_boundary_repair_plans,
+    _materialize_joint_feedback_batch_with_fresh_provider,
+    _select_joint_decoded_passing_cohort,
     _attempt_proxy_triggered_partial_reedit,
+)
+from crosscut.rendered_candidate_selection import RenderedCandidateReview
+from crosscut.rendered_proxy_review import (
+    PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS,
+    SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
+    SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+    SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
+    _canonical_sha256,
+    _render_timeline_binding_payload,
+    verified_file_content_sha256,
 )
 from crosscut.render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
+    RenderPlan,
     RenderSegment,
     TransitionKind,
+    segment_frame_counts,
 )
 from crosscut.timeline import NoCompleteTimelinePath, ShotType
 from crosscut.timeline_no_good import TimelineNoGoodSet
@@ -133,6 +173,188 @@ def _materialized(*choices: VisualTimelineChoice) -> SimpleNamespace:
         candidate_record=SimpleNamespace(review=SimpleNamespace(hard_failures=())),
         visual_plan=_plan(*choices),
     )
+
+
+def _joint_path_signature(tag: str) -> JointTimelinePathSignature:
+    return JointTimelinePathSignature(
+        candidate_clocks=(
+            JointTimelineCandidateClock(
+                segment_index=0,
+                candidate_id=f"candidate-{tag}-0",
+                source_id="0",
+                shot_id=f"0:{tag}:a",
+                start_seconds=0.0,
+                end_seconds=1.0,
+            ),
+            JointTimelineCandidateClock(
+                segment_index=1,
+                candidate_id=f"candidate-{tag}-1",
+                source_id="1",
+                shot_id=f"1:{tag}:b",
+                start_seconds=1.0,
+                end_seconds=2.0,
+            ),
+        ),
+        boundary_proofs=(
+            JointTimelineBoundaryProofIdentity(
+                boundary_index=0,
+                proof_identity=f"proof-{tag}",
+                frame_offset=0,
+            ),
+        ),
+    )
+
+
+def _joint_materialized_mock(
+    tag: str,
+    *,
+    candidate_index: int = 0,
+    same_source: bool = False,
+) -> Mock:
+    incoming_source = 0 if same_source else 1
+    candidate = Mock(spec=JointMaterializedVisualCandidate)
+    candidate.candidate_index = candidate_index
+    candidate.review_rank = candidate_index
+    candidate.cadence_profile = "joint-test"
+    candidate.candidate_record = SimpleNamespace(
+        candidate_index=candidate_index,
+        review=SimpleNamespace(hard_failures=()),
+    )
+    candidate.visual_plan = _plan(
+        _choice(0, f"0:{tag}:a"),
+        _choice(incoming_source, f"{incoming_source}:{tag}:b"),
+    )
+    measurement_key = Mock()
+    measurement_key.boundary_index = 0
+    measurement_key.outgoing = SimpleNamespace(
+        source_id="0",
+        shot_id=f"0:{tag}:a",
+    )
+    measurement_key.incoming = SimpleNamespace(
+        source_id=str(incoming_source),
+        shot_id=f"{incoming_source}:{tag}:b",
+    )
+    candidate.joint_result = SimpleNamespace(
+        complete_path_signature=_joint_path_signature(tag),
+        boundary_options=(
+            SimpleNamespace(
+                measurement_key=measurement_key,
+                frame_offset=0,
+            ),
+        ),
+    )
+    return candidate
+
+
+def _joint_feedback_render_plan(
+    directory: Path,
+    *,
+    source_start_shift: float = 0.0,
+) -> RenderPlan:
+    sources = tuple(directory / name for name in ("a.mp4", "b.mp4"))
+    for index, source in enumerate(sources):
+        if not source.exists():
+            source.write_bytes(f"joint-feedback-source-{index}".encode())
+    return RenderPlan(
+        sources=sources,
+        segments=(
+            RenderSegment(0, source_start_shift, 1.0, 0.0),
+            RenderSegment(1, 1.0, 1.0, 1.0),
+        ),
+        reference_source=0,
+        aspect_ratio=AspectRatio.LANDSCAPE,
+        output=directory / "feedback.mp4",
+        master_audio_start=0.0,
+        width=1920,
+        height=1080,
+        fps=29.97,
+    )
+
+
+def _joint_bound_feedback_review(
+    render_plan: RenderPlan,
+) -> dict[str, object]:
+    proxy_identity = {
+        "width": 854,
+        "height": 480,
+        "fps": 29.97,
+        "decoded_frame_count": 60,
+        "duration_seconds": 2.0,
+        "render_codec": "h264",
+        "content_sha256": "1" * 64,
+    }
+    source_hashes = tuple(
+        verified_file_content_sha256(path)
+        for path in render_plan.sources
+    )
+    evidence = {
+        "schema_version": SEGMENT_INTERIOR_GEOMETRY_SCHEMA_VERSION,
+        "analysis_basis": SEGMENT_INTERIOR_GEOMETRY_ANALYSIS_BASIS,
+        "contract": SEGMENT_INTERIOR_GEOMETRY_CONTRACT,
+        "proxy_identity": proxy_identity,
+        "proxy_identity_sha256": _canonical_sha256(proxy_identity),
+        "render_timeline_binding_sha256": _canonical_sha256(
+            _render_timeline_binding_payload(
+                render_plan,
+                segment_frame_counts(render_plan),
+                source_content_sha256=source_hashes,
+            )
+        ),
+    }
+    evidence["evidence_sha256"] = _canonical_sha256(evidence)
+    return {
+        "passed": False,
+        "proxy": proxy_identity,
+        "segment_interior_geometry": evidence,
+        "perceptual_source_admission": {
+            "admission": {"passed": False},
+        },
+        "boundaries": [
+            {
+                "boundary_index": 0,
+                "review_domain": "introduced_cross_source",
+                "outgoing_source_index": 2,
+                "incoming_source_index": 7,
+                "passed": False,
+                "issue_reasons": ["color_shock"],
+                "technical_integrity_issue_reasons": [],
+            }
+        ],
+    }
+
+
+def _joint_nonlook_review_payload() -> dict[str, object]:
+    return {
+        "geometry_provider_failure_count": 0,
+        "introduced_cross_source_technical_issue_reasons": [],
+        "visible_boundary_score": {
+            "p10": 0.84,
+            "issue_fraction": 0.0,
+        },
+        "segment_interior_geometry": {
+            "complete": True,
+            "geometry_provider_failure_count": 0,
+            "render_timeline_binding_sha256": "a" * 64,
+        },
+        "technical_proxy_passed_before_montage_grammar": True,
+        "professional_reference_gate": {"passed": True},
+        "rendered_montage_grammar_review": {"passed": True},
+        "boundaries": [
+            {
+                "boundary_index": 0,
+                "review_domain": "introduced_cross_source",
+                "outgoing_source_index": 0,
+                "incoming_source_index": 1,
+                "passed": True,
+                "issue_reasons": [],
+                "technical_integrity_issue_reasons": [],
+                "discontinuities": {
+                    "face_scale_discontinuity": 0.08,
+                    "face_position_discontinuity": 0.06,
+                },
+            }
+        ],
+    }
 
 
 def _stability() -> dict[str, float]:
@@ -293,6 +515,131 @@ def _hard_assessment():
 
 
 class PipelineConstraintReoptimizationTests(unittest.TestCase):
+    def test_joint_neutral_provider_accepts_only_boundary_neutral_interior_motion(
+        self,
+    ) -> None:
+        identity = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0),
+                EditorialTransformKeyframe(1.0, 1.0),
+            ),
+            reason="joint-provider-identity",
+        )
+        pulse = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.0),
+                EditorialTransformKeyframe(0.5, 1.06),
+                EditorialTransformKeyframe(1.0, 1.0),
+            ),
+            reason="same-shot-interior-pulse",
+        )
+        provider = EditorialMotionPlan(
+            segments=(
+                EditorialMotionSegment(0, 0, identity),
+                EditorialMotionSegment(1, 0, identity),
+            ),
+            boundary_match_count=1,
+            zoom_event_count=0,
+            pan_event_count=0,
+            roll_event_count=0,
+            blocked_dissolve_segment_count=0,
+        )
+        proposed = EditorialMotionPlan(
+            segments=(
+                EditorialMotionSegment(
+                    0,
+                    0,
+                    pulse,
+                    reasons=(
+                        "reference_calibrated_same_source_interior_zoom_pulse",
+                    ),
+                ),
+                EditorialMotionSegment(1, 0, None),
+            ),
+            boundary_match_count=0,
+            zoom_event_count=1,
+            pan_event_count=0,
+            roll_event_count=0,
+            blocked_dissolve_segment_count=0,
+            interior_zoom_pulse_count=1,
+        )
+        materialized = SimpleNamespace(
+            visual_plan=_plan(_choice(0, "0:a"), _choice(0, "0:a")),
+            output_fps=29.97,
+            editorial_motion_plan=provider,
+            segments=(
+                RenderSegment(0, 0.0, 1.0, 0.0, editorial_transform=identity),
+                RenderSegment(0, 1.0, 1.0, 1.0, editorial_transform=identity),
+            ),
+        )
+        transitions = (
+            _joint_group_hard_cut_transition(
+                materialized.visual_plan.choices[0],
+                materialized.visual_plan.choices[1],
+            ),
+        )
+
+        with patch(
+            "crosscut.pipeline.build_editorial_motion_plan",
+            return_value=proposed,
+        ):
+            motion, segments, applied = _joint_neutral_interior_motion_overlay(
+                materialized,  # type: ignore[arg-type]
+                provider_plan=provider,
+                transitions=transitions,
+                phrase_times=(),
+                section_plan=None,
+            )
+
+        self.assertTrue(applied)
+        self.assertIs(motion, proposed)
+        self.assertIs(segments[0].editorial_transform, pulse)
+        self.assertIsNone(segments[1].editorial_transform)
+
+    def test_joint_non_neutral_provider_never_stacks_generic_motion(self) -> None:
+        corrective = EditorialTransformTrack(
+            (
+                EditorialTransformKeyframe(0.0, 1.05),
+                EditorialTransformKeyframe(1.0, 1.05),
+            ),
+            reason="joint-provider-corrective-crop",
+        )
+        provider = EditorialMotionPlan(
+            segments=(EditorialMotionSegment(0, 0, corrective),),
+            boundary_match_count=0,
+            zoom_event_count=1,
+            pan_event_count=0,
+            roll_event_count=0,
+            blocked_dissolve_segment_count=0,
+        )
+        segment = RenderSegment(
+            0,
+            0.0,
+            1.0,
+            0.0,
+            editorial_transform=corrective,
+        )
+        materialized = SimpleNamespace(
+            visual_plan=_plan(_choice(0, "0:a")),
+            output_fps=29.97,
+            editorial_motion_plan=provider,
+            segments=(segment,),
+        )
+
+        with patch("crosscut.pipeline.build_editorial_motion_plan") as builder:
+            motion, segments, applied = _joint_neutral_interior_motion_overlay(
+                materialized,  # type: ignore[arg-type]
+                provider_plan=provider,
+                transitions=(),
+                phrase_times=(),
+                section_plan=None,
+            )
+
+        builder.assert_not_called()
+        self.assertFalse(applied)
+        self.assertIs(motion, provider)
+        self.assertEqual(segments, (segment,))
+
     def test_group_scalar_cache_calls_forward_direct_derived_root(self) -> None:
         pipeline_path = Path(pipeline_module.__file__)
         syntax = ast.parse(pipeline_path.read_text(encoding="utf-8"))
@@ -2082,6 +2429,983 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 output=Path("/tmp/output.mp4"),
                 splice_feasibility_graph=LazySpliceFeasibilityGraph("test"),
             )
+
+    def test_joint_batch_global_indices_preserve_exact_complete_path(self) -> None:
+        first_batch = tuple(
+            _joint_materialized_mock(tag, candidate_index=index)
+            for index, tag in enumerate(("a", "b"))
+        )
+        wrapped = _globally_index_joint_visual_candidate_batch(
+            first_batch,
+            first_candidate_index=8,
+        )
+
+        self.assertEqual(
+            tuple(item.candidate_index for item in wrapped),
+            (8, 9),
+        )
+        self.assertEqual(
+            tuple(item.materialized.candidate_index for item in wrapped),
+            (0, 1),
+        )
+        self.assertEqual(
+            _joint_complete_path_signature(wrapped[0]),
+            _joint_path_signature("a"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "replayed"):
+            _globally_index_joint_visual_candidate_batch(
+                first_batch,
+                first_candidate_index=10,
+                existing_complete_paths=(_joint_path_signature("a"),),
+            )
+
+    def test_wrapped_joint_candidate_uses_joint_derivation_and_global_id(
+        self,
+    ) -> None:
+        underlying = _joint_materialized_mock("wrapped", candidate_index=0)
+        wrapped = _GloballyIndexedVisualCandidate(underlying, 11)
+        raw_bundle = _GroupRenderCandidateBundle(
+            candidate_index=0,
+            review_rank=0,
+            cadence_profile="joint-test",
+            pre_render_score=90.0,
+            visual_timeline=underlying.visual_plan,
+            boundary_repairs=None,
+            timeline_review=None,
+            face_match_plan=None,
+            group_transition_plan=Mock(),
+            boundary_affine_plan=None,
+            editorial_motion_plan=None,
+            render_plan=Mock(),
+        )
+        request = SimpleNamespace(
+            sources=(Path("/tmp/a.mp4"), Path("/tmp/b.mp4")),
+        )
+        with patch(
+            "crosscut.pipeline._derive_complete_joint_group_candidate",
+            return_value=raw_bundle,
+        ) as derive_joint:
+            result = _derive_complete_group_candidate(
+                wrapped,
+                request=request,  # type: ignore[arg-type]
+                eligible_indices=(0, 1),
+                audio_offsets=(0.0, 0.0),
+                scene_cut_times=((), ()),
+                source_timewarps=(None, None),
+                source_aspect_ratios=(16.0 / 9.0, 16.0 / 9.0),
+                source_durations_seconds=(10.0, 10.0),
+                beat_period_seconds=0.5,
+                phrase_times=(),
+                section_plan=None,
+                common_master_start=0.0,
+                width=1920,
+                height=1080,
+                output=Path("/tmp/joint-wrapped.mp4"),
+            )
+
+        self.assertIs(derive_joint.call_args.args[0], underlying)
+        self.assertEqual(result.candidate_index, 11)
+        self.assertEqual(
+            result.candidate_lineage[-1]["batch_local_candidate_index"],
+            0,
+        )
+
+    def test_joint_localized_feedback_excludes_aggregate_and_same_source(
+        self,
+    ) -> None:
+        candidate = _joint_materialized_mock("local")
+        payload = {
+            "passed": False,
+            "perceptual_source_admission": {
+                "admission": {"passed": False}
+            },
+            "boundaries": [
+                {
+                    "boundary_index": 0,
+                    "review_domain": "introduced_cross_source",
+                    "outgoing_source_index": 2,
+                    "incoming_source_index": 7,
+                    "passed": False,
+                    "issue_reasons": ["color_shock"],
+                    "technical_integrity_issue_reasons": [],
+                },
+                {
+                    "boundary_index": 0,
+                    "review_domain": "tier_d_continuity",
+                    "outgoing_source_index": 2,
+                    "incoming_source_index": 2,
+                    "passed": False,
+                    "issue_reasons": [
+                        "tier_d_cross_boundary_duplicate_or_freeze"
+                    ],
+                    "technical_integrity_issue_reasons": [
+                        "tier_d_cross_boundary_duplicate_or_freeze"
+                    ],
+                },
+            ],
+        }
+
+        no_goods = _joint_localized_decoded_boundary_no_goods(
+            candidate,
+            payload,
+            eligible_indices=(2, 7),
+        )
+
+        self.assertEqual(len(no_goods), 1)
+        key, offset = next(iter(no_goods))
+        self.assertIs(key, candidate.joint_result.boundary_options[0].measurement_key)
+        self.assertEqual(offset, 0)
+
+    def _assert_joint_unbound_feedback_is_not_authored(
+        self,
+        candidate: Mock,
+        render_plan: RenderPlan,
+        review_payload: dict[str, object],
+    ) -> None:
+        forbidden_boundaries = set()
+        classifications = {}
+        nonlocal_failure_paths = {}
+        classification, shared_failure = (
+            _record_bound_joint_decoded_feedback(
+                candidate,
+                SimpleNamespace(render_plan=render_plan),
+                review_payload,
+                eligible_indices=(2, 7),
+                forbidden_boundary_selections=forbidden_boundaries,
+                feedback_classifications=classifications,
+                nonlocal_contract_failure_paths=nonlocal_failure_paths,
+            )
+        )
+        promoted_complete_paths = set()
+        if _joint_complete_path_no_good_allowed_from_feedback(classification):
+            promoted_complete_paths.add(_joint_complete_path_signature(candidate))
+
+        self.assertFalse(classification["feedback_binding_valid"])
+        self.assertFalse(classification["feedback_authoring_allowed"])
+        self.assertEqual(forbidden_boundaries, set())
+        self.assertEqual(nonlocal_failure_paths, {})
+        self.assertIsNone(shared_failure)
+        self.assertEqual(promoted_complete_paths, set())
+        self.assertEqual(classifications, {candidate.candidate_index: classification})
+
+    def test_joint_feedback_stale_render_plan_binding_adds_no_no_goods(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            signed_plan = _joint_feedback_render_plan(root)
+            stale_plan = _joint_feedback_render_plan(
+                root,
+                source_start_shift=0.25,
+            )
+            review_payload = _joint_bound_feedback_review(signed_plan)
+            self._assert_joint_unbound_feedback_is_not_authored(
+                _joint_materialized_mock("stale"),
+                stale_plan,
+                review_payload,
+            )
+
+    def test_joint_feedback_mismatched_proxy_binding_adds_no_no_goods(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            review_payload = _joint_bound_feedback_review(render_plan)
+            proxy = review_payload["proxy"]
+            assert isinstance(proxy, dict)
+            proxy["content_sha256"] = "2" * 64
+            self._assert_joint_unbound_feedback_is_not_authored(
+                _joint_materialized_mock("mismatched"),
+                render_plan,
+                review_payload,
+            )
+
+    def test_joint_feedback_incomplete_binding_adds_no_no_goods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            review_payload = _joint_bound_feedback_review(render_plan)
+            evidence = review_payload["segment_interior_geometry"]
+            assert isinstance(evidence, dict)
+            evidence.pop("evidence_sha256")
+            self._assert_joint_unbound_feedback_is_not_authored(
+                _joint_materialized_mock("incomplete"),
+                render_plan,
+                review_payload,
+            )
+
+    def test_joint_feedback_exact_binding_authors_only_bound_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            review_payload = _joint_bound_feedback_review(render_plan)
+            candidate = _joint_materialized_mock("bound")
+            forbidden_boundaries = set()
+            classifications = {}
+            nonlocal_failure_paths = {}
+
+            classification, shared_failure = (
+                _record_bound_joint_decoded_feedback(
+                    candidate,
+                    SimpleNamespace(render_plan=render_plan),
+                    review_payload,
+                    eligible_indices=(2, 7),
+                    forbidden_boundary_selections=forbidden_boundaries,
+                    feedback_classifications=classifications,
+                    nonlocal_contract_failure_paths=(
+                        nonlocal_failure_paths
+                    ),
+                )
+            )
+
+            self.assertTrue(classification["feedback_binding_valid"])
+            self.assertEqual(len(forbidden_boundaries), 1)
+            self.assertIsNone(shared_failure)
+            self.assertTrue(
+                _joint_complete_path_no_good_allowed_from_feedback(
+                    classification
+                )
+            )
+
+    def test_same_source_zero_tolerance_failure_has_shared_contract_fingerprint(
+        self,
+    ) -> None:
+        candidate = _joint_materialized_mock("freeze", same_source=True)
+        payload = {
+            "passed": False,
+            "boundaries": [
+                {
+                    "boundary_index": 0,
+                    "review_domain": "native_source_cut",
+                    "outgoing_source_index": 4,
+                    "incoming_source_index": 4,
+                    "passed": False,
+                    "issue_reasons": [
+                        "native_source_cut_cross_boundary_duplicate_or_freeze"
+                    ],
+                    "technical_integrity_issue_reasons": [
+                        "native_source_cut_cross_boundary_duplicate_or_freeze"
+                    ],
+                }
+            ],
+            "rendered_montage_grammar_review": {"passed": False},
+        }
+
+        fingerprints = (
+            _joint_nonlocal_render_contract_failure_fingerprints(
+                candidate,
+                payload,
+                eligible_indices=(4,),
+            )
+        )
+
+        self.assertEqual(
+            fingerprints,
+            (
+                (
+                    "native_source_cut",
+                    0,
+                    4,
+                    "native_source_cut_cross_boundary_duplicate_or_freeze",
+                ),
+            ),
+        )
+        self.assertEqual(
+            _joint_localized_decoded_boundary_no_goods(
+                candidate,
+                payload,
+                eligible_indices=(4,),
+            ),
+            frozenset(),
+        )
+
+    def test_two_distinct_paths_abort_repeated_shared_render_contract_failure(
+        self,
+    ) -> None:
+        observed = {}
+        fingerprint = (
+            "tier_d_continuity",
+            11,
+            7,
+            "tier_d_cross_boundary_duplicate_or_freeze",
+        )
+
+        first = _record_joint_shared_render_contract_failure(
+            observed,
+            exact_path=_joint_path_signature("first"),
+            fingerprints=(fingerprint,),
+        )
+        repeated_same_path = _record_joint_shared_render_contract_failure(
+            observed,
+            exact_path=_joint_path_signature("first"),
+            fingerprints=(fingerprint,),
+        )
+        second = _record_joint_shared_render_contract_failure(
+            observed,
+            exact_path=_joint_path_signature("second"),
+            fingerprints=(fingerprint,),
+        )
+
+        self.assertIsNone(first)
+        self.assertIsNone(repeated_same_path)
+        self.assertEqual(second["cause"], "shared_render_contract_failure")
+        self.assertEqual(second["distinct_exact_path_count"], 2)
+        self.assertFalse(second["aggregate_aesthetic_failure_used"])
+
+    def test_joint_final_cohort_caps_two_variants_per_path(self) -> None:
+        bundles = []
+        reviews = []
+        path_names = ("a", "a", "a", "b", "b", "c", "c", "d", "d")
+        for index, path_name in enumerate(path_names):
+            bundle = Mock(spec=_GroupRenderCandidateBundle)
+            bundle.candidate_index = index
+            bundle.pre_render_score = 100.0 - index
+            bundle.visual_timeline = _plan(
+                _choice(0, f"0:{path_name}"),
+                _choice(1, f"1:{path_name}"),
+            )
+            review = Mock(spec=RenderedCandidateReview)
+            review.passed = True
+            review.ranking_weighted_score = 100.0 - index
+            review.weighted_score = 100.0 - index
+            bundles.append(bundle)
+            reviews.append(review)
+
+        cohort = _select_joint_decoded_passing_cohort(bundles, reviews)
+        paths = [
+            tuple(
+                (str(choice.source_index), choice.shot_id)
+                for choice in bundle.visual_timeline.choices
+            )
+            for bundle, _review in cohort
+        ]
+
+        self.assertEqual(len(cohort), 8)
+        self.assertGreaterEqual(len(set(paths)), 4)
+        self.assertLessEqual(max(paths.count(path) for path in set(paths)), 2)
+        self.assertNotIn(2, [bundle.candidate_index for bundle, _ in cohort])
+
+    def test_joint_proof_accounting_is_bounded_by_remaining_session_budget(
+        self,
+    ) -> None:
+        selection_set = Mock(spec=JointVisualSelectionSet)
+        selection_set.selection_retry_audit = {
+            "proof_materialization_call_count": 12
+        }
+        self.assertEqual(
+            _joint_selection_proof_materialization_call_count(
+                selection_set,
+                available_budget=16,
+            ),
+            12,
+        )
+        with self.assertRaisesRegex(RuntimeError, "invalid proof usage"):
+            _joint_selection_proof_materialization_call_count(
+                selection_set,
+                available_budget=8,
+            )
+
+    def test_joint_look_refinement_nonlook_gates_fail_closed_on_regression(
+        self,
+    ) -> None:
+        baseline = _joint_nonlook_review_payload()
+        unchanged = json.loads(json.dumps(baseline))
+        self.assertEqual(
+            _joint_group_nonlook_regression_reasons(baseline, unchanged),
+            (),
+        )
+        regressed = json.loads(json.dumps(baseline))
+        regressed["visible_boundary_score"]["p10"] = 0.80
+        regressed["rendered_montage_grammar_review"]["passed"] = False
+        regressed["boundaries"][0][
+            "technical_integrity_issue_reasons"
+        ] = ["introduced_cross_source_black_frame"]
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            regressed,
+        )
+        self.assertIn("visible_boundary_p10_regressed", reasons)
+        self.assertIn("rendered_montage_grammar_review_regressed", reasons)
+        self.assertIn(
+            "boundary_0_technical_integrity_regressed",
+            reasons,
+        )
+
+    def test_joint_look_rejects_visible_issue_fraction_regression(self) -> None:
+        baseline = _joint_nonlook_review_payload()
+        regressed = json.loads(json.dumps(baseline))
+        visible = regressed["visible_boundary_score"]
+        assert isinstance(visible, dict)
+        visible["issue_fraction"] = 1.0
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            regressed,
+        )
+
+        self.assertIn("visible_boundary_issue_fraction_regressed", reasons)
+        self.assertNotIn("visible_boundary_p10_regressed", reasons)
+
+    def test_joint_look_rejects_boundary_pass_regression(self) -> None:
+        baseline = _joint_nonlook_review_payload()
+        regressed = json.loads(json.dumps(baseline))
+        boundaries = regressed["boundaries"]
+        assert isinstance(boundaries, list)
+        boundaries[0]["passed"] = False
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            regressed,
+        )
+
+        self.assertIn("boundary_0_pass_regressed", reasons)
+
+    def test_joint_look_rejects_new_general_boundary_issue(self) -> None:
+        baseline = _joint_nonlook_review_payload()
+        regressed = json.loads(json.dumps(baseline))
+        boundaries = regressed["boundaries"]
+        assert isinstance(boundaries, list)
+        boundaries[0]["issue_reasons"] = ["color_shock"]
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            regressed,
+        )
+
+        self.assertIn("boundary_0_issue_set_regressed", reasons)
+
+    def test_joint_look_rejects_missing_gate_pass_contract(self) -> None:
+        baseline = _joint_nonlook_review_payload()
+        incomplete = json.loads(json.dumps(baseline))
+        incomplete["rendered_montage_grammar_review"] = {}
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            baseline,
+            incomplete,
+        )
+
+        self.assertIn(
+            "rendered_montage_grammar_review_contract_missing",
+            reasons,
+        )
+
+    def test_joint_look_rejects_malformed_prior_geometry_scalar(self) -> None:
+        malformed = _joint_nonlook_review_payload()
+        boundaries = malformed["boundaries"]
+        assert isinstance(boundaries, list)
+        discontinuities = boundaries[0]["discontinuities"]
+        assert isinstance(discontinuities, dict)
+        discontinuities["face_scale_discontinuity"] = "not-a-scalar"
+        proposed = json.loads(json.dumps(malformed))
+
+        reasons = _joint_group_nonlook_regression_reasons(
+            malformed,
+            proposed,
+        )
+
+        self.assertIn(
+            "boundary_0_face_scale_discontinuity_contract_missing",
+            reasons,
+        )
+
+    def test_joint_refined_variant_lineage_mismatch_is_invalid_evidence(
+        self,
+    ) -> None:
+        proposal = Mock(spec=pipeline_module.GroupDecodedLookRefinement)
+        proposal.lineage = SimpleNamespace(
+            output_render_plan_binding_sha256="a" * 64
+        )
+        audit = {
+            "evidence_complete": True,
+            "iterations": [],
+        }
+        iteration_audit = {
+            "iteration": 1,
+            "proposal_created": True,
+            "applied": True,
+        }
+
+        with self.assertRaisesRegex(ValueError, "lineage mismatch") as raised:
+            _joint_require_refined_render_variant_lineage(
+                proposal,
+                "b" * 64,
+            )
+        _joint_record_invalid_look_refinement_evidence(
+            audit,
+            iteration_audit,
+            raised.exception,
+        )
+        audit["complete_path_no_good_allowed"] = (
+            _joint_look_refinement_complete_path_no_good_allowed(
+                decoded_review_passed=False,
+                exhausted=False,
+                budget_exhausted=False,
+                evidence_complete=(audit["evidence_complete"] is True),
+            )
+        )
+        classification = {
+            "feedback_binding_valid": True,
+            "feedback_authoring_allowed": True,
+            "complete_path_no_good_deferred_for_render_variant": True,
+        }
+        _joint_apply_look_refinement_feedback_classification(
+            classification,
+            audit,
+            decoded_review_passed=False,
+        )
+
+        self.assertFalse(audit["evidence_complete"])
+        self.assertFalse(audit["complete_path_no_good_allowed"])
+        self.assertEqual(
+            audit["iterations"][0]["nonlook_regression_reasons"],
+            ["decoded_refinement_evidence_invalid"],
+        )
+        self.assertTrue(
+            classification[
+                "complete_path_no_good_deferred_for_render_variant"
+            ]
+        )
+        self.assertFalse(
+            _joint_complete_path_no_good_allowed_from_feedback(
+                classification
+            )
+        )
+
+    def test_joint_look_pass_aggregate_failure_retires_exact_bound_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            render_plan = _joint_feedback_render_plan(Path(directory))
+            review_payload = _joint_bound_feedback_review(render_plan)
+            review_payload["perceptual_source_admission"] = {
+                "admission": {"passed": True}
+            }
+            boundaries = review_payload["boundaries"]
+            assert isinstance(boundaries, list)
+            boundaries[0]["passed"] = True
+            boundaries[0]["issue_reasons"] = []
+            candidate = _joint_materialized_mock("aggregate-nonlook")
+            forbidden_boundaries = set()
+            classifications = {}
+            nonlocal_failure_paths = {}
+            classification, shared_failure = (
+                _record_bound_joint_decoded_feedback(
+                    candidate,
+                    SimpleNamespace(render_plan=render_plan),
+                    review_payload,
+                    eligible_indices=(2, 7),
+                    forbidden_boundary_selections=forbidden_boundaries,
+                    feedback_classifications=classifications,
+                    nonlocal_contract_failure_paths=(
+                        nonlocal_failure_paths
+                    ),
+                )
+            )
+
+        self.assertTrue(classification["feedback_binding_valid"])
+        self.assertTrue(
+            classification[
+                "complete_path_no_good_deferred_for_render_variant"
+            ]
+        )
+        self.assertEqual(forbidden_boundaries, set())
+        self.assertIsNone(shared_failure)
+        refinement_audit = (
+            _joint_decoded_look_already_passed_audit_fields(
+                decoded_review_passed=False,
+            )
+        )
+        _joint_apply_look_refinement_feedback_classification(
+            classification,
+            refinement_audit,
+            decoded_review_passed=False,
+        )
+        pending_render_variant_indices = [
+            candidate.candidate_index
+            for _candidate_index, item in classifications.items()
+            if item.get(
+                "complete_path_no_good_deferred_for_render_variant"
+            )
+        ]
+
+        self.assertFalse(refinement_audit["look_rerender_required"])
+        self.assertTrue(refinement_audit["path_invariant_nonlook_failure"])
+        self.assertTrue(
+            refinement_audit["complete_path_no_good_allowed"]
+        )
+        self.assertEqual(pending_render_variant_indices, [])
+        self.assertTrue(
+            _joint_complete_path_no_good_allowed_from_feedback(
+                classification
+            )
+        )
+
+    def test_joint_look_pass_aggregate_pass_keeps_normal_disposition(self) -> None:
+        refinement_audit = _joint_decoded_look_already_passed_audit_fields(
+            decoded_review_passed=True,
+        )
+        classification = {
+            "feedback_binding_valid": True,
+            "feedback_authoring_allowed": True,
+            "complete_path_no_good_deferred_for_render_variant": False,
+        }
+
+        _joint_apply_look_refinement_feedback_classification(
+            classification,
+            refinement_audit,
+            decoded_review_passed=True,
+        )
+
+        self.assertFalse(refinement_audit["look_rerender_required"])
+        self.assertFalse(refinement_audit["path_invariant_nonlook_failure"])
+        self.assertFalse(
+            refinement_audit["complete_path_no_good_allowed"]
+        )
+        self.assertTrue(
+            _joint_complete_path_no_good_allowed_from_feedback(
+                classification
+            )
+        )
+
+    def test_joint_look_accepts_production_visible_schema_and_rolls_back_regression(
+        self,
+    ) -> None:
+        def review(
+            *,
+            luma_value: float,
+            penalty: float,
+            montage_passed: bool = True,
+        ) -> dict[str, object]:
+            return {
+                "perceptual_source_admission": {
+                    "analysis_basis": (
+                        PERCEPTUAL_SOURCE_ADMISSION_ANALYSIS_BASIS
+                    ),
+                    "index_domains": {
+                        "source_index": "render_plan_sources_array_index"
+                    },
+                    "source_median_consistency": {
+                        "worst_source_pairs": {
+                            "sharpness_log": {
+                                "source_indices": [0, 1],
+                                "value": 0.40,
+                                "maximum_allowed": 0.55,
+                            },
+                            "luma": {
+                                "source_indices": [0, 1],
+                                "value": luma_value,
+                                "maximum_allowed": 0.18,
+                            },
+                            "chroma": {
+                                "source_indices": [0, 1],
+                                "value": 0.10,
+                                "maximum_allowed": 0.12,
+                            },
+                        }
+                    },
+                    "rapid_quality_alternation": {
+                        "gate_applicable": True,
+                        "high_quality_shock_fraction": 0.20,
+                        "maximum_allowed_high_quality_shock_fraction": 0.25,
+                    },
+                    "admission": {
+                        "passed": False,
+                        "selection_penalty_points": penalty,
+                    },
+                },
+                "geometry_provider_failure_count": 0,
+                "introduced_cross_source_technical_issue_reasons": [],
+                "visible_boundary_score": {
+                    "p10": 0.84,
+                    "issue_fraction": 0.0,
+                },
+                "segment_interior_geometry": {
+                    "complete": True,
+                    "geometry_provider_failure_count": 0,
+                },
+                "technical_proxy_passed_before_montage_grammar": True,
+                "professional_reference_gate": {"passed": True},
+                "rendered_montage_grammar_review": {
+                    "passed": montage_passed
+                },
+                "boundaries": [
+                    {
+                        "boundary_index": 0,
+                        "review_domain": "introduced_cross_source",
+                        "outgoing_source_index": 0,
+                        "incoming_source_index": 1,
+                        "passed": True,
+                        "issue_reasons": [],
+                        "technical_integrity_issue_reasons": [],
+                        "discontinuities": {
+                            "face_scale_discontinuity": 0.08
+                        },
+                    }
+                ],
+            }
+
+        before = review(luma_value=0.30, penalty=18.0)
+        improved = review(luma_value=0.21, penalty=9.0)
+        visible = before["visible_boundary_score"]
+        assert isinstance(visible, dict)
+        self.assertNotIn("passed", visible)
+        previous_objective = pipeline_module.decoded_look_objective(before)
+        _objective, reasons, accepted = (
+            _joint_group_look_refinement_acceptance(
+                previous_objective,
+                before,
+                improved,
+            )
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(reasons, ())
+
+        regressed = review(
+            luma_value=0.21,
+            penalty=9.0,
+            montage_passed=False,
+        )
+        _objective, reasons, accepted = (
+            _joint_group_look_refinement_acceptance(
+                previous_objective,
+                before,
+                regressed,
+            )
+        )
+        self.assertFalse(accepted)
+        self.assertIn("rendered_montage_grammar_review_regressed", reasons)
+
+    def test_joint_decoded_render_variant_signature_is_exact_and_stable(
+        self,
+    ) -> None:
+        payload = {
+            "segment_interior_geometry": {
+                "render_timeline_binding_sha256": "1" * 64,
+            }
+        }
+        self.assertEqual(
+            _joint_decoded_render_variant_signature(payload),
+            "1" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "stable render variant"):
+            _joint_decoded_render_variant_signature(
+                {
+                    "segment_interior_geometry": {
+                        "render_timeline_binding_sha256": "not-a-sha",
+                    }
+                }
+            )
+
+    def test_joint_feedback_orchestration_reopens_provider_for_second_batch(
+        self,
+    ) -> None:
+        batch_candidates = (
+            tuple(
+                _joint_materialized_mock(tag, candidate_index=index)
+                for index, tag in enumerate("abcdefgh")
+            ),
+            tuple(
+                _joint_materialized_mock(tag, candidate_index=index)
+                for index, tag in enumerate("ijklmnop")
+            ),
+        )
+        selection_sets = []
+        for _batch_index in range(2):
+            selection_set = Mock(spec=JointVisualSelectionSet)
+            selection_set.selection_retry_audit = {
+                "proof_materialization_call_count": 8
+            }
+            selection_sets.append(selection_set)
+
+        providers = []
+        provider_audits = []
+        selector_feedback = []
+        active_batch = 0
+
+        def provider_factory() -> Mock:
+            provider = Mock()
+            provider.to_dict.return_value = {
+                "contract": "mock_joint_provider_v1",
+                "provider_instance": len(providers),
+            }
+            providers.append(provider)
+            return provider
+
+        def select_candidates(
+            provider: Mock,
+            boundary_feedback: frozenset[object],
+            complete_path_feedback: frozenset[JointTimelinePathSignature],
+            proof_budget: int,
+        ) -> JointVisualSelectionSet:
+            self.assertIs(provider, providers[-1])
+            selector_feedback.append(
+                (
+                    boundary_feedback,
+                    complete_path_feedback,
+                    proof_budget,
+                )
+            )
+            return selection_sets[active_batch]
+
+        def materialize_candidates(
+            selection_set: JointVisualSelectionSet,
+            provider: Mock,
+        ) -> tuple[Mock, ...]:
+            self.assertIs(selection_set, selection_sets[active_batch])
+            self.assertIs(provider, providers[-1])
+            return batch_candidates[active_batch]
+
+        forbidden_boundaries = set()
+        forbidden_paths = set()
+        materialized_paths = set()
+        cumulative_proof_calls = 0
+        decoded_render_attempt_count = 0
+        all_wrapped = []
+
+        first_selection, first_materialized = (
+            _materialize_joint_feedback_batch_with_fresh_provider(
+                batch_index=0,
+                provider_factory=provider_factory,
+                select_candidates=select_candidates,
+                materialize_candidates=materialize_candidates,
+                forbidden_boundary_selections=forbidden_boundaries,
+                forbidden_complete_paths=forbidden_paths,
+                maximum_proof_materialization_calls=32,
+                provider_audit_sink=provider_audits.append,
+            )
+        )
+        cumulative_proof_calls += (
+            _joint_selection_proof_materialization_call_count(
+                first_selection,
+                available_budget=32,
+            )
+        )
+        first_wrapped = _globally_index_joint_visual_candidate_batch(
+            first_materialized,
+            first_candidate_index=0,
+        )
+        all_wrapped.extend(first_wrapped)
+        materialized_paths.update(
+            _joint_complete_path_signature(item) for item in first_wrapped
+        )
+        for item in first_wrapped:
+            decoded_render_attempt_count += 1
+            payload = {
+                "passed": False,
+                "boundaries": [
+                    {
+                        "boundary_index": 0,
+                        "review_domain": "introduced_cross_source",
+                        "outgoing_source_index": 2,
+                        "incoming_source_index": 7,
+                        "passed": False,
+                        "issue_reasons": ["color_shock"],
+                        "technical_integrity_issue_reasons": [],
+                    }
+                ],
+            }
+            forbidden_boundaries.update(
+                _joint_localized_decoded_boundary_no_goods(
+                    item,
+                    payload,
+                    eligible_indices=(2, 7),
+                )
+            )
+            forbidden_paths.add(_joint_complete_path_signature(item))
+
+        active_batch = 1
+        second_selection, second_materialized = (
+            _materialize_joint_feedback_batch_with_fresh_provider(
+                batch_index=1,
+                provider_factory=provider_factory,
+                select_candidates=select_candidates,
+                materialize_candidates=materialize_candidates,
+                forbidden_boundary_selections=forbidden_boundaries,
+                forbidden_complete_paths=forbidden_paths,
+                maximum_proof_materialization_calls=(
+                    32 - cumulative_proof_calls
+                ),
+                provider_audit_sink=provider_audits.append,
+            )
+        )
+        cumulative_proof_calls += (
+            _joint_selection_proof_materialization_call_count(
+                second_selection,
+                available_budget=32 - cumulative_proof_calls,
+            )
+        )
+        second_wrapped = _globally_index_joint_visual_candidate_batch(
+            second_materialized,
+            first_candidate_index=len(all_wrapped),
+            existing_complete_paths=materialized_paths,
+        )
+        all_wrapped.extend(second_wrapped)
+
+        bundles = []
+        reviews = []
+        for item in second_wrapped:
+            decoded_render_attempt_count += 1
+            bundle = Mock(spec=_GroupRenderCandidateBundle)
+            bundle.candidate_index = item.candidate_index
+            bundle.pre_render_score = 100.0 - item.candidate_index
+            bundle.visual_timeline = item.visual_plan
+            review = Mock(spec=RenderedCandidateReview)
+            review.passed = True
+            review.ranking_weighted_score = 100.0 - item.candidate_index
+            review.weighted_score = 100.0 - item.candidate_index
+            bundles.append(bundle)
+            reviews.append(review)
+        cohort = _select_joint_decoded_passing_cohort(bundles, reviews)
+
+        self.assertEqual(len(providers), 2)
+        for provider in providers:
+            provider.close.assert_called_once_with()
+        self.assertEqual(len(provider_audits), 2)
+        self.assertTrue(
+            all(
+                audit["provider_closed_after_materialization"] is True
+                for audit in provider_audits
+            )
+        )
+        self.assertEqual(selector_feedback[0], (frozenset(), frozenset(), 32))
+        self.assertTrue(selector_feedback[1][0])
+        self.assertEqual(selector_feedback[1][1], frozenset(forbidden_paths))
+        self.assertEqual(selector_feedback[1][2], 24)
+        self.assertEqual(
+            tuple(item.candidate_index for item in all_wrapped),
+            tuple(range(16)),
+        )
+        self.assertEqual(cumulative_proof_calls, 16)
+        self.assertLessEqual(cumulative_proof_calls, 32)
+        self.assertEqual(decoded_render_attempt_count, 16)
+        self.assertLessEqual(decoded_render_attempt_count, 24)
+        self.assertEqual(len(cohort), 8)
+        cohort_paths = {
+            _exact_source_shot_path(bundle)
+            for bundle, _review in cohort
+        }
+        self.assertGreaterEqual(len(cohort_paths), 4)
+
+    def test_pipeline_joint_selector_forwards_closed_loop_feedback(self) -> None:
+        tree = ast.parse(Path(pipeline_module.__file__).read_text(encoding="utf-8"))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "select_joint_visual_candidates"
+        ]
+        self.assertEqual(len(calls), 1)
+        keywords = {item.arg for item in calls[0].keywords}
+        self.assertTrue(
+            {
+                "forbidden_boundary_selections",
+                "forbidden_complete_paths",
+                "maximum_proof_materialization_calls",
+            }.issubset(keywords)
+        )
+        source = Path(pipeline_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("shared_render_contract_failure", source)
+        self.assertIn("시도 {joint_decoded_render_attempt_count}/", source)
+        self.assertIn("통과 {min(len(derived), 8)}/", source)
 
 
 if __name__ == "__main__":  # pragma: no cover

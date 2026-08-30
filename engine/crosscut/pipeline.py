@@ -103,6 +103,13 @@ from .editorial_motion import (
 from .events import EventReporter
 from .face_match import FaceMatchPlan, build_face_match_plan
 from .group_transition import GroupTransitionPlan, build_group_transition_plan
+from .group_output_look import (
+    DecodedLookObjective,
+    GroupDecodedLookRefinement,
+    _bound_decoded_proxy_identity,
+    decoded_look_objective,
+    refine_group_render_plan_from_decoded_proxy,
+)
 from .group_boundary_grammar_adapter import (
     adapt_group_boundary_grammar_evidence,
 )
@@ -317,7 +324,11 @@ from .joint_visual_candidate_adapter import (
     materialize_joint_visual_candidates,
     select_joint_visual_candidates,
 )
-from .joint_timeline import JointTimelineProgress
+from .joint_timeline import (
+    BoundarySelectionNoGood,
+    JointTimelinePathSignature,
+    JointTimelineProgress,
+)
 from .no_good_selector_identity import build_no_good_selector_identity
 from .timeline import NoCompleteTimelinePath
 from .timeline_no_good import (
@@ -791,6 +802,8 @@ def _exact_source_shot_path(candidate: Any) -> tuple[tuple[str, str], ...]:
     """Return the DP path identity without conflating shots from one source."""
 
     visual_plan = getattr(candidate, "visual_plan", None)
+    if visual_plan is None:
+        visual_plan = getattr(candidate, "visual_timeline", None)
     choices = getattr(visual_plan, "choices", None)
     if not isinstance(choices, tuple) or not choices:
         raise TypeError("visual candidate must expose a non-empty visual path")
@@ -809,6 +822,1052 @@ def _exact_source_shot_path(candidate: Any) -> tuple[tuple[str, str], ...]:
             raise ValueError("visual candidate source/shot path is invalid")
         path.append((str(source_index), shot_id))
     return tuple(path)
+
+
+_JOINT_DECODED_ATTEMPT_LIMIT = 24
+_JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT = 32
+_JOINT_REQUIRED_DECODED_PASS_COUNT = 8
+_JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH = 2
+
+_JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES = frozenset(
+    {
+        "sharpness_discontinuity",
+        "exposure_discontinuity",
+        "color_shock",
+        "structure_shock",
+        "face_scale_discontinuity",
+        "face_position_discontinuity",
+        "silhouette_scale_discontinuity",
+        "silhouette_position_discontinuity",
+        "motion_direction_discontinuity",
+        "introduced_cross_source_duplicate_or_freeze",
+        "introduced_cross_source_black_frame",
+    }
+)
+_JOINT_NONLOCAL_RENDER_CONTRACT_DOMAINS = frozenset(
+    {"tier_d_continuity", "native_source_cut"}
+)
+_JOINT_NONLOCAL_ZERO_TOLERANCE_TOKENS = (
+    "duplicate_or_freeze",
+    "black_frame",
+    "decoded_frame_unavailable",
+    "render_contract_mismatch",
+)
+
+
+def _underlying_joint_materialized_candidate(
+    candidate: Any,
+) -> JointMaterializedVisualCandidate | None:
+    """Unwrap a stream-global shell without losing the joint proof owner."""
+
+    underlying = (
+        candidate.materialized
+        if isinstance(candidate, _GloballyIndexedVisualCandidate)
+        else candidate
+    )
+    return (
+        underlying
+        if isinstance(underlying, JointMaterializedVisualCandidate)
+        else None
+    )
+
+
+def _joint_complete_path_signature(
+    candidate: Any,
+) -> JointTimelinePathSignature:
+    underlying = _underlying_joint_materialized_candidate(candidate)
+    if underlying is None:
+        raise TypeError("joint complete-path identity needs a joint candidate")
+    signature = underlying.joint_result.complete_path_signature
+    if not isinstance(signature, JointTimelinePathSignature):
+        raise TypeError("joint candidate exposed an invalid complete-path identity")
+    return signature
+
+
+def _globally_index_joint_visual_candidate_batch(
+    candidates: Sequence[JointMaterializedVisualCandidate],
+    *,
+    first_candidate_index: int,
+    existing_complete_paths: Iterable[JointTimelinePathSignature] = (),
+) -> tuple[_GloballyIndexedVisualCandidate, ...]:
+    """Assign stable cross-batch IDs while rejecting exact proof replays."""
+
+    if (
+        isinstance(first_candidate_index, bool)
+        or not isinstance(first_candidate_index, int)
+        or first_candidate_index < 0
+    ):
+        raise ValueError("joint global candidate index must be non-negative")
+    if isinstance(candidates, (str, bytes)) or not isinstance(
+        candidates,
+        Sequence,
+    ):
+        raise TypeError("joint candidate batch must be a sequence")
+    seen = set(existing_complete_paths)
+    if any(not isinstance(item, JointTimelinePathSignature) for item in seen):
+        raise TypeError("existing joint complete paths are invalid")
+    wrapped: list[_GloballyIndexedVisualCandidate] = []
+    for offset, candidate in enumerate(candidates):
+        if not isinstance(candidate, JointMaterializedVisualCandidate):
+            raise TypeError("joint batch contains a non-joint candidate")
+        signature = _joint_complete_path_signature(candidate)
+        if signature in seen:
+            raise RuntimeError(
+                "joint selector replayed an exact complete path across batches"
+            )
+        seen.add(signature)
+        wrapped.append(
+            _GloballyIndexedVisualCandidate(
+                materialized=candidate,
+                candidate_index=first_candidate_index + offset,
+            )
+        )
+    return tuple(wrapped)
+
+
+def _joint_selection_proof_materialization_call_count(
+    selection_set: JointVisualSelectionSet,
+    *,
+    available_budget: int,
+) -> int:
+    """Validate selector proof accounting before adding it to session usage."""
+
+    if not isinstance(selection_set, JointVisualSelectionSet):
+        raise TypeError("joint proof accounting needs a selection set")
+    if (
+        isinstance(available_budget, bool)
+        or not isinstance(available_budget, int)
+        or available_budget < MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or available_budget
+        > _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+    ):
+        raise ValueError("joint available proof budget must be within 8..32")
+    value = selection_set.selection_retry_audit.get(
+        "proof_materialization_call_count"
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        <= value
+        <= available_budget
+    ):
+        raise RuntimeError("joint selector returned invalid proof usage")
+    return value
+
+
+def _materialize_joint_feedback_batch_with_fresh_provider(
+    *,
+    batch_index: int,
+    provider_factory: Callable[[], Any],
+    select_candidates: Callable[
+        [
+            Any,
+            frozenset[BoundarySelectionNoGood],
+            frozenset[JointTimelinePathSignature],
+            int,
+        ],
+        JointVisualSelectionSet,
+    ],
+    materialize_candidates: Callable[
+        [JointVisualSelectionSet, Any],
+        Sequence[JointMaterializedVisualCandidate],
+    ],
+    forbidden_boundary_selections: Iterable[BoundarySelectionNoGood],
+    forbidden_complete_paths: Iterable[JointTimelinePathSignature],
+    maximum_proof_materialization_calls: int,
+    provider_audit_sink: Callable[[Mapping[str, Any]], None],
+) -> tuple[
+    JointVisualSelectionSet,
+    tuple[JointMaterializedVisualCandidate, ...],
+]:
+    """Open, use, audit, and close exactly one process-local provider batch."""
+
+    if (
+        isinstance(batch_index, bool)
+        or not isinstance(batch_index, int)
+        or batch_index < 0
+    ):
+        raise ValueError("joint feedback batch index must be non-negative")
+    if (
+        isinstance(maximum_proof_materialization_calls, bool)
+        or not isinstance(maximum_proof_materialization_calls, int)
+        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        <= maximum_proof_materialization_calls
+        <= _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+    ):
+        raise ValueError("joint feedback proof budget must be within 8..32")
+    boundary_feedback = frozenset(forbidden_boundary_selections)
+    complete_path_feedback = frozenset(forbidden_complete_paths)
+    if any(
+        not isinstance(item, tuple) or len(item) != 2
+        for item in boundary_feedback
+    ):
+        raise TypeError("joint boundary feedback contains an invalid no-good")
+    if any(
+        not isinstance(item, JointTimelinePathSignature)
+        for item in complete_path_feedback
+    ):
+        raise TypeError("joint complete-path feedback contains an invalid no-good")
+    provider = provider_factory()
+    if provider is None:
+        raise RuntimeError("joint provider factory returned no provider")
+    provider_audit_before_close: dict[str, Any] | None = None
+    try:
+        selection_set = select_candidates(
+            provider,
+            boundary_feedback,
+            complete_path_feedback,
+            maximum_proof_materialization_calls,
+        )
+        if not isinstance(selection_set, JointVisualSelectionSet):
+            raise TypeError("joint selector returned an invalid selection set")
+        materialized = tuple(
+            materialize_candidates(selection_set, provider)
+        )
+        if (
+            len(materialized) != MINIMUM_PRODUCTION_JOINT_CANDIDATES
+            or any(
+                not isinstance(item, JointMaterializedVisualCandidate)
+                for item in materialized
+            )
+        ):
+            raise RuntimeError(
+                "joint feedback batch must materialize exactly eight candidates"
+            )
+        return selection_set, materialized
+    finally:
+        try:
+            raw_audit = provider.to_dict()
+            if not isinstance(raw_audit, Mapping):
+                raise TypeError("joint provider audit must be a mapping")
+            provider_audit_before_close = deepcopy(dict(raw_audit))
+        finally:
+            provider.close()
+        if provider_audit_before_close is not None:
+            provider_audit_sink(
+                {
+                    **provider_audit_before_close,
+                    "batch_index": batch_index,
+                    "provider_closed_after_materialization": True,
+                    "process_local_materialization_retained": True,
+                }
+            )
+
+
+def _joint_report_source_index(
+    local_source_index: int,
+    eligible_indices: Sequence[int],
+) -> int:
+    if (
+        isinstance(local_source_index, bool)
+        or not isinstance(local_source_index, int)
+        or not 0 <= local_source_index < len(eligible_indices)
+    ):
+        raise ValueError("joint local source index is outside eligible sources")
+    report_index = eligible_indices[local_source_index]
+    if (
+        isinstance(report_index, bool)
+        or not isinstance(report_index, int)
+        or report_index < 0
+    ):
+        raise ValueError("joint eligible source mapping is invalid")
+    return report_index
+
+
+def _joint_localized_decoded_boundary_no_goods(
+    candidate: Any,
+    review_payload: Mapping[str, Any],
+    *,
+    eligible_indices: Sequence[int],
+) -> frozenset[BoundarySelectionNoGood]:
+    """Project only exact introduced-cross-source failures into the joint DP."""
+
+    underlying = _underlying_joint_materialized_candidate(candidate)
+    if underlying is None:
+        return frozenset()
+    boundaries = review_payload.get("boundaries")
+    if not isinstance(boundaries, list):
+        return frozenset()
+    choices = underlying.visual_plan.choices
+    options = underlying.joint_result.boundary_options
+    if len(options) != max(0, len(choices) - 1):
+        raise RuntimeError("joint decoded candidate lost exact boundary options")
+    no_goods: set[BoundarySelectionNoGood] = set()
+    for boundary in boundaries:
+        if (
+            not isinstance(boundary, Mapping)
+            or boundary.get("review_domain")
+            != INTRODUCED_CROSS_SOURCE_DOMAIN
+            or boundary.get("passed") is not False
+        ):
+            continue
+        boundary_index = boundary.get("boundary_index")
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or not 0 <= boundary_index < len(options)
+        ):
+            continue
+        outgoing = choices[boundary_index]
+        incoming = choices[boundary_index + 1]
+        if outgoing.source_index == incoming.source_index:
+            continue
+        expected_outgoing_source = _joint_report_source_index(
+            outgoing.source_index,
+            eligible_indices,
+        )
+        expected_incoming_source = _joint_report_source_index(
+            incoming.source_index,
+            eligible_indices,
+        )
+        if (
+            boundary.get("outgoing_source_index")
+            != expected_outgoing_source
+            or boundary.get("incoming_source_index")
+            != expected_incoming_source
+        ):
+            continue
+        reasons: set[str] = set()
+        for field in ("issue_reasons", "technical_integrity_issue_reasons"):
+            raw_reasons = boundary.get(field)
+            if isinstance(raw_reasons, list):
+                reasons.update(
+                    reason for reason in raw_reasons if isinstance(reason, str)
+                )
+        if not reasons.intersection(_JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES):
+            continue
+        option = options[boundary_index]
+        key = option.measurement_key
+        if (
+            key.boundary_index != boundary_index
+            or key.outgoing.source_id != str(outgoing.source_index)
+            or key.incoming.source_id != str(incoming.source_index)
+            or key.outgoing.shot_id != outgoing.shot_id
+            or key.incoming.shot_id != incoming.shot_id
+        ):
+            raise RuntimeError(
+                "decoded boundary failure does not bind the selected joint proof"
+            )
+        no_goods.add((key, option.frame_offset))
+    return frozenset(no_goods)
+
+
+def _joint_nonlocal_render_contract_failure_fingerprints(
+    candidate: Any,
+    review_payload: Mapping[str, Any],
+    *,
+    eligible_indices: Sequence[int],
+) -> tuple[tuple[str, int, int, str], ...]:
+    """Return only zero-tolerance, same-source renderer-contract failures."""
+
+    underlying = _underlying_joint_materialized_candidate(candidate)
+    if underlying is None:
+        return ()
+    boundaries = review_payload.get("boundaries")
+    if not isinstance(boundaries, list):
+        return ()
+    choices = underlying.visual_plan.choices
+    fingerprints: set[tuple[str, int, int, str]] = set()
+    for boundary in boundaries:
+        if not isinstance(boundary, Mapping) or boundary.get("passed") is not False:
+            continue
+        domain = boundary.get("review_domain")
+        boundary_index = boundary.get("boundary_index")
+        if (
+            domain not in _JOINT_NONLOCAL_RENDER_CONTRACT_DOMAINS
+            or isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or not 0 <= boundary_index < len(choices) - 1
+        ):
+            continue
+        outgoing = choices[boundary_index]
+        incoming = choices[boundary_index + 1]
+        if outgoing.source_index != incoming.source_index:
+            continue
+        expected_source = _joint_report_source_index(
+            outgoing.source_index,
+            eligible_indices,
+        )
+        if (
+            boundary.get("outgoing_source_index") != expected_source
+            or boundary.get("incoming_source_index") != expected_source
+        ):
+            continue
+        technical = boundary.get("technical_integrity_issue_reasons")
+        if not isinstance(technical, list):
+            continue
+        for reason in technical:
+            if not isinstance(reason, str) or not any(
+                token in reason
+                for token in _JOINT_NONLOCAL_ZERO_TOLERANCE_TOKENS
+            ):
+                continue
+            fingerprints.add(
+                (str(domain), boundary_index, expected_source, reason)
+            )
+    return tuple(sorted(fingerprints))
+
+
+def _record_joint_shared_render_contract_failure(
+    observed_paths: dict[
+        tuple[str, int, int, str],
+        set[JointTimelinePathSignature],
+    ],
+    *,
+    exact_path: JointTimelinePathSignature,
+    fingerprints: Sequence[tuple[str, int, int, str]],
+) -> dict[str, Any] | None:
+    """Abort after two exact paths prove one invariant renderer defect."""
+
+    if not isinstance(exact_path, JointTimelinePathSignature):
+        raise TypeError("shared renderer failure needs an exact joint path")
+    if any(
+        not isinstance(item, tuple)
+        or len(item) != 4
+        or not isinstance(item[0], str)
+        or isinstance(item[1], bool)
+        or not isinstance(item[1], int)
+        or item[1] < 0
+        or isinstance(item[2], bool)
+        or not isinstance(item[2], int)
+        or item[2] < 0
+        or not isinstance(item[3], str)
+        or not item[3]
+        for item in fingerprints
+    ):
+        raise ValueError("shared renderer failure fingerprint is invalid")
+    for fingerprint in sorted(set(fingerprints)):
+        paths = observed_paths.setdefault(fingerprint, set())
+        if any(
+            not isinstance(item, JointTimelinePathSignature)
+            for item in paths
+        ):
+            raise TypeError("shared renderer failure path history is invalid")
+        paths.add(exact_path)
+        if len(paths) >= 2:
+            return {
+                "contract": "joint_decoded_shared_render_contract_failure_v1",
+                "cause": "shared_render_contract_failure",
+                "fingerprint": {
+                    "review_domain": fingerprint[0],
+                    "boundary_index": fingerprint[1],
+                    "source_index": fingerprint[2],
+                    "technical_integrity_reason": fingerprint[3],
+                },
+                "distinct_exact_path_count": len(paths),
+                "minimum_distinct_exact_path_count": 2,
+                "aggregate_aesthetic_failure_used": False,
+                "same_source_failure_promoted_to_boundary_no_good": False,
+                "thresholds_lowered": False,
+                "production_use_forbidden": True,
+            }
+    return None
+
+
+def _joint_decoded_render_variant_signature(
+    review_payload: Mapping[str, Any],
+) -> str:
+    """Return the producer-bound RenderPlan identity for one decoded proxy."""
+
+    interior = review_payload.get("segment_interior_geometry")
+    signature = (
+        interior.get("render_timeline_binding_sha256")
+        if isinstance(interior, Mapping)
+        else None
+    )
+    if not (
+        isinstance(signature, str)
+        and len(signature) == 64
+        and all(character in "0123456789abcdef" for character in signature)
+    ):
+        raise ValueError("decoded review lacks a stable render variant signature")
+    return signature
+
+
+def _record_bound_joint_decoded_feedback(
+    candidate: Any,
+    bundle: "_GroupRenderCandidateBundle",
+    review_payload: Mapping[str, Any],
+    *,
+    eligible_indices: Sequence[int],
+    forbidden_boundary_selections: set[BoundarySelectionNoGood],
+    feedback_classifications: dict[int, dict[str, Any]],
+    nonlocal_contract_failure_paths: dict[
+        tuple[str, int, int, str],
+        set[JointTimelinePathSignature],
+    ],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Author decoded feedback only after exact signed render binding."""
+
+    candidate_index = getattr(candidate, "candidate_index", None)
+    if (
+        isinstance(candidate_index, bool)
+        or not isinstance(candidate_index, int)
+        or candidate_index < 0
+    ):
+        raise ValueError("joint decoded feedback candidate index is invalid")
+    render_plan = getattr(bundle, "render_plan", None)
+    invalid_classification: dict[str, Any] = {
+        "feedback_binding_valid": False,
+        "feedback_authoring_allowed": False,
+        "localized_boundary_no_good_count": 0,
+        "nonlocal_render_contract_failure_count": 0,
+        "perceptual_source_admission_failed": False,
+        "complete_path_no_good_deferred_for_render_variant": True,
+        "complete_path_no_good_allowed": False,
+        "aggregate_look_or_montage_promoted_to_boundary_no_good": False,
+        "same_source_duplicate_or_freeze_promoted_to_boundary_no_good": False,
+        "render_variant_signature": None,
+    }
+    try:
+        if not isinstance(review_payload, Mapping):
+            raise TypeError("joint decoded feedback review must be a mapping")
+        if not isinstance(render_plan, RenderPlan):
+            raise TypeError("joint decoded feedback requires an exact RenderPlan")
+        bound_render_variant = _bound_decoded_proxy_identity(
+            review_payload,
+            render_plan=render_plan,
+        )[0]
+        render_variant = _joint_decoded_render_variant_signature(
+            review_payload
+        )
+        if bound_render_variant != render_variant:
+            raise ValueError(
+                "joint decoded feedback render variant binding changed"
+            )
+    except (OSError, TypeError, ValueError) as exc:
+        classification = {
+            **invalid_classification,
+            "binding_error": f"{type(exc).__name__}: {exc}",
+        }
+        feedback_classifications[candidate_index] = classification
+        return classification, None
+
+    exact_path = _joint_complete_path_signature(candidate)
+    localized = _joint_localized_decoded_boundary_no_goods(
+        candidate,
+        review_payload,
+        eligible_indices=eligible_indices,
+    )
+    nonlocal_fingerprints = (
+        _joint_nonlocal_render_contract_failure_fingerprints(
+            candidate,
+            review_payload,
+            eligible_indices=eligible_indices,
+        )
+    )
+    perceptual = review_payload.get("perceptual_source_admission")
+    perceptual_admission_failed = bool(
+        isinstance(perceptual, Mapping)
+        and isinstance(perceptual.get("admission"), Mapping)
+        and perceptual["admission"].get("passed") is False
+    )
+    classification = {
+        "feedback_binding_valid": True,
+        "feedback_authoring_allowed": True,
+        "binding_error": None,
+        "localized_boundary_no_good_count": len(localized),
+        "nonlocal_render_contract_failure_count": len(
+            nonlocal_fingerprints
+        ),
+        "perceptual_source_admission_failed": perceptual_admission_failed,
+        "complete_path_no_good_deferred_for_render_variant": (
+            review_payload.get("passed") is False
+            and not localized
+            and not nonlocal_fingerprints
+        ),
+        "complete_path_no_good_allowed": True,
+        "aggregate_look_or_montage_promoted_to_boundary_no_good": False,
+        "same_source_duplicate_or_freeze_promoted_to_boundary_no_good": False,
+        "render_variant_signature": render_variant,
+    }
+    feedback_classifications[candidate_index] = classification
+    forbidden_boundary_selections.update(localized)
+    shared_failure = _record_joint_shared_render_contract_failure(
+        nonlocal_contract_failure_paths,
+        exact_path=exact_path,
+        fingerprints=nonlocal_fingerprints,
+    )
+    return classification, shared_failure
+
+
+def _joint_complete_path_no_good_allowed_from_feedback(
+    classification: Mapping[str, Any] | None,
+) -> bool:
+    """Keep unbound decoded evidence from promoting an exact path no-good."""
+
+    if classification is None:
+        # Pre-proxy structural/derivation failures do not depend on decoded
+        # evidence and may still retire their exact complete path.
+        return True
+    return bool(
+        classification.get("feedback_binding_valid") is True
+        and classification.get("feedback_authoring_allowed") is True
+        and classification.get(
+            "complete_path_no_good_deferred_for_render_variant"
+        )
+        is False
+    )
+
+
+def _joint_require_refined_render_variant_lineage(
+    proposal: GroupDecodedLookRefinement,
+    render_variant_signature: str,
+) -> None:
+    """Reject a rerender that is not the proposal's exact signed output."""
+
+    if not isinstance(proposal, GroupDecodedLookRefinement):
+        raise TypeError("joint look proposal lineage is invalid")
+    if (
+        render_variant_signature
+        != proposal.lineage.output_render_plan_binding_sha256
+    ):
+        raise ValueError("refined decoded render variant lineage mismatch")
+
+
+def _joint_decoded_look_already_passed_audit_fields(
+    *,
+    decoded_review_passed: bool,
+) -> dict[str, Any]:
+    """Classify an aggregate failure after the decoded look already passed."""
+
+    if not isinstance(decoded_review_passed, bool):
+        raise TypeError("decoded aggregate review pass flag must be boolean")
+    aggregate_nonlook_failure = not decoded_review_passed
+    return {
+        "applicable": False,
+        "evidence_complete": True,
+        "exhausted": True,
+        "budget_exhausted": False,
+        "look_rerender_required": False,
+        "path_invariant_nonlook_failure": aggregate_nonlook_failure,
+        "reason": (
+            "decoded_look_admission_passed_aggregate_nonlook_failed"
+            if aggregate_nonlook_failure
+            else "decoded_look_admission_already_passed"
+        ),
+        "complete_path_no_good_allowed": aggregate_nonlook_failure,
+    }
+
+
+def _joint_look_refinement_complete_path_no_good_allowed(
+    *,
+    decoded_review_passed: bool,
+    exhausted: bool,
+    budget_exhausted: bool,
+    evidence_complete: bool,
+) -> bool:
+    """Return the exact fail-closed full-path retirement disposition."""
+
+    values = (
+        decoded_review_passed,
+        exhausted,
+        budget_exhausted,
+        evidence_complete,
+    )
+    if any(not isinstance(value, bool) for value in values):
+        raise TypeError("joint look refinement disposition flags must be boolean")
+    return bool(
+        not decoded_review_passed
+        and exhausted
+        and not budget_exhausted
+        and evidence_complete
+    )
+
+
+def _joint_record_invalid_look_refinement_evidence(
+    audit: dict[str, Any],
+    iteration_audit: dict[str, Any],
+    error: Exception,
+) -> None:
+    """Record invalid rerender evidence without enabling path retirement."""
+
+    iterations = audit.get("iterations")
+    if not isinstance(iterations, list):
+        raise TypeError("joint look refinement audit iterations are invalid")
+    if not isinstance(iteration_audit, dict) or not isinstance(error, Exception):
+        raise TypeError("joint look refinement evidence failure is invalid")
+    audit["evidence_complete"] = False
+    iteration_audit.update(
+        {
+            "accepted": False,
+            "rollback": True,
+            "error": f"{type(error).__name__}: {error}",
+            "nonlook_regression_reasons": [
+                "decoded_refinement_evidence_invalid"
+            ],
+        }
+    )
+    iterations.append(iteration_audit)
+
+
+def _joint_apply_look_refinement_feedback_classification(
+    classification: dict[str, Any],
+    refinement_audit: Mapping[str, Any],
+    *,
+    decoded_review_passed: bool,
+) -> None:
+    """Apply a refinement disposition without weakening binding feedback."""
+
+    if not isinstance(classification, dict) or not isinstance(
+        refinement_audit,
+        Mapping,
+    ):
+        raise TypeError("joint look refinement feedback audit is invalid")
+    if not isinstance(decoded_review_passed, bool):
+        raise TypeError("decoded aggregate review pass flag must be boolean")
+    classification["look_refinement"] = deepcopy(dict(refinement_audit))
+    if refinement_audit.get("complete_path_no_good_allowed") is True:
+        classification[
+            "complete_path_no_good_deferred_for_render_variant"
+        ] = False
+        classification["same_path_bounded_refinement_exhausted"] = True
+        if refinement_audit.get("path_invariant_nonlook_failure") is True:
+            classification["path_invariant_nonlook_failure"] = True
+    elif decoded_review_passed:
+        classification[
+            "complete_path_no_good_deferred_for_render_variant"
+        ] = False
+
+
+def _joint_group_nonlook_regression_reasons(
+    previous_review: Mapping[str, Any],
+    proposed_review: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Keep technical, geometry, and montage gates monotonic during look repair."""
+
+    reasons: list[str] = []
+
+    def integer_count(payload: Mapping[str, Any], name: str) -> int | None:
+        value = payload.get(name)
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+            else None
+        )
+
+    def issue_set(value: Any) -> frozenset[str] | None:
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item
+            for item in value
+        ):
+            return None
+        return frozenset(value)
+
+    def gate_passed(payload: Mapping[str, Any], name: str) -> bool | None:
+        raw = payload.get(name)
+        value = raw.get("passed") if isinstance(raw, Mapping) else raw
+        return value if isinstance(value, bool) else None
+
+    def finite_scalar(value: Any) -> float | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return None
+        return float(value)
+
+    previous_geometry = integer_count(
+        previous_review,
+        "geometry_provider_failure_count",
+    )
+    proposed_geometry = integer_count(
+        proposed_review,
+        "geometry_provider_failure_count",
+    )
+    if (
+        previous_geometry is None
+        or proposed_geometry is None
+        or proposed_geometry > previous_geometry
+    ):
+        reasons.append("geometry_provider_failure_count_regressed")
+
+    previous_global_technical = issue_set(
+        previous_review.get(
+            "introduced_cross_source_technical_issue_reasons"
+        )
+    )
+    proposed_global_technical = issue_set(
+        proposed_review.get(
+            "introduced_cross_source_technical_issue_reasons"
+        )
+    )
+    if previous_global_technical is None or proposed_global_technical is None:
+        reasons.append("global_technical_integrity_contract_missing")
+    elif not proposed_global_technical.issubset(previous_global_technical):
+        reasons.append("global_technical_integrity_issue_set_regressed")
+
+    previous_visible = previous_review.get("visible_boundary_score")
+    proposed_visible = proposed_review.get("visible_boundary_score")
+    if not isinstance(previous_visible, Mapping) or not isinstance(
+        proposed_visible,
+        Mapping,
+    ):
+        reasons.append("visible_boundary_score_contract_missing")
+    else:
+        previous_p10 = finite_scalar(previous_visible.get("p10"))
+        proposed_p10 = finite_scalar(proposed_visible.get("p10"))
+        previous_issue_fraction = finite_scalar(
+            previous_visible.get("issue_fraction")
+        )
+        proposed_issue_fraction = finite_scalar(
+            proposed_visible.get("issue_fraction")
+        )
+        visible_contract_valid = bool(
+            previous_p10 is not None
+            and proposed_p10 is not None
+            and previous_issue_fraction is not None
+            and proposed_issue_fraction is not None
+            and 0.0 <= previous_issue_fraction <= 1.0
+            and 0.0 <= proposed_issue_fraction <= 1.0
+        )
+        if not visible_contract_valid:
+            reasons.append("visible_boundary_score_contract_missing")
+        else:
+            assert previous_p10 is not None and proposed_p10 is not None
+            if proposed_p10 < previous_p10 - 1e-9:
+                reasons.append("visible_boundary_p10_regressed")
+            assert previous_issue_fraction is not None
+            assert proposed_issue_fraction is not None
+            if proposed_issue_fraction > previous_issue_fraction + 1e-9:
+                reasons.append("visible_boundary_issue_fraction_regressed")
+
+    previous_interior = previous_review.get("segment_interior_geometry")
+    proposed_interior = proposed_review.get("segment_interior_geometry")
+    if not isinstance(previous_interior, Mapping) or not isinstance(
+        proposed_interior,
+        Mapping,
+    ):
+        reasons.append("segment_interior_geometry_missing")
+    else:
+        previous_complete = previous_interior.get("complete")
+        proposed_complete = proposed_interior.get("complete")
+        if not isinstance(previous_complete, bool) or not isinstance(
+            proposed_complete,
+            bool,
+        ):
+            reasons.append("segment_interior_geometry_contract_missing")
+        elif previous_complete and not proposed_complete:
+            reasons.append("segment_interior_geometry_completeness_regressed")
+        previous_failures = integer_count(
+            previous_interior,
+            "geometry_provider_failure_count",
+        )
+        proposed_failures = integer_count(
+            proposed_interior,
+            "geometry_provider_failure_count",
+        )
+        if (
+            previous_failures is None
+            or proposed_failures is None
+            or proposed_failures > previous_failures
+        ):
+            reasons.append("segment_interior_geometry_failures_regressed")
+
+    for gate_name in (
+        "technical_proxy_passed_before_montage_grammar",
+        "professional_reference_gate",
+        "rendered_montage_grammar_review",
+    ):
+        previous_passed = gate_passed(previous_review, gate_name)
+        proposed_passed = gate_passed(proposed_review, gate_name)
+        if previous_passed is None or proposed_passed is None:
+            reasons.append(f"{gate_name}_contract_missing")
+        elif previous_passed and not proposed_passed:
+            reasons.append(f"{gate_name}_regressed")
+
+    previous_boundaries = previous_review.get("boundaries")
+    proposed_boundaries = proposed_review.get("boundaries")
+    if not isinstance(previous_boundaries, list) or not isinstance(
+        proposed_boundaries,
+        list,
+    ):
+        reasons.append("decoded_boundary_contract_missing")
+        return tuple(dict.fromkeys(reasons))
+    def indexed_boundaries(
+        raw: list[Any],
+    ) -> dict[int, Mapping[str, Any]] | None:
+        indexed: dict[int, Mapping[str, Any]] = {}
+        for item in raw:
+            boundary_index = (
+                item.get("boundary_index")
+                if isinstance(item, Mapping)
+                else None
+            )
+            if (
+                isinstance(boundary_index, bool)
+                or not isinstance(boundary_index, int)
+                or boundary_index < 0
+                or boundary_index in indexed
+            ):
+                return None
+            indexed[boundary_index] = item
+        return indexed
+
+    previous_by_index = indexed_boundaries(previous_boundaries)
+    proposed_by_index = indexed_boundaries(proposed_boundaries)
+    if previous_by_index is None or proposed_by_index is None:
+        reasons.append("decoded_boundary_contract_missing")
+        return tuple(dict.fromkeys(reasons))
+    if previous_by_index.keys() != proposed_by_index.keys():
+        reasons.append("decoded_boundary_index_domain_changed")
+        return tuple(dict.fromkeys(reasons))
+    geometry_metrics = (
+        "face_scale_discontinuity",
+        "face_position_discontinuity",
+        "silhouette_scale_discontinuity",
+        "silhouette_position_discontinuity",
+        "motion_direction_discontinuity",
+    )
+    for boundary_index in sorted(previous_by_index):
+        previous_boundary = previous_by_index[boundary_index]
+        proposed_boundary = proposed_by_index[boundary_index]
+        identity_fields = (
+            "review_domain",
+            "outgoing_source_index",
+            "incoming_source_index",
+        )
+        if any(
+            previous_boundary.get(name) != proposed_boundary.get(name)
+            for name in identity_fields
+        ):
+            reasons.append(
+                f"boundary_{boundary_index}_identity_changed"
+            )
+            continue
+        previous_passed = previous_boundary.get("passed")
+        proposed_passed = proposed_boundary.get("passed")
+        if not isinstance(previous_passed, bool) or not isinstance(
+            proposed_passed,
+            bool,
+        ):
+            reasons.append(
+                f"boundary_{boundary_index}_pass_contract_missing"
+            )
+        elif previous_passed and not proposed_passed:
+            reasons.append(f"boundary_{boundary_index}_pass_regressed")
+        previous_technical = issue_set(
+            previous_boundary.get("technical_integrity_issue_reasons")
+        )
+        proposed_technical = issue_set(
+            proposed_boundary.get("technical_integrity_issue_reasons")
+        )
+        if previous_technical is None or proposed_technical is None:
+            reasons.append(
+                f"boundary_{boundary_index}_technical_contract_missing"
+            )
+        elif not proposed_technical.issubset(previous_technical):
+            reasons.append(
+                f"boundary_{boundary_index}_technical_integrity_regressed"
+            )
+        previous_issues = issue_set(previous_boundary.get("issue_reasons"))
+        proposed_issues = issue_set(proposed_boundary.get("issue_reasons"))
+        if previous_issues is None or proposed_issues is None:
+            reasons.append(f"boundary_{boundary_index}_issue_contract_missing")
+        elif not proposed_issues.issubset(previous_issues):
+            reasons.append(f"boundary_{boundary_index}_issue_set_regressed")
+        previous_discontinuities = previous_boundary.get("discontinuities")
+        proposed_discontinuities = proposed_boundary.get("discontinuities")
+        if not isinstance(previous_discontinuities, Mapping):
+            continue
+        for metric in geometry_metrics:
+            if metric not in previous_discontinuities:
+                continue
+            previous_value = previous_discontinuities.get(metric)
+            proposed_value = (
+                proposed_discontinuities.get(metric)
+                if isinstance(proposed_discontinuities, Mapping)
+                else None
+            )
+            previous_scalar = finite_scalar(previous_value)
+            proposed_scalar = finite_scalar(proposed_value)
+            if previous_scalar is None or proposed_scalar is None:
+                reasons.append(
+                    f"boundary_{boundary_index}_{metric}_contract_missing"
+                )
+            elif proposed_scalar > previous_scalar + 1e-9:
+                reasons.append(
+                    f"boundary_{boundary_index}_{metric}_regressed"
+                )
+    return tuple(dict.fromkeys(reasons))
+
+
+def _joint_group_look_refinement_acceptance(
+    previous_objective: DecodedLookObjective,
+    previous_review: Mapping[str, Any],
+    proposed_review: Mapping[str, Any],
+) -> tuple[DecodedLookObjective, tuple[str, ...], bool]:
+    """Apply the production strict-improvement plus non-look rollback gate."""
+
+    if not isinstance(previous_objective, DecodedLookObjective):
+        raise TypeError("previous GROUP decoded look objective is invalid")
+    proposed_objective = decoded_look_objective(proposed_review)
+    nonlook_regressions = _joint_group_nonlook_regression_reasons(
+        previous_review,
+        proposed_review,
+    )
+    accepted = bool(
+        proposed_objective.strictly_improves(previous_objective)
+        and not nonlook_regressions
+    )
+    return proposed_objective, nonlook_regressions, accepted
+
+
+def _select_joint_decoded_passing_cohort(
+    bundles: Sequence["_GroupRenderCandidateBundle"],
+    reviews: Sequence[RenderedCandidateReview],
+) -> tuple[
+    tuple["_GroupRenderCandidateBundle", RenderedCandidateReview], ...
+]:
+    """Choose the best exact-eight cohort under a two-variant path cap."""
+
+    if len(bundles) != len(reviews):
+        raise ValueError("joint decoded bundles and reviews must align")
+    ranked: list[
+        tuple[_GroupRenderCandidateBundle, RenderedCandidateReview]
+    ] = []
+    seen_indices: set[int] = set()
+    for bundle, review in zip(bundles, reviews, strict=True):
+        if not isinstance(bundle, _GroupRenderCandidateBundle):
+            raise TypeError("joint decoded cohort contains an invalid bundle")
+        if not isinstance(review, RenderedCandidateReview) or not review.passed:
+            raise ValueError("joint decoded cohort may contain only passing reviews")
+        if bundle.candidate_index in seen_indices:
+            raise ValueError("joint decoded cohort repeats a candidate index")
+        seen_indices.add(bundle.candidate_index)
+        ranked.append((bundle, review))
+    ranked.sort(
+        key=lambda pair: (
+            -pair[1].ranking_weighted_score,
+            -pair[1].weighted_score,
+            -pair[0].pre_render_score,
+            pair[0].candidate_index,
+        )
+    )
+    selected: list[
+        tuple[_GroupRenderCandidateBundle, RenderedCandidateReview]
+    ] = []
+    path_counts: dict[tuple[tuple[str, str], ...], int] = {}
+    for pair in ranked:
+        path = _exact_source_shot_path(pair[0])
+        if (
+            path_counts.get(path, 0)
+            >= _JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH
+        ):
+            continue
+        path_counts[path] = path_counts.get(path, 0) + 1
+        selected.append(pair)
+        if len(selected) == _JOINT_REQUIRED_DECODED_PASS_COUNT:
+            break
+    if len(selected) < _JOINT_REQUIRED_DECODED_PASS_COUNT:
+        return ()
+    if len(path_counts) < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS:
+        raise RuntimeError("joint exact-eight cohort violated its path floor")
+    return tuple(selected)
 
 
 class _GlobalVisualCandidateStream:
@@ -19123,6 +20182,128 @@ def _validate_joint_editorial_motion_plan(
     return plan
 
 
+def _joint_keyframe_is_exactly_neutral(item: Any) -> bool:
+    return bool(
+        math.isclose(item.zoom, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(item.center_x, 0.5, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(item.center_y, 0.5, rel_tol=0.0, abs_tol=1e-9)
+        and math.isclose(item.roll_degrees, 0.0, rel_tol=0.0, abs_tol=1e-9)
+    )
+
+
+def _joint_track_is_exactly_neutral(track: Any) -> bool:
+    """Prove that a provider track is the identity for its whole curve."""
+
+    return track is None or bool(track.keyframes) and all(
+        _joint_keyframe_is_exactly_neutral(item)
+        for item in track.keyframes
+    )
+
+
+def _joint_neutral_interior_motion_overlay(
+    materialized: JointMaterializedVisualCandidate,
+    *,
+    provider_plan: EditorialMotionPlan,
+    transitions: Sequence[RenderTransition],
+    phrase_times: Sequence[float],
+    section_plan: SectionPlan | None,
+) -> tuple[EditorialMotionPlan, tuple[RenderSegment, ...], bool]:
+    """Replace an all-neutral provider plan with boundary-neutral motion.
+
+    Decoded boundary proofs own the first and final rendered frame of every
+    segment.  The ordinary planner may therefore contribute only a same-shot
+    interior zoom pulse: every segment endpoint must remain exact identity,
+    roll remains disabled for GROUP, and provider-authored non-neutral tracks
+    are never composed with a second transform layer.
+    """
+
+    if any(
+        not _joint_track_is_exactly_neutral(segment.editorial_transform)
+        for segment in materialized.segments
+    ):
+        return provider_plan, materialized.segments, False
+
+    proposed = build_editorial_motion_plan(
+        visual_timeline=materialized.visual_plan,
+        transitions=transitions,
+        face_match_plan=None,
+        boundary_affine_plan=None,
+        boundary_subject_alignment_plan=None,
+        phrase_times=phrase_times,
+        section_plan=section_plan,
+        fps=materialized.output_fps,
+    )
+    proposed_by_segment = {
+        item.segment_index: item for item in proposed.segments
+    }
+    if set(proposed_by_segment) != set(range(len(materialized.segments))):
+        return provider_plan, materialized.segments, False
+
+    visible_motion = False
+    for index, segment in enumerate(materialized.segments):
+        item = proposed_by_segment[index]
+        track = item.track
+        if item.source_index != segment.source_index:
+            return provider_plan, materialized.segments, False
+        if track is None:
+            continue
+        if not track.keyframes:
+            return provider_plan, materialized.segments, False
+        first = track.keyframes[0]
+        last = track.keyframes[-1]
+        if not (
+            _joint_keyframe_is_exactly_neutral(first)
+            and _joint_keyframe_is_exactly_neutral(last)
+            and all(
+                math.isclose(
+                    keyframe.roll_degrees,
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                for keyframe in track.keyframes
+            )
+            and (
+                "reference_calibrated_same_source_interior_zoom_pulse"
+                in item.reasons
+            )
+        ):
+            return provider_plan, materialized.segments, False
+        visible_motion = visible_motion or any(
+            not (
+                math.isclose(
+                    keyframe.zoom,
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    keyframe.center_x,
+                    0.5,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                and math.isclose(
+                    keyframe.center_y,
+                    0.5,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            for keyframe in track.keyframes
+        )
+    if not visible_motion:
+        return provider_plan, materialized.segments, False
+    overlaid_segments = tuple(
+        replace(
+            segment,
+            editorial_transform=proposed_by_segment[index].track,
+        )
+        for index, segment in enumerate(materialized.segments)
+    )
+    return proposed, overlaid_segments, True
+
+
 def _joint_group_hard_cut_transition(
     outgoing: VisualTimelineChoice,
     incoming: VisualTimelineChoice,
@@ -19293,10 +20474,35 @@ def _derive_complete_joint_group_candidate(
             "joint_decoded_boundary_proof_hard_cut_only_v1"
         ),
     )
-    editorial_motion_plan = _validate_joint_editorial_motion_plan(
+    provider_editorial_motion_plan = _validate_joint_editorial_motion_plan(
         materialized,
         eligible_indices=eligible_indices,
     )
+    source_aspects_are_editorial_safe = (
+        len(source_aspect_ratios) == len(eligible_indices)
+        and all(
+            abs(float(value) - 16.0 / 9.0) <= 0.03
+            for value in source_aspect_ratios
+        )
+    )
+    editorial_motion_plan = provider_editorial_motion_plan
+    authorized_segments = materialized.segments
+    joint_interior_motion_applied = False
+    if (
+        request.aspect_ratio is AspectRatio.LANDSCAPE
+        and source_aspects_are_editorial_safe
+    ):
+        (
+            editorial_motion_plan,
+            authorized_segments,
+            joint_interior_motion_applied,
+        ) = _joint_neutral_interior_motion_overlay(
+            materialized,
+            provider_plan=provider_editorial_motion_plan,
+            transitions=group_transition_plan.transitions,
+            phrase_times=phrase_times,
+            section_plan=section_plan,
+        )
     remapped_segments = tuple(
         replace(
             segment,
@@ -19307,13 +20513,13 @@ def _derive_complete_joint_group_candidate(
                 else None
             ),
         )
-        for segment in materialized.segments
+        for segment in authorized_segments
     )
     if any(
         final.editorial_transform is not original.editorial_transform
         for final, original in zip(
             remapped_segments,
-            materialized.segments,
+            authorized_segments,
             strict=True,
         )
     ):
@@ -19335,14 +20541,13 @@ def _derive_complete_joint_group_candidate(
         "legacy_boundary_repair_and_geometry_overlay_bypassed",
         "unsafe_dissolve_disabled_for_joint_candidate",
     ]
-    boundary_look_match: BoundaryLookMatchResult | None = None
-    source_aspects_are_editorial_safe = (
-        len(source_aspect_ratios) == len(eligible_indices)
-        and all(
-            abs(float(value) - 16.0 / 9.0) <= 0.03
-            for value in source_aspect_ratios
-        )
+    diagnostics.append(
+        "joint_neutral_provider_track_replaced_by_section_directed_"
+        "interior_group_motion_v1"
+        if joint_interior_motion_applied
+        else "joint_provider_track_retained_without_unverified_overlay"
     )
+    boundary_look_match: BoundaryLookMatchResult | None = None
     if (
         request.source_mode is SourceMode.AUTOMATIC
         and request.aspect_ratio is AspectRatio.LANDSCAPE
@@ -19364,11 +20569,7 @@ def _derive_complete_joint_group_candidate(
             diagnostics.append(f"boundary_look_match_failed: {exc}")
     if any(
         final.editorial_transform is not original.editorial_transform
-        for final, original in zip(
-            plan.segments,
-            materialized.segments,
-            strict=True,
-        )
+        for final, original in zip(plan.segments, remapped_segments, strict=True)
     ):
         raise RuntimeError("look matching replaced a provider crop track")
     proof_payload = materialized.boundary_proof_bundle.to_dict()
@@ -19406,6 +20607,9 @@ def _derive_complete_joint_group_candidate(
                 "candidate_pool": "joint_decoded_visual_selector",
                 "joint_path_signature": materialized.privacy_safe_signature,
                 "candidate_history": materialized.candidate_history_entry,
+                "joint_interior_motion_overlay_applied": (
+                    joint_interior_motion_applied
+                ),
                 "legacy_local_source_repair_allowed": False,
                 "legacy_constraint_reoptimization_allowed": False,
             },
@@ -19462,15 +20666,16 @@ def _derive_complete_group_candidate(
         == len(source_durations_seconds)
     ):
         raise ValueError("complete group candidate source arrays must match")
-    if isinstance(materialized, JointMaterializedVisualCandidate):
+    joint_materialized = _underlying_joint_materialized_candidate(materialized)
+    if joint_materialized is not None:
         if visual_timeline_override is not None:
             raise ValueError("joint candidate cannot accept a timeline override")
         if precomputed_boundary_repairs is not None:
             raise ValueError("joint candidate cannot accept legacy boundary repair")
         if splice_feasibility_graph is not None:
             raise ValueError("joint candidate cannot enter the lazy splice graph")
-        return _derive_complete_joint_group_candidate(
-            materialized,
+        joint_bundle = _derive_complete_joint_group_candidate(
+            joint_materialized,
             request=request,
             eligible_indices=eligible_indices,
             source_aspect_ratios=source_aspect_ratios,
@@ -19483,6 +20688,25 @@ def _derive_complete_group_candidate(
             source_look_match=source_look_match,
             boundary_look_measurement_cache=boundary_look_measurement_cache,
         )
+        if isinstance(materialized, _GloballyIndexedVisualCandidate):
+            joint_bundle = replace(
+                joint_bundle,
+                candidate_index=materialized.candidate_index,
+                review_rank=materialized.review_rank,
+                cadence_profile=materialized.cadence_profile,
+                candidate_lineage=joint_bundle.candidate_lineage
+                + (
+                    {
+                        "stage": "joint_decoded_global_candidate_index",
+                        "batch_local_candidate_index": (
+                            joint_materialized.candidate_index
+                        ),
+                        "global_candidate_index": materialized.candidate_index,
+                        "complete_path_identity_preserved": True,
+                    },
+                ),
+            )
+        return joint_bundle
     diagnostics: list[str] = []
 
     def run_boundary_repair(
@@ -25182,6 +26406,15 @@ def analyze(
     joint_visual_selection_set: JointVisualSelectionSet | None = None
     joint_visual_selection_audit: dict[str, Any] | None = None
     joint_boundary_provider_audit: dict[str, Any] | None = None
+    joint_visual_selection_batch_audits: list[dict[str, Any]] = []
+    joint_boundary_provider_batch_audits: list[dict[str, Any]] = []
+    joint_decoded_forbidden_complete_paths: set[
+        JointTimelinePathSignature
+    ] = set()
+    joint_decoded_forbidden_boundary_selections: set[
+        BoundarySelectionNoGood
+    ] = set()
+    joint_decoded_cumulative_proof_materialization_calls = 0
     joint_visual_selection_active = False
     joint_visual_selection_attempted = False
     candidate_stream_progress_path: Path | None = None
@@ -25616,11 +26849,6 @@ def analyze(
         if request.source_mode is SourceMode.AUTOMATIC:
             reporter.status("방송 원본 사이의 안정적인 색감 차이를 맞추는 중…")
             try:
-                reference_local_index = (
-                    eligible_indices.index(request.reference_source)
-                    if request.reference_source in eligible_indices
-                    else None
-                )
                 source_look_match_result = analyze_source_look_match(
                     tuple(
                         request.sources[index] for index in eligible_indices
@@ -25628,7 +26856,11 @@ def analyze(
                     source_offsets_seconds=offsets,
                     common_master_start=common_start,
                     common_master_end=common_end,
-                    reference_source=reference_local_index,
+                    # The reference source owns audio/master-clock alignment,
+                    # not the visual grade.  Automatic multi-camera edits use
+                    # the synchronized cross-source consensus so an audio-clean
+                    # but visually atypical broadcast cannot pin every grade.
+                    reference_source=None,
                     source_timewarps=eligible_timewarps,
                 )
                 applied_look_count = sum(
@@ -25912,27 +27144,6 @@ def analyze(
                             "joint visual selection could not recover its "
                             "transient optimizer workspace"
                         )
-                    provider = DecodedBoundaryOptionProvider(
-                        sources=tuple(
-                            request.sources[index]
-                            for index in eligible_indices
-                        ),
-                        audio_offsets=offsets,
-                        scene_cut_times=scene_cut_times,
-                        source_timewarps=eligible_timewarps,
-                        descriptor_cache=boundary_descriptor_cache,
-                        output_fps=29.97,
-                        total_segment_count=len(
-                            workspace.candidates_by_segment
-                        ),
-                        beat_period_seconds=(
-                            group_draft.beat_period_seconds
-                        ),
-                        beat_intensity=rhythm_analysis.tempo_confidence,
-                        **_visual_feature_cache_arguments(request),
-                    )
-                    provider_audit_before_close: dict[str, Any] | None = None
-
                     def report_joint_visual_selection_progress(
                         progress: JointTimelineProgress,
                     ) -> None:
@@ -25953,42 +27164,146 @@ def analyze(
                             **progress.to_dict(),
                         )
 
-                    try:
-                        joint_visual_selection_set = (
-                            select_joint_visual_candidates(
+                    def materialize_joint_visual_feedback_batch(
+                        *,
+                        batch_index: int,
+                        available_proof_budget: int,
+                    ) -> tuple[
+                        JointVisualSelectionSet,
+                        tuple[JointMaterializedVisualCandidate, ...],
+                    ]:
+                        def provider_factory() -> DecodedBoundaryOptionProvider:
+                            return DecodedBoundaryOptionProvider(
+                                sources=tuple(
+                                    request.sources[index]
+                                    for index in eligible_indices
+                                ),
+                                audio_offsets=offsets,
+                                scene_cut_times=scene_cut_times,
+                                source_timewarps=eligible_timewarps,
+                                descriptor_cache=boundary_descriptor_cache,
+                                output_fps=29.97,
+                                total_segment_count=len(
+                                    workspace.candidates_by_segment
+                                ),
+                                beat_period_seconds=(
+                                    group_draft.beat_period_seconds
+                                ),
+                                beat_intensity=(
+                                    rhythm_analysis.tempo_confidence
+                                ),
+                                **_visual_feature_cache_arguments(request),
+                            )
+
+                        def select_feedback_candidates(
+                            provider: Any,
+                            boundary_feedback: frozenset[
+                                BoundarySelectionNoGood
+                            ],
+                            complete_path_feedback: frozenset[
+                                JointTimelinePathSignature
+                            ],
+                            proof_budget: int,
+                        ) -> JointVisualSelectionSet:
+                            return select_joint_visual_candidates(
                                 visual_candidate_set,
                                 provider=provider,
                                 fps=29.97,
                                 minimum_unique_paths=(
                                     MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
                                 ),
-                                maximum_candidates=24,
+                                maximum_candidates=(
+                                    MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                                ),
+                                forbidden_boundary_selections=(
+                                    boundary_feedback
+                                ),
+                                forbidden_complete_paths=(
+                                    complete_path_feedback
+                                ),
+                                maximum_proof_materialization_calls=(
+                                    proof_budget
+                                ),
                                 progress_callback=(
                                     report_joint_visual_selection_progress
                                 ),
                             )
-                        )
-                        materialized_group_candidates = (
-                            materialize_joint_visual_candidates(
-                                joint_visual_selection_set,
+
+                        def materialize_feedback_candidates(
+                            selection_set: JointVisualSelectionSet,
+                            provider: Any,
+                        ) -> tuple[JointMaterializedVisualCandidate, ...]:
+                            return materialize_joint_visual_candidates(
+                                selection_set,
                                 provider=provider,
                                 fps=29.97,
-                                maximum_candidates=len(
-                                    joint_visual_selection_set.candidate_records
+                                maximum_candidates=(
+                                    MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                                ),
+                            )
+
+                        return (
+                            _materialize_joint_feedback_batch_with_fresh_provider(
+                                batch_index=batch_index,
+                                provider_factory=provider_factory,
+                                select_candidates=select_feedback_candidates,
+                                materialize_candidates=(
+                                    materialize_feedback_candidates
+                                ),
+                                forbidden_boundary_selections=(
+                                    joint_decoded_forbidden_boundary_selections
+                                ),
+                                forbidden_complete_paths=(
+                                    joint_decoded_forbidden_complete_paths
+                                ),
+                                maximum_proof_materialization_calls=(
+                                    available_proof_budget
+                                ),
+                                provider_audit_sink=(
+                                    joint_boundary_provider_batch_audits.append
                                 ),
                             )
                         )
-                        provider_audit_before_close = provider.to_dict()
-                    finally:
-                        provider.close()
-                    if provider_audit_before_close is None:
+
+                    (
+                        joint_visual_selection_set,
+                        materialized_group_candidates,
+                    ) = materialize_joint_visual_feedback_batch(
+                        batch_index=0,
+                        available_proof_budget=(
+                            _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                        ),
+                    )
+                    initial_joint_proof_calls = (
+                        _joint_selection_proof_materialization_call_count(
+                            joint_visual_selection_set,
+                            available_budget=(
+                                _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                            ),
+                        )
+                    )
+                    joint_decoded_cumulative_proof_materialization_calls += (
+                        initial_joint_proof_calls
+                    )
+                    if not joint_boundary_provider_batch_audits:
                         raise RuntimeError(
                             "joint provider audit was not captured before close"
                         )
+                    provider_audit_before_close = (
+                        joint_boundary_provider_batch_audits[-1]
+                    )
                     joint_boundary_provider_audit = {
                         **provider_audit_before_close,
-                        "provider_closed_after_materialization": True,
-                        "process_local_materialization_retained": True,
+                        "selection_batch_count": 1,
+                        "batches": deepcopy(
+                            joint_boundary_provider_batch_audits
+                        ),
+                        "cumulative_proof_materialization_call_count": (
+                            joint_decoded_cumulative_proof_materialization_calls
+                        ),
+                        "maximum_cumulative_proof_materialization_calls": (
+                            _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                        ),
                     }
                     joint_visual_selection_audit = {
                         "analysis_basis": (
@@ -26064,6 +27379,171 @@ def analyze(
                         "raw_frames_persisted": False,
                         "raw_visual_descriptors_persisted": False,
                     }
+
+                    def append_joint_visual_selection_batch_audit(
+                        selection_set: JointVisualSelectionSet,
+                        materialized_batch: Sequence[
+                            JointMaterializedVisualCandidate
+                        ],
+                        *,
+                        batch_index: int,
+                        first_global_candidate_index: int,
+                        proof_materialization_call_count: int,
+                    ) -> None:
+                        nonlocal joint_visual_selection_audit
+                        nonlocal joint_boundary_provider_audit
+                        batch_paths = tuple(
+                            _exact_source_shot_path(item)
+                            for item in materialized_batch
+                        )
+                        joint_visual_selection_batch_audits.append(
+                            {
+                                "batch_index": batch_index,
+                                "first_global_candidate_index": (
+                                    first_global_candidate_index
+                                ),
+                                "global_candidate_indices": list(
+                                    range(
+                                        first_global_candidate_index,
+                                        first_global_candidate_index
+                                        + len(materialized_batch),
+                                    )
+                                ),
+                                "candidate_count": len(materialized_batch),
+                                "unique_source_shot_path_count": len(
+                                    set(batch_paths)
+                                ),
+                                "source_shot_paths": [
+                                    [list(pair) for pair in path]
+                                    for path in batch_paths
+                                ],
+                                "candidate_reviews": list(
+                                    joint_candidate_review_summaries(
+                                        selection_set,
+                                        selected_candidate_index=(
+                                            selection_set
+                                            .selected_candidate_index
+                                        ),
+                                    )
+                                ),
+                                "candidate_histories": [
+                                    {
+                                        **item.candidate_history_entry,
+                                        "global_candidate_index": (
+                                            first_global_candidate_index
+                                            + local_index
+                                        ),
+                                    }
+                                    for local_index, item in enumerate(
+                                        materialized_batch
+                                    )
+                                ],
+                                "selection_retry_audit": deepcopy(
+                                    dict(selection_set.selection_retry_audit)
+                                ),
+                                "proof_materialization_call_count": (
+                                    proof_materialization_call_count
+                                ),
+                                "external_complete_path_no_good_count": len(
+                                    joint_decoded_forbidden_complete_paths
+                                ),
+                                "external_boundary_no_good_count": len(
+                                    joint_decoded_forbidden_boundary_selections
+                                ),
+                                "thresholds_lowered": False,
+                            }
+                        )
+                        all_paths = {
+                            tuple(
+                                (str(pair[0]), str(pair[1]))
+                                for pair in path
+                            )
+                            for batch in joint_visual_selection_batch_audits
+                            for path in batch["source_shot_paths"]
+                        }
+                        all_histories = [
+                            deepcopy(history)
+                            for batch in joint_visual_selection_batch_audits
+                            for history in batch["candidate_histories"]
+                        ]
+                        assert joint_visual_selection_audit is not None
+                        joint_visual_selection_audit.update(
+                            {
+                                "candidate_count": sum(
+                                    int(batch["candidate_count"])
+                                    for batch in (
+                                        joint_visual_selection_batch_audits
+                                    )
+                                ),
+                                "unique_source_shot_path_count": len(
+                                    all_paths
+                                ),
+                                "proof_variant_supplement_count": max(
+                                    0,
+                                    sum(
+                                        int(batch["candidate_count"])
+                                        for batch in (
+                                            joint_visual_selection_batch_audits
+                                        )
+                                    )
+                                    - len(all_paths),
+                                ),
+                                "candidate_histories": all_histories,
+                                "selection_batch_count": len(
+                                    joint_visual_selection_batch_audits
+                                ),
+                                "selection_batches": deepcopy(
+                                    joint_visual_selection_batch_audits
+                                ),
+                                "cumulative_proof_materialization_call_count": (
+                                    joint_decoded_cumulative_proof_materialization_calls
+                                ),
+                                "maximum_cumulative_proof_materialization_calls": (
+                                    _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                                ),
+                                "external_complete_path_no_good_count": len(
+                                    joint_decoded_forbidden_complete_paths
+                                ),
+                                "external_boundary_no_good_count": len(
+                                    joint_decoded_forbidden_boundary_selections
+                                ),
+                                "maximum_decoded_attempt_count": (
+                                    _JOINT_DECODED_ATTEMPT_LIMIT
+                                ),
+                                "final_cohort_path_variant_cap": (
+                                    _JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH
+                                ),
+                                "thresholds_lowered": False,
+                            }
+                        )
+                        latest_provider = (
+                            joint_boundary_provider_batch_audits[-1]
+                        )
+                        joint_boundary_provider_audit = {
+                            **latest_provider,
+                            "selection_batch_count": len(
+                                joint_boundary_provider_batch_audits
+                            ),
+                            "batches": deepcopy(
+                                joint_boundary_provider_batch_audits
+                            ),
+                            "cumulative_proof_materialization_call_count": (
+                                joint_decoded_cumulative_proof_materialization_calls
+                            ),
+                            "maximum_cumulative_proof_materialization_calls": (
+                                _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                            ),
+                        }
+
+                    append_joint_visual_selection_batch_audit(
+                        joint_visual_selection_set,
+                        materialized_group_candidates,
+                        batch_index=0,
+                        first_global_candidate_index=0,
+                        proof_materialization_call_count=(
+                            initial_joint_proof_calls
+                        ),
+                    )
                     joint_visual_selection_active = True
                     checkpoint_materialized_candidate_order = ()
                     reporter.log(
@@ -26230,6 +27710,23 @@ def analyze(
                 )
                 attempted_candidate_indices: set[int] = set()
                 attempted_materialized_candidates: list[Any] = []
+                joint_materialized_complete_paths: set[
+                    JointTimelinePathSignature
+                ] = set()
+                joint_nonlocal_contract_failure_paths: dict[
+                    tuple[str, int, int, str],
+                    set[JointTimelinePathSignature],
+                ] = {}
+                joint_shared_render_contract_failure: (
+                    dict[str, Any] | None
+                ) = None
+                joint_decoded_feedback_classifications: dict[
+                    int, dict[str, Any]
+                ] = {}
+                joint_decoded_look_refinement_audits: dict[
+                    int, dict[str, Any]
+                ] = {}
+                joint_decoded_render_attempt_count = 0
                 local_source_repair_seeds: list[LocalSourceRepairSeed] = []
                 local_source_repair_proposal_count = 0
                 local_source_repair_attempted_count = 0
@@ -26341,6 +27838,19 @@ def analyze(
                     materialized_group_candidates = tuple(
                         globally_indexed_initial_candidates
                     )
+                elif joint_visual_selection_active:
+                    global_candidate_stream = None
+                    joint_initial_candidates = (
+                        _globally_index_joint_visual_candidate_batch(
+                            materialized_group_candidates,
+                            first_candidate_index=0,
+                        )
+                    )
+                    joint_materialized_complete_paths.update(
+                        _joint_complete_path_signature(item)
+                        for item in joint_initial_candidates
+                    )
+                    materialized_group_candidates = joint_initial_candidates
                 else:
                     global_candidate_stream = None
                 splice_feasibility_graph: (
@@ -26642,6 +28152,40 @@ def analyze(
                                 "terminal_proof": deepcopy(
                                     constraint_reoptimization_terminal_proof
                                 ),
+                                "decoded_feedback_loop": {
+                                    "maximum_distinct_attempt_count": (
+                                        _JOINT_DECODED_ATTEMPT_LIMIT
+                                    ),
+                                    "attempted_distinct_candidate_count": len(
+                                        attempted_candidate_indices
+                                    ),
+                                    "decoded_render_attempt_count": (
+                                        joint_decoded_render_attempt_count
+                                    ),
+                                    "decoded_pass_count": len(derived),
+                                    "diverse_exact_eight_complete": bool(
+                                        joint_diverse_passing_cohort()
+                                    ),
+                                    "selection_batch_count": len(
+                                        joint_visual_selection_batch_audits
+                                    ),
+                                    "cumulative_proof_materialization_call_count": (
+                                        joint_decoded_cumulative_proof_materialization_calls
+                                    ),
+                                    "maximum_cumulative_proof_materialization_calls": (
+                                        _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                                    ),
+                                    "forbidden_complete_path_count": len(
+                                        joint_decoded_forbidden_complete_paths
+                                    ),
+                                    "localized_boundary_no_good_count": len(
+                                        joint_decoded_forbidden_boundary_selections
+                                    ),
+                                    "shared_render_contract_failure": deepcopy(
+                                        joint_shared_render_contract_failure
+                                    ),
+                                    "thresholds_lowered": False,
+                                },
                             }
                         return {
                             "enabled": False,
@@ -26813,14 +28357,69 @@ def analyze(
                             "candidate progress cannot serialize divergent "
                             "attempt and terminal-verdict sets"
                         )
-                    if not (
+                    decoded_cohort_lengths_align = (
+                        len(derived) == len(streamed_group_candidate_reviews)
+                    )
+                    decoded_verdict_count_aligns = (
                         len(derived)
-                        == len(streamed_group_candidate_reviews)
                         == candidate_stream_reducer.decoded_review_passed_count
+                    )
+                    joint_final_cohort_trimmed = bool(
+                        joint_visual_selection_active
+                        and len(derived) == _JOINT_REQUIRED_DECODED_PASS_COUNT
+                        and candidate_stream_reducer.decoded_review_passed_count
+                        >= _JOINT_REQUIRED_DECODED_PASS_COUNT
+                        and _select_joint_decoded_passing_cohort(
+                            derived,
+                            streamed_group_candidate_reviews,
+                        )
+                    )
+                    if not decoded_cohort_lengths_align or not (
+                        decoded_verdict_count_aligns
+                        or joint_final_cohort_trimmed
                     ):
                         raise RuntimeError(
                             "decoded passing cohort diverged from its bundles "
                             "or reviews"
+                        )
+                    if (
+                        joint_visual_selection_active
+                        and joint_visual_selection_audit is not None
+                    ):
+                        joint_visual_selection_audit.update(
+                            {
+                                "decoded_attempt_count": len(
+                                    attempted_candidate_indices
+                                ),
+                                "decoded_render_attempt_count": (
+                                    joint_decoded_render_attempt_count
+                                ),
+                                "maximum_decoded_attempt_count": (
+                                    _JOINT_DECODED_ATTEMPT_LIMIT
+                                ),
+                                "decoded_pass_count": len(derived),
+                                "required_decoded_pass_count": (
+                                    _JOINT_REQUIRED_DECODED_PASS_COUNT
+                                ),
+                                "diverse_exact_eight_complete": bool(
+                                    joint_diverse_passing_cohort()
+                                ),
+                                "external_complete_path_no_good_count": len(
+                                    joint_decoded_forbidden_complete_paths
+                                ),
+                                "external_boundary_no_good_count": len(
+                                    joint_decoded_forbidden_boundary_selections
+                                ),
+                                "decoded_feedback_classifications": deepcopy(
+                                    joint_decoded_feedback_classifications
+                                ),
+                                "shared_render_contract_failure": deepcopy(
+                                    joint_shared_render_contract_failure
+                                ),
+                                "cumulative_proof_materialization_call_count": (
+                                    joint_decoded_cumulative_proof_materialization_calls
+                                ),
+                            }
                         )
                     _write_analysis_manifest_atomically(
                         candidate_stream_progress_path,
@@ -26966,6 +28565,486 @@ def analyze(
                         for issue in review.hard_failures
                     )
 
+                def joint_diverse_passing_cohort() -> tuple[
+                    tuple[
+                        _GroupRenderCandidateBundle,
+                        RenderedCandidateReview,
+                    ],
+                    ...,
+                ]:
+                    if not joint_visual_selection_active:
+                        return ()
+                    return _select_joint_decoded_passing_cohort(
+                        derived,
+                        streamed_group_candidate_reviews,
+                    )
+
+                def record_joint_decoded_feedback(
+                    materialized: Any,
+                    bundle: _GroupRenderCandidateBundle,
+                    review_payload: Mapping[str, Any],
+                ) -> bool:
+                    nonlocal joint_shared_render_contract_failure
+                    nonlocal constraint_reoptimization_termination_reason
+                    nonlocal constraint_reoptimization_terminal_proof
+                    if not joint_visual_selection_active:
+                        return True
+                    classification, shared_failure = (
+                        _record_bound_joint_decoded_feedback(
+                            materialized,
+                            bundle,
+                            review_payload,
+                            eligible_indices=eligible_indices,
+                            forbidden_boundary_selections=(
+                                joint_decoded_forbidden_boundary_selections
+                            ),
+                            feedback_classifications=(
+                                joint_decoded_feedback_classifications
+                            ),
+                            nonlocal_contract_failure_paths=(
+                                joint_nonlocal_contract_failure_paths
+                            ),
+                        )
+                    )
+                    if classification.get("feedback_binding_valid") is not True:
+                        return False
+                    if (
+                        shared_failure is not None
+                        and joint_shared_render_contract_failure is None
+                    ):
+                        joint_shared_render_contract_failure = shared_failure
+                        constraint_reoptimization_termination_reason = (
+                            "shared_render_contract_failure"
+                        )
+                        constraint_reoptimization_terminal_proof = deepcopy(
+                            joint_shared_render_contract_failure
+                        )
+                    return True
+
+                def decode_and_review_complete_group_bundle(
+                    bundle: _GroupRenderCandidateBundle,
+                ) -> RenderedCandidateReview:
+                    nonlocal joint_decoded_render_attempt_count
+                    if joint_visual_selection_active:
+                        if (
+                            joint_decoded_render_attempt_count
+                            >= _JOINT_DECODED_ATTEMPT_LIMIT
+                        ):
+                            raise RuntimeError(
+                                "joint decoded render attempt budget was exhausted"
+                            )
+                        joint_decoded_render_attempt_count += 1
+                    single_selection = _review_complete_group_candidates(
+                        (bundle,),
+                        scratch_directory=request.output_directory,
+                        maximum_review_count=1,
+                        minimum_required_candidate_count=1,
+                        perform_final_candidate_ranking=False,
+                        professional_reference_profile=(
+                            professional_reference_profile
+                        ),
+                        professional_reference_cadence_profile=(
+                            professional_reference_cadence_profile
+                        ),
+                        learned_reviewer_session=learned_reviewer_session,
+                        stage_edit_montage_section_plan=(
+                            stage_edit_generation_result.learned_section_director.section_plan
+                            if stage_edit_generation_result is not None
+                            and stage_edit_generation_result.learned_section_director
+                            is not None
+                            else section_plan
+                        ),
+                        stage_edit_source_derivative_diversity=(
+                            source_derivative_diversity_result
+                        ),
+                        stage_edit_source_index_mapping=(
+                            _source_index_mapping(
+                                request.sources,
+                                eligible_indices,
+                            )
+                        ),
+                        stage_edit_source_scene_cut_times=(
+                            tuple(
+                                tuple(
+                                    float(change["timestamp_seconds"])
+                                    for change in payload["changes"]
+                                )
+                                for payload in scene_payloads
+                            )
+                        ),
+                        stage_edit_montage_config=rendered_montage_config,
+                        stage_edit_montage_reference_profile=(
+                            stage_edit_montage_policy.profile_identity
+                            if stage_edit_montage_policy is not None
+                            else None
+                        ),
+                    )
+                    return single_selection.reviews[0]
+
+                def refine_joint_candidate_look_from_decoded_output(
+                    materialized: Any,
+                    bundle: _GroupRenderCandidateBundle,
+                    decoded_review: RenderedCandidateReview,
+                ) -> tuple[
+                    _GroupRenderCandidateBundle,
+                    RenderedCandidateReview,
+                ]:
+                    if (
+                        not joint_visual_selection_active
+                        or _underlying_joint_materialized_candidate(
+                            materialized
+                        )
+                        is None
+                        or decoded_review.review_payload is None
+                    ):
+                        return bundle, decoded_review
+                    candidate_index = int(materialized.candidate_index)
+                    initial_payload = decoded_review.review_payload
+                    audit: dict[str, Any] = {
+                        "contract": (
+                            "joint_decoded_same_path_group_look_refinement_v1"
+                        ),
+                        "candidate_index": candidate_index,
+                        "maximum_iteration_count": 2,
+                        "iterations": [],
+                        "thresholds_lowered": False,
+                        "exact_cut_path_changed": False,
+                        "rollback_on_rejection": True,
+                    }
+                    try:
+                        current_objective = decoded_look_objective(
+                            initial_payload
+                        )
+                        initial_render_variant = (
+                            _joint_decoded_render_variant_signature(
+                                initial_payload
+                            )
+                        )
+                        initial_bound_variant = (
+                            _bound_decoded_proxy_identity(
+                                initial_payload,
+                                render_plan=bundle.render_plan,
+                            )[0]
+                        )
+                        if initial_bound_variant != initial_render_variant:
+                            raise ValueError(
+                                "initial decoded render variant binding changed"
+                            )
+                    except (TypeError, ValueError) as exc:
+                        audit.update(
+                            {
+                                "applicable": False,
+                                "evidence_complete": False,
+                                "exhausted": False,
+                                "budget_exhausted": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "complete_path_no_good_allowed": False,
+                            }
+                        )
+                        joint_decoded_look_refinement_audits[
+                            candidate_index
+                        ] = audit
+                        return bundle, decoded_review
+                    audit["initial_render_variant_signature"] = (
+                        initial_render_variant
+                    )
+                    audit["initial_objective"] = {
+                        "admission_passed": current_objective.admission_passed,
+                        "normalized_excess": current_objective.normalized_excess,
+                        "selection_penalty_points": (
+                            current_objective.selection_penalty_points
+                        ),
+                    }
+                    if current_objective.admission_passed:
+                        audit.update(
+                            _joint_decoded_look_already_passed_audit_fields(
+                                decoded_review_passed=decoded_review.passed,
+                            )
+                        )
+                        joint_decoded_look_refinement_audits[
+                            candidate_index
+                        ] = audit
+                        return bundle, decoded_review
+
+                    audit["applicable"] = True
+                    audit["evidence_complete"] = True
+                    current_bundle = bundle
+                    current_review = decoded_review
+                    previous_refinement: GroupDecodedLookRefinement | None = None
+                    exhausted = False
+                    budget_exhausted = False
+                    for iteration in (1, 2):
+                        if (
+                            joint_decoded_render_attempt_count
+                            >= _JOINT_DECODED_ATTEMPT_LIMIT
+                        ):
+                            budget_exhausted = True
+                            break
+                        assert current_review.review_payload is not None
+                        try:
+                            proposal = (
+                                refine_group_render_plan_from_decoded_proxy(
+                                    current_bundle.render_plan,
+                                    rendered_proxy_review=(
+                                        current_review.review_payload
+                                    ),
+                                    iteration=iteration,
+                                    previous_refinement=previous_refinement,
+                                )
+                            )
+                        except (OSError, TypeError, ValueError) as exc:
+                            audit["evidence_complete"] = False
+                            audit["iterations"].append(
+                                {
+                                    "iteration": iteration,
+                                    "proposal_created": False,
+                                    "accepted": False,
+                                    "rollback": True,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                            break
+                        if not proposal.applied:
+                            audit["iterations"].append(
+                                {
+                                    "iteration": iteration,
+                                    "proposal_created": True,
+                                    "applied": False,
+                                    "accepted": False,
+                                    "rollback": True,
+                                    "refinement": proposal.to_dict(),
+                                }
+                            )
+                            exhausted = True
+                            break
+                        proposal_bundle = replace(
+                            current_bundle,
+                            render_plan=proposal.render_plan,
+                            candidate_lineage=current_bundle.candidate_lineage
+                            + (
+                                {
+                                    "stage": (
+                                        "decoded_group_look_refinement_proposal"
+                                    ),
+                                    "iteration": iteration,
+                                    "refinement": proposal.to_dict(),
+                                    "same_exact_cut_path": True,
+                                },
+                            ),
+                        )
+                        reporter.status(
+                            "joint 동일 경로 출력 색감 재보정·"
+                            "디코딩 QA 중… "
+                            f"시도 {joint_decoded_render_attempt_count + 1}/"
+                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            f"라운드 {iteration}/2"
+                        )
+                        proposed_review = (
+                            decode_and_review_complete_group_bundle(
+                                proposal_bundle
+                            )
+                        )
+                        iteration_audit: dict[str, Any] = {
+                            "iteration": iteration,
+                            "proposal_created": True,
+                            "applied": True,
+                            "refinement": proposal.to_dict(),
+                            "decoded_render_attempt_count": (
+                                joint_decoded_render_attempt_count
+                            ),
+                        }
+                        if proposed_review.review_payload is None:
+                            audit["evidence_complete"] = False
+                            iteration_audit.update(
+                                {
+                                    "accepted": False,
+                                    "rollback": True,
+                                    "error": proposed_review.error,
+                                    "nonlook_regression_reasons": [
+                                        "decoded_proxy_review_unavailable"
+                                    ],
+                                }
+                            )
+                            audit["iterations"].append(iteration_audit)
+                            break
+                        try:
+                            (
+                                proposed_objective,
+                                base_nonlook_regressions,
+                                _base_accepted,
+                            ) = _joint_group_look_refinement_acceptance(
+                                current_objective,
+                                current_review.review_payload,
+                                proposed_review.review_payload,
+                            )
+                            proposed_render_variant = (
+                                _joint_decoded_render_variant_signature(
+                                    proposed_review.review_payload
+                                )
+                            )
+                            proposed_bound_variant = (
+                                _bound_decoded_proxy_identity(
+                                    proposed_review.review_payload,
+                                    render_plan=proposal.render_plan,
+                                )[0]
+                            )
+                            if (
+                                proposed_bound_variant
+                                != proposed_render_variant
+                            ):
+                                raise ValueError(
+                                    "refined decoded render variant binding changed"
+                                )
+                            nonlook_regressions = list(
+                                base_nonlook_regressions
+                            )
+                            _joint_require_refined_render_variant_lineage(
+                                proposal,
+                                proposed_render_variant,
+                            )
+                            decoded_geometry_comparison: (
+                                dict[str, Any] | None
+                            ) = None
+                            if current_bundle.output_geometry_deferral is not None:
+                                previous_geometry_resolution = (
+                                    _decoded_output_geometry_resolution(
+                                        candidate_index=candidate_index,
+                                        output_geometry_deferral=(
+                                            current_bundle
+                                            .output_geometry_deferral
+                                        ),
+                                        review_payload=(
+                                            current_review.review_payload
+                                        ),
+                                    )
+                                )
+                                proposed_geometry_resolution = (
+                                    _decoded_output_geometry_resolution(
+                                        candidate_index=candidate_index,
+                                        output_geometry_deferral=(
+                                            proposal_bundle
+                                            .output_geometry_deferral
+                                        ),
+                                        review_payload=(
+                                            proposed_review.review_payload
+                                        ),
+                                    )
+                                )
+                                decoded_geometry_comparison = {
+                                    "before": previous_geometry_resolution,
+                                    "after": proposed_geometry_resolution,
+                                }
+                                if (
+                                    previous_geometry_resolution["passed"]
+                                    is True
+                                    and proposed_geometry_resolution["passed"]
+                                    is not True
+                                ):
+                                    nonlook_regressions.append(
+                                        "decoded_output_geometry_resolution_"
+                                        "regressed"
+                                    )
+                            objective_improved = bool(
+                                proposed_objective.strictly_improves(
+                                    current_objective
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            _joint_record_invalid_look_refinement_evidence(
+                                audit,
+                                iteration_audit,
+                                exc,
+                            )
+                            break
+                        accepted = bool(
+                            objective_improved and not nonlook_regressions
+                        )
+                        iteration_audit.update(
+                            {
+                                "accepted": accepted,
+                                "rollback": not accepted,
+                                "objective_strictly_improved": (
+                                    objective_improved
+                                ),
+                                "nonlook_regression_reasons": list(
+                                    nonlook_regressions
+                                ),
+                                "decoded_output_geometry_comparison": (
+                                    decoded_geometry_comparison
+                                ),
+                                "render_variant_signature": (
+                                    proposed_render_variant
+                                ),
+                                "objective": {
+                                    "admission_passed": (
+                                        proposed_objective.admission_passed
+                                    ),
+                                    "normalized_excess": (
+                                        proposed_objective.normalized_excess
+                                    ),
+                                    "selection_penalty_points": (
+                                        proposed_objective
+                                        .selection_penalty_points
+                                    ),
+                                },
+                            }
+                        )
+                        audit["iterations"].append(iteration_audit)
+                        if not accepted:
+                            exhausted = True
+                            break
+                        current_bundle = replace(
+                            proposal_bundle,
+                            candidate_lineage=proposal_bundle.candidate_lineage
+                            + (
+                                {
+                                    "stage": (
+                                        "decoded_group_look_refinement_accepted"
+                                    ),
+                                    "iteration": iteration,
+                                    "render_variant_signature": (
+                                        proposed_render_variant
+                                    ),
+                                    "strict_objective_improvement": True,
+                                    "nonlook_gate_regression": False,
+                                    "same_exact_cut_path": True,
+                                },
+                            ),
+                        )
+                        current_review = proposed_review
+                        current_objective = proposed_objective
+                        previous_refinement = proposal
+                        if current_review.passed:
+                            exhausted = True
+                            break
+                        if iteration == 2:
+                            exhausted = True
+                    audit.update(
+                        {
+                            "exhausted": exhausted,
+                            "budget_exhausted": budget_exhausted,
+                            "accepted_iteration_count": sum(
+                                item.get("accepted") is True
+                                for item in audit["iterations"]
+                            ),
+                            "final_passed": current_review.passed,
+                            "complete_path_no_good_allowed": (
+                                _joint_look_refinement_complete_path_no_good_allowed(
+                                    decoded_review_passed=(
+                                        current_review.passed
+                                    ),
+                                    exhausted=exhausted,
+                                    budget_exhausted=budget_exhausted,
+                                    evidence_complete=(
+                                        audit["evidence_complete"] is True
+                                    ),
+                                )
+                            ),
+                        }
+                    )
+                    joint_decoded_look_refinement_audits[candidate_index] = audit
+                    return current_bundle, current_review
+
                 def _derive_and_gate_candidate_verdict(
                     materialized: Any,
                     *,
@@ -26983,12 +29062,29 @@ def analyze(
                             "candidate verdict producer received a duplicate "
                             f"attempt: {materialized.candidate_index}"
                         )
+                    if (
+                        joint_visual_selection_active
+                        and len(attempted_candidate_indices)
+                        >= _JOINT_DECODED_ATTEMPT_LIMIT
+                    ):
+                        raise RuntimeError(
+                            "joint decoded candidate attempt limit was exceeded"
+                        )
                     attempted_candidate_indices.add(materialized.candidate_index)
                     attempted_materialized_candidates.append(materialized)
-                    reporter.status(
-                        "후보 경계 보정·완전 파생 중… "
-                        f"{len(attempted_candidate_indices)}개 시도"
-                    )
+                    if joint_visual_selection_active:
+                        reporter.status(
+                            "joint 후보 경계 보정·완전 파생 중… "
+                            f"시도 {min(joint_decoded_render_attempt_count + 1, 24)}/"
+                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            f"통과 {min(len(derived), 8)}/"
+                            f"{_JOINT_REQUIRED_DECODED_PASS_COUNT}"
+                        )
+                    else:
+                        reporter.status(
+                            "후보 경계 보정·완전 파생 중… "
+                            f"{len(attempted_candidate_indices)}개 시도"
+                        )
                     try:
                         bundle = _derive_complete_group_candidate(
                             materialized,
@@ -27248,10 +29344,10 @@ def analyze(
                         )
                         if (
                             not local_source_repair
-                            and not isinstance(
-                                materialized,
-                                JointMaterializedVisualCandidate,
+                            and _underlying_joint_materialized_candidate(
+                                materialized
                             )
+                            is None
                             and bundle.timeline_review is not None
                         ):
                             seed = LocalSourceRepairSeed(
@@ -27448,57 +29544,24 @@ def analyze(
                             ),
                         )
                     post_repair_structure_passing_complete_count += 1
-                    reporter.status(
-                        "완전 파생 후보를 즉시 480p 렌더·디코딩 QA 중… "
-                        f"{len(streamed_group_candidate_reviews) + 1}/8 "
-                        f"(후보 {materialized.candidate_index})"
+                    if joint_visual_selection_active:
+                        reporter.status(
+                            "joint 후보 480p 렌더·디코딩 QA 중… "
+                            f"시도 {min(joint_decoded_render_attempt_count + 1, 24)}/"
+                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            f"통과 {min(len(derived), 8)}/"
+                            f"{_JOINT_REQUIRED_DECODED_PASS_COUNT} "
+                            f"(후보 {materialized.candidate_index})"
+                        )
+                    else:
+                        reporter.status(
+                            "완전 파생 후보를 즉시 480p 렌더·디코딩 QA 중… "
+                            f"{len(streamed_group_candidate_reviews) + 1}/8 "
+                            f"(후보 {materialized.candidate_index})"
+                        )
+                    decoded_review = decode_and_review_complete_group_bundle(
+                        bundle
                     )
-                    single_selection = _review_complete_group_candidates(
-                        (bundle,),
-                        scratch_directory=request.output_directory,
-                        maximum_review_count=1,
-                        minimum_required_candidate_count=1,
-                        perform_final_candidate_ranking=False,
-                        professional_reference_profile=(
-                            professional_reference_profile
-                        ),
-                        professional_reference_cadence_profile=(
-                            professional_reference_cadence_profile
-                        ),
-                        learned_reviewer_session=learned_reviewer_session,
-                        stage_edit_montage_section_plan=(
-                            stage_edit_generation_result.learned_section_director.section_plan
-                            if stage_edit_generation_result is not None
-                            and stage_edit_generation_result.learned_section_director
-                            is not None
-                            else section_plan
-                        ),
-                        stage_edit_source_derivative_diversity=(
-                            source_derivative_diversity_result
-                        ),
-                        stage_edit_source_index_mapping=(
-                            _source_index_mapping(
-                                request.sources,
-                                eligible_indices,
-                            )
-                        ),
-                        stage_edit_source_scene_cut_times=(
-                            tuple(
-                                tuple(
-                                    float(change["timestamp_seconds"])
-                                    for change in payload["changes"]
-                                )
-                                for payload in scene_payloads
-                            )
-                        ),
-                        stage_edit_montage_config=rendered_montage_config,
-                        stage_edit_montage_reference_profile=(
-                            stage_edit_montage_policy.profile_identity
-                            if stage_edit_montage_policy is not None
-                            else None
-                        ),
-                    )
-                    decoded_review = single_selection.reviews[0]
                     if decoded_review.review_payload is None:
                         candidate_decoded_review_failures.append(
                             {
@@ -27519,6 +29582,69 @@ def analyze(
                             ),
                             geometry_deferral_pre_proxy_eligible,
                         )
+                    bundle, decoded_review = (
+                        refine_joint_candidate_look_from_decoded_output(
+                            materialized,
+                            bundle,
+                            decoded_review,
+                        )
+                    )
+                    assert decoded_review.review_payload is not None
+                    feedback_binding_valid = record_joint_decoded_feedback(
+                        materialized,
+                        bundle,
+                        decoded_review.review_payload,
+                    )
+                    if not feedback_binding_valid:
+                        candidate_decoded_review_failures.append(
+                            {
+                                "candidate_index": materialized.candidate_index,
+                                "review_rank": materialized.review_rank,
+                                "stage": "decoded_feedback_exact_binding",
+                                "error": (
+                                    "decoded proxy feedback did not bind the "
+                                    "exact candidate RenderPlan"
+                                ),
+                                "feedback_classification": deepcopy(
+                                    joint_decoded_feedback_classifications.get(
+                                        int(materialized.candidate_index),
+                                        {},
+                                    )
+                                ),
+                            }
+                        )
+                        return TerminalCandidateVerdict(
+                            materialized.candidate_index,
+                            CandidateVerdictStatus.DECODED_REVIEW_FAILED,
+                            (
+                                CandidateBlocker(
+                                    CandidateBlockerKind.DECODED_REVIEW,
+                                    "decoded_feedback_exact_binding_invalid",
+                                ),
+                            ),
+                            geometry_deferral_pre_proxy_eligible,
+                        )
+                    if joint_visual_selection_active:
+                        candidate_index = int(materialized.candidate_index)
+                        refinement_audit = (
+                            joint_decoded_look_refinement_audits.get(
+                                candidate_index
+                            )
+                        )
+                        classification = (
+                            joint_decoded_feedback_classifications.get(
+                                candidate_index
+                            )
+                        )
+                        if (
+                            refinement_audit is not None
+                            and classification is not None
+                        ):
+                            _joint_apply_look_refinement_feedback_classification(
+                                classification,
+                                refinement_audit,
+                                decoded_review_passed=decoded_review.passed,
+                            )
                     if bundle.output_geometry_deferral is not None:
                         decoded_resolution = _decoded_output_geometry_resolution(
                             candidate_index=materialized.candidate_index,
@@ -27627,11 +29753,21 @@ def analyze(
                         )
                     derived.append(bundle)
                     streamed_group_candidate_reviews.append(decoded_review)
-                    reporter.log(
-                        f"후보 {materialized.candidate_index} 즉시 디코딩 QA 완료 · "
-                        f"누적 {len(streamed_group_candidate_reviews)}/8 · "
-                        "임시 프록시 제거"
-                    )
+                    if joint_visual_selection_active:
+                        reporter.log(
+                            f"후보 {materialized.candidate_index} 즉시 디코딩 QA 완료 · "
+                            f"시도 {joint_decoded_render_attempt_count}/"
+                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            f"통과 {min(len(streamed_group_candidate_reviews), 8)}/"
+                            f"{_JOINT_REQUIRED_DECODED_PASS_COUNT} · "
+                            "임시 프록시 제거"
+                        )
+                    else:
+                        reporter.log(
+                            f"후보 {materialized.candidate_index} 즉시 디코딩 QA 완료 · "
+                            f"누적 {len(streamed_group_candidate_reviews)}/8 · "
+                            "임시 프록시 제거"
+                        )
                     return TerminalCandidateVerdict(
                         materialized.candidate_index,
                         CandidateVerdictStatus.DECODED_REVIEW_PASSED,
@@ -27646,10 +29782,14 @@ def analyze(
                     precomputed_boundary_repairs: (
                         VisualBoundaryRepairPlan | None
                     ) = None,
-                ) -> None:
+                ) -> TerminalCandidateVerdict:
                     candidate_index = int(materialized.candidate_index)
                     if candidate_index in attempted_candidate_indices:
-                        return
+                        return next(
+                            verdict
+                            for verdict in candidate_stream_reducer.verdicts
+                            if verdict.candidate_index == candidate_index
+                        )
                     try:
                         verdict = _derive_and_gate_candidate_verdict(
                             materialized,
@@ -27676,6 +29816,29 @@ def analyze(
                                 "attempted candidates and terminal verdicts "
                                 "diverged"
                             )
+                        joint_underlying = (
+                            _underlying_joint_materialized_candidate(
+                                materialized
+                            )
+                        )
+                        if joint_underlying is not None:
+                            classification = (
+                                joint_decoded_feedback_classifications.get(
+                                    candidate_index
+                                )
+                            )
+                            if (
+                                _joint_complete_path_no_good_allowed_from_feedback(
+                                    classification
+                                )
+                            ):
+                                joint_decoded_forbidden_complete_paths.add(
+                                    _joint_complete_path_signature(materialized)
+                                )
+                                if classification is not None:
+                                    classification[
+                                        "complete_path_no_good_added"
+                                    ] = True
                     except Exception as exc:
                         if (
                             candidate_index in attempted_candidate_indices
@@ -27701,6 +29864,7 @@ def analyze(
                         )
                         raise
                     persist_candidate_stream_progress()
+                    return verdict
 
                 def reject_preflight_blocked_candidate(
                     materialized: _GloballyIndexedVisualCandidate,
@@ -28499,11 +30663,264 @@ def analyze(
                 else:
                     for materialized in materialized_group_candidates:
                         derive_and_gate_candidate(materialized)
+                        if joint_visual_selection_active and (
+                            joint_diverse_passing_cohort()
+                            or joint_shared_render_contract_failure is not None
+                        ):
+                            break
                         if (
-                            candidate_stream_reducer
+                            not joint_visual_selection_active
+                            and candidate_stream_reducer
                             .required_passing_cohort_complete
                         ):
                             break
+
+                def set_joint_decoded_feedback_terminal_proof(
+                    cause: str,
+                    *,
+                    evidence: Mapping[str, Any] | None = None,
+                ) -> None:
+                    nonlocal constraint_reoptimization_termination_reason
+                    nonlocal constraint_reoptimization_terminal_proof
+                    if joint_shared_render_contract_failure is not None:
+                        return
+                    constraint_reoptimization_termination_reason = cause
+                    constraint_reoptimization_terminal_proof = {
+                        "contract": (
+                            "joint_decoded_multi_batch_terminal_proof_v1"
+                        ),
+                        "cause": cause,
+                        "attempted_candidate_count": len(
+                            attempted_candidate_indices
+                        ),
+                        "decoded_render_attempt_count": (
+                            joint_decoded_render_attempt_count
+                        ),
+                        "maximum_attempted_candidate_count": (
+                            _JOINT_DECODED_ATTEMPT_LIMIT
+                        ),
+                        "authorized_candidate_count": len(derived),
+                        "required_authorized_candidate_count": (
+                            _JOINT_REQUIRED_DECODED_PASS_COUNT
+                        ),
+                        "selection_batch_count": len(
+                            joint_visual_selection_batch_audits
+                        ),
+                        "cumulative_proof_materialization_call_count": (
+                            joint_decoded_cumulative_proof_materialization_calls
+                        ),
+                        "maximum_cumulative_proof_materialization_calls": (
+                            _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                        ),
+                        "forbidden_complete_path_count": len(
+                            joint_decoded_forbidden_complete_paths
+                        ),
+                        "localized_boundary_no_good_count": len(
+                            joint_decoded_forbidden_boundary_selections
+                        ),
+                        "evidence": deepcopy(dict(evidence or {})),
+                        "legacy_constraint_reoptimization_invoked": False,
+                        "legacy_local_source_repair_invoked": False,
+                        "thresholds_lowered": False,
+                        "production_use_forbidden": True,
+                    }
+
+                if joint_visual_selection_active:
+                    while (
+                        not joint_diverse_passing_cohort()
+                        and joint_shared_render_contract_failure is None
+                    ):
+                        if (
+                            joint_decoded_render_attempt_count
+                            >= _JOINT_DECODED_ATTEMPT_LIMIT
+                        ):
+                            set_joint_decoded_feedback_terminal_proof(
+                                "joint_decoded_attempt_limit_exhausted"
+                            )
+                            break
+                        pending_render_variant_indices = sorted(
+                            candidate_index
+                            for candidate_index, classification in (
+                                joint_decoded_feedback_classifications.items()
+                            )
+                            if classification.get(
+                                "complete_path_no_good_deferred_for_render_variant"
+                            )
+                        )
+                        if pending_render_variant_indices:
+                            set_joint_decoded_feedback_terminal_proof(
+                                "joint_decoded_render_variant_refinement_required",
+                                evidence={
+                                    "pending_candidate_indices": (
+                                        pending_render_variant_indices
+                                    ),
+                                    "exact_path_no_good_added": False,
+                                },
+                            )
+                            break
+                        remaining_proof_budget = (
+                            _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                            - joint_decoded_cumulative_proof_materialization_calls
+                        )
+                        if (
+                            remaining_proof_budget
+                            < MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                        ):
+                            set_joint_decoded_feedback_terminal_proof(
+                                "joint_decoded_proof_materialization_budget_exhausted",
+                                evidence={
+                                    "remaining_proof_materialization_calls": (
+                                        remaining_proof_budget
+                                    )
+                                },
+                            )
+                            break
+                        batch_index = len(joint_visual_selection_batch_audits)
+                        first_global_candidate_index = sum(
+                            int(batch["candidate_count"])
+                            for batch in joint_visual_selection_batch_audits
+                        )
+                        if (
+                            first_global_candidate_index
+                            + MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                            > _JOINT_DECODED_ATTEMPT_LIMIT
+                        ):
+                            set_joint_decoded_feedback_terminal_proof(
+                                "joint_decoded_materialized_pool_limit_exhausted"
+                            )
+                            break
+                        reporter.status(
+                            "decoded QA 피드백으로 joint 후보 재선택 중… "
+                            f"시도 {joint_decoded_render_attempt_count}/"
+                            f"{_JOINT_DECODED_ATTEMPT_LIMIT} · "
+                            f"통과 {min(len(derived), 8)}/"
+                            f"{_JOINT_REQUIRED_DECODED_PASS_COUNT}"
+                        )
+                        try:
+                            (
+                                feedback_selection_set,
+                                feedback_materialized,
+                            ) = materialize_joint_visual_feedback_batch(
+                                batch_index=batch_index,
+                                available_proof_budget=remaining_proof_budget,
+                            )
+                        except NoCompleteTimelinePath as exc:
+                            used_on_failure = exc.rejection_counts.get(
+                                "proof_materialization_call_count",
+                                0,
+                            )
+                            if (
+                                isinstance(used_on_failure, bool)
+                                or not isinstance(used_on_failure, int)
+                                or not 0
+                                <= used_on_failure
+                                <= remaining_proof_budget
+                            ):
+                                raise RuntimeError(
+                                    "joint selector failure reported invalid proof usage"
+                                ) from exc
+                            joint_decoded_cumulative_proof_materialization_calls += (
+                                used_on_failure
+                            )
+                            if joint_boundary_provider_batch_audits:
+                                latest_provider = (
+                                    joint_boundary_provider_batch_audits[-1]
+                                )
+                                joint_boundary_provider_audit = {
+                                    **latest_provider,
+                                    "selection_batch_count": len(
+                                        joint_boundary_provider_batch_audits
+                                    ),
+                                    "batches": deepcopy(
+                                        joint_boundary_provider_batch_audits
+                                    ),
+                                    "cumulative_proof_materialization_call_count": (
+                                        joint_decoded_cumulative_proof_materialization_calls
+                                    ),
+                                    "maximum_cumulative_proof_materialization_calls": (
+                                        _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
+                                    ),
+                                }
+                            failure_evidence = exc.to_dict()
+                            assert joint_visual_selection_audit is not None
+                            joint_visual_selection_audit[
+                                "terminal_selection_failure"
+                            ] = deepcopy(failure_evidence)
+                            set_joint_decoded_feedback_terminal_proof(
+                                (
+                                    "joint_decoded_exact_complete_path_exhausted"
+                                    if exc.reason_code
+                                    == (
+                                        "joint_visual_complete_path_"
+                                        "no_good_exhausted"
+                                    )
+                                    else exc.reason_code
+                                ),
+                                evidence={
+                                    "no_complete_timeline_path": (
+                                        failure_evidence
+                                    )
+                                },
+                            )
+                            break
+                        proof_calls = (
+                            _joint_selection_proof_materialization_call_count(
+                                feedback_selection_set,
+                                available_budget=remaining_proof_budget,
+                            )
+                        )
+                        joint_decoded_cumulative_proof_materialization_calls += (
+                            proof_calls
+                        )
+                        globally_indexed_feedback = (
+                            _globally_index_joint_visual_candidate_batch(
+                                feedback_materialized,
+                                first_candidate_index=(
+                                    first_global_candidate_index
+                                ),
+                                existing_complete_paths=(
+                                    joint_materialized_complete_paths
+                                ),
+                            )
+                        )
+                        joint_materialized_complete_paths.update(
+                            _joint_complete_path_signature(item)
+                            for item in globally_indexed_feedback
+                        )
+                        append_joint_visual_selection_batch_audit(
+                            feedback_selection_set,
+                            feedback_materialized,
+                            batch_index=batch_index,
+                            first_global_candidate_index=(
+                                first_global_candidate_index
+                            ),
+                            proof_materialization_call_count=proof_calls,
+                        )
+                        total_materialized_candidate_count += len(
+                            globally_indexed_feedback
+                        )
+                        pre_repair_structure_passing_materialized_count += sum(
+                            not _pre_review_hard_failure_codes(item)
+                            for item in globally_indexed_feedback
+                        )
+                        reporter.log(
+                            "joint decoded 피드백 후보 "
+                            f"{len(globally_indexed_feedback)}개 추가 · "
+                            f"누적 proof "
+                            f"{joint_decoded_cumulative_proof_materialization_calls}/"
+                            f"{_JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT} · "
+                            "임계값 하향 없음"
+                        )
+                        for materialized in globally_indexed_feedback:
+                            if (
+                                joint_decoded_render_attempt_count
+                                >= _JOINT_DECODED_ATTEMPT_LIMIT
+                                or joint_diverse_passing_cohort()
+                                or joint_shared_render_contract_failure
+                                is not None
+                            ):
+                                break
+                            derive_and_gate_candidate(materialized)
 
                 if (
                     not candidate_stream_reducer.required_passing_cohort_complete
@@ -28530,40 +30947,34 @@ def analyze(
                     constraint_reoptimization_termination_reason = (
                         "initial_stream_exact_eight"
                     )
-                elif (
-                    joint_visual_selection_active
-                    and candidate_stream_reducer
-                    .required_passing_cohort_complete
-                ):
+                joint_final_cohort = joint_diverse_passing_cohort()
+                if joint_visual_selection_active and joint_final_cohort:
                     constraint_reoptimization_termination_reason = (
-                        "joint_decoded_visual_selector_exact_eight"
+                        "joint_decoded_multi_batch_exact_eight"
                     )
+                    constraint_reoptimization_terminal_proof = None
                 materialized_group_candidates = tuple(
                     attempted_materialized_candidates
                 )
-                complete_group_candidates = tuple(derived)
-                if len(complete_group_candidates) != 8:
+                if joint_visual_selection_active and joint_final_cohort:
+                    complete_group_candidates = tuple(
+                        bundle for bundle, _review in joint_final_cohort
+                    )
+                    derived[:] = list(complete_group_candidates)
+                    streamed_group_candidate_reviews[:] = [
+                        review for _bundle, review in joint_final_cohort
+                    ]
+                else:
+                    complete_group_candidates = tuple(derived)
+                if len(complete_group_candidates) != 8 or (
+                    joint_visual_selection_active and not joint_final_cohort
+                ):
                     if joint_visual_selection_active:
-                        constraint_reoptimization_termination_reason = (
-                            "joint_decoded_candidate_pool_exhausted_before_"
-                            "exact_eight"
-                        )
-                        constraint_reoptimization_terminal_proof = {
-                            "contract": (
-                                "joint_decoded_candidate_pool_terminal_proof_v1"
-                            ),
-                            "cause": (
-                                "joint_decoded_candidate_pool_exhausted_"
-                                "before_exact_eight"
-                            ),
-                            "authorized_candidate_count": len(derived),
-                            "attempted_candidate_count": len(
-                                attempted_candidate_indices
-                            ),
-                            "legacy_constraint_reoptimization_invoked": False,
-                            "legacy_local_source_repair_invoked": False,
-                            "production_use_forbidden": True,
-                        }
+                        if constraint_reoptimization_terminal_proof is None:
+                            set_joint_decoded_feedback_terminal_proof(
+                                "joint_decoded_candidate_pool_exhausted_before_"
+                                "exact_eight"
+                            )
                     elif constraint_reoptimization_terminal_proof is None:
                         set_nonstructural_constraint_exhaustion(
                             cause="candidate_stream_exhausted_before_exact_eight"
