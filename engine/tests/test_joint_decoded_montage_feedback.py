@@ -56,6 +56,8 @@ def _review(signature: str) -> dict[str, object]:
     return {
         "segment_interior_geometry": {
             "render_timeline_binding_sha256": signature,
+            "evidence_sha256": "e" * 64,
+            "sampling_schedule_sha256": "f" * 64,
         },
         "rendered_montage_grammar_review": {
             "render_plan_binding": {
@@ -66,6 +68,8 @@ def _review(signature: str) -> dict[str, object]:
             "rendered_segment_interior_geometry": {
                 "available": True,
                 "source_render_timeline_binding_sha256": signature,
+                "source_evidence_sha256": "e" * 64,
+                "source_sampling_schedule_sha256": "f" * 64,
                 "segment_records": [
                     {
                         "segment_index": 0,
@@ -137,6 +141,36 @@ class JointDecodedMontageFeedbackBridgeTests(unittest.TestCase):
         assert isinstance(records[1], dict)
         records[1]["source_index"] = 0
         with self.assertRaisesRegex(ValueError, "source binding changed"):
+            joint_decoded_montage_observations_from_bound_review(
+                timeline_choices=(_choice(0, 0), _choice(1, 1)),
+                render_plan=_plan(),
+                review_payload=review,
+                render_variant_signature=signature,
+            )
+
+    def test_rejects_evidence_or_sampling_lineage_drift(self) -> None:
+        signature = "9" * 64
+        review = _review(signature)
+        montage = review["rendered_montage_grammar_review"]
+        assert isinstance(montage, dict)
+        interior = montage["rendered_segment_interior_geometry"]
+        assert isinstance(interior, dict)
+        interior["source_evidence_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "evidence binding changed"):
+            joint_decoded_montage_observations_from_bound_review(
+                timeline_choices=(_choice(0, 0), _choice(1, 1)),
+                render_plan=_plan(),
+                review_payload=review,
+                render_variant_signature=signature,
+            )
+
+        review = _review(signature)
+        montage = review["rendered_montage_grammar_review"]
+        assert isinstance(montage, dict)
+        interior = montage["rendered_segment_interior_geometry"]
+        assert isinstance(interior, dict)
+        interior["source_sampling_schedule_sha256"] = "1" * 64
+        with self.assertRaisesRegex(ValueError, "sampling binding changed"):
             joint_decoded_montage_observations_from_bound_review(
                 timeline_choices=(_choice(0, 0), _choice(1, 1)),
                 render_plan=_plan(),

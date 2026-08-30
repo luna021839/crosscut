@@ -68,6 +68,14 @@ def joint_decoded_montage_observations_from_bound_review(
     )
     if root_signature != signature:
         raise ValueError("decoded montage root render binding changed")
+    root_evidence_signature = _lowercase_sha256(
+        root_geometry.get("evidence_sha256"),
+        "decoded montage root evidence signature",
+    )
+    root_sampling_signature = _lowercase_sha256(
+        root_geometry.get("sampling_schedule_sha256"),
+        "decoded montage root sampling signature",
+    )
 
     montage = review_payload.get("rendered_montage_grammar_review")
     if not isinstance(montage, Mapping):
@@ -96,6 +104,13 @@ def joint_decoded_montage_observations_from_bound_review(
         raise ValueError("decoded montage segment evidence is unavailable")
     if geometry.get("source_render_timeline_binding_sha256") != signature:
         raise ValueError("decoded montage segment render binding changed")
+    if geometry.get("source_evidence_sha256") != root_evidence_signature:
+        raise ValueError("decoded montage segment evidence binding changed")
+    if (
+        geometry.get("source_sampling_schedule_sha256")
+        != root_sampling_signature
+    ):
+        raise ValueError("decoded montage segment sampling binding changed")
     records = geometry.get("segment_records")
     if not isinstance(records, list) or len(records) != len(render_plan.segments):
         raise ValueError("decoded montage segment records are incomplete")
