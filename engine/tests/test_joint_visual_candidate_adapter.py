@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import product
+import json
 import math
 from pathlib import Path
 import unittest
@@ -21,9 +22,11 @@ from crosscut.joint_timeline import (
     BoundaryOffsetDisposition,
     BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
+    BoundarySelectionNoGood,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
     JointTimelineProgress,
+    JointTimelinePathSignature,
     JointTimelineResult,
     SegmentBridgeDisposition,
     SegmentBridgeDispositionRequest,
@@ -31,10 +34,15 @@ from crosscut.joint_timeline import (
 )
 from crosscut.joint_visual_candidate_adapter import (
     JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS,
+    MAXIMUM_JOINT_VISUAL_PROOF_CALLS,
+    JointVisualEvidenceCoverageError,
     JointVisualBoundaryProofBundle,
+    JointVisualSelectionRecord,
+    _proof_bundle,
+    _project_visual_plan_from_joint_proof,
     _shift_joint_timeline_result,
-    materialize_joint_visual_candidates,
-    select_joint_visual_candidates,
+    materialize_joint_visual_candidates as _production_materialize_joint_visual_candidates,
+    select_joint_visual_candidates as _production_select_joint_visual_candidates,
 )
 from crosscut.render import (
     EditorialTransformKeyframe,
@@ -46,6 +54,7 @@ from crosscut.section_director import (
     SectionRole,
 )
 from crosscut.timeline import (
+    BoundarySideStability,
     NoCompleteTimelinePath,
     ShotType,
     TimelineCandidate,
@@ -53,11 +62,19 @@ from crosscut.timeline import (
     TimelineMode,
     TimelineResult,
 )
+from crosscut.visual_boundary_repair import (
+    BoundaryEvidenceCoverage,
+    BoundaryVisualEvidence,
+    TemporalPoseMotionEvidence,
+)
 from crosscut.timeline_no_good import (
     TimelineNoGoodEdgeKey,
     TimelineNoGoodSet,
 )
-from crosscut.timeline_review import review_timeline
+from crosscut.timeline_review import (
+    JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
+    review_timeline,
+)
 from crosscut.visual_score import (
     FrameVisualDescriptor,
     ProfessionalMontageSelectionPolicy,
@@ -65,12 +82,49 @@ from crosscut.visual_score import (
     VisualTimelineCandidateSet,
     VisualTimelineOptimizerSeed,
     VisualTimelineOptimizerWorkspace,
+    _CandidateFaceMetadata,
     _review_ranked_candidate_indices,
     _visual_optimizer_input_identity,
 )
 
 
 RAW_SENTINEL = 0.987654321234567
+
+
+def _synthetic_review(
+    plan: object,
+    *,
+    available_source_count: int | None = None,
+):  # type: ignore[no-untyped-def]
+    """Keep real boundary diagnostics while relaxing tiny-fixture global floors."""
+
+    return replace(
+        review_timeline(
+            plan,
+            available_source_count=available_source_count,
+        ),
+        hard_failures=(),
+    )
+
+
+def select_joint_visual_candidates(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+    """Exercise production selection with only synthetic global review floors relaxed."""
+
+    with patch(
+        "crosscut.joint_visual_candidate_adapter.review_timeline",
+        side_effect=_synthetic_review,
+    ):
+        return _production_select_joint_visual_candidates(*args, **kwargs)
+
+
+def materialize_joint_visual_candidates(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+    """Use the same synthetic review contract for materialization parity."""
+
+    with patch(
+        "crosscut.joint_visual_candidate_adapter.review_timeline",
+        side_effect=_synthetic_review,
+    ):
+        return _production_materialize_joint_visual_candidates(*args, **kwargs)
 
 
 class StubDecodedProvider(DecodedBoundaryOptionProvider):
@@ -100,6 +154,18 @@ class StubDecodedProvider(DecodedBoundaryOptionProvider):
     ) -> tuple[SegmentBridgeDisposition, ...]:
         raise AssertionError(
             "selector stub must not invoke bridge_disposition_batch"
+        )
+
+    def selection_materialization_proof(
+        self,
+        boundary_options: tuple[AuthorizedBoundaryOption, ...],
+        segment_bridge_proofs: tuple[SegmentBridgeProof, ...] = (),
+    ) -> JointSelectionMaterializationProof:
+        return StubMaterializingProvider(
+            fps=self.output_fps
+        ).selection_materialization_proof(
+            boundary_options,
+            segment_bridge_proofs,
         )
 
 
@@ -192,6 +258,7 @@ class StubMaterializingProvider(StubDecodedProvider):
         self.fps = fps
         self.output_fps = fps
         self._bridge_audits: dict[str, dict[str, object]] = {}
+        self.selection_materialization_calls = 0
 
     @staticmethod
     def _descriptor() -> FrameVisualDescriptor:
@@ -202,6 +269,72 @@ class StubMaterializingProvider(StubDecodedProvider):
             shot_type=ShotType.MEDIUM,
             face_count=1,
             structure_embedding=(0.1, 0.2),
+        )
+
+    @staticmethod
+    def _evidence() -> BoundaryVisualEvidence:
+        stability = BoundarySideStability(
+            sample_span_seconds=0.3,
+            scale_delta=0.02,
+            structure_mismatch=0.03,
+            pose_mismatch=0.04,
+            shot_type_mismatch=0.0,
+        )
+        return BoundaryVisualEvidence(
+            total_cost=0.05,
+            base_total_cost=0.05,
+            formation_mismatch=0.05,
+            pose_mismatch=0.05,
+            pose_basis="synthetic_actual_pose",
+            exact_pose_mismatch=0.05,
+            nearest_temporal_pose_mismatch=0.05,
+            silhouette_mismatch=0.05,
+            layout_mismatch=0.05,
+            persisted_layout_mismatch=0.05,
+            focus_mismatch=0.05,
+            structure_mismatch=0.05,
+            shot_scale_delta=0.05,
+            shot_type_mismatch=0.0,
+            temporal_pose_motion=TemporalPoseMotionEvidence(
+                calibration_status="synthetic",
+                analysis_executed=True,
+                input_valid=True,
+                qualifies=True,
+                classification="synthetic_match",
+                failure_reasons=(),
+                feature_dimension=2,
+                outgoing_sample_count=2,
+                incoming_sample_count=2,
+                outgoing_boundary_motion_magnitude=0.1,
+                incoming_boundary_motion_magnitude=0.1,
+                endpoint_pose_cosine=1.0,
+                velocity_direction_cosine=1.0,
+                phase_compatibility=1.0,
+                confidence=1.0,
+                static_pose_match=True,
+                dynamic_pose_phase_match=True,
+                direction_evidence_available=True,
+                dynamic_direction_match_proven=True,
+                soft_preference_applied=0.0,
+                threshold_values={},
+                threshold_identity_sha256="0" * 64,
+                preference_weight=0.0,
+                configuration_fingerprint_sha256="1" * 64,
+            ),
+            evidence_coverage=BoundaryEvidenceCoverage(
+                exact_pose_available=(True, True),
+                temporal_pose_available=(True, True),
+                temporal_pose_offsets_frames=(0, 0),
+                formation_person_counts=(1, 1),
+                formation_upper_body_counts=(1, 1),
+                person_layout_available=(True, True),
+                silhouette_available=(True, True),
+                professional_evidence_basis="synthetic_complete",
+                professional_gate_passed=True,
+                missing_mask=(),
+            ),
+            outgoing_side_stability=stability,
+            incoming_side_stability=stability,
         )
 
     @staticmethod
@@ -281,12 +414,14 @@ class StubMaterializingProvider(StubDecodedProvider):
         boundary_options: tuple[AuthorizedBoundaryOption, ...],
         segment_bridge_proofs: tuple[SegmentBridgeProof, ...] = (),
     ) -> JointSelectionMaterializationProof:
+        self.selection_materialization_calls += 1
         options = tuple(boundary_options)
         candidates = (options[0].measurement_key.outgoing,) + tuple(
             option.measurement_key.incoming for option in options
         )
         offsets = tuple(option.frame_offset for option in options)
         descriptor = self._descriptor()
+        evidence = self._evidence()
         boundaries = tuple(
             BoundaryMaterializationProof(
                 proof_identity=option.proof_identity,
@@ -326,8 +461,8 @@ class StubMaterializingProvider(StubDecodedProvider):
                 result_outgoing_preceding_descriptor=descriptor,
                 result_incoming_descriptor=descriptor,
                 result_incoming_following_descriptor=descriptor,
-                raw_evidence=object(),
-                result_evidence=object(),
+                raw_evidence=evidence,
+                result_evidence=evidence,
                 outgoing_face_identity_embedding=(RAW_SENTINEL,),
                 incoming_face_identity_embedding=(RAW_SENTINEL,),
                 scoring_outgoing=option.scoring_outgoing,
@@ -377,34 +512,37 @@ class StubMaterializingProvider(StubDecodedProvider):
                 if start + (frame_index + 0.5) / self.fps < end - 1e-9
             )
             sample_times = (start, *frame_centers, end)
-            samples = tuple(
-                SegmentTransformPathSample(
+            samples_list: list[SegmentTransformPathSample] = []
+            for sample_index, master in enumerate(sample_times):
+                sample_transform = (
+                    entry
+                    if sample_index == 0
+                    else exit_
+                    if sample_index == len(sample_times) - 1
+                    else self._sample_transform(
+                        track.evaluate(master - start),
+                        track_id=entry.track_id or "missing-track",
+                        identity=(
+                            "synthetic-sample:"
+                            f"{candidate.candidate_id}:{sample_index}"
+                        ),
+                    )
+                )
+                samples_list.append(
+                    SegmentTransformPathSample(
                     master_seconds=master,
                     source_seconds=master + source_offset,
-                    transform=(
-                        entry
-                        if sample_index == 0
-                        else exit_
-                        if sample_index == len(sample_times) - 1
-                        else self._sample_transform(
-                            track.evaluate(master - start),
-                            track_id=entry.track_id or "missing-track",
-                            identity=(
-                                "synthetic-sample:"
-                                f"{candidate.candidate_id}:{sample_index}"
-                            ),
-                        )
-                    ),
-                    subject_basis="dominant_face",
+                    transform=sample_transform,
+                    subject_basis=sample_transform.subject_basis,
                     subject_bbox_xywh=(0.3, 0.2, 0.2, 0.4),
                     subject_bbox_coverage=1.0,
                     face_similarity_to_anchor=1.0,
                     face_similarity_to_previous=1.0,
                     descriptor=None,
                     face_identity_embedding=(RAW_SENTINEL,),
+                    )
                 )
-                for sample_index, master in enumerate(sample_times)
-            )
+            samples = tuple(samples_list)
             paths.append(
                 SegmentTransformPathMaterializationProof(
                     proof_identity=proof_identity,
@@ -538,19 +676,37 @@ def _option_set(
             f"{key.outgoing.source_id}:{key.incoming.source_id}:{offset}"
         )
         if offset == selected_offset:
-            selected = AuthorizedBoundaryOption(
-                measurement_key=key,
-                frame_offset=offset,
-                outgoing_transform=_transform(
+            if key.outgoing.source_id == key.incoming.source_id:
+                outgoing_transform = BoundaryTransformState(
+                    transform_identity=identity + ":out",
+                    crop_xywh=None,
+                    rotation_degrees=0.0,
+                    track_id=f"track:{key.outgoing.candidate_id}",
+                    subject_basis="full_frame_identity",
+                )
+                incoming_transform = BoundaryTransformState(
+                    transform_identity=identity + ":in",
+                    crop_xywh=None,
+                    rotation_degrees=0.0,
+                    track_id=f"track:{key.incoming.candidate_id}",
+                    subject_basis="full_frame_identity",
+                )
+            else:
+                outgoing_transform = _transform(
                     identity + ":out",
                     key.outgoing,
                     boundary_index=key.boundary_index,
-                ),
-                incoming_transform=_transform(
+                )
+                incoming_transform = _transform(
                     identity + ":in",
                     key.incoming,
                     boundary_index=key.boundary_index,
-                ),
+                )
+            selected = AuthorizedBoundaryOption(
+                measurement_key=key,
+                frame_offset=offset,
+                outgoing_transform=outgoing_transform,
+                incoming_transform=incoming_transform,
                 proof_identity=identity,
             )
             audits.append(
@@ -580,15 +736,24 @@ def _joint(
     offsets: tuple[int, ...],
     score: float,
     variant: str,
+    allow_same_source_offsets: bool = False,
 ) -> JointTimelineResult:
     option_sets: list[BoundaryOptionSet] = []
     options: list[AuthorizedBoundaryOption] = []
     for index, (outgoing, incoming) in enumerate(
         zip(timeline.candidates, timeline.candidates[1:])
     ):
+        selected_offset = (
+            0
+            if (
+                outgoing.source_id == incoming.source_id
+                and not allow_same_source_offsets
+            )
+            else offsets[index]
+        )
         option_set, option = _option_set(
             BoundaryMeasurementKey(index, outgoing, incoming),
-            selected_offset=offsets[index],
+            selected_offset=selected_offset,
             variant=variant,
         )
         option_sets.append(option_set)
@@ -812,13 +977,15 @@ def _limited_profile_pools(
     assert candidate_set.optimizer_workspace is not None
     lattice = candidate_set.optimizer_workspace.candidates_by_segment
     paths = tuple(product(("0", "1"), repeat=3))
+    primary_path_indices = (1, 2, 3, 4, 5, 6, 0, 7)
     pools: list[list[JointTimelineResult]] = [[], [], []]
     for path_index in range(unique_path_count):
+        actual_path_index = primary_path_indices[path_index]
         pools[path_index % 3].append(
             _joint(
                 _timeline(
                     lattice,
-                    paths[path_index],
+                    paths[actual_path_index],
                     score=40.0 - path_index,
                 ),
                 offsets=(0, 0),
@@ -828,11 +995,12 @@ def _limited_profile_pools(
         )
     alternate_offsets = ((1, -1), (-1, 1))
     for alternate_index, path_index in enumerate(alternate_paths):
+        actual_path_index = primary_path_indices[path_index]
         pools[alternate_index % 3].append(
             _joint(
                 _timeline(
                     lattice,
-                    paths[path_index],
+                    paths[actual_path_index],
                     score=20.0 - alternate_index,
                 ),
                 offsets=alternate_offsets[alternate_index % 2],
@@ -844,6 +1012,427 @@ def _limited_profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_selection_set_rejects_failed_review_with_two_source_fixture(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        pools = _profile_pools(candidate_set)
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+            )
+
+        failed_record = replace(
+            selected.candidate_records[0],
+            review=replace(
+                selected.candidate_records[0].review,
+                hard_failures=("synthetic_global_review_failure",),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "failed review"):
+            replace(
+                selected,
+                candidate_records=(
+                    failed_record,
+                    *selected.candidate_records[1:],
+                ),
+            )
+
+    def test_two_source_selector_cannot_bypass_production_review_floor(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+
+        def failed_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            return replace(
+                _synthetic_review(
+                    plan,
+                    available_source_count=available_source_count,
+                ),
+                hard_failures=("synthetic_global_review_failure",),
+            )
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=pools,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=failed_review,
+            ),
+        ):
+            with self.assertRaises(NoCompleteTimelinePath):
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                )
+
+        self.assertEqual(provider.selection_materialization_calls, 8)
+
+    def test_same_source_native_continuity_does_not_require_crosscut_coverage(
+        self,
+    ) -> None:
+        class IncompleteCoverageProvider(StubMaterializingProvider):
+            @staticmethod
+            def _evidence() -> BoundaryVisualEvidence:
+                base = StubMaterializingProvider._evidence()
+                return replace(
+                    base,
+                    evidence_coverage=replace(
+                        base.evidence_coverage,
+                        professional_evidence_basis=(
+                            "insufficient_combined_geometry_evidence"
+                        ),
+                        professional_gate_passed=False,
+                        missing_mask=("outgoing_exact_actual_pose",),
+                    ),
+                )
+
+        candidate_set = _candidate_set()
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        result = _joint(
+            _timeline(
+                workspace.candidates_by_segment,
+                ("0", "0", "0"),
+                score=10.0,
+            ),
+            offsets=(0, 0),
+            score=10.0,
+            variant="same-source-incomplete",
+        )
+        selection = JointVisualSelectionRecord(
+            cadence_profile="balanced",
+            joint_result=result,
+            shifted_timeline_result=_shift_joint_timeline_result(
+                result,
+                fps=10.0,
+                candidate_set=candidate_set,
+            ),
+            source_shot_path=tuple(
+                (item.segment_index, item.source_id, item.shot_id)
+                for item in result.candidates
+            ),
+            proof_variant_signature=tuple(
+                item.proof_identity for item in result.boundary_options
+            ),
+        )
+        provider = IncompleteCoverageProvider(fps=10.0)
+        plan = _project_visual_plan_from_joint_proof(
+            candidate_set=candidate_set,
+            timeline_result=selection.shifted_timeline_result,
+            proof_bundle=_proof_bundle(selection, provider),
+            candidate_index=0,
+            cadence_profile="balanced",
+        )
+        reviewed = review_timeline(plan, available_source_count=2)
+        self.assertTrue(all(not item.source_switch for item in reviewed.boundaries))
+
+    def test_cross_source_coverage_violation_is_exact_and_privacy_safe(
+        self,
+    ) -> None:
+        class IncompleteCoverageProvider(StubMaterializingProvider):
+            @staticmethod
+            def _evidence() -> BoundaryVisualEvidence:
+                base = StubMaterializingProvider._evidence()
+                return replace(
+                    base,
+                    evidence_coverage=replace(
+                        base.evidence_coverage,
+                        professional_evidence_basis=(
+                            "insufficient_combined_geometry_evidence"
+                        ),
+                        professional_gate_passed=False,
+                        missing_mask=(
+                            "incoming_temporal_actual_pose",
+                            "incoming_silhouette",
+                        ),
+                    ),
+                )
+
+        candidate_set = _candidate_set()
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        result = _joint(
+            _timeline(
+                workspace.candidates_by_segment,
+                ("0", "1", "0"),
+                score=10.0,
+            ),
+            offsets=(1, -1),
+            score=10.0,
+            variant="cross-source-incomplete",
+        )
+        selection = JointVisualSelectionRecord(
+            cadence_profile="dense_safe",
+            joint_result=result,
+            shifted_timeline_result=_shift_joint_timeline_result(
+                result,
+                fps=10.0,
+                candidate_set=candidate_set,
+            ),
+            source_shot_path=tuple(
+                (item.segment_index, item.source_id, item.shot_id)
+                for item in result.candidates
+            ),
+            proof_variant_signature=tuple(
+                item.proof_identity for item in result.boundary_options
+            ),
+        )
+        provider = IncompleteCoverageProvider(fps=10.0)
+        with self.assertRaises(JointVisualEvidenceCoverageError) as caught:
+            _project_visual_plan_from_joint_proof(
+                candidate_set=candidate_set,
+                timeline_result=selection.shifted_timeline_result,
+                proof_bundle=_proof_bundle(selection, provider),
+                candidate_index=7,
+                cadence_profile="dense_safe",
+            )
+        payload = caught.exception.to_dict()
+        json.dumps(payload, allow_nan=False)
+        self.assertEqual(payload["joint_candidate_index"], 7)
+        self.assertEqual(payload["cadence_profile"], "dense_safe")
+        self.assertEqual(payload["boundary_index"], 0)
+        self.assertEqual(payload["frame_offset"], 1)
+        self.assertEqual(
+            payload["coverage"]["failed_coverage_fields"],
+            ["incoming_temporal_actual_pose", "incoming_silhouette"],
+        )
+        serialized = json.dumps(payload, sort_keys=True)
+        self.assertNotIn(str(RAW_SENTINEL), serialized)
+        self.assertNotIn(str(RAW_SENTINEL), str(caught.exception))
+        self.assertFalse(payload["raw_frames_persisted"])
+        self.assertFalse(payload["raw_visual_descriptors_persisted"])
+
+    def test_selector_turns_cross_source_coverage_failure_into_exact_retry(
+        self,
+    ) -> None:
+        class IncompleteCoverageProvider(StubMaterializingProvider):
+            @staticmethod
+            def _evidence() -> BoundaryVisualEvidence:
+                base = StubMaterializingProvider._evidence()
+                return replace(
+                    base,
+                    evidence_coverage=replace(
+                        base.evidence_coverage,
+                        professional_evidence_basis=(
+                            "insufficient_combined_geometry_evidence"
+                        ),
+                        professional_gate_passed=False,
+                        missing_mask=("incoming_temporal_actual_pose",),
+                    ),
+                )
+
+        candidate_set = _candidate_set()
+        provider = IncompleteCoverageProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+        selector_calls: list[dict[str, object]] = []
+
+        def selector(*_args: object, **kwargs: object):
+            selector_calls.append(dict(kwargs))
+            return pools[(len(selector_calls) - 1) % 3]
+
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=selector,
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                )
+
+        self.assertEqual(len(selector_calls), 6)
+        self.assertEqual(provider.selection_materialization_calls, 8)
+        first_retry_no_goods = set(
+            selector_calls[3]["forbidden_boundary_selections"]
+        )
+        self.assertTrue(first_retry_no_goods)
+        self.assertTrue(
+            all(
+                set(call["forbidden_boundary_selections"])
+                == first_retry_no_goods
+                for call in selector_calls[3:]
+            )
+        )
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_unique_path_floor_not_met",
+        )
+
+    def test_authoritative_result_evidence_blocks_midpoint_and_hog_fallback(
+        self,
+    ) -> None:
+        class ExactUnavailableProvider(StubMaterializingProvider):
+            @staticmethod
+            def _evidence() -> BoundaryVisualEvidence:
+                base = StubMaterializingProvider._evidence()
+                return replace(
+                    base,
+                    silhouette_mismatch=None,
+                    pose_mismatch=0.05,
+                    evidence_coverage=replace(
+                        base.evidence_coverage,
+                        silhouette_available=(False, False),
+                    ),
+                )
+
+        candidate_set = _candidate_set()
+        workspace = candidate_set.optimizer_workspace
+        assert workspace is not None
+        face_metadata = {
+            candidate.candidate_id: _CandidateFaceMetadata(
+                boxes=(
+                    (
+                        (0.05, 0.05, 0.10, 0.10)
+                        if candidate.source_id == "0"
+                        else (0.80, 0.80, 0.10, 0.10)
+                    ),
+                )
+                * 3,
+                failure=None,
+                backends=("synthetic",) * 3,
+                landmarks=(None, None, None),
+                rolls=(None, None, None),
+                eye_scales=(None, None, None),
+            )
+            for segment in workspace.candidates_by_segment
+            for candidate in segment
+        }
+        candidate_set = replace(
+            candidate_set,
+            face_metadata_by_candidate=face_metadata,
+        )
+
+        def contaminated(result: JointTimelineResult) -> JointTimelineResult:
+            choices = tuple(
+                replace(
+                    choice,
+                    candidate=replace(
+                        choice.candidate,
+                        structure_embedding=(
+                            (0.0, 0.0)
+                            if choice.candidate.source_id == "0"
+                            else (1.0, 1.0)
+                        ),
+                        silhouette_embedding=(
+                            (0.0, 0.0)
+                            if choice.candidate.source_id == "0"
+                            else (1.0, 1.0)
+                        ),
+                    ),
+                )
+                for choice in result.timeline.choices
+            )
+            return replace(
+                result,
+                timeline=replace(result.timeline, choices=choices),
+            )
+
+        pools = tuple(
+            tuple(contaminated(result) for result in pool)
+            for pool in _profile_pools(candidate_set)
+        )
+        provider = ExactUnavailableProvider(fps=10.0)
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+            )
+
+        switched_boundary_count = 0
+        for record in selected.candidate_records:
+            for boundary in record.review.boundaries:
+                if not boundary.source_switch:
+                    continue
+                switched_boundary_count += 1
+                self.assertEqual(boundary.focus_mismatch, 0.05)
+                self.assertIsNone(boundary.silhouette_mismatch)
+                self.assertEqual(boundary.pose_mismatch, 0.05)
+                self.assertTrue(
+                    {"focus", "silhouette", "pose"}.isdisjoint(
+                        boundary.exceeded_metrics
+                    )
+                )
+        self.assertGreater(switched_boundary_count, 0)
+
+        materialized = materialize_joint_visual_candidates(
+            selected,
+            provider=provider,
+            fps=10.0,
+            maximum_candidates=8,
+        )
+        self.assertEqual(len(materialized), 8)
+        for item in materialized:
+            self.assertEqual(
+                _synthetic_review(
+                    item.visual_plan,
+                    available_source_count=2,
+                ).to_dict(),
+                item.candidate_record.review.to_dict(),
+            )
+
+        spoof_source = next(
+            item
+            for item in materialized
+            if any(boundary.source_switch for boundary in item.candidate_record.review.boundaries)
+        )
+        spoof_boundary = next(
+            boundary
+            for boundary in spoof_source.candidate_record.review.boundaries
+            if boundary.source_switch
+        )
+        serialized = spoof_source.visual_plan.to_dict()
+        outgoing = serialized["choices"][spoof_boundary.boundary_index]
+        incoming = serialized["choices"][spoof_boundary.boundary_index + 1]
+        self.assertNotIn(
+            "transition_evidence_authority_from_previous",
+            incoming,
+        )
+        outgoing["face_samples_xywh"][-1] = [0.02, 0.02, 0.10, 0.10]
+        incoming["face_samples_xywh"][0] = [0.88, 0.88, 0.10, 0.10]
+        incoming["transition_evidence_contract_from_previous"] = (
+            JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT
+        )
+        incoming["focus_transition_mismatch_from_previous"] = None
+        spoofed_review = review_timeline(
+            serialized,
+            available_source_count=2,
+        )
+        self.assertGreater(
+            spoofed_review.boundaries[
+                spoof_boundary.boundary_index
+            ].focus_mismatch
+            or 0.0,
+            0.24,
+        )
+
     def test_optimizer_seed_and_full_candidate_set_produce_same_joint_result(
         self,
     ) -> None:
@@ -943,6 +1532,658 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         self.assertEqual(provider.bridge_calls, 6)
         self.assertEqual(len(provider.bridge_batch_calls), 1)
         self.assertEqual(len(provider.bridge_batch_calls[0]), 2)
+
+    def test_authoritative_floor_retries_only_exact_failed_offsets(self) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        first_round = _profile_pools(candidate_set)
+        retry_round = tuple(
+            tuple(
+                _joint(
+                    result.timeline,
+                    offsets=(1, -1),
+                    score=result.total_score + 0.25,
+                    variant=f"retry-{profile_index}-{result_index}",
+                )
+                for result_index, result in enumerate(pool)
+            )
+            for profile_index, pool in enumerate(first_round)
+        )
+        selector_calls: list[dict[str, object]] = []
+        selector_pools = (*first_round, *retry_round)
+
+        def selector(*_args: object, **kwargs: object):
+            selector_calls.append(dict(kwargs))
+            return selector_pools[len(selector_calls) - 1]
+
+        review_calls = 0
+
+        def controlled_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            nonlocal review_calls
+            reviewed = review_timeline(
+                plan,
+                available_source_count=available_source_count,
+            )
+            review_calls += 1
+            if review_calls > 9:
+                return replace(reviewed, hard_failures=())
+            boundaries = list(reviewed.boundaries)
+            switched = next(
+                (item for item in boundaries if item.source_switch),
+                None,
+            )
+            if switched is not None:
+                boundaries[switched.boundary_index] = replace(
+                    switched,
+                    exceeded_metrics=("pose",),
+                )
+            return replace(reviewed, boundaries=tuple(boundaries))
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=selector,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=controlled_review,
+            ),
+        ):
+            selected = _production_select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertTrue(all(item.review.passed for item in selected.candidate_records))
+        self.assertEqual(len(selector_calls), 6)
+        self.assertTrue(
+            all(not call["forbidden_boundary_selections"] for call in selector_calls[:3])
+        )
+        retry_no_goods = tuple(
+            selector_calls[3]["forbidden_boundary_selections"]
+        )
+        self.assertTrue(retry_no_goods)
+        self.assertTrue(
+            all(
+                set(call["forbidden_boundary_selections"])
+                == set(retry_no_goods)
+                for call in selector_calls[3:]
+            )
+        )
+        self.assertTrue(
+            all(
+                isinstance(key, BoundaryMeasurementKey)
+                and offset == 0
+                for key, offset in retry_no_goods
+            )
+        )
+        self.assertEqual(
+            selected.selection_retry_audit["retry_round_count"],
+            1,
+        )
+        self.assertEqual(
+            selected.selection_retry_audit["global_profile_attempt_count"],
+            6,
+        )
+
+    def test_first_passing_eight_stop_before_ninth_proof(self) -> None:
+        self.assertEqual(MAXIMUM_JOINT_VISUAL_PROOF_CALLS, 32)
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=_profile_pools(candidate_set),
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(provider.selection_materialization_calls, 8)
+        audit = selected.selection_retry_audit
+        self.assertEqual(audit["proof_materialization_call_count"], 8)
+        self.assertEqual(
+            audit["maximum_proof_materialization_calls"],
+            MAXIMUM_JOINT_VISUAL_PROOF_CALLS,
+        )
+        self.assertEqual(audit["total_unique_candidate_attempt_count"], 8)
+        self.assertEqual(audit["review_cache_hit_count"], 0)
+        self.assertEqual(audit["total_round_count"], 1)
+        self.assertEqual(audit["retry_round_count"], 0)
+
+    def test_external_feedback_is_validated_and_forwarded_to_every_profile(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        pools = _profile_pools(candidate_set)
+        result = pools[0][0]
+        option = result.boundary_options[0]
+        boundary_no_good: BoundarySelectionNoGood = (
+            option.measurement_key,
+            option.frame_offset,
+        )
+        complete_path_no_good = result.complete_path_signature
+        selector_calls: list[dict[str, object]] = []
+
+        def selector(*_args: object, **kwargs: object):
+            selector_calls.append(dict(kwargs))
+            return pools[len(selector_calls) - 1]
+
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=selector,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubMaterializingProvider(fps=10.0),
+                fps=10.0,
+                forbidden_boundary_selections=(
+                    boundary_no_good,
+                    boundary_no_good,
+                ),
+                forbidden_complete_paths=(
+                    complete_path_no_good,
+                    complete_path_no_good,
+                ),
+                maximum_proof_materialization_calls=8,
+            )
+
+        self.assertEqual(len(selector_calls), 3)
+        for call in selector_calls:
+            self.assertEqual(
+                call["forbidden_boundary_selections"],
+                frozenset((boundary_no_good,)),
+            )
+            self.assertEqual(
+                call["forbidden_complete_paths"],
+                frozenset((complete_path_no_good,)),
+            )
+        audit = selected.selection_retry_audit
+        self.assertEqual(audit["initial_exact_boundary_no_good_count"], 1)
+        self.assertEqual(audit["exact_boundary_no_good_count"], 1)
+        self.assertEqual(audit["external_complete_path_no_good_count"], 1)
+        self.assertEqual(audit["maximum_proof_materialization_calls"], 8)
+
+    def test_external_feedback_malformed_values_fail_before_proof_calls(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        pools = _profile_pools(candidate_set)
+        result = pools[0][0]
+        path = result.complete_path_signature
+        option = result.boundary_options[0]
+        foreign_path = replace(
+            path,
+            candidate_clocks=(
+                replace(path.candidate_clocks[0], source_id="foreign"),
+                *path.candidate_clocks[1:],
+            ),
+        )
+        short_path = JointTimelinePathSignature(
+            candidate_clocks=(path.candidate_clocks[0],),
+            boundary_proofs=(),
+        )
+        foreign_key = BoundaryMeasurementKey.from_candidates(
+            option.measurement_key.boundary_index,
+            replace(
+                option.measurement_key.outgoing,
+                candidate_id="foreign-candidate",
+            ),
+            option.measurement_key.incoming,
+        )
+        invalid_cases = (
+            (
+                "boundary_raw",
+                {"forbidden_boundary_selections": (("bad", 0),)},
+                TypeError,
+                "BoundaryMeasurementKey",
+            ),
+            (
+                "boundary_bool",
+                {
+                    "forbidden_boundary_selections": (
+                        ((option.measurement_key, True)),
+                    )
+                },
+                TypeError,
+                "must be an integer",
+            ),
+            (
+                "boundary_foreign",
+                {"forbidden_boundary_selections": ((foreign_key, 0),)},
+                ValueError,
+                "does not belong to the candidate lattice",
+            ),
+            (
+                "complete_raw",
+                {"forbidden_complete_paths": (("bad",),)},
+                TypeError,
+                "JointTimelinePathSignature",
+            ),
+            (
+                "complete_mapping",
+                {"forbidden_complete_paths": {"bad": path}},
+                TypeError,
+                "must be a collection",
+            ),
+            (
+                "complete_foreign",
+                {"forbidden_complete_paths": (foreign_path,)},
+                ValueError,
+                "does not belong to the candidate lattice",
+            ),
+            (
+                "complete_short",
+                {"forbidden_complete_paths": (short_path,)},
+                ValueError,
+                "length does not match the candidate lattice",
+            ),
+        )
+        for name, kwargs, exception_type, message in invalid_cases:
+            provider = StubMaterializingProvider(fps=10.0)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(exception_type, message):
+                    _production_select_joint_visual_candidates(
+                        candidate_set,
+                        provider=provider,
+                        fps=10.0,
+                        **kwargs,
+                    )
+            self.assertEqual(provider.selection_materialization_calls, 0)
+
+    def test_proof_materialization_budget_accepts_only_eight_through_32(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        for invalid in (True, 7, 33, 8.0):
+            with self.subTest(invalid=invalid):
+                provider = StubMaterializingProvider(fps=10.0)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "between 8 and 32",
+                ):
+                    _production_select_joint_visual_candidates(
+                        candidate_set,
+                        provider=provider,
+                        fps=10.0,
+                        maximum_proof_materialization_calls=invalid,
+                    )
+                self.assertEqual(provider.validated_segment_counts, [])
+
+        for valid in (8, 32):
+            with self.subTest(valid=valid):
+                provider = StubMaterializingProvider(fps=10.0)
+                with patch(
+                    "crosscut.joint_visual_candidate_adapter."
+                    "select_joint_timeline_candidates",
+                    side_effect=_profile_pools(candidate_set),
+                ):
+                    selected = select_joint_visual_candidates(
+                        candidate_set,
+                        provider=provider,
+                        fps=10.0,
+                        maximum_proof_materialization_calls=valid,
+                    )
+                self.assertEqual(
+                    selected.selection_retry_audit[
+                        "maximum_proof_materialization_calls"
+                    ],
+                    valid,
+                )
+                self.assertEqual(provider.selection_materialization_calls, 8)
+
+    def test_complete_path_exhaustion_is_typed_across_all_profiles(self) -> None:
+        candidate_set = _candidate_set()
+        path_no_good = _profile_pools(candidate_set)[0][
+            0
+        ].complete_path_signature
+        selector_calls: list[dict[str, object]] = []
+
+        def exhausted(*_args: object, **kwargs: object):
+            selector_calls.append(dict(kwargs))
+            raise NoCompleteTimelinePath(
+                "synthetic exact path exhaustion",
+                reason_code=(
+                    "joint_timeline_complete_path_no_good_exhausted"
+                ),
+                rejection_counts={
+                    "complete_path_external_no_good_rejected": 1
+                },
+            )
+
+        provider = StubMaterializingProvider(fps=10.0)
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=exhausted,
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                    forbidden_complete_paths=(path_no_good,),
+                )
+
+        self.assertEqual(len(selector_calls), 3)
+        self.assertTrue(
+            all(
+                call["forbidden_complete_paths"]
+                == frozenset((path_no_good,))
+                for call in selector_calls
+            )
+        )
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_complete_path_no_good_exhausted",
+        )
+        self.assertEqual(
+            tuple(name for name, _failure in caught.exception.profile_failures),
+            ("balanced", "reference", "dense_safe"),
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts,
+            {
+                "exhausted_profile_count": 3,
+                "forbidden_complete_path_count": 1,
+                "proof_materialization_call_count": 0,
+            },
+        )
+        self.assertEqual(provider.selection_materialization_calls, 0)
+
+    def test_repeated_review_failures_stop_at_proof_budget(self) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+
+        def rejected_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            reviewed = _synthetic_review(
+                plan,
+                available_source_count=available_source_count,
+            )
+            boundaries = tuple(
+                replace(boundary, exceeded_metrics=("pose",))
+                if boundary.source_switch
+                else boundary
+                for boundary in reviewed.boundaries
+            )
+            return replace(
+                reviewed,
+                boundaries=boundaries,
+                hard_failures=("synthetic_repeated_review_failure",),
+            )
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=pools,
+            ) as selector_mock,
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=rejected_review,
+            ),
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                    maximum_proof_materialization_calls=8,
+                )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_proof_budget_exhausted",
+        )
+        self.assertEqual(provider.selection_materialization_calls, 8)
+        self.assertEqual(selector_mock.call_count, 3)
+        self.assertEqual(
+            caught.exception.rejection_counts[
+                "proof_materialization_call_count"
+            ],
+            8,
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts[
+                "maximum_proof_materialization_calls"
+            ],
+            8,
+        )
+
+    def test_repeated_profile_failure_names_are_coalesced_across_retry(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+        selector_call_count = 0
+
+        def selector(*_args: object, **_kwargs: object):
+            nonlocal selector_call_count
+            profile_index = selector_call_count % 3
+            selector_call_count += 1
+            if profile_index == 0:
+                raise NoCompleteTimelinePath(
+                    "synthetic repeated cadence failure",
+                    reason_code="synthetic_repeated_cadence_failure",
+                )
+            return pools[profile_index]
+
+        def rejected_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            reviewed = _synthetic_review(
+                plan,
+                available_source_count=available_source_count,
+            )
+            boundaries = tuple(
+                replace(boundary, exceeded_metrics=("pose",))
+                if boundary.source_switch
+                else boundary
+                for boundary in reviewed.boundaries
+            )
+            return replace(
+                reviewed,
+                boundaries=boundaries,
+                hard_failures=("synthetic_boundary_review_failure",),
+            )
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=selector,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=rejected_review,
+            ),
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                )
+
+        self.assertEqual(selector_call_count, 6)
+        self.assertEqual(
+            tuple(name for name, _failure in caught.exception.profile_failures),
+            ("balanced",),
+        )
+
+    def test_global_only_review_rejection_is_lightweight_cached_on_retry(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+        selector_call_count = 0
+        review_call_count = 0
+
+        def selector(*_args: object, **_kwargs: object):
+            nonlocal selector_call_count
+            result = pools[selector_call_count % 3]
+            selector_call_count += 1
+            return result
+
+        def controlled_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            nonlocal review_call_count
+            review_call_count += 1
+            reviewed = _synthetic_review(
+                plan,
+                available_source_count=available_source_count,
+            )
+            if review_call_count == 1:
+                return replace(
+                    reviewed,
+                    hard_failures=("synthetic_global_only_failure",),
+                )
+            if review_call_count == 2:
+                boundaries = list(reviewed.boundaries)
+                switched = next(
+                    item for item in boundaries if item.source_switch
+                )
+                boundaries[switched.boundary_index] = replace(
+                    switched,
+                    exceeded_metrics=("pose",),
+                )
+                return replace(
+                    reviewed,
+                    boundaries=tuple(boundaries),
+                    hard_failures=("synthetic_local_boundary_failure",),
+                )
+            return reviewed
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=selector,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=controlled_review,
+            ),
+        ):
+            with self.assertRaises(NoCompleteTimelinePath):
+                _production_select_joint_visual_candidates(
+                    candidate_set,
+                    provider=provider,
+                    fps=10.0,
+                )
+
+        self.assertEqual(selector_call_count, 6)
+        self.assertEqual(review_call_count, 8)
+        self.assertEqual(provider.selection_materialization_calls, 8)
+
+    def test_retry_reuses_passing_proofs_without_spending_budget_again(
+        self,
+    ) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        first_round = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=4,
+            alternate_paths=(0, 1, 2, 3),
+        )
+        replacement_index = 0
+        second_round_lists: list[list[JointTimelineResult]] = [[], [], []]
+        replacement_offsets = ((2, -2), (-2, 2))
+        for profile_index, pool in enumerate(first_round):
+            for result in pool:
+                if result.total_score >= 30.0:
+                    second_round_lists[profile_index].append(result)
+                    continue
+                offsets = replacement_offsets[replacement_index % 2]
+                second_round_lists[profile_index].append(
+                    _joint(
+                        result.timeline,
+                        offsets=offsets,
+                        score=result.total_score,
+                        variant=f"retry-cache-replacement-{replacement_index}",
+                    )
+                )
+                replacement_index += 1
+        second_round = tuple(tuple(pool) for pool in second_round_lists)
+        selector_pools = (*first_round, *second_round)
+        selector_call_count = 0
+        review_call_count = 0
+
+        def selector(*_args: object, **_kwargs: object):
+            nonlocal selector_call_count
+            result = selector_pools[selector_call_count]
+            selector_call_count += 1
+            return result
+
+        def controlled_review(plan, *, available_source_count=None):  # type: ignore[no-untyped-def]
+            nonlocal review_call_count
+            reviewed = _synthetic_review(
+                plan,
+                available_source_count=available_source_count,
+            )
+            review_call_count += 1
+            if review_call_count <= 4 or review_call_count > 8:
+                return reviewed
+            boundaries = tuple(
+                replace(boundary, exceeded_metrics=("pose",))
+                if boundary.source_switch
+                else boundary
+                for boundary in reviewed.boundaries
+            )
+            return replace(
+                reviewed,
+                boundaries=boundaries,
+                hard_failures=("synthetic_retryable_review_failure",),
+            )
+
+        with (
+            patch(
+                "crosscut.joint_visual_candidate_adapter."
+                "select_joint_timeline_candidates",
+                side_effect=selector,
+            ),
+            patch(
+                "crosscut.joint_visual_candidate_adapter.review_timeline",
+                side_effect=controlled_review,
+            ),
+        ):
+            selected = _production_select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertTrue(all(item.review.passed for item in selected.candidate_records))
+        self.assertEqual(selector_call_count, 6)
+        self.assertEqual(provider.selection_materialization_calls, 12)
+        self.assertEqual(review_call_count, 12)
+        audit = selected.selection_retry_audit
+        self.assertEqual(audit["proof_materialization_call_count"], 12)
+        self.assertEqual(audit["review_cache_hit_count"], 4)
+        self.assertEqual(audit["total_unique_candidate_attempt_count"], 12)
+        self.assertEqual(audit["discarded_candidate_count"], 4)
+        self.assertEqual(audit["total_round_count"], 2)
+        self.assertEqual(audit["retry_round_count"], 1)
 
     def test_boundary_option_evidence_is_shared_across_all_profiles_with_progress(
         self,
@@ -1134,18 +2375,15 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             selected.to_dict()["proof_variant_supplement_count"],
             0,
         )
+        profile_names = tuple(
+            item.cadence_profile for item in selected.selections
+        )
         self.assertEqual(
-            [item.cadence_profile for item in selected.selections],
-            [
-                "balanced",
-                "reference",
-                "dense_safe",
-                "balanced",
-                "reference",
-                "dense_safe",
-                "reference",
-                "dense_safe",
-            ],
+            {
+                profile: profile_names.count(profile)
+                for profile in set(profile_names)
+            },
+            {"balanced": 2, "reference": 3, "dense_safe": 3},
         )
         path_zero = next(
             item
@@ -1159,7 +2397,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             (candidate.start_seconds, candidate.end_seconds)
             for candidate in path_zero.shifted_timeline_result.candidates
         )
-        self.assertEqual(spans, ((5.0, 6.2), (6.2, 6.8), (6.8, 8.0)))
+        self.assertEqual(spans, ((5.0, 6.0), (6.0, 7.0), (7.0, 8.0)))
         self.assertNotIn(str(RAW_SENTINEL), repr(selected.to_dict()))
 
     def test_unique_path_floor_fails_closed_after_proof_dedup(self) -> None:
@@ -1520,12 +2758,24 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 provider=provider,
                 fps=10.0,
             )
+        self.assertEqual(provider.selection_materialization_calls, 8)
+        with self.assertRaisesRegex(
+            ValueError,
+            "another boundary proof variant",
+        ):
+            replace(
+                selected,
+                boundary_proof_bundles=tuple(
+                    reversed(selected.boundary_proof_bundles)
+                ),
+            )
         materialized = materialize_joint_visual_candidates(
             selected,
             provider=provider,
             fps=10.0,
             maximum_candidates=8,
         )
+        self.assertEqual(provider.selection_materialization_calls, 8)
 
         self.assertEqual(len(materialized), 8)
         self.assertEqual(
@@ -1559,14 +2809,48 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 motion.analysis_basis,
                 JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS,
             )
+            source_path = tuple(
+                choice.candidate.source_id
+                for choice in item.candidate_record.timeline_result.choices
+            )
+            switched_boundaries = tuple(
+                index
+                for index, (outgoing, incoming) in enumerate(
+                    zip(source_path, source_path[1:])
+                )
+                if outgoing != incoming
+            )
+            native_boundaries = tuple(
+                index
+                for index in range(len(source_path) - 1)
+                if index not in switched_boundaries
+            )
             self.assertEqual(motion.applied_count, 3)
-            self.assertEqual(motion.boundary_match_count, 2)
+            self.assertEqual(
+                motion.boundary_match_count,
+                len(switched_boundaries),
+            )
             self.assertEqual(motion.affine_boundary_match_count, 0)
-            self.assertEqual(motion.zoom_event_count, 2)
-            self.assertEqual(motion.pan_event_count, 1)
-            self.assertEqual(motion.roll_event_count, 1)
-            self.assertEqual(motion.accepted_boundary_indices, (0, 1))
-            self.assertEqual(motion.natural_match_boundary_indices, ())
+            self.assertEqual(
+                motion.zoom_event_count,
+                len(switched_boundaries),
+            )
+            self.assertEqual(
+                motion.pan_event_count,
+                int(0 in switched_boundaries),
+            )
+            self.assertEqual(
+                motion.roll_event_count,
+                int(1 in switched_boundaries),
+            )
+            self.assertEqual(
+                motion.accepted_boundary_indices,
+                switched_boundaries,
+            )
+            self.assertEqual(
+                motion.natural_match_boundary_indices,
+                native_boundaries,
+            )
             self.assertEqual(motion.blocked_dissolve_segment_count, 0)
             for segment, path, motion_segment in zip(
                 item.segments,
@@ -1768,6 +3052,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             offsets=(2, 0),
             score=10.0,
             variant="scene-cut-shift",
+            allow_same_source_offsets=True,
         )
 
         shifted = _shift_joint_timeline_result(
@@ -1796,6 +3081,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             offsets=(-8, 0),
             score=10.0,
             variant="short",
+            allow_same_source_offsets=True,
         )
         with self.assertRaisesRegex(ValueError, "shorter than two frames"):
             _shift_joint_timeline_result(

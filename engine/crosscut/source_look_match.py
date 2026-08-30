@@ -54,6 +54,22 @@ def _deadband(value: float, identity: float, tolerance: float) -> float:
     return identity if abs(value - identity) < tolerance else value
 
 
+def _directional_residual_is_reliable(
+    values: Sequence[float],
+    *,
+    residual_median: float,
+    residual_mad: float,
+    deadband: float,
+) -> bool:
+    """Allow one bounded step for a large but consistently directed error."""
+
+    if not values or abs(residual_median) < 2.0 * residual_mad + deadband:
+        return False
+    direction = 1.0 if residual_median > 0.0 else -1.0
+    agreeing = sum(value * direction > deadband for value in values)
+    return agreeing / len(values) >= 0.80 - 1e-12
+
+
 @dataclass(frozen=True, slots=True)
 class LookMetricVector:
     """Robust per-frame or aggregate color statistics in normalized units."""
@@ -520,13 +536,52 @@ def match_source_look_samples(
             math.log(1.25),
             0.35,
         )
-        component_safe = tuple(
-            mad <= stable_limit and abs(median) <= plausible_limit
-            for median, mad, stable_limit, plausible_limit in zip(
-                residual_median,
+        component_deadbands = (0.005, 0.010, 0.015, 0.004)
+        component_stable = tuple(
+            mad <= stable_limit
+            for mad, stable_limit in zip(
                 residual_mad,
                 stable_limits,
+                strict=True,
+            )
+        )
+        component_large_directional = tuple(
+            stable
+            and abs(median) > plausible_limit
+            and _directional_residual_is_reliable(
+                tuple(item[index] for item in residuals),
+                residual_median=median,
+                residual_mad=mad,
+                deadband=deadband,
+            )
+            for index, (
+                median,
+                mad,
+                stable,
+                plausible_limit,
+                deadband,
+            ) in enumerate(
+                zip(
+                    residual_median,
+                    residual_mad,
+                    component_stable,
+                    plausible_limits,
+                    component_deadbands,
+                    strict=True,
+                )
+            )
+        )
+        component_safe = tuple(
+            stable
+            and (
+                abs(median) <= plausible_limit
+                or large_directional
+            )
+            for median, stable, plausible_limit, large_directional in zip(
+                residual_median,
+                component_stable,
                 plausible_limits,
+                component_large_directional,
                 strict=True,
             )
         )
@@ -598,6 +653,12 @@ def match_source_look_samples(
                     (
                         "unstable_synchronized_residual"
                         if mad > stable_limit
+                        else (
+                            "bounded_directional_step_applied_"
+                            "large_stable_residual"
+                        )
+                        if large_directional
+                        and abs(value - identity) > 1e-12
                         else "required_correction_exceeds_safe_evidence_range"
                         if abs(median) > plausible_limit
                         else "identity_within_deadband"
@@ -605,12 +666,22 @@ def match_source_look_samples(
                         else "bounded_adjustment_applied"
                     ),
                 )
-                for name, median, mad, stable_limit, plausible_limit, value, identity in zip(
+                for (
+                    name,
+                    median,
+                    mad,
+                    stable_limit,
+                    plausible_limit,
+                    large_directional,
+                    value,
+                    identity,
+                ) in zip(
                     component_names,
                     residual_median,
                     residual_mad,
                     stable_limits,
                     plausible_limits,
+                    component_large_directional,
                     applied_values,
                     identities,
                     strict=True,

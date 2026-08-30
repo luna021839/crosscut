@@ -17,7 +17,7 @@ long.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from math import isfinite
@@ -554,7 +554,237 @@ BoundaryOptionRehydrator: TypeAlias = Callable[
     [AuthorizedBoundaryOption],
     tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None,
 ]
-_BoundarySelectionNoGood: TypeAlias = tuple[BoundaryMeasurementKey, int]
+BoundarySelectionNoGood: TypeAlias = tuple[BoundaryMeasurementKey, int]
+
+
+@dataclass(frozen=True, slots=True)
+class JointTimelineCandidateClock:
+    """Exact source/shot and canonical clocks for one selected segment."""
+
+    segment_index: int
+    candidate_id: str
+    source_id: str
+    shot_id: str
+    start_seconds: float
+    end_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.segment_index, bool)
+            or not isinstance(self.segment_index, int)
+            or self.segment_index < 0
+        ):
+            raise ValueError("path candidate segment_index must be non-negative")
+        for field_name in (
+            "candidate_id",
+            "source_id",
+            "shot_id",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise TypeError(f"path candidate {field_name} must be a string")
+        if not self.source_id:
+            raise ValueError("path candidate source_id cannot be empty")
+        start_seconds = _finite_number(
+            self.start_seconds,
+            "path candidate start_seconds",
+        )
+        end_seconds = _finite_number(
+            self.end_seconds,
+            "path candidate end_seconds",
+        )
+        if start_seconds < 0.0 or end_seconds <= start_seconds:
+            raise ValueError("path candidate clocks must have positive duration")
+        object.__setattr__(self, "start_seconds", start_seconds)
+        object.__setattr__(self, "end_seconds", end_seconds)
+
+    @classmethod
+    def from_candidate(
+        cls,
+        candidate: TimelineCandidate,
+    ) -> "JointTimelineCandidateClock":
+        if not isinstance(candidate, TimelineCandidate):
+            raise TypeError("path candidate clock requires a TimelineCandidate")
+        return cls(
+            segment_index=candidate.segment_index,
+            candidate_id=candidate.candidate_id,
+            source_id=candidate.source_id,
+            shot_id=candidate.shot_id,
+            start_seconds=candidate.start_seconds,
+            end_seconds=candidate.end_seconds,
+        )
+
+    @property
+    def deterministic_key(self) -> tuple[str, ...]:
+        return (
+            "candidate",
+            str(self.segment_index),
+            self.candidate_id,
+            self.source_id,
+            self.shot_id,
+            format(self.start_seconds, ".17g"),
+            format(self.end_seconds, ".17g"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JointTimelineBoundaryProofIdentity:
+    """Exact decoded boundary proof chosen between two candidate clocks."""
+
+    boundary_index: int
+    proof_identity: str
+    frame_offset: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.boundary_index, bool)
+            or not isinstance(self.boundary_index, int)
+            or self.boundary_index < 0
+        ):
+            raise ValueError("path boundary_index must be non-negative")
+        object.__setattr__(
+            self,
+            "proof_identity",
+            _exact_identifier(self.proof_identity, "path boundary proof_identity"),
+        )
+        if isinstance(self.frame_offset, bool) or not isinstance(
+            self.frame_offset,
+            int,
+        ):
+            raise TypeError("path boundary frame_offset must be an integer")
+        if self.frame_offset not in JOINT_BOUNDARY_FRAME_OFFSETS:
+            raise ValueError("path boundary frame_offset must be in -8..+8")
+
+    @classmethod
+    def from_option(
+        cls,
+        option: AuthorizedBoundaryOption,
+    ) -> "JointTimelineBoundaryProofIdentity":
+        if not isinstance(option, AuthorizedBoundaryOption):
+            raise TypeError("path boundary proof requires an authorized option")
+        return cls(
+            boundary_index=option.measurement_key.boundary_index,
+            proof_identity=option.proof_identity,
+            frame_offset=option.frame_offset,
+        )
+
+    @property
+    def deterministic_key(self) -> tuple[str, ...]:
+        return (
+            "boundary",
+            str(self.boundary_index),
+            self.proof_identity,
+            str(self.frame_offset),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JointTimelinePathSignature:
+    """Canonical complete-path identity used by decoded-QA no-goods.
+
+    Candidate clocks identify the exact source/shot material selected for each
+    segment.  Boundary identities record the exact rehydrated proof and frame
+    offset between each adjacent pair.  Crop/track proof details deliberately
+    stay outside this stable identity: the boundary proof identity owns them.
+    """
+
+    candidate_clocks: tuple[JointTimelineCandidateClock, ...]
+    boundary_proofs: tuple[JointTimelineBoundaryProofIdentity, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_clocks, tuple):
+            raise TypeError("path candidate_clocks must be a tuple")
+        if not isinstance(self.boundary_proofs, tuple):
+            raise TypeError("path boundary_proofs must be a tuple")
+        if not self.candidate_clocks:
+            raise ValueError("complete path requires at least one candidate clock")
+        if any(
+            type(item) is not JointTimelineCandidateClock
+            for item in self.candidate_clocks
+        ):
+            raise TypeError("complete path candidate clocks are invalid")
+        if any(
+            type(item) is not JointTimelineBoundaryProofIdentity
+            for item in self.boundary_proofs
+        ):
+            raise TypeError("complete path boundary proofs are invalid")
+        if len(self.boundary_proofs) != len(self.candidate_clocks) - 1:
+            raise ValueError(
+                "complete path boundary count must be one less than candidate count"
+            )
+        segment_indices = tuple(
+            item.segment_index for item in self.candidate_clocks
+        )
+        if segment_indices != tuple(
+            range(segment_indices[0], segment_indices[0] + len(segment_indices))
+        ):
+            raise ValueError("complete path candidate segments must be contiguous")
+        if tuple(
+            item.boundary_index for item in self.boundary_proofs
+        ) != tuple(range(len(self.boundary_proofs))):
+            raise ValueError("complete path boundary indices must be canonical")
+
+    @classmethod
+    def from_selection(
+        cls,
+        candidates: Sequence[TimelineCandidate],
+        boundary_options: Sequence[AuthorizedBoundaryOption],
+    ) -> "JointTimelinePathSignature":
+        if isinstance(candidates, (str, bytes)) or not isinstance(
+            candidates,
+            Sequence,
+        ):
+            raise TypeError("complete path candidates must be a sequence")
+        if isinstance(boundary_options, (str, bytes)) or not isinstance(
+            boundary_options,
+            Sequence,
+        ):
+            raise TypeError("complete path boundary options must be a sequence")
+        selected_candidates = tuple(candidates)
+        selected_options = tuple(boundary_options)
+        if len(selected_options) != len(selected_candidates) - 1:
+            raise ValueError("complete path selection counts are inconsistent")
+        for boundary_index, option in enumerate(selected_options):
+            if not isinstance(option, AuthorizedBoundaryOption):
+                raise TypeError("complete path boundary options are invalid")
+            key = option.measurement_key
+            if (
+                key.boundary_index != boundary_index
+                or key.outgoing != selected_candidates[boundary_index]
+                or key.incoming != selected_candidates[boundary_index + 1]
+            ):
+                raise ValueError(
+                    "complete path boundary proof does not match candidate clocks"
+                )
+        return cls(
+            candidate_clocks=tuple(
+                JointTimelineCandidateClock.from_candidate(candidate)
+                for candidate in selected_candidates
+            ),
+            boundary_proofs=tuple(
+                JointTimelineBoundaryProofIdentity.from_option(option)
+                for option in selected_options
+            ),
+        )
+
+    @property
+    def deterministic_key(self) -> tuple[tuple[str, ...], ...]:
+        components: list[tuple[str, ...]] = [
+            self.candidate_clocks[0].deterministic_key
+        ]
+        for boundary, candidate_clock in zip(
+            self.boundary_proofs,
+            self.candidate_clocks[1:],
+            strict=True,
+        ):
+            components.extend(
+                (
+                    boundary.deterministic_key,
+                    candidate_clock.deterministic_key,
+                )
+            )
+        return tuple(components)
+
+
 SegmentBridgeProvider: TypeAlias = Callable[
     [
         TimelineCandidate,
@@ -786,6 +1016,15 @@ class JointTimelineResult:
         return self.timeline.candidates
 
     @property
+    def complete_path_signature(self) -> JointTimelinePathSignature:
+        """Return the exact complete path used by decoded-QA no-goods."""
+
+        return JointTimelinePathSignature.from_selection(
+            self.candidates,
+            self.boundary_options,
+        )
+
+    @property
     def total_score(self) -> float:
         return self.timeline.total_score
 
@@ -837,7 +1076,7 @@ class _SelectionCumulativeAudit:
 class _BoundarySelectionRetry(RuntimeError):
     def __init__(
         self,
-        failures: frozenset[_BoundarySelectionNoGood],
+        failures: frozenset[BoundarySelectionNoGood],
     ) -> None:
         super().__init__("selected boundary evidence requires exact retry")
         self.failures = failures
@@ -1358,6 +1597,7 @@ def _no_path_reason(rejection_counts: Mapping[str, int]) -> str:
         or reason
         in {
             "boundary_option_timeline_hard_gate",
+            "boundary_selection_external_no_good_rejected",
             "boundary_selection_exact_rehydration_rejected",
             "exact_boundary_no_good",
             "segment_duration_below_two_frames",
@@ -1368,6 +1608,125 @@ def _no_path_reason(rejection_counts: Mapping[str, int]) -> str:
     if hard and not incomplete:
         return "joint_timeline_hard_incompatible"
     return "joint_timeline_state_graph_exhausted"
+
+
+def _canonical_forbidden_boundary_selections(
+    candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
+    | Sequence[Sequence[TimelineCandidate]],
+    values: Collection[BoundarySelectionNoGood],
+) -> frozenset[BoundarySelectionNoGood]:
+    if (
+        isinstance(values, (str, bytes, Mapping))
+        or not isinstance(values, Collection)
+    ):
+        raise TypeError("forbidden_boundary_selections must be a collection")
+    canonical: set[BoundarySelectionNoGood] = set()
+    for value in values:
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise TypeError(
+                "forbidden_boundary_selections must contain exact "
+                "(BoundaryMeasurementKey, frame_offset) tuples"
+            )
+        measurement_key, frame_offset = value
+        if not isinstance(measurement_key, BoundaryMeasurementKey):
+            raise TypeError(
+                "forbidden boundary selection key must be a "
+                "BoundaryMeasurementKey"
+            )
+        if isinstance(frame_offset, bool) or not isinstance(frame_offset, int):
+            raise TypeError(
+                "forbidden boundary selection frame_offset must be an integer"
+            )
+        if frame_offset not in JOINT_BOUNDARY_FRAME_OFFSETS:
+            raise ValueError(
+                "forbidden boundary selection frame_offset must be in -8..+8"
+            )
+        canonical.add((measurement_key, frame_offset))
+    if not canonical:
+        return frozenset()
+
+    segments = _normalise_segments(candidates_by_segment)
+    for measurement_key, _frame_offset in canonical:
+        boundary_index = measurement_key.boundary_index
+        if (
+            boundary_index >= len(segments) - 1
+            or measurement_key.outgoing not in segments[boundary_index]
+            or measurement_key.incoming not in segments[boundary_index + 1]
+        ):
+            raise ValueError(
+                "forbidden boundary selection does not belong to the "
+                "candidate lattice"
+            )
+    return frozenset(canonical)
+
+
+def _canonical_forbidden_complete_paths(
+    candidates_by_segment: Mapping[int, Sequence[TimelineCandidate]]
+    | Sequence[Sequence[TimelineCandidate]],
+    values: Collection[JointTimelinePathSignature],
+) -> frozenset[JointTimelinePathSignature]:
+    if (
+        isinstance(values, (str, bytes, Mapping))
+        or not isinstance(values, Collection)
+    ):
+        raise TypeError("forbidden_complete_paths must be a collection")
+    canonical: set[JointTimelinePathSignature] = set()
+    for value in values:
+        if type(value) is not JointTimelinePathSignature:
+            raise TypeError(
+                "forbidden_complete_paths must contain exact "
+                "JointTimelinePathSignature values"
+            )
+        # Re-run the public constructor so even a forged or deserialized
+        # instance cannot bypass the immutable structural contract.
+        canonical.add(
+            JointTimelinePathSignature(
+                candidate_clocks=tuple(
+                    JointTimelineCandidateClock(
+                        segment_index=item.segment_index,
+                        candidate_id=item.candidate_id,
+                        source_id=item.source_id,
+                        shot_id=item.shot_id,
+                        start_seconds=item.start_seconds,
+                        end_seconds=item.end_seconds,
+                    )
+                    for item in value.candidate_clocks
+                ),
+                boundary_proofs=tuple(
+                    JointTimelineBoundaryProofIdentity(
+                        boundary_index=item.boundary_index,
+                        proof_identity=item.proof_identity,
+                        frame_offset=item.frame_offset,
+                    )
+                    for item in value.boundary_proofs
+                ),
+            )
+        )
+    if not canonical:
+        return frozenset()
+
+    segments = _normalise_segments(candidates_by_segment)
+    lattice_clocks = tuple(
+        frozenset(
+            JointTimelineCandidateClock.from_candidate(candidate)
+            for candidate in segment
+        )
+        for segment in segments
+    )
+    for path in canonical:
+        if len(path.candidate_clocks) != len(segments):
+            raise ValueError(
+                "forbidden complete path length does not match the "
+                "candidate lattice"
+            )
+        if any(
+            candidate_clock not in lattice_clocks[position]
+            for position, candidate_clock in enumerate(path.candidate_clocks)
+        ):
+            raise ValueError(
+                "forbidden complete path does not belong to the candidate lattice"
+            )
+    return frozenset(canonical)
 
 
 def _select_joint_timeline_candidates_core(
@@ -1395,7 +1754,13 @@ def _select_joint_timeline_candidates_core(
     shared_bridge_evidence_cache: (
         JointTimelineSharedBridgeEvidenceCache | None
     ) = None,
-    _selection_no_goods: frozenset[_BoundarySelectionNoGood] = frozenset(),
+    _selection_no_goods: frozenset[BoundarySelectionNoGood] = frozenset(),
+    _external_selection_no_goods: frozenset[
+        BoundarySelectionNoGood
+    ] = frozenset(),
+    _forbidden_complete_paths: frozenset[
+        JointTimelinePathSignature
+    ] = frozenset(),
     _selection_option_cache: (
         dict[BoundaryMeasurementKey, BoundaryOptionSet] | None
     ) = None,
@@ -1659,7 +2024,10 @@ def _select_joint_timeline_candidates_core(
     rejection_counts = selection_audit.rejection_counts
     layer_rejection_counts: dict[str, int] = {}
     total_boundary_layers = max(0, len(segments) - 1)
-    state_result_limit = maximum_results + (
+    retained_result_limit = maximum_results + len(
+        _forbidden_complete_paths
+    )
+    state_result_limit = retained_result_limit + (
         1 if option_rehydrator is not None else 0
     )
 
@@ -2255,8 +2623,20 @@ def _select_joint_timeline_candidates_core(
                 options = selectable_options(option_set)
                 if not options:
                     if option_set.authorized_options:
+                        authorized_keys = {
+                            (option.measurement_key, option.frame_offset)
+                            for option in option_set.authorized_options
+                        }
                         reject_layer_only(
-                            "boundary_selection_exact_rehydration_rejected"
+                            "boundary_selection_external_no_good_rejected"
+                            if authorized_keys
+                            and authorized_keys.issubset(
+                                _external_selection_no_goods
+                            )
+                            else (
+                                "boundary_selection_exact_"
+                                "rehydration_rejected"
+                            )
                         )
                     else:
                         reject(
@@ -2508,17 +2888,17 @@ def _select_joint_timeline_candidates_core(
         }
         if option_rehydrator is not None:
             for nodes in current_layer.values():
-                if len(nodes) <= maximum_results:
+                if len(nodes) <= retained_result_limit:
                     continue
                 if abs(
-                    nodes[maximum_results - 1].cumulative_score
-                    - nodes[maximum_results].cumulative_score
+                    nodes[retained_result_limit - 1].cumulative_score
+                    - nodes[retained_result_limit].cumulative_score
                 ) <= 1e-12:
                     raise RuntimeError(
                         "provisional boundary proof identity reached an "
                         "unresolved exact top-K tie"
                     )
-                del nodes[maximum_results:]
+                del nodes[retained_result_limit:]
         if not current_layer:
             reason_code = _no_path_reason(layer_rejection_counts)
             summary = ",".join(
@@ -2549,20 +2929,22 @@ def _select_joint_timeline_candidates_core(
             ):
                 final_by_signature[node.path_signature] = node
     ranked_final_nodes = tuple(
-        sorted(final_by_signature.values(), key=_node_rank_key)[:maximum_results]
+        sorted(final_by_signature.values(), key=_node_rank_key)[
+            :retained_result_limit
+        ]
     )
     rehydration_cache: dict[
         tuple[BoundaryMeasurementKey, int, str],
         tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None,
     ] = {}
-    selection_failures: set[_BoundarySelectionNoGood] = set()
+    selection_failures: set[BoundarySelectionNoGood] = set()
     rehydrated_backtraces: list[
         tuple[
             _JointNode,
             tuple[_JointNode, ...],
             tuple[AuthorizedBoundaryOption, ...],
             tuple[BoundaryOptionSet, ...],
-            tuple[tuple[str, ...], ...],
+            JointTimelinePathSignature,
         ]
     ] = []
     for final_node in ranked_final_nodes:
@@ -2640,32 +3022,17 @@ def _select_joint_timeline_candidates_core(
             exact_option_sets.append(exact_option_set)
         if path_failed:
             continue
-        exact_signature: list[tuple[str, ...]] = [
-            _candidate_signature(selected_nodes[0].candidate)
-        ]
-        for selected_node, exact_option in zip(
-            selected_nodes[1:],
-            exact_options,
-            strict=True,
-        ):
-            exact_signature.extend(
-                (
-                    (
-                        "boundary",
-                        str(exact_option.measurement_key.boundary_index),
-                        exact_option.proof_identity,
-                        str(exact_option.frame_offset),
-                    ),
-                    _candidate_signature(selected_node.candidate),
-                )
-            )
+        exact_signature = JointTimelinePathSignature.from_selection(
+            tuple(item.candidate for item in selected_nodes),
+            tuple(exact_options),
+        )
         rehydrated_backtraces.append(
             (
                 final_node,
                 tuple(selected_nodes),
                 tuple(exact_options),
                 tuple(exact_option_sets),
-                tuple(exact_signature),
+                exact_signature,
             )
         )
     if selection_failures:
@@ -2690,9 +3057,38 @@ def _select_joint_timeline_candidates_core(
         key=lambda item: (
             -item[0].cumulative_score,
             _state_sort_key(item[0].state),
-            item[4],
+            item[4].deterministic_key,
         )
     )
+    forbidden_path_rejection_count = sum(
+        1
+        for item in rehydrated_backtraces
+        if item[4] in _forbidden_complete_paths
+    )
+    if forbidden_path_rejection_count:
+        rejection_counts["complete_path_external_no_good_rejected"] = (
+            rejection_counts.get(
+                "complete_path_external_no_good_rejected",
+                0,
+            )
+            + forbidden_path_rejection_count
+        )
+        rehydrated_backtraces = [
+            item
+            for item in rehydrated_backtraces
+            if item[4] not in _forbidden_complete_paths
+        ]
+    del rehydrated_backtraces[maximum_results:]
+    if not rehydrated_backtraces:
+        terminal_rejections = dict(rejection_counts)
+        report_progress("selection_failed", total_boundary_layers)
+        raise NoCompleteTimelinePath(
+            "all complete joint timeline paths were rejected by exact "
+            "external no-goods",
+            reason_code="joint_timeline_complete_path_no_good_exhausted",
+            segment_index=segments[-1][0].segment_index,
+            rejection_counts=terminal_rejections,
+        )
     measured_option_sets = tuple(
         option_cache[key]
         for key in sorted(option_cache, key=_measurement_sort_key)
@@ -2830,6 +3226,8 @@ def select_joint_timeline(
     shared_bridge_evidence_cache: (
         JointTimelineSharedBridgeEvidenceCache | None
     ) = None,
+    forbidden_boundary_selections: Collection[BoundarySelectionNoGood] = (),
+    forbidden_complete_paths: Collection[JointTimelinePathSignature] = (),
 ) -> JointTimelineResult:
     """Return the single best fully authorized joint timeline."""
 
@@ -2850,6 +3248,8 @@ def select_joint_timeline(
         forbidden_boundary_edges=forbidden_boundary_edges,
         progress_callback=progress_callback,
         shared_bridge_evidence_cache=shared_bridge_evidence_cache,
+        forbidden_boundary_selections=forbidden_boundary_selections,
+        forbidden_complete_paths=forbidden_complete_paths,
     )[0]
 
 
@@ -2878,18 +3278,30 @@ def select_joint_timeline_candidates(
     shared_bridge_evidence_cache: (
         JointTimelineSharedBridgeEvidenceCache | None
     ) = None,
+    forbidden_boundary_selections: Collection[BoundarySelectionNoGood] = (),
+    forbidden_complete_paths: Collection[JointTimelinePathSignature] = (),
 ) -> tuple[JointTimelineResult, ...]:
     """Return up to eight distinct source/shot/boundary-proof paths.
 
     The k-best Viterbi keeps at most ``maximum_results`` unique path
     signatures per future-equivalent state.  Boundary and bridge providers are
     memoized once for the whole search, so increasing K never remeasures an
-    exact request.
+    exact request.  Complete-path no-goods are matched only after exact proof
+    rehydration; the DP retains the requested count plus every validated
+    forbidden path so exclusions cannot hide the next eligible result.
     """
 
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
-    selection_no_goods: frozenset[_BoundarySelectionNoGood] = frozenset()
+    external_selection_no_goods = _canonical_forbidden_boundary_selections(
+        candidates_by_segment,
+        forbidden_boundary_selections,
+    )
+    external_complete_path_no_goods = _canonical_forbidden_complete_paths(
+        candidates_by_segment,
+        forbidden_complete_paths,
+    )
+    selection_no_goods = external_selection_no_goods
     selection_option_cache: dict[
         BoundaryMeasurementKey,
         BoundaryOptionSet,
@@ -2947,6 +3359,8 @@ def select_joint_timeline_candidates(
                 ),
                 shared_bridge_evidence_cache=shared_bridge_evidence_cache,
                 _selection_no_goods=selection_no_goods,
+                _external_selection_no_goods=external_selection_no_goods,
+                _forbidden_complete_paths=external_complete_path_no_goods,
                 _selection_option_cache=selection_option_cache,
                 _selection_audit=selection_audit,
             )
@@ -2968,9 +3382,13 @@ __all__ = [
     "BoundaryOptionProvider",
     "BoundaryOptionRehydrator",
     "BoundaryOptionSet",
+    "BoundarySelectionNoGood",
     "BoundaryTransformState",
     "JOINT_BOUNDARY_FRAME_OFFSETS",
     "JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES",
+    "JointTimelineBoundaryProofIdentity",
+    "JointTimelineCandidateClock",
+    "JointTimelinePathSignature",
     "JointTimelineResult",
     "JointTimelineProgress",
     "JointTimelineProgressCallback",

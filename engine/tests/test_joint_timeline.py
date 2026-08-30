@@ -12,9 +12,13 @@ from crosscut.joint_timeline import (
     BoundaryOffsetDisposition,
     BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
+    BoundarySelectionNoGood,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
     JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+    JointTimelineBoundaryProofIdentity,
+    JointTimelineCandidateClock,
+    JointTimelinePathSignature,
     JointTimelineProgress,
     JointTimelineSharedBridgeEvidenceCache,
     SegmentBridgeDisposition,
@@ -364,6 +368,494 @@ def zero_offset_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
 
 
 class JointTimelineTests(unittest.TestCase):
+    def test_forbidden_boundary_selection_is_exact_to_key_and_offset(
+        self,
+    ) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        segments = ((outgoing,), (incoming,))
+        key = BoundaryMeasurementKey.from_candidates(0, outgoing, incoming)
+        forbidden: tuple[BoundarySelectionNoGood, ...] = (
+            (key, 0),
+            (key, 0),
+        )
+
+        ranked = select_joint_timeline_candidates(
+            segments,
+            option_provider=lambda measured_key: option_set(
+                measured_key,
+                authorized={0: 0.0, 1: -0.1},
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=2,
+            forbidden_boundary_selections=forbidden,
+        )
+        single = select_joint_timeline(
+            segments,
+            option_provider=lambda measured_key: option_set(
+                measured_key,
+                authorized={0: 0.0, 1: -0.1},
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+            forbidden_boundary_selections=((key, 0),),
+        )
+
+        self.assertEqual(
+            tuple(
+                item.boundary_options[0].frame_offset
+                for item in ranked
+            ),
+            (1,),
+        )
+        self.assertEqual(single.boundary_options[0].frame_offset, 1)
+
+    def test_omitted_forbidden_boundary_selections_remains_compatible(
+        self,
+    ) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        segments = ((outgoing,), (incoming,))
+
+        omitted = select_joint_timeline(
+            segments,
+            option_provider=lambda key: option_set(
+                key,
+                authorized={0: 0.0, 1: -0.1},
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        explicit_empty = select_joint_timeline(
+            segments,
+            option_provider=lambda key: option_set(
+                key,
+                authorized={0: 0.0, 1: -0.1},
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+            forbidden_boundary_selections=(),
+        )
+
+        self.assertEqual(omitted.timeline, explicit_empty.timeline)
+        self.assertEqual(
+            omitted.boundary_options,
+            explicit_empty.boundary_options,
+        )
+
+    def test_initial_forbidden_selection_unions_with_rehydration_no_good(
+        self,
+    ) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        segments = ((outgoing,), (incoming,))
+        key = BoundaryMeasurementKey.from_candidates(0, outgoing, incoming)
+        measured: dict[BoundaryMeasurementKey, BoundaryOptionSet] = {}
+        rehydrated_offsets: list[int] = []
+
+        def provide_options(
+            measured_key: BoundaryMeasurementKey,
+        ) -> BoundaryOptionSet:
+            result = selection_scalar_option_set(
+                measured_key,
+                authorized={0: 0.0, 1: -0.1, 2: -0.2},
+            )
+            measured[measured_key] = result
+            return result
+
+        def rehydrate(
+            provisional: AuthorizedBoundaryOption,
+        ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet] | None:
+            rehydrated_offsets.append(provisional.frame_offset)
+            if provisional.frame_offset == 1:
+                return None
+            return exact_rehydrated_option_set(
+                provisional,
+                measured[provisional.measurement_key],
+            )
+
+        result = select_joint_timeline(
+            segments,
+            option_provider=provide_options,
+            option_rehydrator=rehydrate,
+            fps=30.0,
+            config=isolated_score_config(),
+            forbidden_boundary_selections=((key, 0),),
+        )
+
+        self.assertEqual(result.boundary_options[0].frame_offset, 2)
+        self.assertEqual(rehydrated_offsets, [1, 2])
+        self.assertEqual(
+            dict(result.rejection_counts)[
+                "boundary_selection_exact_rehydration_rejected"
+            ],
+            1,
+        )
+
+    def test_invalid_forbidden_boundary_selections_fail_before_provider(
+        self,
+    ) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        segments = ((outgoing,), (incoming,))
+        key = BoundaryMeasurementKey.from_candidates(0, outgoing, incoming)
+        foreign = BoundaryMeasurementKey.from_candidates(
+            0,
+            replace(outgoing, candidate_id="candidate:0:foreign"),
+            incoming,
+        )
+        provider_calls = 0
+
+        def provide_options(
+            measured_key: BoundaryMeasurementKey,
+        ) -> BoundaryOptionSet:
+            nonlocal provider_calls
+            provider_calls += 1
+            return option_set(measured_key, authorized={0: 0.0})
+
+        invalid_cases = (
+            ("bool", ((key, True),), TypeError, "must be an integer"),
+            ("out_of_range", ((key, 9),), ValueError, "must be in -8..\\+8"),
+            (
+                "foreign_key",
+                ((foreign, 0),),
+                ValueError,
+                "does not belong to the candidate lattice",
+            ),
+        )
+        for name, forbidden, exception_type, message in invalid_cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(exception_type, message):
+                    select_joint_timeline_candidates(
+                        segments,
+                        option_provider=provide_options,
+                        fps=30.0,
+                        config=isolated_score_config(),
+                        forbidden_boundary_selections=forbidden,
+                    )
+            self.assertEqual(provider_calls, 0)
+
+    def test_external_exact_no_good_has_distinct_rejection_reason(self) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        segments = ((outgoing,), (incoming,))
+        key = BoundaryMeasurementKey.from_candidates(0, outgoing, incoming)
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_timeline(
+                segments,
+                option_provider=lambda measured_key: option_set(
+                    measured_key,
+                    authorized={0: 0.0},
+                ),
+                fps=30.0,
+                config=isolated_score_config(),
+                forbidden_boundary_selections=((key, 0),),
+            )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_timeline_hard_incompatible",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts[
+                "boundary_selection_external_no_good_rejected"
+            ],
+            1,
+        )
+
+    def test_complete_path_signature_binds_clocks_and_exact_boundary(self) -> None:
+        outgoing = candidate(0, "outgoing", 0.8)
+        incoming = candidate(1, "incoming", 0.8)
+        result = select_joint_timeline(
+            ((outgoing,), (incoming,)),
+            option_provider=lambda key: option_set(
+                key,
+                authorized={-1: 0.0},
+            ),
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+
+        signature = result.complete_path_signature
+
+        self.assertIsInstance(signature, JointTimelinePathSignature)
+        self.assertEqual(
+            signature.candidate_clocks,
+            (
+                JointTimelineCandidateClock.from_candidate(outgoing),
+                JointTimelineCandidateClock.from_candidate(incoming),
+            ),
+        )
+        self.assertEqual(
+            signature.boundary_proofs,
+            (
+                JointTimelineBoundaryProofIdentity.from_option(
+                    result.boundary_options[0]
+                ),
+            ),
+        )
+        self.assertEqual(signature.boundary_proofs[0].frame_offset, -1)
+        self.assertIn(
+            result.boundary_options[0].proof_identity,
+            signature.deterministic_key[1],
+        )
+
+    def test_forbidding_top_eight_complete_paths_returns_exact_ninth(
+        self,
+    ) -> None:
+        first_segment = tuple(
+            replace(
+                candidate(0, "same", 0.8),
+                candidate_id=f"candidate:0:same:{index:02d}",
+                shot_id=f"shot:0:same:{index:02d}",
+            )
+            for index in range(9)
+        )
+        segments = (
+            first_segment,
+            (candidate(1, "end", 0.8),),
+        )
+        initial = select_joint_timeline_candidates(
+            segments,
+            option_provider=zero_offset_options,
+            fps=30.0,
+            config=isolated_score_config(),
+            maximum_results=8,
+        )
+        forbidden = tuple(
+            item.complete_path_signature for item in initial
+        )
+
+        selected = tuple(
+            select_joint_timeline_candidates(
+                segments,
+                option_provider=zero_offset_options,
+                fps=30.0,
+                config=isolated_score_config(),
+                maximum_results=1,
+                forbidden_complete_paths=forbidden,
+            )[0]
+            for _attempt in range(2)
+        )
+
+        self.assertEqual(len(initial), 8)
+        self.assertEqual(
+            tuple(
+                item.candidates[0].candidate_id for item in selected
+            ),
+            ("candidate:0:same:08", "candidate:0:same:08"),
+        )
+        self.assertNotIn(selected[0].complete_path_signature, forbidden)
+        self.assertEqual(
+            dict(selected[0].rejection_counts)[
+                "complete_path_external_no_good_rejected"
+            ],
+            8,
+        )
+
+    def test_complete_path_no_good_is_exact_to_boundary_proof(self) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8),),
+        )
+        initial = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        signature = initial.complete_path_signature
+        near_miss = replace(
+            signature,
+            boundary_proofs=(
+                replace(
+                    signature.boundary_proofs[0],
+                    proof_identity=(
+                        signature.boundary_proofs[0].proof_identity
+                        + ":different-proof"
+                    ),
+                ),
+            ),
+        )
+
+        selected = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            fps=30.0,
+            config=isolated_score_config(),
+            forbidden_complete_paths=(near_miss,),
+        )
+
+        self.assertEqual(selected.complete_path_signature, signature)
+        self.assertNotIn(
+            "complete_path_external_no_good_rejected",
+            dict(selected.rejection_counts),
+        )
+
+    def test_complete_path_no_good_matches_after_exact_rehydration(self) -> None:
+        preferred = candidate(0, "preferred", 1.0)
+        fallback = candidate(0, "fallback", 0.5)
+        incoming = candidate(1, "incoming", 0.5)
+        segments = ((preferred, fallback), (incoming,))
+
+        def select(
+            forbidden: tuple[JointTimelinePathSignature, ...] = (),
+        ):
+            provisional_sets: dict[
+                BoundaryMeasurementKey,
+                BoundaryOptionSet,
+            ] = {}
+
+            def provide_options(
+                key: BoundaryMeasurementKey,
+            ) -> BoundaryOptionSet:
+                measured = selection_scalar_option_set(
+                    key,
+                    authorized={0: 0.0},
+                )
+                provisional_sets[key] = measured
+                return measured
+
+            def rehydrate(
+                provisional: AuthorizedBoundaryOption,
+            ) -> tuple[AuthorizedBoundaryOption, BoundaryOptionSet]:
+                return exact_rehydrated_option_set(
+                    provisional,
+                    provisional_sets[provisional.measurement_key],
+                )
+
+            return select_joint_timeline(
+                segments,
+                option_provider=provide_options,
+                option_rehydrator=rehydrate,
+                fps=30.0,
+                config=isolated_score_config(),
+                forbidden_complete_paths=forbidden,
+            )
+
+        initial = select()
+        selected = select((initial.complete_path_signature,))
+
+        self.assertIs(initial.candidates[0], preferred)
+        self.assertIs(selected.candidates[0], fallback)
+        self.assertTrue(
+            all(
+                proof.proof_identity.endswith(":exact")
+                for proof in selected.complete_path_signature.boundary_proofs
+            )
+        )
+
+    def test_all_complete_paths_forbidden_is_typed_exact_exhaustion(self) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8),),
+        )
+        initial = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            fps=30.0,
+            config=isolated_score_config(),
+        )
+        provider_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal provider_calls
+            provider_calls += 1
+            return zero_offset_options(key)
+
+        with self.assertRaises(NoCompleteTimelinePath) as caught:
+            select_joint_timeline_candidates(
+                segments,
+                option_provider=provide_options,
+                fps=30.0,
+                config=isolated_score_config(),
+                forbidden_complete_paths=(
+                    initial.complete_path_signature,
+                    initial.complete_path_signature,
+                ),
+            )
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_timeline_complete_path_no_good_exhausted",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts,
+            {"complete_path_external_no_good_rejected": 1},
+        )
+
+    def test_malformed_complete_path_no_goods_fail_before_provider(self) -> None:
+        segments = (
+            (candidate(0, "A", 0.8),),
+            (candidate(1, "B", 0.8),),
+        )
+        initial = select_joint_timeline(
+            segments,
+            option_provider=zero_offset_options,
+            fps=30.0,
+            config=isolated_score_config(),
+        ).complete_path_signature
+        foreign = replace(
+            initial,
+            candidate_clocks=(
+                JointTimelineCandidateClock.from_candidate(
+                    candidate(0, "foreign", 0.8)
+                ),
+                initial.candidate_clocks[1],
+            ),
+        )
+        short = JointTimelinePathSignature(
+            candidate_clocks=(initial.candidate_clocks[0],),
+            boundary_proofs=(),
+        )
+        provider_calls = 0
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            nonlocal provider_calls
+            provider_calls += 1
+            return zero_offset_options(key)
+
+        invalid_cases = (
+            (
+                "raw_tuple",
+                (("not-a-signature",),),
+                TypeError,
+                "JointTimelinePathSignature",
+            ),
+            (
+                "mapping",
+                {"invalid": initial},
+                TypeError,
+                "must be a collection",
+            ),
+            (
+                "foreign",
+                (foreign,),
+                ValueError,
+                "does not belong to the candidate lattice",
+            ),
+            (
+                "wrong_length",
+                (short,),
+                ValueError,
+                "length does not match the candidate lattice",
+            ),
+        )
+        for name, forbidden, exception_type, message in invalid_cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(exception_type, message):
+                    select_joint_timeline_candidates(
+                        segments,
+                        option_provider=provide_options,
+                        fps=30.0,
+                        config=isolated_score_config(),
+                        forbidden_complete_paths=forbidden,
+                    )
+            self.assertEqual(provider_calls, 0)
+
     def test_selected_scalar_rehydration_rejects_once_and_reselects_exact(
         self,
     ) -> None:

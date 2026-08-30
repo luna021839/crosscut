@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import permutations
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -121,6 +122,70 @@ class SourceLookMatchTests(unittest.TestCase):
         self.assertLessEqual(abs(repair.temperature_balance), 0.025)
         self.assertEqual(result.evidence[1].reason, "stable_bounded_static_match")
         self.assertTrue(result.adjustment_for_source(2).is_identity)
+
+    def test_large_stable_luma_residual_uses_existing_bounded_directional_step(
+        self,
+    ) -> None:
+        reference = tuple(
+            _metric(0.50, 0.40, 0.40, 0.0) for _ in range(6)
+        )
+        dark = tuple(
+            _metric(0.20, 0.40, 0.40, 0.0) for _ in range(6)
+        )
+        bright = tuple(
+            _metric(0.80, 0.40, 0.40, 0.0) for _ in range(6)
+        )
+
+        result = match_source_look_samples(
+            (reference, dark, bright),
+            canonical_sample_times_seconds=self.times,
+            reference_source=0,
+            config=self.config,
+        )
+
+        self.assertEqual(
+            result.adjustment_for_source(1).brightness,
+            self.config.maximum_brightness,
+        )
+        self.assertEqual(
+            result.adjustment_for_source(2).brightness,
+            -self.config.maximum_brightness,
+        )
+        self.assertEqual(
+            dict(result.evidence[1].component_status)["luma"],
+            "bounded_directional_step_applied_large_stable_residual",
+        )
+        self.assertEqual(
+            dict(result.evidence[2].component_status)["luma"],
+            "bounded_directional_step_applied_large_stable_residual",
+        )
+
+    def test_consensus_is_order_invariant_and_does_not_pin_visual_outlier(
+        self,
+    ) -> None:
+        source_values = (0.75, 0.49, 0.50, 0.51)
+        for order in permutations(range(len(source_values))):
+            samples = tuple(
+                tuple(
+                    _metric(source_values[index], 0.40, 0.40, 0.0)
+                    for _ in range(6)
+                )
+                for index in order
+            )
+            result = match_source_look_samples(
+                samples,
+                canonical_sample_times_seconds=self.times,
+                reference_source=None,
+                config=self.config,
+            )
+            self.assertEqual(result.target_mode, "cross_source_consensus")
+            assert result.target_median is not None
+            self.assertAlmostEqual(result.target_median.luma, 0.505)
+            outlier_position = order.index(0)
+            self.assertLess(
+                result.adjustment_for_source(outlier_position).brightness,
+                0.0,
+            )
 
     def test_volatile_or_missing_evidence_is_identity(self) -> None:
         reference = tuple(_metric(0.50, 0.38, 0.40, 0.0) for _ in range(6))

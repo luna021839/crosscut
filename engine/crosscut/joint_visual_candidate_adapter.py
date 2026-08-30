@@ -12,7 +12,7 @@ to process-local provider materializations and are never serialized here.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 import hashlib
 import json
@@ -34,25 +34,31 @@ from .joint_timeline import (
     BoundaryMeasurementKey,
     BoundaryOptionEvidenceScope,
     BoundaryOptionSet,
+    BoundarySelectionNoGood,
     JOINT_BOUNDARY_FRAME_OFFSETS,
     JOINT_SHARED_BRIDGE_CACHE_MAXIMUM_ENTRIES,
+    JointTimelineBoundaryProofIdentity,
+    JointTimelineCandidateClock,
     JointTimelineProgress,
     JointTimelineProgressCallback,
+    JointTimelinePathSignature,
     JointTimelineResult,
     JointTimelineSharedBridgeEvidenceCache,
     select_joint_timeline_candidates,
 )
 from .timeline import (
-    comparable_group_formation_mismatch,
-    cross_source_layout_mismatch,
-    face_geometry_minimax_mismatch,
     NoCompleteTimelinePath,
     TimelineCandidate,
     TimelineChoice,
     TimelineResult,
 )
 from .timeline_no_good import TimelineNoGoodSet
-from .timeline_review import review_timeline
+from .timeline_review import (
+    JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
+    JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
+    TimelineReview,
+    review_timeline,
+)
 from .render import (
     RenderPlan,
     RenderSegment,
@@ -68,7 +74,6 @@ from .visual_score import (
     VisualTimelineOptimizerSeed,
     VisualTimelinePlan,
     _candidate_review_summary,
-    _embedding_rms_distance,
     _master_clock_time,
     _missing_candidate_face_metadata,
     _missing_candidate_subject_metadata,
@@ -77,6 +82,7 @@ from .visual_score import (
     _safe_cadence_profiles,
     _source_clock_time,
 )
+from .visual_boundary_repair import BoundaryVisualEvidence
 
 
 JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
@@ -87,7 +93,12 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "shifted_scene_cut_clock_rematerialization_v1+"
     "workspace_only_optimizer_seed_v1+"
     "selection_scalar_exact_rehydration_v1+"
-    "finite_exact_boundary_nogood_retry_v1"
+    "finite_exact_boundary_nogood_retry_v1+"
+    "post_transform_result_evidence_projection_v1+"
+    "selection_materialization_review_parity_v1+"
+    "same_source_exact_renderer_clock_continuity_projection_v2+"
+    "authoritative_passing_cohort_retry_v2+"
+    "bounded_exact_proof_materialization_v1"
 )
 JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
@@ -100,6 +111,223 @@ MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS = math.ceil(
 )
 MAXIMUM_PROFILE_JOINT_CANDIDATES = 8
 _SCENE_CUT_INTERIOR_EPSILON_SECONDS = 1e-6
+MAXIMUM_JOINT_VISUAL_RETRY_ROUNDS = 2
+MAXIMUM_JOINT_VISUAL_PROOF_CALLS = 32
+
+
+def _canonical_external_boundary_no_goods(
+    lattice: Sequence[Sequence[TimelineCandidate]],
+    values: Collection[BoundarySelectionNoGood],
+) -> frozenset[BoundarySelectionNoGood]:
+    """Validate process-local exact boundary feedback before any search."""
+
+    if (
+        isinstance(values, (str, bytes, Mapping))
+        or not isinstance(values, Collection)
+    ):
+        raise TypeError("forbidden_boundary_selections must be a collection")
+    canonical: set[BoundarySelectionNoGood] = set()
+    for value in values:
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise TypeError(
+                "forbidden_boundary_selections must contain exact "
+                "(BoundaryMeasurementKey, frame_offset) tuples"
+            )
+        key, frame_offset = value
+        if not isinstance(key, BoundaryMeasurementKey):
+            raise TypeError(
+                "forbidden boundary selection key must be a "
+                "BoundaryMeasurementKey"
+            )
+        if isinstance(frame_offset, bool) or not isinstance(frame_offset, int):
+            raise TypeError(
+                "forbidden boundary selection frame_offset must be an integer"
+            )
+        if frame_offset not in JOINT_BOUNDARY_FRAME_OFFSETS:
+            raise ValueError(
+                "forbidden boundary selection frame_offset must be in -8..+8"
+            )
+        if (
+            key.boundary_index >= len(lattice) - 1
+            or key.outgoing not in lattice[key.boundary_index]
+            or key.incoming not in lattice[key.boundary_index + 1]
+        ):
+            raise ValueError(
+                "forbidden boundary selection does not belong to the "
+                "candidate lattice"
+            )
+        canonical.add((key, frame_offset))
+    return frozenset(canonical)
+
+
+def _canonical_external_complete_path_no_goods(
+    lattice: Sequence[Sequence[TimelineCandidate]],
+    values: Collection[JointTimelinePathSignature],
+) -> frozenset[JointTimelinePathSignature]:
+    """Validate stable complete-path feedback before any profile search."""
+
+    if (
+        isinstance(values, (str, bytes, Mapping))
+        or not isinstance(values, Collection)
+    ):
+        raise TypeError("forbidden_complete_paths must be a collection")
+    canonical: set[JointTimelinePathSignature] = set()
+    for value in values:
+        if type(value) is not JointTimelinePathSignature:
+            raise TypeError(
+                "forbidden_complete_paths must contain exact "
+                "JointTimelinePathSignature values"
+            )
+        canonical.add(
+            JointTimelinePathSignature(
+                candidate_clocks=tuple(
+                    JointTimelineCandidateClock(
+                        segment_index=item.segment_index,
+                        candidate_id=item.candidate_id,
+                        source_id=item.source_id,
+                        shot_id=item.shot_id,
+                        start_seconds=item.start_seconds,
+                        end_seconds=item.end_seconds,
+                    )
+                    for item in value.candidate_clocks
+                ),
+                boundary_proofs=tuple(
+                    JointTimelineBoundaryProofIdentity(
+                        boundary_index=item.boundary_index,
+                        proof_identity=item.proof_identity,
+                        frame_offset=item.frame_offset,
+                    )
+                    for item in value.boundary_proofs
+                ),
+            )
+        )
+    if not canonical:
+        return frozenset()
+
+    lattice_clocks = tuple(
+        frozenset(
+            JointTimelineCandidateClock.from_candidate(candidate)
+            for candidate in segment
+        )
+        for segment in lattice
+    )
+    for path in canonical:
+        if len(path.candidate_clocks) != len(lattice):
+            raise ValueError(
+                "forbidden complete path length does not match the "
+                "candidate lattice"
+            )
+        if any(
+            candidate_clock not in lattice_clocks[position]
+            for position, candidate_clock in enumerate(path.candidate_clocks)
+        ):
+            raise ValueError(
+                "forbidden complete path does not belong to the candidate lattice"
+            )
+    return frozenset(canonical)
+
+
+def _neutral_transition_annotations() -> dict[str, object]:
+    return {
+        "authority": None,
+        "contract": None,
+        "scale": None,
+        "focus": None,
+        "layout": None,
+        "pose_basis": None,
+        "pose": None,
+        "silhouette": None,
+        "formation": None,
+        "entry_side_stability": None,
+        "exit_side_stability": None,
+    }
+
+
+class JointVisualEvidenceCoverageError(ValueError):
+    """Privacy-safe cross-source result-evidence contract violation."""
+
+    def __init__(
+        self,
+        *,
+        candidate_index: int,
+        cadence_profile: str,
+        boundary: BoundaryMaterializationProof,
+    ) -> None:
+        key = boundary.measurement_key
+        coverage = boundary.result_evidence.evidence_coverage
+
+        def candidate_payload(candidate: TimelineCandidate) -> dict[str, object]:
+            return {
+                "segment_index": candidate.segment_index,
+                "source_id": candidate.source_id,
+                "candidate_id": candidate.candidate_id,
+                "shot_id": candidate.shot_id,
+            }
+
+        measurement_key_payload = {
+            "boundary_index": key.boundary_index,
+            "outgoing": candidate_payload(key.outgoing),
+            "incoming": candidate_payload(key.incoming),
+        }
+        self._payload = {
+            "contract": "joint-visual-result-evidence-coverage-failure-v1",
+            "reason_code": (
+                "joint_boundary_result_evidence_coverage_contract_violation"
+            ),
+            "joint_candidate_index": candidate_index,
+            "cadence_profile": cadence_profile,
+            "boundary_index": key.boundary_index,
+            "measurement_key": measurement_key_payload,
+            "measurement_key_sha256": _sha256_json(measurement_key_payload),
+            "frame_offset": boundary.frame_offset,
+            "coverage": {
+                "professional_evidence_basis": (
+                    coverage.professional_evidence_basis
+                ),
+                "professional_gate_passed": coverage.professional_gate_passed,
+                "failed_coverage_fields": list(coverage.missing_mask),
+            },
+            "raw_frames_persisted": False,
+            "raw_visual_descriptors_persisted": False,
+            "raw_candidate_embeddings_persisted": False,
+            "biometric_model_vectors_persisted": False,
+        }
+        self._boundary_no_good = (key, boundary.frame_offset)
+        super().__init__(
+            "joint cross-source result evidence coverage contract violated "
+            f"for candidate {candidate_index} ({cadence_profile}), boundary "
+            f"{key.boundary_index}, offset {boundary.frame_offset}; missing="
+            + ",".join(coverage.missing_mask)
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return json.loads(json.dumps(self._payload, allow_nan=False))
+
+    @property
+    def boundary_no_good(self) -> tuple[BoundaryMeasurementKey, int]:
+        """Return the process-local exact option that violated coverage."""
+
+        return self._boundary_no_good
+
+
+def _freeze_json_audit(value: object) -> object:
+    """Recursively freeze a JSON-safe audit without retaining caller aliases."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_json_audit(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_audit(item) for item in value)
+    return value
+
+
+def _thaw_json_audit(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json_audit(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json_audit(item) for item in value]
+    return value
 
 
 def _sha256_json(value: object) -> str:
@@ -216,6 +444,9 @@ class JointVisualSelectionSet:
     selections: tuple[JointVisualSelectionRecord, ...]
     candidate_records: tuple[VisualTimelineCandidateRecord, ...]
     selected_candidate_index: int
+    boundary_proof_bundles: tuple["JointVisualBoundaryProofBundle", ...] = field(
+        repr=False
+    )
     profile_failures: tuple[tuple[str, NoCompleteTimelinePath], ...] = field(
         default=(),
         repr=False,
@@ -227,6 +458,7 @@ class JointVisualSelectionSet:
     shared_bridge_evidence_cache_audit: Mapping[str, Any] = field(
         default_factory=dict
     )
+    selection_retry_audit: Mapping[str, Any] = field(default_factory=dict)
     analysis_basis: str = JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS
 
     def __post_init__(self) -> None:
@@ -239,10 +471,88 @@ class JointVisualSelectionSet:
             )
         selections = tuple(self.selections)
         records = tuple(self.candidate_records)
+        proof_bundles = tuple(self.boundary_proof_bundles)
         if len(selections) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
             raise ValueError("joint selection set requires at least eight variants")
-        if len(selections) != len(records):
-            raise ValueError("joint selections and candidate records must align")
+        if len(selections) != len(records) or len(selections) != len(
+            proof_bundles
+        ):
+            raise ValueError(
+                "joint selections, records, and proof bundles must align"
+            )
+        if any(
+            not isinstance(bundle, JointVisualBoundaryProofBundle)
+            for bundle in proof_bundles
+        ):
+            raise TypeError("joint selection contains an invalid proof bundle")
+        for selection, bundle in zip(
+            selections,
+            proof_bundles,
+            strict=True,
+        ):
+            options = selection.joint_result.boundary_options
+            boundaries = bundle.boundary_proofs
+            paths = bundle.segment_path_proofs
+            if (
+                bundle.frame_offsets
+                != tuple(option.frame_offset for option in options)
+                or tuple(boundary.proof_identity for boundary in boundaries)
+                != selection.proof_variant_signature
+                or len(boundaries) != len(options)
+            ):
+                raise ValueError(
+                    "joint selection is bound to another boundary proof variant"
+                )
+            for option, boundary in zip(options, boundaries, strict=True):
+                if (
+                    boundary.measurement_key != option.measurement_key
+                    or boundary.frame_offset != option.frame_offset
+                    or boundary.outgoing_transform != option.outgoing_transform
+                    or boundary.incoming_transform != option.incoming_transform
+                    or boundary.scoring_outgoing != option.scoring_outgoing
+                    or boundary.scoring_incoming != option.scoring_incoming
+                ):
+                    raise ValueError(
+                        "joint boundary proof does not match its selected option"
+                    )
+            expected_bridges = tuple(
+                proof.proof_identity
+                for proof in selection.joint_result.segment_bridge_proofs
+            )
+            if tuple(path.proof_identity for path in paths[1:-1]) != (
+                expected_bridges
+            ):
+                raise ValueError(
+                    "joint segment proof does not match selected bridge identity"
+                )
+            shifted_candidates = selection.shifted_timeline_result.candidates
+            for candidate, path in zip(
+                shifted_candidates,
+                paths,
+                strict=True,
+            ):
+                if (
+                    path.candidate.segment_index != candidate.segment_index
+                    or path.candidate.source_id != candidate.source_id
+                    or path.candidate.shot_id != candidate.shot_id
+                    or path.candidate.candidate_id != candidate.candidate_id
+                    or path.source_index != int(candidate.source_id)
+                    or not math.isclose(
+                        path.start_master_seconds,
+                        candidate.start_seconds,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                    or not math.isclose(
+                        path.end_master_seconds,
+                        candidate.end_seconds,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                ):
+                    raise ValueError(
+                        "joint segment proof path does not match shifted selection"
+                    )
         if tuple(record.candidate_index for record in records) != tuple(
             range(len(records))
         ):
@@ -301,8 +611,13 @@ class JointVisualSelectionSet:
         )
         if selected != (self.selected_candidate_index,):
             raise ValueError("joint selection set must mark one selected record")
+        if any(not record.review.passed for record in records):
+            raise ValueError(
+                "production joint selection set contains a failed review"
+            )
         object.__setattr__(self, "selections", selections)
         object.__setattr__(self, "candidate_records", records)
+        object.__setattr__(self, "boundary_proof_bundles", proof_bundles)
         object.__setattr__(
             self,
             "role_control_audits",
@@ -317,6 +632,18 @@ class JointVisualSelectionSet:
             self,
             "shared_bridge_evidence_cache_audit",
             MappingProxyType(dict(self.shared_bridge_evidence_cache_audit)),
+        )
+        object.__setattr__(
+            self,
+            "selection_retry_audit",
+            _freeze_json_audit(
+                json.loads(
+                    json.dumps(
+                        dict(self.selection_retry_audit),
+                        allow_nan=False,
+                    )
+                )
+            ),
         )
 
     @property
@@ -342,6 +669,18 @@ class JointVisualSelectionSet:
         ):
             raise IndexError("joint candidate index is outside the selection set")
         return self.selections[candidate_index]
+
+    def proof_bundle_for_candidate(
+        self,
+        candidate_index: int,
+    ) -> "JointVisualBoundaryProofBundle":
+        if (
+            isinstance(candidate_index, bool)
+            or not isinstance(candidate_index, int)
+            or not 0 <= candidate_index < len(self.boundary_proof_bundles)
+        ):
+            raise IndexError("joint candidate index is outside the proof set")
+        return self.boundary_proof_bundles[candidate_index]
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only scalar review/audit data, never transient descriptors."""
@@ -385,6 +724,9 @@ class JointVisualSelectionSet:
             ),
             "shared_bridge_evidence_cache": dict(
                 self.shared_bridge_evidence_cache_audit
+            ),
+            "selection_retry_audit": _thaw_json_audit(
+                self.selection_retry_audit
             ),
             "raw_visual_descriptors_persisted": False,
             "raw_candidate_embeddings_persisted": False,
@@ -610,6 +952,177 @@ def _coalesce_profile_results(
     return sorted_pools(primary_pools), sorted_pools(alternate_pools)
 
 
+def _ordered_profile_candidate_pool(
+    profile_results: Sequence[tuple[str, Sequence[JointTimelineResult]]],
+) -> tuple[tuple[str, JointTimelineResult], ...]:
+    """Return all distinct primary paths, then at most one supplement each."""
+
+    coalesced, alternates = _coalesce_profile_results(profile_results)
+    maximum_pool_size = 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES
+    ordered: list[tuple[str, JointTimelineResult]] = []
+    maximum_primary_rank = max(
+        (len(pool) for pool in coalesced.values()),
+        default=0,
+    )
+    for rank in range(maximum_primary_rank):
+        for profile, _unused in profile_results:
+            pool = coalesced[profile]
+            if rank < len(pool):
+                ordered.append((profile, pool[rank]))
+                if len(ordered) >= maximum_pool_size:
+                    return tuple(ordered)
+
+    selected_proof_variants = {
+        (
+            _source_shot_path_signature(result),
+            _proof_variant_signature(result),
+        )
+        for _profile, result in ordered
+    }
+    selected_render_variants = {
+        (
+            _source_shot_path_signature(result),
+            _render_variant_signature(result),
+        )
+        for _profile, result in ordered
+    }
+    supplemented_paths: set[tuple[tuple[int, str, str], ...]] = set()
+    maximum_alternate_rank = max(
+        (len(pool) for pool in alternates.values()),
+        default=0,
+    )
+    for rank in range(maximum_alternate_rank):
+        for profile, _unused in profile_results:
+            pool = alternates[profile]
+            if rank >= len(pool):
+                continue
+            result = pool[rank]
+            path = _source_shot_path_signature(result)
+            proof_signature = (path, _proof_variant_signature(result))
+            render_signature = (path, _render_variant_signature(result))
+            if (
+                path in supplemented_paths
+                or proof_signature in selected_proof_variants
+                or render_signature in selected_render_variants
+            ):
+                continue
+            ordered.append((profile, result))
+            supplemented_paths.add(path)
+            selected_proof_variants.add(proof_signature)
+            selected_render_variants.add(render_signature)
+            if len(ordered) >= maximum_pool_size:
+                return tuple(ordered)
+    return tuple(ordered)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewedJointCandidate:
+    selection: JointVisualSelectionRecord
+    proof_bundle: "JointVisualBoundaryProofBundle" = field(repr=False)
+    review: TimelineReview
+    global_candidate_attempt_index: int
+
+
+def _boundary_review_no_goods(
+    selection: JointVisualSelectionRecord,
+    review: TimelineReview,
+) -> frozenset[tuple[BoundaryMeasurementKey, int]]:
+    """Project only exact boundary-local hard review failures to no-goods."""
+
+    no_goods: set[tuple[BoundaryMeasurementKey, int]] = set()
+    options = selection.joint_result.boundary_options
+    for diagnostic in review.boundaries:
+        if not diagnostic.source_switch:
+            continue
+        local_failure = bool(
+            diagnostic.exceeded_metrics
+            or diagnostic.scene_cut_risk
+            or diagnostic.outgoing_side_stability_exceeded_metrics
+            or diagnostic.incoming_side_stability_exceeded_metrics
+        )
+        if not local_failure:
+            continue
+        if not 0 <= diagnostic.boundary_index < len(options):
+            raise RuntimeError("review boundary index is outside the joint proof")
+        option = options[diagnostic.boundary_index]
+        if option.measurement_key.boundary_index != diagnostic.boundary_index:
+            raise RuntimeError("review boundary index drifted from the joint option")
+        no_goods.add((option.measurement_key, option.frame_offset))
+    return frozenset(no_goods)
+
+
+def _production_passing_cohort(
+    reviewed: Sequence[_ReviewedJointCandidate],
+    *,
+    maximum_candidates: int,
+    minimum_unique_paths: int,
+) -> tuple[_ReviewedJointCandidate, ...]:
+    """Choose passed candidates while preserving path and proof diversity."""
+
+    passing = tuple(item for item in reviewed if item.review.passed)
+    if not passing:
+        return ()
+    ranked = _review_ranked_candidate_indices(
+        tuple(item.review for item in passing)
+    )
+    ordered = tuple(passing[index] for index in ranked)
+    primaries: list[_ReviewedJointCandidate] = []
+    primary_paths: set[tuple[tuple[int, str, str], ...]] = set()
+    for item in ordered:
+        path = item.selection.source_shot_path
+        if path in primary_paths:
+            continue
+        primaries.append(item)
+        primary_paths.add(path)
+        if len(primaries) >= maximum_candidates:
+            break
+    if len(primary_paths) < minimum_unique_paths:
+        return ()
+    cohort = list(primaries)
+    if len(cohort) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+        # ``maximum_candidates`` is an upper bound, not a target.  Once at
+        # least eight unique passing paths exist, retaining alternate proofs
+        # would violate the exact supplement invariant and waste materialized
+        # proof memory.
+        return tuple(cohort[:maximum_candidates])
+    required_supplement_count = (
+        MINIMUM_PRODUCTION_JOINT_CANDIDATES - len(cohort)
+    )
+    selected_variants = {
+        (
+            item.selection.source_shot_path,
+            item.selection.proof_variant_signature,
+            _render_variant_signature(item.selection.joint_result),
+        )
+        for item in cohort
+    }
+    selected_candidate_ids = {id(item) for item in cohort}
+    supplemented_paths: set[tuple[tuple[int, str, str], ...]] = set()
+    for item in ordered:
+        path = item.selection.source_shot_path
+        signature = (
+            path,
+            item.selection.proof_variant_signature,
+            _render_variant_signature(item.selection.joint_result),
+        )
+        if (
+            path not in primary_paths
+            or path in supplemented_paths
+            or signature in selected_variants
+            or id(item) in selected_candidate_ids
+        ):
+            continue
+        cohort.append(item)
+        supplemented_paths.add(path)
+        selected_variants.add(signature)
+        selected_candidate_ids.add(id(item))
+        if len(supplemented_paths) >= required_supplement_count:
+            break
+    if len(cohort) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+        return ()
+    return tuple(cohort[:maximum_candidates])
+
+
 def _assert_provider_binding(
     candidate_set: VisualTimelineOptimizerCarrier,
     provider: DecodedBoundaryOptionProvider,
@@ -660,13 +1173,25 @@ def select_joint_visual_candidates(
     hard_forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
     minimum_unique_paths: int = MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS,
     maximum_candidates: int | None = None,
+    forbidden_boundary_selections: Collection[
+        BoundarySelectionNoGood
+    ] = (),
+    forbidden_complete_paths: Collection[
+        JointTimelinePathSignature
+    ] = (),
+    maximum_proof_materialization_calls: int = (
+        MAXIMUM_JOINT_VISUAL_PROOF_CALLS
+    ),
     progress_callback: JointTimelineProgressCallback | None = None,
 ) -> JointVisualSelectionSet:
     """Run the existing professional controls through the decoded joint DP.
 
     ``hard_forbidden_boundary_edges`` is deliberately typed as an already
     classified :class:`TimelineNoGoodSet`.  Missing or indeterminate boundary
-    evidence must not be projected into this argument.
+    evidence must not be projected into this argument.  Exact boundary and
+    complete-path feedback is validated against this candidate lattice before
+    being forwarded unchanged to every cadence profile.  The proof budget is
+    per call, allowing a caller to pass its remaining bounded-session budget.
     """
 
     if not isinstance(
@@ -712,6 +1237,16 @@ def select_joint_visual_candidates(
         )
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("fps must be positive and finite")
+    if (
+        isinstance(maximum_proof_materialization_calls, bool)
+        or not isinstance(maximum_proof_materialization_calls, int)
+        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        <= maximum_proof_materialization_calls
+        <= MAXIMUM_JOINT_VISUAL_PROOF_CALLS
+    ):
+        raise ValueError(
+            "proof materialization budget must be between 8 and 32"
+        )
     _assert_provider_binding(candidate_set, provider, fps=fps)
 
     lattice: tuple[tuple[TimelineCandidate, ...], ...]
@@ -737,6 +1272,16 @@ def select_joint_visual_candidates(
         lattice = tuple(restricted)
         preferred_source_ids = None
 
+    external_boundary_no_goods = _canonical_external_boundary_no_goods(
+        lattice,
+        forbidden_boundary_selections,
+    )
+    external_complete_path_no_goods = (
+        _canonical_external_complete_path_no_goods(
+            lattice,
+            forbidden_complete_paths,
+        )
+    )
     profiles = tuple(_safe_cadence_profiles(workspace.diversity))
     if len(profiles) != 3:
         raise RuntimeError(
@@ -809,7 +1354,10 @@ def select_joint_visual_candidates(
                 phase=phase,
                 cadence_profile=profile_name,
                 profile_index=profile_index,
-                total_profiles=len(profiles),
+                total_profiles=max(
+                    len(profiles),
+                    (retry_round + 1) * len(profiles),
+                ),
                 completed_boundary_layers=completed,
                 total_boundary_layers=total_boundary_layers,
                 shared_option_cache_hit_count=(
@@ -828,239 +1376,504 @@ def select_joint_visual_candidates(
             )
         )
 
-    profile_results: list[tuple[str, tuple[JointTimelineResult, ...]]] = []
-    profile_failures: list[tuple[str, NoCompleteTimelinePath]] = []
     role_audits: list[Mapping[str, Any]] = []
-    role_audit_by_profile: dict[str, Mapping[str, Any]] = {}
     bridge_disposition_batch_call_count = 0
     bridge_disposition_batch_request_count = 0
-    for zero_based_profile_index, profile in enumerate(profiles):
-        profile_index = zero_based_profile_index + 1
-        latest_core_progress: JointTimelineProgress | None = None
-        callback_no_path_failure: NoCompleteTimelinePath | None = None
-        emit_progress(
-            phase="profile_start",
-            profile_name=profile.name,
-            profile_index=profile_index,
-            profile_status="in_progress",
-        )
+    global_profile_attempt_index = 0
+    global_candidate_attempt_index = 0
+    proof_materialization_call_count = 0
+    review_call_count = 0
+    review_failure_count = 0
+    review_cache_hit_count = 0
+    total_unique_candidate_attempt_count = 0
+    discarded_candidate_count = 0
+    coverage_contract_failure_count = 0
+    total_round_count = 0
+    retry_round = 0
+    exact_boundary_no_goods: frozenset[
+        tuple[BoundaryMeasurementKey, int]
+    ] = external_boundary_no_goods
+    initial_exact_boundary_no_good_count = len(exact_boundary_no_goods)
+    reviewed_variants: dict[
+        tuple[
+            tuple[tuple[int, str, str], ...],
+            tuple[str, ...],
+            tuple[tuple[object, ...], ...],
+        ],
+        _ReviewedJointCandidate,
+    ] = {}
+    attempted_variant_keys: set[
+        tuple[
+            tuple[tuple[int, str, str], ...],
+            tuple[str, ...],
+            tuple[tuple[object, ...], ...],
+        ]
+    ] = set()
+    rejected_variant_no_goods: dict[
+        tuple[
+            tuple[tuple[int, str, str], ...],
+            tuple[str, ...],
+            tuple[tuple[object, ...], ...],
+        ],
+        frozenset[tuple[BoundaryMeasurementKey, int]],
+    ] = {}
+    discarded_variant_keys: set[
+        tuple[
+            tuple[tuple[int, str, str], ...],
+            tuple[str, ...],
+            tuple[tuple[object, ...], ...],
+        ]
+    ] = set()
+    retry_events: list[dict[str, object]] = []
+    coverage_failure_events: list[dict[str, object]] = []
+    maximum_exact_no_goods = len(JOINT_BOUNDARY_FRAME_OFFSETS) * sum(
+        len(lattice[index]) * len(lattice[index + 1])
+        for index in range(len(lattice) - 1)
+    )
+    profile_failures: tuple[tuple[str, NoCompleteTimelinePath], ...] = ()
+    profile_failure_by_name: dict[str, NoCompleteTimelinePath] = {}
+    profile_failure_events: list[dict[str, object]] = []
 
-        def report_core_progress(progress: JointTimelineProgress) -> None:
-            nonlocal latest_core_progress
-            nonlocal callback_no_path_failure
-            if not isinstance(progress, JointTimelineProgress):
-                raise TypeError("joint timeline progress payload is invalid")
-            latest_core_progress = progress
-            if progress.phase != "boundary_layer_complete":
-                return
+    def run_profile_round() -> tuple[
+        tuple[tuple[str, tuple[JointTimelineResult, ...]], ...],
+        Mapping[str, Mapping[str, Any]],
+    ]:
+        nonlocal bridge_disposition_batch_call_count
+        nonlocal bridge_disposition_batch_request_count
+        nonlocal global_profile_attempt_index
+        round_results: list[tuple[str, tuple[JointTimelineResult, ...]]] = []
+        round_failures: list[tuple[str, NoCompleteTimelinePath]] = []
+        round_role_audit_by_profile: dict[str, Mapping[str, Any]] = {}
+        for profile in profiles:
+            global_profile_attempt_index += 1
+            profile_index = global_profile_attempt_index
+            latest_core_progress: JointTimelineProgress | None = None
+            callback_no_path_failure: NoCompleteTimelinePath | None = None
+            emit_progress(
+                phase="profile_start",
+                profile_name=profile.name,
+                profile_index=profile_index,
+                profile_status="in_progress",
+            )
+
+            def report_core_progress(progress: JointTimelineProgress) -> None:
+                nonlocal latest_core_progress
+                nonlocal callback_no_path_failure
+                if not isinstance(progress, JointTimelineProgress):
+                    raise TypeError("joint timeline progress payload is invalid")
+                latest_core_progress = progress
+                if progress.phase != "boundary_layer_complete":
+                    return
+                try:
+                    emit_progress(
+                        phase="boundary_layer_complete",
+                        profile_name=profile.name,
+                        profile_index=profile_index,
+                        core=progress,
+                        profile_status="in_progress",
+                    )
+                except NoCompleteTimelinePath as exc:
+                    callback_no_path_failure = exc
+                    raise
+
+            selection_kwargs: dict[str, Any] = {}
+            if workspace.professional_montage_policy is not None:
+                if workspace.section_plan is None:  # pragma: no cover
+                    raise RuntimeError("montage policy lost its section plan")
+                adjustments, switch_bonus, raw_role_audit = (
+                    _role_conditioned_visual_controls(
+                        lattice,
+                        section_plan=workspace.section_plan,
+                        phrase_times=workspace.phrase_times,
+                        policy=workspace.professional_montage_policy,
+                        cadence_profile=profile.name,
+                        subject_metadata_by_candidate=(
+                            workspace.subject_metadata_by_candidate
+                        ),
+                        timeline_config=profile.config,
+                        forbidden_boundary_edges=hard_forbidden_boundary_edges,
+                    )
+                )
+                role_audit = {
+                    **dict(raw_role_audit),
+                    "retry_round": retry_round,
+                    "global_profile_attempt_index": (
+                        global_profile_attempt_index
+                    ),
+                    "exact_boundary_no_good_count": len(
+                        exact_boundary_no_goods
+                    ),
+                }
+                selection_kwargs = {
+                    "emission_adjustments": adjustments,
+                    "source_switch_bonus_by_segment": switch_bonus,
+                }
+                round_role_audit_by_profile[profile.name] = role_audit
+                role_audits.append(role_audit)
             try:
-                emit_progress(
-                    phase="boundary_layer_complete",
-                    profile_name=profile.name,
-                    profile_index=profile_index,
-                    core=progress,
-                    profile_status="in_progress",
+                results = select_joint_timeline_candidates(
+                    lattice,
+                    option_provider=shared_option_provider,
+                    option_rehydrator=provider.rehydrate_selection_option,
+                    bridge_provider=provider.bridge_provider,
+                    bridge_disposition_batch_provider=(
+                        provider.bridge_disposition_batch
+                    ),
+                    fps=fps,
+                    config=profile.config,
+                    preferred_source_ids=preferred_source_ids,
+                    maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
+                    forbidden_boundary_edges=hard_forbidden_boundary_edges,
+                    forbidden_boundary_selections=exact_boundary_no_goods,
+                    forbidden_complete_paths=external_complete_path_no_goods,
+                    progress_callback=report_core_progress,
+                    shared_bridge_evidence_cache=shared_bridge_evidence_cache,
+                    **selection_kwargs,
                 )
             except NoCompleteTimelinePath as exc:
-                callback_no_path_failure = exc
-                raise
-
-        selection_kwargs: dict[str, Any] = {}
-        if workspace.professional_montage_policy is not None:
-            if workspace.section_plan is None:  # pragma: no cover - invariant
-                raise RuntimeError("montage policy lost its section plan")
-            adjustments, switch_bonus, role_audit = (
-                _role_conditioned_visual_controls(
-                    lattice,
-                    section_plan=workspace.section_plan,
-                    phrase_times=workspace.phrase_times,
-                    policy=workspace.professional_montage_policy,
-                    cadence_profile=profile.name,
-                    subject_metadata_by_candidate=(
-                        workspace.subject_metadata_by_candidate
-                    ),
-                    timeline_config=profile.config,
-                    forbidden_boundary_edges=hard_forbidden_boundary_edges,
+                if exc is callback_no_path_failure:
+                    raise
+                round_failures.append((profile.name, exc))
+                audit = round_role_audit_by_profile.get(profile.name)
+                if isinstance(audit, dict):
+                    audit["candidate_generation_exhaustion"] = exc.to_dict()
+                results = ()
+                emit_progress(
+                    phase="profile_complete",
+                    profile_name=profile.name,
+                    profile_index=profile_index,
+                    core=latest_core_progress,
+                    profile_status="no_complete_path",
                 )
-            )
-            selection_kwargs = {
-                "emission_adjustments": adjustments,
-                "source_switch_bonus_by_segment": switch_bonus,
-            }
-            role_audit_by_profile[profile.name] = role_audit
-            role_audits.append(role_audit)
-        try:
-            results = select_joint_timeline_candidates(
-                lattice,
-                option_provider=shared_option_provider,
-                option_rehydrator=provider.rehydrate_selection_option,
-                bridge_provider=provider.bridge_provider,
-                bridge_disposition_batch_provider=(
-                    provider.bridge_disposition_batch
-                ),
-                fps=fps,
-                config=profile.config,
-                preferred_source_ids=preferred_source_ids,
-                maximum_results=MAXIMUM_PROFILE_JOINT_CANDIDATES,
-                forbidden_boundary_edges=hard_forbidden_boundary_edges,
-                progress_callback=report_core_progress,
-                shared_bridge_evidence_cache=shared_bridge_evidence_cache,
-                **selection_kwargs,
-            )
-        except NoCompleteTimelinePath as exc:
-            if exc is callback_no_path_failure:
-                raise
-            profile_failures.append((profile.name, exc))
-            audit = role_audit_by_profile.get(profile.name)
-            if isinstance(audit, dict):
-                audit["candidate_generation_exhaustion"] = exc.to_dict()
-            results = ()
-            emit_progress(
-                phase="profile_complete",
-                profile_name=profile.name,
-                profile_index=profile_index,
-                core=latest_core_progress,
-                profile_status="no_complete_path",
-            )
-        else:
-            if progress_callback is not None and (
-                latest_core_progress is None
-                or latest_core_progress.phase != "selection_complete"
-            ):
-                raise RuntimeError("joint timeline emitted no terminal progress")
-            emit_progress(
-                phase="profile_complete",
-                profile_name=profile.name,
-                profile_index=profile_index,
-                core=latest_core_progress,
-                profile_status="completed",
-            )
-        if latest_core_progress is not None:
-            bridge_disposition_batch_call_count += (
-                latest_core_progress.bridge_disposition_batch_call_count
-            )
-            bridge_disposition_batch_request_count += (
-                latest_core_progress.bridge_disposition_batch_request_count
-            )
-        profile_results.append((profile.name, tuple(results)))
-
-    coalesced, alternates = _coalesce_profile_results(profile_results)
-    ordered: list[tuple[str, JointTimelineResult]] = []
-    maximum_pool_size = max((len(pool) for pool in coalesced.values()), default=0)
-    for rank in range(maximum_pool_size):
-        for profile, _unused in profile_results:
-            pool = coalesced[profile]
-            if rank >= len(pool):
-                continue
-            ordered.append((profile, pool[rank]))
-            if len(ordered) >= requested_maximum:
-                break
-        if len(ordered) >= requested_maximum:
-            break
-    if len(ordered) < minimum_unique_paths:
-        rejection_counts = {
-            "unique_source_shot_path_count": len(ordered),
-            "required_unique_source_shot_path_count": minimum_unique_paths,
-        }
-        raise NoCompleteTimelinePath(
-            "joint visual selection produced fewer than the required unique "
-            f"source/shot paths ({len(ordered)}/{minimum_unique_paths})",
-            reason_code="joint_visual_unique_path_floor_not_met",
-            rejection_counts=rejection_counts,
-            profile_failures=tuple(profile_failures),
-        )
-
-    selected_proof_variants = {
-        (
-            _source_shot_path_signature(result),
-            _proof_variant_signature(result),
-        )
-        for _profile, result in ordered
-    }
-    selected_render_variants = {
-        (
-            _source_shot_path_signature(result),
-            _render_variant_signature(result),
-        )
-        for _profile, result in ordered
-    }
-    supplemented_paths: set[tuple[tuple[int, str, str], ...]] = set()
-    maximum_alternate_pool_size = (
-        0
-        if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES
-        else max(
-            (len(pool) for pool in alternates.values()),
-            default=0,
-        )
-    )
-    for rank in range(maximum_alternate_pool_size):
-        for profile, _unused in profile_results:
-            pool = alternates[profile]
-            if rank >= len(pool):
-                continue
-            result = pool[rank]
-            path = _source_shot_path_signature(result)
-            proof_signature = (path, _proof_variant_signature(result))
-            render_signature = (path, _render_variant_signature(result))
-            if (
-                path in supplemented_paths
-                or proof_signature in selected_proof_variants
-                or render_signature in selected_render_variants
-            ):
-                continue
-            ordered.append((profile, result))
-            supplemented_paths.add(path)
-            selected_proof_variants.add(proof_signature)
-            selected_render_variants.add(render_signature)
-            if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-                break
-        if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-            break
-    if len(ordered) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-        rejection_counts = {
-            "unique_source_shot_path_count": len(
+            else:
+                if progress_callback is not None and (
+                    latest_core_progress is None
+                    or latest_core_progress.phase != "selection_complete"
+                ):
+                    raise RuntimeError(
+                        "joint timeline emitted no terminal progress"
+                    )
+                emit_progress(
+                    phase="profile_complete",
+                    profile_name=profile.name,
+                    profile_index=profile_index,
+                    core=latest_core_progress,
+                    profile_status="completed",
+                )
+            if latest_core_progress is not None:
+                bridge_disposition_batch_call_count += (
+                    latest_core_progress.bridge_disposition_batch_call_count
+                )
+                bridge_disposition_batch_request_count += (
+                    latest_core_progress.bridge_disposition_batch_request_count
+                )
+            round_results.append((profile.name, tuple(results)))
+        nonlocal profile_failures
+        for profile_name, failure in round_failures:
+            profile_failure_by_name[profile_name] = failure
+            profile_failure_events.append(
                 {
-                    _source_shot_path_signature(result)
-                    for _profile, result in ordered
+                    "retry_round": retry_round,
+                    "cadence_profile": profile_name,
+                    "no_complete_path": failure.to_dict(),
                 }
-            ),
+            )
+        profile_failures = tuple(profile_failure_by_name.items())
+        return tuple(round_results), round_role_audit_by_profile
+
+    def proof_budget_exhaustion() -> NoCompleteTimelinePath:
+        return NoCompleteTimelinePath(
+            "joint visual proof materialization budget was exhausted before "
+            "eight authoritative candidates passed",
+            reason_code="joint_visual_proof_budget_exhausted",
+            rejection_counts={
+                "proof_materialization_call_count": (
+                    proof_materialization_call_count
+                ),
+                "maximum_proof_materialization_calls": (
+                    maximum_proof_materialization_calls
+                ),
+                "review_call_count": review_call_count,
+                "review_failure_count": review_failure_count,
+                "review_cache_hit_count": review_cache_hit_count,
+                "total_unique_candidate_attempt_count": (
+                    total_unique_candidate_attempt_count
+                ),
+                "discarded_candidate_count": discarded_candidate_count,
+                "passing_candidate_count": len(reviewed_variants),
+                "total_round_count": total_round_count,
+            },
+            profile_failures=profile_failures,
+        )
+
+    final_reviewed: tuple[_ReviewedJointCandidate, ...] = ()
+    while True:
+        total_round_count += 1
+        profile_results, role_audit_by_profile = run_profile_round()
+        ordered_pool = _ordered_profile_candidate_pool(profile_results)
+        if (
+            not ordered_pool
+            and len(profile_failures) == len(profiles)
+            and all(
+                failure.reason_code
+                == "joint_timeline_complete_path_no_good_exhausted"
+                for _profile_name, failure in profile_failures
+            )
+        ):
+            raise NoCompleteTimelinePath(
+                "every cadence profile exhausted its exact complete-path "
+                "search space under external feedback",
+                reason_code="joint_visual_complete_path_no_good_exhausted",
+                rejection_counts={
+                    "exhausted_profile_count": len(profile_failures),
+                    "forbidden_complete_path_count": len(
+                        external_complete_path_no_goods
+                    ),
+                    "proof_materialization_call_count": (
+                        proof_materialization_call_count
+                    ),
+                },
+                profile_failures=profile_failures,
+            )
+        round_new_no_goods: set[tuple[BoundaryMeasurementKey, int]] = set()
+        for pool_index, (profile, result) in enumerate(ordered_pool):
+            variant_key = (
+                _source_shot_path_signature(result),
+                _proof_variant_signature(result),
+                _render_variant_signature(result),
+            )
+            cached_reviewed = reviewed_variants.get(variant_key)
+            if cached_reviewed is not None:
+                review_cache_hit_count += 1
+                final_reviewed = _production_passing_cohort(
+                    tuple(reviewed_variants.values()),
+                    maximum_candidates=requested_maximum,
+                    minimum_unique_paths=minimum_unique_paths,
+                )
+                if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+                    break
+                continue
+            rejected_no_good = rejected_variant_no_goods.get(variant_key)
+            if rejected_no_good is not None:
+                round_new_no_goods.update(rejected_no_good)
+                continue
+            if proof_materialization_call_count >= (
+                maximum_proof_materialization_calls
+            ):
+                raise proof_budget_exhaustion()
+            if variant_key not in attempted_variant_keys:
+                attempted_variant_keys.add(variant_key)
+                total_unique_candidate_attempt_count += 1
+            global_candidate_attempt_index += 1
+            selection = JointVisualSelectionRecord(
+                cadence_profile=profile,
+                joint_result=result,
+                shifted_timeline_result=_shift_joint_timeline_result(
+                    result,
+                    fps=fps,
+                    candidate_set=candidate_set,
+                ),
+                source_shot_path=_source_shot_path_signature(result),
+                proof_variant_signature=_proof_variant_signature(result),
+                role_control_audit=role_audit_by_profile.get(profile),
+            )
+            proof_materialization_call_count += 1
+            proof_bundle = _proof_bundle(selection, provider)
+            try:
+                projected_plan = _project_visual_plan_from_joint_proof(
+                    candidate_set=candidate_set,
+                    timeline_result=selection.shifted_timeline_result,
+                    proof_bundle=proof_bundle,
+                    candidate_index=pool_index,
+                    cadence_profile=selection.cadence_profile,
+                )
+            except JointVisualEvidenceCoverageError as exc:
+                coverage_contract_failure_count += 1
+                round_new_no_goods.add(exc.boundary_no_good)
+                rejected_variant_no_goods[variant_key] = frozenset(
+                    (exc.boundary_no_good,)
+                )
+                coverage_failure_events.append(exc.to_dict())
+                if variant_key not in discarded_variant_keys:
+                    discarded_variant_keys.add(variant_key)
+                    discarded_candidate_count += 1
+                if proof_materialization_call_count >= (
+                    maximum_proof_materialization_calls
+                ):
+                    raise proof_budget_exhaustion()
+                del proof_bundle
+                continue
+            review = review_timeline(
+                projected_plan,
+                available_source_count=len(candidate_set.sources),
+            )
+            review_call_count += 1
+            if review.passed:
+                reviewed_variants[variant_key] = _ReviewedJointCandidate(
+                    selection=selection,
+                    proof_bundle=proof_bundle,
+                    review=review,
+                    global_candidate_attempt_index=(
+                        global_candidate_attempt_index
+                    ),
+                )
+            else:
+                review_failure_count += 1
+                review_no_goods = _boundary_review_no_goods(
+                    selection,
+                    review,
+                )
+                round_new_no_goods.update(review_no_goods)
+                # Cache every deterministic review rejection by its exact
+                # path/proof key, including global-only failures with no local
+                # no-good.  The empty frozenset is a lightweight negative cache
+                # entry and deliberately retains no decoded proof bundle.
+                rejected_variant_no_goods[variant_key] = review_no_goods
+                if variant_key not in discarded_variant_keys:
+                    discarded_variant_keys.add(variant_key)
+                    discarded_candidate_count += 1
+                del proof_bundle, projected_plan, review
+            final_reviewed = _production_passing_cohort(
+                tuple(reviewed_variants.values()),
+                maximum_candidates=requested_maximum,
+                minimum_unique_paths=minimum_unique_paths,
+            )
+            if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+                break
+            if proof_materialization_call_count >= (
+                maximum_proof_materialization_calls
+            ):
+                raise proof_budget_exhaustion()
+
+        if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+            break
+
+        new_no_goods = frozenset(
+            round_new_no_goods - set(exact_boundary_no_goods)
+        )
+        passing_candidate_count = len(reviewed_variants)
+        passing_unique_path_count = len(
+            {
+                item.selection.source_shot_path
+                for item in reviewed_variants.values()
+            }
+        )
+        rejection_counts = {
+            "reviewed_unique_candidate_count": review_call_count,
+            "retained_reviewed_candidate_count": len(reviewed_variants),
+            "passing_candidate_count": passing_candidate_count,
+            "unique_source_shot_path_count": passing_unique_path_count,
             "required_unique_source_shot_path_count": minimum_unique_paths,
-            "distinct_render_candidate_count": len(ordered),
+            "distinct_render_candidate_count": passing_candidate_count,
             "required_render_candidate_count": (
                 MINIMUM_PRODUCTION_JOINT_CANDIDATES
             ),
-            "proof_variant_supplement_count": len(supplemented_paths),
-        }
-        raise NoCompleteTimelinePath(
-            "joint visual selection could not retain eight distinct render "
-            f"variants ({len(ordered)}/{MINIMUM_PRODUCTION_JOINT_CANDIDATES})",
-            reason_code="joint_visual_candidate_cohort_floor_not_met",
-            rejection_counts=rejection_counts,
-            profile_failures=tuple(profile_failures),
-        )
-
-    selections = tuple(
-        JointVisualSelectionRecord(
-            cadence_profile=profile,
-            joint_result=result,
-            shifted_timeline_result=_shift_joint_timeline_result(
-                result,
-                fps=fps,
-                candidate_set=candidate_set,
+            "proof_variant_supplement_count": max(
+                0,
+                passing_candidate_count - passing_unique_path_count,
             ),
-            source_shot_path=_source_shot_path_signature(result),
-            proof_variant_signature=_proof_variant_signature(result),
-            role_control_audit=role_audit_by_profile.get(profile),
+            "exact_boundary_no_good_count": len(exact_boundary_no_goods),
+            "new_exact_boundary_no_good_count": len(new_no_goods),
+            "retry_round": retry_round,
+            "proof_materialization_call_count": (
+                proof_materialization_call_count
+            ),
+            "maximum_proof_materialization_calls": (
+                maximum_proof_materialization_calls
+            ),
+        }
+        if not new_no_goods:
+            if passing_unique_path_count < minimum_unique_paths:
+                reason_code = "joint_visual_unique_path_floor_not_met"
+                message = (
+                    "authoritative review produced fewer than the required "
+                    "unique passing source/shot paths and no exact boundary "
+                    "retry made progress"
+                )
+            elif review_failure_count == 0:
+                reason_code = "joint_visual_candidate_cohort_floor_not_met"
+                message = (
+                    "joint visual selection could not retain eight distinct "
+                    "passing render variants and no exact boundary retry made "
+                    "progress"
+                )
+            else:
+                reason_code = "joint_visual_authoritative_review_fixed_point"
+                message = (
+                    "authoritative review produced fewer than eight passing "
+                    "candidates and no boundary-local retry made progress"
+                )
+            raise NoCompleteTimelinePath(
+                message,
+                reason_code=reason_code,
+                rejection_counts=rejection_counts,
+                profile_failures=profile_failures,
+            )
+        if retry_round >= MAXIMUM_JOINT_VISUAL_RETRY_ROUNDS:
+            raise NoCompleteTimelinePath(
+                "authoritative review retry round limit was reached before "
+                "eight passing candidates existed",
+                reason_code="joint_visual_authoritative_review_retry_exhausted",
+                rejection_counts=rejection_counts,
+                profile_failures=profile_failures,
+            )
+        updated_no_goods = frozenset(
+            set(exact_boundary_no_goods) | set(new_no_goods)
         )
-        for profile, result in ordered
-    )
-    reviews = tuple(
-        review_timeline(
-            selection.shifted_timeline_result,
-            available_source_count=len(candidate_set.sources),
+        if len(updated_no_goods) > maximum_exact_no_goods:
+            raise RuntimeError("exact boundary no-good bound was exceeded")
+        retry_events.append(
+            {
+                "retry_round": retry_round,
+                "global_profile_attempt_index_after_round": (
+                    global_profile_attempt_index
+                ),
+                "global_candidate_attempt_index_after_round": (
+                    global_candidate_attempt_index
+                ),
+                "reviewed_unique_candidate_count": review_call_count,
+                "passing_candidate_count": len(reviewed_variants),
+                "new_exact_boundary_no_good_count": len(new_no_goods),
+                "total_exact_boundary_no_good_count": len(updated_no_goods),
+                "proof_materialization_call_count": (
+                    proof_materialization_call_count
+                ),
+            }
         )
-        for selection in selections
-    )
+        exact_boundary_no_goods = updated_no_goods
+        pruned_variant_keys = {
+            key
+            for key, item in reviewed_variants.items()
+            if any(
+                (option.measurement_key, option.frame_offset)
+                in exact_boundary_no_goods
+                for option in item.selection.joint_result.boundary_options
+            )
+        }
+        for key in pruned_variant_keys - discarded_variant_keys:
+            discarded_variant_keys.add(key)
+            discarded_candidate_count += 1
+        for key in pruned_variant_keys:
+            item = reviewed_variants[key]
+            rejected_variant_no_goods[key] = frozenset(
+                (option.measurement_key, option.frame_offset)
+                for option in item.selection.joint_result.boundary_options
+                if (
+                    option.measurement_key,
+                    option.frame_offset,
+                )
+                in exact_boundary_no_goods
+            )
+        reviewed_variants = {
+            key: item
+            for key, item in reviewed_variants.items()
+            if key not in pruned_variant_keys
+        }
+        retry_round += 1
+
+    selections = tuple(item.selection for item in final_reviewed)
+    proof_bundles = tuple(item.proof_bundle for item in final_reviewed)
+    reviews = tuple(item.review for item in final_reviewed)
     ranked_indices = _review_ranked_candidate_indices(reviews)
     selected_candidate_index = ranked_indices[0]
     rank_by_index = {
@@ -1083,6 +1896,7 @@ def select_joint_visual_candidates(
         selections=selections,
         candidate_records=records,
         selected_candidate_index=selected_candidate_index,
+        boundary_proof_bundles=proof_bundles,
         profile_failures=tuple(profile_failures),
         role_control_audits=tuple(role_audits),
         shared_option_evidence_cache_audit={
@@ -1107,6 +1921,46 @@ def select_joint_visual_candidates(
                 ),
             }
         ),
+        selection_retry_audit={
+            "contract": "joint_visual_authoritative_passing_retry_v2",
+            "production_review_floor_required": True,
+            "total_round_count": total_round_count,
+            "retry_round_count": retry_round,
+            "global_profile_attempt_count": global_profile_attempt_index,
+            "global_candidate_attempt_count": global_candidate_attempt_index,
+            "total_unique_candidate_attempt_count": (
+                total_unique_candidate_attempt_count
+            ),
+            "proof_materialization_call_count": (
+                proof_materialization_call_count
+            ),
+            "maximum_proof_materialization_calls": (
+                maximum_proof_materialization_calls
+            ),
+            "review_call_count": review_call_count,
+            "review_failure_count": review_failure_count,
+            "review_cache_hit_count": review_cache_hit_count,
+            "reviewed_unique_candidate_count": review_call_count,
+            "retained_reviewed_candidate_count": len(reviewed_variants),
+            "discarded_candidate_count": discarded_candidate_count,
+            "coverage_contract_failure_count": (
+                coverage_contract_failure_count
+            ),
+            "passing_candidate_count": len(reviewed_variants),
+            "initial_exact_boundary_no_good_count": (
+                initial_exact_boundary_no_good_count
+            ),
+            "exact_boundary_no_good_count": len(exact_boundary_no_goods),
+            "external_complete_path_no_good_count": len(
+                external_complete_path_no_goods
+            ),
+            "maximum_retry_rounds": MAXIMUM_JOINT_VISUAL_RETRY_ROUNDS,
+            "events": retry_events,
+            "profile_failure_events": profile_failure_events,
+            "coverage_failure_events": coverage_failure_events,
+            "raw_frames_persisted": False,
+            "raw_visual_descriptors_persisted": False,
+        },
     )
 
 
@@ -1305,83 +2159,137 @@ class JointVisualBoundaryProofBundle:
         }
 
 
-def _transition_annotations(
-    candidates: Sequence[TimelineCandidate],
+def _maximum_available_metric(*values: float | None) -> float | None:
+    available = tuple(float(value) for value in values if value is not None)
+    return max(available) if available else None
+
+
+def _authoritative_transition_annotations(
+    proof_bundle: JointVisualBoundaryProofBundle,
     index: int,
-    candidate_set: VisualTimelineOptimizerCarrier,
+    *,
+    candidate_index: int,
+    cadence_profile: str,
 ) -> dict[str, object]:
+    """Project the exact post-transform provider result into review scalars."""
+
     if index == 0:
-        return {
-            "face": None,
-            "layout": None,
-            "pose_basis": None,
-            "pose": None,
-            "silhouette": None,
-            "formation": None,
-        }
-    previous = candidates[index - 1]
-    current = candidates[index]
-    current_subject_metadata = candidate_set.subject_metadata_by_candidate.get(
-        current.candidate_id,
-        _missing_candidate_subject_metadata(),
-    )
-    previous_subject_metadata = (
-        candidate_set.subject_metadata_by_candidate.get(previous.candidate_id)
-    )
-    face_mismatch = face_geometry_minimax_mismatch(
-        previous.exit_face_geometry_window,
-        current.entry_face_geometry_window,
-    )
-    face = (
-        face_mismatch
-        if previous.exit_face_geometry_window
-        and current.entry_face_geometry_window
-        else None
-    )
-    previous_pose = previous.exit_pose_embedding or previous.pose_embedding
-    current_pose = current.entry_pose_embedding or current.pose_embedding
-    actual_pose_pair = (
-        previous_subject_metadata is not None
-        and previous_subject_metadata.pose_backends[2]
-        != "structure_hog_fallback"
-        and current_subject_metadata.pose_backends[0]
-        != "structure_hog_fallback"
-        and bool(previous_pose)
-        and bool(current_pose)
-        and len(previous_pose) == len(current_pose)
-    )
-    if actual_pose_pair:
-        pose_basis = "opencv_zoo_mediapipe_pose"
-    else:
-        pose_basis = "structure_hog_fallback"
-        previous_pose = (
-            previous.exit_structure_embedding or previous.structure_embedding
+        return _neutral_transition_annotations()
+    boundary = proof_bundle.boundary_proofs[index - 1]
+    if boundary.measurement_key.boundary_index != index - 1:
+        raise ValueError("joint boundary proof index drifted during projection")
+    evidence = boundary.result_evidence
+    if not isinstance(evidence, BoundaryVisualEvidence):
+        raise TypeError("joint boundary proof contains invalid result evidence")
+    if (
+        boundary.measurement_key.outgoing.source_id
+        == boundary.measurement_key.incoming.source_id
+    ):
+        if boundary.frame_offset != 0:
+            raise ValueError(
+                "same-source joint boundary proof changed the native clock"
+            )
+        key = boundary.measurement_key
+        if not (
+            math.isclose(
+                key.outgoing.end_seconds,
+                key.incoming.start_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                boundary.boundary_master_seconds,
+                key.outgoing.end_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            and boundary.outgoing_source_index
+            == boundary.incoming_source_index
+            and math.isclose(
+                boundary.outgoing_boundary_source_seconds,
+                boundary.incoming_boundary_source_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise ValueError(
+                "same-source joint boundary lost exact renderer clock "
+                "continuity"
+            )
+        for transform in (
+            boundary.outgoing_transform,
+            boundary.incoming_transform,
+        ):
+            if (
+                transform.crop_xywh is not None
+                or not math.isclose(
+                    transform.rotation_degrees,
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                or transform.subject_basis != "full_frame_identity"
+            ):
+                raise ValueError(
+                    "same-source renderer continuity used a non-identity "
+                    "boundary transform"
+                )
+        # This is one continuous decode clock with identity transforms.  It may
+        # contain a broadcaster-authored native camera cut, but the cross-cut
+        # engine introduces no new visual discontinuity at this boundary.
+        # Cross-source pose/layout coverage is therefore not the authority for
+        # this path; the exact renderer clock proof is.
+        return _neutral_transition_annotations()
+    if not evidence.evidence_coverage.professional_gate_passed:
+        raise JointVisualEvidenceCoverageError(
+            candidate_index=candidate_index,
+            cadence_profile=cadence_profile,
+            boundary=boundary,
         )
-        current_pose = current.entry_structure_embedding or current.structure_embedding
     return {
-        "face": face,
-        "layout": cross_source_layout_mismatch(previous, current),
-        "pose_basis": pose_basis,
-        "pose": _embedding_rms_distance(previous_pose, current_pose),
-        "silhouette": _embedding_rms_distance(
-            previous.exit_silhouette_embedding or previous.silhouette_embedding,
-            current.entry_silhouette_embedding or current.silhouette_embedding,
+        "authority": JOINT_BOUNDARY_RESULT_EVIDENCE_AUTHORITY,
+        "contract": JOINT_BOUNDARY_RESULT_EVIDENCE_CONTRACT,
+        "scale": evidence.shot_scale_delta,
+        "focus": evidence.focus_mismatch,
+        # The provider gates both transient and persisted layout estimates.
+        # Carry the stricter available scalar into the single generic review
+        # lane so neither gate can disappear at the representation boundary.
+        "layout": _maximum_available_metric(
+            evidence.layout_mismatch,
+            evidence.persisted_layout_mismatch,
         ),
-        "formation": comparable_group_formation_mismatch(
-            previous.exit_formation_people,
-            current.entry_formation_people,
-            left_shot_type=previous.exit_shot_type or previous.shot_type,
-            right_shot_type=current.entry_shot_type or current.shot_type,
-        ),
+        "pose_basis": evidence.pose_basis,
+        "pose": evidence.pose_mismatch,
+        "silhouette": evidence.silhouette_mismatch,
+        "formation": evidence.formation_mismatch,
+        "entry_side_stability": evidence.incoming_side_stability,
+        "exit_side_stability": evidence.outgoing_side_stability,
     }
 
 
-def _materialize_visual_plan_without_decode(
-    selection_set: JointVisualSelectionSet,
-    record: VisualTimelineCandidateRecord,
+def _replace_endpoint_sample(
+    samples: Sequence[object],
+    *,
+    entry: object,
+    exit_: object,
+) -> tuple[object, object, object]:
+    if len(samples) != 3:
+        raise ValueError("joint visual metadata must contain three samples")
+    return (entry, samples[1], exit_)
+
+
+def _project_visual_plan_from_joint_proof(
+    *,
+    candidate_set: VisualTimelineOptimizerCarrier,
+    timeline_result: TimelineResult,
+    proof_bundle: JointVisualBoundaryProofBundle,
+    candidate_index: int,
+    cadence_profile: str,
+    candidate_review_summaries_payload: tuple[dict[str, Any], ...] = (),
 ) -> VisualTimelinePlan:
-    candidate_set = selection_set.candidate_set
-    candidates = record.timeline_result.candidates
+    candidates = timeline_result.candidates
+    if len(proof_bundle.boundary_proofs) != max(0, len(candidates) - 1):
+        raise ValueError("joint proof count does not match projected timeline")
     choices: list[VisualTimelineChoice] = []
     for index, candidate in enumerate(candidates):
         source_index = int(candidate.source_id)
@@ -1393,11 +2301,62 @@ def _materialize_visual_plan_without_decode(
             candidate.candidate_id,
             _missing_candidate_subject_metadata(),
         )
-        transition = _transition_annotations(
-            candidates,
+        transition = _authoritative_transition_annotations(
+            proof_bundle,
             index,
-            candidate_set,
+            candidate_index=candidate_index,
+            cadence_profile=cadence_profile,
         )
+        face_samples = _replace_endpoint_sample(
+            face_metadata.boxes,
+            entry=(
+                candidate.entry_focus_bbox_xywh
+                if index > 0
+                else face_metadata.boxes[0]
+            ),
+            exit_=(
+                candidate.exit_focus_bbox_xywh
+                if index < len(candidates) - 1
+                else face_metadata.boxes[2]
+            ),
+        )
+        silhouette_samples = _replace_endpoint_sample(
+            subject_metadata.silhouette_boxes,
+            entry=(
+                candidate.entry_subject_bbox_xywh
+                if index > 0
+                else subject_metadata.silhouette_boxes[0]
+            ),
+            exit_=(
+                candidate.exit_subject_bbox_xywh
+                if index < len(candidates) - 1
+                else subject_metadata.silhouette_boxes[2]
+            ),
+        )
+        silhouette_centroids = _replace_endpoint_sample(
+            subject_metadata.silhouette_centroids,
+            entry=(
+                candidate.entry_subject_centroid_xy
+                if index > 0
+                else subject_metadata.silhouette_centroids[0]
+            ),
+            exit_=(
+                candidate.exit_subject_centroid_xy
+                if index < len(candidates) - 1
+                else subject_metadata.silhouette_centroids[2]
+            ),
+        )
+        entry_side_stability = (
+            transition["entry_side_stability"]
+            if index > 0
+            else candidate.entry_boundary_side_stability
+        )
+        if index < len(candidates) - 1:
+            exit_side_stability = proof_bundle.boundary_proofs[
+                index
+            ].result_evidence.outgoing_side_stability
+        else:
+            exit_side_stability = candidate.exit_boundary_side_stability
         choices.append(
             VisualTimelineChoice(
                 segment_index=candidate.segment_index,
@@ -1434,13 +2393,9 @@ def _materialize_visual_plan_without_decode(
                 internal_scene_cut_master_seconds=(
                     candidate.internal_scene_cut_master_seconds
                 ),
-                entry_boundary_side_stability=(
-                    candidate.entry_boundary_side_stability
-                ),
-                exit_boundary_side_stability=(
-                    candidate.exit_boundary_side_stability
-                ),
-                face_samples_xywh=face_metadata.boxes,
+                entry_boundary_side_stability=entry_side_stability,
+                exit_boundary_side_stability=exit_side_stability,
+                face_samples_xywh=face_samples,
                 face_match_candidate_failure=face_metadata.failure,
                 face_detector_backends=face_metadata.backends,
                 face_landmark_samples_xy=face_metadata.landmarks,
@@ -1448,7 +2403,6 @@ def _materialize_visual_plan_without_decode(
                 face_eye_scale_samples=face_metadata.eye_scales,
                 entry_face_geometry_window=candidate.entry_face_geometry_window,
                 exit_face_geometry_window=candidate.exit_face_geometry_window,
-                face_transition_minimax_mismatch_from_previous=transition["face"],
                 pose_backends=subject_metadata.pose_backends,
                 pose_confidences=subject_metadata.pose_confidences,
                 detected_person_counts=subject_metadata.person_counts,
@@ -1457,12 +2411,18 @@ def _materialize_visual_plan_without_decode(
                     subject_metadata.formation_upper_body_counts
                 ),
                 shot_scale_bases=subject_metadata.shot_scale_bases,
-                silhouette_samples_xywh=subject_metadata.silhouette_boxes,
-                silhouette_centroid_samples_xy=(
-                    subject_metadata.silhouette_centroids
-                ),
+                silhouette_samples_xywh=silhouette_samples,
+                silhouette_centroid_samples_xy=silhouette_centroids,
                 silhouette_backends=subject_metadata.silhouette_backends,
                 silhouette_confidences=subject_metadata.silhouette_confidences,
+                transition_evidence_authority_from_previous=(
+                    transition["authority"]
+                ),
+                transition_evidence_contract_from_previous=(
+                    transition["contract"]
+                ),
+                scale_transition_mismatch_from_previous=transition["scale"],
+                focus_transition_mismatch_from_previous=transition["focus"],
                 layout_transition_mismatch_from_previous=transition["layout"],
                 pose_transition_basis_from_previous=transition["pose_basis"],
                 pose_transition_mismatch_from_previous=transition["pose"],
@@ -1476,17 +2436,33 @@ def _materialize_visual_plan_without_decode(
         )
     return VisualTimelinePlan(
         choices=tuple(choices),
-        optimizer_score=record.timeline_result.total_score,
+        optimizer_score=timeline_result.total_score,
         analysis_basis=(
-            "joint_decoded_boundary_offset_and_transform_materialization_v1"
+            "joint_decoded_boundary_offset_transform_and_result_evidence_"
+            "materialization_v2"
         ),
-        selected_candidate_index=record.candidate_index,
+        selected_candidate_index=candidate_index,
         candidate_generation_basis=JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS,
-        candidate_review_summaries=candidate_review_summaries(
+        candidate_review_summaries=candidate_review_summaries_payload,
+        source_clock_basis=candidate_set.source_clock_basis,
+    )
+
+
+def _materialize_visual_plan_without_decode(
+    selection_set: JointVisualSelectionSet,
+    record: VisualTimelineCandidateRecord,
+    proof_bundle: JointVisualBoundaryProofBundle,
+) -> VisualTimelinePlan:
+    return _project_visual_plan_from_joint_proof(
+        candidate_set=selection_set.candidate_set,
+        timeline_result=record.timeline_result,
+        proof_bundle=proof_bundle,
+        candidate_index=record.candidate_index,
+        cadence_profile=record.cadence_profile,
+        candidate_review_summaries_payload=candidate_review_summaries(
             selection_set,
             selected_candidate_index=record.candidate_index,
         ),
-        source_clock_basis=candidate_set.source_clock_basis,
     )
 
 
@@ -1804,12 +2780,24 @@ def _materialize_joint_candidate(
     selection_set: JointVisualSelectionSet,
     record: VisualTimelineCandidateRecord,
     *,
-    provider: DecodedBoundaryOptionProvider,
     fps: float,
 ) -> JointMaterializedVisualCandidate:
-    selection = selection_set.selection_for_candidate(record.candidate_index)
-    proof_bundle = _proof_bundle(selection, provider)
-    visual_plan = _materialize_visual_plan_without_decode(selection_set, record)
+    proof_bundle = selection_set.proof_bundle_for_candidate(
+        record.candidate_index
+    )
+    visual_plan = _materialize_visual_plan_without_decode(
+        selection_set,
+        record,
+        proof_bundle,
+    )
+    materialized_review = review_timeline(
+        visual_plan,
+        available_source_count=len(selection_set.candidate_set.sources),
+    )
+    if materialized_review.to_dict() != record.review.to_dict():
+        raise RuntimeError(
+            "joint authoritative review changed during materialization"
+        )
     common_master_start = visual_plan.choices[0].canonical_master_start
     segments: list[RenderSegment] = []
     for choice, path in zip(
@@ -1919,7 +2907,6 @@ def materialize_joint_visual_candidates(
         _materialize_joint_candidate(
             selection_set,
             record,
-            provider=provider,
             fps=fps,
         )
         for record in ranked
