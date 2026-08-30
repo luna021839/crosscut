@@ -72,7 +72,7 @@ JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS = (
     "decoded_exact_seventeen_offset_joint_boundary_provider_v2+"
     "visual_boundary_repair_professional_gates_v4+"
     "scalar_only_exact_raw_result_context_proof_v2+"
-    "renderer_exact_full_segment_sface_track_v1+"
+    "renderer_exact_full_segment_sface_track_v2+"
     "immutable_transform_subject_basis_v1+selected_bridge_audit_handoff_v1"
 )
 _SIDE_SAMPLE_RADIUS_FRAMES = 3
@@ -91,8 +91,8 @@ _BOUNDARY_MATERIALIZATION_LIMIT = 64
 _SEGMENT_MATERIALIZATION_LIMIT = 32
 _MEASUREMENT_AUDIT_LIMIT = 8
 _TRANSIENT_AUDIT_LIMIT = 32
-_SCALAR_BRIDGE_CACHE_NAMESPACE = "joint-bridge-disposition-v2"
-_SCALAR_BRIDGE_CACHE_CONTRACT = "joint-bridge-disposition-scalar-shard-v2"
+_SCALAR_BRIDGE_CACHE_NAMESPACE = "joint-bridge-disposition-v3"
+_SCALAR_BRIDGE_CACHE_CONTRACT = "joint-bridge-disposition-scalar-shard-v3"
 _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD = 8 * (
     1 + (8 - 1) * len(JOINT_BOUNDARY_FRAME_OFFSETS)
 ) ** 2
@@ -177,6 +177,76 @@ def _finite(value: object, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite")
     return result
+
+
+def _renderer_sample_schedule(
+    *,
+    start_master_seconds: float,
+    end_master_seconds: float,
+    duration_frames: float,
+    output_fps: float,
+    required_master_sample_times: Sequence[float],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return renderer frame centres plus exact boundary-required clocks.
+
+    Renderer-visible centres are anchored at the segment start.  A segment can
+    end on a fractional frame, while a boundary proof is anchored at that exact
+    end clock.  Keep the regular renderer centres and union only the explicit
+    boundary clocks needed by the adjacent authorized options.  Required clocks
+    replace a tolerance-equivalent regular centre so the strict proof retains
+    the boundary's exact floating-point identity.
+    """
+
+    expected_frame_center_count = int(
+        math.ceil(max(0.0, duration_frames - 0.5 - _EPSILON))
+    )
+    frame_centers = tuple(
+        start_master_seconds + (index + 0.5) / output_fps
+        for index in range(expected_frame_center_count)
+        if start_master_seconds + (index + 0.5) / output_fps
+        < end_master_seconds - _EPSILON
+    )
+    interior = list(frame_centers)
+    for index, raw_required in enumerate(required_master_sample_times):
+        required = _finite(
+            raw_required,
+            f"required_master_sample_times[{index}]",
+        )
+        if not (
+            start_master_seconds + _EPSILON
+            < required
+            < end_master_seconds - _EPSILON
+        ):
+            raise RuntimeError(
+                "required boundary renderer sample lies outside its segment"
+            )
+        for existing_index, existing in enumerate(interior):
+            if math.isclose(
+                existing,
+                required,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                interior[existing_index] = required
+                break
+        else:
+            interior.append(required)
+    interior.sort()
+    deduplicated: list[float] = []
+    for value in interior:
+        if deduplicated and math.isclose(
+            deduplicated[-1],
+            value,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            continue
+        deduplicated.append(value)
+    return frame_centers, (
+        start_master_seconds,
+        *deduplicated,
+        end_master_seconds,
+    )
 
 
 def _candidate_private_state_sha256(candidate: TimelineCandidate) -> str:
@@ -2701,6 +2771,7 @@ class DecodedBoundaryOptionProvider:
         start_master_seconds: float,
         end_master_seconds: float,
         duration_frames: float,
+        required_master_sample_times: Sequence[float],
         context_identity: str,
     ) -> _TransformPathEvidence:
         expected_duration_frames = (
@@ -2714,7 +2785,7 @@ class DecodedBoundaryOptionProvider:
         ):
             raise RuntimeError("segment bridge duration disagrees with endpoint clocks")
         base_payload: dict[str, object] = {
-            "contract": "joint-segment-transform-path-proof-v1",
+            "contract": "joint-segment-transform-path-proof-v2",
             "analysis_basis": self.analysis_basis,
             "configuration_identity": self._configuration_identity,
             "context_identity": context_identity,
@@ -2724,10 +2795,14 @@ class DecodedBoundaryOptionProvider:
             "start_master_seconds": start_master_seconds,
             "end_master_seconds": end_master_seconds,
             "duration_frames": duration_frames,
+            "required_master_sample_times": list(
+                required_master_sample_times
+            ),
         }
         source_index = self._source_index(candidate.source_id)
         expected_sample_count = 0
         expected_frame_center_count = 0
+        frame_centers: tuple[float, ...] = ()
         transient_samples: list[SegmentTransformPathSample] = []
         editorial_track: EditorialTransformTrack | None = None
 
@@ -2755,11 +2830,34 @@ class DecodedBoundaryOptionProvider:
                     abs_tol=1e-9,
                 )
             )
+            required_boundary_samples_included = all(
+                any(
+                    math.isclose(
+                        float(sample["master_seconds"]),
+                        required,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                    for sample in samples
+                )
+                for required in required_master_sample_times
+            )
             full_frame_centers_included = bool(
                 endpoints_included
                 and len(samples) == expected_sample_count
-                and expected_sample_count
-                == expected_frame_center_count + 2
+                and all(
+                    any(
+                        math.isclose(
+                            float(sample["master_seconds"]),
+                            center,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                        for sample in samples
+                    )
+                    for center in frame_centers
+                )
+                and required_boundary_samples_included
             )
             identity = "joint-segment-path:" + _sha256_json(
                 {
@@ -2775,6 +2873,9 @@ class DecodedBoundaryOptionProvider:
                     "endpoints_included": endpoints_included,
                     "full_frame_centers_included": (
                         full_frame_centers_included
+                    ),
+                    "required_boundary_samples_included": (
+                        required_boundary_samples_included
                     ),
                     "editorial_transform_track": (
                         {
@@ -2847,30 +2948,34 @@ class DecodedBoundaryOptionProvider:
                 track_compatible=True,
                 failure_codes=("segment_duration_below_two_frames",),
             )
+        if any(
+            not (
+                start_master_seconds + _EPSILON
+                < float(required)
+                < end_master_seconds - _EPSILON
+            )
+            for required in required_master_sample_times
+        ):
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=(
+                    "segment_required_boundary_sample_outside_path",
+                ),
+            )
 
         # Rendering samples visible frames at half-frame centres.  Bind both
         # exact endpoint transforms and every such centre; boundary-aligned
         # integer-frame sampling alone can miss a one-frame crop/track escape.
-        expected_frame_center_count = int(
-            math.ceil(
-                max(
-                    0.0,
-                    duration_frames - 0.5 - _EPSILON,
-                )
-            )
-        )
-        frame_centers = tuple(
-            start_master_seconds + (index + 0.5) / self.output_fps
-            for index in range(expected_frame_center_count)
-            if start_master_seconds + (index + 0.5) / self.output_fps
-            < end_master_seconds - _EPSILON
+        frame_centers, sample_times = _renderer_sample_schedule(
+            start_master_seconds=start_master_seconds,
+            end_master_seconds=end_master_seconds,
+            duration_frames=duration_frames,
+            output_fps=self.output_fps,
+            required_master_sample_times=required_master_sample_times,
         )
         expected_frame_center_count = len(frame_centers)
-        sample_times = (
-            start_master_seconds,
-            *frame_centers,
-            end_master_seconds,
-        )
         expected_sample_count = len(sample_times)
 
         if entry_transform.track_id is None or exit_transform.track_id is None:
@@ -2967,36 +3072,52 @@ class DecodedBoundaryOptionProvider:
                 max(0.0, master_seconds - start_master_seconds)
             )
             sample_crop = self._renderer_crop(renderer_keyframe)
-            sample_transform = BoundaryTransformState(
-                transform_identity=(
-                    "joint-segment-sample-transform:"
-                    + _sha256_json(
-                        {
-                            "context_identity": context_identity,
-                            "master_seconds": master_seconds,
-                            "source_seconds": source_seconds,
-                            "fraction": fraction,
-                            "crop_xywh": (
-                                list(sample_crop)
-                                if sample_crop is not None
-                                else None
-                            ),
-                            "track_id": entry_transform.track_id,
-                        }
-                    )
-                ),
-                crop_xywh=sample_crop,
-                rotation_degrees=renderer_keyframe.roll_degrees,
-                track_id=entry_transform.track_id,
-                subject_basis=subject_basis,
-            )
+            if math.isclose(
+                master_seconds,
+                start_master_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                sample_transform = entry_transform
+            elif math.isclose(
+                master_seconds,
+                end_master_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                sample_transform = exit_transform
+            else:
+                sample_transform = BoundaryTransformState(
+                    transform_identity=(
+                        "joint-segment-sample-transform:"
+                        + _sha256_json(
+                            {
+                                "context_identity": context_identity,
+                                "master_seconds": master_seconds,
+                                "source_seconds": source_seconds,
+                                "fraction": fraction,
+                                "crop_xywh": (
+                                    list(sample_crop)
+                                    if sample_crop is not None
+                                    else None
+                                ),
+                                "track_id": entry_transform.track_id,
+                            }
+                        )
+                    ),
+                    crop_xywh=sample_crop,
+                    rotation_degrees=renderer_keyframe.roll_degrees,
+                    track_id=entry_transform.track_id,
+                    subject_basis=subject_basis,
+                )
+            sample_subject_basis = sample_transform.subject_basis
             if source_seconds < 0.0:
                 transient_samples.append(
                     SegmentTransformPathSample(
                         master_seconds=master_seconds,
                         source_seconds=source_seconds,
                         transform=sample_transform,
-                        subject_basis=subject_basis,
+                        subject_basis=sample_subject_basis,
                         subject_bbox_xywh=None,
                         subject_bbox_coverage=None,
                         face_similarity_to_anchor=None,
@@ -3019,7 +3140,7 @@ class DecodedBoundaryOptionProvider:
                         master_seconds=master_seconds,
                         source_seconds=source_seconds,
                         transform=sample_transform,
-                        subject_basis=subject_basis,
+                        subject_basis=sample_subject_basis,
                         subject_bbox_xywh=None,
                         subject_bbox_coverage=None,
                         face_similarity_to_anchor=None,
@@ -3037,9 +3158,9 @@ class DecodedBoundaryOptionProvider:
                 )
             if not track_geometry_required:
                 bbox = None
-            elif subject_basis == "dominant_face":
+            elif sample_subject_basis == "dominant_face":
                 bbox = descriptor.primary_face_bbox
-            elif subject_basis == "subject_silhouette":
+            elif sample_subject_basis == "subject_silhouette":
                 bbox = descriptor.silhouette_bbox_xywh
             else:
                 bbox = descriptor.silhouette_bbox_xywh
@@ -3049,7 +3170,7 @@ class DecodedBoundaryOptionProvider:
                         master_seconds=master_seconds,
                         source_seconds=source_seconds,
                         transform=sample_transform,
-                        subject_basis=subject_basis,
+                        subject_basis=sample_subject_basis,
                         subject_bbox_xywh=None,
                         subject_bbox_coverage=None,
                         face_similarity_to_anchor=None,
@@ -3089,7 +3210,7 @@ class DecodedBoundaryOptionProvider:
             face_identity: tuple[float, ...] = ()
             similarity_to_anchor: float | None = None
             similarity_to_previous: float | None = None
-            if subject_basis == "dominant_face":
+            if sample_subject_basis == "dominant_face":
                 face_identity = self._sample_face_identity(
                     source_index,
                     source_seconds,
@@ -3113,7 +3234,7 @@ class DecodedBoundaryOptionProvider:
                     master_seconds=master_seconds,
                     source_seconds=source_seconds,
                     transform=sample_transform,
-                    subject_basis=subject_basis,
+                    subject_basis=sample_subject_basis,
                     subject_bbox_xywh=bbox,
                     subject_bbox_coverage=coverage,
                     face_similarity_to_anchor=similarity_to_anchor,
@@ -3130,7 +3251,7 @@ class DecodedBoundaryOptionProvider:
                     failure_codes=("segment_subject_exits_crop_track",),
                     samples=samples,
                 )
-            if subject_basis == "dominant_face" and (
+            if sample_subject_basis == "dominant_face" and (
                 not face_identity
                 or similarity_to_anchor is None
                 or similarity_to_previous is None
@@ -3144,7 +3265,7 @@ class DecodedBoundaryOptionProvider:
                     ),
                     samples=samples,
                 )
-            if subject_basis == "dominant_face" and (
+            if sample_subject_basis == "dominant_face" and (
                 similarity_to_anchor
                 < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
                 or similarity_to_previous
@@ -3168,7 +3289,7 @@ class DecodedBoundaryOptionProvider:
                         if sample_crop is not None
                         else None
                     ),
-                    "subject_basis": subject_basis,
+                    "subject_basis": sample_subject_basis,
                     "subject_bbox_coverage": coverage,
                     "descriptor_private_state_sha256": (
                         _descriptor_private_state_sha256(descriptor)
@@ -3198,6 +3319,7 @@ class DecodedBoundaryOptionProvider:
         key: BoundaryMeasurementKey,
         frame_offset: int,
         boundary_master_seconds: float,
+        side_sample_radius_frames: int,
         raw_context_identity: str,
         outgoing_transform: BoundaryTransformState,
         incoming_transform: BoundaryTransformState,
@@ -3225,6 +3347,15 @@ class DecodedBoundaryOptionProvider:
                         key.outgoing.duration_seconds * self.output_fps
                         + frame_offset
                     ),
+                    required_master_sample_times=(
+                        self._required_boundary_renderer_sample_times(
+                            boundary_master_seconds=boundary_master_seconds,
+                            side_sample_radius_frames=(
+                                side_sample_radius_frames
+                            ),
+                            side="outgoing",
+                        )
+                    ),
                     context_identity=(raw_context_identity + ":first-outer"),
                 )
             )
@@ -3245,10 +3376,94 @@ class DecodedBoundaryOptionProvider:
                         key.incoming.duration_seconds * self.output_fps
                         - frame_offset
                     ),
+                    required_master_sample_times=(
+                        self._required_boundary_renderer_sample_times(
+                            boundary_master_seconds=boundary_master_seconds,
+                            side_sample_radius_frames=(
+                                side_sample_radius_frames
+                            ),
+                            side="incoming",
+                        )
+                    ),
                     context_identity=(raw_context_identity + ":last-outer"),
                 )
             )
         return tuple(proofs)
+
+    def _side_sample_radius_frames(
+        self,
+        *,
+        key: BoundaryMeasurementKey,
+        boundary_master_seconds: float,
+    ) -> int:
+        outgoing_span_frames = (
+            boundary_master_seconds - key.outgoing.start_seconds
+        ) * self.output_fps
+        incoming_span_frames = (
+            key.incoming.end_seconds - boundary_master_seconds
+        ) * self.output_fps
+        return min(
+            _SIDE_SAMPLE_RADIUS_FRAMES,
+            int(math.floor(outgoing_span_frames - 1.0 + _EPSILON)),
+            int(math.floor(incoming_span_frames - 1.0 + _EPSILON)),
+        )
+
+    def _required_boundary_renderer_sample_times(
+        self,
+        *,
+        boundary_master_seconds: float,
+        side_sample_radius_frames: int,
+        side: str,
+    ) -> tuple[float, float]:
+        if not 1 <= side_sample_radius_frames <= _SIDE_SAMPLE_RADIUS_FRAMES:
+            raise RuntimeError("boundary renderer sample radius is invalid")
+        frame_seconds = 1.0 / self.output_fps
+        exact_delta = frame_seconds / 2.0
+        side_delta = (
+            side_sample_radius_frames + 0.5
+        ) * frame_seconds
+        if side == "outgoing":
+            return (
+                boundary_master_seconds - side_delta,
+                boundary_master_seconds - exact_delta,
+            )
+        if side == "incoming":
+            return (
+                boundary_master_seconds + exact_delta,
+                boundary_master_seconds + side_delta,
+            )
+        raise ValueError("boundary renderer sample side is invalid")
+
+    def _bridge_required_master_sample_times(
+        self,
+        *,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        start_master_seconds: float,
+        end_master_seconds: float,
+    ) -> tuple[float, ...]:
+        entry_radius = self._side_sample_radius_frames(
+            key=entry_option.measurement_key,
+            boundary_master_seconds=start_master_seconds,
+        )
+        exit_radius = self._side_sample_radius_frames(
+            key=exit_option.measurement_key,
+            boundary_master_seconds=end_master_seconds,
+        )
+        if entry_radius < 1 or exit_radius < 1:
+            return ()
+        return (
+            *self._required_boundary_renderer_sample_times(
+                boundary_master_seconds=start_master_seconds,
+                side_sample_radius_frames=entry_radius,
+                side="incoming",
+            ),
+            *self._required_boundary_renderer_sample_times(
+                boundary_master_seconds=end_master_seconds,
+                side_sample_radius_frames=exit_radius,
+                side="outgoing",
+            ),
+        )
 
     def _measure(
         self,
@@ -3293,16 +3508,9 @@ class DecodedBoundaryOptionProvider:
                 audits.append(audit)
                 records.append(record)
                 continue
-            outgoing_span_frames = (
-                boundary - key.outgoing.start_seconds
-            ) * self.output_fps
-            incoming_span_frames = (
-                key.incoming.end_seconds - boundary
-            ) * self.output_fps
-            side_sample_radius_frames = min(
-                _SIDE_SAMPLE_RADIUS_FRAMES,
-                int(math.floor(outgoing_span_frames - 1.0 + _EPSILON)),
-                int(math.floor(incoming_span_frames - 1.0 + _EPSILON)),
+            side_sample_radius_frames = self._side_sample_radius_frames(
+                key=key,
+                boundary_master_seconds=boundary,
             )
             if side_sample_radius_frames < 1:
                 audit, record = self._incomplete_audit(
@@ -3807,6 +4015,7 @@ class DecodedBoundaryOptionProvider:
                 key=key,
                 frame_offset=frame_offset,
                 boundary_master_seconds=boundary,
+                side_sample_radius_frames=side_sample_radius_frames,
                 raw_context_identity=raw_context_identity,
                 outgoing_transform=outgoing_transform,
                 incoming_transform=incoming_transform,
@@ -4064,16 +4273,9 @@ class DecodedBoundaryOptionProvider:
                 source_index = self._source_index(key.outgoing.source_id)
                 boundary = key.outgoing.end_seconds
                 frame_seconds = 1.0 / self.output_fps
-                outgoing_span_frames = (
-                    boundary - key.outgoing.start_seconds
-                ) * self.output_fps
-                incoming_span_frames = (
-                    key.incoming.end_seconds - boundary
-                ) * self.output_fps
-                side_sample_radius_frames = min(
-                    _SIDE_SAMPLE_RADIUS_FRAMES,
-                    int(math.floor(outgoing_span_frames - 1.0 + _EPSILON)),
-                    int(math.floor(incoming_span_frames - 1.0 + _EPSILON)),
+                side_sample_radius_frames = self._side_sample_radius_frames(
+                    key=key,
+                    boundary_master_seconds=boundary,
                 )
                 if side_sample_radius_frames < 1:
                     audit, record = self._incomplete_audit(
@@ -4267,6 +4469,7 @@ class DecodedBoundaryOptionProvider:
                     key=key,
                     frame_offset=0,
                     boundary_master_seconds=boundary,
+                    side_sample_radius_frames=side_sample_radius_frames,
                     raw_context_identity=raw_context_identity,
                     outgoing_transform=outgoing_transform,
                     incoming_transform=incoming_transform,
@@ -4559,6 +4762,7 @@ class DecodedBoundaryOptionProvider:
         start_master_seconds: float,
         end_master_seconds: float,
         duration_frames: float,
+        required_master_sample_times: Sequence[float],
     ) -> tuple[object, ...]:
         return (
             self.analysis_basis,
@@ -4567,6 +4771,7 @@ class DecodedBoundaryOptionProvider:
             float(start_master_seconds),
             float(end_master_seconds),
             float(duration_frames),
+            tuple(float(value) for value in required_master_sample_times),
             self._bridge_transform_semantic_state(entry_transform),
             self._bridge_transform_semantic_state(exit_transform),
         )
@@ -4587,6 +4792,12 @@ class DecodedBoundaryOptionProvider:
         end_master_seconds = (
             candidate.end_seconds
             + exit_option.frame_offset / self.output_fps
+        )
+        required_master_sample_times = self._bridge_required_master_sample_times(
+            entry_option=entry_option,
+            exit_option=exit_option,
+            start_master_seconds=start_master_seconds,
+            end_master_seconds=end_master_seconds,
         )
 
         def renderer_state(
@@ -4628,6 +4839,9 @@ class DecodedBoundaryOptionProvider:
                 "start_master_seconds": float(start_master_seconds),
                 "end_master_seconds": float(end_master_seconds),
                 "duration_frames": float(request.duration_frames),
+                "required_master_sample_times": list(
+                    required_master_sample_times
+                ),
                 "entry_renderer_state": renderer_state(
                     entry_option.incoming_transform
                 ),
@@ -4906,6 +5120,7 @@ class DecodedBoundaryOptionProvider:
         start_master_seconds: float,
         end_master_seconds: float,
         duration_frames: float,
+        required_master_sample_times: Sequence[float],
         descriptor_resolver: Callable[
             [int, float], FrameVisualDescriptor | None
         ],
@@ -4959,25 +5174,29 @@ class DecodedBoundaryOptionProvider:
                 track_compatible=True,
                 failure_codes=("segment_duration_below_two_frames",),
             )
-
-        expected_frame_center_count = int(
-            math.ceil(
-                max(
-                    0.0,
-                    duration_frames - 0.5 - _EPSILON,
-                )
+        if any(
+            not (
+                start_master_seconds + _EPSILON
+                < float(required)
+                < end_master_seconds - _EPSILON
             )
-        )
-        frame_centers = tuple(
-            start_master_seconds + (index + 0.5) / self.output_fps
-            for index in range(expected_frame_center_count)
-            if start_master_seconds + (index + 0.5) / self.output_fps
-            < end_master_seconds - _EPSILON
-        )
-        sample_times = (
-            start_master_seconds,
-            *frame_centers,
-            end_master_seconds,
+            for required in required_master_sample_times
+        ):
+            return outcome(
+                evidence_complete=True,
+                crop_compatible=False,
+                track_compatible=True,
+                failure_codes=(
+                    "segment_required_boundary_sample_outside_path",
+                ),
+            )
+
+        _frame_centers, sample_times = _renderer_sample_schedule(
+            start_master_seconds=start_master_seconds,
+            end_master_seconds=end_master_seconds,
+            duration_frames=duration_frames,
+            output_fps=self.output_fps,
+            required_master_sample_times=required_master_sample_times,
         )
 
         if entry_transform.track_id is None or exit_transform.track_id is None:
@@ -5063,6 +5282,22 @@ class DecodedBoundaryOptionProvider:
         anchor_face_identity: tuple[float, ...] = ()
         previous_face_identity: tuple[float, ...] = ()
         for master_seconds in sample_times:
+            if math.isclose(
+                master_seconds,
+                start_master_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                sample_subject_basis = entry_transform.subject_basis
+            elif math.isclose(
+                master_seconds,
+                end_master_seconds,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                sample_subject_basis = exit_transform.subject_basis
+            else:
+                sample_subject_basis = subject_basis
             source_seconds = self._source_time(source_index, master_seconds)
             renderer_keyframe = editorial_track.evaluate(
                 max(0.0, master_seconds - start_master_seconds)
@@ -5085,9 +5320,9 @@ class DecodedBoundaryOptionProvider:
                 )
             if not track_geometry_required:
                 bbox = None
-            elif subject_basis == "dominant_face":
+            elif sample_subject_basis == "dominant_face":
                 bbox = descriptor.primary_face_bbox
-            elif subject_basis == "subject_silhouette":
+            elif sample_subject_basis == "subject_silhouette":
                 bbox = descriptor.silhouette_bbox_xywh
             else:
                 bbox = descriptor.silhouette_bbox_xywh
@@ -5128,7 +5363,7 @@ class DecodedBoundaryOptionProvider:
             face_identity: tuple[float, ...] = ()
             similarity_to_anchor: float | None = None
             similarity_to_previous: float | None = None
-            if subject_basis == "dominant_face":
+            if sample_subject_basis == "dominant_face":
                 face_identity = face_identity_resolver(
                     source_index,
                     source_seconds,
@@ -5147,7 +5382,7 @@ class DecodedBoundaryOptionProvider:
                         previous_face_identity,
                         face_identity,
                     )
-            if subject_basis == "dominant_face" and (
+            if sample_subject_basis == "dominant_face" and (
                 not face_identity
                 or similarity_to_anchor is None
                 or similarity_to_previous is None
@@ -5160,7 +5395,7 @@ class DecodedBoundaryOptionProvider:
                         "segment_dominant_face_identity_evidence_incomplete",
                     ),
                 )
-            if subject_basis == "dominant_face" and (
+            if sample_subject_basis == "dominant_face" and (
                 similarity_to_anchor
                 < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
                 or similarity_to_previous
@@ -5428,6 +5663,14 @@ class DecodedBoundaryOptionProvider:
                     candidate.end_seconds
                     + exit_option.frame_offset / self.output_fps
                 )
+                required_master_sample_times = (
+                    self._bridge_required_master_sample_times(
+                        entry_option=entry_option,
+                        exit_option=exit_option,
+                        start_master_seconds=start_master_seconds,
+                        end_master_seconds=end_master_seconds,
+                    )
+                )
                 (
                     evidence_complete,
                     crop_compatible,
@@ -5441,6 +5684,9 @@ class DecodedBoundaryOptionProvider:
                     start_master_seconds=start_master_seconds,
                     end_master_seconds=end_master_seconds,
                     duration_frames=request.duration_frames,
+                    required_master_sample_times=(
+                        required_master_sample_times
+                    ),
                     descriptor_resolver=resolve_descriptor,
                     face_identity_resolver=resolve_face_identity,
                 )
@@ -5614,6 +5860,12 @@ class DecodedBoundaryOptionProvider:
             candidate.end_seconds
             + exit_option.frame_offset / self.output_fps
         )
+        required_master_sample_times = self._bridge_required_master_sample_times(
+            entry_option=entry_option,
+            exit_option=exit_option,
+            start_master_seconds=start_master_seconds,
+            end_master_seconds=end_master_seconds,
+        )
         semantic_key = self._bridge_semantic_key(
             candidate=candidate,
             entry_transform=entry_option.incoming_transform,
@@ -5621,10 +5873,11 @@ class DecodedBoundaryOptionProvider:
             start_master_seconds=start_master_seconds,
             end_master_seconds=end_master_seconds,
             duration_frames=duration,
+            required_master_sample_times=required_master_sample_times,
         )
         semantic_context_identity = _sha256_json(
             {
-                "contract": "joint-middle-segment-semantic-bridge-context-v1",
+                "contract": "joint-middle-segment-semantic-bridge-context-v2",
                 "analysis_basis": self.analysis_basis,
                 "configuration_identity": self._configuration_identity,
                 "candidate_state_sha256": (
@@ -5633,6 +5886,9 @@ class DecodedBoundaryOptionProvider:
                 "start_master_seconds": start_master_seconds,
                 "end_master_seconds": end_master_seconds,
                 "duration_frames": duration,
+                "required_master_sample_times": list(
+                    required_master_sample_times
+                ),
                 "entry_renderer_state": list(
                     self._bridge_transform_semantic_state(
                         entry_option.incoming_transform
@@ -5699,6 +5955,9 @@ class DecodedBoundaryOptionProvider:
                     start_master_seconds=start_master_seconds,
                     end_master_seconds=end_master_seconds,
                     duration_frames=duration,
+                    required_master_sample_times=(
+                        required_master_sample_times
+                    ),
                     context_identity=semantic_context_identity,
                 )
                 semantic_materialization = (
@@ -5757,6 +6016,9 @@ class DecodedBoundaryOptionProvider:
                     start_master_seconds=start_master_seconds,
                     end_master_seconds=end_master_seconds,
                     duration_frames=duration,
+                    required_master_sample_times=(
+                        required_master_sample_times
+                    ),
                     context_identity=semantic_context_identity,
                 )
                 if rehydrated_path != path:
@@ -5770,11 +6032,30 @@ class DecodedBoundaryOptionProvider:
                 )
                 materialization_rehydrated = True
             if semantic_materialization is not None:
+                alias_samples = semantic_materialization.samples
+                if alias_samples:
+                    rebound_samples = list(alias_samples)
+                    rebound_samples[0] = replace(
+                        rebound_samples[0],
+                        transform=entry_option.incoming_transform,
+                        subject_basis=(
+                            entry_option.incoming_transform.subject_basis
+                        ),
+                    )
+                    rebound_samples[-1] = replace(
+                        rebound_samples[-1],
+                        transform=exit_option.outgoing_transform,
+                        subject_basis=(
+                            exit_option.outgoing_transform.subject_basis
+                        ),
+                    )
+                    alias_samples = tuple(rebound_samples)
                 alias_materialization = replace(
                     semantic_materialization,
                     proof_identity=alias_identity,
                     entry_transform=entry_option.incoming_transform,
                     exit_transform=exit_option.outgoing_transform,
+                    samples=alias_samples,
                 )
                 self._bounded_transactional_set(
                     self._segment_materialization_by_proof,

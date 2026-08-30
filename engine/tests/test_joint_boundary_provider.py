@@ -2196,7 +2196,7 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
                 (
                     root
                     / "scalar-v1"
-                    / "joint-bridge-disposition-v2"
+                    / "joint-bridge-disposition-v3"
                 ).rglob("*.json")
             )
             self.assertEqual(len(records), 2)
@@ -3382,6 +3382,8 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             )
             self.assertIsNotNone(path.editorial_transform_track)
             self.assertIsNotNone(path.samples[0].descriptor)
+            self.assertEqual(path.samples[0].transform, path.entry_transform)
+            self.assertEqual(path.samples[-1].transform, path.exit_transform)
         self.assertFalse(hasattr(materialization, "to_dict"))
         first_boundary = materialization.boundaries[0]
         self.assertIn(first_boundary.raw_proof_identity, first_boundary.proof_identity)
@@ -3392,6 +3394,193 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
         self.assertIsNotNone(
             first_boundary.raw_outgoing_preceding_descriptor
         )
+
+    def test_fractional_segment_paths_retain_every_exact_boundary_sample(
+        self,
+    ) -> None:
+        fps = 29.97
+        first_end = 0.37540405660272214
+        middle_end = first_end + 1.014
+        last_end = middle_end + 1.014
+        first = TimelineCandidate(
+            segment_index=0,
+            source_id="0",
+            start_seconds=0.0,
+            end_seconds=first_end,
+            quality_score=0.8,
+            candidate_id="fractional:0",
+            shot_id="fractional-shot:0",
+        )
+        middle = TimelineCandidate(
+            segment_index=1,
+            source_id="1",
+            start_seconds=first_end,
+            end_seconds=middle_end,
+            quality_score=0.8,
+            candidate_id="fractional:1",
+            shot_id="fractional-shot:1",
+        )
+        last = TimelineCandidate(
+            segment_index=2,
+            source_id="0",
+            start_seconds=middle_end,
+            end_seconds=last_end,
+            quality_score=0.8,
+            candidate_id="fractional:2",
+            shot_id="fractional-shot:2",
+        )
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5, pose_value=0.1),
+            total_segment_count=3,
+            output_fps=fps,
+        )
+        result = select_joint_timeline(
+            ((first,), (middle,), (last,)),
+            option_provider=provider,
+            bridge_provider=provider.bridge_provider,
+            fps=fps,
+        )
+
+        materialization = provider.selection_materialization_proof(
+            result.boundary_options,
+            result.segment_bridge_proofs,
+        )
+        self.assertGreaterEqual(
+            provider.bridge_materialization_rehydration_count,
+            1,
+        )
+        self.assertGreaterEqual(
+            provider.boundary_materialization_rehydration_count,
+            1,
+        )
+
+        bridge_request = _bridge_request(
+            middle,
+            result.boundary_options[0],
+            result.boundary_options[1],
+            fps=fps,
+        )
+        scalar = provider.bridge_disposition_batch((bridge_request,))[0]
+        exact = result.segment_bridge_proofs[0]
+        self.assertEqual(
+            (
+                scalar.evidence_complete,
+                scalar.crop_compatible,
+                scalar.track_compatible,
+                scalar.failure_codes,
+                scalar.score_adjustment,
+            ),
+            (
+                exact.evidence_complete,
+                exact.crop_compatible,
+                exact.track_compatible,
+                exact.failure_codes,
+                exact.score_adjustment,
+            ),
+        )
+
+        frame_seconds = 1.0 / fps
+        for boundary_index, boundary in enumerate(materialization.boundaries):
+            outgoing_path = materialization.segment_paths[boundary_index]
+            incoming_path = materialization.segment_paths[boundary_index + 1]
+            expected = (
+                (
+                    outgoing_path,
+                    boundary.boundary_master_seconds - frame_seconds / 2.0,
+                ),
+                (
+                    outgoing_path,
+                    boundary.boundary_master_seconds
+                    - (boundary.side_sample_radius_frames + 0.5)
+                    * frame_seconds,
+                ),
+                (
+                    incoming_path,
+                    boundary.boundary_master_seconds + frame_seconds / 2.0,
+                ),
+                (
+                    incoming_path,
+                    boundary.boundary_master_seconds
+                    + (boundary.side_sample_radius_frames + 0.5)
+                    * frame_seconds,
+                ),
+            )
+            for path, required_seconds in expected:
+                self.assertEqual(
+                    sum(
+                        math.isclose(
+                            sample.master_seconds,
+                            required_seconds,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                        for sample in path.samples
+                    ),
+                    1,
+                )
+        for path in materialization.segment_paths:
+            self.assertEqual(path.samples[0].transform, path.entry_transform)
+            self.assertEqual(path.samples[-1].transform, path.exit_transform)
+
+    def test_opposing_offsets_reject_out_of_path_boundary_samples(self) -> None:
+        middle_duration_frames = 19.0
+        middle_end = 10.0 + middle_duration_frames / FPS
+        first = TimelineCandidate(
+            segment_index=0,
+            source_id="0",
+            start_seconds=9.0,
+            end_seconds=10.0,
+            quality_score=0.8,
+            candidate_id="opposing:0",
+            shot_id="opposing-shot:0",
+        )
+        middle = TimelineCandidate(
+            segment_index=1,
+            source_id="1",
+            start_seconds=10.0,
+            end_seconds=middle_end,
+            quality_score=0.8,
+            candidate_id="opposing:1",
+            shot_id="opposing-shot:1",
+        )
+        last = TimelineCandidate(
+            segment_index=2,
+            source_id="0",
+            start_seconds=middle_end,
+            end_seconds=middle_end + 1.0,
+            quality_score=0.8,
+            candidate_id="opposing:2",
+            shot_id="opposing-shot:2",
+        )
+        provider = _provider(
+            lambda _source, _seconds: _descriptor(0.5, pose_value=0.1),
+            total_segment_count=3,
+        )
+        entry = provider(
+            BoundaryMeasurementKey(0, first, middle)
+        ).audit_for(8).authorized_option
+        exit_ = provider(
+            BoundaryMeasurementKey(1, middle, last)
+        ).audit_for(-8).authorized_option
+        assert entry is not None and exit_ is not None
+        request = _bridge_request(middle, entry, exit_)
+        self.assertAlmostEqual(request.duration_frames, 3.0)
+
+        scalar = provider.bridge_disposition_batch((request,))[0]
+        exact = provider.bridge_provider(
+            middle,
+            entry,
+            exit_,
+            request.duration_frames,
+        )
+
+        self.assertFalse(scalar.authorized)
+        self.assertFalse(exact.authorized)
+        self.assertEqual(
+            scalar.failure_codes,
+            ("segment_required_boundary_sample_outside_path",),
+        )
+        self.assertEqual(exact.failure_codes, scalar.failure_codes)
 
     def test_selection_rejects_bridge_from_different_boundary_options(self) -> None:
         first = _candidate(0, "0")
