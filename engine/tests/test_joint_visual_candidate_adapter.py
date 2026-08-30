@@ -82,6 +82,7 @@ class StubDecodedProvider(DecodedBoundaryOptionProvider):
         self.sources = (Path("source-0.mp4"), Path("source-1.mp4"))
         self.audio_offsets = (0.25, 0.50)
         self.source_timewarps = (None, None)
+        self.scene_cut_times = ((), ())
         self.source_ids = ("0", "1")
         self.validated_segment_counts: list[int] = []
 
@@ -665,7 +666,11 @@ def _section_plan() -> SectionPlan:
     )
 
 
-def _candidate_set(*, role_conditioned: bool = False) -> VisualTimelineCandidateSet:
+def _candidate_set(
+    *,
+    role_conditioned: bool = False,
+    scene_cut_times: tuple[tuple[float, ...], ...] = ((), ()),
+) -> VisualTimelineCandidateSet:
     lattice = tuple(
         (_candidate(segment, "0"), _candidate(segment, "1"))
         for segment in range(3)
@@ -700,7 +705,7 @@ def _candidate_set(*, role_conditioned: bool = False) -> VisualTimelineCandidate
         audio_offsets=(0.25, 0.50),
         source_timewarps=(None, None),
         source_clock_basis="global_scalar_offset",
-        scene_cut_times=((), ()),
+        scene_cut_times=scene_cut_times,
         preferred_source_ids=("0", "1", "0"),
         section_plan=section_plan,
         phrase_times=(6.0,),
@@ -724,7 +729,7 @@ def _candidate_set(*, role_conditioned: bool = False) -> VisualTimelineCandidate
         source_timewarps=(None, None),
         source_clock_basis="global_scalar_offset",
         requested_maximum_results=8,
-        scene_cut_times=((), ()),
+        scene_cut_times=scene_cut_times,
         optimizer_workspace=workspace,
         optimizer_input_identity=workspace_identity,
     )
@@ -1745,6 +1750,43 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 bridge_audits=(tampered,),
             )
 
+    def test_shift_rematerializes_scene_cuts_across_moved_boundary(self) -> None:
+        candidate_set = _candidate_set(scene_cut_times=((6.35,), ()))
+        assert candidate_set.optimizer_workspace is not None
+        lattice = candidate_set.optimizer_workspace.candidates_by_segment
+        timeline = _timeline(lattice, ("0", "0", "0"), score=10.0)
+        choices = list(timeline.choices)
+        choices[1] = replace(
+            choices[1],
+            candidate=replace(
+                choices[1].candidate,
+                internal_scene_cut_master_seconds=(6.1,),
+            ),
+        )
+        result = _joint(
+            replace(timeline, choices=tuple(choices)),
+            offsets=(2, 0),
+            score=10.0,
+            variant="scene-cut-shift",
+        )
+
+        shifted = _shift_joint_timeline_result(
+            result,
+            fps=10.0,
+            candidate_set=candidate_set,
+        )
+
+        self.assertEqual(
+            shifted.candidates[0].internal_scene_cut_master_seconds,
+            (6.1,),
+        )
+        self.assertEqual(
+            shifted.candidates[1].internal_scene_cut_master_seconds,
+            (),
+        )
+        self.assertAlmostEqual(shifted.candidates[0].end_seconds, 6.2)
+        self.assertAlmostEqual(shifted.candidates[1].start_seconds, 6.2)
+
     def test_shift_rejects_sub_two_frame_segment(self) -> None:
         candidate_set = _candidate_set()
         assert candidate_set.optimizer_workspace is not None
@@ -1756,7 +1798,11 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             variant="short",
         )
         with self.assertRaisesRegex(ValueError, "shorter than two frames"):
-            _shift_joint_timeline_result(result, fps=9.0)
+            _shift_joint_timeline_result(
+                result,
+                fps=9.0,
+                candidate_set=candidate_set,
+            )
 
 
 if __name__ == "__main__":

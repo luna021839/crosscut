@@ -69,6 +69,7 @@ from .visual_score import (
     VisualTimelinePlan,
     _candidate_review_summary,
     _embedding_rms_distance,
+    _master_clock_time,
     _missing_candidate_face_metadata,
     _missing_candidate_subject_metadata,
     _review_ranked_candidate_indices,
@@ -83,6 +84,7 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "three_existing_safe_cadence_profiles_v1+"
     "exact_source_shot_proof_variant_coalescing_v2+"
     "mathematical_unique_path_floor_minimum_eight_render_variants_v2+"
+    "shifted_scene_cut_clock_rematerialization_v1+"
     "workspace_only_optimizer_seed_v1+"
     "selection_scalar_exact_rehydration_v1+"
     "finite_exact_boundary_nogood_retry_v1"
@@ -97,6 +99,7 @@ MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS = math.ceil(
     / MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH
 )
 MAXIMUM_PROFILE_JOINT_CANDIDATES = 8
+_SCENE_CUT_INTERIOR_EPSILON_SECONDS = 1e-6
 
 
 def _sha256_json(value: object) -> str:
@@ -407,6 +410,7 @@ def _shift_joint_timeline_result(
     result: JointTimelineResult,
     *,
     fps: float,
+    candidate_set: VisualTimelineOptimizerCarrier,
 ) -> TimelineResult:
     """Apply each selected boundary offset to both adjacent segment clocks."""
 
@@ -439,10 +443,55 @@ def _shift_joint_timeline_result(
         )
         if end - start < 2.0 / fps - 1e-9:
             raise ValueError("joint offset produced a segment shorter than two frames")
+        source_index = int(candidate.source_id)
+        if not 0 <= source_index < len(candidate_set.sources):
+            raise ValueError("joint candidate source_id is outside the candidate set")
+        if candidate_set.scene_cut_times:
+            source_start = _source_clock_time(
+                start,
+                source_index=source_index,
+                audio_offsets=candidate_set.audio_offsets,
+                source_timewarps=candidate_set.source_timewarps,
+            )
+            source_end = _source_clock_time(
+                end,
+                source_index=source_index,
+                audio_offsets=candidate_set.audio_offsets,
+                source_timewarps=candidate_set.source_timewarps,
+            )
+            internal_scene_cut_master_seconds = tuple(
+                master_cut
+                for source_cut in candidate_set.scene_cut_times[source_index]
+                if source_start + _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+                < source_cut
+                < source_end - _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+                for master_cut in (
+                    _master_clock_time(
+                        source_cut,
+                        source_index=source_index,
+                        audio_offsets=candidate_set.audio_offsets,
+                        source_timewarps=candidate_set.source_timewarps,
+                    ),
+                )
+                if start + _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+                < master_cut
+                < end - _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+            )
+        else:
+            internal_scene_cut_master_seconds = tuple(
+                value
+                for value in candidate.internal_scene_cut_master_seconds
+                if start + _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+                < value
+                < end - _SCENE_CUT_INTERIOR_EPSILON_SECONDS
+            )
         candidate = replace(
             candidate,
             start_seconds=start,
             end_seconds=end,
+            internal_scene_cut_master_seconds=(
+                internal_scene_cut_master_seconds
+            ),
         )
         shifted_choices.append(replace(choice, candidate=candidate))
     for left, right in zip(shifted_choices, shifted_choices[1:]):
@@ -593,6 +642,10 @@ def _assert_provider_binding(
         raise ValueError("joint provider audio offsets do not match candidate set")
     if tuple(provider.source_timewarps) != candidate_set.source_timewarps:
         raise ValueError("joint provider timewarps do not match candidate set")
+    if tuple(tuple(item) for item in provider.scene_cut_times) != (
+        candidate_set.scene_cut_times
+    ):
+        raise ValueError("joint provider scene cuts do not match candidate set")
     if tuple(provider.source_ids) != tuple(
         str(index) for index in range(len(candidate_set.sources))
     ):
@@ -990,7 +1043,11 @@ def select_joint_visual_candidates(
         JointVisualSelectionRecord(
             cadence_profile=profile,
             joint_result=result,
-            shifted_timeline_result=_shift_joint_timeline_result(result, fps=fps),
+            shifted_timeline_result=_shift_joint_timeline_result(
+                result,
+                fps=fps,
+                candidate_set=candidate_set,
+            ),
             source_shot_path=_source_shot_path_signature(result),
             proof_variant_signature=_proof_variant_signature(result),
             role_control_audit=role_audit_by_profile.get(profile),
