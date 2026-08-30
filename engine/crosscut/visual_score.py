@@ -1609,6 +1609,22 @@ class FrameVisualDescriptor:
         }
 
 
+_SHOT_SCALE_BASES = frozenset(
+    {
+        "legacy",
+        "dominant_face_height",
+        "aggregate_formation_people",
+        "clipped_single_performer_bbox",
+        "single_or_pair_performer_bbox",
+        "distant_single_or_pair_performer_bbox",
+        "clipped_single_subject_silhouette",
+        "single_subject_silhouette",
+        "aggregate_or_distant_silhouette",
+        "unknown_no_subject_geometry",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class VisualTimelineChoice:
     segment_index: int
@@ -4358,7 +4374,7 @@ def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
     )
     _VISUAL_ANALYZER_FINGERPRINT = build_analyzer_fingerprint(
         descriptor_schema=(
-            "frame_visual_descriptor_v1_numeric_geometry_pose_silhouette_"
+            "frame_visual_descriptor_v2_numeric_geometry_pose_silhouette_"
             "nanodet_formation_motion_no_sface_no_raw_frame"
         ),
         code_paths=(Path(__file__).with_name("pose.py"),),
@@ -4382,11 +4398,14 @@ def _descriptor_cache_payload(
 ) -> dict[str, Any]:
     """Serialize only derived numeric/geometry features, never frame pixels."""
 
+    if descriptor.shot_scale_basis not in _SHOT_SCALE_BASES:
+        raise ValueError("visual descriptor shot_scale_basis is invalid")
     return {
         "quality_score": descriptor.quality_score,
         "composition_score": descriptor.composition_score,
         "shot_scale": descriptor.shot_scale,
         "shot_type": descriptor.shot_type.value,
+        "shot_scale_basis": descriptor.shot_scale_basis,
         "face_count": descriptor.face_count,
         "structure_embedding": list(descriptor.structure_embedding),
         "motion": list(descriptor.motion) if descriptor.motion is not None else None,
@@ -4539,6 +4558,12 @@ def _descriptor_from_cache_payload(
         shot_type = ShotType(_cache_string(payload["shot_type"], "shot_type"))
     except ValueError as exc:
         raise ValueError("cached shot_type is invalid") from exc
+    shot_scale_basis = _cache_string(
+        payload["shot_scale_basis"],
+        "shot_scale_basis",
+    )
+    if shot_scale_basis not in _SHOT_SCALE_BASES:
+        raise ValueError("cached shot_scale_basis is invalid")
     raw_landmarks = payload["primary_face_landmarks_xy"]
     landmarks = (
         None
@@ -4597,6 +4622,7 @@ def _descriptor_from_cache_payload(
         ),
         shot_scale=_cache_float(payload["shot_scale"], "shot_scale"),
         shot_type=shot_type,
+        shot_scale_basis=shot_scale_basis,
         face_count=_cache_integer(payload["face_count"], "face_count"),
         structure_embedding=_cache_vector(
             payload["structure_embedding"], "structure_embedding"

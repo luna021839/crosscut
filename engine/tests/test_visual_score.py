@@ -36,6 +36,8 @@ from crosscut.visual_score import (
     YUNET_EXPECTED_SHA256,
     _DissolveEvidence,
     _DetectedFace,
+    _descriptor_cache_payload,
+    _descriptor_from_cache_payload,
     _dark_foreground_obstruction_score,
     _dissolve_evidence_window,
     _candidate_role_shot_samples,
@@ -766,7 +768,15 @@ class VisualScoreTests(unittest.TestCase):
             silhouette_area_ratio=0.0,
             silhouette_confidence=0.0,
             silhouette_backend="none",
+            shot_scale_basis="aggregate_formation_people",
         )
+
+    def test_descriptor_cache_rejects_unknown_shot_scale_basis(self) -> None:
+        payload = _descriptor_cache_payload(self._cache_descriptor())
+        payload["shot_scale_basis"] = "forged_geometry_basis"
+
+        with self.assertRaisesRegex(ValueError, "shot_scale_basis is invalid"):
+            _descriptor_from_cache_payload(payload)
 
     def test_required_direct_cache_symlink_fails_before_visual_analysis(
         self,

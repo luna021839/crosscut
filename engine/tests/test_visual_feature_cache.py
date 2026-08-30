@@ -58,6 +58,9 @@ _AUDITED_SFACE_PREVIOUS_ANALYZER_DIGEST = (
 _AUDITED_CURRENT_ANALYZER_DIGEST = (
     "072871c33ea2610cd30f4210b7cc80a35e418ca7c563a4c10ce39ca2e5b52173"
 )
+_AUDITED_ACTIVE_ANALYZER_DIGEST = (
+    "76f6b6eb0f9b6356c29950f4952613932644c999259e4139d9b34adfa2e2e692"
+)
 _AUDITED_LEGACY_DESCRIPTOR_DIGEST = (
     "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
 )
@@ -75,6 +78,9 @@ _AUDITED_SFACE_PREVIOUS_DESCRIPTOR_DIGEST = (
 )
 _AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
     "512bf2d767f5ca035f986f0e4e7b4693bb93e5aff828308537e0d8d795204c1e"
+)
+_AUDITED_ACTIVE_DESCRIPTOR_DIGEST = (
+    "e0429bd3e1f6f54d1a82a535953950f7f12fd0c426a266b42fdd619985076319"
 )
 
 
@@ -127,6 +133,17 @@ def _audited_analyzer_components(descriptor_digest: str) -> dict[str, object]:
             "python_version": "3.11.9",
         },
     }
+
+
+def _audited_active_analyzer_components() -> dict[str, object]:
+    components = _audited_analyzer_components(
+        _AUDITED_ACTIVE_DESCRIPTOR_DIGEST
+    )
+    components["descriptor_schema"] = (
+        "frame_visual_descriptor_v2_numeric_geometry_pose_silhouette_"
+        "nanodet_formation_motion_no_sface_no_raw_frame"
+    )
+    return components
 
 
 def _analyzer_from_components(components: dict[str, object]) -> AnalyzerFingerprint:
@@ -483,7 +500,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
             self.assertNotEqual(changed_asname, explicit_same_asname)
             self.assertNotEqual(baseline, changed_level)
 
-    def test_current_descriptor_dependency_digest_matches_migration_endpoint(
+    def test_current_descriptor_dependency_digest_matches_active_schema(
         self,
     ) -> None:
         visual_score_path = (
@@ -500,8 +517,36 @@ class VisualFeatureCacheTests(unittest.TestCase):
                     "describe_frame",
                 ),
             ),
-            _AUDITED_CURRENT_DESCRIPTOR_DIGEST,
+            _AUDITED_ACTIVE_DESCRIPTOR_DIGEST,
         )
+
+    def test_active_schema_does_not_reuse_incomplete_v1_descriptor(self) -> None:
+        previous = _analyzer_from_components(
+            _audited_analyzer_components(_AUDITED_CURRENT_DESCRIPTOR_DIGEST)
+        )
+        active = _analyzer_from_components(_audited_active_analyzer_components())
+        self.assertEqual(previous.digest, _AUDITED_CURRENT_ANALYZER_DIGEST)
+        self.assertEqual(active.digest, _AUDITED_ACTIVE_ANALYZER_DIGEST)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v1")
+            request = _request()
+            cold = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=previous,
+            )
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(
+                source_cache_directory=root / "cache",
+                source_path=source,
+                analyzer=active,
+            )
+
+            self.assertIsNone(warm.get_by_locator(request.locator))
+            self.assertEqual(warm.diagnostics()["decode_free_legacy_hit_count"], 0)
 
     def test_symbol_dependency_fingerprint_binds_helper_body_and_constant(
         self,

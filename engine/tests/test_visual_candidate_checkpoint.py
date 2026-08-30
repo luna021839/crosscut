@@ -258,7 +258,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
             "crop_rerank_code_sha256": (
                 "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
@@ -301,7 +301,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
         }
         unknown = {
@@ -335,7 +335,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
         }
 
@@ -364,7 +364,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
         }
 
@@ -393,7 +393,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
         }
 
@@ -422,7 +422,7 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         current = {
             **legacy,
             "selector_code_sha256": (
-                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
             ),
         }
 
@@ -451,6 +451,37 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
                 migration.current_crop_rerank_code_sha256,
                 crop_digest,
             )
+
+    def test_production_migration_accepts_descriptor_basis_cache_predecessor(
+        self,
+    ) -> None:
+        migration = next(
+            item
+            for item in VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+            if item.legacy_selector_code_sha256.startswith("0d10dbfa")
+        )
+        legacy = {
+            "sources": ["a", "b"],
+            "canonical_spans": [[0.0, 1.0]],
+            "selector_code_sha256": (
+                "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+            ),
+            "crop_rerank_code_sha256": (
+                "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+            ),
+            "code_fingerprint_contract": (
+                "python_module_symbol_dependency_ast_v2"
+            ),
+        }
+        current = {
+            **legacy,
+            "selector_code_sha256": (
+                "fa8ed04566a3d6c0d95ddb6eeb58d10e1331c99beb8585d2759d2b2b6841ab0f"
+            ),
+        }
+
+        self.assertTrue(migration.matches(legacy, current))
+        self.assertFalse(migration.matches(current, legacy))
 
     def test_code_migration_rejects_non_code_reverse_unknown_and_tamper(self) -> None:
         legacy_selector = "1" * 64

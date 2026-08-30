@@ -43,7 +43,11 @@ from crosscut.timewarp import (
     TimeWarpResidualDiagnostics,
 )
 from crosscut.visual_boundary_repair import BoundaryDescriptorCache
-from crosscut.visual_score import FrameVisualDescriptor
+from crosscut.visual_score import (
+    FrameVisualDescriptor,
+    _descriptor_cache_payload,
+    _descriptor_from_cache_payload,
+)
 
 
 FPS = 30.0
@@ -641,6 +645,51 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             payload["selection_options"]["exact_rejection_count"],
             0,
         )
+
+    def test_selected_proof_rehydrates_after_descriptor_cache_round_trip(
+        self,
+    ) -> None:
+        cold_descriptor = replace(
+            _descriptor(0.5, pose_value=0.1),
+            structure_embedding=(0.5,) * 96,
+            color_embedding=(0.2,) * 8,
+            person_layout_embedding=(0.1,) * 134,
+            silhouette_embedding=(0.2,) * 121,
+            shot_scale_basis="aggregate_formation_people",
+        )
+        warm_descriptor = _descriptor_from_cache_payload(
+            _descriptor_cache_payload(cold_descriptor)
+        )
+        self.assertEqual(warm_descriptor, cold_descriptor)
+        state = {"warm": False}
+
+        def descriptor(
+            _source: int,
+            _seconds: float,
+        ) -> FrameVisualDescriptor:
+            return warm_descriptor if state["warm"] else cold_descriptor
+
+        with mock.patch(
+            "crosscut.joint_boundary_provider._BOUNDARY_MATERIALIZATION_LIMIT",
+            1,
+        ):
+            provider = _provider(
+                descriptor,
+                descriptor_cache=BoundaryDescriptorCache(maximum_entries=1),
+            )
+            option = provider(_key()).audit_for(0).authorized_option
+            assert option is not None
+            with self.assertRaises(KeyError):
+                provider.materialization_proof(option.proof_identity)
+
+            state["warm"] = True
+            selection = provider.selection_materialization_proof((option,))
+
+        self.assertEqual(
+            selection.boundary_proof_identities,
+            (option.proof_identity,),
+        )
+        self.assertEqual(provider.boundary_materialization_rehydration_count, 1)
 
     def test_same_source_selection_options_defer_both_outer_tracks(
         self,
