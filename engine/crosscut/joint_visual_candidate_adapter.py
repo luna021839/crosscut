@@ -81,8 +81,8 @@ from .visual_score import (
 JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "joint_visual_candidate_adapter_v1+"
     "three_existing_safe_cadence_profiles_v1+"
-    "exact_source_shot_proof_variant_coalescing_v1+"
-    "minimum_eight_unique_paths_fail_closed_v1+"
+    "exact_source_shot_proof_variant_coalescing_v2+"
+    "minimum_six_unique_paths_minimum_eight_render_variants_v1+"
     "workspace_only_optimizer_seed_v1+"
     "selection_scalar_exact_rehydration_v1+"
     "finite_exact_boundary_nogood_retry_v1"
@@ -91,6 +91,8 @@ JOINT_EDITORIAL_MOTION_AUTHORITY_BASIS = (
     "decoded_joint_boundary_exact_renderer_track_editorial_motion_authority_v1"
 )
 MINIMUM_PRODUCTION_JOINT_CANDIDATES = 8
+MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS = 6
+MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH = 2
 MAXIMUM_PROFILE_JOINT_CANDIDATES = 8
 
 
@@ -118,6 +120,29 @@ def _source_shot_path_signature(
 
 def _proof_variant_signature(result: JointTimelineResult) -> tuple[str, ...]:
     return tuple(option.proof_identity for option in result.boundary_options)
+
+
+def _render_variant_signature(
+    result: JointTimelineResult,
+) -> tuple[tuple[object, ...], ...]:
+    """Identify the exact boundary clocks and renderer-authority transforms."""
+
+    return tuple(
+        (
+            option.frame_offset,
+            option.outgoing_transform.transform_identity,
+            option.outgoing_transform.crop_xywh,
+            option.outgoing_transform.rotation_degrees,
+            option.outgoing_transform.track_id,
+            option.outgoing_transform.subject_basis,
+            option.incoming_transform.transform_identity,
+            option.incoming_transform.crop_xywh,
+            option.incoming_transform.rotation_degrees,
+            option.incoming_transform.track_id,
+            option.incoming_transform.subject_basis,
+        )
+        for option in result.boundary_options
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +234,7 @@ class JointVisualSelectionSet:
         selections = tuple(self.selections)
         records = tuple(self.candidate_records)
         if len(selections) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-            raise ValueError("joint selection set requires at least eight paths")
+            raise ValueError("joint selection set requires at least eight variants")
         if len(selections) != len(records):
             raise ValueError("joint selections and candidate records must align")
         if tuple(record.candidate_index for record in records) != tuple(
@@ -222,8 +247,46 @@ class JointVisualSelectionSet:
         ):
             raise ValueError("candidate records lost their shifted joint timeline")
         paths = tuple(selection.source_shot_path for selection in selections)
-        if len(set(paths)) != len(paths):
-            raise ValueError("joint selection set contains duplicate source/shot paths")
+        unique_path_count = len(set(paths))
+        if unique_path_count < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS:
+            raise ValueError(
+                "joint selection set requires at least six unique source/shot paths"
+            )
+        supplement_count = len(paths) - unique_path_count
+        required_supplement_count = max(
+            0,
+            MINIMUM_PRODUCTION_JOINT_CANDIDATES - unique_path_count,
+        )
+        if supplement_count != required_supplement_count:
+            raise ValueError(
+                "joint selection set retained an invalid proof supplement count"
+            )
+        path_multiplicity = {
+            path: paths.count(path)
+            for path in set(paths)
+        }
+        if any(
+            count > MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH
+            for count in path_multiplicity.values()
+        ):
+            raise ValueError(
+                "joint selection set retained too many variants for one path"
+            )
+        proof_variants = tuple(
+            (selection.source_shot_path, selection.proof_variant_signature)
+            for selection in selections
+        )
+        if len(set(proof_variants)) != len(proof_variants):
+            raise ValueError("joint selection set contains a duplicate proof variant")
+        render_variants = tuple(
+            (
+                selection.source_shot_path,
+                _render_variant_signature(selection.joint_result),
+            )
+            for selection in selections
+        )
+        if len(set(render_variants)) != len(render_variants):
+            raise ValueError("joint selection set contains a duplicate render variant")
         if not 0 <= self.selected_candidate_index < len(records):
             raise ValueError("selected joint candidate index is outside the set")
         selected = tuple(
@@ -253,6 +316,14 @@ class JointVisualSelectionSet:
     def ranked_records(self) -> tuple[VisualTimelineCandidateRecord, ...]:
         return tuple(sorted(self.candidate_records, key=lambda item: item.review_rank))
 
+    @property
+    def unique_source_shot_path_count(self) -> int:
+        return len({selection.source_shot_path for selection in self.selections})
+
+    @property
+    def proof_variant_supplement_count(self) -> int:
+        return len(self.selections) - self.unique_source_shot_path_count
+
     def selection_for_candidate(
         self,
         candidate_index: int,
@@ -271,6 +342,10 @@ class JointVisualSelectionSet:
         return {
             "analysis_basis": self.analysis_basis,
             "candidate_count": len(self.candidate_records),
+            "unique_source_shot_path_count": self.unique_source_shot_path_count,
+            "proof_variant_supplement_count": (
+                self.proof_variant_supplement_count
+            ),
             "selected_candidate_index": self.selected_candidate_index,
             "candidates": [
                 {
@@ -384,54 +459,102 @@ def _shift_joint_timeline_result(
 
 def _coalesce_profile_results(
     profile_results: Sequence[tuple[str, Sequence[JointTimelineResult]]],
-) -> dict[str, tuple[JointTimelineResult, ...]]:
-    """Keep the highest scoring proof variant for each exact source/shot path."""
+) -> tuple[
+    dict[str, tuple[JointTimelineResult, ...]],
+    dict[str, tuple[JointTimelineResult, ...]],
+]:
+    """Retain unique path primaries plus exact alternate render variants."""
 
     profile_order = {
         profile: index for index, (profile, _results) in enumerate(profile_results)
     }
-    winners: dict[
-        tuple[tuple[int, str, str], ...],
+    variant_winners: dict[
+        tuple[
+            tuple[tuple[int, str, str], ...],
+            tuple[str, ...],
+        ],
         tuple[str, JointTimelineResult],
     ] = {}
     for profile, results in profile_results:
         for result in results:
-            path = _source_shot_path_signature(result)
-            previous = winners.get(path)
+            signature = (
+                _source_shot_path_signature(result),
+                _proof_variant_signature(result),
+            )
+            previous = variant_winners.get(signature)
             if previous is None:
-                winners[path] = (profile, result)
+                variant_winners[signature] = (profile, result)
                 continue
             previous_profile, previous_result = previous
-            current_key = (
-                result.total_score,
-                -profile_order[profile],
-                tuple(reversed(_proof_variant_signature(result))),
-            )
+            current_key = (result.total_score, -profile_order[profile])
             previous_key = (
                 previous_result.total_score,
                 -profile_order[previous_profile],
-                tuple(reversed(_proof_variant_signature(previous_result))),
             )
             if current_key > previous_key:
-                winners[path] = (profile, result)
-    pools: dict[str, list[JointTimelineResult]] = {
+                variant_winners[signature] = (profile, result)
+
+    primary_winners: dict[
+        tuple[tuple[int, str, str], ...],
+        tuple[str, JointTimelineResult],
+    ] = {}
+    for profile, result in variant_winners.values():
+        path = _source_shot_path_signature(result)
+        previous = primary_winners.get(path)
+        if previous is None:
+            primary_winners[path] = (profile, result)
+            continue
+        previous_profile, previous_result = previous
+        current_key = (
+            result.total_score,
+            -profile_order[profile],
+            tuple(reversed(_proof_variant_signature(result))),
+        )
+        previous_key = (
+            previous_result.total_score,
+            -profile_order[previous_profile],
+            tuple(reversed(_proof_variant_signature(previous_result))),
+        )
+        if current_key > previous_key:
+            primary_winners[path] = (profile, result)
+
+    primary_signatures = {
+        (
+            _source_shot_path_signature(result),
+            _proof_variant_signature(result),
+        )
+        for _profile, result in primary_winners.values()
+    }
+    primary_pools: dict[str, list[JointTimelineResult]] = {
         profile: [] for profile, _results in profile_results
     }
-    for profile, result in winners.values():
-        pools[profile].append(result)
-    return {
-        profile: tuple(
-            sorted(
-                results,
-                key=lambda item: (
-                    -item.total_score,
-                    _source_shot_path_signature(item),
-                    _proof_variant_signature(item),
-                ),
-            )
-        )
-        for profile, results in pools.items()
+    alternate_pools: dict[str, list[JointTimelineResult]] = {
+        profile: [] for profile, _results in profile_results
     }
+    for profile, result in primary_winners.values():
+        primary_pools[profile].append(result)
+    for signature, (profile, result) in variant_winners.items():
+        if signature not in primary_signatures:
+            alternate_pools[profile].append(result)
+
+    def sorted_pools(
+        pools: Mapping[str, Sequence[JointTimelineResult]],
+    ) -> dict[str, tuple[JointTimelineResult, ...]]:
+        return {
+            profile: tuple(
+                sorted(
+                    results,
+                    key=lambda item: (
+                        -item.total_score,
+                        _source_shot_path_signature(item),
+                        _proof_variant_signature(item),
+                    ),
+                )
+            )
+            for profile, results in pools.items()
+        }
+
+    return sorted_pools(primary_pools), sorted_pools(alternate_pools)
 
 
 def _assert_provider_binding(
@@ -478,7 +601,7 @@ def select_joint_visual_candidates(
     provider: DecodedBoundaryOptionProvider,
     fps: float = 29.97,
     hard_forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
-    minimum_unique_paths: int = MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+    minimum_unique_paths: int = MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS,
     maximum_candidates: int | None = None,
     progress_callback: JointTimelineProgressCallback | None = None,
 ) -> JointVisualSelectionSet:
@@ -508,9 +631,9 @@ def select_joint_visual_candidates(
     if (
         isinstance(minimum_unique_paths, bool)
         or not isinstance(minimum_unique_paths, int)
-        or minimum_unique_paths < MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or minimum_unique_paths < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
     ):
-        raise ValueError("minimum_unique_paths must be an integer of at least eight")
+        raise ValueError("minimum_unique_paths must be an integer of at least six")
     requested_maximum = (
         min(workspace.maximum_results, 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES)
         if maximum_candidates is None
@@ -519,10 +642,15 @@ def select_joint_visual_candidates(
     if (
         isinstance(requested_maximum, bool)
         or not isinstance(requested_maximum, int)
-        or requested_maximum < minimum_unique_paths
+        or requested_maximum < max(
+            minimum_unique_paths,
+            MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+        )
         or requested_maximum > 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES
     ):
-        raise ValueError("maximum_candidates must be between the floor and 24")
+        raise ValueError(
+            "maximum_candidates must retain eight variants and be at most 24"
+        )
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("fps must be positive and finite")
     _assert_provider_binding(candidate_set, provider, fps=fps)
@@ -757,7 +885,7 @@ def select_joint_visual_candidates(
             )
         profile_results.append((profile.name, tuple(results)))
 
-    coalesced = _coalesce_profile_results(profile_results)
+    coalesced, alternates = _coalesce_profile_results(profile_results)
     ordered: list[tuple[str, JointTimelineResult]] = []
     maximum_pool_size = max((len(pool) for pool in coalesced.values()), default=0)
     for rank in range(maximum_pool_size):
@@ -776,9 +904,78 @@ def select_joint_visual_candidates(
             "required_unique_source_shot_path_count": minimum_unique_paths,
         }
         raise NoCompleteTimelinePath(
-            "joint visual selection produced fewer than eight unique "
+            "joint visual selection produced fewer than the required unique "
             f"source/shot paths ({len(ordered)}/{minimum_unique_paths})",
             reason_code="joint_visual_unique_path_floor_not_met",
+            rejection_counts=rejection_counts,
+            profile_failures=tuple(profile_failures),
+        )
+
+    selected_proof_variants = {
+        (
+            _source_shot_path_signature(result),
+            _proof_variant_signature(result),
+        )
+        for _profile, result in ordered
+    }
+    selected_render_variants = {
+        (
+            _source_shot_path_signature(result),
+            _render_variant_signature(result),
+        )
+        for _profile, result in ordered
+    }
+    supplemented_paths: set[tuple[tuple[int, str, str], ...]] = set()
+    maximum_alternate_pool_size = (
+        0
+        if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        else max(
+            (len(pool) for pool in alternates.values()),
+            default=0,
+        )
+    )
+    for rank in range(maximum_alternate_pool_size):
+        for profile, _unused in profile_results:
+            pool = alternates[profile]
+            if rank >= len(pool):
+                continue
+            result = pool[rank]
+            path = _source_shot_path_signature(result)
+            proof_signature = (path, _proof_variant_signature(result))
+            render_signature = (path, _render_variant_signature(result))
+            if (
+                path in supplemented_paths
+                or proof_signature in selected_proof_variants
+                or render_signature in selected_render_variants
+            ):
+                continue
+            ordered.append((profile, result))
+            supplemented_paths.add(path)
+            selected_proof_variants.add(proof_signature)
+            selected_render_variants.add(render_signature)
+            if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+                break
+        if len(ordered) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+            break
+    if len(ordered) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+        rejection_counts = {
+            "unique_source_shot_path_count": len(
+                {
+                    _source_shot_path_signature(result)
+                    for _profile, result in ordered
+                }
+            ),
+            "required_unique_source_shot_path_count": minimum_unique_paths,
+            "distinct_render_candidate_count": len(ordered),
+            "required_render_candidate_count": (
+                MINIMUM_PRODUCTION_JOINT_CANDIDATES
+            ),
+            "proof_variant_supplement_count": len(supplemented_paths),
+        }
+        raise NoCompleteTimelinePath(
+            "joint visual selection could not retain eight distinct render "
+            f"variants ({len(ordered)}/{MINIMUM_PRODUCTION_JOINT_CANDIDATES})",
+            reason_code="joint_visual_candidate_cohort_floor_not_met",
             rejection_counts=rejection_counts,
             profile_failures=tuple(profile_failures),
         )
@@ -1680,7 +1877,7 @@ def build_joint_visual_candidates(
         provider=provider,
         fps=fps,
         hard_forbidden_boundary_edges=hard_forbidden_boundary_edges,
-        minimum_unique_paths=MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+        minimum_unique_paths=MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS,
         maximum_candidates=MINIMUM_PRODUCTION_JOINT_CANDIDATES,
     )
     return materialize_joint_visual_candidates(
@@ -1699,6 +1896,7 @@ __all__ = [
     "JointVisualSelectionRecord",
     "JointVisualSelectionSet",
     "MINIMUM_PRODUCTION_JOINT_CANDIDATES",
+    "MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS",
     "build_joint_visual_candidates",
     "candidate_review_summaries",
     "materialize_joint_visual_candidates",

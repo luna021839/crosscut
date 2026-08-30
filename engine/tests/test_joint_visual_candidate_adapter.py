@@ -796,6 +796,48 @@ def _profile_pools(
     )
 
 
+def _limited_profile_pools(
+    candidate_set: VisualTimelineCandidateSet,
+    *,
+    unique_path_count: int,
+    alternate_paths: tuple[int, ...],
+) -> tuple[tuple[JointTimelineResult, ...], ...]:
+    """Build deterministic primary paths plus render-distinct proof variants."""
+
+    assert candidate_set.optimizer_workspace is not None
+    lattice = candidate_set.optimizer_workspace.candidates_by_segment
+    paths = tuple(product(("0", "1"), repeat=3))
+    pools: list[list[JointTimelineResult]] = [[], [], []]
+    for path_index in range(unique_path_count):
+        pools[path_index % 3].append(
+            _joint(
+                _timeline(
+                    lattice,
+                    paths[path_index],
+                    score=40.0 - path_index,
+                ),
+                offsets=(0, 0),
+                score=40.0 - path_index,
+                variant=f"primary-{path_index}",
+            )
+        )
+    alternate_offsets = ((1, -1), (-1, 1))
+    for alternate_index, path_index in enumerate(alternate_paths):
+        pools[alternate_index % 3].append(
+            _joint(
+                _timeline(
+                    lattice,
+                    paths[path_index],
+                    score=20.0 - alternate_index,
+                ),
+                offsets=alternate_offsets[alternate_index % 2],
+                score=20.0 - alternate_index,
+                variant=f"alternate-{alternate_index}-{path_index}",
+            )
+        )
+    return tuple(tuple(pool) for pool in pools)
+
+
 class JointVisualCandidateAdapterTests(unittest.TestCase):
     def test_optimizer_seed_and_full_candidate_set_produce_same_joint_result(
         self,
@@ -1084,6 +1126,10 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
 
         self.assertEqual(len(selected.selections), 8)
         self.assertEqual(
+            selected.to_dict()["proof_variant_supplement_count"],
+            0,
+        )
+        self.assertEqual(
             [item.cadence_profile for item in selected.selections],
             [
                 "balanced",
@@ -1131,6 +1177,210 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             caught.exception.rejection_counts["unique_source_shot_path_count"],
+            1,
+        )
+
+    def test_six_unique_paths_retain_two_distinct_render_variants(self) -> None:
+        candidate_set = _candidate_set()
+        provider = StubMaterializingProvider(fps=10.0)
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=6,
+            alternate_paths=(0, 1),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=provider,
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(
+            len({item.source_shot_path for item in selected.selections}),
+            6,
+        )
+        self.assertEqual(
+            selected.to_dict()["proof_variant_supplement_count"],
+            2,
+        )
+        self.assertEqual(
+            len({item.privacy_safe_signature for item in selected.selections}),
+            8,
+        )
+        self.assertEqual(
+            len(
+                {
+                    item.source_shot_path
+                    for item in selected.selections[:6]
+                }
+            ),
+            6,
+        )
+        supplement_paths = tuple(
+            item.source_shot_path for item in selected.selections[6:]
+        )
+        self.assertEqual(len(set(supplement_paths)), 2)
+        for supplement in selected.selections[6:]:
+            primary = next(
+                item
+                for item in selected.selections[:6]
+                if item.source_shot_path == supplement.source_shot_path
+            )
+            self.assertNotEqual(
+                tuple(
+                    option.frame_offset
+                    for option in primary.joint_result.boundary_options
+                ),
+                tuple(
+                    option.frame_offset
+                    for option in supplement.joint_result.boundary_options
+                ),
+            )
+            self.assertNotEqual(
+                tuple(
+                    (candidate.start_seconds, candidate.end_seconds)
+                    for candidate in primary.shifted_timeline_result.candidates
+                ),
+                tuple(
+                    (candidate.start_seconds, candidate.end_seconds)
+                    for candidate in supplement.shifted_timeline_result.candidates
+                ),
+            )
+            primary_record = selected.candidate_records[
+                selected.selections.index(primary)
+            ]
+            supplement_record = selected.candidate_records[
+                selected.selections.index(supplement)
+            ]
+            self.assertEqual(
+                primary_record.path_signature,
+                supplement_record.path_signature,
+            )
+            self.assertNotEqual(
+                primary.privacy_safe_signature,
+                supplement.privacy_safe_signature,
+            )
+
+        materialized = materialize_joint_visual_candidates(
+            selected,
+            provider=provider,
+            fps=10.0,
+            maximum_candidates=8,
+        )
+        self.assertEqual(len(materialized), 8)
+        self.assertEqual(len({item.path_signature for item in materialized}), 8)
+        by_raw_path: dict[str, list[object]] = {}
+        for item in materialized:
+            by_raw_path.setdefault(
+                item.candidate_record.path_signature,
+                [],
+            ).append(item)
+        repeated = tuple(items for items in by_raw_path.values() if len(items) == 2)
+        self.assertEqual(len(repeated), 2)
+        for primary_and_supplement in repeated:
+            self.assertNotEqual(
+                primary_and_supplement[0].boundary_proof_bundle.frame_offsets,
+                primary_and_supplement[1].boundary_proof_bundle.frame_offsets,
+            )
+            self.assertNotEqual(
+                primary_and_supplement[0].candidate_history_entry[
+                    "joint_path_signature"
+                ],
+                primary_and_supplement[1].candidate_history_entry[
+                    "joint_path_signature"
+                ],
+            )
+
+    def test_seven_unique_paths_retain_one_distinct_render_variant(self) -> None:
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=7,
+            alternate_paths=(0,),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            selected = select_joint_visual_candidates(
+                candidate_set,
+                provider=StubDecodedProvider(),
+                fps=10.0,
+            )
+
+        self.assertEqual(len(selected.selections), 8)
+        self.assertEqual(
+            len({item.source_shot_path for item in selected.selections}),
+            7,
+        )
+        self.assertEqual(
+            selected.to_dict()["proof_variant_supplement_count"],
+            1,
+        )
+
+    def test_five_unique_paths_fail_even_with_many_render_variants(self) -> None:
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=5,
+            alternate_paths=(0, 1, 2, 3, 4),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                select_joint_visual_candidates(
+                    candidate_set,
+                    provider=StubDecodedProvider(),
+                    fps=10.0,
+                )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_unique_path_floor_not_met",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts["unique_source_shot_path_count"],
+            5,
+        )
+
+    def test_six_unique_paths_fail_without_two_eligible_supplements(self) -> None:
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set,
+            unique_path_count=6,
+            alternate_paths=(0, 0),
+        )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter."
+            "select_joint_timeline_candidates",
+            side_effect=pools,
+        ):
+            with self.assertRaises(NoCompleteTimelinePath) as caught:
+                select_joint_visual_candidates(
+                    candidate_set,
+                    provider=StubDecodedProvider(),
+                    fps=10.0,
+                )
+
+        self.assertEqual(
+            caught.exception.reason_code,
+            "joint_visual_candidate_cohort_floor_not_met",
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts["distinct_render_candidate_count"],
+            7,
+        )
+        self.assertEqual(
+            caught.exception.rejection_counts["proof_variant_supplement_count"],
             1,
         )
 

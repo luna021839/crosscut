@@ -242,7 +242,7 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
             "363acfa826d846bfc62396f483ce1adc6d0b1ff903ffd32c39630dc2db70e857"
         ),
         current_selector_code_sha256=(
-            "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
         ),
         legacy_crop_rerank_code_sha256=(
             "23aa118ec3a822544ca36d90ba72c821a6e9157175efe863b7c181b6e73a97ba"
@@ -257,7 +257,7 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
             "9ad134a8bac4a4946bb56d5ca4d161ee226320fe2504b826fda6ad1c5abc5982"
         ),
         current_selector_code_sha256=(
-            "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
         ),
         legacy_crop_rerank_code_sha256=(
             "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
@@ -273,7 +273,7 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
             "59aa2115e68c773db670641ecf44581006ab6a0bb4dc7d70f8f6e65d87e731e8"
         ),
         current_selector_code_sha256=(
-            "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
         ),
         legacy_crop_rerank_code_sha256=(
             "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
@@ -291,7 +291,7 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
             "d1529daef216659bf3fa9b482a1fb5ab1bf53ec8c1ac1b3f486b2d65ae349230"
         ),
         current_selector_code_sha256=(
-            "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
         ),
         legacy_crop_rerank_code_sha256=(
             "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
@@ -309,7 +309,25 @@ VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS = (
             "8004e6ff1e9813da730b07e3c031b940666cf27707cd1b231fc6af36d0d40aa2"
         ),
         current_selector_code_sha256=(
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
+        ),
+        legacy_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        current_crop_rerank_code_sha256=(
+            "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"
+        ),
+        legacy_fingerprint_contract=PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    ),
+    CheckpointCodeFingerprintMigration(
+        contract=(
+            "alias_ast_v2_optimizer_seed_face_deferral_v6_to_v7_20260830"
+        ),
+        legacy_selector_code_sha256=(
             "91442b648f3a9c17ec359c01edc67e85a2422fcc4f4f273b6990d1e0d6e0bd35"
+        ),
+        current_selector_code_sha256=(
+            "0d10dbfa3fbf72f51a85692702ec0677750e64111996028c398ec971aff428fb"
         ),
         legacy_crop_rerank_code_sha256=(
             "0b522e5cbd12142d9b6d4b18e36fb982132892a4b5addaa8f84423d530b476b9"

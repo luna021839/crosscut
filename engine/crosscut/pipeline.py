@@ -311,6 +311,8 @@ from .joint_boundary_provider import DecodedBoundaryOptionProvider
 from .joint_visual_candidate_adapter import (
     JointMaterializedVisualCandidate,
     JointVisualSelectionSet,
+    MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+    MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS,
     candidate_review_summaries as joint_candidate_review_summaries,
     materialize_joint_visual_candidates,
     select_joint_visual_candidates,
@@ -25957,7 +25959,9 @@ def analyze(
                                 visual_candidate_set,
                                 provider=provider,
                                 fps=29.97,
-                                minimum_unique_paths=8,
+                                minimum_unique_paths=(
+                                    MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                                ),
                                 maximum_candidates=24,
                                 progress_callback=(
                                     report_joint_visual_selection_progress
@@ -25993,6 +25997,14 @@ def analyze(
                         "candidate_pool": "joint_decoded_visual_selector",
                         "candidate_count": len(
                             joint_visual_selection_set.candidate_records
+                        ),
+                        "unique_source_shot_path_count": (
+                            joint_visual_selection_set
+                            .unique_source_shot_path_count
+                        ),
+                        "proof_variant_supplement_count": (
+                            joint_visual_selection_set
+                            .proof_variant_supplement_count
                         ),
                         "selected_candidate_index": (
                             joint_visual_selection_set
@@ -26035,7 +26047,16 @@ def analyze(
                                 joint_visual_selection_set.profile_failures
                             )
                         ],
-                        "minimum_unique_path_floor": 8,
+                        "minimum_unique_path_floor": (
+                            MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                        ),
+                        "minimum_render_variant_floor": (
+                            MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                        ),
+                        "proof_variant_supplement_budget": (
+                            MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                            - MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                        ),
                         "maximum_candidate_pool": 24,
                         "baseline_candidate_materialization_invoked": False,
                         "checkpoint_candidate_direct_reuse": False,
