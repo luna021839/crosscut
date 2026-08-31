@@ -5,7 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -74,6 +74,7 @@ from crosscut.pipeline import (
     _joint_neutral_interior_motion_overlay,
     _joint_nonlocal_render_contract_failure_fingerprints,
     _joint_selection_proof_materialization_call_count,
+    _joint_selection_retry_audit_payload,
     _joint_require_refined_render_variant_lineage,
     _joint_record_invalid_look_refinement_evidence,
     _globally_index_joint_visual_candidate_batch,
@@ -3059,6 +3060,47 @@ class PipelineConstraintReoptimizationTests(unittest.TestCase):
                 selection_set,
                 available_budget=8,
             )
+
+    def test_joint_selection_retry_audit_uses_recursive_public_thaw(self) -> None:
+        selection_set = Mock(spec=JointVisualSelectionSet)
+        selection_set.selection_retry_audit = MappingProxyType(
+            {
+                "decoded_montage_feedback": MappingProxyType(
+                    {
+                        "contract": (
+                            "joint_decoded_montage_soft_role_feedback_"
+                            "application_v1"
+                        ),
+                        "feedback_supplied": False,
+                    }
+                )
+            }
+        )
+        selection_set.to_dict.return_value = {
+            "selection_retry_audit": {
+                "decoded_montage_feedback": {
+                    "contract": (
+                        "joint_decoded_montage_soft_role_feedback_"
+                        "application_v1"
+                    ),
+                    "feedback_supplied": False,
+                }
+            }
+        }
+
+        payload = _joint_selection_retry_audit_payload(selection_set)
+
+        self.assertEqual(
+            payload["decoded_montage_feedback"]["feedback_supplied"],
+            False,
+        )
+        self.assertIsInstance(payload["decoded_montage_feedback"], dict)
+        self.assertIsNot(
+            payload["decoded_montage_feedback"],
+            selection_set.to_dict.return_value[
+                "selection_retry_audit"
+            ]["decoded_montage_feedback"],
+        )
 
     def test_joint_look_refinement_nonlook_gates_fail_closed_on_regression(
         self,

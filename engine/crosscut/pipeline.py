@@ -1204,6 +1204,22 @@ def _joint_selection_proof_materialization_call_count(
     return value
 
 
+def _joint_selection_retry_audit_payload(
+    selection_set: JointVisualSelectionSet,
+) -> dict[str, Any]:
+    """Copy the selector audit through its public recursive thaw contract."""
+
+    serialized = selection_set.to_dict()
+    if not isinstance(serialized, Mapping):
+        raise TypeError("joint selector serialization must be a mapping")
+    raw_audit = serialized.get("selection_retry_audit")
+    if not isinstance(raw_audit, Mapping):
+        raise TypeError("joint selector retry audit must be a mapping")
+    audit = deepcopy(dict(raw_audit))
+    json.dumps(audit, allow_nan=False)
+    return audit
+
+
 def _materialize_joint_feedback_batch_with_fresh_provider(
     *,
     batch_index: int,
@@ -28284,8 +28300,10 @@ def analyze(
                                         materialized_batch
                                     )
                                 ],
-                                "selection_retry_audit": deepcopy(
-                                    dict(selection_set.selection_retry_audit)
+                                "selection_retry_audit": (
+                                    _joint_selection_retry_audit_payload(
+                                        selection_set
+                                    )
                                 ),
                                 "proof_materialization_call_count": (
                                     proof_materialization_call_count
