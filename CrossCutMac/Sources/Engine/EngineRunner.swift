@@ -69,6 +69,156 @@ enum EngineRunState: Equatable {
     }
 }
 
+private enum EngineOutputReadError: Error, LocalizedError {
+    case lineTooLong
+    case invalidUTF8
+    case backlogExceeded
+
+    var errorDescription: String? {
+        switch self {
+        case .lineTooLong: "엔진 출력 한 줄이 허용 크기를 초과했습니다."
+        case .invalidUTF8: "엔진 출력에 올바르지 않은 UTF-8 데이터가 있습니다."
+        case .backlogExceeded: "엔진 출력 대기열이 허용 크기를 초과했습니다."
+        }
+    }
+}
+
+/// Decode only complete lines, so a multibyte character may cross any chunk.
+/// A final unterminated line is delivered at EOF, not discarded.
+struct EngineOutputLineBuffer {
+    private var pending = Data()
+    private let maximumLineBytes: Int
+
+    init(maximumLineBytes: Int = 8 * 1_024 * 1_024) {
+        precondition(maximumLineBytes > 0)
+        self.maximumLineBytes = maximumLineBytes
+    }
+
+    mutating func append(_ data: Data) {
+        pending.append(data)
+    }
+
+    mutating func nextLine() throws -> String? {
+        if let newline = pending.firstIndex(of: 0x0a) {
+            let line = try decode(pending[..<newline])
+            pending.removeSubrange(pending.startIndex...newline)
+            return line
+        }
+        guard pending.count <= maximumLineBytes else { throw EngineOutputReadError.lineTooLong }
+        return nil
+    }
+
+    mutating func finish() throws -> [String] {
+        guard !pending.isEmpty else { return [] }
+        let line = try decode(pending)
+        pending.removeAll()
+        return [line]
+    }
+
+    private func decode(_ bytes: Data) throws -> String {
+        guard bytes.count <= maximumLineBytes else { throw EngineOutputReadError.lineTooLong }
+        guard let line = String(data: bytes, encoding: .utf8) else { throw EngineOutputReadError.invalidUTF8 }
+        return line
+    }
+}
+
+private final class EnginePipeReadState: @unchecked Sendable {
+    enum ReadResult { case data(Data), retry, end }
+
+    let handle: FileHandle
+    private let lock = NSLock()
+    private var closed = false
+
+    init(_ handle: FileHandle) throws {
+        self.handle = handle
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    func readAvailable() throws -> ReadResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return .end }
+        var bytes = Data(count: 64 * 1_024)
+        let count = bytes.withUnsafeMutableBytes {
+            Darwin.read(handle.fileDescriptor, $0.baseAddress!, $0.count)
+        }
+        if count < 0 {
+            let code = errno
+            if code == EINTR || code == EAGAIN { return .retry }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+        if count == 0 { return .end }
+        bytes.removeSubrange(count..<bytes.count)
+        return .data(bytes)
+    }
+
+    func close() {
+        handle.readabilityHandler = nil
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        closed = true
+        try? handle.close()
+    }
+}
+
+private func enginePipeChunks(from handle: FileHandle) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream(bufferingPolicy: .bufferingOldest(128)) { continuation in
+        let reader: EnginePipeReadState
+        do { reader = try EnginePipeReadState(handle) }
+        catch {
+            try? handle.close()
+            continuation.finish(throwing: error)
+            return
+        }
+        continuation.onTermination = { _ in reader.close() }
+        handle.readabilityHandler = { _ in
+            do {
+                switch try reader.readAvailable() {
+                case .data(let data):
+                    if case .dropped = continuation.yield(data) {
+                        continuation.finish(throwing: EngineOutputReadError.backlogExceeded)
+                    }
+                case .retry: break
+                case .end: continuation.finish()
+                }
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+    }
+}
+
+private final class EngineOutputDrainState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remainingStreams = 2
+    private var expired = false
+
+    func streamFinished() {
+        lock.lock()
+        defer { lock.unlock() }
+        remainingStreams -= 1
+    }
+
+    func expireIfPending() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard remainingStreams > 0 else { return false }
+        expired = true
+        return true
+    }
+
+    var timedOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return expired
+    }
+}
+
 struct EngineLogEntry: Identifiable, Equatable {
     enum Level: String {
         case info
@@ -337,6 +487,7 @@ enum CompletedEngineOutputSetDiscovery {
 
     private struct AnalysisRequest: Decodable {
         let group: String
+        let song: String?
         let editMode: String
         let sourceMode: String
         let outputDirectory: String
@@ -345,6 +496,7 @@ enum CompletedEngineOutputSetDiscovery {
 
         enum CodingKeys: String, CodingKey {
             case group
+            case song
             case editMode = "edit_mode"
             case sourceMode = "source_mode"
             case outputDirectory = "output_directory"
@@ -640,6 +792,64 @@ enum CompletedEngineOutputSetDiscovery {
             case fps
             case renderDuration = "render_duration"
             case outputFrameCount = "output_frame_count"
+        }
+    }
+
+    /// Validate the set explicitly reported by this run. Never search the
+    /// directory for a replacement result, and expose only its eight core files.
+    static func reported(
+        _ reportedURLs: [URL],
+        for request: EditRequest
+    ) -> CompletedEngineOutputSet? {
+        guard request.sourceMode == SourceMode.automatic.rawValue,
+              let requestedMode = EditMode(rawValue: request.editMode) else {
+            return nil
+        }
+        let mode = CompletedEngineOutputMode(requestedMode)
+        let song = request.song.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !song.isEmpty else { return nil }
+        let directory = URL(fileURLWithPath: request.outputDirectory).standardizedFileURL
+        let urls = Set(reportedURLs.map(\.standardizedFileURL)).filter {
+            $0.isFileURL && samePath($0.deletingLastPathComponent().path, directory)
+        }
+        let videoSuffix: String
+        switch mode {
+        case .group:
+            videoSuffix = "-group-crosscut.mp4"
+        case .member:
+            guard let target = request.targetMember,
+                  IVEMember(rawValue: target) != nil else { return nil }
+            videoSuffix = "-\(target)-member-crosscut.mp4"
+        }
+        let reportedVideos = urls.filter { $0.lastPathComponent.hasSuffix(videoSuffix) }
+        guard reportedVideos.count == 1, let video = reportedVideos.first else { return nil }
+        let prefix = String(video.lastPathComponent.dropLast(videoSuffix.count))
+        guard let timestamp = timestamp(in: prefix) else { return nil }
+        let groups = Dictionary(grouping: urls, by: \.lastPathComponent)
+        guard groups.values.allSatisfy({ $0.count == 1 }) else { return nil }
+        let byName = groups.mapValues { $0[0] }
+        guard let analysisURL = byName["\(prefix)-analysis.json"] else { return nil }
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]
+        guard isNonemptyRegularFile(analysisURL, keys: resourceKeys) else { return nil }
+        switch mode {
+        case .group:
+            guard let analysis = decode(GroupAnalysisManifest.self, from: analysisURL),
+                  analysis.request.song == song,
+                  analysis.request.targetMember == request.targetMember else { return nil }
+            return completedGroupOutput(
+                prefix: prefix, timestamp: timestamp, byName: byName,
+                resourceKeys: resourceKeys, outputDirectory: directory
+            )
+        case .member:
+            guard let analysis = decode(MemberAnalysisManifest.self, from: analysisURL),
+                  analysis.request.song == song,
+                  analysis.request.targetMember == request.targetMember else { return nil }
+            return completedMemberOutput(
+                prefix: prefix, timestamp: timestamp, analysisURL: analysisURL,
+                byName: byName, resourceKeys: resourceKeys, outputDirectory: directory
+            )
         }
     }
 
@@ -1055,6 +1265,9 @@ final class EngineRunner: ObservableObject {
     @Published private(set) var isRestoringCompletedOutputs = false
 
     private var process: Process?
+    private var activeRunID: UUID?
+    private var activeRequest: EditRequest?
+    private var pendingOutputURLs: [URL] = []
     private var requestFileURL: URL?
     private var reportedError: String?
     private var resultMessage: String?
@@ -1064,13 +1277,17 @@ final class EngineRunner: ObservableObject {
     private var activeCompletedOutputDiscoveryID: UUID?
     private let locateEngine: @Sendable () -> URL?
     private let preparationProbe: EnginePreparationProbe
+    private let outputDrainGraceNanoseconds: UInt64
 
     init(
         locateEngine: @escaping @Sendable () -> URL? = { EngineLocator.locate() },
-        preparationProbe: @escaping EnginePreparationProbe = defaultEnginePreparationProbe
+        preparationProbe: @escaping EnginePreparationProbe = defaultEnginePreparationProbe,
+        outputDrainGraceNanoseconds: UInt64 = 5_000_000_000
     ) {
+        precondition(outputDrainGraceNanoseconds > 0)
         self.locateEngine = locateEngine
         self.preparationProbe = preparationProbe
+        self.outputDrainGraceNanoseconds = outputDrainGraceNanoseconds
         engineURL = locateEngine()
     }
 
@@ -1114,6 +1331,8 @@ final class EngineRunner: ObservableObject {
         guard !state.isRunning else { return }
 
         resetForNewRun()
+        activeRunID = UUID()
+        activeRequest = request
         state = .preparing
         statusMessage = "엔진을 준비하는 중…"
 
@@ -1148,6 +1367,7 @@ final class EngineRunner: ObservableObject {
     func cancel() {
         guard state.isRunning, !cancellationRequested else { return }
         cancellationRequested = true
+        discardReportedOutputs()
         statusMessage = "취소하는 중…"
         appendLog("사용자가 작업 취소를 요청했습니다.", level: .warning)
         if let process {
@@ -1163,6 +1383,8 @@ final class EngineRunner: ObservableObject {
             preparationTask = nil
             activePreparationID = nil
             cleanupRequestFile()
+            activeRunID = nil
+            activeRequest = nil
             state = .cancelled
             statusMessage = "작업이 취소되었습니다."
             appendLog(statusMessage, level: .warning)
@@ -1182,10 +1404,13 @@ final class EngineRunner: ObservableObject {
         preparationTask?.cancel()
         preparationTask = nil
         activePreparationID = nil
+        activeRunID = nil
+        activeRequest = nil
         progress = 0
         logs.removeAll()
         outputURLs.removeAll()
         renderedVideoURL = nil
+        pendingOutputURLs.removeAll()
         cancellationRequested = false
         reportedError = nil
         resultMessage = nil
@@ -1316,6 +1541,9 @@ final class EngineRunner: ObservableObject {
     }
 
     private func launch(engineURL: URL, pythonURL: URL, requestURL: URL) throws {
+        guard let runID = activeRunID else {
+            throw CocoaError(.userCancelled)
+        }
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -1337,42 +1565,78 @@ final class EngineRunner: ObservableObject {
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PATH"] = EngineLocator.augmentedPath(existing: environment["PATH"])
         process.environment = environment
+        let drainState = EngineOutputDrainState()
+        let drainGrace = outputDrainGraceNanoseconds
 
         let stdoutTask = Task.detached(priority: .utility) { [weak self] in
+            defer { drainState.streamFinished() }
             do {
-                for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
-                    await self?.consumeStandardOutput(line)
+                var buffer = EngineOutputLineBuffer()
+                for try await bytes in enginePipeChunks(from: stdoutPipe.fileHandleForReading) {
+                    buffer.append(bytes)
+                    while let line = try buffer.nextLine() {
+                        await self?.consumeStandardOutput(line, runID: runID)
+                    }
+                }
+                for line in try buffer.finish() {
+                    await self?.consumeStandardOutput(line, runID: runID)
                 }
             } catch {
-                await self?.appendLog(
-                    "표준 출력 스트림을 읽지 못했습니다: \(error.localizedDescription)",
-                    level: .warning
+                await self?.recordStreamFailure(
+                    "표준 출력 스트림을 읽지 못했습니다: \(error.localizedDescription)", runID: runID
                 )
             }
         }
 
         let stderrTask = Task.detached(priority: .utility) { [weak self] in
+            defer { drainState.streamFinished() }
             do {
-                for try await line in stderrPipe.fileHandleForReading.bytes.lines {
-                    await self?.consumeStandardError(line)
+                var buffer = EngineOutputLineBuffer()
+                for try await bytes in enginePipeChunks(from: stderrPipe.fileHandleForReading) {
+                    buffer.append(bytes)
+                    while let line = try buffer.nextLine() {
+                        await self?.consumeStandardError(line, runID: runID)
+                    }
+                }
+                for line in try buffer.finish() {
+                    await self?.consumeStandardError(line, runID: runID)
                 }
             } catch {
-                await self?.appendLog(
-                    "오류 출력 스트림을 읽지 못했습니다: \(error.localizedDescription)",
-                    level: .warning
+                await self?.recordStreamFailure(
+                    "오류 출력 스트림을 읽지 못했습니다: \(error.localizedDescription)", runID: runID
                 )
             }
         }
 
         process.terminationHandler = { [weak self] terminatedProcess in
             Task {
+                let deadlineTask = Task.detached(priority: .utility) {
+                    do { try await Task.sleep(nanoseconds: drainGrace) }
+                    catch { return }
+                    if drainState.expireIfPending() {
+                        // Stop only our readers. The exited parent's numeric
+                        // process group is not authority to kill surviving PIDs.
+                        stdoutTask.cancel()
+                        stderrTask.cancel()
+                    }
+                }
                 await stdoutTask.value
                 await stderrTask.value
-                await self?.finish(exitCode: terminatedProcess.terminationStatus)
+                deadlineTask.cancel()
+                await self?.finish(
+                    exitCode: terminatedProcess.terminationStatus,
+                    runID: runID, outputDrainTimedOut: drainState.timedOut
+                )
             }
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            stdoutTask.cancel()
+            stderrTask.cancel()
+            throw error
+        }
         self.process = process
         state = .running
         statusMessage = "소스를 맞추고 교차편집하는 중…"
@@ -1380,7 +1644,8 @@ final class EngineRunner: ObservableObject {
         appendLog("엔진 실행: \(engineURL.path)", level: .info)
     }
 
-    private func consumeStandardOutput(_ line: String) {
+    private func consumeStandardOutput(_ line: String, runID: UUID) {
+        guard activeRunID == runID else { return }
         let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLine.isEmpty else { return }
 
@@ -1393,10 +1658,19 @@ final class EngineRunner: ObservableObject {
         handle(event)
     }
 
-    private func consumeStandardError(_ line: String) {
+    private func consumeStandardError(_ line: String, runID: UUID) {
+        guard activeRunID == runID else { return }
         let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLine.isEmpty else { return }
         appendLog(trimmedLine, level: .error)
+    }
+
+    private func recordStreamFailure(_ message: String, runID: UUID) {
+        guard activeRunID == runID else { return }
+        discardReportedOutputs()
+        reportedError = reportedError ?? message
+        appendLog(message, level: .error)
+        if let process { EngineProcessTree.requestTermination(process) }
     }
 
     func handle(_ event: EngineEvent) {
@@ -1432,15 +1706,15 @@ final class EngineRunner: ObservableObject {
             )
 
         case "result":
-            outputURLs = event.outputPaths.map { URL(fileURLWithPath: $0) }
+            guard state.isRunning, !cancellationRequested, reportedError == nil else { return }
+            pendingOutputURLs = event.outputPaths.map { URL(fileURLWithPath: $0) }
             if let message = event.message {
                 resultMessage = message
-                statusMessage = message
-                appendLog(message, level: .info)
             }
 
         case "error":
             let message = event.message ?? "엔진에서 알 수 없는 오류를 보고했습니다."
+            discardReportedOutputs()
             reportedError = message
             statusMessage = message
             appendLog(message, level: .error)
@@ -1450,11 +1724,21 @@ final class EngineRunner: ObservableObject {
         }
     }
 
-    private func finish(exitCode: Int32) {
+    private func finish(exitCode: Int32, runID: UUID, outputDrainTimedOut: Bool) async {
+        guard activeRunID == runID else { return }
         process = nil
         cleanupRequestFile()
 
+        if outputDrainTimedOut {
+            let message = "엔진은 종료했지만 출력 스트림이 닫히지 않았습니다. 하위 작업이 남아 있을 수 있으니 확인이 필요합니다."
+            fail(reportedError.map { $0 + "\n" + message } ?? message)
+            return
+        }
+
         if cancellationRequested {
+            discardReportedOutputs()
+            activeRunID = nil
+            activeRequest = nil
             state = .cancelled
             statusMessage = "작업이 취소되었습니다."
             appendLog(statusMessage, level: .warning)
@@ -1466,26 +1750,59 @@ final class EngineRunner: ObservableObject {
             return
         }
 
-        guard let renderedVideo = RenderedVideoOutputDiscovery.firstValidVideo(
-            in: outputURLs
-        ) else {
+        guard let request = activeRequest else {
+            fail("완성 결과를 현재 실행 요청과 연결하지 못했습니다.")
+            return
+        }
+        let reported = pendingOutputURLs
+        let accepted: [URL]
+        if request.sourceMode == SourceMode.automatic.rawValue {
+            statusMessage = "최종 결과와 QA 기록을 확인하는 중…"
+            let validated = await Task.detached(priority: .utility) {
+                CompletedEngineOutputSetDiscovery.reported(reported, for: request)
+            }.value
+            guard activeRunID == runID, state.isRunning, !cancellationRequested else { return }
+            guard let validated else {
+                fail("보고된 자동 교차편집 결과의 최종 QA와 전달 기록을 확인하지 못했습니다.")
+                return
+            }
+            accepted = validated.outputURLs
+        } else {
+            accepted = reported
+        }
+        guard let renderedVideo = RenderedVideoOutputDiscovery.firstValidVideo(in: accepted) else {
             fail(
                 "엔진은 정상 종료했지만 읽을 수 있는 비어 있지 않은 "
                     + "결과 영상을 확인하지 못했습니다."
             )
             return
         }
+        pendingOutputURLs.removeAll()
+        outputURLs = accepted
         renderedVideoURL = renderedVideo
+        activeRunID = nil
+        activeRequest = nil
         progress = 1
         state = .completed
         statusMessage = "교차편집 결과가 준비되었습니다."
+        if let resultMessage { appendLog(resultMessage, level: .info) }
         appendLog(statusMessage, level: .info)
     }
 
     private func fail(_ message: String) {
+        discardReportedOutputs()
+        activeRunID = nil
+        activeRequest = nil
         state = .failed(message)
         statusMessage = message
         appendLog(message, level: .error)
+    }
+
+    private func discardReportedOutputs() {
+        pendingOutputURLs.removeAll()
+        outputURLs.removeAll()
+        renderedVideoURL = nil
+        resultMessage = nil
     }
 
     private func cleanupRequestFile() {

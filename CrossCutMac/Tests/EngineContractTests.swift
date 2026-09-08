@@ -27,9 +27,10 @@ final class EngineContractTests: XCTestCase {
     }
 
     @discardableResult
-    private func makeCompletedAutomaticGroupOutputSet(
+    func makeCompletedAutomaticGroupOutputSet(
         in directory: URL,
         timestamp: String,
+        song: String = "BANG BANG",
         selectionPassed: Bool = true,
         videoData: Data? = Data([0, 0, 0, 1]),
         proxySchemaVersion: Int = 2,
@@ -39,7 +40,7 @@ final class EngineContractTests: XCTestCase {
             at: directory,
             withIntermediateDirectories: true
         )
-        let prefix = "IVE-BANG-BANG-\(timestamp)"
+        let prefix = "IVE-\(song.replacingOccurrences(of: " ", with: "-"))-\(timestamp)"
         let analysisURL = directory.appendingPathComponent("\(prefix)-analysis.json")
         let planURL = directory.appendingPathComponent("\(prefix)-render-plan.json")
         let selectionURL = directory.appendingPathComponent(
@@ -156,6 +157,7 @@ final class EngineContractTests: XCTestCase {
             "created_at": isoFormatter.string(from: creationDate),
             "request": [
                 "group": "IVE",
+                "song": song,
                 "edit_mode": "group",
                 "source_mode": "automatic",
                 "output_directory": directory.path,
@@ -225,10 +227,11 @@ final class EngineContractTests: XCTestCase {
     }
 
     @discardableResult
-    private func makeCompletedAutomaticMemberOutputSet(
+    func makeCompletedAutomaticMemberOutputSet(
         in directory: URL,
         timestamp: String,
         targetMember: String = "가을",
+        song: String = "ATTITUDE",
         mutateAnalysis: ((inout [String: Any]) -> Void)? = nil,
         mutatePostRenderQA: ((inout [String: Any]) -> Void)? = nil
     ) throws -> [URL] {
@@ -236,7 +239,7 @@ final class EngineContractTests: XCTestCase {
             at: directory,
             withIntermediateDirectories: true
         )
-        let prefix = "IVE-ATTITUDE-\(timestamp)"
+        let prefix = "IVE-\(song)-\(timestamp)"
         let memberPrefix = "\(prefix)-\(targetMember)"
         let analysisURL = directory.appendingPathComponent("\(prefix)-analysis.json")
         let planURL = directory.appendingPathComponent(
@@ -334,6 +337,7 @@ final class EngineContractTests: XCTestCase {
             "created_at": isoFormatter.string(from: creationDate),
             "request": [
                 "group": "IVE",
+                "song": song,
                 "edit_mode": "member",
                 "source_mode": "automatic",
                 "output_directory": directory.path,
@@ -416,6 +420,54 @@ final class EngineContractTests: XCTestCase {
         }
         mutation(&render)
         analysis["render"] = render
+    }
+
+    func testReportedDeliveryUsesOnlyTheExplicitArtifactSet() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-reported-set-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        for mode in [EditMode.group, .member] {
+            let directory = root.appendingPathComponent(mode.rawValue)
+            let files = try mode == .group
+                ? makeCompletedAutomaticGroupOutputSet(in: directory, timestamp: "20260908-120000", song: "XOXZ")
+                : makeCompletedAutomaticMemberOutputSet(in: directory, timestamp: "20260908-120000", song: "XOXZ")
+            let request = EditRequest(
+                song: "XOXZ", targetMember: .gaeul, editMode: mode,
+                aspectRatio: mode == .member ? .portrait : .landscape,
+                sources: [], outputDirectory: directory, sourceMode: .automatic
+            )
+            let extraVideo = directory.appendingPathComponent("unreviewed-preview.mp4")
+            try Data([1]).write(to: extraVideo)
+            let accepted = try XCTUnwrap(
+                CompletedEngineOutputSetDiscovery.reported(files + [extraVideo], for: request)
+            )
+            XCTAssertEqual(accepted.outputURLs, files.map(\.standardizedFileURL))
+            // A valid older set in the directory cannot fill missing reported files.
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported([files.last!], for: request))
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(Array(files.dropFirst()), for: request))
+        }
+    }
+
+    func testReportedDeliveryBindsTheLiveMemberModeAndDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ive-crosscut-reported-request-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let files = try makeCompletedAutomaticMemberOutputSet(
+            in: root, timestamp: "20260908-120001", song: "XOXZ"
+        )
+        for (mode, member, directory, song) in [
+            (EditMode.member, IVEMember.anYujin, root, "XOXZ"),
+            (EditMode.group, IVEMember.gaeul, root, "XOXZ"),
+            (EditMode.member, IVEMember.gaeul, root.appendingPathComponent("different"), "XOXZ"),
+            (EditMode.member, IVEMember.gaeul, root, "I AM"),
+        ] {
+            let request = EditRequest(
+                song: song, targetMember: member, editMode: mode,
+                aspectRatio: .portrait, sources: [], outputDirectory: directory,
+                sourceMode: .automatic
+            )
+            XCTAssertNil(CompletedEngineOutputSetDiscovery.reported(files, for: request))
+        }
     }
 
     private func assertAutomaticGroupOutputIsNotRestorable(
