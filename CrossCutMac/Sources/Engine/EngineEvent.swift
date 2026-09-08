@@ -9,6 +9,7 @@ struct EngineEvent: Decodable, Equatable {
     let outputPaths: [String]
     let sourcePaths: [String]
     let acquisitionManifestPath: String?
+    let workStatus: EngineWorkStatus?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -52,16 +53,135 @@ struct EngineEvent: Decodable, Equatable {
             String.self,
             forKey: .acquisitionManifest
         )
+        workStatus = try EngineWorkStatus.decode(type: type.lowercased(), from: decoder)
+    }
+}
+
+/// Stage counts describe work in progress; they never grant delivery status or
+/// set the whole job's progress bar to 100 percent.
+struct EngineWorkStatus: Equatable {
+    let message: String
+    let shouldLog: Bool
+    let isWarning: Bool
+
+    private enum Key: String, CodingKey {
+        case contract, phase, status
+        case completed = "completed_boundary_layers"
+        case total = "total_boundary_layers"
+        case ordinal = "proof_candidate_ordinal"
+        case pool = "proof_candidate_pool_count"
+        case boundaries = "completed_proof_boundary_count"
+        case boundaryTotal = "total_proof_boundary_count"
+        case bridges = "completed_proof_bridge_count"
+        case bridgeTotal = "total_proof_bridge_count"
+        case profileIndex = "profile_index"
+        case profileTotal = "total_profiles"
+        case candidateIndex = "candidate_index"
+        case passed = "decoded_pass_count"
+        case pending = "pending_candidate_count"
+        case elapsed = "elapsed_seconds"
+        case failure = "proof_failure_code"
+    }
+
+    static func decode(type: String, from decoder: Decoder) throws -> Self? {
+        guard ["joint_visual_selection_progress", "joint_candidate_terminal", "joint_candidate_look_pending"].contains(type) else {
+            return nil
+        }
+        let c = try decoder.container(keyedBy: Key.self)
+        let contract = try c.decode(String.self, forKey: .contract)
+        func count(_ key: Key) throws -> Int {
+            let value = try c.decode(Int.self, forKey: key)
+            guard value >= 0 else {
+                throw DecodingError.dataCorruptedError(forKey: key, in: c, debugDescription: "Negative work count")
+            }
+            return value
+        }
+        func pair(_ completed: Key, _ total: Key) throws -> String {
+            let done = try count(completed)
+            let limit = try count(total)
+            guard done <= limit else {
+                throw DecodingError.dataCorruptedError(forKey: completed, in: c, debugDescription: "Work count exceeds total")
+            }
+            return "\(done)/\(limit)"
+        }
+        if type == "joint_candidate_look_pending" {
+            guard contract == "joint_candidate_look_pending_v1" else {
+                throw DecodingError.dataCorruptedError(forKey: .contract, in: c, debugDescription: "Unknown look continuation contract")
+            }
+            let index = try count(.candidateIndex)
+            guard index < Int.max else {
+                throw DecodingError.dataCorruptedError(forKey: .candidateIndex, in: c, debugDescription: "Candidate index overflows")
+            }
+            return Self(
+                message: "후보 \(index + 1) · 두 번째 색감 보정 대기 · 대기 \(try count(.pending))개",
+                shouldLog: true,
+                isWarning: false
+            )
+        }
+        if type == "joint_visual_selection_progress" {
+            guard contract == "joint_selection_progress_v1" else {
+                throw DecodingError.dataCorruptedError(forKey: .contract, in: c, debugDescription: "Unknown selection progress contract")
+            }
+            let phase = try c.decode(String.self, forKey: .phase)
+            if phase.hasPrefix("proof_") {
+                let candidate = try pair(.ordinal, .pool)
+                let boundaries = try pair(.boundaries, .boundaryTotal)
+                let bridges = try pair(.bridges, .bridgeTotal)
+                let failure = try c.decodeIfPresent(String.self, forKey: .failure)
+                let rejected = phase == "proof_failed" || failure != nil
+                let label = rejected ? "후보 연결 검증 탈락" : "후보 연결 검증"
+                return Self(
+                    message: "\(label) \(candidate) · 컷 \(boundaries) · 구간 \(bridges)",
+                    shouldLog: ["proof_start", "proof_failed", "proof_review_complete"].contains(phase),
+                    isWarning: rejected
+                )
+            }
+            let layers = try pair(.completed, .total)
+            let profiles = try pair(.profileIndex, .profileTotal)
+            return Self(
+                message: "컷 후보 조합 분석 · 설정 \(profiles) · 경계 \(layers)",
+                shouldLog: ["profile_start", "profile_complete", "selection_failed"].contains(phase),
+                isWarning: phase == "selection_failed"
+            )
+        }
+        guard contract == "joint_candidate_terminal_v1" else {
+            throw DecodingError.dataCorruptedError(forKey: .contract, in: c, debugDescription: "Unknown candidate outcome contract")
+        }
+        let index = try count(.candidateIndex)
+        guard index < Int.max else {
+            throw DecodingError.dataCorruptedError(forKey: .candidateIndex, in: c, debugDescription: "Candidate index overflows")
+        }
+        let status = try c.decode(String.self, forKey: .status)
+        let passed = status == "decoded_review_passed"
+        let labels = [
+            "decoded_review_passed": "사전 영상 QA 통과",
+            "decoded_review_failed": "사전 영상 QA 탈락",
+            "derivation_rejected": "분석에서 제외",
+            "timeline_rejected": "편집 구성에서 제외",
+            "splice_blocked": "컷 연결에서 제외",
+            "proxy_execution_error": "사전 렌더 오류",
+            "system_error": "처리 오류",
+        ]
+        let label = labels[status] ?? "검사 종료"
+        let elapsed = try c.decode(Double.self, forKey: .elapsed)
+        guard elapsed.isFinite, elapsed >= 0 else {
+            throw DecodingError.dataCorruptedError(forKey: .elapsed, in: c, debugDescription: "Invalid elapsed time")
+        }
+        return Self(
+            message: "후보 \(index + 1) \(label) · \(String(format: "%.1f", elapsed))초 · 사전 통과 \(try count(.passed))개",
+            shouldLog: true,
+            isWarning: !passed
+        )
     }
 }
 private extension KeyedDecodingContainer where Key == EngineEvent.CodingKeys {
     func decodeFlexibleDouble(forKeys keys: [Key]) throws -> Double? {
         for key in keys {
-            if let number = try decodeIfPresent(Double.self, forKey: key) {
+            if let number = try? decode(Double.self, forKey: key), number.isFinite {
                 return number
             }
-            if let text = try decodeIfPresent(String.self, forKey: key),
-               let number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if let text = try? decode(String.self, forKey: key),
+               let number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)), number.isFinite {
                 return number
             }
         }

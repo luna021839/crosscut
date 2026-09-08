@@ -1399,10 +1399,18 @@ final class EngineRunner: ObservableObject {
         appendLog(trimmedLine, level: .error)
     }
 
-    private func handle(_ event: EngineEvent) {
+    func handle(_ event: EngineEvent) {
         let type = event.type.lowercased()
 
         switch type {
+        case "joint_visual_selection_progress", "joint_candidate_terminal", "joint_candidate_look_pending":
+            if let work = event.workStatus {
+                statusMessage = work.message
+                if work.shouldLog {
+                    appendLog(work.message, level: work.isWarning ? .warning : .info)
+                }
+            }
+
         case "status":
             statusMessage = event.message ?? event.stage ?? "처리 중…"
             if let message = event.message ?? event.stage {
