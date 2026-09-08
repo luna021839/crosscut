@@ -14,6 +14,7 @@ from crosscut.candidate_stream_verdict import (
 )
 from crosscut.events import EventReporter
 from crosscut.joint_decoded_budget import JointDecodedBudgetLedger
+from crosscut.joint_look_breadth import JointLookBreadthScheduler
 from crosscut.joint_runtime_progress import (
     JointSelectionRuntime, joint_candidate_terminal_payload,
 )
@@ -110,6 +111,8 @@ class JointRuntimeProgressTests(unittest.TestCase):
             "joint_visual_selection_active": True,
             "joint_candidate_terminal_payload": joint_candidate_terminal_payload,
             "joint_candidate_runtime_audits": audits,
+            "joint_candidate_started_at": {},
+            "joint_look_scheduler": JointLookBreadthScheduler(),
             "joint_decoded_budget": JointDecodedBudgetLedger(),
             "candidate_derivation_failures": [],
             "candidate_post_repair_review_rejections": [],

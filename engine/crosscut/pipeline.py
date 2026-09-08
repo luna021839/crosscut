@@ -331,6 +331,10 @@ from .joint_decoded_budget import (
     JointDecodedLookRefinementEligibility,
     JointDecodedRenderKind,
 )
+from .joint_look_breadth import (
+    JointLookBreadthScheduler,
+    PendingJointLookRefinement,
+)
 from .joint_decoded_montage_feedback import (
     joint_decoded_montage_observations_from_bound_review,
     merge_joint_decoded_montage_observations,
@@ -2153,7 +2157,12 @@ def _joint_apply_look_refinement_feedback_classification(
     if not isinstance(decoded_review_passed, bool):
         raise TypeError("decoded aggregate review pass flag must be boolean")
     classification["look_refinement"] = deepcopy(dict(refinement_audit))
-    if refinement_audit.get("complete_path_no_good_allowed") is True:
+    if refinement_audit.get("pending_second_look") is True:
+        classification[
+            "complete_path_no_good_deferred_for_render_variant"
+        ] = True
+        classification["complete_path_no_good_allowed"] = False
+    elif refinement_audit.get("complete_path_no_good_allowed") is True:
         classification[
             "complete_path_no_good_deferred_for_render_variant"
         ] = False
@@ -2164,6 +2173,24 @@ def _joint_apply_look_refinement_feedback_classification(
         classification[
             "complete_path_no_good_deferred_for_render_variant"
         ] = False
+
+
+def _drain_joint_look_continuations(
+    scheduler: JointLookBreadthScheduler,
+    *,
+    resume: Callable[[Any], Any],
+    should_stop: Callable[[], bool],
+) -> None:
+    """Close the global first-attempt stream before revisiting retained paths."""
+    scheduler.close_admission()
+    for candidate_index in scheduler.pending_indices:
+        if should_stop():
+            break
+        state = scheduler.get(candidate_index)
+        assert state is not None
+        resume(state.materialized)
+        if scheduler.get(candidate_index) is not None:
+            raise RuntimeError("resumed look candidate failed to reach a terminal verdict")
 
 
 def _joint_group_look_sensitive_visible_audit(
@@ -28615,6 +28642,12 @@ def analyze(
                 ] = {}
                 joint_candidate_runtime_audits: list[dict[str, Any]] = []
                 joint_decoded_budget = JointDecodedBudgetLedger()
+                joint_look_scheduler = JointLookBreadthScheduler(
+                    maximum_pending_count=(
+                        joint_decoded_budget.limits.distinct_candidate_limit
+                    )
+                )
+                joint_candidate_started_at: dict[int, float] = {}
                 joint_decoded_budget_exhaustions: list[dict[str, Any]] = []
                 local_source_repair_seeds: list[LocalSourceRepairSeed] = []
                 local_source_repair_proposal_count = 0
@@ -29251,11 +29284,9 @@ def analyze(
                         item.candidate_index
                         for item in candidate_stream_reducer.verdicts
                     }
-                    if attempted_candidate_indices != verdict_indices:
-                        raise RuntimeError(
-                            "candidate progress cannot serialize divergent "
-                            "attempt and terminal-verdict sets"
-                        )
+                    joint_look_scheduler.assert_partition(
+                        attempted_candidate_indices, verdict_indices,
+                    )
                     decoded_cohort_lengths_align = (
                         len(derived) == len(streamed_group_candidate_reviews)
                     )
@@ -29322,6 +29353,12 @@ def analyze(
                                 "candidate_runtime": deepcopy(
                                     joint_candidate_runtime_audits
                                 ),
+                                "look_breadth_scheduler": (
+                                    joint_look_scheduler.to_dict()
+                                ),
+                                "look_refinement_audits": deepcopy(
+                                    joint_decoded_look_refinement_audits
+                                ),
                                 "decoded_montage_feedback": {
                                     **(
                                         JointDecodedMontageFeedback(
@@ -29382,6 +29419,10 @@ def analyze(
                             "attempted_candidate_indices": sorted(
                                 attempted_candidate_indices
                             ),
+                            "pending_look_candidate_indices": list(
+                                joint_look_scheduler.pending_indices
+                            ),
+                            "terminal_candidate_indices": sorted(verdict_indices),
                             "post_repair_structure_passing_count": (
                                 post_repair_structure_passing_complete_count
                             ),
@@ -29764,7 +29805,10 @@ def analyze(
                         return bundle, decoded_review
                     candidate_index = int(materialized.candidate_index)
                     initial_payload = decoded_review.review_payload
-                    audit: dict[str, Any] = {
+                    resumed_look = joint_look_scheduler.get(candidate_index)
+                    audit: dict[str, Any] = (
+                        joint_decoded_look_refinement_audits[candidate_index]
+                        if resumed_look is not None else {
                         "contract": (
                             "joint_decoded_same_path_group_look_refinement_v1"
                         ),
@@ -29774,7 +29818,9 @@ def analyze(
                         "thresholds_lowered": False,
                         "exact_cut_path_changed": False,
                         "rollback_on_rejection": True,
-                    }
+                        }
+                    )
+                    audit["pending_second_look"] = False
                     try:
                         current_objective = decoded_look_objective(
                             initial_payload
@@ -29809,16 +29855,16 @@ def analyze(
                             candidate_index
                         ] = audit
                         return bundle, decoded_review
-                    audit["initial_render_variant_signature"] = (
+                    audit.setdefault("initial_render_variant_signature", (
                         initial_render_variant
-                    )
-                    audit["initial_objective"] = {
+                    ))
+                    audit.setdefault("initial_objective", {
                         "admission_passed": current_objective.admission_passed,
                         "normalized_excess": current_objective.normalized_excess,
                         "selection_penalty_points": (
                             current_objective.selection_penalty_points
                         ),
-                    }
+                    })
                     (
                         current_eligibility,
                         current_eligibility_diagnostics,
@@ -29830,12 +29876,12 @@ def analyze(
                         ),
                         decoded_review_passed=decoded_review.passed,
                     )
-                    audit["eligibility_checks"] = [
+                    audit.setdefault("eligibility_checks", []).append(
                         {
-                            "iteration": 1,
+                            "iteration": 2 if resumed_look is not None else 1,
                             **current_eligibility_diagnostics,
                         }
-                    ]
+                    )
                     if current_objective.admission_passed:
                         audit.update(
                             _joint_decoded_look_already_passed_audit_fields(
@@ -29881,10 +29927,15 @@ def analyze(
                     audit["evidence_complete"] = True
                     current_bundle = bundle
                     current_review = decoded_review
-                    previous_refinement: GroupDecodedLookRefinement | None = None
+                    previous_refinement: GroupDecodedLookRefinement | None = (
+                        resumed_look.previous_refinement
+                        if resumed_look is not None else None
+                    )
                     exhausted = False
                     budget_exhausted = False
-                    for iteration in (1, 2):
+                    # The second attempt runs only after distinct-candidate
+                    # admission closes, using this exact retained bundle.
+                    for iteration in ((2,) if resumed_look is not None else (1,)):
                         assert current_review.review_payload is not None
                         if iteration > 1:
                             (
@@ -30248,6 +30299,23 @@ def analyze(
                         }
                     )
                     joint_decoded_look_refinement_audits[candidate_index] = audit
+                    pending_second_look = bool(
+                        resumed_look is None
+                        and not current_review.passed
+                        and not exhausted
+                        and not budget_exhausted
+                        and audit["evidence_complete"] is True
+                        and previous_refinement is not None
+                    )
+                    audit["pending_second_look"] = pending_second_look
+                    if pending_second_look:
+                        joint_look_scheduler.defer(
+                            candidate_index,
+                            PendingJointLookRefinement(
+                                materialized, current_bundle, current_review,
+                                previous_refinement,
+                            ),
+                        )
                     return current_bundle, current_review
 
                 def _derive_and_gate_candidate_verdict(
@@ -30256,8 +30324,16 @@ def analyze(
                     precomputed_boundary_repairs: (
                         VisualBoundaryRepairPlan | None
                     ) = None,
-                ) -> TerminalCandidateVerdict:
+                ) -> TerminalCandidateVerdict | None:
                     nonlocal post_repair_structure_passing_complete_count
+                    pending = joint_look_scheduler.get(int(materialized.candidate_index))
+                    if pending is not None:
+                        if not joint_look_scheduler.admission_closed:
+                            raise RuntimeError("pending look resumed before breadth pass closed")
+                        return finish_decoded_group_candidate(
+                            materialized, pending.bundle, pending.decoded_review,
+                            pending.bundle.output_geometry_deferral is not None,
+                        )
                     local_source_repair = isinstance(
                         materialized,
                         LocalSourceRepairMaterializedCandidate,
@@ -30840,6 +30916,17 @@ def analyze(
                             ),
                             geometry_deferral_pre_proxy_eligible,
                         )
+                    return finish_decoded_group_candidate(
+                        materialized, bundle, decoded_review,
+                        geometry_deferral_pre_proxy_eligible,
+                    )
+
+                def finish_decoded_group_candidate(
+                    materialized: Any,
+                    bundle: _GroupRenderCandidateBundle,
+                    decoded_review: RenderedCandidateReview,
+                    geometry_deferral_pre_proxy_eligible: bool,
+                ) -> TerminalCandidateVerdict | None:
                     bundle, decoded_review = (
                         refine_joint_candidate_look_from_decoded_output(
                             materialized,
@@ -30903,6 +30990,15 @@ def analyze(
                                 refinement_audit,
                                 decoded_review_passed=decoded_review.passed,
                             )
+                    if (
+                        joint_visual_selection_active
+                        and joint_decoded_look_refinement_audits.get(
+                            int(materialized.candidate_index), {}
+                        ).get("pending_second_look") is True
+                    ):
+                        # This is a started path with an outstanding render
+                        # variant, not a failed terminal candidate/no-good.
+                        return None
                     if bundle.output_geometry_deferral is not None:
                         decoded_resolution = _decoded_output_geometry_resolution(
                             candidate_index=materialized.candidate_index,
@@ -31044,15 +31140,20 @@ def analyze(
                     precomputed_boundary_repairs: (
                         VisualBoundaryRepairPlan | None
                     ) = None,
-                ) -> TerminalCandidateVerdict:
+                ) -> TerminalCandidateVerdict | None:
                     candidate_index = int(materialized.candidate_index)
                     if candidate_index in attempted_candidate_indices:
-                        return next(
-                            verdict
-                            for verdict in candidate_stream_reducer.verdicts
-                            if verdict.candidate_index == candidate_index
-                        )
-                    attempt_started = monotonic()
+                        if joint_look_scheduler.get(candidate_index) is not None:
+                            joint_look_scheduler.begin_resume(candidate_index)
+                        else:
+                            return next(
+                                verdict
+                                for verdict in candidate_stream_reducer.verdicts
+                                if verdict.candidate_index == candidate_index
+                            )
+                    attempt_started = joint_candidate_started_at.setdefault(
+                        candidate_index, monotonic(),
+                    )
 
                     def record_terminal(
                         outcome: TerminalCandidateVerdict,
@@ -31070,6 +31171,9 @@ def analyze(
                             budget=joint_decoded_budget.report_payload(),
                             decoded_pass_count=len(derived),
                         )
+                        payload["elapsed_seconds_basis"] = (
+                            "candidate_lifecycle_including_pending_look_wait"
+                        )
                         joint_candidate_runtime_audits.append(payload)
                         return payload
 
@@ -31080,11 +31184,33 @@ def analyze(
                                 precomputed_boundary_repairs
                             ),
                         )
+                        if verdict is None:
+                            if joint_look_scheduler.get(candidate_index) is None:
+                                raise RuntimeError("nonterminal candidate lost its look continuation")
+                            persist_candidate_stream_progress(
+                                status="candidate_stream_pending_second_look"
+                            )
+                            reporter.emit(
+                                "joint_candidate_look_pending",
+                                contract="joint_candidate_look_pending_v1",
+                                candidate_index=candidate_index,
+                                pending_candidate_count=len(
+                                    joint_look_scheduler.pending_indices
+                                ),
+                                elapsed_seconds=monotonic() - attempt_started,
+                                elapsed_seconds_basis=(
+                                    "candidate_lifecycle_including_pending_look_wait"
+                                ),
+                                scheduler=joint_look_scheduler.to_dict(),
+                                decoded_render_budget=joint_decoded_budget.report_payload(),
+                            )
+                            return None
                         if not isinstance(verdict, TerminalCandidateVerdict):
                             raise TypeError(
                                 "candidate verdict producer did not return a "
                                 "TerminalCandidateVerdict"
                             )
+                        joint_look_scheduler.finish_terminal(candidate_index)
                         action = candidate_stream_reducer.apply(verdict)
                         if action is CandidateStreamAction.ABORT_IMMEDIATELY:
                             raise RuntimeError(
@@ -31094,11 +31220,9 @@ def analyze(
                             item.candidate_index
                             for item in candidate_stream_reducer.verdicts
                         }
-                        if attempted_candidate_indices != verdict_indices:
-                            raise RuntimeError(
-                                "attempted candidates and terminal verdicts "
-                                "diverged"
-                            )
+                        joint_look_scheduler.assert_partition(
+                            attempted_candidate_indices, verdict_indices,
+                        )
                         joint_underlying = (
                             _underlying_joint_materialized_candidate(
                                 materialized
@@ -31123,6 +31247,7 @@ def analyze(
                                         "complete_path_no_good_added"
                                     ] = True
                     except Exception as exc:
+                        joint_look_scheduler.finish_terminal(candidate_index)
                         if (
                             candidate_index in attempted_candidate_indices
                             and not candidate_stream_reducer.has_verdict(
@@ -32023,6 +32148,7 @@ def analyze(
                         "decoded_budget_exhaustions": deepcopy(
                             joint_decoded_budget_exhaustions
                         ),
+                        "look_breadth_scheduler": joint_look_scheduler.to_dict(),
                         "maximum_base_render_count": (
                             joint_decoded_budget.limits
                             .distinct_candidate_limit
@@ -32273,6 +32399,47 @@ def analyze(
                             ):
                                 break
                             derive_and_gate_candidate(materialized)
+
+                if joint_visual_selection_active:
+                    _drain_joint_look_continuations(
+                        joint_look_scheduler,
+                        resume=derive_and_gate_candidate,
+                        should_stop=lambda: bool(
+                            joint_diverse_passing_cohort()
+                            or joint_shared_render_contract_failure is not None
+                        ),
+                    )
+                    if (
+                        not joint_diverse_passing_cohort()
+                        and constraint_reoptimization_termination_reason is not None
+                    ):
+                        previous_terminal_evidence = deepcopy(dict(
+                            (constraint_reoptimization_terminal_proof or {})
+                            .get("evidence", {})
+                        ))
+                        if "pending_candidate_indices" in previous_terminal_evidence:
+                            previous_terminal_evidence[
+                                "pending_candidate_indices_at_admission_close"
+                            ] = previous_terminal_evidence["pending_candidate_indices"]
+                        if "decoded_render_budget" in previous_terminal_evidence:
+                            previous_terminal_evidence[
+                                "decoded_render_budget_at_admission_close"
+                            ] = previous_terminal_evidence["decoded_render_budget"]
+                        previous_terminal_evidence.update({
+                            "pending_candidate_indices": list(
+                                joint_look_scheduler.pending_indices
+                            ),
+                            "pending_candidate_count": len(
+                                joint_look_scheduler.pending_indices
+                            ),
+                            "decoded_render_budget": joint_decoded_budget.report_payload(),
+                            "exact_path_no_good_added_for_pending": False,
+                        })
+                        set_joint_decoded_feedback_terminal_proof(
+                            constraint_reoptimization_termination_reason,
+                            evidence=previous_terminal_evidence,
+                        )
+                    persist_candidate_stream_progress()
 
                 if (
                     not candidate_stream_reducer.required_passing_cohort_complete
