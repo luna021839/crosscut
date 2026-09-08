@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,10 @@ from unittest.mock import patch
 
 from crosscut.timeline import ShotType
 from crosscut import crop_aware_candidate_rerank, visual_score
+from crosscut.failed_candidate_replay import (
+    CandidateReplayValidationError,
+    deserialize_visual_timeline_plan,
+)
 from crosscut.visual_candidate_checkpoint import (
     CheckpointCodeFingerprintMigration,
     VISUAL_CANDIDATE_CHECKPOINT_ANALYSIS_BASIS,
@@ -20,8 +25,16 @@ from crosscut.visual_candidate_checkpoint import (
     load_visual_candidate_checkpoint,
     materialized_candidate_checkpoint_payload,
 )
-from crosscut.visual_feature_cache import python_symbol_dependency_sha256
+from crosscut.visual_feature_cache import (
+    PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+    python_symbol_dependency_sha256,
+)
 from crosscut.visual_score import VisualTimelineChoice, VisualTimelinePlan
+
+
+_TRANSITION_EVIDENCE_CONTRACT = (
+    "joint_decoded_post_transform_boundary_result_evidence_v1"
+)
 
 
 def _candidate(index: int) -> SimpleNamespace:
@@ -587,7 +600,8 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
         self.assertTrue(migration.matches(legacy, current))
         self.assertFalse(migration.matches(current, legacy))
 
-    def test_production_migration_current_hashes_match_runtime_code(self) -> None:
+    @staticmethod
+    def _runtime_identity() -> dict[str, object]:
         selector_digest = python_symbol_dependency_sha256(
             Path(visual_score.__file__),
             root_symbols=("build_visual_timeline_candidate_set",),
@@ -598,17 +612,131 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
                 "rerank_materialized_visual_candidates_for_safe_crops",
             ),
         )
-        for migration in (
-            VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
-        ):
-            self.assertEqual(
-                migration.current_selector_code_sha256,
-                selector_digest,
+        return {
+            "sources": ["a", "b"],
+            "selector_code_sha256": selector_digest,
+            "crop_rerank_code_sha256": crop_digest,
+            "code_fingerprint_contract": PYTHON_SYMBOL_DEPENDENCY_AST_CONTRACT,
+        }
+
+    def test_current_runtime_identity_reuses_checkpoint_without_migration(self) -> None:
+        identity = self._runtime_identity()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            self._write_checkpoint(path, identity)
+            loaded = load_visual_candidate_checkpoint(
+                path,
+                expected_input_identity_sha256=canonical_json_sha256(identity),
+                expected_source_count=2,
+                expected_input_identity=identity,
+                code_fingerprint_migrations=(
+                    VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+                ),
             )
-            self.assertEqual(
-                migration.current_crop_rerank_code_sha256,
-                crop_digest,
-            )
+        self.assertIsNone(loaded.code_fingerprint_migration)
+        self.assertEqual(len(loaded.initial_candidates), 8)
+
+    def test_unapproved_historical_identity_cannot_migrate_to_current_runtime(
+        self,
+    ) -> None:
+        current = self._runtime_identity()
+        historical_targets = {
+            migration.current_selector_code_sha256
+            for migration in VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+        }
+        # A selector version with no audited edge to this runtime must remain
+        # a cache miss, even when earlier migration edges remain in the table.
+        unapproved_selector = "f" * 64
+        self.assertNotIn(unapproved_selector, historical_targets)
+        self.assertNotEqual(unapproved_selector, current["selector_code_sha256"])
+        legacy = {**current, "selector_code_sha256": unapproved_selector}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            self._write_checkpoint(path, legacy)
+            with self.assertRaisesRegex(ValueError, "input identity mismatch"):
+                load_visual_candidate_checkpoint(
+                    path,
+                    expected_input_identity_sha256=canonical_json_sha256(current),
+                    expected_source_count=2,
+                    expected_input_identity=current,
+                    code_fingerprint_migrations=(
+                        VISUAL_CANDIDATE_CHECKPOINT_CODE_FINGERPRINT_MIGRATIONS
+                    ),
+                )
+
+    def test_replay_preserves_transition_scalars_without_restoring_authority(
+        self,
+    ) -> None:
+        plan = _candidate(0).visual_plan
+        incoming = replace(
+            plan.choices[1],
+            transition_evidence_authority_from_previous=object(),
+            transition_evidence_contract_from_previous=(
+                _TRANSITION_EVIDENCE_CONTRACT
+            ),
+            scale_transition_mismatch_from_previous=0.11,
+            focus_transition_mismatch_from_previous=0.22,
+        )
+        payload = replace(plan, choices=(plan.choices[0], incoming)).to_dict()
+        self.assertNotIn(
+            "transition_evidence_authority_from_previous", payload["choices"][1]
+        )
+        payload["choices"][1]["transition_evidence_authority_from_previous"] = {
+            "forged": True
+        }
+        loaded = deserialize_visual_timeline_plan(payload).choices[1]
+        self.assertEqual(
+            loaded.transition_evidence_contract_from_previous,
+            _TRANSITION_EVIDENCE_CONTRACT,
+        )
+        self.assertEqual(loaded.scale_transition_mismatch_from_previous, 0.11)
+        self.assertEqual(loaded.focus_transition_mismatch_from_previous, 0.22)
+        self.assertIsNone(loaded.transition_evidence_authority_from_previous)
+
+    def test_replay_accepts_missing_legacy_transition_annotations(self) -> None:
+        payload = _candidate(0).visual_plan.to_dict()
+        names = (
+            "transition_evidence_contract_from_previous",
+            "scale_transition_mismatch_from_previous",
+            "focus_transition_mismatch_from_previous",
+        )
+        for choice in payload["choices"]:
+            for name in names:
+                choice.pop(name)
+        loaded = deserialize_visual_timeline_plan(payload)
+        for choice in loaded.choices:
+            for name in names:
+                self.assertIsNone(getattr(choice, name))
+            self.assertIsNone(choice.transition_evidence_authority_from_previous)
+
+    def test_replay_rejects_invalid_transition_annotations(self) -> None:
+        invalid_values = (
+            ("transition_evidence_contract_from_previous", ""),
+            ("transition_evidence_contract_from_previous", "unknown-contract"),
+            ("transition_evidence_contract_from_previous", True),
+            ("transition_evidence_contract_from_previous", None),
+            *(
+                (field, value)
+                for field in (
+                    "scale_transition_mismatch_from_previous",
+                    "focus_transition_mismatch_from_previous",
+                )
+                for value in (True, "0.2", float("nan"), float("inf"), -0.1, 1.1)
+            ),
+        )
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                payload = _candidate(0).visual_plan.to_dict()
+                payload["choices"][1].update(
+                    transition_evidence_contract_from_previous=(
+                        _TRANSITION_EVIDENCE_CONTRACT
+                    ),
+                    scale_transition_mismatch_from_previous=0.11,
+                    focus_transition_mismatch_from_previous=0.22,
+                )
+                payload["choices"][1][field] = value
+                with self.assertRaises(CandidateReplayValidationError):
+                    deserialize_visual_timeline_plan(payload)
 
     def test_production_migration_accepts_descriptor_basis_cache_predecessor(
         self,

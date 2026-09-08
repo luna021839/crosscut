@@ -1734,6 +1734,121 @@ class VisualScoreTests(unittest.TestCase):
             "unknown_no_subject_geometry",
         )
 
+    def _describe_cropped_group_fixture(self, boxes, *, faces=()):
+        frame = np.full((180, 320, 3), 118, dtype=np.uint8)
+        people = tuple(
+            FormationPersonDescriptor(
+                bbox_xywh=box,
+                centroid_xy=(box[0] + box[2] / 2, box[1] + box[3] / 2),
+                detection_confidence=0.8,
+            )
+            for box in boxes
+        )
+        subject = SubjectGeometryDescriptor(
+            detected_person_count=len(people),
+            formation_people=people,
+        )
+        detections = tuple(
+            _DetectedFace((x * 320, y * 180, width * 320, height * 180))
+            for x, y, width, height in faces
+        )
+        with patch(
+            "crosscut.visual_score.describe_subject_geometry",
+            return_value=subject,
+        ), patch(
+            "crosscut.visual_score._detect_faces",
+            return_value=(detections, "test"),
+        ):
+            return describe_frame(frame)
+
+    def test_cropped_central_upper_body_with_edge_fragments_is_medium(self) -> None:
+        for central in (
+            (0.28, 0.22, 0.44, 0.78),
+            (0.25, 0.18, 0.48, 0.82),
+            (0.31, 0.31, 0.38, 0.69),
+        ):
+            boxes = ((0.0, 0.26, 0.22, 0.74), central, (0.82, 0.42, 0.18, 0.58))
+            for mirrored in (False, True):
+                variant = (
+                    tuple((1 - x - w, y, w, h) for x, y, w, h in boxes)
+                    if mirrored else boxes
+                )
+                for faces in (
+                    (),
+                    ((0.43, 0.26, 0.10, 0.21), (0.015, 0.31, 0.10, 0.20)),
+                ):
+                    face_variant = (
+                        tuple((1 - x - w, y, w, h) for x, y, w, h in faces)
+                        if mirrored else faces
+                    )
+                    with self.subTest(
+                        central=central, mirrored=mirrored, faces=bool(faces),
+                    ):
+                        descriptor = self._describe_cropped_group_fixture(
+                            variant, faces=face_variant,
+                        )
+                        self.assertEqual(descriptor.shot_type, ShotType.MEDIUM)
+                        self.assertEqual(
+                            descriptor.shot_scale_basis, "cropped_foreground_group",
+                        )
+                        self.assertGreaterEqual(descriptor.shot_scale, 0.28)
+                        self.assertLess(descriptor.shot_scale, 0.52)
+                        self.assertIsNone(descriptor.primary_face_bbox)
+
+    def test_cropped_group_geometry_does_not_promote_full_or_distant_formations(self) -> None:
+        fragments = ((0.0, 0.26, 0.22, 0.74), (0.82, 0.42, 0.18, 0.58))
+        variants = {
+            "full_bodies": tuple((x, 0.14, 0.16, 0.72) for x in (0.17, 0.42, 0.67)),
+            "distant_bodies": tuple((x, 0.55, 0.07, 0.30) for x in (0.20, 0.46, 0.72)),
+            "central_not_cropped": (fragments[0], (0.28, 0.22, 0.44, 0.70), fragments[1]),
+            "central_narrow": (fragments[0], (0.36, 0.22, 0.28, 0.78), fragments[1]),
+            "central_off_center": (fragments[0], (0.06, 0.22, 0.44, 0.78), fragments[1]),
+            "neighbor_not_edge_fragment": ((0.09, 0.26, 0.18, 0.74), (0.28, 0.22, 0.44, 0.78), fragments[1]),
+        }
+        for name, boxes in variants.items():
+            for faces in ((), ((0.43, 0.26, 0.10, 0.10),)):
+                with self.subTest(variant=name, faces=bool(faces)):
+                    descriptor = self._describe_cropped_group_fixture(boxes, faces=faces)
+                    self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
+                    self.assertEqual(descriptor.shot_scale_basis, "aggregate_formation_people")
+
+    def test_cropped_group_keeps_existing_large_face_closeup_authority(self) -> None:
+        boxes = ((0.0, 0.26, 0.22, 0.74), (0.28, 0.22, 0.44, 0.78), (0.82, 0.42, 0.18, 0.58))
+        descriptor = self._describe_cropped_group_fixture(
+            boxes, faces=((0.40, 0.20, 0.14, 0.28),),
+        )
+        self.assertEqual(descriptor.shot_type, ShotType.CLOSE_UP)
+        self.assertEqual(descriptor.shot_scale_basis, "dominant_face_height")
+        self.assertIsNotNone(descriptor.primary_face_bbox)
+
+    def test_cropped_group_respects_existing_face_closeup_threshold(self) -> None:
+        boxes = (
+            (0.0, 0.26, 0.22, 0.74),
+            (0.28, 0.22, 0.44, 0.78),
+            (0.82, 0.42, 0.18, 0.58),
+        )
+        for face_scale, expected in (
+            (0.51, ShotType.MEDIUM), (0.53, ShotType.CLOSE_UP),
+        ):
+            with self.subTest(face_scale=face_scale):
+                descriptor = self._describe_cropped_group_fixture(
+                    boxes, faces=((0.43, 0.26, 0.10, face_scale * 0.42),),
+                )
+                self.assertEqual(descriptor.shot_type, expected)
+
+    def test_cropped_group_geometry_basis_round_trips_descriptor_cache(self) -> None:
+        descriptor = self._describe_cropped_group_fixture(
+            ((0.0, 0.26, 0.22, 0.74), (0.28, 0.22, 0.44, 0.78),
+             (0.82, 0.42, 0.18, 0.58)),
+        )
+        restored = _descriptor_from_cache_payload(
+            _descriptor_cache_payload(descriptor),
+        )
+        self.assertEqual(restored.shot_type, ShotType.MEDIUM)
+        self.assertEqual(restored.shot_scale_basis, "cropped_foreground_group")
+        self.assertEqual(restored.formation_people, descriptor.formation_people)
+        self.assertEqual(restored.primary_face_bbox, descriptor.primary_face_bbox)
+
     def test_visual_plan_exposes_selected_body_transition_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             paths = self.write_constant_sources(

@@ -1615,6 +1615,7 @@ _SHOT_SCALE_BASES = frozenset(
         "dominant_face_height",
         "aggregate_formation_people",
         "clipped_single_performer_bbox",
+        "cropped_foreground_group",
         "single_or_pair_performer_bbox",
         "distant_single_or_pair_performer_bbox",
         "clipped_single_subject_silhouette",
@@ -1731,6 +1732,14 @@ class VisualTimelineChoice:
     ] = (None, None, None)
     silhouette_backends: tuple[str, str, str] = ("none", "none", "none")
     silhouette_confidences: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    transition_evidence_authority_from_previous: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    transition_evidence_contract_from_previous: str | None = None
+    scale_transition_mismatch_from_previous: float | None = None
+    focus_transition_mismatch_from_previous: float | None = None
     layout_transition_mismatch_from_previous: float | None = None
     pose_transition_basis_from_previous: str | None = None
     pose_transition_mismatch_from_previous: float | None = None
@@ -1887,6 +1896,15 @@ class VisualTimelineChoice:
             ],
             "silhouette_backends": list(self.silhouette_backends),
             "silhouette_confidences": list(self.silhouette_confidences),
+            "transition_evidence_contract_from_previous": (
+                self.transition_evidence_contract_from_previous
+            ),
+            "scale_transition_mismatch_from_previous": (
+                self.scale_transition_mismatch_from_previous
+            ),
+            "focus_transition_mismatch_from_previous": (
+                self.focus_transition_mismatch_from_previous
+            ),
             "layout_transition_mismatch_from_previous": (
                 self.layout_transition_mismatch_from_previous
             ),
@@ -4025,6 +4043,53 @@ def _normalized_face_metadata(
     )
 
 
+def _cropped_foreground_group_scale(
+    people: Sequence[FormationPersonDescriptor],
+) -> float | None:
+    """Recognize tight shared framing without selecting a crop target.
+
+    Several detections can be a large central upper body with fragments of
+    neighboring performers at the image edges. Person count alone cannot
+    distinguish that composition from a full formation. Require a broad,
+    tall central body clipped below the frame, with every smaller neighbor
+    clipped at an outer side and lying outside the central body's span.
+    This only supplies MEDIUM framing evidence; face close-up and identity
+    dominance decisions remain separate.
+    """
+
+    if len(people) < 3:
+        return None
+    central = max(
+        people,
+        key=lambda person: person.bbox_xywh[2] * person.bbox_xywh[3],
+    )
+    left, top, width, height = central.bbox_xywh
+    right = left + width
+    if not (
+        1.0 / 3.0 <= left + width / 2.0 <= 2.0 / 3.0
+        and width >= 0.30
+        and height >= 0.68
+        and top + height >= 0.965
+        and left > 0.035
+        and right < 0.965
+    ):
+        return None
+    central_area = width * height
+    for neighbor in people:
+        if neighbor is central:
+            continue
+        x, _y, neighbor_width, neighbor_height = neighbor.bbox_xywh
+        center_x = x + neighbor_width / 2.0
+        outside_left = x <= 0.035 and center_x < left
+        outside_right = x + neighbor_width >= 0.965 and center_x > right
+        if not (
+            (outside_left or outside_right)
+            and neighbor_width * neighbor_height < central_area
+        ):
+            return None
+    return max(0.28, min(0.50, height * 0.56))
+
+
 def describe_frame(
     frame: np.ndarray,
     *,
@@ -4089,6 +4154,9 @@ def describe_frame(
         attention_bbox_xywh=primary_face_bbox,
         secondary_attention_bbox_xywh=subject.silhouette_bbox_xywh,
     )
+    cropped_group_scale = _cropped_foreground_group_scale(
+        subject.formation_people
+    )
     if face_count:
         largest = max(
             faces,
@@ -4123,7 +4191,11 @@ def describe_frame(
             )
             union_width = union_right - union_left
             boundary_clipped = union_top <= 0.035 or union_bottom >= 0.965
-            if len(people) >= 3:
+            if cropped_group_scale is not None:
+                shot_scale = cropped_group_scale
+                shot_type = ShotType.MEDIUM
+                shot_scale_basis = "cropped_foreground_group"
+            elif len(people) >= 3:
                 shot_scale = min(0.21, max(0.08, median_height * 0.30))
                 shot_type = ShotType.GROUP_WIDE
                 shot_scale_basis = "aggregate_formation_people"
@@ -4174,6 +4246,10 @@ def describe_frame(
     if face_count:
         if face_count < 4 and shot_scale >= 0.52:
             shot_type = ShotType.CLOSE_UP
+        elif cropped_group_scale is not None:
+            shot_scale = max(min(shot_scale, 0.50), cropped_group_scale)
+            shot_type = ShotType.MEDIUM
+            shot_scale_basis = "cropped_foreground_group"
         elif len(subject.formation_people) >= 3:
             heights = sorted(
                 float(person.bbox_xywh[3])

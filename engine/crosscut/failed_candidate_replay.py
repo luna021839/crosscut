@@ -56,6 +56,9 @@ EXPECTED_SELECTION_BASIS = "sequential_decoded_proxy_candidate_rerank_v1"
 EXPECTED_REQUEST_INDEX_DOMAIN = "request_source_index"
 EXPECTED_ELIGIBLE_INDEX_DOMAIN = "eligible_source_index"
 EXPECTED_RENDER_INDEX_DOMAIN = "render_plan_sources_array_index"
+_PERSISTED_TRANSITION_EVIDENCE_CONTRACT = (
+    "joint_decoded_post_transform_boundary_result_evidence_v1"
+)
 
 
 class CandidateReplayValidationError(ValueError):
@@ -180,6 +183,15 @@ def _string(value: Any, name: str) -> str:
 
 def _optional_number(value: Any, name: str) -> float | None:
     return None if value is None else _number(value, name)
+
+
+def _optional_transition_mismatch(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    result = _number(value, name, minimum=0.0)
+    if result > 1.0:
+        raise CandidateReplayValidationError(f"{name} must be <= 1.0")
+    return result
 
 
 def _optional_string(value: Any, name: str) -> str | None:
@@ -1181,6 +1193,29 @@ def _deserialize_visual_timeline(
         item = _mapping(raw, f"visual_timeline.choices[{position}]")
         if _integer(item.get("segment_index"), "choice.segment_index") != position:
             raise CandidateReplayValidationError("visual choice order is inconsistent")
+        transition_contract = _optional_string(
+            item.get("transition_evidence_contract_from_previous"),
+            "choice.transition_evidence_contract_from_previous",
+        )
+        if transition_contract not in (None, _PERSISTED_TRANSITION_EVIDENCE_CONTRACT):
+            raise CandidateReplayValidationError(
+                "choice.transition_evidence_contract_from_previous is unsupported"
+            )
+        scale_transition_mismatch = _optional_transition_mismatch(
+            item.get("scale_transition_mismatch_from_previous"),
+            "choice.scale_transition_mismatch_from_previous",
+        )
+        focus_transition_mismatch = _optional_transition_mismatch(
+            item.get("focus_transition_mismatch_from_previous"),
+            "choice.focus_transition_mismatch_from_previous",
+        )
+        if transition_contract is None and (
+            scale_transition_mismatch is not None
+            or focus_transition_mismatch is not None
+        ):
+            raise CandidateReplayValidationError(
+                "choice transition mismatches require an evidence contract"
+            )
         landmark_samples_raw = _sequence(
             item.get("face_landmark_samples_xy"), "choice.face_landmark_samples_xy"
         )
@@ -1426,6 +1461,11 @@ def _deserialize_visual_timeline(
                 "choice.silhouette_confidences",
                 length=3,
             ),  # type: ignore[arg-type]
+            # Persisted scalars describe a prior review; they cannot recreate
+            # the process-local authority required for an authoritative result.
+            transition_evidence_contract_from_previous=transition_contract,
+            scale_transition_mismatch_from_previous=scale_transition_mismatch,
+            focus_transition_mismatch_from_previous=focus_transition_mismatch,
             layout_transition_mismatch_from_previous=_optional_number(
                 item.get("layout_transition_mismatch_from_previous"),
                 "choice.layout_transition_mismatch_from_previous",
