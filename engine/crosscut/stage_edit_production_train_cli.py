@@ -29,10 +29,13 @@ from .professional_montage_policy import (
 from .stage_edit_feature_materializer import StageEditFeatureSnapshot
 from .stage_edit_production_training import train_production_stage_edit
 from .stage_edit_production_registry import (
+    STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT,
+    _validated_contextual_source_pair_identity,
     register_stage_edit_production_bundle,
 )
 from .stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
     STAGE_EDIT_CONTINUITY_AUTHORITIES,
 )
@@ -148,6 +151,78 @@ def _json_object_argument(raw: str, name: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"{name} must be a JSON object")
     return payload
+
+
+def _contextual_activation_evidence(
+    bundle_directory: Path,
+    beam_qa_manifest_path: Path,
+) -> tuple[object, ...]:
+    """Replay registry-format Beam-QA evidence before any expensive training."""
+
+    for path, option, is_directory in (
+        (bundle_directory, "--contextual-source-pair-bundle", True),
+        (beam_qa_manifest_path, "--contextual-source-pair-beam-qa-manifest", False),
+    ):
+        if not path.is_absolute():
+            raise ValueError(f"{option} must be an explicit absolute path")
+        if path.is_symlink() or not (path.is_dir() if is_directory else path.is_file()):
+            raise ValueError(f"{option} is missing or unsafe")
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate Beam-QA manifest key: {key}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite Beam-QA manifest value: {value}")
+
+    payload = json.loads(
+        beam_qa_manifest_path.read_text(encoding="utf-8"),
+        object_pairs_hook=strict_object,
+        parse_constant=reject_nonfinite,
+    )
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"contract", "cases"}
+        or payload.get("contract")
+        != STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT
+        or not isinstance(payload.get("cases"), list)
+        or not payload["cases"]
+    ):
+        raise ValueError(
+            "--contextual-source-pair-beam-qa-manifest requires a nonempty "
+            "registry-format Beam-QA manifest with contract and cases"
+        )
+    for entry in payload["cases"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"case", "derivation"}
+            or not isinstance(entry["case"], dict)
+            or not isinstance(entry["derivation"], dict)
+        ):
+            raise ValueError("Beam-QA manifest entries require case and derivation objects")
+
+    from .stage_edit_contextual_beam_qa_adapter_v2 import (
+        rehydrate_stage_edit_contextual_beam_qa_case_v2,
+    )
+
+    try:
+        cases = tuple(
+            rehydrate_stage_edit_contextual_beam_qa_case_v2(
+                case_payload=entry["case"],
+                derivation_payload=entry["derivation"],
+            )
+            for entry in payload["cases"]
+        )
+        # Use the same artifact, model-readiness, and adapter-seal authority as
+        # registration. A JSON DTO alone must never authorize activation.
+        _validated_contextual_source_pair_identity(bundle_directory, cases)
+    except Exception as exc:
+        raise ValueError(f"contextual-v2 activation evidence failed preflight: {exc}") from exc
+    return cases
 
 
 def _dynamic_artifact_map(
@@ -430,6 +505,23 @@ def build_parser() -> argparse.ArgumentParser:
             "--source-pair-scorer."
         ),
     )
+    parser.add_argument(
+        "--contextual-source-pair-bundle",
+        type=Path,
+        help=(
+            "Exact contextual-v2 production bundle directory. Required with "
+            "contextual-v2 continuity authority and verified Beam-QA evidence."
+        ),
+    )
+    parser.add_argument(
+        "--contextual-source-pair-beam-qa-manifest",
+        type=Path,
+        help=(
+            "Registry-format JSON with contract and case/derivation records. "
+            "Its bound artifacts are replayed before training, then the "
+            "verified envelopes are passed to contextual-v2 registration."
+        ),
+    )
     return parser
 
 
@@ -502,6 +594,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.continuity_authority,
         args.source_pair_scorer,
         args.source_pair_production_report,
+        args.contextual_source_pair_bundle,
+        args.contextual_source_pair_beam_qa_manifest,
     )
     if any(value is not None for value in continuity_inputs) and not (
         args.authorize_production_activation
@@ -526,6 +620,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "authorized Dynamic Crop v3 activation requires "
             "--continuity-authority"
         )
+    contextual_inputs = (
+        args.contextual_source_pair_bundle,
+        args.contextual_source_pair_beam_qa_manifest,
+    )
+    if args.continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        if args.source_pair_scorer is not None or args.source_pair_production_report is not None:
+            raise ValueError("contextual-v2 continuity rejects learned-v1 source-pair artifacts")
+        if any(value is None for value in contextual_inputs):
+            raise ValueError(
+                "contextual-v2 continuity requires both --contextual-source-pair-bundle "
+                "and --contextual-source-pair-beam-qa-manifest before training"
+            )
+    elif any(value is not None for value in contextual_inputs):
+        raise ValueError("contextual-v2 artifacts require contextual-v2 continuity authority")
     if args.continuity_authority == HANDCRAFTED_CONTINUITY_AUTHORITY and (
         args.source_pair_scorer is not None
         or args.source_pair_production_report is not None
@@ -584,6 +692,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{exc}"
             ) from exc
         args.professional_montage_grammar_profile = montage_profile_path
+    verified_contextual_cases = None
+    if args.continuity_authority == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2:
+        verified_contextual_cases = _contextual_activation_evidence(
+            args.contextual_source_pair_bundle,
+            args.contextual_source_pair_beam_qa_manifest,
+        )
     checkpoint_directory = args.checkpoint_dir.expanduser().resolve()
     if checkpoint_directory.exists() or checkpoint_directory.is_symlink():
         raise FileExistsError(
@@ -689,6 +803,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_pair_scorer_path=args.source_pair_scorer,
             source_pair_production_report_path=(
                 args.source_pair_production_report
+            ),
+            **(
+                {
+                    "contextual_source_pair_bundle_directory": args.contextual_source_pair_bundle,
+                    "contextual_source_pair_verified_beam_qa_cases": verified_contextual_cases,
+                }
+                if verified_contextual_cases is not None
+                else {}
             ),
         )
     print(

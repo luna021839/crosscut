@@ -829,6 +829,17 @@ class JointTimelineProgress:
     shared_option_cache_miss_count: int = 0
     shared_option_cache_entry_count: int = 0
     profile_status: str = "in_progress"
+    proof_candidate_ordinal: int = 0
+    proof_candidate_pool_count: int = 0
+    proof_materialization_call_count: int = 0
+    maximum_proof_materialization_calls: int = 0
+    retained_candidate_count: int = 0
+    required_candidate_count: int = 0
+    completed_proof_boundary_count: int = 0
+    total_proof_boundary_count: int = 0
+    completed_proof_bridge_count: int = 0
+    total_proof_bridge_count: int = 0
+    proof_failure_code: str | None = None
     contract: str = "joint_selection_progress_v1"
     version: int = 1
 
@@ -846,6 +857,12 @@ class JointTimelineProgress:
             "selection_complete",
             "profile_start",
             "profile_complete",
+            "proof_start",
+            "proof_boundary_complete",
+            "proof_bridge_complete",
+            "proof_complete",
+            "proof_failed",
+            "proof_review_complete",
         }:
             raise ValueError("joint selection progress phase is invalid")
         integer_fields = (
@@ -858,6 +875,8 @@ class JointTimelineProgress:
                 "total_boundary_layers",
                 "profile_index",
                 "total_profiles",
+                "proof_candidate_ordinal",
+                "maximum_proof_materialization_calls",
             }
         )
         if any(
@@ -869,6 +888,27 @@ class JointTimelineProgress:
             raise ValueError("joint selection progress counts must be non-negative")
         if self.completed_boundary_layers > self.total_boundary_layers:
             raise ValueError("completed boundary layers exceed the total")
+        if (
+            self.proof_candidate_ordinal > self.proof_candidate_pool_count
+            or self.proof_materialization_call_count
+            > self.maximum_proof_materialization_calls
+            or self.completed_proof_boundary_count
+            > self.total_proof_boundary_count
+            or self.completed_proof_bridge_count > self.total_proof_bridge_count
+        ):
+            raise ValueError("joint proof progress exceeds its declared budget")
+        if self.proof_failure_code is not None and (
+            not isinstance(self.proof_failure_code, str)
+            or not self.proof_failure_code
+            or len(self.proof_failure_code) > 96
+            or any(
+                not (character.isascii() and (
+                    character.isalnum() or character == "_"
+                ))
+                for character in self.proof_failure_code
+            )
+        ):
+            raise ValueError("joint proof failure code must be a scalar identifier")
         if self.shared_bridge_cache_entry_count > (
             self.shared_bridge_cache_admission_count
         ):

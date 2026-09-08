@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import ANY, patch
 
 from crosscut.stage_edit_continuity_authority import (
     HANDCRAFTED_CONTINUITY_AUTHORITY,
+    PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
     PRODUCTION_LEARNED_CONTINUITY_AUTHORITY,
 )
 from crosscut.stage_edit_dynamic_crop_head_v3 import DynamicCropV3LossContract
@@ -22,6 +24,8 @@ from crosscut.stage_edit_feature_materializer import (
     materialize_stage_edit_feature_snapshot,
 )
 from crosscut.stage_edit_production_train_cli import (
+    STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT,
+    _contextual_activation_evidence,
     _dynamic_artifact_map,
     _snapshot_map,
     _training_result_exit_code,
@@ -31,6 +35,171 @@ from crosscut.stage_edit_production_train_cli import (
 
 
 class StageEditProductionTrainCliTests(unittest.TestCase):
+    @staticmethod
+    def _contextual_args(root: Path) -> list[str]:
+        return [
+            "--input", str(root / "input.json"),
+            "--song-id", "reference-a=IVE-XOXZ",
+            "--held-out-song", "IVE-XOXZ",
+            "--feature-snapshot", f"reference-a={root / 'features.json'}",
+            "--dynamic-crop-manifest", str(root / "crop-manifest.json"),
+            "--dynamic-crop-version", "3",
+            "--checkpoint-dir", str(root / "checkpoint-v3"),
+            "--authorize-production-activation",
+            "--professional-montage-grammar-profile", str(root / "montage.json"),
+            "--continuity-authority", PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2,
+        ]
+
+    def test_contextual_cli_requires_both_evidence_inputs_before_loading_data(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            for extra in (
+                [],
+                ["--contextual-source-pair-bundle", str(root / "bundle")],
+                ["--contextual-source-pair-beam-qa-manifest", str(root / "qa.json")],
+            ):
+                with (
+                    self.subTest(extra=extra),
+                    patch("crosscut.stage_edit_production_train_cli.load_reference_training_corpus") as load,
+                    patch("crosscut.stage_edit_production_train_cli.train_production_stage_edit") as train,
+                    self.assertRaisesRegex(ValueError, "requires both --contextual-source-pair"),
+                ):
+                    main([*self._contextual_args(root), *extra])
+                load.assert_not_called()
+                train.assert_not_called()
+
+    def test_contextual_cli_rejects_mixed_authority_and_unauthorized_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            base = [
+                *self._contextual_args(root),
+                "--contextual-source-pair-bundle", str(root / "bundle"),
+                "--contextual-source-pair-beam-qa-manifest", str(root / "qa.json"),
+            ]
+            for args, error in (
+                ([value for value in base if value != "--authorize-production-activation"],
+                 "require --authorize-production-activation"),
+                ([*base, "--source-pair-scorer", str(root / "pair.json")],
+                 "rejects learned-v1"),
+                ([HANDCRAFTED_CONTINUITY_AUTHORITY if value == PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2 else value for value in base],
+                 "require contextual-v2 continuity"),
+            ):
+                with (
+                    self.subTest(error=error),
+                    patch("crosscut.stage_edit_production_train_cli.train_production_stage_edit") as train,
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    main(args)
+                train.assert_not_called()
+
+    def test_contextual_manifest_rejects_missing_empty_and_noncanonical_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            manifest = root / "qa.json"
+            with self.assertRaisesRegex(ValueError, "missing or unsafe"):
+                _contextual_activation_evidence(bundle, manifest)
+            contract = STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT
+            for payload, error in (
+                (json.dumps({"contract": contract, "cases": []}), "nonempty"),
+                (json.dumps({"contract": contract, "cases": [{"case": {}}]}), "case and derivation"),
+                (json.dumps({"contract": contract, "cases": [{"case": {}, "derivation": {}}]}),
+                 "failed preflight: persisted Beam-QA manifest is invalid"),
+                ('{"contract":"a","contract":"b","cases":[]}', "duplicate"),
+                ('{"contract":"a","cases":[NaN]}', "non-finite"),
+            ):
+                with self.subTest(error=error):
+                    manifest.write_text(payload, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, error):
+                        _contextual_activation_evidence(bundle, manifest)
+
+    def test_contextual_cli_preflight_rejects_invalid_evidence_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            manifest = root / "qa.json"
+            manifest.write_text(json.dumps({
+                "contract": STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT,
+                "cases": [{"case": {}, "derivation": {}}],
+            }), encoding="utf-8")
+            for replay_fails in (True, False):
+                with (
+                    self.subTest(replay_fails=replay_fails),
+                    patch("crosscut.stage_edit_production_train_cli.load_professional_montage_policy"),
+                    patch("crosscut.stage_edit_contextual_beam_qa_adapter_v2.rehydrate_stage_edit_contextual_beam_qa_case_v2",
+                          side_effect=ValueError("stale QA") if replay_fails else None),
+                    patch("crosscut.stage_edit_production_train_cli._validated_contextual_source_pair_identity",
+                          side_effect=ValueError("stale model bundle")) as validate,
+                    patch("crosscut.stage_edit_production_train_cli.load_reference_training_corpus") as load,
+                    patch("crosscut.stage_edit_production_train_cli.train_production_stage_edit") as train,
+                    self.assertRaisesRegex(ValueError, "failed preflight: stale"),
+                ):
+                    main([
+                        *self._contextual_args(root),
+                        "--contextual-source-pair-bundle", str(bundle),
+                        "--contextual-source-pair-beam-qa-manifest", str(manifest),
+                    ])
+                load.assert_not_called()
+                train.assert_not_called()
+                if replay_fails:
+                    validate.assert_not_called()
+                else:
+                    validate.assert_called_once()
+
+    def test_contextual_cli_forwards_only_replayed_and_preflighted_envelopes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            manifest = root / "qa.json"
+            case = {"case_id": "qa-case"}
+            derivation = {"decode": "hash-bound-evidence"}
+            manifest.write_text(json.dumps({
+                "contract": STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT,
+                "cases": [{"case": case, "derivation": derivation}],
+            }), encoding="utf-8")
+            envelope = object()
+            result = SimpleNamespace(
+                checkpoint_directory=root / "checkpoint-v3",
+                report_path=root / "training-report.json", best_epoch=3,
+                best_training_step=120, production_ready=True,
+                quality_gate=SimpleNamespace(passed=True, to_dict=lambda: {}),
+            )
+            with ExitStack() as stack:
+                prefix = "crosscut.stage_edit_production_train_cli."
+                for name, value in (
+                    ("load_professional_montage_policy", SimpleNamespace()),
+                    ("_snapshot_map", {}),
+                    ("load_reference_training_corpus", SimpleNamespace(examples=())),
+                    ("_dynamic_artifact_map", {}),
+                    ("build_stage_edit_dynamic_crop_training_corpus_v2", SimpleNamespace()),
+                    ("build_stage_edit_dynamic_crop_training_corpus_v3", SimpleNamespace()),
+                ):
+                    stack.enter_context(patch(prefix + name, return_value=value))
+                replay = stack.enter_context(patch(
+                    "crosscut.stage_edit_contextual_beam_qa_adapter_v2.rehydrate_stage_edit_contextual_beam_qa_case_v2",
+                    return_value=envelope,
+                ))
+                validate = stack.enter_context(patch(prefix + "_validated_contextual_source_pair_identity"))
+                def trained(*args, **kwargs):
+                    validate.assert_called_once_with(bundle, (envelope,))
+                    return result
+                stack.enter_context(patch(prefix + "train_production_stage_edit", side_effect=trained))
+                register = stack.enter_context(patch(prefix + "register_stage_edit_production_bundle", return_value=root / "registry.json"))
+                stack.enter_context(patch("builtins.print"))
+                exit_code = main([
+                    *self._contextual_args(root),
+                    "--contextual-source-pair-bundle", str(bundle),
+                    "--contextual-source-pair-beam-qa-manifest", str(manifest),
+                ])
+            self.assertEqual(exit_code, 0)
+            replay.assert_called_once_with(case_payload=case, derivation_payload=derivation)
+            self.assertEqual(register.call_args.kwargs["contextual_source_pair_bundle_directory"], bundle)
+            self.assertEqual(register.call_args.kwargs["contextual_source_pair_verified_beam_qa_cases"], (envelope,))
+            self.assertEqual(register.call_args.kwargs["continuity_authority"], PRODUCTION_CONTEXTUAL_CONTINUITY_AUTHORITY_V2)
+
     def test_legacy_schema3_snapshot_fails_production_snapshot_gate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "legacy-schema3-feature-snapshot.json"

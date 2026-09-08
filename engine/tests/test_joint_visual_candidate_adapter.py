@@ -12,8 +12,10 @@ from crosscut.joint_boundary_provider import DecodedBoundaryOptionProvider
 from crosscut.joint_boundary_provider import (
     BoundaryMaterializationProof,
     JointSelectionMaterializationProof,
+    ProgressDecodedBoundaryOptionProvider,
     SegmentTransformPathMaterializationProof,
     SegmentTransformPathSample,
+    _SelectionProofProgressObserver,
 )
 from crosscut.joint_timeline import (
     AuthorizedBoundaryOption,
@@ -2430,7 +2432,7 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             ["balanced", "reference", "dense_safe"],
         )
         self.assertEqual(
-            [item.phase for item in progress],
+            [item.phase for item in progress if not item.phase.startswith("proof_")],
             [
                 "profile_start",
                 "boundary_layer_complete",
@@ -2440,15 +2442,29 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
             * 3,
         )
         self.assertEqual(
-            [item.completed_boundary_layers for item in progress],
+            [item.completed_boundary_layers for item in progress
+             if not item.phase.startswith("proof_")],
             [0, 1, 2, 2] * 3,
         )
-        final_progress = progress[-1]
+        final_progress = [item for item in progress if item.phase == "profile_complete"][-1]
         self.assertEqual(final_progress.total_profiles, 3)
         self.assertEqual(final_progress.shared_option_cache_miss_count, 1)
         self.assertEqual(final_progress.shared_option_cache_hit_count, 2)
         self.assertEqual(final_progress.shared_option_cache_entry_count, 1)
         self.assertEqual(final_progress.option_key_count, 1)
+        proof_progress = [item for item in progress if item.phase.startswith("proof_")]
+        self.assertEqual(
+            [item.phase for item in proof_progress],
+            ["proof_start", "proof_complete", "proof_review_complete"] * 8,
+        )
+        self.assertEqual(
+            [item.proof_materialization_call_count for item in proof_progress
+             if item.phase == "proof_start"], list(range(1, 9)),
+        )
+        self.assertEqual(proof_progress[-1].retained_candidate_count, 8)
+        self.assertEqual(proof_progress[-1].required_candidate_count, 8)
+        self.assertEqual(proof_progress[-1].completed_proof_boundary_count, 2)
+        self.assertEqual(proof_progress[-1].completed_proof_bridge_count, 1)
         self.assertEqual(
             (
                 selected.shared_option_evidence_cache_audit["entry_count"],
@@ -2520,6 +2536,158 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 progress_callback=fail_during_search,
             )
         self.assertIs(caught.exception, callback_failure)
+
+    def test_proof_observer_is_throttled_and_reports_exact_stage_ends(self) -> None:
+        progress: list[JointTimelineProgress] = []
+        observer = _SelectionProofProgressObserver(progress.append, 119, 118)
+        with patch("crosscut.joint_boundary_provider.monotonic", return_value=0.0):
+            for index in range(119):
+                observer.completed(boundary_index=index)
+            for index in range(1, 119):
+                observer.completed(bridge_index=index)
+            observer.completed(bridge_index=118)
+        self.assertEqual(len(progress), 4)
+        self.assertEqual(
+            [(item.completed_proof_boundary_count, item.completed_proof_bridge_count)
+             for item in progress], [(1, 0), (119, 0), (119, 1), (119, 118)],
+        )
+        json.dumps([item.to_dict() for item in progress], allow_nan=False)
+
+    def test_proof_observation_preserves_real_proof_and_provider_counters(self) -> None:
+        from . import test_joint_boundary_provider as fixtures
+
+        descriptor = fixtures._descriptor(0.5)
+        def descriptor_provider(_source: int, _seconds: float) -> FrameVisualDescriptor:
+            return descriptor
+        providers = [fixtures._provider(
+            descriptor_provider, total_segment_count=3,
+        )]
+        with patch.object(fixtures, "DecodedBoundaryOptionProvider",
+                          ProgressDecodedBoundaryOptionProvider):
+            providers.append(fixtures._provider(
+                descriptor_provider, total_segment_count=3,
+            ))
+        results = []
+        progress: list[JointTimelineProgress] = []
+        for index, provider in enumerate(providers):
+            middle, entries, exits = fixtures._bridge_fixture(provider)
+            entry = next(item for item in entries if item.frame_offset == 0)
+            exit_ = next(item for item in exits if item.frame_offset == 0)
+            bridge = provider.bridge_provider(middle, entry, exit_, fixtures.FPS)
+            kwargs = {"progress_callback": progress.append} if index else {}
+            results.append(provider.selection_materialization_proof(
+                (entry, exit_), (bridge,), **kwargs,
+            ))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(providers[0].to_dict(), providers[1].to_dict())
+        self.assertEqual(
+            [item.phase for item in progress],
+            ["proof_boundary_complete", "proof_boundary_complete", "proof_bridge_complete"],
+        )
+        self.assertIsNone(providers[1]._selection_progress_observer)
+        for provider in providers:
+            provider.close()
+
+    def test_proof_observer_failure_rolls_back_and_next_attempt_is_clean(self) -> None:
+        from . import test_joint_boundary_provider as fixtures
+
+        with patch.object(fixtures, "DecodedBoundaryOptionProvider",
+                          ProgressDecodedBoundaryOptionProvider):
+            provider = fixtures._provider(
+                lambda _source, _seconds: fixtures._descriptor(0.5),
+            )
+        option = provider(fixtures._key()).audit_for(0).authorized_option
+        self.assertIsNotNone(option)
+        baseline = provider.selection_materialization_proof((option,))
+        before = provider.to_dict()
+        failure = RuntimeError("synthetic proof observer failure")
+
+        def reject(_progress: JointTimelineProgress) -> None:
+            raise failure
+
+        with self.assertRaises(RuntimeError) as caught:
+            provider.selection_materialization_proof((option,), progress_callback=reject)
+        self.assertIs(caught.exception, failure)
+        self.assertIsNone(provider._selection_progress_observer)
+        self.assertIsNone(provider._active_transaction_journal)
+        after = provider.to_dict()
+        for field in ("descriptor_decode_count", "bridge_measurement_count",
+                      "selection_materialization_count", "last_selection"):
+            if field in before:
+                self.assertEqual(before[field], after[field])
+        self.assertEqual(after["selection_failure_count"], before["selection_failure_count"] + 1)
+        progress: list[JointTimelineProgress] = []
+        recovered = provider.selection_materialization_proof(
+            (option,), progress_callback=progress.append,
+        )
+        self.assertEqual(recovered, baseline)
+        self.assertEqual(len(progress), 1)
+        provider.close()
+
+    def test_proof_failure_progress_preserves_original_error_without_private_text(self) -> None:
+        candidate_set = _candidate_set()
+        pools = iter(_profile_pools(candidate_set))
+        progress: list[JointTimelineProgress] = []
+        provider = StubMaterializingProvider()
+
+        def selector(_lattice: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(JointTimelineProgress(
+                phase="selection_complete", completed_boundary_layers=2,
+                total_boundary_layers=2, option_key_count=0,
+                bridge_provider_call_count=0,
+            ))
+            return next(pools)
+
+        failure = ValueError("private-media-path/source.mp4 failed")
+        with patch("crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+                   side_effect=selector), patch.object(provider, "selection_materialization_proof",
+                                                       side_effect=failure):
+            with self.assertRaises(ValueError) as caught:
+                select_joint_visual_candidates(candidate_set, provider=provider,
+                                               fps=10.0, progress_callback=progress.append)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(progress[-1].phase, "proof_failed")
+        self.assertEqual(progress[-1].proof_failure_code, "ValueError")
+        self.assertEqual(progress[-1].proof_candidate_ordinal, 1)
+        self.assertEqual(progress[-1].proof_materialization_call_count, 1)
+        self.assertNotIn("private-media-path", json.dumps([item.to_dict() for item in progress]))
+
+    def test_proof_failure_observer_error_does_not_mask_provider_error(self) -> None:
+        candidate_set = _candidate_set()
+        pools = iter(_profile_pools(candidate_set))
+        provider = StubMaterializingProvider()
+
+        def selector(_lattice: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(JointTimelineProgress(
+                phase="selection_complete", completed_boundary_layers=2,
+                total_boundary_layers=2, option_key_count=0,
+                bridge_provider_call_count=0,
+            ))
+            return next(pools)
+
+        def observer(progress: JointTimelineProgress) -> None:
+            if progress.phase == "proof_failed":
+                raise BrokenPipeError("private-observer-destination")
+
+        failure = ValueError("original provider proof failure")
+        with patch(
+            "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+            side_effect=selector,
+        ), patch.object(provider, "selection_materialization_proof", side_effect=failure):
+            with self.assertRaises(ValueError) as caught:
+                select_joint_visual_candidates(
+                    candidate_set, provider=provider, fps=10.0,
+                    progress_callback=observer,
+                )
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(
+            failure.__notes__,
+            ["proof failure progress callback failed: BrokenPipeError"],
+        )
 
     def test_offsets_shift_clocks_and_highest_proof_variant_wins(self) -> None:
         candidate_set = _candidate_set()

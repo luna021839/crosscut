@@ -15,6 +15,7 @@ import re
 import stat
 from statistics import median
 import tempfile
+from time import monotonic
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from numpy.typing import NDArray
@@ -314,7 +315,14 @@ from .lazy_splice_feasibility_graph import (
     LazySpliceFeasibilityGraph,
     LazySpliceFeasibilityKey,
 )
-from .joint_boundary_provider import DecodedBoundaryOptionProvider
+from .joint_boundary_provider import (
+    DecodedBoundaryOptionProvider,
+    ProgressDecodedBoundaryOptionProvider,
+)
+from .joint_runtime_progress import (
+    JointSelectionRuntime,
+    joint_candidate_terminal_payload,
+)
 from .joint_decoded_budget import (
     JOINT_DECODED_DISTINCT_CANDIDATE_LIMIT,
     JointDecodedBudgetExhausted,
@@ -27998,6 +28006,8 @@ def analyze(
                         )
                     def report_joint_visual_selection_progress(
                         progress: JointTimelineProgress,
+                        *,
+                        runtime: JointSelectionRuntime,
                     ) -> None:
                         if not isinstance(progress, JointTimelineProgress):
                             raise TypeError(
@@ -28014,6 +28024,7 @@ def analyze(
                         reporter.emit(
                             "joint_visual_selection_progress",
                             **progress.to_dict(),
+                            runtime=runtime.snapshot(),
                         )
 
                     def materialize_joint_visual_feedback_batch(
@@ -28025,7 +28036,7 @@ def analyze(
                         tuple[JointMaterializedVisualCandidate, ...],
                     ]:
                         def provider_factory() -> DecodedBoundaryOptionProvider:
-                            return DecodedBoundaryOptionProvider(
+                            return ProgressDecodedBoundaryOptionProvider(
                                 sources=tuple(
                                     request.sources[index]
                                     for index in eligible_indices
@@ -28057,6 +28068,9 @@ def analyze(
                             ],
                             proof_budget: int,
                         ) -> JointVisualSelectionSet:
+                            runtime = JointSelectionRuntime(
+                                provider, batch_index=batch_index,
+                            )
                             return select_joint_visual_candidates(
                                 visual_candidate_set,
                                 provider=provider,
@@ -28086,7 +28100,9 @@ def analyze(
                                     else None
                                 ),
                                 progress_callback=(
-                                    report_joint_visual_selection_progress
+                                    lambda progress: report_joint_visual_selection_progress(
+                                        progress, runtime=runtime,
+                                    )
                                 ),
                             )
 
@@ -28597,6 +28613,7 @@ def analyze(
                 joint_decoded_look_refinement_audits: dict[
                     int, dict[str, Any]
                 ] = {}
+                joint_candidate_runtime_audits: list[dict[str, Any]] = []
                 joint_decoded_budget = JointDecodedBudgetLedger()
                 joint_decoded_budget_exhaustions: list[dict[str, Any]] = []
                 local_source_repair_seeds: list[LocalSourceRepairSeed] = []
@@ -29301,6 +29318,9 @@ def analyze(
                                 ),
                                 "decoded_feedback_classifications": deepcopy(
                                     joint_decoded_feedback_classifications
+                                ),
+                                "candidate_runtime": deepcopy(
+                                    joint_candidate_runtime_audits
                                 ),
                                 "decoded_montage_feedback": {
                                     **(
@@ -31032,6 +31052,27 @@ def analyze(
                             for verdict in candidate_stream_reducer.verdicts
                             if verdict.candidate_index == candidate_index
                         )
+                    attempt_started = monotonic()
+
+                    def record_terminal(
+                        outcome: TerminalCandidateVerdict,
+                    ) -> dict[str, Any] | None:
+                        if not joint_visual_selection_active:
+                            return None
+                        payload = joint_candidate_terminal_payload(
+                            outcome,
+                            elapsed_seconds=monotonic() - attempt_started,
+                            failures=(
+                                candidate_derivation_failures
+                                + candidate_post_repair_review_rejections
+                                + candidate_decoded_review_failures
+                            ),
+                            budget=joint_decoded_budget.report_payload(),
+                            decoded_pass_count=len(derived),
+                        )
+                        joint_candidate_runtime_audits.append(payload)
+                        return payload
+
                     try:
                         verdict = _derive_and_gate_candidate_verdict(
                             materialized,
@@ -31101,11 +31142,33 @@ def analyze(
                                     ),
                                 )
                             )
+                        terminal = next(
+                            (item for item in candidate_stream_reducer.verdicts
+                             if item.candidate_index == candidate_index),
+                            None,
+                        )
+                        terminal_payload = (
+                            record_terminal(terminal)
+                            if terminal is not None else None
+                        )
                         persist_candidate_stream_progress(
                             status="candidate_stream_system_error"
                         )
+                        if terminal_payload is not None:
+                            try:
+                                reporter.emit(
+                                    "joint_candidate_terminal", **terminal_payload,
+                                )
+                            except Exception as telemetry_error:
+                                exc.add_note(
+                                    "terminal telemetry failed after evidence was "
+                                    f"persisted: {type(telemetry_error).__name__}"
+                                )
                         raise
+                    terminal_payload = record_terminal(verdict)
                     persist_candidate_stream_progress()
+                    if terminal_payload is not None:
+                        reporter.emit("joint_candidate_terminal", **terminal_payload)
                     return verdict
 
                 def reject_preflight_blocked_candidate(

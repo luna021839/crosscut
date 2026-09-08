@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from time import monotonic
 from types import MappingProxyType
 from typing import Any
 
@@ -37,6 +38,8 @@ from .joint_timeline import (
     BoundaryOptionSet,
     BoundaryTransformState,
     JOINT_BOUNDARY_FRAME_OFFSETS,
+    JointTimelineProgress,
+    JointTimelineProgressCallback,
     SegmentBridgeDisposition,
     SegmentBridgeDispositionRequest,
     SegmentBridgeProof,
@@ -7190,6 +7193,123 @@ class DecodedBoundaryOptionProvider:
         }
 
 
+@dataclass
+class _SelectionProofProgressObserver:
+    callback: JointTimelineProgressCallback
+    boundary_count: int
+    bridge_count: int
+    completed_boundaries: set[int] = field(default_factory=set)
+    completed_bridges: set[int] = field(default_factory=set)
+    last_emission_seconds: float = float("-inf")
+
+    def completed(
+        self,
+        *,
+        boundary_index: int | None = None,
+        bridge_index: int | None = None,
+    ) -> None:
+        """Count completed rehydrations; full proof acceptance is a later event."""
+
+        if boundary_index is not None:
+            completed = self.completed_boundaries
+            index, total = boundary_index, self.boundary_count
+            phase = "proof_boundary_complete"
+        else:
+            assert bridge_index is not None
+            completed = self.completed_bridges
+            index, total = bridge_index, self.bridge_count
+            phase = "proof_bridge_complete"
+        if index in completed:
+            return
+        completed.add(index)
+        now = monotonic()
+        # First and last item of each stage are always visible.  Cheap cache
+        # hits otherwise emit at most one update per second, not per frame.
+        if (
+            len(completed) not in {1, total}
+            and now - self.last_emission_seconds < 1.0
+        ):
+            return
+        self.last_emission_seconds = now
+        self.callback(
+            JointTimelineProgress(
+                phase=phase,
+                completed_boundary_layers=self.boundary_count,
+                total_boundary_layers=self.boundary_count,
+                option_key_count=0,
+                bridge_provider_call_count=0,
+                completed_proof_boundary_count=len(self.completed_boundaries),
+                total_proof_boundary_count=self.boundary_count,
+                completed_proof_bridge_count=len(self.completed_bridges),
+                total_proof_bridge_count=self.bridge_count,
+            )
+        )
+
+
+class ProgressDecodedBoundaryOptionProvider(DecodedBoundaryOptionProvider):
+    """Observe exact proof work without changing the scalar-cache authority.
+
+    The base provider class is intentionally unchanged: its AST binds existing
+    persistent scalar-cache entries.  This subclass delegates every operation
+    and adds only process-local counters/callbacks during final proof calls.
+    Callback failures propagate through the base transaction rollback.
+    """
+
+    def selection_materialization_proof(
+        self,
+        boundary_options: Sequence[AuthorizedBoundaryOption],
+        segment_bridge_proofs: Sequence[SegmentBridgeProof] = (),
+        *,
+        progress_callback: JointTimelineProgressCallback | None = None,
+    ) -> JointSelectionMaterializationProof:
+        if progress_callback is None:
+            return super().selection_materialization_proof(
+                boundary_options, segment_bridge_proofs
+            )
+        if not callable(progress_callback):
+            raise TypeError("progress_callback must be callable or None")
+        if getattr(self, "_selection_progress_observer", None) is not None:
+            raise RuntimeError("selection materialization cannot be re-entered")
+        self._selection_progress_observer = _SelectionProofProgressObserver(
+            callback=progress_callback,
+            boundary_count=self.total_segment_count - 1,
+            bridge_count=max(0, self.total_segment_count - 2),
+        )
+        try:
+            return super().selection_materialization_proof(
+                boundary_options, segment_bridge_proofs
+            )
+        finally:
+            self._selection_progress_observer = None
+
+    def _ensure_boundary_materialization(
+        self,
+        option: AuthorizedBoundaryOption,
+    ) -> BoundaryMaterializationProof:
+        materialization = super()._ensure_boundary_materialization(option)
+        observer = getattr(self, "_selection_progress_observer", None)
+        if observer is not None:
+            observer.completed(
+                boundary_index=option.measurement_key.boundary_index
+            )
+        return materialization
+
+    def bridge_provider(
+        self,
+        candidate: TimelineCandidate,
+        entry_option: AuthorizedBoundaryOption,
+        exit_option: AuthorizedBoundaryOption,
+        duration_frames: float,
+    ) -> SegmentBridgeProof:
+        proof = super().bridge_provider(
+            candidate, entry_option, exit_option, duration_frames
+        )
+        observer = getattr(self, "_selection_progress_observer", None)
+        if observer is not None and proof.authorized:
+            observer.completed(bridge_index=candidate.segment_index)
+        return proof
+
+
 __all__ = [
     "BoundaryMaterializationProof",
     "DecodedBoundaryOptionProvider",
@@ -7198,6 +7318,7 @@ __all__ = [
     "JointSelectionMaterializationProof",
     "JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS",
     "PersistentScalarBridgeCacheWriteError",
+    "ProgressDecodedBoundaryOptionProvider",
     "SegmentTransformPathMaterializationProof",
     "SegmentTransformPathSample",
     "TransformedDescriptorProvider",

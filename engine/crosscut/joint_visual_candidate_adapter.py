@@ -26,6 +26,7 @@ from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
 from .joint_boundary_provider import (
     BoundaryMaterializationProof,
     DecodedBoundaryOptionProvider,
+    ProgressDecodedBoundaryOptionProvider,
     JointSelectionMaterializationProof,
     SegmentTransformPathMaterializationProof,
 )
@@ -2142,7 +2143,108 @@ def select_joint_visual_candidates(
                 role_control_audit=role_audit_by_profile.get(profile),
             )
             proof_materialization_call_count += 1
-            proof_bundle = _proof_bundle(selection, provider)
+            latest_proof_progress: JointTimelineProgress | None = None
+            proof_callback_failure: BaseException | None = None
+
+            def report_proof_progress(
+                core: JointTimelineProgress | None = None,
+                *,
+                phase: str | None = None,
+                failure_code: str | None = None,
+            ) -> None:
+                nonlocal latest_proof_progress, proof_callback_failure
+                if progress_callback is None:
+                    return
+                observed = core or latest_proof_progress
+                payload = JointTimelineProgress(
+                    phase=phase or (
+                        core.phase if core is not None else "proof_start"
+                    ),
+                    cadence_profile=profile,
+                    profile_index=global_profile_attempt_index,
+                    total_profiles=total_round_count * len(profiles),
+                    completed_boundary_layers=total_boundary_layers,
+                    total_boundary_layers=total_boundary_layers,
+                    option_key_count=0,
+                    bridge_provider_call_count=0,
+                    shared_option_cache_hit_count=shared_option_cache_hit_count,
+                    shared_option_cache_miss_count=shared_option_cache_miss_count,
+                    shared_option_cache_entry_count=len(shared_option_cache),
+                    **shared_bridge_evidence_cache._progress_counts(),
+                    profile_status="completed",
+                    proof_candidate_ordinal=pool_index + 1,
+                    proof_candidate_pool_count=len(ordered_pool),
+                    proof_materialization_call_count=(
+                        proof_materialization_call_count
+                    ),
+                    maximum_proof_materialization_calls=(
+                        maximum_proof_materialization_calls
+                    ),
+                    retained_candidate_count=len(reviewed_variants),
+                    required_candidate_count=MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+                    completed_proof_boundary_count=(
+                        observed.completed_proof_boundary_count
+                        if observed else 0
+                    ),
+                    total_proof_boundary_count=len(result.boundary_options),
+                    completed_proof_bridge_count=(
+                        observed.completed_proof_bridge_count if observed else 0
+                    ),
+                    total_proof_bridge_count=len(result.segment_bridge_proofs),
+                    proof_failure_code=failure_code,
+                )
+                latest_proof_progress = payload
+                try:
+                    progress_callback(payload)
+                except BaseException as exc:
+                    proof_callback_failure = exc
+                    raise
+
+            report_proof_progress(phase="proof_start")
+            try:
+                proof_bundle = _proof_bundle(
+                    selection,
+                    provider,
+                    progress_callback=(
+                        report_proof_progress
+                        if progress_callback is not None else None
+                    ),
+                )
+            except BaseException as exc:
+                if exc is not proof_callback_failure:
+                    try:
+                        report_proof_progress(
+                            phase="proof_failed",
+                            failure_code=(
+                                type(exc).__name__
+                                if type(exc).__name__.isascii()
+                                and type(exc).__name__.isidentifier()
+                                and len(type(exc).__name__) <= 96
+                                else "proof_materialization_error"
+                            ),
+                        )
+                    except Exception as report_error:
+                        # A broken observer must not replace the provider's
+                        # causal failure with a secondary reporting error.
+                        BaseException.add_note(
+                            exc,
+                            "proof failure progress callback failed: "
+                            + type(report_error).__name__,
+                        )
+                raise
+            report_proof_progress(
+                JointTimelineProgress(
+                    phase="proof_complete",
+                    completed_boundary_layers=total_boundary_layers,
+                    total_boundary_layers=total_boundary_layers,
+                    option_key_count=0,
+                    bridge_provider_call_count=0,
+                    completed_proof_boundary_count=len(result.boundary_options),
+                    total_proof_boundary_count=len(result.boundary_options),
+                    completed_proof_bridge_count=len(result.segment_bridge_proofs),
+                    total_proof_bridge_count=len(result.segment_bridge_proofs),
+                )
+            )
             try:
                 projected_plan = _project_visual_plan_from_joint_proof(
                     candidate_set=candidate_set,
@@ -2161,6 +2263,10 @@ def select_joint_visual_candidates(
                 if variant_key not in discarded_variant_keys:
                     discarded_variant_keys.add(variant_key)
                     discarded_candidate_count += 1
+                report_proof_progress(
+                    phase="proof_review_complete",
+                    failure_code="evidence_coverage_rejected",
+                )
                 if proof_materialization_call_count >= (
                     maximum_proof_materialization_calls
                 ):
@@ -2197,6 +2303,13 @@ def select_joint_visual_candidates(
                     discarded_variant_keys.add(variant_key)
                     discarded_candidate_count += 1
                 del proof_bundle, projected_plan, review
+            report_proof_progress(
+                phase="proof_review_complete",
+                failure_code=(
+                    None if variant_key in reviewed_variants
+                    else "authoritative_review_rejected"
+                ),
+            )
             final_reviewed = _production_passing_cohort(
                 tuple(reviewed_variants.values()),
                 maximum_candidates=requested_maximum,
@@ -3228,11 +3341,20 @@ class JointMaterializedVisualCandidate:
 def _proof_bundle(
     selection: JointVisualSelectionRecord,
     provider: DecodedBoundaryOptionProvider,
+    *,
+    progress_callback: JointTimelineProgressCallback | None = None,
 ) -> JointVisualBoundaryProofBundle:
     result = selection.joint_result
+    progress_options = (
+        {"progress_callback": progress_callback}
+        if progress_callback is not None
+        and isinstance(provider, ProgressDecodedBoundaryOptionProvider)
+        else {}
+    )
     proof = provider.selection_materialization_proof(
         result.boundary_options,
         segment_bridge_proofs=result.segment_bridge_proofs,
+        **progress_options,
     )
     return JointVisualBoundaryProofBundle(
         selection_proof=proof,
