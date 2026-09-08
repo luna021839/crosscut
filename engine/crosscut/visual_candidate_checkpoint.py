@@ -15,6 +15,7 @@ import json
 import math
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping, Sequence
 
 from .failed_candidate_replay import deserialize_visual_timeline_plan
@@ -544,18 +545,27 @@ def find_latest_matching_visual_candidate_checkpoint(
     ] = (),
 ) -> LoadedVisualCandidateCheckpoint | None:
     root = Path(output_directory)
-    if root.is_symlink() or not root.is_dir():
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return None
+    except OSError:
         return None
-    candidates = sorted(
-        (
-            path
-            for path in root.glob("*-pre-derivation-candidate-selection.json")
-            if not path.name.startswith("._")
-        ),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
-    for path in candidates:
+    candidates: list[tuple[int, Path]] = []
+    try:
+        for path in root.glob("*-pre-derivation-candidate-selection.json"):
+            if path.name.startswith("._"):
+                continue
+            try:
+                metadata = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                candidates.append((metadata.st_mtime_ns, path))
+    except OSError:
+        # A directory can disappear during enumeration. Still try entries
+        # already collected; the loader independently checks each file.
+        pass
+    for _, path in sorted(candidates, key=lambda item: item[0], reverse=True):
         try:
             return load_visual_candidate_checkpoint(
                 path,

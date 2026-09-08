@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from crosscut.timeline import ShotType
 from crosscut import crop_aware_candidate_rerank, visual_score
@@ -177,6 +179,162 @@ class VisualCandidateCheckpointTests(unittest.TestCase):
                     expected_input_identity_sha256="f" * 64,
                     expected_source_count=2,
                 )
+
+    def test_latest_checkpoint_ignores_symlinks_and_directories(self) -> None:
+        identity = {"sources": ["a", "b"]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid-pre-derivation-candidate-selection.json"
+            self._write_checkpoint(valid, identity)
+            dangling = root / "dangling-pre-derivation-candidate-selection.json"
+            dangling.symlink_to(root / "missing.json")
+            linked = root / "linked-pre-derivation-candidate-selection.json"
+            linked.symlink_to(valid)
+            (root / "directory-pre-derivation-candidate-selection.json").mkdir()
+
+            loaded = find_latest_matching_visual_candidate_checkpoint(
+                root,
+                expected_input_identity_sha256=canonical_json_sha256(identity),
+                expected_source_count=2,
+            )
+
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.path, valid.resolve())
+
+    def test_latest_checkpoint_orders_by_mtime_and_preserves_ties(self) -> None:
+        identity = {"sources": ["a", "b"]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first-pre-derivation-candidate-selection.json"
+            second = root / "second-pre-derivation-candidate-selection.json"
+            self._write_checkpoint(first, identity)
+            self._write_checkpoint(second, identity)
+            for second_mtime, expected in (
+                (2_000_000_000, second),
+                (1_000_000_000, first),
+            ):
+                with self.subTest(second_mtime=second_mtime):
+                    os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+                    os.utime(second, ns=(second_mtime, second_mtime))
+                    with patch.object(Path, "glob", return_value=iter((first, second))):
+                        loaded = find_latest_matching_visual_candidate_checkpoint(
+                            root,
+                            expected_input_identity_sha256=canonical_json_sha256(identity),
+                            expected_source_count=2,
+                        )
+
+                    self.assertIsNotNone(loaded)
+                    assert loaded is not None
+                    self.assertEqual(loaded.path, expected.resolve())
+
+    def test_latest_checkpoint_continues_when_listed_file_disappears(self) -> None:
+        identity = {"sources": ["a", "b"]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid-pre-derivation-candidate-selection.json"
+            missing = root / "missing-pre-derivation-candidate-selection.json"
+            self._write_checkpoint(valid, identity)
+            self._write_checkpoint(missing, identity)
+
+            def listed_paths():
+                missing.unlink()
+                yield missing
+                yield valid
+
+            with patch.object(Path, "glob", return_value=listed_paths()):
+                loaded = find_latest_matching_visual_candidate_checkpoint(
+                    root,
+                    expected_input_identity_sha256=canonical_json_sha256(identity),
+                    expected_source_count=2,
+                )
+
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.path, valid.resolve())
+
+    def test_latest_checkpoint_keeps_entries_before_enumeration_error(self) -> None:
+        identity = {"sources": ["a", "b"]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid-pre-derivation-candidate-selection.json"
+            self._write_checkpoint(valid, identity)
+
+            def listed_paths():
+                yield valid
+                raise OSError("directory became unavailable")
+
+            with patch.object(Path, "glob", return_value=listed_paths()):
+                loaded = find_latest_matching_visual_candidate_checkpoint(
+                    root,
+                    expected_input_identity_sha256=canonical_json_sha256(identity),
+                    expected_source_count=2,
+                )
+
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.path, valid.resolve())
+
+    def test_latest_checkpoint_unavailable_directory_returns_none(self) -> None:
+        identity = {"sources": ["a", "b"]}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(Path, "is_dir", side_effect=OSError("unavailable")):
+                loaded = find_latest_matching_visual_candidate_checkpoint(
+                    Path(directory),
+                    expected_input_identity_sha256=canonical_json_sha256(identity),
+                    expected_source_count=2,
+                )
+        self.assertIsNone(loaded)
+
+    def test_latest_checkpoint_falls_back_from_partial_json_or_invalid_utf8(
+        self,
+    ) -> None:
+        identity = {"sources": ["a", "b"]}
+        for contents in (b'{"checkpoint_contract":', b"\xff\xfe"):
+            with self.subTest(contents=contents):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    valid = root / "valid-pre-derivation-candidate-selection.json"
+                    self._write_checkpoint(valid, identity)
+                    os.utime(valid, ns=(1_000_000_000, 1_000_000_000))
+                    partial = root / "partial-pre-derivation-candidate-selection.json"
+                    partial.write_bytes(contents)
+
+                    loaded = find_latest_matching_visual_candidate_checkpoint(
+                        root,
+                        expected_input_identity_sha256=canonical_json_sha256(identity),
+                        expected_source_count=2,
+                    )
+
+                    self.assertIsNotNone(loaded)
+                    assert loaded is not None
+                    self.assertEqual(loaded.path, valid.resolve())
+
+    def test_incomplete_candidate_pool_or_initial_selection_fails_closed(
+        self,
+    ) -> None:
+        identity = {"sources": ["a", "b"]}
+        for missing_plan in (True, False):
+            with self.subTest(missing_plan=missing_plan):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "checkpoint.json"
+                    self._write_checkpoint(path, identity)
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    plans = payload["materialized_candidate_plans"]
+                    if missing_plan:
+                        plans.pop()
+                        error = "needs 8 to 32 plans"
+                    else:
+                        plans[0]["selected_for_initial_stream"] = False
+                        error = "exactly eight initial candidates"
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+
+                    with self.assertRaisesRegex(ValueError, error):
+                        load_visual_candidate_checkpoint(
+                            path,
+                            expected_input_identity_sha256=canonical_json_sha256(identity),
+                            expected_source_count=2,
+                        )
 
     def test_exact_directional_code_fingerprint_migration_reuses_plan(self) -> None:
         legacy_selector = "1" * 64
