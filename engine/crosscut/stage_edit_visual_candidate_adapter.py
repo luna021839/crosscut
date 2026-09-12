@@ -24,6 +24,10 @@ from .render import (
     TransitionKind,
 )
 from .stage_edit import StageBoundary, StageEdit, StageShot
+from .stage_edit_release_policy import (
+    STAGE_EDIT_SINGLE_DELIVERY_VISUAL_CONTRACT,
+    stage_edit_release_policy_payload,
+)
 from .stage_edit_pipeline_bridge import (
     STAGE_EDIT_PIPELINE_BRIDGE_CONTRACT,
     RetainedStageEditCandidate,
@@ -160,6 +164,12 @@ class StageEditMaterializedVisualCandidate:
     base_materialized: MaterializedVisualTimelineCandidate
     visual_plan: VisualTimelinePlan
     retained_candidate: RetainedStageEditCandidate
+    quality_gated_single_delivery: bool = False
+
+    @property
+    def adapter_contract(self) -> str:
+        return (STAGE_EDIT_SINGLE_DELIVERY_VISUAL_CONTRACT
+                if self.quality_gated_single_delivery else STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT)
 
     @property
     def candidate_index(self) -> int:
@@ -203,7 +213,7 @@ class StageEditMaterializedVisualCandidate:
             dict(item) for item in self.retained_candidate.edit.candidate_history
         ) + (
             {
-                "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
+                "adapter": self.adapter_contract,
                 "candidate_index": self.candidate_index,
                 "stage_edit_candidate_rank": self.retained_candidate.rank,
                 "candidate_origin": self.candidate_origin,
@@ -241,9 +251,16 @@ class StageEditVisualCandidateBatch:
     candidates: tuple[StageEditMaterializedVisualCandidate, ...]
     learned_candidate_rejections: tuple[Mapping[str, Any], ...] = ()
     contract: str = STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT
+    quality_gated_single_delivery: bool = False
 
     def __post_init__(self) -> None:
-        if len(self.candidates) != STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
+        if type(self.quality_gated_single_delivery) is not bool:
+            raise TypeError("StageEdit delivery policy must be explicit boolean")
+        if self.quality_gated_single_delivery:
+            if not 1 <= len(self.candidates) <= STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
+                raise ValueError("StageEdit delivery batch requires 1...8 candidates")
+            object.__setattr__(self, "contract", STAGE_EDIT_SINGLE_DELIVERY_VISUAL_CONTRACT)
+        elif len(self.candidates) != STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
             raise ValueError("StageEdit visual batch must contain exactly 8 candidates")
         if any(
             not isinstance(item, StageEditMaterializedVisualCandidate)
@@ -252,6 +269,9 @@ class StageEditVisualCandidateBatch:
             raise TypeError(
                 "StageEdit visual batch requires typed materialized candidates"
             )
+        if any(item.quality_gated_single_delivery is not self.quality_gated_single_delivery
+               for item in self.candidates):
+            raise ValueError("StageEdit candidate lineage delivery policy differs from batch")
         if any(
             not isinstance(item.candidate_record, StageEditVisualCandidateRecord)
             for item in self.candidates
@@ -272,7 +292,7 @@ class StageEditVisualCandidateBatch:
             raise TypeError(
                 "StageEdit visual batch candidate lineage is not typed and bound"
             )
-        if tuple(item.candidate_index for item in self.candidates) != tuple(range(8)):
+        if tuple(item.candidate_index for item in self.candidates) != tuple(range(len(self.candidates))):
             raise ValueError("StageEdit visual candidate indices must be contiguous")
         if any(not item.candidate_record.review.passed for item in self.candidates):
             raise ValueError("StageEdit visual batch cannot retain failed candidates")
@@ -287,6 +307,8 @@ class StageEditVisualCandidateBatch:
             raise ValueError(
                 "StageEdit visual batch can retain only one hybrid visual floor"
             )
+        if self.quality_gated_single_delivery and hybrid_count == len(self.candidates):
+            raise ValueError("StageEdit delivery cannot substitute a floor for all learned paths")
         if hybrid_count and versions != {3}:
             raise ValueError(
                 "hybrid visual floor requires Dynamic Crop v3"
@@ -298,6 +320,10 @@ class StageEditVisualCandidateBatch:
             raise TypeError(
                 "learned candidate rejections must be scalar audit mappings"
             )
+
+    @property
+    def minimum_passing_candidate_count(self) -> int:
+        return 1 if self.quality_gated_single_delivery else STAGE_EDIT_VISUAL_CANDIDATE_COUNT
 
     @property
     def hybrid_visual_floor_candidate_count(self) -> int:
@@ -335,7 +361,9 @@ class StageEditVisualCandidateBatch:
             "learned_candidate_rejections": [
                 dict(item) for item in self.learned_candidate_rejections
             ],
-            "required_candidate_count": STAGE_EDIT_VISUAL_CANDIDATE_COUNT,
+            "required_candidate_count": self.minimum_passing_candidate_count,
+            "release_policy": (stage_edit_release_policy_payload()
+                               if self.quality_gated_single_delivery else None),
             "candidate_count": len(self.candidates),
             "dynamic_crop_version": self.candidates[0].dynamic_crop_version,
             "all_prescribed_paths_passed_visual_hard_gates": all(
@@ -799,8 +827,9 @@ def materialize_stage_edit_visual_candidates(
     feature_derived_cache_directory: Path | None = None,
     require_persistent_feature_cache: bool = False,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
+    quality_gated_single_delivery: bool = False,
 ) -> StageEditVisualCandidateBatch:
-    """Hard-gate exactly eight StageEdit-typed rendered-proxy candidates.
+    """Hard-gate retained StageEdit paths before any rendered-proxy selection.
 
     The legacy path retains eight learned semi-Markov candidates.  Production
     Dynamic Crop v3 may instead predeclare one already reviewed visual quality
@@ -808,8 +837,14 @@ def materialize_stage_edit_visual_candidates(
     paths are retained, and the floor is converted to an exact-PTS StageEdit
     with source-local v3 crop decodes.  It is never a post-failure fallback or
     a raw baseline candidate selected outside StageEdit proxy/montage QA.
+
+    With explicit single-delivery policy, retain up to eight passing paths;
+    at least one learned path must pass even when a hybrid floor was declared.
+    Per-path failures remain audited and runtime/storage errors still propagate.
     """
 
+    if type(quality_gated_single_delivery) is not bool:
+        raise TypeError("StageEdit delivery policy must be explicit boolean")
     if not isinstance(bridge_result, StageEditPipelineBridgeResult):
         raise TypeError("bridge_result must be a StageEditPipelineBridgeResult")
     expected_dynamic_crop_version = getattr(
@@ -837,7 +872,9 @@ def materialize_stage_edit_visual_candidates(
             "StageEdit visual materialization Section Director version differs"
         )
     retained = bridge_result.retained_candidates
-    if len(retained) != STAGE_EDIT_VISUAL_CANDIDATE_COUNT:
+    if not (1 <= len(retained) <= STAGE_EDIT_VISUAL_CANDIDATE_COUNT
+            if quality_gated_single_delivery
+            else len(retained) == STAGE_EDIT_VISUAL_CANDIDATE_COUNT):
         raise StageEditVisualCandidateError(
             "StageEdit rendered-proxy promotion requires exactly 8 retained "
             f"candidates; got {len(retained)}"
@@ -916,11 +953,14 @@ def materialize_stage_edit_visual_candidates(
                     }
                 )
                 continue
-            learned_materialized.append(value)
-        required_learned_count = STAGE_EDIT_VISUAL_CANDIDATE_COUNT - 1
+            learned_materialized.append(replace(value,
+                quality_gated_single_delivery=quality_gated_single_delivery))
+        required_learned_count = (
+            1 if quality_gated_single_delivery else STAGE_EDIT_VISUAL_CANDIDATE_COUNT - 1
+        )
         if len(learned_materialized) < required_learned_count:
             raise StageEditVisualCandidateError(
-                "hybrid StageEdit batch requires seven learned paths to pass "
+                f"hybrid StageEdit batch requires {required_learned_count} learned paths to pass "
                 "the visual hard gates; "
                 f"passed={len(learned_materialized)}, "
                 f"rejected={len(learned_rejections)}"
@@ -931,7 +971,7 @@ def materialize_stage_edit_visual_candidates(
                 candidate_index=index,
             )
             for index, value in enumerate(
-                learned_materialized[:required_learned_count]
+                learned_materialized[:STAGE_EDIT_VISUAL_CANDIDATE_COUNT - 1]
             )
         )
         hybrid_rank = max(candidate.rank for candidate in retained) + 1
@@ -943,19 +983,23 @@ def materialize_stage_edit_visual_candidates(
         hybrid_materialized = _wrap_hybrid_visual_floor_candidate(
             hybrid_visual_floor_candidate,
             hybrid_retained,
-            candidate_index=required_learned_count,
+            candidate_index=len(selected_learned),
         )
+        hybrid_materialized = replace(hybrid_materialized,
+            quality_gated_single_delivery=quality_gated_single_delivery)
         if progress_callback is not None:
             progress_callback(analysis_total, analysis_total, 1, 1)
         return StageEditVisualCandidateBatch(
             selected_learned + (hybrid_materialized,),
             learned_candidate_rejections=tuple(learned_rejections),
+            quality_gated_single_delivery=quality_gated_single_delivery,
         )
 
     materialized: list[StageEditMaterializedVisualCandidate] = []
+    rejected: list[dict[str, Any]] = []
     for position, candidate in enumerate(retained):
-        materialized.append(
-            materialize_stage_edit_visual_candidate(
+        try:
+            value = materialize_stage_edit_visual_candidate(
                 candidate,
                 candidate_index=position,
                 review_rank=position,
@@ -984,8 +1028,21 @@ def materialize_stage_edit_visual_candidates(
                     else None
                 ),
             )
-        )
-    return StageEditVisualCandidateBatch(tuple(materialized))
+        except StageEditVisualCandidateError as exc:
+            if not quality_gated_single_delivery:
+                raise
+            rejected.append({"stage_edit_candidate_rank": candidate.rank,
+                             "candidate_origin": candidate.candidate_origin,
+                             "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        materialized.append(_reindex_stage_edit_materialized_candidate(
+            replace(value, quality_gated_single_delivery=quality_gated_single_delivery),
+            candidate_index=len(materialized)))
+    if not materialized:
+        raise StageEditVisualCandidateError("No learned path passed visual hard gates")
+    return StageEditVisualCandidateBatch(tuple(materialized),
+        learned_candidate_rejections=tuple(rejected),
+        quality_gated_single_delivery=quality_gated_single_delivery)
 
 
 def materialize_stage_edit_visual_candidate(

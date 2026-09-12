@@ -1798,9 +1798,12 @@ def run_stage_edit_pipeline_bridge(
     fps: float = 29.97,
     schema: StageEditTokenSchema = DEFAULT_STAGE_EDIT_SCHEMA,
     config: StageEditSemiMarkovConfig = StageEditSemiMarkovConfig(),
+    quality_gated_single_delivery: bool = False,
 ) -> StageEditPipelineBridgeResult:
     """Materialize, decode, and retain learned candidates without selecting them."""
 
+    if type(quality_gated_single_delivery) is not bool:
+        raise TypeError("StageEdit delivery policy must be explicit boolean")
     preflight.revalidate_snapshot_identity(schema=schema)
     preflight._validate_learned_scorer_identity()
     preflight._validate_contextual_scorer_identity(reload_artifacts=True)
@@ -2008,27 +2011,46 @@ def run_stage_edit_pipeline_bridge(
             preflight.contextual_source_pair_scorer_v2
         ),
     )
-    if not decoded.audit.request_fulfilled:
+    if (decoded.audit.requested_timeline_count != config.timeline_count
+            or decoded.audit.returned_timeline_count != len(decoded.timelines)
+            or decoded.audit.request_fulfilled is not (len(decoded.timelines) == config.timeline_count)):
+        raise StageEditPipelineBridgeError("StageEdit decoder comparison-count audit disagrees")
+    # The decoder's audit continues to report whether its comparison target
+    # was met. A partial, nonempty search can still proceed to per-edit QA;
+    # never manufacture paths or report that the eight-path request succeeded.
+    if not decoded.audit.request_fulfilled and not (
+        quality_gated_single_delivery
+        and 1 <= len(decoded.timelines) <= config.timeline_count
+    ):
         raise StageEditPipelineBridgeError(
             "requested StageEdit candidate count was not satisfied; visual baseline "
             "was not used as a silent learned-inference fallback"
         )
-    retained = tuple(
-        _exact_clock_candidate(
-            timeline=timeline,
-            sources=normalized_sources,
-            source_offsets=offsets,
-            source_durations=durations,
-            internal_cuts=cuts,
-            timewarps=timewarps,
-            section_plan=learned_section_plan,
-            config=config,
-            dynamic_crop_version=preflight.dynamic_crop_version,
-            continuity_authority=preflight.continuity_authority,
-        )
-        for timeline in decoded.timelines
-    )
-    if len(retained) != config.timeline_count:
+    retained_values = []
+    exact_clock_rejections = []
+    for timeline in decoded.timelines:
+        try:
+            value = _exact_clock_candidate(
+                timeline=timeline,
+                sources=normalized_sources,
+                source_offsets=offsets,
+                source_durations=durations,
+                internal_cuts=cuts,
+                timewarps=timewarps,
+                section_plan=learned_section_plan,
+                config=config,
+                dynamic_crop_version=preflight.dynamic_crop_version,
+                continuity_authority=preflight.continuity_authority,
+            )
+        except StageEditPipelineBridgeError as exc:
+            if not quality_gated_single_delivery:
+                raise
+            exact_clock_rejections.append({"candidate_rank": timeline.rank,
+                                           "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        retained_values.append(value)
+    retained = tuple(retained_values)
+    if not retained or (not quality_gated_single_delivery and len(retained) != config.timeline_count):
         raise StageEditPipelineBridgeError(
             "exact StageEdit clock validation did not retain every requested candidate"
         )
@@ -2040,6 +2062,9 @@ def run_stage_edit_pipeline_bridge(
         source_derivative_diversity=source_derivative_metadata,
         learned_section_director=learned_section_director,
         selection_policy={
+            "quality_gated_single_delivery": quality_gated_single_delivery,
+            "comparison_target_satisfied": decoded.audit.request_fulfilled,
+            "exact_clock_candidate_rejections": exact_clock_rejections,
             "selected_for_render": False,
             "visual_baseline_replaced": False,
             "retention": "parallel_unrendered_stage_edit_candidates",

@@ -150,6 +150,9 @@ from .joint_release_policy import (
     JOINT_COMPARISON_CANDIDATE_BUDGET,
     joint_release_policy_payload,
 )
+from .stage_edit_release_policy import (
+    stage_edit_release_policy_payload, select_stage_edit_delivery_cohort,
+)
 from .post_render_qa import (
     INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
     PostRenderArtifactSet,
@@ -20357,7 +20360,7 @@ def _apply_stage_edit_candidate_render_contract(
         _strip_superseded_exact_stage_edit_shot_clocks(materialized.lineage)
     )
     overlay_event = {
-        "adapter": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
+        "adapter": materialized.adapter_contract,
         "stage": f"dynamic_crop_v{dynamic_crop_version}_render_plan_overlay",
         "dynamic_crop_version": dynamic_crop_version,
         "dynamic_crop_render_contract": (
@@ -27762,6 +27765,7 @@ def analyze(
                 height=generation_height,
                 fps=29.97,
                 config=stage_edit_semimarkov_config,
+                quality_gated_single_delivery=True,
             )
             stage_edit_generation_audit_path = (
                 request.output_directory
@@ -27907,6 +27911,7 @@ def analyze(
                                 hybrid_visual_floor_candidate=(
                                     hybrid_floor_values[0]
                                 ),
+                                quality_gated_single_delivery=True,
                                 **_visual_feature_cache_arguments(request),
                                 progress_callback=(
                                     lambda candidate_position,
@@ -27978,8 +27983,8 @@ def analyze(
                         stage_edit_visual_candidate_batch.candidates
                     )
                     reporter.log(
-                        "StageEdit 학습 후보 7개 + Dynamic Crop v3를 결합한 "
-                        "일반 시각 품질 하한선 1개가 동일 하드 게이트 통과 · "
+                        f"StageEdit 학습 후보 {len(stage_edit_visual_candidate_batch.candidates) - stage_edit_visual_candidate_batch.hybrid_visual_floor_candidate_count}개 + "
+                        "Dynamic Crop v3 시각 품질 하한선 1개가 동일 하드 게이트 통과 · "
                         "실패 뒤 원시 베이스라인으로 교체하지 않음"
                     )
                 else:
@@ -28679,11 +28684,14 @@ def analyze(
                     materialized_group_candidates
                 )
                 derived: list[_GroupRenderCandidateBundle] = []
+                stage_edit_delivery_comparison: dict[str, Any] | None = None
+                required_delivery_count = (
+                    _JOINT_REQUIRED_DECODED_PASS_COUNT if joint_visual_selection_active
+                    else stage_edit_visual_candidate_batch.minimum_passing_candidate_count
+                    if stage_edit_visual_candidate_batch is not None else 8
+                )
                 candidate_stream_reducer = CandidateStreamReducer(
-                    required_passing_count=(
-                        _JOINT_REQUIRED_DECODED_PASS_COUNT
-                        if joint_visual_selection_active else 8
-                    )
+                    required_passing_count=required_delivery_count
                 )
                 attempted_candidate_indices: set[int] = set()
                 attempted_materialized_candidates: list[Any] = []
@@ -29367,6 +29375,14 @@ def analyze(
                     if not decoded_cohort_lengths_align or not (
                         decoded_verdict_count_aligns
                         or joint_final_cohort_trimmed
+                        or (
+                            stage_edit_delivery_comparison is not None
+                            and len(derived) == 1
+                            and stage_edit_delivery_comparison["comparison_candidate_count"]
+                            == candidate_stream_reducer.decoded_review_passed_count
+                            and derived[0].candidate_index
+                            == stage_edit_delivery_comparison["selected_candidate_index"]
+                        )
                     ):
                         raise RuntimeError(
                             "decoded passing cohort diverged from its bundles "
@@ -29476,8 +29492,7 @@ def analyze(
                             "production_use_forbidden": True,
                             "final_media_authority": False,
                             "requested_successful_decoded_review_count": (
-                                _JOINT_REQUIRED_DECODED_PASS_COUNT
-                                if joint_visual_selection_active else 8
+                                required_delivery_count
                             ),
                             "attempted_candidate_indices": sorted(
                                 attempted_candidate_indices
@@ -32179,6 +32194,7 @@ def analyze(
                             break
                         if (
                             not joint_visual_selection_active
+                            and stage_edit_visual_candidate_batch is None
                             and candidate_stream_reducer
                             .required_passing_cohort_complete
                         ):
@@ -32546,12 +32562,20 @@ def analyze(
                     streamed_group_candidate_reviews[:] = [
                         review for _bundle, review in joint_final_cohort
                     ]
+                elif (stage_edit_visual_candidate_batch is not None
+                      and stage_edit_visual_candidate_batch.quality_gated_single_delivery
+                      and derived):
+                    cohort, stage_edit_delivery_comparison = select_stage_edit_delivery_cohort(
+                        derived, streamed_group_candidate_reviews,
+                        professional_reference_profile=professional_reference_profile,
+                        professional_reference_cadence_profile=professional_reference_cadence_profile,
+                        learned_reviewer_session=learned_reviewer_session,
+                    )
+                    complete_group_candidates = tuple(bundle for bundle, _ in cohort)
+                    derived[:] = list(complete_group_candidates)
+                    streamed_group_candidate_reviews[:] = [review for _, review in cohort]
                 else:
                     complete_group_candidates = tuple(derived)
-                required_delivery_count = (
-                    _JOINT_REQUIRED_DECODED_PASS_COUNT
-                    if joint_visual_selection_active else 8
-                )
                 if len(complete_group_candidates) != required_delivery_count or (
                     joint_visual_selection_active and not joint_final_cohort
                 ):
@@ -32563,10 +32587,10 @@ def analyze(
                             )
                     elif constraint_reoptimization_terminal_proof is None:
                         set_nonstructural_constraint_exhaustion(
-                            cause="candidate_stream_exhausted_before_exact_eight"
+                            cause="candidate_stream_exhausted_before_required_delivery"
                         )
                     persist_candidate_stream_progress(
-                        status="candidate_stream_exhausted_before_exact_eight"
+                        status="candidate_stream_exhausted_before_required_delivery"
                     )
                     complete_candidate_count = len(
                         complete_group_candidates
@@ -32650,7 +32674,7 @@ def analyze(
                         "blocking_reason": (
                             constraint_reoptimization_termination_reason
                             or (
-                                "automatic_group_requires_exactly_eight_"
+                                "automatic_group_requires_quality_passing_"
                                 "successful_immediate_decoded_candidate_"
                                 "reviews"
                             )
@@ -32729,13 +32753,13 @@ def analyze(
                         rendered_candidate_selection_payload,
                     )
                     raise RuntimeError(
-                        "automatic GROUP full render requires exactly 8 "
+                        f"automatic GROUP full render requires {required_delivery_count} "
                         "successfully decoded candidates; got "
                         f"{complete_candidate_count}; report: "
                         f"{rendered_candidate_selection_path}"
                     )
                 persist_candidate_stream_progress(
-                    status="candidate_stream_exact_eight_complete"
+                    status="candidate_stream_required_delivery_complete"
                 )
                 reporter.log(
                     "시각 후보 "
@@ -32999,11 +33023,15 @@ def analyze(
                 streamed_group_candidate_reviews,
                 requested_review_count=(
                     _JOINT_REQUIRED_DECODED_PASS_COUNT
-                    if joint_visual_selection_active else 8
+                    if joint_visual_selection_active
+                    else stage_edit_visual_candidate_batch.minimum_passing_candidate_count
+                    if stage_edit_visual_candidate_batch is not None else 8
                 ),
                 minimum_required_candidate_count=(
                     _JOINT_REQUIRED_DECODED_PASS_COUNT
-                    if joint_visual_selection_active else 8
+                    if joint_visual_selection_active
+                    else stage_edit_visual_candidate_batch.minimum_passing_candidate_count
+                    if stage_edit_visual_candidate_batch is not None else 8
                 ),
                 professional_reference_profile=(
                     professional_reference_profile
@@ -33017,6 +33045,11 @@ def analyze(
             if joint_visual_selection_active:
                 rendered_candidate_selection_payload["release_policy"] = (
                     joint_release_policy_payload()
+                )
+            elif (stage_edit_visual_candidate_batch is not None
+                  and stage_edit_visual_candidate_batch.quality_gated_single_delivery):
+                rendered_candidate_selection_payload["release_policy"] = (
+                    stage_edit_release_policy_payload()
                 )
             rendered_candidate_selection_payload.update(
                 {
@@ -33101,6 +33134,7 @@ def analyze(
                     "candidate_stream_verdicts": (
                         candidate_stream_reducer.to_dict()
                     ),
+                    "stage_edit_delivery_comparison": stage_edit_delivery_comparison,
                     "constraint_reoptimization": (
                         constraint_reoptimization_payload()
                     ),
@@ -33555,10 +33589,10 @@ def analyze(
                             "selected_version": partial_reedit.audit_payload[
                                 "selected_version"
                             ],
-                            "exact_eight_complete_candidates_satisfied": bool(
+                            "required_complete_candidates_satisfied": bool(
                                 exact_complete_candidates_satisfied
                             ),
-                            "exact_eight_decoded_proxy_reviews_satisfied": bool(
+                            "required_decoded_proxy_reviews_satisfied": bool(
                                 exact_decoded_reviews_satisfied
                             ),
                             "decoded_selected_proxy_passed": final_proxy_passed,
@@ -33581,7 +33615,7 @@ def analyze(
                 rendered_candidate_selection_payload[
                     "stage_edit_render_promotion"
                 ] = {
-                    "contract": STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT,
+                    "contract": stage_edit_visual_candidate_batch.contract,
                     "activation": (
                         "automatic_registered_production_bundle"
                         if registered_stage_edit_bundle is not None
@@ -33596,8 +33630,8 @@ def analyze(
                     "hybrid_visual_floor_candidate_count": (
                         stage_edit_visual_candidate_batch.hybrid_visual_floor_candidate_count
                     ),
-                    "exact_eight_complete_candidates_required": True,
-                    "exact_eight_decoded_proxy_reviews_required": True,
+                    "required_complete_candidate_count": stage_edit_visual_candidate_batch.minimum_passing_candidate_count,
+                    "required_decoded_proxy_review_count": stage_edit_visual_candidate_batch.minimum_passing_candidate_count,
                     "deterministic_hard_gates_remain_authority": True,
                     "learned_reviewer_configured": (
                         learned_reviewer_session is not None
@@ -33919,7 +33953,10 @@ def analyze(
         render_payload = {
             "release_policy": (
                 joint_release_policy_payload()
-                if joint_visual_selection_active else None
+                if joint_visual_selection_active
+                else stage_edit_release_policy_payload()
+                if stage_edit_visual_candidate_batch is not None
+                and stage_edit_visual_candidate_batch.quality_gated_single_delivery else None
             ),
             "video_path": str(rendered_video_path),
             "plan_path": str(render_plan_path),
@@ -33947,7 +33984,7 @@ def analyze(
                 )
             ),
             "stage_edit_promotion_contract": (
-                STAGE_EDIT_VISUAL_CANDIDATE_CONTRACT
+                stage_edit_visual_candidate_batch.contract
                 if stage_edit_visual_candidate_batch is not None
                 else None
             ),

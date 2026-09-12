@@ -52,6 +52,9 @@ from .joint_release_policy import (
     JOINT_RELEASE_CANDIDATE_COUNT,
     joint_release_policy_payload,
 )
+from .stage_edit_release_policy import (
+    stage_edit_release_binding_valid, stage_edit_release_policy_payload,
+)
 from .render import (
     BoundaryLookKeyframe,
     BoundaryLookTrack,
@@ -7441,12 +7444,15 @@ def evaluate_post_render_qa(
                 settings,
                 required_complete_candidate_count=JOINT_RELEASE_CANDIDATE_COUNT,
             )
+        elif stage_edit_release_binding_valid(selection, render_payload):
+            settings = replace(settings, required_complete_candidate_count=1)
         else:
             collector.add(
                 "candidate_release_policy_mismatch", QAIssueSeverity.FAIL,
                 "Candidate release policy is invalid or differs across artifacts.",
                 path="selection.release_policy", value=release_policy,
-                threshold=joint_release_policy_payload(),
+                threshold={"joint": joint_release_policy_payload(),
+                           "stage_edit": stage_edit_release_policy_payload()},
             )
 
     metrics["artifact_binding"] = _validate_artifact_binding(
