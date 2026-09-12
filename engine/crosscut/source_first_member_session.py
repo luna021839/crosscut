@@ -5,6 +5,23 @@ from .source_first_model_assets import ensure_source_first_model_assets
 from .direct_member_visual import _VideoDescriptorProvider
 
 
+def _decoder_locality_diagnostics(focal):
+    """Report the actual reader state, not an inferred code-version promise."""
+    def describe(index, reader, sampler=None):
+        if reader is None:
+            return dict(source_index=index, initialized=False)
+        return dict(source_index=index, initialized=True, enabled=reader.enabled,
+                    seek_count=reader.seek_count, read_count=reader.read_count,
+                    pixel_cache_hit_count=reader.pixel_cache_hit_count,
+                    fallback_count=reader.fallback_count,
+                    legacy_direct_read_count=getattr(sampler, 'dense_sequential_frame_decode_count', 0))
+    return dict(
+        working=[describe(i, getattr(sampler, '_seek_locality', None), sampler)
+                 for i, sampler in enumerate(focal.faces._samplers)],
+        native=[describe(i, reader) for i, reader in sorted(focal.native_faces._readers.items())],
+    )
+
+
 def open_source_first_member_session(sources, *, feature_cache_directory=None,
         feature_derived_cache_directory=None, require_persistent_feature_cache=False,
         progress_callback=None, body_execution_device='auto'):
@@ -28,6 +45,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
                 progress_callback(dict(elapsed_seconds=round(now-started,3),queries=queries,
                     body_frame_inference_count=focal.bodies.frame_inference_count,
                     native_face_inference_count=focal.native_faces.inference_frame_count,
+                    decoder_locality=_decoder_locality_diagnostics(focal),
                     persistent=focal._persistent.diagnostics() if focal._persistent else None))
                 last=now
             return result
