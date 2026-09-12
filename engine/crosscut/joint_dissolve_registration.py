@@ -177,7 +177,7 @@ approval. Existing cameras are preserved by rejecting conflicting ownership.
 def review_joint_dissolve_containment(*, segments, transitions, source_geometries,
         geometry_provider, fps, minimum_face_visible=.98, minimum_body_visible=.72,
         pixel_containment_provider=None, legacy_face_only_maximum_zoom=1.12,
-        legacy_face_only_maximum_center_shift=.025):
+        legacy_face_only_maximum_center_shift=.025, frame_counts=None):
     """Review every transformed output frame on its actual render source clock.
 
 The provider accepts (request source index, source-local seconds), NOT master
@@ -192,7 +192,9 @@ This is containment evidence, not a final artistic/pixel quality judgement.
     from .render import quantized_segment_frame_counts
     from .focal_pixel_containment_support import FocalPixelContainmentSupport
     segments=tuple(segments);transitions=tuple(transitions)
-    counts=quantized_segment_frame_counts(segments,fps)
+    counts=quantized_segment_frame_counts(segments,fps) if frame_counts is None else tuple(frame_counts)
+    if len(counts)!=len(segments) or any(isinstance(n,bool) or not isinstance(n,int) or n<2 for n in counts):
+        raise ValueError('containment needs exact full-plan frame counts')
     rows=[];failures=[]
     for index,segment in enumerate(segments):
         schedules=[]

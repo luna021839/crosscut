@@ -882,6 +882,33 @@ def _integer(value: Any) -> int | None:
     return value
 
 
+def _boundary_editorial_track_from_serialized(
+    value: object, *, label: str,
+) -> EditorialTransformTrack | None:
+    if value is None:
+        return None
+    payload = _mapping(value)
+    if payload is None:
+        raise ValueError(f"{label} is malformed")
+    raw_keyframes = _sequence(payload.get("keyframes"))
+    reason = payload.get("reason")
+    if not raw_keyframes or not isinstance(reason, str) or not reason:
+        raise ValueError(f"{label} is incomplete")
+    keyframes = []
+    for raw in raw_keyframes:
+        item = _mapping(raw)
+        if item is None:
+            raise ValueError(f"{label} keyframe is malformed")
+        values = {
+            key: _number(item.get(key))
+            for key in ("time_seconds", "zoom", "center_x", "center_y", "roll_degrees")
+        }
+        if any(value is None for value in values.values()):
+            raise ValueError(f"{label} keyframe is incomplete")
+        keyframes.append(EditorialTransformKeyframe(**values))
+    return EditorialTransformTrack(tuple(keyframes), reason=reason)
+
+
 def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
     """Rebuild the typed boundary authority from the persisted final plan.
 
@@ -934,55 +961,14 @@ def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
                 f"render plan segment {index} source_duration is malformed"
             )
 
-        transform: EditorialTransformTrack | None = None
-        raw_transform = segment.get("editorial_transform")
-        if raw_transform is not None:
-            transform_payload = _mapping(raw_transform)
-            if transform_payload is None:
-                raise ValueError(
-                    f"render plan segment {index} editorial transform is malformed"
-                )
-            raw_keyframes = _sequence(transform_payload.get("keyframes"))
-            reason = transform_payload.get("reason")
-            if not raw_keyframes or not isinstance(reason, str) or not reason:
-                raise ValueError(
-                    f"render plan segment {index} editorial transform is incomplete"
-                )
-            keyframes: list[EditorialTransformKeyframe] = []
-            for keyframe_index, raw_keyframe in enumerate(raw_keyframes):
-                keyframe = _mapping(raw_keyframe)
-                if keyframe is None:
-                    raise ValueError(
-                        "render plan editorial transform keyframe is malformed"
-                    )
-                values = {
-                    key: _number(keyframe.get(key))
-                    for key in (
-                        "time_seconds",
-                        "zoom",
-                        "center_x",
-                        "center_y",
-                        "roll_degrees",
-                    )
-                }
-                if any(item is None for item in values.values()):
-                    raise ValueError(
-                        "render plan segment "
-                        f"{index} transform keyframe {keyframe_index} is incomplete"
-                    )
-                keyframes.append(
-                    EditorialTransformKeyframe(
-                        time_seconds=float(values["time_seconds"]),
-                        zoom=float(values["zoom"]),
-                        center_x=float(values["center_x"]),
-                        center_y=float(values["center_y"]),
-                        roll_degrees=float(values["roll_degrees"]),
-                    )
-                )
-            transform = EditorialTransformTrack(
-                keyframes=tuple(keyframes),
-                reason=reason,
-            )
+        transform = _boundary_editorial_track_from_serialized(
+            segment.get("editorial_transform"),
+            label=f"render plan segment {index} editorial transform",
+        )
+        overlap_transform = _boundary_editorial_track_from_serialized(
+            segment.get("outgoing_overlap_transform"),
+            label=f"render plan segment {index} outgoing overlap transform",
+        )
 
         rebuilt = RenderSegment(
             source_index=source_index,
@@ -991,6 +977,7 @@ def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
             master_start=master_start,
             source_duration=source_duration,
             editorial_transform=transform,
+            outgoing_overlap_transform=overlap_transform,
         )
         redundant_numbers = {
             "source_local_start": rebuilt.source_start,
@@ -1045,6 +1032,17 @@ def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
                 raise ValueError(
                     f"render plan transition {index} {key} is malformed"
                 )
+        transform_overlap_authority = transition.get(
+            "transform_overlap_authority"
+        )
+        if transform_overlap_authority is not None and (
+            not isinstance(transform_overlap_authority, str)
+            or not transform_overlap_authority
+        ):
+            raise ValueError(
+                f"render plan transition {index} transform overlap authority "
+                "is malformed"
+            )
         rebuilt_transition = RenderTransition(
             kind=kind,
             frame_count=frame_count,
@@ -1060,6 +1058,7 @@ def _boundary_render_plan_from_serialized(value: object) -> RenderPlan:
             future_silhouette_max_mismatch=optional_numbers[
                 "future_silhouette_max_mismatch"
             ],
+            transform_overlap_authority=transform_overlap_authority,
         )
         serialized_duration = _number(transition.get("duration_seconds"))
         if serialized_duration is None or not math.isclose(

@@ -1102,6 +1102,11 @@ def demote_failed_direct_member_pose_dissolves_from_rendered_proxy(
         repaired = replace(
             plan,
             transitions=tuple(transitions),
+            segments=tuple(
+                replace(segment, outgoing_overlap_transform=None)
+                if index in demoted_indices else segment
+                for index, segment in enumerate(plan.segments)
+            ),
             member_pose_dissolve_effective=True,
             member_pose_dissolve_count=len(retained_indices),
         )
@@ -1795,6 +1800,20 @@ def refine_direct_member_camera_plan_from_rendered_proxy(
         transition = plan.transitions[boundary_index]
         outgoing_segment = plan.segments[boundary_index]
         incoming_segment = plan.segments[boundary_index + 1]
+        # A fixed endpoint repair would flatten the independently measured
+        # moving overlap, or disconnect its first frame from the nominal track.
+        # Keep these cameras for decoded QA; this helper does not re-solve them.
+        if (
+            outgoing_segment.outgoing_overlap_transform is not None
+            or incoming_segment.outgoing_overlap_transform is not None
+            or (
+                boundary_index > 0
+                and plan.segments[boundary_index - 1].outgoing_overlap_transform
+                is not None
+            )
+        ):
+            record_diagnostics["status"] = "joint_moving_camera_ownership_preserved"
+            continue
         is_hard_cut = bool(
             transition.kind is TransitionKind.HARD_CUT
             and raw_record.get("transition_kind") == "hard_cut"

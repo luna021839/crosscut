@@ -9868,6 +9868,9 @@ def _direct_member_dense_render_feedback_binding(
                     "direct_member_target_face.py"
                 ),
                 Path(__file__).with_name("direct_member_look.py"),
+                Path(__file__).with_name("automatic_joint_dissolve.py"),
+                Path(__file__).with_name("joint_dissolve_registration.py"),
+                Path(__file__).with_name("focal_pixel_containment_support.py"),
                 Path(__file__).with_name("rendered_proxy_review.py"),
                 Path(__file__).with_name("render.py"),
                 Path(__file__).with_name("source_first_focal_geometry.py"),
@@ -9928,7 +9931,7 @@ def _direct_member_dense_render_feedback_binding(
     binding_evidence = {
         "contract": _DIRECT_MEMBER_DENSE_RENDER_FEEDBACK_CONTRACT,
         "feedback_application_policy": (
-            "dense_partial_camera_boundary_pair_diagnostics_proxy_v8"
+            "dense_joint_overlap_camera_boundary_pair_diagnostics_proxy_v9"
         ),
         "acquisition_source_identity_sha256": source_identity_sha256,
         "timing_draft": timing_draft.to_dict(),
@@ -34921,6 +34924,9 @@ def analyze(
                     payload["proxy_render_index"] = proxy_render_index
                     payload["candidate_camera_diagnostics"] = {
                         "motion_plan": candidate_motion_plan.to_dict(),
+                        "joint_dissolve_registration": deepcopy(
+                            candidate_joint_dissolve_audit
+                        ),
                         "boundary_focal_reference_geometry": [
                             {
                                 "boundary_index": boundary_index,
@@ -34958,6 +34964,11 @@ def analyze(
                                     ]
                                     if segment.editorial_transform is not None
                                     else []
+                                ),
+                                "outgoing_overlap_transform": (
+                                    asdict(segment.outgoing_overlap_transform)
+                                    if segment.outgoing_overlap_transform is not None
+                                    else None
                                 ),
                             }
                             for segment_index, segment in enumerate(
@@ -35144,6 +35155,11 @@ def analyze(
                     )
                     return preflight, payload, report_path
 
+                from .automatic_joint_dissolve import (
+                    register_automatic_member_dissolves,
+                )
+
+                joint_dissolve_registration_cache: dict = {}
                 maximum_path_selection_attempt_count = (
                     _DIRECT_MEMBER_MAXIMUM_DENSE_RENDER_PATH_RESELECTIONS
                     + _DIRECT_MEMBER_MAXIMUM_DECODED_PROXY_PATH_AUDITIONS
@@ -35496,6 +35512,25 @@ def analyze(
                             motion_plan=candidate_member_motion_plan,
                         )
                     )
+                    (
+                        attached_segments,
+                        candidate_member_transitions,
+                        candidate_joint_dissolve_audit,
+                    ) = register_automatic_member_dissolves(
+                        render_segments=attached_segments,
+                        transitions=member_transitions,
+                        visual_selection=direct_visual_selection,
+                        eligible_request_source_indices=eligible_indices,
+                        common_master_start=member_common_start,
+                        focal_provider=dense_face_provider,
+                        config=candidate_member_motion_config,
+                        registration_cache=joint_dissolve_registration_cache,
+                    )
+                    reporter.log(
+                        "직캠 양쪽 디졸브 카메라 적용 "
+                        f"{candidate_joint_dissolve_audit['applied_count']}개 · "
+                        "최종 품질은 실제 출력 QA에서 판정"
+                    )
                     assert direct_full_frame_ratios is not None
                     candidate_segments = (
                         _attach_direct_member_portrait_fill_geometry(
@@ -35541,7 +35576,7 @@ def analyze(
                         master_audio_start=member_common_start,
                         width=candidate_width,
                         height=candidate_height,
-                        transitions=member_transitions,
+                        transitions=candidate_member_transitions,
                         member_pose_dissolve_requested=bool(
                             direct_cadence[
                                 "member_pose_dissolve_requested"
@@ -36882,6 +36917,10 @@ def analyze(
                         dense_render_path_reselection_count += 1
                         continue
                     segments = candidate_segments
+                    member_transitions = candidate_plan.transitions
+                    direct_cadence["joint_dissolve_registration"] = (
+                        deepcopy(candidate_joint_dissolve_audit)
+                    )
                     member_look_plan = candidate_member_look_plan
                     member_editorial_motion_plan = (
                         candidate_member_motion_plan
@@ -37080,14 +37119,19 @@ def analyze(
                 f"예측 충격 {member_look_plan.predicted_high_shock_count}개 · "
                 "추가 원본 디코드 0회"
             )
-            for detail, segment in zip(
-                direct_segment_details,
-                segments,
-                strict=True,
-            ):
+            for segment_index, (detail, segment) in enumerate(zip(
+                direct_segment_details, segments, strict=True,
+            )):
                 detail["crop_applied"] = segment.crop is not None
                 detail["editorial_transform_applied"] = (
                     segment.editorial_transform is not None
+                )
+                detail["outgoing_overlap_transform_applied"] = (
+                    segment.outgoing_overlap_transform is not None
+                )
+                detail["outgoing_transition"] = (
+                    member_transitions[segment_index].to_dict(candidate_plan.fps)
+                    if segment_index < len(member_transitions) else None
                 )
             professional_gate_path = request.output_directory / (
                 f"{base_filename}-{_safe_slug(request.target_member.value)}-"
