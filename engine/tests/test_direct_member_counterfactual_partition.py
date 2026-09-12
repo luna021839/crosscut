@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import unittest
+from unittest.mock import patch
 
 from crosscut.direct_member_visual import (
     DirectMemberVisualConfig,
@@ -728,7 +729,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
                 ]
             )
 
-    def test_repair_uses_three_span_window_before_visual_split(self) -> None:
+    def test_repair_uses_window_after_local_proposals_are_exhausted(self) -> None:
         segments = _professional_timing_segments(34)
         unit_counts = (5, 3, 4, 4, 4, 4, 4, 4, 2)
         bare_parent = _DirectFullFramePartitionProfile(
@@ -749,15 +750,25 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             latest_operation_kind="boundary_shift",
         )
 
-        children = _direct_full_frame_proof_directed_repair_profiles(
-            segments,
-            parent,
-            _forward_frontier_diagnostics(
-                span_count=len(parent.unit_counts),
-                boundary_index=0,
-            ),
-            config=DirectMemberVisualConfig(),
+        diagnostics = _forward_frontier_diagnostics(
+            span_count=len(parent.unit_counts), boundary_index=0,
         )
+        # A recorded shift is no longer evidence that all local shifts are
+        # exhausted: the current proof-bound search can still use (6, 2, 4).
+        local_children = _direct_full_frame_proof_directed_repair_profiles(
+            segments, parent, diagnostics, config=DirectMemberVisualConfig(),
+        )
+        self.assertEqual(len(local_children), 1)
+        self.assertEqual(local_children[0].latest_operation_kind, "boundary_shift")
+        self.assertEqual(local_children[0].unit_counts[:3], (6, 2, 4))
+        # Exercise the actual fallback dispatch without weakening proposal
+        # evidence or changing the production search order to fit this test.
+        with patch("crosscut.pipeline._direct_full_frame_proof_directed_child_profiles", return_value=()), patch(
+            "crosscut.pipeline._direct_full_frame_visual_frontier_split_child_profiles", return_value=(),
+        ):
+            children = _direct_full_frame_proof_directed_repair_profiles(
+                segments, parent, diagnostics, config=DirectMemberVisualConfig(),
+            )
 
         self.assertTrue(children)
         self.assertTrue(
@@ -905,7 +916,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
                         "quality_sample_scores": [0.95, 0.95],
                         "samples": [
                             {
-                                "canonical_master_seconds": 6.10,
+                                "canonical_master_seconds": 7.35,
                                 "descriptor_available": True,
                                 "attention_basis": "human_pose",
                                 "face_count": 1,
@@ -915,7 +926,7 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
                                 "foreground_obstruction_score": 0.1,
                             },
                             {
-                                "canonical_master_seconds": 6.40,
+                                "canonical_master_seconds": 7.65,
                                 "descriptor_available": False,
                             },
                         ],
@@ -933,10 +944,10 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
         )
         self.assertEqual(len(children), 1)
         child = children[0]
-        self.assertEqual(child.unit_counts, (1, 3, 1, 3, 4))
+        self.assertEqual(child.unit_counts, (1, 3, 2, 2, 4))
         self.assertEqual(len(child.visual_frontier_splits), 2)
         split = child.visual_frontier_splits[-1]
-        self.assertEqual(split.canonical_master_seconds, 6.25)
+        self.assertEqual(split.canonical_master_seconds, 7.5)
         self.assertEqual(
             split.trigger,
             "diagnostic_severe_counterfactual_visual_micro_split",
@@ -953,6 +964,21 @@ class DirectMemberCounterfactualPartitionTests(unittest.TestCase):
             split.to_dict()["proposal_evidence"][
                 "proposal_only_full_selector_recheck_required"
             ]
+        )
+        # The old 6.25-second fixture creates a 1.25-second run, below the
+        # current 1.8-second minimum. It must remain rejected, not be made
+        # feasible by altering production cadence rules for a test.
+        too_short = deepcopy(diagnostics)
+        short_samples = too_short["span_content_validity"][0]["sources"][0]["samples"]
+        short_samples[0]["canonical_master_seconds"] = 6.10
+        short_samples[1]["canonical_master_seconds"] = 6.40
+        self.assertEqual(
+            _direct_full_frame_visual_frontier_split_child_profiles(
+                _timing_segments(), parent, too_short,
+                config=DirectMemberVisualConfig(),
+                allow_counterfactual_secondary_split=True,
+            ),
+            (),
         )
         malformed_samples = deepcopy(diagnostics)
         malformed_samples["span_content_validity"][0]["sources"][0][
