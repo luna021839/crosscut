@@ -2382,8 +2382,13 @@ class DirectMemberVisualSelection:
     source_duration_minimums_seconds: tuple[float, ...] = ()
     source_duration_maximums_seconds: tuple[float, ...] = ()
     focal_geometry_used: bool = False
+    content_invalid_boundary_samples_skipped: int = 0
 
     def __post_init__(self) -> None:
+        if (isinstance(self.content_invalid_boundary_samples_skipped, bool)
+                or not isinstance(self.content_invalid_boundary_samples_skipped, int)
+                or self.content_invalid_boundary_samples_skipped < 0):
+            raise ValueError('skipped boundary sample count must be nonnegative')
         if not isinstance(self.focal_geometry_used, bool):
             raise TypeError('focal geometry usage must be boolean')
         if not self.source_indices:
@@ -3089,6 +3094,12 @@ class DirectMemberVisualSelection:
                 span.to_dict() for span in self.span_validity
             ],
             "boundaries": [boundary.to_dict() for boundary in self.boundaries],
+            "observation_work": {
+                "content_invalid_boundary_samples_skipped": self.content_invalid_boundary_samples_skipped,
+                "source_content_screening_preserved": True,
+                "eligible_exact_boundary_observations_preserved": True,
+                "outgoing_overlap_handles_preserved": True,
+            },
             "privacy": {
                 "face_identity_inference_used": False,
                 "face_appearance_embeddings_computed": self.focal_geometry_used,
@@ -11487,6 +11498,13 @@ def _hard_boundary_forward_exhaustion_boundary(
     return None
 
 
+def _boundary_endpoint_content_eligibility(outgoing_valid: bool, incoming_valid: bool):
+    # An outgoing effect can need this source beyond the cut even when its
+    # next full span is invalid. Keep both outgoing overlap-handle samples.
+    handle_valid = outgoing_valid or incoming_valid
+    return outgoing_valid, outgoing_valid, incoming_valid, handle_valid, handle_valid
+
+
 def select_balanced_direct_member_sources(
     *,
     sources: Sequence[Path],
@@ -12027,6 +12045,7 @@ def select_balanced_direct_member_sources(
     span_diagnostics: list[DirectSpanVisualDiagnostic] = []
     sample_count = 0
     failed_sample_count = 0
+    content_invalid_boundary_samples_skipped = 0
     try:
         for segment_index, (span_start, span_end) in enumerate(spans):
             duration = span_end - span_start
@@ -12148,6 +12167,41 @@ def select_balanced_direct_member_sources(
                 )
             )
 
+        empty_content_spans = tuple(span.segment_index for span in span_diagnostics
+                                    if not any(source.valid for source in span.sources))
+        if empty_content_spans:
+            # No cut geometry, quota reassignment or cinematic effect can put
+            # a source into a span where every source failed content validity.
+            # Prove that impossibility before paying for all boundary NNs.
+            content_counts = [sum(span.sources[index].valid for span in span_diagnostics)
+                              for index in range(source_count)]
+            raise DirectMemberVisualSelectionError(
+                'direct member content validity cannot cover every span',
+                {'failure': 'content_validity_quota_precheck_failed',
+                 'empty_segment_indices': list(empty_content_spans),
+                 'span_content_validity': [span.to_dict() for span in span_diagnostics],
+                 'valid_count_by_source': [
+                     {'eligible_source_index': index, 'quota': quotas[index],
+                      'valid_span_count': content_counts[index],
+                      'invalid_span_count': len(spans) - content_counts[index],
+                      'valid_segment_indices': [span.segment_index for span in span_diagnostics
+                                                if span.sources[index].valid]}
+                     for index in range(source_count)],
+                 'quota_shortfalls': [
+                     {'eligible_source_index': index, 'quota': quotas[index],
+                      'valid_span_count': content_counts[index]}
+                     for index in range(source_count) if content_counts[index] < quotas[index]],
+                 'quota_basis': 'initial_assignment_before_optional_source_subset_ranking',
+                 'source_quota_assignment': quota_assignment_provenance,
+                 'constraint_infeasibility_proven': True,
+                 'visual_gates_relaxed': False,
+                 'observation_work': {
+                     'boundary_observations_evaluated': False,
+                     'reason': 'no_content_valid_source_for_required_span',
+                     'sample_count': sample_count,
+                 }},
+            )
+
         frame_offsets = _boundary_search_frame_offsets(resolved_config)
         for boundary_index in range(len(spans) - 1):
             canonical_boundary = spans[boundary_index][1]
@@ -12209,6 +12263,10 @@ def select_balanced_direct_member_sources(
                         incoming_next_master,
                         incoming_future_master,
                     )
+                    outgoing_eligible = span_diagnostics[boundary_index].sources[source_index].valid
+                    incoming_eligible = span_diagnostics[boundary_index + 1].sources[source_index].valid
+                    endpoint_eligibility = _boundary_endpoint_content_eligibility(
+                        outgoing_eligible, incoming_eligible)
                     local_times = tuple(
                         _source_local_time(
                             master_seconds,
@@ -12219,12 +12277,14 @@ def select_balanced_direct_member_sources(
                         for master_seconds in master_times
                     )
                     descriptors = tuple(
-                        provider(source_index, source, local_seconds)
-                        for local_seconds in local_times
+                        provider(source_index, source, local_seconds) if eligible else None
+                        for local_seconds, eligible in zip(local_times, endpoint_eligibility, strict=True)
                     )
-                    sample_count += 5
+                    sample_count += sum(endpoint_eligibility)
+                    content_invalid_boundary_samples_skipped += 5 - sum(endpoint_eligibility)
                     failed_sample_count += sum(
-                        descriptor is None for descriptor in descriptors
+                        eligible and descriptor is None
+                        for descriptor, eligible in zip(descriptors, endpoint_eligibility, strict=True)
                     )
                     samples = tuple(
                         _boundary_sample_with_focal_geometry(
@@ -12234,10 +12294,22 @@ def select_balanced_direct_member_sources(
                             descriptor=descriptor,
                             provider=provider,
                         )
-                        for master_seconds, local_seconds, descriptor in zip(
+                        if eligible else _BoundarySample(
+                            master_seconds=master_seconds,
+                            source_local_seconds=local_seconds,
+                            descriptor=None,
+                            attention=None,
+                        )
+                        # Content-invalid source/segments are excluded by every
+                        # path solver below, for every boundary offset. Their
+                        # expensive focal observations cannot affect a legal
+                        # path. Preserve explicit missing evidence here rather
+                        # than substituting a midpoint or an invented pose.
+                        for master_seconds, local_seconds, descriptor, eligible in zip(
                             master_times,
                             local_times,
                             descriptors,
+                            endpoint_eligibility,
                             strict=True,
                         )
                     )
@@ -13619,6 +13691,7 @@ def select_balanced_direct_member_sources(
         optimizer_cost=optimizer_cost,
         sample_count=sample_count,
         failed_sample_count=failed_sample_count,
+        content_invalid_boundary_samples_skipped=content_invalid_boundary_samples_skipped,
         native_scene_cut_evidence_available=scene_cut_evidence_available,
         continuous_official_portrait_fancam_contract=(
             continuous_official_portrait_fancam_contract
