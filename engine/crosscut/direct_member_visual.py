@@ -1,6 +1,7 @@
-"""Non-identifying visual path selection for direct member fancams.
+"""Visual path proposals for authenticated member fancams.
 
-The direct portrait member path never identifies a face. It can authorize a
+The optional frozen-source focal provider binds geometry before path choice;
+without it, the legacy non-identifying geometry path remains unchanged. It can authorize a
 short geometry-only crop/zoom/pan repair for an already-authenticated official
 target fancam, but only when source resolution and subject containment prove
 that repair can be rendered without an upscaled working frame. This module
@@ -9,7 +10,8 @@ a balanced, no-repeat source path that minimizes the residual visible jumps.
 
 Only normalized screen geometry and aggregate mismatch scores are serialized.
 Pose, silhouette, layout, and structure vectors are transient and no face
-appearance embedding or named identity inference is used.
+appearance embedding is serialized here. The optional focal provider computes
+transient correspondence evidence but does not infer a person's name.
 """
 
 from __future__ import annotations
@@ -27,6 +29,11 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 
 from .member_bridge_contract import member_bridge_handle_quality_failures
+from .focal_selector_geometry import (
+    FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_POSE_BASIS, FOCAL_SELECTOR_BODY_BASIS,
+    FOCAL_MEMBER_MINIMUM_SUBJECT_VISIBLE_FRACTION,
+    FocalSelectorGeometry, common_focal_pose_vectors, focal_pose_shape_mismatch,
+)
 from .direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     DirectMemberSourceFrameGeometry,
@@ -980,6 +987,7 @@ class _BoundarySample:
     source_local_seconds: float
     descriptor: FrameVisualDescriptor | None
     attention: _AttentionGeometry | None
+    focal_geometry: FocalSelectorGeometry | None = None
 
     def to_dict(self) -> dict[str, Any]:
         descriptor = self.descriptor
@@ -987,6 +995,7 @@ class _BoundarySample:
             "canonical_master_seconds": self.master_seconds,
             "source_local_seconds": self.source_local_seconds,
             "descriptor_available": descriptor is not None,
+            "focal_geometry": self.focal_geometry.to_dict() if self.focal_geometry else None,
             "attention_basis": (
                 self.attention.basis if self.attention is not None else None
             ),
@@ -2366,8 +2375,11 @@ class DirectMemberVisualSelection:
     source_count_maximums: tuple[int, ...] = ()
     source_duration_minimums_seconds: tuple[float, ...] = ()
     source_duration_maximums_seconds: tuple[float, ...] = ()
+    focal_geometry_used: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.focal_geometry_used, bool):
+            raise TypeError('focal geometry usage must be boolean')
         if not self.source_indices:
             raise ValueError("direct member visual selection cannot be empty")
         if len(self.source_quotas) != len(self.source_counts):
@@ -3037,7 +3049,8 @@ class DirectMemberVisualSelection:
             "boundaries": [boundary.to_dict() for boundary in self.boundaries],
             "privacy": {
                 "face_identity_inference_used": False,
-                "face_appearance_embeddings_computed": False,
+                "face_appearance_embeddings_computed": self.focal_geometry_used,
+                "source_focal_geometry_used_before_selection": self.focal_geometry_used,
                 "raw_pose_silhouette_layout_embeddings_persisted": False,
                 "persisted_evidence": (
                     "normalized_attention_geometry_backend_confidence_"
@@ -3059,6 +3072,7 @@ class _VideoDescriptorProvider:
         feature_cache_directory: Path | None = None,
         feature_derived_cache_directory: Path | None = None,
         require_persistent_feature_cache: bool = False,
+        focal_geometry_provider: Callable[[int, float, FrameVisualDescriptor | None], FocalSelectorGeometry] | None = None,
     ) -> None:
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
@@ -3071,6 +3085,7 @@ class _VideoDescriptorProvider:
                 "feature_derived_cache_directory"
             )
         self._samplers: list[_VideoSampler | None] = []
+        self.focal_geometry_at = focal_geometry_provider
         self._descriptor_cache: dict[
             tuple[int, CanonicalFrameIdentity], FrameVisualDescriptor | None
         ] = {}
@@ -3195,6 +3210,29 @@ class _VideoDescriptorProvider:
 _ATTENTION_FACE_BASIS = "unambiguous_dominant_face_bbox_geometry_only"
 _ATTENTION_SILHOUETTE_BASIS = "aggregate_human_silhouette"
 _ATTENTION_PERSON_BASIS = "unambiguous_dominant_person_box_geometry_only"
+
+
+def _boundary_sample_with_focal_geometry(
+    *, master_seconds: float, source_local_seconds: float,
+    source_index: int, descriptor: FrameVisualDescriptor | None,
+    provider: DescriptorProvider,
+) -> _BoundarySample:
+    resolver = getattr(provider, 'focal_geometry_at', None)
+    focal = resolver(source_index, source_local_seconds, descriptor) if resolver is not None else None
+    if resolver is not None:
+        if not isinstance(focal, FocalSelectorGeometry):
+            raise TypeError('focal selector provider must report explicit missing evidence')
+        if focal.source_index != source_index or not math.isclose(focal.source_seconds, source_local_seconds, abs_tol=1e-9, rel_tol=0):
+            raise ValueError('focal selector evidence belongs to another source/frame')
+    attention = _attention_geometry(descriptor)
+    if focal is not None:
+        box = focal.face_bbox_xywh
+        attention = (_AttentionGeometry(box, (box[0]+box[2]/2, box[1]+box[3]/2),
+            FOCAL_SELECTOR_FACE_BASIS, focal.face_scale**2 if focal.face_scale else None)
+            if box is not None else None)
+        if attention is None and focal.body_track is not None and focal.person is not None:
+            attention = _AttentionGeometry(focal.person.bbox_xywh, focal.person.centroid_xy, FOCAL_SELECTOR_BODY_BASIS)
+    return _BoundarySample(master_seconds, source_local_seconds, descriptor, attention, focal)
 
 
 def _attention_geometry_for_basis(
@@ -4008,6 +4046,15 @@ def _actual_pose_vector(
     return tuple(float(value) for value in descriptor.pose_embedding)
 
 
+def _sample_pose_vectors(
+    samples: Sequence[_BoundarySample], config: DirectMemberVisualConfig,
+) -> tuple[tuple[float, ...], ...] | None:
+    if any(sample.focal_geometry is not None for sample in samples):
+        return common_focal_pose_vectors(tuple(sample.focal_geometry for sample in samples))
+    poses = tuple(_actual_pose_vector(sample.descriptor, config) for sample in samples)
+    return tuple(pose for pose in poses if pose is not None) if all(pose is not None for pose in poses) else None
+
+
 def _vector_delta(
     previous: Sequence[float] | None,
     current: Sequence[float] | None,
@@ -4093,24 +4140,10 @@ def _pose_phase_continuation_mismatch(
     their aggregate residual.
     """
 
-    outgoing_previous_pose = _actual_pose_vector(
-        outgoing_previous.descriptor,
-        config,
-    )
-    outgoing_endpoint_pose = _actual_pose_vector(
-        outgoing_endpoint.descriptor,
-        config,
-    )
-    incoming_start_pose = _actual_pose_vector(incoming_start.descriptor, config)
-    incoming_next_pose = _actual_pose_vector(incoming_next.descriptor, config)
-    poses = (
-        outgoing_previous_pose,
-        outgoing_endpoint_pose,
-        incoming_start_pose,
-        incoming_next_pose,
-    )
-    if any(value is None for value in poses):
+    poses = _sample_pose_vectors((outgoing_previous, outgoing_endpoint, incoming_start, incoming_next), config)
+    if poses is None:
         return None
+    outgoing_previous_pose, outgoing_endpoint_pose, incoming_start_pose, incoming_next_pose = poses
     assert all(value is not None for value in poses)
     lengths = {len(value) for value in poses if value is not None}
     if len(lengths) != 1:
@@ -4122,8 +4155,22 @@ def _pose_phase_continuation_mismatch(
     incoming_delta = _vector_delta(incoming_start_pose, incoming_next_pose)
     if outgoing_delta is None or incoming_delta is None:
         return None
+    outgoing_step = outgoing_endpoint.master_seconds - outgoing_previous.master_seconds
+    incoming_step = incoming_next.master_seconds - incoming_start.master_seconds
+    forward_gap = incoming_next.master_seconds - outgoing_endpoint.master_seconds
+    backward_gap = incoming_start.master_seconds - outgoing_previous.master_seconds
+    if (not all(math.isfinite(value) and value > 0 for value in
+                (outgoing_step, incoming_step, forward_gap, backward_gap))
+            or incoming_start.master_seconds < outgoing_endpoint.master_seconds):
+        return None
+    # The visible pair is outgoing-last / incoming-first. Incoming-next is
+    # normally TWO frame intervals after outgoing-last, not one. Comparing a
+    # one-step prediction with that two-step frame falsely penalized a linear,
+    # perfectly continuous dance motion. Bind extrapolation to actual clocks.
+    forward_steps = forward_gap / outgoing_step
+    backward_steps = backward_gap / incoming_step
     predicted_next = tuple(
-        value + delta
+        value + forward_steps * delta
         for value, delta in zip(
             outgoing_endpoint_pose,
             outgoing_delta,
@@ -4131,7 +4178,7 @@ def _pose_phase_continuation_mismatch(
         )
     )
     predicted_previous = tuple(
-        value - delta
+        value - backward_steps * delta
         for value, delta in zip(
             incoming_start_pose,
             incoming_delta,
@@ -4166,16 +4213,17 @@ def _motion_components(
     previous: _BoundarySample,
     current: _BoundarySample,
     config: DirectMemberVisualConfig,
+    *, focal_window: bool = False,
+    window_pose_vectors: tuple[tuple[float, ...], tuple[float, ...]] | None = None,
 ) -> dict[str, tuple[float, tuple[float, ...]]]:
     previous_descriptor = previous.descriptor
     current_descriptor = current.descriptor
     if previous_descriptor is None or current_descriptor is None:
         return {}
-    pose_delta = _vector_delta(
-        _actual_pose_vector(previous_descriptor, config),
-        _actual_pose_vector(current_descriptor, config),
-    )
-    silhouette_delta = _vector_delta(
+    focal_mode = focal_window or previous.focal_geometry is not None or current.focal_geometry is not None
+    poses = window_pose_vectors if focal_window else _sample_pose_vectors((previous, current), config)
+    pose_delta = _vector_delta(*poses) if poses is not None else None
+    silhouette_delta = None if focal_mode else _vector_delta(
         (
             tuple(previous_descriptor.silhouette_embedding)
             if previous_descriptor.silhouette_confidence
@@ -4244,13 +4292,17 @@ def _cut_adjacent_motion_evidence(
             )
         )
     )
+    focal_window = any(s.focal_geometry is not None for s in (outgoing_previous, outgoing_endpoint, incoming_start, incoming_next))
+    focal_poses = _sample_pose_vectors((outgoing_previous, outgoing_endpoint, incoming_start, incoming_next), config) if focal_window else None
     outgoing_components = (
-        _motion_components(outgoing_previous, outgoing_endpoint, config)
+        _motion_components(outgoing_previous, outgoing_endpoint, config,
+            focal_window=focal_window, window_pose_vectors=focal_poses[:2] if focal_poses else None)
         if adjacent
         else {}
     )
     incoming_components = (
-        _motion_components(incoming_start, incoming_next, config)
+        _motion_components(incoming_start, incoming_next, config,
+            focal_window=focal_window, window_pose_vectors=focal_poses[2:] if focal_poses else None)
         if adjacent
         else {}
     )
@@ -4270,13 +4322,14 @@ def _cut_adjacent_motion_evidence(
     right = incoming_start.descriptor
     endpoint_components: list[float] = []
     if left is not None and right is not None:
-        left_pose = _actual_pose_vector(left, config)
-        right_pose = _actual_pose_vector(right, config)
-        pose_mismatch = _embedding_distance(left_pose or (), right_pose or ())
+        endpoint_poses = _sample_pose_vectors((outgoing_endpoint, incoming_start), config)
+        pose_mismatch = (focal_pose_shape_mismatch(outgoing_endpoint.focal_geometry, incoming_start.focal_geometry)
+            if focal_window else _embedding_distance(*(endpoint_poses or ((), ()))))
         if pose_mismatch is not None:
             endpoint_components.append(pose_mismatch)
         if (
-            left.silhouette_confidence >= config.minimum_silhouette_confidence
+            not focal_window
+            and left.silhouette_confidence >= config.minimum_silhouette_confidence
             and right.silhouette_confidence
             >= config.minimum_silhouette_confidence
         ):
@@ -4530,6 +4583,18 @@ def _boundary_mismatch(
     incoming_source_geometry: DirectMemberSourceFrameGeometry | None = None,
     continuous_official_portrait_fancam_contract: bool = False,
 ) -> DirectBoundaryMismatch:
+    if any(sample.attention is not None and sample.attention.basis == FOCAL_SELECTOR_BODY_BASIS
+           for sample in (outgoing, incoming)):
+        # One side cannot measure a face while the other measures a torso.
+        # Both endpoints AND their motion neighbors use the same target body.
+        def focal_body_sample(sample):
+            if sample is None:
+                return None
+            person = sample.focal_geometry.person if sample.focal_geometry else None
+            return replace(sample, attention=_AttentionGeometry(person.bbox_xywh, person.centroid_xy,
+                FOCAL_SELECTOR_BODY_BASIS) if person is not None else None)
+        outgoing, incoming = focal_body_sample(outgoing), focal_body_sample(incoming)
+        outgoing_previous, incoming_next = focal_body_sample(outgoing_previous), focal_body_sample(incoming_next)
     outgoing_output = _sample_in_portrait_fill(
         outgoing,
         outgoing_source_geometry,
@@ -4598,6 +4663,7 @@ def _boundary_mismatch(
         outgoing_attention,
         incoming_attention,
     )
+    focal_mode = outgoing.focal_geometry is not None or incoming.focal_geometry is not None
     actual_pose = (
         left.pose_backend != "structure_hog_fallback"
         and right.pose_backend != "structure_hog_fallback"
@@ -4606,7 +4672,12 @@ def _boundary_mismatch(
         and bool(left.pose_embedding)
         and len(left.pose_embedding) == len(right.pose_embedding)
     )
-    if actual_pose:
+    if focal_mode:
+        pose = focal_pose_shape_mismatch(outgoing.focal_geometry, incoming.focal_geometry)
+        pose_basis = FOCAL_SELECTOR_POSE_BASIS
+        actual_pose = pose is not None
+        pose_weight = config.dominant_pose_weight
+    elif actual_pose:
         pose_basis = "opencv_zoo_mediapipe_dominant_pose"
         pose = _embedding_distance(left.pose_embedding, right.pose_embedding)
         pose_weight = config.dominant_pose_weight
@@ -4635,6 +4706,10 @@ def _boundary_mismatch(
         left.detected_person_count,
         right.detected_person_count,
     )
+    if focal_mode:
+        # A surrounding formation is context, not the selected performer's
+        # body or silhouette. Do not let it authorize a focal pose match.
+        formation = silhouette = layout = person_count = None
     weighted_components = (
         (attention_position, config.attention_position_weight),
         (attention_scale, config.attention_scale_weight),
@@ -4684,13 +4759,15 @@ def _boundary_mismatch(
         and incoming_source_index is not None
         and outgoing_attention is not None
         and incoming_attention is not None
-        and outgoing_attention.basis
-        == incoming_attention.basis
-        == "unambiguous_dominant_face_bbox_geometry_only"
-        and left.face_count == right.face_count == 1
-        and left.face_detector_backend.casefold()
-        == right.face_detector_backend.casefold()
-        == "yunet"
+        and (
+            (outgoing_attention.basis == incoming_attention.basis == FOCAL_SELECTOR_FACE_BASIS
+             and outgoing.focal_geometry is not None and incoming.focal_geometry is not None
+             and outgoing.focal_geometry.face_bbox_xywh is not None and incoming.focal_geometry.face_bbox_xywh is not None)
+            or (not focal_mode
+                and outgoing_attention.basis == incoming_attention.basis == "unambiguous_dominant_face_bbox_geometry_only"
+                and left.face_count == right.face_count == 1
+                and left.face_detector_backend.casefold() == right.face_detector_backend.casefold() == "yunet")
+        )
     )
     official_silhouette_pair = bool(
         continuous_official_portrait_fancam_contract
@@ -4727,10 +4804,15 @@ def _boundary_mismatch(
     )
     official_body_pair = bool(
         official_silhouette_pair or official_dominant_person_pair
+        or (continuous_official_portrait_fancam_contract and focal_mode
+            and outgoing_source_geometry is not None and incoming_source_geometry is not None
+            and outgoing_source_index is not None and incoming_source_index is not None
+            and outgoing_attention is not None and incoming_attention is not None
+            and outgoing_attention.basis == incoming_attention.basis == FOCAL_SELECTOR_BODY_BASIS)
     )
     official_alignment_pair = bool(official_face_pair or official_body_pair)
     alignment_geometry_basis = (
-        "unambiguous_dominant_face_bbox_geometry_only"
+        outgoing_attention.basis
         if official_face_pair
         else outgoing_attention.basis
         if official_body_pair and outgoing_attention is not None
@@ -4784,13 +4866,19 @@ def _boundary_mismatch(
         assert incoming_source_geometry is not None
         assert outgoing_source_index is not None
         assert incoming_source_index is not None
-        if official_face_pair:
+        if official_face_pair or focal_mode:
             outgoing_subject, outgoing_subject_basis = (
                 _verified_direct_member_subject_geometry(left, config)
             )
             incoming_subject, incoming_subject_basis = (
                 _verified_direct_member_subject_geometry(right, config)
             )
+            if focal_mode:
+                outgoing_person = outgoing.focal_geometry.person if outgoing.focal_geometry else None
+                incoming_person = incoming.focal_geometry.person if incoming.focal_geometry else None
+                outgoing_subject = outgoing_person.bbox_xywh if outgoing_person else None
+                incoming_subject = incoming_person.bbox_xywh if incoming_person else None
+                outgoing_subject_basis = incoming_subject_basis = 'uniquely_face_associated_focal_body'
             outgoing_subject_box = (
                 map_box_to_portrait_fill(
                     outgoing_subject,
@@ -4849,7 +4937,8 @@ def _boundary_mismatch(
                 config.transform_repair_legacy_face_only_maximum_center_shift
             ),
             minimum_subject_visible_fraction=(
-                config.transform_repair_minimum_subject_visible_fraction
+                FOCAL_MEMBER_MINIMUM_SUBJECT_VISIBLE_FRACTION
+                if focal_mode else config.transform_repair_minimum_subject_visible_fraction
             ),
             alignment_geometry_basis=str(alignment_geometry_basis),
         )
@@ -4971,6 +5060,10 @@ def _boundary_mismatch(
         )
     ]
     if cross_source_edge:
+        if focal_mode and (outgoing.focal_geometry is None or incoming.focal_geometry is None
+                or (outgoing.focal_geometry.face_bbox_xywh is None and outgoing.focal_geometry.body_track is None)
+                or (incoming.focal_geometry.face_bbox_xywh is None and incoming.focal_geometry.body_track is None)):
+            severe_flags.append('cross_source_focal_subject_unresolved')
         if alignment_transform_required and transform_repair is None:
             severe_flags.append(
                 "cross_source_face_alignment_unrepaired"
@@ -4988,10 +5081,10 @@ def _boundary_mismatch(
             and pose > config.maximum_cross_source_pose_mismatch + 1e-9
         ):
             severe_flags.append("cross_source_pose_mismatch")
-        if silhouette is None:
+        if silhouette is None and not (focal_mode and actual_pose):
             severe_flags.append("cross_source_silhouette_missing")
         elif (
-            silhouette
+            silhouette is not None and silhouette
             > config.maximum_cross_source_silhouette_mismatch + 1e-9
         ):
             severe_flags.append("cross_source_silhouette_mismatch")
@@ -11909,14 +12002,18 @@ def select_balanced_direct_member_sources(
                     descriptor = provider(source_index, source, local_seconds)
                     sample_count += 1
                     failed_sample_count += int(descriptor is None)
-                    samples.append(
-                        _BoundarySample(
-                            master_seconds=master_seconds,
-                            source_local_seconds=local_seconds,
-                            descriptor=descriptor,
-                            attention=_attention_geometry(descriptor),
-                        )
-                    )
+                    # These six samples only detect blank/obstructed/static
+                    # content and exposure, not who should match at a cut.
+                    # Running target tracking here paid for thousands of
+                    # unused identity/pose observations before any boundary.
+                    # Every exact cut/motion sample below STILL uses the
+                    # shared target authority; content is never cut proof.
+                    samples.append(_BoundarySample(
+                        master_seconds=master_seconds,
+                        source_local_seconds=local_seconds,
+                        descriptor=descriptor,
+                        attention=_attention_geometry(descriptor),
+                    ))
                 source_validity.append(
                     _span_source_validity(
                         source_index=source_index,
@@ -12019,11 +12116,12 @@ def select_balanced_direct_member_sources(
                         descriptor is None for descriptor in descriptors
                     )
                     samples = tuple(
-                        _BoundarySample(
+                        _boundary_sample_with_focal_geometry(
                             master_seconds=master_seconds,
                             source_local_seconds=local_seconds,
+                            source_index=source_index,
                             descriptor=descriptor,
-                            attention=_attention_geometry(descriptor),
+                            provider=provider,
                         )
                         for master_seconds, local_seconds, descriptor in zip(
                             master_times,
@@ -13403,6 +13501,7 @@ def select_balanced_direct_member_sources(
             continuous_official_portrait_fancam_contract
         ),
         config=resolved_config,
+        focal_geometry_used=getattr(provider, 'focal_geometry_at', None) is not None,
         optimizer_search_diagnostics=optimizer_search_diagnostics,
         source_frame_geometries=source_frame_geometries,
         usage_policy=usage_policy,

@@ -9853,8 +9853,22 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("direct_member_look.py"),
                 Path(__file__).with_name("rendered_proxy_review.py"),
                 Path(__file__).with_name("render.py"),
+                Path(__file__).with_name("source_first_focal_geometry.py"),
+                Path(__file__).with_name("source_first_model_assets.py"),
+                Path(__file__).with_name("source_first_member_session.py"),
+                Path(__file__).with_name("focal_selector_geometry.py"),
+                Path(__file__).with_name("focal_reference_consensus.py"),
+                Path(__file__).with_name("focal_body_track.py"),
+                Path(__file__).with_name("focal_body_track_provider.py"),
+                Path(__file__).with_name("body_appearance.py"),
+                Path(__file__).with_name("body_pose_2d.py"),
+                Path(__file__).with_name("native_focal_faces.py"),
             )
         }
+        from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
+        implementation_sha256["source_first_observation_semantics"] = (
+            SourceFirstFocalGeometryProvider.observation_fingerprint()
+        )
     except (OSError, ValueError) as exc:
         diagnostics.update(
             {
@@ -34300,9 +34314,19 @@ def analyze(
             # Dense retries add hard camera-solve exclusions. Decoded-output
             # retries add only finite visual costs. Keep the descriptor session
             # alive across both so a 26-second proof does not repay feature IO.
-            direct_visual_descriptor_provider = _VideoDescriptorProvider(
-                eligible_direct_sources,
-                **_visual_feature_cache_arguments(request),
+            from .source_first_member_session import open_source_first_member_session
+            dense_face_provider, direct_visual_descriptor_provider = (
+                open_source_first_member_session(
+                    eligible_direct_sources,
+                    progress_callback=lambda payload: reporter.log(
+                        "직캠 공유 인물 관측 " + json.dumps(payload, ensure_ascii=False)
+                    ),
+                    **_visual_feature_cache_arguments(request),
+                )
+            )
+            reporter.log(
+                "직캠 대상 인물·포즈 관측 공유 활성화 · 선택과 카메라 보정이 "
+                "동일한 원본 프레임 관측 사용 · 외장 관측 캐시 재사용"
             )
 
             effect_authoring_failed_edges: list[tuple[float, int, int]] = []
@@ -34603,6 +34627,7 @@ def analyze(
                 )
             except DirectMemberVisualSelectionError as exc:
                 direct_visual_descriptor_provider.close()
+                dense_face_provider.close()
                 raise _report_direct_member_selection_failure(
                     exc,
                     output_directory=request.output_directory,
@@ -34611,9 +34636,13 @@ def analyze(
                     eligible_indices=eligible_indices,
                     reporter=reporter,
                 ) from exc
+            except BaseException:
+                direct_visual_descriptor_provider.close()
+                dense_face_provider.close()
+                raise
             visual_aggregate = direct_visual_selection.to_dict()["aggregate"]
             reporter.log(
-                "비신원 시각 경계 선택 "
+                "대상 인물 관측 기반 시각 경계 선택 "
                 f"{visual_aggregate['selected_boundary_count']}개 · "
                 "시각 경고 "
                 f"{visual_aggregate['warning_boundary_count']}개 · "
@@ -34650,7 +34679,6 @@ def analyze(
                             for reason, count in ranked_rejections[:8]
                         )
                     )
-            dense_face_provider: DirectMemberDenseFaceProvider | None = None
             direct_motion_error: str | None = None
             untouched_direct_segments = segments
             required_transform_boundary_indices: tuple[int, ...] = ()
@@ -34667,12 +34695,6 @@ def analyze(
             decoded_proxy_camera_refinement_count = 0
             accepted_rendered_proxy_preflight_payload: dict[str, Any] | None = None
             try:
-                dense_face_provider = DirectMemberDenseFaceProvider(
-                    tuple(request.sources[index] for index in eligible_indices),
-                    require_focal_consensus=True,
-                    **_visual_feature_cache_arguments(request),
-                )
-
                 def direct_member_geometry_provider(
                     eligible_source_index: int,
                     canonical_master_seconds: float,

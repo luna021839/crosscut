@@ -287,6 +287,8 @@ class DirectMemberBoundaryTransformRepair:
             raise ValueError("direct member repair exceeds lossless zoom capacity")
         if self.alignment_geometry_basis not in {
             "unambiguous_dominant_face_bbox_geometry_only",
+            "verified_official_fancam_focal_face_correspondence",
+            "frozen_source_focal_body_track_geometry",
             "aggregate_human_silhouette",
             "unambiguous_dominant_person_box_geometry_only",
         }:

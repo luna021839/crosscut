@@ -39,6 +39,11 @@ from .focal_reference_consensus import (
     SoloFaceObservation,
     build_focal_reference_consensus,
 )
+from .focal_selector_geometry import (
+    FOCAL_MEMBER_MINIMUM_SUBJECT_VISIBLE_FRACTION,
+    FOCAL_SELECTOR_BODY_BASIS,
+    FocalSelectorGeometry, focal_selector_geometry,
+)
 from .member_editorial_motion import (
     MemberEditorialMotionConfig,
     _State,
@@ -125,10 +130,12 @@ class DirectMemberFaceSample:
             raise ValueError("direct member subject confidence must be normalized")
         basis = self.subject_geometry_basis.strip()
         alignment_override = self.alignment_geometry_basis_override
-        if alignment_override is not None and alignment_override != FOCAL_FACE_BASIS:
+        if alignment_override is not None and alignment_override not in (FOCAL_FACE_BASIS, FOCAL_SELECTOR_BODY_BASIS):
             raise ValueError("direct member alignment basis override is invalid")
-        if alignment_override is not None and self.face_count != 1:
+        if alignment_override == FOCAL_FACE_BASIS and self.face_count != 1:
             raise ValueError("focal face basis requires one verified face")
+        if alignment_override == FOCAL_SELECTOR_BODY_BASIS and (self.face_count != 0 or basis != 'source_local_focal_body_track'):
+            raise ValueError('focal body basis requires a verified source-local body track')
         if subject_box is None:
             if confidence != 0.0 or basis != "none":
                 raise ValueError(
@@ -137,6 +144,7 @@ class DirectMemberFaceSample:
         elif confidence <= 0.0 or basis not in {
             "pphumanseg_full_subject_silhouette",
             "face_associated_formation_person_box",
+            "source_local_focal_body_track",
         }:
             raise ValueError("direct member subject geometry is unverified")
         if self.face_count == 1:
@@ -326,6 +334,7 @@ class DirectMemberDenseFaceProvider:
         feature_derived_cache_directory: Path | None = None,
         require_persistent_feature_cache: bool = False,
         require_focal_consensus: bool = False,
+        focal_candidate_provider: Callable[[int, float], tuple[FocalFaceCandidate, ...]] | None = None,
     ) -> None:
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
@@ -351,6 +360,9 @@ class DirectMemberDenseFaceProvider:
             [] for _source in self._sources
         ]
         self._require_focal_consensus = require_focal_consensus
+        if focal_candidate_provider is not None and not callable(focal_candidate_provider):
+            raise TypeError('focal candidate provider must be callable')
+        self._external_focal_candidate_provider = focal_candidate_provider
         self._frozen_focal_banks: dict[int, FocalReferenceConsensus | None] = {}
         self._frozen_focal_queries: dict[tuple[object, ...], FocalFaceCandidate | None] = {}
         self._focal_temporal_recovery_count = 0
@@ -433,12 +445,20 @@ class DirectMemberDenseFaceProvider:
             return self._focal_candidate_cache[key]
         before = sampler.frame_decode_count
         try:
-            frame = sampler.frame_at(seconds)
-            candidates = (
-                detect_focal_face_candidates(frame)
-                if frame is not None
-                else ()
-            )
+            external = getattr(self, '_external_focal_candidate_provider', None)
+            if external is not None:
+                # Seed and query faces must come from the same appearance
+                # basis. Do not silently mix thumbnail/native embeddings.
+                candidates = external(source_index, sampler.frame_identity(seconds).canonical_seconds)
+                if not isinstance(candidates, tuple) or any(not isinstance(c, FocalFaceCandidate) for c in candidates):
+                    raise TypeError('external focal provider returned invalid evidence')
+            else:
+                frame = sampler.frame_at(seconds)
+                candidates = (
+                    detect_focal_face_candidates(frame)
+                    if frame is not None
+                    else ()
+                )
         except (cv2.error, ValueError, FloatingPointError):
             candidates = ()
         self._decode_count += max(0, sampler.frame_decode_count - before)
@@ -589,6 +609,19 @@ class DirectMemberDenseFaceProvider:
             self._focal_temporal_recovery_count += int(selected is not None)
         self._frozen_focal_queries[key] = selected
         return selected
+
+    def selector_geometry(
+        self, source_index: int, seconds: float, descriptor: object | None,
+    ) -> FocalSelectorGeometry:
+        """Expose the same frozen target to the selector without editing raw features."""
+        if not self._require_focal_consensus:
+            raise ValueError('early focal selector requires the frozen reference contract')
+        if (isinstance(source_index, bool) or not isinstance(source_index, int)
+                or not 0 <= source_index < len(self._sources)):
+            raise ValueError('focal selector source index is invalid')
+        candidate = self._frozen_focal_candidate(source_index, seconds)
+        return focal_selector_geometry(source_index=source_index, source_seconds=seconds,
+            candidate=candidate, people=tuple(getattr(descriptor, 'formation_people', ())))
 
     def begin_focal_boundary_reference_capture(self) -> None:
         """Start one ordered, path-local capture before dense motion planning."""
@@ -1052,7 +1085,7 @@ class DirectMemberEditorialMotionConfig:
     # height, confidence, and residual gates still apply independently.
     minimum_widened_subject_visible_fraction: float = 0.930
     minimum_widened_subject_vertical_visible_fraction: float = 0.980
-    minimum_face_associated_subject_visible_fraction: float = 0.720
+    minimum_face_associated_subject_visible_fraction: float = FOCAL_MEMBER_MINIMUM_SUBJECT_VISIBLE_FRACTION
     maximum_dense_subject_center_step: float = 0.20
     maximum_dense_subject_height_ratio: float = 1.40
     maximum_dense_center_step: float = 0.15
@@ -1325,7 +1358,10 @@ def _attention_alignment_geometry(
     descriptor = getattr(sample, "descriptor", None)
     if descriptor is None:
         return None
-    if _is_face_alignment_basis(basis):
+    if basis == FOCAL_FACE_BASIS and getattr(sample, 'focal_geometry', None) is not None:
+        if sample.focal_geometry.face_bbox_xywh is None:
+            return None
+    elif _is_face_alignment_basis(basis):
         if getattr(descriptor, "face_count", None) != 1:
             return None
     elif basis == "aggregate_human_silhouette":
@@ -1338,6 +1374,10 @@ def _attention_alignment_geometry(
             return None
     elif basis == "unambiguous_dominant_person_box_geometry_only":
         if not tuple(getattr(descriptor, "formation_people", ())):
+            return None
+    elif basis == FOCAL_SELECTOR_BODY_BASIS:
+        focal = getattr(sample, 'focal_geometry', None)
+        if focal is None or focal.person is None or (focal.face_bbox_xywh is None and focal.body_track is None):
             return None
     else:
         return None
@@ -2506,6 +2546,7 @@ def _track_is_dense_face_safe(
     elif resolved_basis in {
         "aggregate_human_silhouette",
         "unambiguous_dominant_person_box_geometry_only",
+        FOCAL_SELECTOR_BODY_BASIS,
     }:
         if any(subject_box is None for subject_box in subject_boxes):
             return reject("dense_subject_track_gap_unresolved")
@@ -2758,6 +2799,7 @@ def _track_is_dense_face_safe(
                 not in {
                     "pphumanseg_full_subject_silhouette",
                     "face_associated_formation_person_box",
+                    "source_local_focal_body_track",
                 }
             ):
                 return reject("dense_widened_subject_evidence_missing")
