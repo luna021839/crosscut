@@ -1,5 +1,7 @@
 from fractions import Fraction
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -194,6 +196,83 @@ class SeekLocalityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reader.frame_at(seconds)
         self.assertEqual(reader.seek_count, 0)
+
+
+class ActualDecoderLocalityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ffmpeg = shutil.which('ffmpeg')
+        cls.ffprobe = shutil.which('ffprobe')
+        if not cls.ffmpeg or not cls.ffprobe:
+            raise unittest.SkipTest('ffmpeg and ffprobe required')
+        encoders = subprocess.run(
+            [cls.ffmpeg, '-hide_banner', '-encoders'], capture_output=True,
+            check=True, timeout=10,
+        ).stdout
+        if b'libsvtav1' not in encoders:
+            raise unittest.SkipTest('SVT-AV1 fixture encoder unavailable')
+        directory = tempfile.TemporaryDirectory(prefix='crosscut-seek-clock-')
+        cls.addClassCleanup(directory.cleanup)
+        cls.directory = Path(directory.name)
+        cls.files = {}
+        for name, rate, filters in (
+            ('cfr', '30', []),
+            ('ntsc', '30000/1001', []),
+            ('vfr', '30', ['-vf', r'select=not(eq(mod(n\,5)\,0))',
+                           '-fps_mode', 'vfr']),
+        ):
+            output = cls.directory / (name + '.mp4')
+            subprocess.run(
+                [cls.ffmpeg, '-v', 'error', '-f', 'lavfi', '-i',
+                 'testsrc2=size=96x128:rate=' + rate + ':duration=2',
+                 *filters, '-an', '-c:v', 'libsvtav1', '-preset', '13',
+                 '-crf', '40', '-g', '30', '-svtav1-params', 'lp=1',
+                 str(output)], capture_output=True, check=True, timeout=30,
+            )
+            cls.files[name] = output
+
+    def compare_requests(self, path, clock):
+        baseline = cv2.VideoCapture(str(path))
+        accelerated = cv2.VideoCapture(str(path))
+        self.addCleanup(baseline.release)
+        self.addCleanup(accelerated.release)
+        if accelerated.getBackendName() != 'FFMPEG':
+            self.skipTest('FFmpeg decoder backend required')
+        reader = SeekLocalityReader(
+            accelerated, clock=clock, process_frame=lambda frame: frame,
+        )
+        rate = baseline.get(cv2.CAP_PROP_FPS)
+        values = [0, -1, 1, 2, 2.49, 2.5, 2.51, 3, 8, 12, 5, 30, 32, 31,
+                  48, 49, 55, 51, 56, 20, 21, 100, 1]
+        for value in values:
+            seconds = value / rate
+            baseline.set(cv2.CAP_PROP_POS_MSEC, max(0, seconds) * 1000)
+            success, expected = baseline.read()
+            actual = reader.frame_at(seconds)
+            with self.subTest(value=value):
+                if success:
+                    np.testing.assert_array_equal(actual, expected)
+                else:
+                    self.assertIsNone(actual)
+        return reader
+
+    def test_real_constant_rate_av1_matches_timestamp_decoder(self):
+        for name in ('cfr', 'ntsc'):
+            with self.subTest(name=name):
+                clock = probe_constant_frame_clock(
+                    self.files[name], ffprobe=self.ffprobe,
+                )
+                self.assertIsNotNone(clock)
+                reader = self.compare_requests(self.files[name], clock)
+                self.assertLess(reader.seek_count, 23)
+                self.assertGreater(reader.pixel_cache_hit_count, 0)
+
+    def test_real_vfr_is_not_aliasable_and_preserves_original_seeking(self):
+        clock = probe_constant_frame_clock(self.files['vfr'], ffprobe=self.ffprobe)
+        self.assertIsNone(clock)
+        reader = self.compare_requests(self.files['vfr'], clock)
+        self.assertFalse(reader.enabled)
+        self.assertEqual(reader.seek_count, 23)
 
 
 if __name__ == '__main__':
