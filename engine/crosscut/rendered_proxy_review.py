@@ -392,6 +392,9 @@ class OutputSubjectGeometry:
         tuple[float, float, float, float], ...
     ] = ()
     shot_scale_basis: str = "unknown_no_subject_geometry"
+    # Largest observed face-height scale (height / 0.42, clamped to one),
+    # separate from a unique focal face used for position/identity continuity.
+    framing_face_scale: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -467,6 +470,17 @@ class OutputSubjectGeometry:
         if not basis:
             raise ValueError("shot_scale_basis cannot be blank")
         object.__setattr__(self, "shot_scale_basis", basis)
+        if self.framing_face_scale is not None:
+            scale = _finite(self.framing_face_scale, "framing face scale")
+            if (
+                isinstance(self.framing_face_scale, bool)
+                or not 0.0 < scale <= 1.0
+                or self.face_count == 0
+                or self.face_backend == "none"
+                or basis != "dominant_face_height"
+            ):
+                raise ValueError("framing face scale requires observed face-height evidence")
+            object.__setattr__(self, "framing_face_scale", scale)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -494,6 +508,7 @@ class OutputSubjectGeometry:
                 list(box) for box in self.formation_boxes_xywh
             ],
             "shot_scale_basis": self.shot_scale_basis,
+            "framing_face_scale": self.framing_face_scale,
         }
 
 
@@ -524,6 +539,12 @@ def _default_geometry_provider(frame: np.ndarray) -> OutputSubjectGeometry:
             person.bbox_xywh for person in descriptor.formation_people
         ),
         shot_scale_basis=descriptor.shot_scale_basis,
+        framing_face_scale=(
+            descriptor.shot_scale
+            if descriptor.face_count > 0
+            and descriptor.shot_scale_basis == "dominant_face_height"
+            else None
+        ),
     )
 
 

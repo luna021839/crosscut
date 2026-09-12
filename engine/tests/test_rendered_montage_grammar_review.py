@@ -628,6 +628,63 @@ def _hash_bound_montage_config() -> RenderedMontageGrammarConfig:
 
 
 class RenderedMontageGrammarReviewTests(unittest.TestCase):
+    def test_face_framing_does_not_require_or_invent_a_unique_focal_face(self):
+        for scale, expected in ((0.45, "medium"), (0.65, "close")):
+            with self.subTest(scale=scale):
+                geometry = OutputSubjectGeometry(
+                    face_count=2, face_bbox_xywh=None, face_backend="yunet",
+                    shot_scale_basis="dominant_face_height", framing_face_scale=scale,
+                ).to_dict()
+                self.assertEqual(_proxy_geometry_shot_class(
+                    geometry, RenderedMontageGrammarConfig()), expected)
+                self.assertIsNone(geometry["face_bbox_xywh"])
+
+    def test_face_framing_metadata_cannot_come_from_missing_face_or_body_label(self):
+        for fields in (
+            dict(face_count=0, shot_scale_basis="dominant_face_height", framing_face_scale=.7),
+            dict(face_count=2, shot_scale_basis="aggregate_formation_people", framing_face_scale=.7),
+            dict(face_count=2, shot_scale_basis="dominant_face_height", framing_face_scale=float("nan")),
+            dict(face_count=2, shot_scale_basis="dominant_face_height", framing_face_scale=True),
+        ):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                OutputSubjectGeometry(**fields)
+
+    def test_cropped_shared_framing_matches_source_classifier_without_face_identity(self):
+        # Real decoded I AM 53.0 s geometry: large central upper body with
+        # smaller clipped neighbors, not a distant full formation.
+        boxes = (
+            (0.004032626641503714, 0.21604985485301834, 0.20941972271775594, 0.7633084474966254),
+            (0.2716739008562608, 0.2450446992156612, 0.45477195486547467, 0.7487679985008621),
+            (0.8076968291244723, 0.38812682601142273, 0.19230317087552773, 0.6023226441222196),
+        )
+        for face_count in (0, 2):
+            for mirrored in (False, True):
+                with self.subTest(face_count=face_count, mirrored=mirrored):
+                    observed = tuple((1-x-w, y, w, h) for x,y,w,h in boxes) if mirrored else boxes
+                    geometry = OutputSubjectGeometry(
+                        face_count=face_count,
+                        face_bbox_xywh=None,
+                        detected_person_count=3,
+                        formation_boxes_xywh=observed,
+                    ).to_dict()
+                    self.assertEqual(_proxy_geometry_shot_class(
+                        geometry, RenderedMontageGrammarConfig()), "medium")
+                    self.assertIsNone(geometry["face_bbox_xywh"])
+
+    def test_claimed_cropped_basis_cannot_promote_uncropped_or_interior_neighbors(self):
+        for boxes in (
+            ((0.0, 0.2, 0.2, 0.6), (0.3, 0.1, 0.4, 0.7), (0.8, 0.2, 0.2, 0.6)),
+            ((0.08, 0.2, 0.2, 0.6), (0.3, 0.2, 0.4, 0.8), (0.8, 0.2, 0.2, 0.6)),
+            ((0.15, 0.3, 0.14, 0.48), (0.43, 0.26, 0.15, 0.54), (0.71, 0.31, 0.13, 0.47)),
+        ):
+            with self.subTest(boxes=boxes):
+                geometry = OutputSubjectGeometry(
+                    detected_person_count=3, formation_boxes_xywh=boxes,
+                    shot_scale_basis="cropped_foreground_group",
+                ).to_dict()
+                self.assertEqual(_proxy_geometry_shot_class(
+                    geometry, RenderedMontageGrammarConfig()), "wide")
+
     def test_no_face_without_body_geometry_is_unknown_not_wide(
         self,
     ) -> None:

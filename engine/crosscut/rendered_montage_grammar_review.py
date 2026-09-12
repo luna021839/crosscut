@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -1019,8 +1020,23 @@ def _proxy_geometry_shot_class(
 ) -> str:
     geometry = value if isinstance(value, Mapping) else {}
     parsed = _normalized_face_geometry(value)
-    if parsed is not None:
-        face_count, (_x, _y, _width, height) = parsed
+    framing_face = (parsed[0], parsed[1][3]) if parsed is not None else None
+    if framing_face is None:
+        count = geometry.get("face_count")
+        scale = geometry.get("framing_face_scale")
+        backend = geometry.get("face_backend")
+        if (
+            isinstance(count, int) and not isinstance(count, bool) and count > 0
+            and isinstance(scale, (int, float)) and not isinstance(scale, bool)
+            and math.isfinite(float(scale)) and 0.0 < float(scale) <= 1.0
+            and isinstance(backend, str) and backend.strip() not in {"", "none"}
+            and geometry.get("shot_scale_basis") == "dominant_face_height"
+        ):
+            # Saturated scale is a lower bound on height; it is already above
+            # the existing close-up threshold. Never construct a focal bbox.
+            framing_face = (count, float(scale) * 0.42)
+    if framing_face is not None:
+        face_count, height = framing_face
         if (
             face_count < 4
             and height >= config.minimum_closeup_proxy_face_height_fraction
@@ -1052,9 +1068,19 @@ def _proxy_geometry_shot_class(
             for raw in raw_formation
         )
     ):
+        # Use the same geometry rule as source analysis, not its serialized
+        # shot label. These shape-only views supply no face identity, detection
+        # confidence or invented pose. Keep the close-face priority above.
+        from .visual_score import _cropped_foreground_group_scale
+
+        if _cropped_foreground_group_scale(
+            tuple(SimpleNamespace(bbox_xywh=tuple(float(item) for item in raw))
+                  for raw in raw_formation)
+        ) is not None:
+            return "medium"
         return "wide"
-    if parsed is not None:
-        face_count, (_x, _y, _width, height) = parsed
+    if framing_face is not None:
+        face_count, height = framing_face
         # Reuse visual_score's face thresholds exactly.
         if (
             face_count >= 4
