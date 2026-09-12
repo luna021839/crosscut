@@ -19,6 +19,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import re
@@ -628,11 +629,17 @@ def build_stage_edit_feature_snapshots(
     edit_mode: object = "group",
     target_member: object | None = None,
     inspection_only_without_causal_sensing: bool = False,
+    auto_causal_sensing: bool = False,
 ) -> StageEditFeatureSnapshotJobResult:
     """Build immutable feature-only snapshots for one complete song corpus."""
 
     normalized_song = str(song_id).strip()
     paths = tuple(Path(path) for path in supervision_paths)
+    if auto_causal_sensing:
+        from .ive_causal_sensing_media_job import reject_attitude_before_ive_causal_sensing_access
+        reject_attitude_before_ive_causal_sensing_access(song=normalized_song, source_paths=paths)
+        if inspection_only_without_causal_sensing or causal_sensing is not None:
+            raise ValueError('automatic causal sensing cannot be combined with manual or inspection-only inputs')
     destination = Path(output_directory)
     if not normalized_song or not paths:
         raise ValueError("song_id and supervision paths are required")
@@ -647,7 +654,7 @@ def build_stage_edit_feature_snapshots(
             raise ValueError(
                 "inspection-only feature job cannot bind causal sensing"
             )
-    else:
+    elif not auto_causal_sensing:
         if not isinstance(causal_sensing, StageEditCausalSensingArtifacts):
             raise ValueError(
                 "production feature snapshot job requires the complete causal-"
@@ -673,6 +680,12 @@ def build_stage_edit_feature_snapshots(
     catalog_sha256 = tuple(_canonical_sha256(value) for value in catalogs)
     if len(set(catalog_sha256)) != 1:
         raise ValueError("song references do not share one exact source catalog")
+    if auto_causal_sensing:
+        reject_attitude_before_ive_causal_sensing_access(
+            song=normalized_song,
+            source_ids=[item.get('video_id', item.get('source_id')) for item in catalogs[0] if isinstance(item, Mapping)],
+            source_paths=[item.get('path') for item in catalogs[0] if isinstance(item, Mapping)],
+        )
     sources = _source_records(catalogs[0])
     if expected_source_count is not None and len(sources) != expected_source_count:
         raise ValueError(
@@ -696,6 +709,16 @@ def build_stage_edit_feature_snapshots(
     master_times = tuple(sorted({time for item in scaffolds for time in item.times}))
     if not master_times:
         raise ValueError("reference corpus has no StageEdit decision times")
+    if auto_causal_sensing:
+        from .stage_edit_reference_causal_sensing import materialize_reference_causal_sensing
+        causal_sensing = materialize_reference_causal_sensing(
+            song=normalized_song, sources=sources, master_times=master_times,
+            artifact_directory=destination / 'causal-sensing',
+            edit_mode=edit_mode, target_member=target_member,
+        ).stage_edit_artifacts
+        causal_sensing.binding.require_production_scope(
+            edit_mode=edit_mode, target_member=target_member,
+        )
 
     # The identity/scalar-zero source defines the master clock.  Requiring it
     # explicitly avoids analyzing a reference with a shifted broadcaster intro.
@@ -953,6 +976,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--edit-mode", choices=("group", "member"), default="group")
     parser.add_argument("--target-member")
+    parser.add_argument('--auto-causal-sensing', action='store_true',
+        help='Measure the required causal-sensing triple from the exact training sources/grid using the installed gallery.')
     parser.add_argument("--shooting-grammar", type=Path)
     parser.add_argument("--shooting-grammar-content-sha256")
     parser.add_argument("--member-state-graph", type=Path)
@@ -971,6 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     args = build_parser().parse_args(argv)
     style: Mapping[str, Any] | None = None
     if args.style_features_json is not None:
@@ -991,7 +1017,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.ive_performer_state,
         args.ive_performer_state_content_sha256,
     )
-    if args.inspection_only_without_causal_sensing:
+    if args.auto_causal_sensing:
+        if args.inspection_only_without_causal_sensing or any(value is not None for value in sensing_values):
+            raise ValueError('automatic causal sensing cannot be combined with manual or inspection-only inputs')
+        causal_sensing = None
+    elif args.inspection_only_without_causal_sensing:
         if any(value is not None for value in sensing_values):
             raise ValueError(
                 "inspection-only feature job cannot accept causal-sensing inputs"
@@ -1036,6 +1066,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         inspection_only_without_causal_sensing=(
             args.inspection_only_without_causal_sensing
         ),
+        auto_causal_sensing=args.auto_causal_sensing,
     )
     print(
         json.dumps(
