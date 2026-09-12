@@ -5034,11 +5034,22 @@ class DirectMemberVisualTests(unittest.TestCase):
             queries.append((source_index, seconds))
             return _descriptor(.20 + source_index*.02,
                 foreground_obstruction_score=.94 if source_index == 0 and .48 < seconds < .52 else 0.)
-        result = select_balanced_direct_member_sources(
-            sources=tuple(Path(f'{i}.mp4') for i in range(3)), canonical_spans=spans,
-            audio_offsets=(0.,0.,0.), descriptor_provider=provider,
-            config=DirectMemberVisualConfig(beam_width=1000),
-        )
+        arguments = dict(sources=tuple(Path(f'{i}.mp4') for i in range(3)),
+            canonical_spans=spans, audio_offsets=(0.,0.,0.),
+            config=DirectMemberVisualConfig(beam_width=1000))
+        with patch('crosscut.direct_member_visual._balanced_visual_path',
+                   wraps=_balanced_visual_path) as solver:
+            result = select_balanced_direct_member_sources(**arguments, descriptor_provider=provider)
+            occluded_matrix = solver.call_args.args[0]
+        with patch('crosscut.direct_member_visual._balanced_visual_path',
+                   wraps=_balanced_visual_path) as solver:
+            select_balanced_direct_member_sources(**arguments,
+                descriptor_provider=lambda source, path, seconds: _descriptor(.20+source*.02))
+            clean_matrix = solver.call_args.args[0]
+        self.assertAlmostEqual(occluded_matrix[0][0][1].cost-clean_matrix[0][0][1].cost, .1)
+        self.assertEqual(occluded_matrix[0][0][1].base_mismatch, clean_matrix[0][0][1].base_mismatch)
+        self.assertEqual(occluded_matrix[0][1][0].cost, clean_matrix[0][1][0].cost)
+        self.assertEqual(occluded_matrix[1][0][1].cost, clean_matrix[1][0][1].cost)
         candidate = result.span_validity[0].sources[0]
         self.assertTrue(candidate.valid, candidate.rejection_reasons)
         self.assertEqual(candidate.foreground_obstruction_sample_count, 1)
