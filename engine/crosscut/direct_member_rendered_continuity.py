@@ -15,6 +15,9 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import cv2
+import numpy as np
+
 from .direct_member_visual import (
     DirectMemberVisualConfig,
     _AttentionGeometry,
@@ -25,6 +28,7 @@ from .direct_member_visual import (
     _common_attention_geometries,
     _cut_adjacent_motion_evidence,
     _embedding_distance,
+    _scale_log_ratio_evidence,
 )
 from .direct_member_target_face import (
     FOCAL_FACE_BASIS,
@@ -33,7 +37,8 @@ from .direct_member_target_face import (
     select_focal_face_matching_reference,
     select_focal_face_pair,
 )
-from .visual_score import FrameVisualDescriptor, _VideoSampler
+from .visual_score import FrameVisualDescriptor, _VideoSampler, describe_frame
+from .focal_selector_geometry import FocalSelectorGeometry, focal_pose_shape_mismatch
 
 
 ANALYSIS_BASIS = "automatic_member_exact_rendered_boundary_continuity_v1"
@@ -82,6 +87,10 @@ class DirectMemberRenderedContinuityConfig:
     maximum_silhouette_mismatch_p95: float = 0.35
     minimum_actual_pose_coverage_fraction: float = 0.80
     minimum_attention_coverage_fraction: float = 0.95
+    minimum_focal_reference_guided_fraction: float = 0.75
+    minimum_strong_subject_motion_magnitude: float = 0.08
+    maximum_strong_subject_motion_opposition: float = 0.35
+    maximum_strong_subject_motion_speed_ratio_mismatch: float = 0.75
     maximum_effect_endpoint_attention_position_step: float = 0.12
     maximum_effect_endpoint_attention_scale_step: float = 0.10
     maximum_effect_endpoint_pose_step: float = 0.24
@@ -132,9 +141,95 @@ class DirectMemberRenderedContinuityResult:
                 ),
                 "aspect_fill_and_editorial_transform_already_materialized": True,
                 "raw_pose_or_silhouette_vectors_persisted": False,
+                "normalized_attention_endpoint_geometry_persisted": True,
+                "focal_reference_embeddings_persisted": False,
+                "pose_recovery_input": (
+                    "same_decoded_output_frame_with_luminance_only_"
+                    "detector_normalization"
+                ),
+                "pose_recovery_spatial_transform_applied": False,
                 "failure_effect": "retain_pending_qa_and_do_not_expose",
             },
         }
+
+
+def _descriptor_has_actual_pose(
+    descriptor: FrameVisualDescriptor | None,
+) -> bool:
+    return bool(
+        descriptor is not None
+        and descriptor.pose_backend != "structure_hog_fallback"
+        and descriptor.pose_embedding
+        and math.isfinite(float(descriptor.pose_confidence))
+        and descriptor.pose_confidence > 0.0
+    )
+
+
+def _photometric_pose_variants(
+    frame: np.ndarray,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Build bounded, geometry-preserving detector views of one output frame."""
+
+    if not isinstance(frame, np.ndarray) or frame.size == 0:
+        return ()
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    luminance, channel_a, channel_b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    normalized_luminance = clahe.apply(luminance)
+    color_normalized = cv2.cvtColor(
+        cv2.merge((normalized_luminance, channel_a, channel_b)),
+        cv2.COLOR_LAB2BGR,
+    )
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    neutral_normalized = cv2.cvtColor(
+        clahe.apply(gray),
+        cv2.COLOR_GRAY2BGR,
+    )
+    return (
+        ("lab_luminance_clahe", color_normalized),
+        ("neutral_luminance_clahe", neutral_normalized),
+    )
+
+
+def _recover_actual_pose_under_photometric_variants(
+    frame: np.ndarray,
+    descriptor: FrameVisualDescriptor,
+    *,
+    describer: Callable[..., FrameVisualDescriptor] = describe_frame,
+) -> tuple[FrameVisualDescriptor, str | None]:
+    """Recover detector evidence without changing any reviewed output geometry."""
+
+    if _descriptor_has_actual_pose(descriptor):
+        return (descriptor, None)
+    recovered: tuple[str, FrameVisualDescriptor] | None = None
+    for label, variant in _photometric_pose_variants(frame):
+        try:
+            candidate = describer(
+                variant,
+                include_subject_geometry=True,
+                include_formation_pose=True,
+            )
+        except Exception:
+            continue
+        if not _descriptor_has_actual_pose(candidate):
+            continue
+        if (
+            recovered is None
+            or candidate.pose_confidence > recovered[1].pose_confidence
+        ):
+            recovered = (label, candidate)
+    if recovered is None:
+        return (descriptor, None)
+    label, candidate = recovered
+    return (
+        replace(
+            descriptor,
+            pose_embedding=candidate.pose_embedding,
+            pose_confidence=candidate.pose_confidence,
+            pose_backend=candidate.pose_backend,
+        ),
+        label,
+    )
 
 
 class _FinalVideoDescriptorProvider:
@@ -144,6 +239,9 @@ class _FinalVideoDescriptorProvider:
         self._focal_face_cache: dict[
             object, tuple[FocalFaceCandidate, ...]
         ] = {}
+        self.pose_recovery_attempt_frame_count = 0
+        self.pose_recovery_success_frame_count = 0
+        self.pose_recovery_variant_counts: dict[str, int] = {}
 
     def __call__(self, seconds: float) -> FrameVisualDescriptor | None:
         identity = self._sampler.frame_identity(seconds)
@@ -157,6 +255,28 @@ class _FinalVideoDescriptorProvider:
             )
         except Exception:
             descriptor = None
+        if descriptor is not None and not _descriptor_has_actual_pose(descriptor):
+            try:
+                frame = self._sampler.frame_at(seconds)
+                if frame is not None:
+                    self.pose_recovery_attempt_frame_count += 1
+                    descriptor, recovery_variant = (
+                        _recover_actual_pose_under_photometric_variants(
+                            frame,
+                            descriptor,
+                        )
+                    )
+                    if recovery_variant is not None:
+                        self.pose_recovery_success_frame_count += 1
+                        self.pose_recovery_variant_counts[recovery_variant] = (
+                            self.pose_recovery_variant_counts.get(
+                                recovery_variant,
+                                0,
+                            )
+                            + 1
+                        )
+            except Exception:
+                pass
         self._cache[identity] = descriptor
         return descriptor
 
@@ -218,10 +338,13 @@ def _samples_with_common_attention(
 def _sample_with_focal_face(
     sample: _BoundarySample,
     candidate: FocalFaceCandidate,
+    focal_geometry_provider=None,
 ) -> _BoundarySample:
     box = candidate.bbox_xywh
     return replace(
         sample,
+        focal_geometry=(focal_geometry_provider(sample.master_seconds,candidate)
+            if focal_geometry_provider is not None else sample.focal_geometry),
         attention=_AttentionGeometry(
             bbox_xywh=box,
             centroid_xy=(
@@ -229,8 +352,30 @@ def _sample_with_focal_face(
                 box[1] + box[3] / 2.0,
             ),
             basis=FOCAL_FACE_BASIS,
+            scale_area_proxy=(
+                candidate.landmark_scale**2
+                if candidate.landmark_scale is not None
+                else None
+            ),
         ),
     )
+
+
+def _serialized_attention_geometry(
+    attention: _AttentionGeometry | None,
+) -> dict[str, Any] | None:
+    if attention is None:
+        return None
+    return {
+        "bbox_xywh": list(attention.bbox_xywh),
+        "centroid_xy": list(attention.centroid_xy),
+        "scale_area_proxy": attention.scale_area_proxy,
+        "scale_measurement": (
+            "landmark_configuration_rms_squared"
+            if attention.scale_area_proxy is not None
+            else "bbox_area"
+        ),
+    }
 
 
 def _focal_face_window(
@@ -238,9 +383,12 @@ def _focal_face_window(
     *,
     frame_indices: Sequence[int],
     fps: float,
+    outgoing_references: Sequence[FocalFaceCandidate] = (),
+    incoming_references: Sequence[FocalFaceCandidate] = (),
 ) -> tuple[
     tuple[FocalFaceCandidate | None, ...],
-    float,
+    float | None,
+    bool,
 ] | None:
     """Resolve the same focal face at a hard cut and adjacent motion frames."""
 
@@ -251,20 +399,54 @@ def _focal_face_window(
         tuple(candidate_provider(frame_index / fps))
         for frame_index in frame_indices
     )
-    pair = select_focal_face_pair(candidates[1], candidates[2])
-    if pair is None:
-        return None
+    reference_guided = bool(outgoing_references and incoming_references)
+    selected_outgoing: FocalFaceCandidate | None = None
+    selected_incoming: FocalFaceCandidate | None = None
+    similarity: float | None = None
+    if reference_guided:
+        selected_outgoing = select_focal_face_matching_reference(
+            candidates[1],
+            outgoing_references,
+        )
+        selected_incoming = select_focal_face_matching_reference(
+            candidates[2],
+            incoming_references,
+        )
+        if selected_outgoing is not None and selected_incoming is not None:
+            reference_pair = select_focal_face_pair(
+                (selected_outgoing,),
+                (selected_incoming,),
+            )
+            similarity = (
+                reference_pair.cosine_similarity
+                if reference_pair is not None
+                else None
+            )
+        else:
+            reference_guided = False
+    if selected_outgoing is None or selected_incoming is None:
+        if outgoing_references or incoming_references:
+            # A source-bound target is not optional. Failure to observe that
+            # face cannot authorize a different matching performer in output.
+            return None
+        pair = select_focal_face_pair(candidates[1], candidates[2])
+        if pair is None:
+            return None
+        selected_outgoing = pair.outgoing
+        selected_incoming = pair.incoming
+        similarity = pair.cosine_similarity
     previous = select_focal_face_matching_reference(
         candidates[0],
-        (pair.outgoing,),
+        (selected_outgoing,),
     )
     following = select_focal_face_matching_reference(
         candidates[3],
-        (pair.incoming,),
+        (selected_incoming,),
     )
     return (
-        (previous, pair.outgoing, pair.incoming, following),
-        pair.cosine_similarity,
+        (previous, selected_outgoing, selected_incoming, following),
+        similarity,
+        reference_guided,
     )
 
 
@@ -274,10 +456,41 @@ def evaluate_direct_member_rendered_continuity(
     *,
     config: DirectMemberRenderedContinuityConfig | None = None,
     descriptor_provider: RenderedDescriptorProvider | None = None,
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int, tuple[FocalFaceCandidate, FocalFaceCandidate]
+    ] | None = None,
+    focal_pose_model_path: Path | None = None,
+    focal_geometry_provider=None,
 ) -> DirectMemberRenderedContinuityResult:
     """Evaluate every real hard source switch in the encoded member video."""
 
     settings = config or DirectMemberRenderedContinuityConfig()
+    if focal_pose_model_path is not None and (
+        descriptor_provider is not None or focal_geometry_provider is not None
+    ):
+        raise ValueError('rendered focal pose model requires its owned decoded video provider')
+    if focal_reference_candidates_by_boundary_index is not None:
+        if not isinstance(
+            focal_reference_candidates_by_boundary_index,
+            Mapping,
+        ) or any(
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+            or not isinstance(reference_pair, tuple)
+            or len(reference_pair) != 2
+            or any(
+                not isinstance(candidate, FocalFaceCandidate)
+                for candidate in reference_pair
+            )
+            for boundary_index, reference_pair in (
+                focal_reference_candidates_by_boundary_index.items()
+            )
+        ):
+            raise ValueError("rendered focal references are malformed")
+    reference_authority_active = bool(
+        focal_reference_candidates_by_boundary_index
+    )
     fps = _finite(render_plan.get("fps"))
     output_frames = _integer(render_plan.get("output_frame_count"))
     segments = _sequence(render_plan.get("segments"), "render segments")
@@ -322,6 +535,13 @@ def evaluate_direct_member_rendered_continuity(
         owned = _FinalVideoDescriptorProvider(path)
         provider = owned
     assert provider is not None
+    if focal_pose_model_path is not None:
+        from .rendered_focal_geometry import RenderedFocalGeometryProvider
+        try:
+            focal_geometry_provider=RenderedFocalGeometryProvider(owned._sampler.frame_at,focal_pose_model_path)
+        except BaseException:
+            owned.close()
+            raise
     visual_config = replace(
         DirectMemberVisualConfig(),
         sample_frame_step_seconds=1.0 / fps,
@@ -333,6 +553,8 @@ def evaluate_direct_member_rendered_continuity(
     silhouette_values: list[float] = []
     position_values: list[float] = []
     scale_values: list[float] = []
+    focal_guided_position_values: list[float] = []
+    focal_guided_scale_values: list[float] = []
     actual_pose_count = 0
     attention_count = 0
     hard_switch_count = 0
@@ -342,6 +564,10 @@ def evaluate_direct_member_rendered_continuity(
     effect_endpoint_pose_count = 0
     focal_face_correspondence_count = 0
     focal_face_motion_window_count = 0
+    focal_face_reference_guided_count = 0
+    effect_focal_face_correspondence_count = 0
+    effect_focal_reference_guided_count = 0
+    aggregate_silhouette_diagnostic_only_count = 0
 
     def fail(reason: str, boundary_index: int) -> None:
         failures_by_reason.setdefault(reason, []).append(boundary_index)
@@ -486,10 +712,113 @@ def evaluate_direct_member_rendered_continuity(
                     fps=fps,
                     provider=provider,
                 )
+                # Camera correction for an overlap cannot use the blended
+                # entry/exit samples themselves: a face detector may jump
+                # between the two performers as alpha changes. Resolve the
+                # exact pure outgoing frame immediately before the effect and
+                # the exact pure incoming frame immediately after it instead.
+                # These are the two pictures the virtual camera must align;
+                # the outgoing handle holds its final transform while the
+                # incoming transform is held through the overlap.
+                pure_focal_window = _focal_face_window(
+                    provider,
+                    frame_indices=(
+                        max(0, boundary_frame - 2),
+                        boundary_frame - 1,
+                        effect_next_frame,
+                        min(output_frames - 1, effect_next_frame + 1),
+                    ),
+                    fps=fps,
+                    outgoing_references=(
+                        (
+                            focal_reference_candidates_by_boundary_index[
+                                boundary_index
+                            ][0],
+                        )
+                        if focal_reference_candidates_by_boundary_index is not None
+                        and boundary_index
+                        in focal_reference_candidates_by_boundary_index
+                        else ()
+                    ),
+                    incoming_references=(
+                        (
+                            focal_reference_candidates_by_boundary_index[
+                                boundary_index
+                            ][1],
+                        )
+                        if focal_reference_candidates_by_boundary_index is not None
+                        and boundary_index
+                        in focal_reference_candidates_by_boundary_index
+                        else ()
+                    ),
+                )
+                if focal_geometry_provider is not None and (
+                    focal_reference_candidates_by_boundary_index is None
+                    or boundary_index not in focal_reference_candidates_by_boundary_index
+                ):
+                    fail("rendered_boundary_target_reference_unresolved", boundary_index)
+                pure_focal_similarity: float | None = None
+                pure_focal_reference_guided = False
+                if pure_focal_window is not None:
+                    (
+                        pure_focal_candidates,
+                        pure_focal_similarity,
+                        pure_focal_reference_guided,
+                    ) = pure_focal_window
+                    assert pure_focal_candidates[1] is not None
+                    assert pure_focal_candidates[2] is not None
+                    pure_outgoing, pure_incoming = (
+                        _sample_with_focal_face(
+                            entry_previous,
+                            pure_focal_candidates[1],
+                            focal_geometry_provider,
+                        ),
+                        _sample_with_focal_face(
+                            exit_next,
+                            pure_focal_candidates[2],
+                            focal_geometry_provider,
+                        ),
+                    )
+                    effect_focal_face_correspondence_count += 1
+                    effect_focal_reference_guided_count += int(
+                        pure_focal_reference_guided
+                    )
+                else:
+                    pure_outgoing, pure_incoming = (
+                        _samples_with_common_attention(
+                            (entry_previous, exit_next),
+                            minimum_silhouette_confidence=(
+                                visual_config.minimum_silhouette_confidence
+                            ),
+                        )
+                    )
+                pure_position, pure_scale = _attention_mismatch(
+                    pure_outgoing.attention,
+                    pure_incoming.attention,
+                )
+                pure_pose = None
+                if (
+                    pure_outgoing.descriptor is not None
+                    and pure_incoming.descriptor is not None
+                ):
+                    pure_pose = (focal_pose_shape_mismatch(pure_outgoing.focal_geometry,pure_incoming.focal_geometry)
+                        if focal_geometry_provider is not None else _embedding_distance(
+                        _actual_pose_vector(
+                            pure_outgoing.descriptor,
+                            visual_config,
+                        )
+                        or (),
+                        _actual_pose_vector(
+                            pure_incoming.descriptor,
+                            visual_config,
+                        )
+                        or (),
+                    ))
                 records.append(
                     {
                         "boundary_index": boundary_index,
                         "output_frame_index": boundary_frame,
+                        "output_seconds": boundary_frame / fps,
                         "outgoing_source_index": outgoing_source,
                         "incoming_source_index": incoming_source,
                         "transition_kind": transition_kind,
@@ -508,6 +837,43 @@ def evaluate_direct_member_rendered_continuity(
                                 right=exit_next,
                             ),
                         ],
+                        "pure_endpoint_sample_frame_indices": [
+                            boundary_frame - 1,
+                            effect_next_frame,
+                        ],
+                        "descriptors_available": bool(
+                            pure_outgoing.descriptor is not None
+                            and pure_incoming.descriptor is not None
+                        ),
+                        "attention_basis": {
+                            "outgoing": (
+                                pure_outgoing.attention.basis
+                                if pure_outgoing.attention is not None
+                                else None
+                            ),
+                            "incoming": (
+                                pure_incoming.attention.basis
+                                if pure_incoming.attention is not None
+                                else None
+                            ),
+                        },
+                        "attention_geometry": {
+                            "outgoing": _serialized_attention_geometry(
+                                pure_outgoing.attention
+                            ),
+                            "incoming": _serialized_attention_geometry(
+                                pure_incoming.attention
+                            ),
+                        },
+                        "attention_position_mismatch": pure_position,
+                        "attention_scale_mismatch": pure_scale,
+                        "pose_mismatch": pure_pose,
+                        "focal_face_correspondence_similarity": (
+                            pure_focal_similarity
+                        ),
+                        "focal_face_reference_guided": (
+                            pure_focal_reference_guided
+                        ),
                         "raw_embeddings_persisted": False,
                     }
                 )
@@ -547,6 +913,13 @@ def evaluate_direct_member_rendered_continuity(
             )
             if not descriptors_available:
                 fail("rendered_boundary_descriptor_missing", boundary_index)
+            if focal_geometry_provider is not None and (
+                focal_reference_candidates_by_boundary_index is None
+                or boundary_index not in focal_reference_candidates_by_boundary_index
+            ):
+                # A missing source reference is not permission to identify
+                # an arbitrary matching pair of background performers.
+                fail("rendered_boundary_target_reference_unresolved", boundary_index)
             focal_window = _focal_face_window(
                 provider,
                 frame_indices=(
@@ -556,23 +929,55 @@ def evaluate_direct_member_rendered_continuity(
                     boundary_frame + 1,
                 ),
                 fps=fps,
+                outgoing_references=(
+                    (
+                        focal_reference_candidates_by_boundary_index[
+                            boundary_index
+                        ][0],
+                    )
+                    if focal_reference_candidates_by_boundary_index is not None
+                    and boundary_index
+                    in focal_reference_candidates_by_boundary_index
+                    else ()
+                ),
+                incoming_references=(
+                    (
+                        focal_reference_candidates_by_boundary_index[
+                            boundary_index
+                        ][1],
+                    )
+                    if focal_reference_candidates_by_boundary_index is not None
+                    and boundary_index
+                    in focal_reference_candidates_by_boundary_index
+                    else ()
+                ),
             )
             focal_similarity: float | None = None
+            focal_reference_guided = False
             if focal_window is not None:
-                focal_candidates, focal_similarity = focal_window
+                (
+                    focal_candidates,
+                    focal_similarity,
+                    focal_reference_guided,
+                ) = focal_window
                 assert focal_candidates[1] is not None
                 assert focal_candidates[2] is not None
                 endpoint_samples = (
                     _sample_with_focal_face(
                         outgoing_endpoint,
                         focal_candidates[1],
+                        focal_geometry_provider,
                     ),
                     _sample_with_focal_face(
                         incoming_start,
                         focal_candidates[2],
+                        focal_geometry_provider,
                     ),
                 )
                 focal_face_correspondence_count += 1
+                focal_face_reference_guided_count += int(
+                    focal_reference_guided
+                )
             else:
                 focal_candidates = (None, None, None, None)
                 endpoint_samples = _samples_with_common_attention(
@@ -586,12 +991,47 @@ def evaluate_direct_member_rendered_continuity(
                 endpoint_outgoing.attention,
                 endpoint_incoming.attention,
             )
+            bbox_scale_mismatch: float | None = None
+            landmark_scale_mismatch: float | None = None
+            scale_direction_agreement: bool | None = None
+            if (
+                endpoint_outgoing.attention is not None
+                and endpoint_incoming.attention is not None
+            ):
+                (
+                    bbox_scale_log,
+                    landmark_scale_log,
+                    scale_direction_agreement,
+                    _consensus_scale_log,
+                ) = _scale_log_ratio_evidence(
+                    endpoint_outgoing.attention.bbox_xywh[2]
+                    * endpoint_outgoing.attention.bbox_xywh[3],
+                    endpoint_incoming.attention.bbox_xywh[2]
+                    * endpoint_incoming.attention.bbox_xywh[3],
+                    endpoint_outgoing.attention.scale_area_proxy,
+                    endpoint_incoming.attention.scale_area_proxy,
+                )
+                bbox_scale_mismatch = min(
+                    1.0,
+                    abs(bbox_scale_log) / math.log(3.2),
+                )
+                landmark_scale_mismatch = (
+                    min(
+                        1.0,
+                        abs(landmark_scale_log) / math.log(3.2),
+                    )
+                    if landmark_scale_log is not None
+                    else None
+                )
             if position is None or scale is None:
                 fail("rendered_boundary_attention_missing", boundary_index)
             else:
                 attention_count += 1
                 position_values.append(position)
                 scale_values.append(scale)
+                if focal_reference_guided:
+                    focal_guided_position_values.append(position)
+                    focal_guided_scale_values.append(scale)
                 if position > settings.maximum_attention_position_mismatch + 1e-9:
                     fail("rendered_boundary_position_discontinuity", boundary_index)
                 if scale > settings.maximum_attention_scale_mismatch + 1e-9:
@@ -605,10 +1045,11 @@ def evaluate_direct_member_rendered_continuity(
             if left is not None and right is not None:
                 left_pose = _actual_pose_vector(left, visual_config)
                 right_pose = _actual_pose_vector(right, visual_config)
-                pose_mismatch = _embedding_distance(
+                pose_mismatch = (focal_pose_shape_mismatch(endpoint_outgoing.focal_geometry,endpoint_incoming.focal_geometry)
+                    if focal_geometry_provider is not None else _embedding_distance(
                     left_pose or (),
                     right_pose or (),
-                )
+                ))
                 if pose_mismatch is not None:
                     actual_pose_count += 1
                     pose_values.append(pose_mismatch)
@@ -625,14 +1066,31 @@ def evaluate_direct_member_rendered_continuity(
                     else (),
                 )
                 # A full-frame segmentation contains every visible dancer.
-                # Once the official-fancam focal face has been verified on
-                # both sides, that aggregate is not the target member's body
-                # outline and must not overrule focal geometry and pose.
-                silhouette_mismatch = (
-                    None
-                    if focal_window is not None
-                    else aggregate_silhouette_mismatch
-                )
+                # With source-bound member references active, it is never a
+                # target-body authority when actual pose is available -- even
+                # on the occasional wide frame where the focal face vanishes.
+                # A source-bound focal face also supplies direct target-member
+                # identity and framing evidence when one pose frame is absent.
+                # The aggregate remains a fail-closed fallback only when both
+                # target-specific authorities are missing.
+                if reference_authority_active:
+                    silhouette_mismatch = (
+                        aggregate_silhouette_mismatch
+                        if pose_mismatch is None
+                        and not focal_reference_guided
+                        else None
+                    )
+                else:
+                    silhouette_mismatch = (
+                        None
+                        if focal_window is not None
+                        else aggregate_silhouette_mismatch
+                    )
+                if (
+                    aggregate_silhouette_mismatch is not None
+                    and silhouette_mismatch is None
+                ):
+                    aggregate_silhouette_diagnostic_only_count += 1
                 if silhouette_mismatch is not None:
                     silhouette_values.append(silhouette_mismatch)
                     if (
@@ -643,12 +1101,16 @@ def evaluate_direct_member_rendered_continuity(
                             "rendered_boundary_silhouette_discontinuity",
                             boundary_index,
                         )
-            if pose_mismatch is None and silhouette_mismatch is None:
+            if (
+                pose_mismatch is None
+                and silhouette_mismatch is None
+                and not focal_reference_guided
+            ):
                 fail("rendered_boundary_shape_evidence_missing", boundary_index)
 
             if all(candidate is not None for candidate in focal_candidates):
                 motion_samples = tuple(
-                    _sample_with_focal_face(sample, candidate)
+                    _sample_with_focal_face(sample, candidate, focal_geometry_provider)
                     for sample, candidate in zip(
                         samples,
                         focal_candidates,
@@ -664,6 +1126,12 @@ def evaluate_direct_member_rendered_continuity(
                         visual_config.minimum_silhouette_confidence
                     ),
                 )
+            if focal_geometry_provider is not None:
+                # Missing focal frames must not reactivate whole-frame pose
+                # in the four-frame motion window.
+                motion_samples=tuple(replace(s,focal_geometry=s.focal_geometry or
+                    FocalSelectorGeometry(0,s.master_seconds,None,pose_backend='rtmpose_body7'))
+                    for s in motion_samples)
             motion = _cut_adjacent_motion_evidence(
                 outgoing_previous=motion_samples[0],
                 outgoing_endpoint=motion_samples[1],
@@ -672,19 +1140,33 @@ def evaluate_direct_member_rendered_continuity(
                 config=visual_config,
                 output_space_subject_motion_used=True,
             )
-            if motion.both_moving:
+            strong_output_subject_motion_gate = bool(
+                focal_reference_guided
+                and motion.outgoing_subject_motion_magnitude is not None
+                and motion.incoming_subject_motion_magnitude is not None
+                and motion.outgoing_subject_motion_magnitude
+                + 1e-9
+                >= settings.minimum_strong_subject_motion_magnitude
+                and motion.incoming_subject_motion_magnitude
+                + 1e-9
+                >= settings.minimum_strong_subject_motion_magnitude
+            )
+            if strong_output_subject_motion_gate:
                 if (
-                    motion.direction_cosine_audit_only is None
-                    or motion.direction_cosine_audit_only
-                    < visual_config.minimum_motion_direction_cosine - 1e-9
+                    motion.subject_direction_cosine is None
+                    or motion.subject_direction_cosine
+                    < -settings.maximum_strong_subject_motion_opposition
+                    - 1e-9
                 ):
                     fail("rendered_boundary_motion_direction_opposed", boundary_index)
                 if (
-                    motion.motion_speed_ratio_mismatch is not None
-                    and motion.motion_speed_ratio_mismatch
-                    > visual_config.maximum_motion_speed_ratio_mismatch + 1e-9
+                    motion.subject_motion_speed_ratio_mismatch is not None
+                    and motion.subject_motion_speed_ratio_mismatch
+                    > settings.maximum_strong_subject_motion_speed_ratio_mismatch
+                    + 1e-9
                 ):
                     fail("rendered_boundary_motion_speed_discontinuity", boundary_index)
+            if motion.both_moving:
                 if (
                     motion.pose_phase_continuation_mismatch is not None
                     and motion.pose_phase_continuation_mismatch
@@ -718,14 +1200,73 @@ def evaluate_direct_member_rendered_continuity(
                             else None
                         ),
                     },
+                    "attention_geometry": {
+                        "outgoing": (
+                            {
+                                "bbox_xywh": list(
+                                    endpoint_outgoing.attention.bbox_xywh
+                                ),
+                                "centroid_xy": list(
+                                    endpoint_outgoing.attention.centroid_xy
+                                ),
+                                "scale_area_proxy": (
+                                    endpoint_outgoing.attention.scale_area_proxy
+                                ),
+                                "scale_measurement": (
+                                    "landmark_configuration_rms_squared"
+                                    if endpoint_outgoing.attention.scale_area_proxy
+                                    is not None
+                                    else "bbox_area"
+                                ),
+                            }
+                            if endpoint_outgoing.attention is not None
+                            else None
+                        ),
+                        "incoming": (
+                            {
+                                "bbox_xywh": list(
+                                    endpoint_incoming.attention.bbox_xywh
+                                ),
+                                "centroid_xy": list(
+                                    endpoint_incoming.attention.centroid_xy
+                                ),
+                                "scale_area_proxy": (
+                                    endpoint_incoming.attention.scale_area_proxy
+                                ),
+                                "scale_measurement": (
+                                    "landmark_configuration_rms_squared"
+                                    if endpoint_incoming.attention.scale_area_proxy
+                                    is not None
+                                    else "bbox_area"
+                                ),
+                            }
+                            if endpoint_incoming.attention is not None
+                            else None
+                        ),
+                    },
                     "attention_position_mismatch": position,
                     "attention_scale_mismatch": scale,
+                    "attention_bbox_scale_mismatch_diagnostic": (
+                        bbox_scale_mismatch
+                    ),
+                    "attention_landmark_scale_mismatch_diagnostic": (
+                        landmark_scale_mismatch
+                    ),
+                    "attention_scale_evidence_direction_agreement": (
+                        scale_direction_agreement
+                    ),
                     "pose_mismatch": pose_mismatch,
                     "silhouette_mismatch": silhouette_mismatch,
                     "aggregate_silhouette_mismatch_diagnostic_only": (
                         aggregate_silhouette_mismatch
                     ),
                     "focal_face_correspondence_similarity": focal_similarity,
+                    "focal_face_reference_guided": (
+                        focal_reference_guided
+                    ),
+                    "strong_output_subject_motion_gate_applied": (
+                        strong_output_subject_motion_gate
+                    ),
                     "motion": motion.to_dict(),
                     "raw_embeddings_persisted": False,
                 }
@@ -738,6 +1279,16 @@ def evaluate_direct_member_rendered_continuity(
     source_switch_count = hard_switch_count + effect_switch_count
     pose_coverage = actual_pose_count / hard_count if hard_count else 0.0
     attention_coverage = attention_count / hard_count if hard_count else 0.0
+    focal_reference_coverage = (
+        focal_face_reference_guided_count / hard_count
+        if hard_count
+        else 0.0
+    )
+    focal_authority_coverage = (
+        focal_face_correspondence_count / hard_count
+        if hard_count
+        else 0.0
+    )
     if source_switch_count == 0:
         failures_by_reason.setdefault(
             "no_rendered_source_switch_boundaries",
@@ -756,9 +1307,31 @@ def evaluate_direct_member_rendered_continuity(
     ):
         failures_by_reason.setdefault("rendered_attention_coverage_below_floor", [])
 
+    if (
+        reference_authority_active
+        and hard_count > 0
+        and (focal_reference_coverage if focal_geometry_provider is not None
+             else focal_authority_coverage) + 1e-9
+        < settings.minimum_focal_reference_guided_fraction
+    ):
+        failures_by_reason.setdefault(
+            "rendered_focal_reference_coverage_below_floor",
+            [],
+        )
+
+    strict_position_values = (
+        focal_guided_position_values
+        if reference_authority_active
+        else position_values
+    )
+    strict_scale_values = (
+        focal_guided_scale_values
+        if reference_authority_active
+        else scale_values
+    )
     p95_metrics = {
-        "attention_position_mismatch_p95": _p95(position_values),
-        "attention_scale_mismatch_p95": _p95(scale_values),
+        "attention_position_mismatch_p95": _p95(strict_position_values),
+        "attention_scale_mismatch_p95": _p95(strict_scale_values),
         "pose_mismatch_p95": _p95(pose_values),
         "silhouette_mismatch_p95": _p95(silhouette_values),
     }
@@ -794,6 +1367,9 @@ def evaluate_direct_member_rendered_continuity(
         if indices
     }
     metrics = {
+        "pose_measurement_basis": ('source_referenced_output_rtmpose_body7'
+            if focal_geometry_provider is not None else 'legacy_full_frame_pose'),
+        "effect_endpoint_step_pose_basis": "legacy_full_frame_step_not_target_specific",
         "fps": fps,
         "output_frame_count": output_frames,
         "source_switch_boundary_count": source_switch_count,
@@ -805,14 +1381,50 @@ def evaluate_direct_member_rendered_continuity(
         "focal_face_correspondence_boundary_count": (
             focal_face_correspondence_count
         ),
+        "focal_face_reference_guided_boundary_count": (
+            focal_face_reference_guided_count
+        ),
+        "focal_face_reference_guided_fraction": focal_reference_coverage,
+        "focal_face_authoritative_fraction": focal_authority_coverage,
+        "focal_face_authority_basis": (
+            "source_bound_reference_or_verified_official_fancam_"
+            "cross_output_correspondence"
+        ),
+        "focal_reference_authority_active": reference_authority_active,
         "focal_face_motion_window_count": focal_face_motion_window_count,
+        "effect_focal_face_correspondence_boundary_count": (
+            effect_focal_face_correspondence_count
+        ),
+        "effect_focal_face_reference_guided_boundary_count": (
+            effect_focal_reference_guided_count
+        ),
+        "aggregate_silhouette_diagnostic_only_boundary_count": (
+            aggregate_silhouette_diagnostic_only_count
+        ),
         "actual_pose_boundary_count": actual_pose_count,
         "actual_pose_coverage_fraction": pose_coverage,
         "attention_boundary_count": attention_count,
         "attention_coverage_fraction": attention_coverage,
+        "all_attention_position_mismatch_p95_diagnostic_only": _p95(
+            position_values
+        ),
+        "all_attention_scale_mismatch_p95_diagnostic_only": _p95(
+            scale_values
+        ),
         **p95_metrics,
         "exact_incoming_first_frame_evaluated": True,
         "final_render_transform_domain_evaluated": True,
+        "photometric_pose_recovery_attempt_frame_count": (
+            owned.pose_recovery_attempt_frame_count if owned is not None else 0
+        ),
+        "photometric_pose_recovery_success_frame_count": (
+            owned.pose_recovery_success_frame_count if owned is not None else 0
+        ),
+        "photometric_pose_recovery_variant_counts": (
+            dict(sorted(owned.pose_recovery_variant_counts.items()))
+            if owned is not None
+            else {}
+        ),
     }
     return DirectMemberRenderedContinuityResult(
         passed=not failure_reasons,

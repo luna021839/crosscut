@@ -37,6 +37,7 @@ from .direct_member_rendered_continuity import (
     DirectMemberRenderedContinuityConfig,
     evaluate_direct_member_rendered_continuity,
 )
+from .direct_member_target_face import FocalFaceCandidate
 from .post_render_perceptual_quality import (
     ANALYSIS_BASIS as PERCEPTUAL_ANALYSIS_BASIS,
     PerceptualQualityConfig,
@@ -1295,14 +1296,26 @@ def _rendered_continuity_payload(
     config: AutomaticMemberPostRenderQAConfig,
     evaluator: RenderedContinuityEvaluator,
     issues: _Issues,
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     """Run the fail-closed exact-frame action/geometry continuity gate."""
 
     try:
+        evaluator_kwargs: dict[str, Any] = {
+            "config": config.rendered_continuity,
+        }
+        if focal_reference_candidates_by_boundary_index is not None:
+            evaluator_kwargs[
+                "focal_reference_candidates_by_boundary_index"
+            ] = focal_reference_candidates_by_boundary_index
         raw = evaluator(
             artifacts.video_path,
             plan,
-            config=config.rendered_continuity,
+            **evaluator_kwargs,
         )
         if isinstance(raw, Mapping):
             payload = dict(raw)
@@ -1506,6 +1519,11 @@ def evaluate_automatic_member_post_render_qa(
     rendered_continuity_evaluator: RenderedContinuityEvaluator = (
         evaluate_direct_member_rendered_continuity
     ),
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ]
+    | None = None,
     created_at: datetime | None = None,
 ) -> AutomaticMemberPostRenderQAReport:
     """Evaluate one pending automatic member render without mutating inputs."""
@@ -1580,6 +1598,7 @@ def evaluate_automatic_member_post_render_qa(
         settings,
         rendered_continuity_evaluator,
         issues,
+        focal_reference_candidates_by_boundary_index,
     )
     metrics["rendered_continuity"] = rendered_continuity
     perceptual, receipt = _perceptual_and_receipt(
@@ -1681,6 +1700,11 @@ def evaluate_and_write_automatic_member_post_render_qa(
     rendered_continuity_evaluator: RenderedContinuityEvaluator = (
         evaluate_direct_member_rendered_continuity
     ),
+    focal_reference_candidates_by_boundary_index: Mapping[
+        int,
+        tuple[FocalFaceCandidate, FocalFaceCandidate],
+    ]
+    | None = None,
     created_at: datetime | None = None,
 ) -> tuple[AutomaticMemberPostRenderQAReport, Path]:
     report = evaluate_automatic_member_post_render_qa(
@@ -1689,6 +1713,9 @@ def evaluate_and_write_automatic_member_post_render_qa(
         runner=runner,
         perceptual_evaluator=perceptual_evaluator,
         rendered_continuity_evaluator=rendered_continuity_evaluator,
+        focal_reference_candidates_by_boundary_index=(
+            focal_reference_candidates_by_boundary_index
+        ),
         created_at=created_at,
     )
     return report, report.write_atomic(output_path)

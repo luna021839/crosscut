@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 import hashlib
 from itertools import combinations
 import json
@@ -5060,6 +5061,7 @@ def _enforce_automatic_member_post_render_qa(
         tuple[FocalFaceCandidate, FocalFaceCandidate],
     ]
     | None = None,
+    rendered_continuity_evaluator=None,
 ) -> Path | None:
     """Promote an automatic direct-member MP4 only after final pixel QA.
 
@@ -5111,6 +5113,8 @@ def _enforce_automatic_member_post_render_qa(
     report, report_path = (
         evaluate_and_write_automatic_member_post_render_qa(
             artifacts,
+            **({"rendered_continuity_evaluator": rendered_continuity_evaluator}
+                if rendered_continuity_evaluator is not None else {}),
             focal_reference_candidates_by_boundary_index=(
                 focal_reference_candidates_by_boundary_index
             ),
@@ -9863,6 +9867,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("body_appearance.py"),
                 Path(__file__).with_name("body_pose_2d.py"),
                 Path(__file__).with_name("native_focal_faces.py"),
+                Path(__file__).with_name("rendered_focal_geometry.py"),
             )
         }
         from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
@@ -27156,6 +27161,7 @@ def analyze(
     member_direct_dense_face_review_payload: dict[str, Any] | None = None
     member_direct_professional_pre_render_payload: dict[str, Any] | None = None
     member_look_plan: DirectMemberLookPlan | None = None
+    member_rendered_continuity_evaluator = None
     member_final_focal_reference_candidates_by_boundary_index: dict[
         int,
         tuple[FocalFaceCandidate, FocalFaceCandidate],
@@ -34328,6 +34334,11 @@ def analyze(
                 "직캠 대상 인물·포즈 관측 공유 활성화 · 선택과 카메라 보정이 "
                 "동일한 원본 프레임 관측 사용 · 외장 관측 캐시 재사용"
             )
+            from .direct_member_rendered_continuity import evaluate_direct_member_rendered_continuity
+            member_rendered_continuity_evaluator = partial(
+                evaluate_direct_member_rendered_continuity,
+                focal_pose_model_path=dense_face_provider.pose.model_path,
+            )
 
             effect_authoring_failed_edges: list[tuple[float, int, int]] = []
 
@@ -34810,6 +34821,7 @@ def analyze(
                                 candidate_plan,
                                 Path(temporary_directory)
                                 / "member-candidate.mp4",
+                                continuity_evaluator=member_rendered_continuity_evaluator,
                                 focal_reference_candidates_by_boundary_index=(
                                     candidate_focal_reference_candidates_by_boundary_index
                                 ),
@@ -37694,6 +37706,7 @@ def analyze(
             manifest=manifest,
             manifest_path=manifest_path,
             reporter=reporter,
+            rendered_continuity_evaluator=member_rendered_continuity_evaluator,
             focal_reference_candidates_by_boundary_index=(
                 member_final_focal_reference_candidates_by_boundary_index
             ),
