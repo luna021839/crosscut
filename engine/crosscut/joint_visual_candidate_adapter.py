@@ -254,6 +254,8 @@ class JointDecodedMontageFeedback:
             "minimum_distinct_render_variant_count": (
                 MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
             ),
+            "minimum_variants_for_bounded_rank_feedback": 1,
+            "single_variant_policy": "half_additional_existing_role_penalty_without_shot_relabeling",
             "hard_no_good_authoring_allowed": False,
             "thresholds_lowered": False,
             "raw_frames_persisted": False,
@@ -305,11 +307,16 @@ def _candidate_role_face_boxes(
 def _canonical_decoded_montage_feedback(
     lattice: Sequence[Sequence[TimelineCandidate]],
     feedback: JointDecodedMontageFeedback | None,
+    *,
+    minimum_variants: int = MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS,
 ) -> tuple[
     dict[JointTimelineCandidateClock, tuple[str | None, str | None, str | None]],
     dict[str, object],
 ]:
     """Validate feedback against the exact lattice and promote stable samples."""
+
+    if type(minimum_variants) is not int or minimum_variants not in (1, 2):
+        raise ValueError("decoded feedback support must be one or two variants")
 
     if feedback is not None and not isinstance(
         feedback,
@@ -379,7 +386,7 @@ def _canonical_decoded_montage_feedback(
                     for shot_class, variants in variants_by_class.items()
                     if shot_class in _DECODED_MONTAGE_PROMOTABLE_CLASSES
                     and len(variants)
-                    >= MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
+                    >= minimum_variants
                 )
             )
             if len(supported) > 1:
@@ -416,7 +423,7 @@ def _canonical_decoded_montage_feedback(
         "conflicting_repeated_sample_count": conflicting_sample_count,
         "redundant_wide_sample_count": redundant_wide_sample_count,
         "minimum_distinct_render_variant_count": (
-            MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS
+            minimum_variants
         ),
         "exact_candidate_clock_binding_valid": True,
         "hard_no_good_count": 0,
@@ -431,6 +438,8 @@ def _decoded_montage_role_control_inputs(
     lattice: Sequence[Sequence[TimelineCandidate]],
     subject_metadata_by_candidate: Mapping[str, _CandidateSubjectMetadata],
     feedback: JointDecodedMontageFeedback | None,
+    *,
+    minimum_variants: int = MINIMUM_DECODED_MONTAGE_FEEDBACK_RENDER_VARIANTS,
 ) -> tuple[
     tuple[tuple[TimelineCandidate, ...], ...],
     Mapping[str, _CandidateSubjectMetadata],
@@ -438,7 +447,9 @@ def _decoded_montage_role_control_inputs(
 ]:
     """Build a scoring-only lattice without changing provider proof identity."""
 
-    promoted, audit = _canonical_decoded_montage_feedback(lattice, feedback)
+    promoted, audit = _canonical_decoded_montage_feedback(
+        lattice, feedback, minimum_variants=minimum_variants,
+    )
     metadata = dict(subject_metadata_by_candidate)
     shadow_segments: list[tuple[TimelineCandidate, ...]] = []
     cold_start_close_demotion_count = 0
@@ -508,6 +519,53 @@ def _decoded_montage_role_control_inputs(
         }
     )
     return tuple(shadow_segments), MappingProxyType(metadata), audit
+
+
+def _single_variant_feedback_keys(lattice, feedback):
+    """Clocks with one adverse observation, not yet stable relabeling evidence."""
+    promoted, _audit = _canonical_decoded_montage_feedback(
+        lattice, feedback, minimum_variants=1,
+    )
+    counts: dict[JointTimelineCandidateClock, int] = {}
+    for observation in (() if feedback is None else feedback.observations):
+        counts[observation.candidate_clock] = counts.get(observation.candidate_clock, 0) + 1
+    return frozenset(
+        (candidate.segment_index, candidate.source_id)
+        for segment in lattice for candidate in segment
+        if (clock := JointTimelineCandidateClock.from_candidate(candidate)) in promoted
+        and counts[clock] == 1
+    )
+
+
+def _blend_single_variant_role_adjustments(base, provisional, keys):
+    """Use first evidence now, without exclusions or confident shot relabeling.
+
+    Half of an additional existing-role penalty is applied only to the exact
+    observed candidate. Two-variant promotion remains the ordinary role path.
+    No reward, new gate, global penalty on unseen sources, or switch-bonus
+    change can be produced by one failed render.
+    """
+    adjusted = dict(base)
+    changed = 0
+    largest = 0.0
+    for key in sorted(keys):
+        original = float(base.get(key, 0.0))
+        observed = float(provisional.get(key, 0.0))
+        if not all(math.isfinite(value) and value <= 0.0 for value in (original, observed)):
+            raise ValueError("decoded provisional role penalties must be finite and non-positive")
+        penalty = max(0.0, original - observed) * 0.5
+        if penalty:
+            adjusted[key] = original - penalty
+            changed += 1
+            largest = max(largest, penalty)
+    return adjusted, dict(
+        contract="single_decoded_variant_bounded_role_penalty_v1",
+        observed_candidate_count=len(keys), adjusted_candidate_count=changed,
+        observation_weight=0.5, maximum_applied_penalty=largest,
+        existing_role_penalty_interpolation=True, candidate_exclusions=0,
+        unobserved_candidate_adjustments=0, switch_bonus_changed=False,
+        shot_labels_overridden=False, thresholds_lowered=False,
+    )
 
 
 def _canonical_external_boundary_no_goods(
@@ -1736,6 +1794,16 @@ def select_joint_visual_candidates(
             }
         )
 
+    single_variant_keys = _single_variant_feedback_keys(lattice, decoded_montage_feedback)
+    provisional_role_inputs = (
+        _decoded_montage_role_control_inputs(
+            lattice, workspace.subject_metadata_by_candidate,
+            decoded_montage_feedback, minimum_variants=1,
+        )
+        if single_variant_keys and workspace.professional_montage_policy is not None
+        else None
+    )
+
     external_boundary_no_goods = _canonical_external_boundary_no_goods(
         lattice,
         forbidden_boundary_selections,
@@ -1958,6 +2026,22 @@ def select_joint_visual_candidates(
                         forbidden_boundary_edges=hard_forbidden_boundary_edges,
                     )
                 )
+                single_variant_audit = None
+                if provisional_role_inputs is not None:
+                    provisional_lattice, provisional_metadata, _ = provisional_role_inputs
+                    provisional_adjustments, _, _ = _role_conditioned_visual_controls(
+                        provisional_lattice,
+                        section_plan=workspace.section_plan,
+                        phrase_times=workspace.phrase_times,
+                        policy=workspace.professional_montage_policy,
+                        cadence_profile=profile.name,
+                        subject_metadata_by_candidate=provisional_metadata,
+                        timeline_config=profile.config,
+                        forbidden_boundary_edges=hard_forbidden_boundary_edges,
+                    )
+                    adjustments, single_variant_audit = _blend_single_variant_role_adjustments(
+                        adjustments, provisional_adjustments, single_variant_keys,
+                    )
                 if any(
                     not math.isfinite(float(value)) or float(value) > 0.0
                     for value in adjustments.values()
@@ -1968,6 +2052,7 @@ def select_joint_visual_candidates(
                     )
                 role_audit = {
                     **dict(raw_role_audit),
+                    "single_variant_decoded_feedback": single_variant_audit,
                     "decoded_montage_feedback": dict(
                         decoded_montage_feedback_audit
                     ),
