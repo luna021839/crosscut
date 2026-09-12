@@ -897,6 +897,7 @@ def build_direct_member_look_plan(
     visual_selection: DirectMemberVisualSelection,
     render_segments: Sequence[RenderSegment],
     config: DirectMemberLookConfig | None = None,
+    require_predicted_pass: bool = True,
 ) -> DirectMemberLookPlan:
     settings = config or DirectMemberLookConfig()
     segments = tuple(render_segments)
@@ -952,7 +953,9 @@ def build_direct_member_look_plan(
                 sample_count=len(embeddings),
             )
         )
-    return solve_direct_member_look_adjustments(observations, config=settings)
+    return solve_direct_member_look_adjustments(
+        observations, config=settings, require_predicted_pass=require_predicted_pass,
+    )
 
 
 __all__ = [

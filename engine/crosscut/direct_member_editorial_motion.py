@@ -34,6 +34,11 @@ from .direct_member_target_face import (
     select_focal_face_pair,
 )
 from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
+from .focal_reference_consensus import (
+    FocalReferenceConsensus,
+    SoloFaceObservation,
+    build_focal_reference_consensus,
+)
 from .member_editorial_motion import (
     MemberEditorialMotionConfig,
     _State,
@@ -320,9 +325,12 @@ class DirectMemberDenseFaceProvider:
         feature_cache_directory: Path | None = None,
         feature_derived_cache_directory: Path | None = None,
         require_persistent_feature_cache: bool = False,
+        require_focal_consensus: bool = False,
     ) -> None:
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be boolean")
+        if not isinstance(require_focal_consensus, bool):
+            raise TypeError("require_focal_consensus must be boolean")
         if (
             require_persistent_feature_cache
             and feature_derived_cache_directory is None
@@ -342,6 +350,10 @@ class DirectMemberDenseFaceProvider:
         self._focal_references: list[list[FocalFaceCandidate]] = [
             [] for _source in self._sources
         ]
+        self._require_focal_consensus = require_focal_consensus
+        self._frozen_focal_banks: dict[int, FocalReferenceConsensus | None] = {}
+        self._frozen_focal_queries: dict[tuple[object, ...], FocalFaceCandidate | None] = {}
+        self._focal_temporal_recovery_count = 0
         self._focal_boundary_reference_capture: list[
             tuple[
                 int,
@@ -504,11 +516,79 @@ class DirectMemberDenseFaceProvider:
         source_index: int,
         candidate: FocalFaceCandidate,
     ) -> None:
+        if getattr(self, "_require_focal_consensus", False):
+            # Query matches must never expand the acquisition-time identity
+            # bank, even when the match was recovered through a nearby frame.
+            return
         references = self._focal_references[source_index]
         if candidate not in references:
             references.append(candidate)
         if len(references) > 32:
             del references[:-32]
+
+    def _ensure_focal_consensus(self, source_index: int) -> FocalReferenceConsensus | None:
+        if source_index in self._frozen_focal_banks:
+            return self._frozen_focal_banks[source_index]
+        sampler = self._samplers[source_index]
+        if sampler is None:
+            self._frozen_focal_banks[source_index] = None
+            return None
+        capture = sampler.capture
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        observations = []
+        bank = None
+        if math.isfinite(fps) and fps > 0 and math.isfinite(count) and count > 0:
+            duration = count/fps
+            # An initially occluded grid does not exclude a scarce source:
+            # inspect the 20 interleaved frames once, with the same evidence
+            # rules and a hard 41-frame per-source bootstrap bound.
+            for positions in (tuple(range(21)), tuple(i+.5 for i in range(20))):
+                for position in positions:
+                    seconds = duration*(.03+.94*position/20)
+                    candidates = self._focal_candidates(source_index, seconds)
+                    if (len(candidates) == 1 and .2 <= candidates[0].center_xy[0] <= .8
+                            and candidates[0].bbox_xywh[3] >= .05):
+                        observations.append(SoloFaceObservation(seconds, candidates[0]))
+                bank = build_focal_reference_consensus(observations)
+                if bank is not None:
+                    break
+        self._frozen_focal_banks[source_index] = bank
+        # These are immutable seeds, not pair-local discoveries. Preserve the
+        # existing transient-reference interface for downstream diagnostics.
+        self._focal_references[source_index] = (
+            [observation.candidate for observation in bank.references] if bank else []
+        )
+        return bank
+
+    def _frozen_focal_candidate(
+        self, source_index: int, seconds: float, *, direction: int = 0,
+    ) -> FocalFaceCandidate | None:
+        sampler = self._samplers[source_index]
+        if sampler is None:
+            return None
+        if self._require_persistent_feature_cache:
+            sampler.assert_required_persistent_cache_available()
+        key = (*self._identity_key(source_index, sampler, seconds), direction)
+        if key in self._frozen_focal_queries:
+            return self._frozen_focal_queries[key]
+        bank = self._ensure_focal_consensus(source_index)
+        candidates = self._focal_candidates(source_index, seconds)
+        selected = bank.select(candidates) if bank else None
+        if bank and candidates and selected is None:
+            observations = []
+            for sign in ((direction,) if direction else (-1, 1)):
+                for offset in (.10, .20, .30):
+                    adjacent_seconds = max(0., seconds+sign*offset)
+                    adjacent = bank.select(self._focal_candidates(source_index, adjacent_seconds))
+                    if adjacent is not None:
+                        observations.append(SoloFaceObservation(adjacent_seconds, adjacent))
+            selected = bank.recover_from_adjacent_observations(
+                candidates, query_seconds=seconds, adjacent_observations=observations,
+            )
+            self._focal_temporal_recovery_count += int(selected is not None)
+        self._frozen_focal_queries[key] = selected
+        return selected
 
     def begin_focal_boundary_reference_capture(self) -> None:
         """Start one ordered, path-local capture before dense motion planning."""
@@ -548,6 +628,15 @@ class DirectMemberDenseFaceProvider:
             incoming_source_index,
             max(0.0, incoming_seconds),
         )
+        if self._require_focal_consensus:
+            left = self._frozen_focal_candidate(
+                outgoing_source_index, max(0., outgoing_seconds), direction=-1,
+            )
+            right = self._frozen_focal_candidate(
+                incoming_source_index, max(0., incoming_seconds), direction=1,
+            )
+            left_candidates = (left,) if left else ()
+            right_candidates = (right,) if right else ()
         pair = select_focal_face_pair(left_candidates, right_candidates)
         if pair is None:
             self._focal_boundary_reference_capture.append(
@@ -654,6 +743,10 @@ class DirectMemberDenseFaceProvider:
             exact_seconds: float,
             direction: float,
         ) -> FocalFaceCandidate | None:
+            if getattr(self, "_require_focal_consensus", False):
+                return self._frozen_focal_candidate(
+                    source_index, max(0., exact_seconds), direction=int(direction),
+                )
             exact_candidates = self._focal_candidates(
                 source_index,
                 max(0.0, exact_seconds),
@@ -744,6 +837,15 @@ class DirectMemberDenseFaceProvider:
         if key in self._cache:
             self._cache_hit_count += 1
             return self._cache[key]
+        if self._require_focal_consensus:
+            selected = self._frozen_focal_candidate(source_index, normalized_seconds)
+            sample = (self._sample_for_focal_candidate(source_index, normalized_seconds, selected)
+                      if selected is not None else None)
+            self._focal_reference_match_count += int(selected is not None)
+            # A crowd silhouette or an unrelated solo face is not a verified
+            # substitute when the frozen focal track is occluded.
+            self._cache[key] = sample
+            return sample
         references = self._focal_references[source_index]
         if references:
             selected = select_focal_face_matching_reference(
@@ -838,7 +940,7 @@ class DirectMemberDenseFaceProvider:
         self._cache[key] = sample
         return sample
 
-    def diagnostics(self) -> dict[str, int | bool | str]:
+    def diagnostics(self) -> dict[str, object]:
         persistent = tuple(
             diagnostics
             for sampler in self._samplers
@@ -861,6 +963,12 @@ class DirectMemberDenseFaceProvider:
                 len(values) for values in self._focal_references
             ),
             "focal_face_basis": FOCAL_FACE_BASIS,
+            "frozen_focal_consensus_required": self._require_focal_consensus,
+            "frozen_focal_consensus": {
+                str(index): bank.to_dict() if bank else None
+                for index, bank in self._frozen_focal_banks.items()
+            },
+            "focal_temporal_recovery_count": self._focal_temporal_recovery_count,
             "persistent_feature_cache_enabled_source_count": len(persistent),
             "persistent_feature_cache_hit_count": sum(
                 int(item.get("hit_count", 0)) for item in persistent

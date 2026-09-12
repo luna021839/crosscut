@@ -88,6 +88,10 @@ from .direct_member_look import (
     build_direct_member_look_plan,
     refine_direct_member_look_plan_from_rendered_proxy,
 )
+from .member_look_preflight import (
+    build_member_look_proxy_proposal,
+    predicted_member_look_failure_reasons,
+)
 from .direct_member_transition import (
     OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT,
     build_direct_member_pose_dissolve_plan,
@@ -34665,6 +34669,7 @@ def analyze(
             try:
                 dense_face_provider = DirectMemberDenseFaceProvider(
                     tuple(request.sources[index] for index in eligible_indices),
+                    require_focal_consensus=True,
                     **_visual_feature_cache_arguments(request),
                 )
 
@@ -35378,10 +35383,21 @@ def analyze(
                             render_segments=attached_segments,
                         )
                     )
-                    candidate_member_look_plan = build_direct_member_look_plan(
+                    candidate_member_look_plan = build_member_look_proxy_proposal(
                         visual_selection=direct_visual_selection,
                         render_segments=candidate_segments,
+                        mandatory_decoded_proxy=True,
                     )
+                    cached_look_failures = predicted_member_look_failure_reasons(
+                        candidate_member_look_plan,
+                    )
+                    if cached_look_failures:
+                        reporter.log(
+                            "직캠 원본 캐시 룩 예측 미충족 · "
+                            + ",".join(cached_look_failures)
+                            + " · 보정 범위와 재렌더 상한은 유지하며 "
+                            "필수 실출력 QA로 판정"
+                        )
                     candidate_segments = candidate_member_look_plan.apply(
                         candidate_segments
                     )
