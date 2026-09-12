@@ -9354,20 +9354,16 @@ def _heterogeneous_cinematic_visual_path(
                 raw_portrait_bridge_candidate_count_by_boundary[
                     boundary_index
                 ] += 1
-        retained_bridges: set[tuple[int, int]] = set()
-        grouped: dict[tuple[int, str], list[tuple[float, int, int]]] = {}
-        for item in bridge_candidates:
-            _cost, left_source, right_source = item
-            if left_source in landscape_sources:
-                key = (left_source, "outgoing")
-            elif right_source in landscape_sources:
-                key = (right_source, "incoming")
-            else:
-                key = (right_source, "portrait_incoming")
-            grouped.setdefault(key, []).append(item)
-        for values in grouped.values():
-            for _cost, left_source, right_source in sorted(values)[:3]:
-                retained_bridges.add((left_source, right_source))
+        # Local cost is not a dominance proof: a fourth-ranked predecessor can
+        # be the only one reachable from earlier cuts or compatible with later
+        # exposure/cadence constraints. Keep the complete measured edge domain
+        # (already bounded by source_count**2 per boundary). The MILP's existing
+        # time/node budget controls search; pruning a valid edge must not turn a
+        # capacity shortcut into a false proof that no edit path exists.
+        retained_bridges = {
+            (left_source, right_source)
+            for _cost, left_source, right_source in bridge_candidates
+        }
 
         for left_source in range(source_count):
             if upper_x[boundary_index * source_count + left_source] <= 0.5:
@@ -10093,6 +10089,7 @@ def _heterogeneous_cinematic_visual_path(
         "raw_bridge_candidate_edge_count": sum(
             raw_bridge_candidate_count_by_boundary
         ),
+        "bridge_candidate_pruning_policy": "complete_admissible_pair_domain",
         "raw_portrait_bridge_candidate_edge_count": sum(
             raw_portrait_bridge_candidate_count_by_boundary
         ),
@@ -10395,8 +10392,14 @@ def _heterogeneous_cinematic_visual_path(
                 ],
                 dtype=np.int32,
             )
+            # A counterfactual asks whether a witness EXISTS, not whether its
+            # editorial cost is optimal. Reusing the production objective can
+            # spend the entire diagnostic budget improving a known feasible
+            # path and then report only a timeout. A constant objective makes
+            # the first feasible witness optimal without changing any row or
+            # admitting it to production selection.
             probe_result = milp(
-                objective,
+                np.zeros(variable_count, dtype=np.float64),
                 integrality=integrality,
                 bounds=Bounds(lower_bounds, upper_bounds),
                 constraints=LinearConstraint(
@@ -10434,6 +10437,7 @@ def _heterogeneous_cinematic_visual_path(
                 "status": int(probe_result.status),
                 "message": str(probe_result.message),
                 "success": bool(probe_result.success),
+                "objective_policy": "feasibility_only_constant_zero",
                 "mip_node_count": int(
                     getattr(probe_result, "mip_node_count", 0) or 0
                 ),

@@ -227,6 +227,54 @@ def _linear_timewarp(
 
 
 class DirectMemberVisualTests(unittest.TestCase):
+    def test_fourth_ranked_bridge_preserves_the_only_all_source_path(self) -> None:
+        safe = _optimizer_mismatch(0.04)
+        severe = _optimizer_mismatch(0.50, severe=True)
+        expected = (0, 1, 2, 3, 4, 0, 1, 2, 4, 0)
+        matrices = [
+            [[severe for _ in range(5)] for _ in range(5)]
+            for _ in range(len(expected) - 1)
+        ]
+        for boundary, (left, right) in enumerate(zip(expected, expected[1:])):
+            matrices[boundary][left][right] = safe
+        for left in range(4):
+            matrices[3][left][4] = replace(
+                severe, cost=0.20 + left * 0.01, base_mismatch=0.30,
+                severe_flags=("attention_scale",),
+                cinematic_bridge=DirectMemberCinematicBridge(
+                    style="zoom_in", outgoing_is_landscape=False,
+                    incoming_is_landscape=False,
+                    authorized_severe_flags=("attention_scale",),
+                    pose_mismatch=0.12, silhouette_mismatch=0.18,
+                    base_mismatch=0.30,
+                ),
+            )
+        validity = tuple(
+            tuple(source == selected or (position == 3 and source < 4)
+                  for source in range(5))
+            for position, selected in enumerate(expected)
+        )
+        kwargs = dict(
+            source_order=tuple(range(5)), candidate_validity=validity,
+            span_durations=(4.0,) * len(expected),
+            source_geometries=(direct_member_source_frame_geometry((2160, 3840)),) * 5,
+            priority_cut_boundary_indices=(3,), maximum_priority_cut_hold_count=0,
+            config=DirectMemberVisualConfig(),
+        )
+        result = _heterogeneous_cinematic_visual_path(matrices, **kwargs)
+        self.assertIsNotNone(result)
+        path, _, diagnostics = result
+        self.assertEqual(path, expected)
+        self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
+        self.assertEqual(diagnostics["solver"]["raw_bridge_candidate_edge_count"], 4)
+        self.assertEqual(diagnostics["solver"]["bridge_candidate_edge_count"], 4)
+
+        # Reproduce the former local top-three filter: its cheaper alternatives
+        # cannot include source 3 anywhere, so it destroys a valid full path.
+        matrices[3][3][4] = severe
+        with self.assertRaises(DirectMemberVisualSelectionError):
+            _heterogeneous_cinematic_visual_path(matrices, **kwargs)
+
     def test_boundary_alignment_exposure_tolerance_preserves_omitted_sources(
         self,
     ) -> None:
@@ -923,7 +971,14 @@ class DirectMemberVisualTests(unittest.TestCase):
         )
         self.assertTrue(diagnostics["solver"]["postsolve_path_audit_passed"])
 
-        with self.assertRaises(DirectMemberVisualSelectionError) as raised:
+        from scipy.optimize import milp as actual_milp
+        probe_objectives = []
+
+        def capture_objective(objective, **kwargs):
+            probe_objectives.append(tuple(float(value) for value in objective))
+            return actual_milp(objective, **kwargs)
+
+        with patch("scipy.optimize.milp", side_effect=capture_objective), self.assertRaises(DirectMemberVisualSelectionError) as raised:
             _heterogeneous_cinematic_visual_path(
                 matrices,
                 source_order=(0, 1),
@@ -945,6 +1000,12 @@ class DirectMemberVisualTests(unittest.TestCase):
         ]
         self.assertTrue(relaxation["evidence_only"])
         self.assertFalse(relaxation["witness_render_authorized"])
+        self.assertEqual(len(probe_objectives), len(relaxation["probes"]) + 2)
+        self.assertTrue(any(value != 0.0 for value in probe_objectives[0]))
+        self.assertTrue(all(value == 0.0 for objective in probe_objectives[1:-1] for value in objective))
+        self.assertTrue(any(value != 0.0 for value in probe_objectives[-1]))
+        self.assertTrue(all(item["objective_policy"] == "feasibility_only_constant_zero"
+                            for item in relaxation["probes"]))
         self.assertIn(
             "without_bridge_contract_constraints",
             relaxation["feasible_probe_names"],
