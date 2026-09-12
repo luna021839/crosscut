@@ -48,6 +48,10 @@ from .group_boundary_grammar_adapter import (
     adapt_group_boundary_grammar_evidence,
 )
 from .ive import AspectRatio
+from .joint_release_policy import (
+    JOINT_RELEASE_CANDIDATE_COUNT,
+    joint_release_policy_payload,
+)
 from .render import (
     BoundaryLookKeyframe,
     BoundaryLookTrack,
@@ -2291,7 +2295,7 @@ def _validate_selection(
             collector.add(
                 f"selection_{name}",
                 QAIssueSeverity.FAIL,
-                "The exact-eight decoded candidate selection contract did not pass.",
+                "The required decoded candidate selection contract did not pass.",
                 path=f"selection.{name}",
                 value=passed,
                 threshold=True,
@@ -7421,6 +7425,29 @@ def evaluate_post_render_qa(
             input_artifact_fingerprints=input_artifact_fingerprints,
             created_at=created_at or datetime.now(UTC),
         )
+
+    # The policy must agree in BOTH independently loaded artifacts. Never use
+    # an arbitrary serialized candidate count to weaken the decoded QA gates.
+    render_payload = _mapping(analysis.get("render")) or {}
+    release_policy = selection.get("release_policy")
+    if release_policy is not None or render_payload.get("release_policy") is not None:
+        if (
+            release_policy == joint_release_policy_payload()
+            and render_payload.get("release_policy") == release_policy
+            and selection.get("candidate_pool") == "joint_decoded_visual_selector"
+            and render_payload.get("candidate_origin") == "joint_decoded_visual_selector"
+        ):
+            settings = replace(
+                settings,
+                required_complete_candidate_count=JOINT_RELEASE_CANDIDATE_COUNT,
+            )
+        else:
+            collector.add(
+                "candidate_release_policy_mismatch", QAIssueSeverity.FAIL,
+                "Candidate release policy is invalid or differs across artifacts.",
+                path="selection.release_policy", value=release_policy,
+                threshold=joint_release_policy_payload(),
+            )
 
     metrics["artifact_binding"] = _validate_artifact_binding(
         artifact_set, analysis, plan, selection, collector

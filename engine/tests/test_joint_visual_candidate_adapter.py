@@ -1018,6 +1018,62 @@ def _limited_profile_pools(
 
 
 class JointVisualCandidateAdapterTests(unittest.TestCase):
+    def test_one_to_seven_candidates_can_reach_materialization_under_delivery_policy(self):
+        for pool_size in (1, 2, 7):
+            with self.subTest(pool_size=pool_size):
+                candidate_set = _candidate_set()
+                provider = StubMaterializingProvider(fps=10.0)
+                pools = _limited_profile_pools(
+                    candidate_set, unique_path_count=pool_size, alternate_paths=(),
+                )
+                with patch(
+                    "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+                    side_effect=pools,
+                ):
+                    selected = select_joint_visual_candidates(
+                        candidate_set, provider=provider, fps=10.0,
+                        minimum_unique_paths=1, minimum_required_candidates=1,
+                        maximum_candidates=8,
+                    )
+                self.assertEqual(len(selected.candidate_records), 1)
+                self.assertTrue(selected.candidate_records[0].review.passed)
+                self.assertEqual(selected.candidate_set.sources, candidate_set.sources)
+                materialized = materialize_joint_visual_candidates(
+                    selected, provider=provider, fps=10.0, maximum_candidates=8,
+                )
+                self.assertEqual(len(materialized), 1)
+                with self.assertRaisesRegex(ValueError, "required passing"):
+                    replace(selected, selections=(), candidate_records=(), boundary_proof_bundles=())
+
+    def test_single_delivery_policy_does_not_admit_a_failed_review(self):
+        candidate_set = _candidate_set()
+        pools = _limited_profile_pools(
+            candidate_set, unique_path_count=2, alternate_paths=(),
+        )
+        def reject(plan, *, available_source_count=None):
+            return replace(
+                _synthetic_review(plan, available_source_count=available_source_count),
+                hard_failures=("synthetic_global_quality_failure",),
+            )
+        with patch(
+            "crosscut.joint_visual_candidate_adapter.select_joint_timeline_candidates",
+            side_effect=pools,
+        ), patch("crosscut.joint_visual_candidate_adapter.review_timeline", side_effect=reject):
+            with self.assertRaises(NoCompleteTimelinePath):
+                _production_select_joint_visual_candidates(
+                    candidate_set, provider=StubMaterializingProvider(fps=10.0),
+                    fps=10.0, minimum_unique_paths=1, minimum_required_candidates=1,
+                    maximum_candidates=8,
+                )
+
+    def test_zero_candidate_delivery_requirement_is_invalid(self):
+        with self.assertRaisesRegex(ValueError, "between 1 and 24"):
+            select_joint_visual_candidates(
+                _candidate_set(), provider=StubMaterializingProvider(fps=10.0),
+                fps=10.0, minimum_unique_paths=1, minimum_required_candidates=0,
+                maximum_candidates=8,
+            )
+
     def test_one_off_decoded_wide_observation_stays_audited_only(self) -> None:
         candidate_set = _candidate_set(role_conditioned=True)
         workspace = candidate_set.optimizer_workspace

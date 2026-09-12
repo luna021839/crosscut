@@ -93,7 +93,7 @@ JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS = (
     "joint_visual_candidate_adapter_v1+"
     "three_existing_safe_cadence_profiles_v1+"
     "exact_source_shot_proof_variant_coalescing_v2+"
-    "mathematical_unique_path_floor_minimum_eight_render_variants_v2+"
+    "explicit_passing_cohort_separate_from_comparison_capacity_v3+"
     "shifted_scene_cut_clock_rematerialization_v1+"
     "workspace_only_optimizer_seed_v1+"
     "selection_scalar_exact_rehydration_v1+"
@@ -855,6 +855,8 @@ class JointVisualSelectionSet:
     )
     selection_retry_audit: Mapping[str, Any] = field(default_factory=dict)
     analysis_basis: str = JOINT_VISUAL_CANDIDATE_ADAPTER_BASIS
+    minimum_required_candidates: int = MINIMUM_PRODUCTION_JOINT_CANDIDATES
+    minimum_unique_paths: int = MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -867,8 +869,11 @@ class JointVisualSelectionSet:
         selections = tuple(self.selections)
         records = tuple(self.candidate_records)
         proof_bundles = tuple(self.boundary_proof_bundles)
-        if len(selections) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-            raise ValueError("joint selection set requires at least eight variants")
+        _validate_cohort_requirements(
+            self.minimum_required_candidates, self.minimum_unique_paths,
+        )
+        if len(selections) < self.minimum_required_candidates:
+            raise ValueError("joint selection set lacks required passing variants")
         if len(selections) != len(records) or len(selections) != len(
             proof_bundles
         ):
@@ -959,7 +964,7 @@ class JointVisualSelectionSet:
             raise ValueError("candidate records lost their shifted joint timeline")
         paths = tuple(selection.source_shot_path for selection in selections)
         unique_path_count = len(set(paths))
-        if unique_path_count < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS:
+        if unique_path_count < self.minimum_unique_paths:
             raise ValueError(
                 "joint selection set does not retain the mathematical minimum "
                 "of unique source/shot paths"
@@ -967,7 +972,7 @@ class JointVisualSelectionSet:
         supplement_count = len(paths) - unique_path_count
         required_supplement_count = max(
             0,
-            MINIMUM_PRODUCTION_JOINT_CANDIDATES - unique_path_count,
+            self.minimum_required_candidates - unique_path_count,
         )
         if supplement_count != required_supplement_count:
             raise ValueError(
@@ -1083,6 +1088,8 @@ class JointVisualSelectionSet:
         return {
             "analysis_basis": self.analysis_basis,
             "candidate_count": len(self.candidate_records),
+            "minimum_required_candidates": self.minimum_required_candidates,
+            "minimum_unique_paths": self.minimum_unique_paths,
             "unique_source_shot_path_count": self.unique_source_shot_path_count,
             "proof_variant_supplement_count": (
                 self.proof_variant_supplement_count
@@ -1446,14 +1453,26 @@ def _boundary_review_no_goods(
     return frozenset(no_goods)
 
 
+def _validate_cohort_requirements(required: int, unique: int) -> None:
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (required, unique)):
+        raise ValueError("candidate cohort requirements must be integers")
+    if not 1 <= required <= 24 or not 1 <= unique <= 24:
+        raise ValueError("candidate cohort requirements must be between 1 and 24")
+    if unique < math.ceil(required / MAXIMUM_PRODUCTION_PROOF_VARIANTS_PER_PATH):
+        raise ValueError("minimum_unique_paths is below the mathematical render cohort floor")
+
+
 def _production_passing_cohort(
     reviewed: Sequence[_ReviewedJointCandidate],
     *,
     maximum_candidates: int,
     minimum_unique_paths: int,
+    minimum_required_candidates: int = MINIMUM_PRODUCTION_JOINT_CANDIDATES,
 ) -> tuple[_ReviewedJointCandidate, ...]:
     """Choose passed candidates while preserving path and proof diversity."""
 
+    _validate_cohort_requirements(minimum_required_candidates, minimum_unique_paths)
     passing = tuple(item for item in reviewed if item.review.passed)
     if not passing:
         return ()
@@ -1474,14 +1493,11 @@ def _production_passing_cohort(
     if len(primary_paths) < minimum_unique_paths:
         return ()
     cohort = list(primaries)
-    if len(cohort) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
-        # ``maximum_candidates`` is an upper bound, not a target.  Once at
-        # least eight unique passing paths exist, retaining alternate proofs
-        # would violate the exact supplement invariant and waste materialized
-        # proof memory.
+    if len(cohort) >= minimum_required_candidates:
+        # Comparison capacity is not a minimum number of deliverables.
         return tuple(cohort[:maximum_candidates])
     required_supplement_count = (
-        MINIMUM_PRODUCTION_JOINT_CANDIDATES - len(cohort)
+        minimum_required_candidates - len(cohort)
     )
     selected_variants = {
         (
@@ -1513,7 +1529,7 @@ def _production_passing_cohort(
         selected_candidate_ids.add(id(item))
         if len(supplemented_paths) >= required_supplement_count:
             break
-    if len(cohort) < MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+    if len(cohort) < minimum_required_candidates:
         return ()
     return tuple(cohort[:maximum_candidates])
 
@@ -1567,6 +1583,7 @@ def select_joint_visual_candidates(
     fps: float = 29.97,
     hard_forbidden_boundary_edges: TimelineNoGoodSet = TimelineNoGoodSet(),
     minimum_unique_paths: int = MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS,
+    minimum_required_candidates: int = MINIMUM_PRODUCTION_JOINT_CANDIDATES,
     maximum_candidates: int | None = None,
     forbidden_boundary_selections: Collection[
         BoundarySelectionNoGood
@@ -1616,14 +1633,7 @@ def select_joint_visual_candidates(
         raise TypeError(
             "decoded_montage_feedback must be JointDecodedMontageFeedback or None"
         )
-    if (
-        isinstance(minimum_unique_paths, bool)
-        or not isinstance(minimum_unique_paths, int)
-        or minimum_unique_paths < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
-    ):
-        raise ValueError(
-            "minimum_unique_paths is below the mathematical render cohort floor"
-        )
+    _validate_cohort_requirements(minimum_required_candidates, minimum_unique_paths)
     requested_maximum = (
         min(workspace.maximum_results, 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES)
         if maximum_candidates is None
@@ -1634,24 +1644,24 @@ def select_joint_visual_candidates(
         or not isinstance(requested_maximum, int)
         or requested_maximum < max(
             minimum_unique_paths,
-            MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+            minimum_required_candidates,
         )
         or requested_maximum > 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES
     ):
         raise ValueError(
-            "maximum_candidates must retain eight variants and be at most 24"
+            "maximum_candidates must cover the passing cohort and be at most 24"
         )
     if not math.isfinite(fps) or fps <= 0.0:
         raise ValueError("fps must be positive and finite")
     if (
         isinstance(maximum_proof_materialization_calls, bool)
         or not isinstance(maximum_proof_materialization_calls, int)
-        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or not minimum_required_candidates
         <= maximum_proof_materialization_calls
         <= MAXIMUM_JOINT_VISUAL_PROOF_CALLS
     ):
         raise ValueError(
-            "proof materialization budget must be between 8 and 32"
+            f"proof materialization budget must be between {minimum_required_candidates} and 32"
         )
     _assert_provider_binding(candidate_set, provider, fps=fps)
 
@@ -2050,7 +2060,7 @@ def select_joint_visual_candidates(
     def proof_budget_exhaustion() -> NoCompleteTimelinePath:
         return NoCompleteTimelinePath(
             "joint visual proof materialization budget was exhausted before "
-            "eight authoritative candidates passed",
+            "the required authoritative candidates passed",
             reason_code="joint_visual_proof_budget_exhausted",
             rejection_counts={
                 "proof_materialization_call_count": (
@@ -2115,8 +2125,9 @@ def select_joint_visual_candidates(
                     tuple(reviewed_variants.values()),
                     maximum_candidates=requested_maximum,
                     minimum_unique_paths=minimum_unique_paths,
+                    minimum_required_candidates=minimum_required_candidates,
                 )
-                if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+                if len(final_reviewed) >= minimum_required_candidates:
                     break
                 continue
             rejected_no_good = rejected_variant_no_goods.get(variant_key)
@@ -2182,7 +2193,7 @@ def select_joint_visual_candidates(
                         maximum_proof_materialization_calls
                     ),
                     retained_candidate_count=len(reviewed_variants),
-                    required_candidate_count=MINIMUM_PRODUCTION_JOINT_CANDIDATES,
+                    required_candidate_count=minimum_required_candidates,
                     completed_proof_boundary_count=(
                         observed.completed_proof_boundary_count
                         if observed else 0
@@ -2315,15 +2326,16 @@ def select_joint_visual_candidates(
                 tuple(reviewed_variants.values()),
                 maximum_candidates=requested_maximum,
                 minimum_unique_paths=minimum_unique_paths,
+                minimum_required_candidates=minimum_required_candidates,
             )
-            if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+            if len(final_reviewed) >= minimum_required_candidates:
                 break
             if proof_materialization_call_count >= (
                 maximum_proof_materialization_calls
             ):
                 raise proof_budget_exhaustion()
 
-        if len(final_reviewed) >= MINIMUM_PRODUCTION_JOINT_CANDIDATES:
+        if len(final_reviewed) >= minimum_required_candidates:
             break
 
         new_no_goods = frozenset(
@@ -2344,7 +2356,7 @@ def select_joint_visual_candidates(
             "required_unique_source_shot_path_count": minimum_unique_paths,
             "distinct_render_candidate_count": passing_candidate_count,
             "required_render_candidate_count": (
-                MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                minimum_required_candidates
             ),
             "proof_variant_supplement_count": max(
                 0,
@@ -2371,14 +2383,14 @@ def select_joint_visual_candidates(
             elif review_failure_count == 0:
                 reason_code = "joint_visual_candidate_cohort_floor_not_met"
                 message = (
-                    "joint visual selection could not retain eight distinct "
+                    "joint visual selection could not retain enough distinct "
                     "passing render variants and no exact boundary retry made "
                     "progress"
                 )
             else:
                 reason_code = "joint_visual_authoritative_review_fixed_point"
                 message = (
-                    "authoritative review produced fewer than eight passing "
+                    "authoritative review produced fewer than the required passing "
                     "candidates and no boundary-local retry made progress"
                 )
             raise NoCompleteTimelinePath(
@@ -2390,7 +2402,7 @@ def select_joint_visual_candidates(
         if retry_round >= MAXIMUM_JOINT_VISUAL_RETRY_ROUNDS:
             raise NoCompleteTimelinePath(
                 "authoritative review retry round limit was reached before "
-                "eight passing candidates existed",
+                "the required passing candidates existed",
                 reason_code="joint_visual_authoritative_review_retry_exhausted",
                 rejection_counts=rejection_counts,
                 profile_failures=profile_failures,
@@ -2470,6 +2482,8 @@ def select_joint_visual_candidates(
         for index, selection in enumerate(selections)
     )
     return JointVisualSelectionSet(
+        minimum_required_candidates=minimum_required_candidates,
+        minimum_unique_paths=minimum_unique_paths,
         candidate_set=candidate_set,
         selections=selections,
         candidate_records=records,
@@ -3483,11 +3497,11 @@ def materialize_joint_visual_candidates(
     if (
         isinstance(maximum_candidates, bool)
         or not isinstance(maximum_candidates, int)
-        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or not selection_set.minimum_required_candidates
         <= maximum_candidates
-        <= len(selection_set.candidate_records)
+        <= 3 * MAXIMUM_PROFILE_JOINT_CANDIDATES
     ):
-        raise ValueError("maximum_candidates must retain at least exact eight")
+        raise ValueError("maximum_candidates must cover the required cohort and be at most 24")
     ranked = selection_set.ranked_records[:maximum_candidates]
     # Build in a local tuple.  If any proof is missing or stale, no partial
     # renderer candidate escapes this atomic adapter call.

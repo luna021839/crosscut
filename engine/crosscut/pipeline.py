@@ -145,6 +145,11 @@ from .member_post_render_qa import (
     fingerprint_automatic_member_artifacts,
 )
 from .performance_range import estimate_shared_performance_range
+from .joint_release_policy import (
+    JOINT_RELEASE_CANDIDATE_COUNT,
+    JOINT_COMPARISON_CANDIDATE_BUDGET,
+    joint_release_policy_payload,
+)
 from .post_render_qa import (
     INPUT_ARTIFACT_FINGERPRINT_CONTRACT,
     PostRenderArtifactSet,
@@ -861,7 +866,7 @@ def _exact_source_shot_path(candidate: Any) -> tuple[tuple[str, str], ...]:
 
 
 _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT = 32
-_JOINT_REQUIRED_DECODED_PASS_COUNT = 8
+_JOINT_REQUIRED_DECODED_PASS_COUNT = JOINT_RELEASE_CANDIDATE_COUNT
 _JOINT_MAXIMUM_VARIANTS_PER_SOURCE_SHOT_PATH = 2
 
 _JOINT_LOCALIZED_BOUNDARY_FAILURE_CODES = frozenset(
@@ -1204,18 +1209,18 @@ def _joint_selection_proof_materialization_call_count(
     if (
         isinstance(available_budget, bool)
         or not isinstance(available_budget, int)
-        or available_budget < MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or available_budget < selection_set.minimum_required_candidates
         or available_budget
         > _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
     ):
-        raise ValueError("joint available proof budget must be within 8..32")
+        raise ValueError("joint available proof budget must cover the cohort within 1..32")
     value = selection_set.selection_retry_audit.get(
         "proof_materialization_call_count"
     )
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
-        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or not len(selection_set.candidate_records)
         <= value
         <= available_budget
     ):
@@ -1275,11 +1280,11 @@ def _materialize_joint_feedback_batch_with_fresh_provider(
     if (
         isinstance(maximum_proof_materialization_calls, bool)
         or not isinstance(maximum_proof_materialization_calls, int)
-        or not MINIMUM_PRODUCTION_JOINT_CANDIDATES
+        or not JOINT_RELEASE_CANDIDATE_COUNT
         <= maximum_proof_materialization_calls
         <= _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
     ):
-        raise ValueError("joint feedback proof budget must be within 8..32")
+        raise ValueError("joint feedback proof budget must be within 1..32")
     boundary_feedback = frozenset(forbidden_boundary_selections)
     complete_path_feedback = frozenset(forbidden_complete_paths)
     if any(
@@ -1309,14 +1314,15 @@ def _materialize_joint_feedback_batch_with_fresh_provider(
             materialize_candidates(selection_set, provider)
         )
         if (
-            len(materialized) != MINIMUM_PRODUCTION_JOINT_CANDIDATES
+            not selection_set.minimum_required_candidates
+            <= len(materialized) <= JOINT_COMPARISON_CANDIDATE_BUDGET
             or any(
                 not isinstance(item, JointMaterializedVisualCandidate)
                 for item in materialized
             )
         ):
             raise RuntimeError(
-                "joint feedback batch must materialize exactly eight candidates"
+                "joint feedback batch must materialize its passing cohort within comparison capacity"
             )
         return selection_set, materialized
     finally:
@@ -2769,7 +2775,7 @@ def _select_joint_decoded_passing_cohort(
 ) -> tuple[
     tuple["_GroupRenderCandidateBundle", RenderedCandidateReview], ...
 ]:
-    """Choose the best exact-eight cohort under a two-variant path cap."""
+    """Choose a quality-passing deliverable, not eight redundant deliverables."""
 
     if len(bundles) != len(reviews):
         raise ValueError("joint decoded bundles and reviews must align")
@@ -2811,8 +2817,8 @@ def _select_joint_decoded_passing_cohort(
             break
     if len(selected) < _JOINT_REQUIRED_DECODED_PASS_COUNT:
         return ()
-    if len(path_counts) < MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS:
-        raise RuntimeError("joint exact-eight cohort violated its path floor")
+    if not path_counts:
+        raise RuntimeError("joint delivery cohort has no source/shot path")
     return tuple(selected)
 
 
@@ -28144,10 +28150,11 @@ def analyze(
                                 provider=provider,
                                 fps=29.97,
                                 minimum_unique_paths=(
-                                    MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                                    JOINT_RELEASE_CANDIDATE_COUNT
                                 ),
+                                minimum_required_candidates=JOINT_RELEASE_CANDIDATE_COUNT,
                                 maximum_candidates=(
-                                    MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                                    JOINT_COMPARISON_CANDIDATE_BUDGET
                                 ),
                                 forbidden_boundary_selections=(
                                     boundary_feedback
@@ -28183,7 +28190,7 @@ def analyze(
                                 provider=provider,
                                 fps=29.97,
                                 maximum_candidates=(
-                                    MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                                    JOINT_COMPARISON_CANDIDATE_BUDGET
                                 ),
                             )
 
@@ -28309,15 +28316,15 @@ def analyze(
                             )
                         ],
                         "minimum_unique_path_floor": (
-                            MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                            JOINT_RELEASE_CANDIDATE_COUNT
                         ),
                         "minimum_render_variant_floor": (
-                            MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                            JOINT_RELEASE_CANDIDATE_COUNT
                         ),
                         "proof_variant_supplement_budget": (
-                            MINIMUM_PRODUCTION_JOINT_CANDIDATES
-                            - MINIMUM_PRODUCTION_UNIQUE_SOURCE_SHOT_PATHS
+                            0
                         ),
+                        "release_policy": joint_release_policy_payload(),
                         "maximum_candidate_pool": 24,
                         "baseline_candidate_materialization_invoked": False,
                         "checkpoint_candidate_direct_reuse": False,
@@ -28578,7 +28585,7 @@ def analyze(
                         ),
                         "production_use_forbidden": True,
                         "final_media_authority": False,
-                        "requested_complete_candidate_count": 8,
+                        "requested_complete_candidate_count": JOINT_RELEASE_CANDIDATE_COUNT,
                         "selected_materialized_candidate_indices": list(
                             selected_materialized_index_order
                         ),
@@ -28664,7 +28671,10 @@ def analyze(
                 )
                 derived: list[_GroupRenderCandidateBundle] = []
                 candidate_stream_reducer = CandidateStreamReducer(
-                    required_passing_count=8
+                    required_passing_count=(
+                        _JOINT_REQUIRED_DECODED_PASS_COUNT
+                        if joint_visual_selection_active else 8
+                    )
                 )
                 attempted_candidate_indices: set[int] = set()
                 attempted_materialized_candidates: list[Any] = []
@@ -29133,7 +29143,7 @@ def analyze(
                                         joint_decoded_budget_exhaustions
                                     ),
                                     "decoded_pass_count": len(derived),
-                                    "diverse_exact_eight_complete": bool(
+                                    "quality_passing_delivery_cohort_complete": bool(
                                         joint_diverse_passing_cohort()
                                     ),
                                     "selection_batch_count": len(
@@ -29379,7 +29389,7 @@ def analyze(
                                 "required_decoded_pass_count": (
                                     _JOINT_REQUIRED_DECODED_PASS_COUNT
                                 ),
-                                "diverse_exact_eight_complete": bool(
+                                "quality_passing_delivery_cohort_complete": bool(
                                     joint_diverse_passing_cohort()
                                 ),
                                 "external_complete_path_no_good_count": len(
@@ -29456,7 +29466,10 @@ def analyze(
                             "status": status,
                             "production_use_forbidden": True,
                             "final_media_authority": False,
-                            "requested_successful_decoded_review_count": 8,
+                            "requested_successful_decoded_review_count": (
+                                _JOINT_REQUIRED_DECODED_PASS_COUNT
+                                if joint_visual_selection_active else 8
+                            ),
                             "attempted_candidate_indices": sorted(
                                 attempted_candidate_indices
                             ),
@@ -32258,7 +32271,7 @@ def analyze(
                         )
                         if (
                             remaining_proof_budget
-                            < MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                            < JOINT_RELEASE_CANDIDATE_COUNT
                         ):
                             set_joint_decoded_feedback_terminal_proof(
                                 "joint_decoded_proof_materialization_budget_exhausted",
@@ -32276,7 +32289,7 @@ def analyze(
                         )
                         if (
                             first_global_candidate_index
-                            + MINIMUM_PRODUCTION_JOINT_CANDIDATES
+                            + JOINT_RELEASE_CANDIDATE_COUNT
                             > _JOINT_CUMULATIVE_PROOF_MATERIALIZATION_LIMIT
                         ):
                             set_joint_decoded_feedback_terminal_proof(
@@ -32510,7 +32523,7 @@ def analyze(
                 joint_final_cohort = joint_diverse_passing_cohort()
                 if joint_visual_selection_active and joint_final_cohort:
                     constraint_reoptimization_termination_reason = (
-                        "joint_decoded_multi_batch_exact_eight"
+                        "joint_decoded_quality_passing_delivery"
                     )
                     constraint_reoptimization_terminal_proof = None
                 materialized_group_candidates = tuple(
@@ -32526,14 +32539,18 @@ def analyze(
                     ]
                 else:
                     complete_group_candidates = tuple(derived)
-                if len(complete_group_candidates) != 8 or (
+                required_delivery_count = (
+                    _JOINT_REQUIRED_DECODED_PASS_COUNT
+                    if joint_visual_selection_active else 8
+                )
+                if len(complete_group_candidates) != required_delivery_count or (
                     joint_visual_selection_active and not joint_final_cohort
                 ):
                     if joint_visual_selection_active:
                         if constraint_reoptimization_terminal_proof is None:
                             set_joint_decoded_feedback_terminal_proof(
                                 "joint_decoded_candidate_pool_exhausted_before_"
-                                "exact_eight"
+                                "quality_passing_delivery"
                             )
                     elif constraint_reoptimization_terminal_proof is None:
                         set_nonstructural_constraint_exhaustion(
@@ -32549,12 +32566,12 @@ def analyze(
                         "analysis_basis": (
                             "sequential_decoded_proxy_candidate_rerank_v1"
                         ),
-                        "requested_review_count": 8,
+                        "requested_review_count": required_delivery_count,
                         "reviewed_candidate_count": (
                             candidate_stream_reducer
                             .decoded_review_completed_count
                         ),
-                        "minimum_required_candidate_count": 8,
+                        "minimum_required_candidate_count": required_delivery_count,
                         "minimum_candidate_count_satisfied": False,
                         "structure_passing_materialized_count": (
                             pre_repair_structure_passing_materialized_count
@@ -32967,12 +32984,18 @@ def analyze(
             or stage_edit_visual_candidate_batch is not None
         ):
             reporter.status(
-                "즉시 디코딩 QA를 마친 후보 8개의 최종 순위를 정하는 중…"
+                "전체 디코딩 QA를 통과한 후보의 최종 순위를 정하는 중…"
             )
             rendered_selection = select_rendered_candidate_reviews(
                 streamed_group_candidate_reviews,
-                requested_review_count=8,
-                minimum_required_candidate_count=8,
+                requested_review_count=(
+                    _JOINT_REQUIRED_DECODED_PASS_COUNT
+                    if joint_visual_selection_active else 8
+                ),
+                minimum_required_candidate_count=(
+                    _JOINT_REQUIRED_DECODED_PASS_COUNT
+                    if joint_visual_selection_active else 8
+                ),
                 professional_reference_profile=(
                     professional_reference_profile
                 ),
@@ -32982,6 +33005,10 @@ def analyze(
                 learned_reviewer_session=learned_reviewer_session,
             )
             rendered_candidate_selection_payload = rendered_selection.to_dict()
+            if joint_visual_selection_active:
+                rendered_candidate_selection_payload["release_policy"] = (
+                    joint_release_policy_payload()
+                )
             rendered_candidate_selection_payload.update(
                 {
                     "candidate_pool": (
@@ -33069,12 +33096,16 @@ def analyze(
                         constraint_reoptimization_payload()
                     ),
                     "exact_successful_decoded_review_count_satisfied": (
-                        rendered_selection.passing_candidate_count == 8
+                        rendered_selection.passing_candidate_count
+                        == rendered_selection.minimum_required_candidate_count
                     ),
                     "exact_complete_candidate_count_satisfied": (
-                        len(complete_group_candidates) == 8
-                        and len(rendered_selection.reviews) == 8
-                        and rendered_selection.passing_candidate_count == 8
+                        len(complete_group_candidates)
+                        == rendered_selection.minimum_required_candidate_count
+                        and len(rendered_selection.reviews)
+                        == rendered_selection.minimum_required_candidate_count
+                        and rendered_selection.passing_candidate_count
+                        == rendered_selection.minimum_required_candidate_count
                     ),
                     "professional_reference_profile": (
                         professional_reference_profile.provenance_dict()
@@ -33597,12 +33628,12 @@ def analyze(
                 rendered_candidate_selection_payload["passed"] = False
                 rendered_candidate_selection_payload["blocking_reason"] = (
                     (
-                        "automatic_group_requires_exactly_eight_"
+                        "automatic_group_requires_quality_passing_"
                         "complete_candidates"
                     )
-                    if len(complete_group_candidates) != 8
+                    if len(complete_group_candidates) != rendered_selection.minimum_required_candidate_count
                     else (
-                        "automatic_group_requires_exactly_eight_"
+                        "automatic_group_requires_quality_passing_"
                         "successful_decoded_candidate_reviews"
                     )
                 )
@@ -33619,8 +33650,8 @@ def analyze(
                 ]
             ):
                 raise RuntimeError(
-                    "automatic GROUP full render requires exactly 8 complete "
-                    "candidates with 8 successful decoded reviews; got "
+                    "automatic GROUP full render requires its complete passing "
+                    "delivery cohort with successful decoded reviews; got "
                     f"{len(complete_group_candidates)} complete / "
                     f"{rendered_selection.passing_candidate_count} passed; "
                     f"report: {rendered_candidate_selection_path}"
@@ -33877,6 +33908,10 @@ def analyze(
             project_name=f"IVE {request.song} group crosscut",
         )
         render_payload = {
+            "release_policy": (
+                joint_release_policy_payload()
+                if joint_visual_selection_active else None
+            ),
             "video_path": str(rendered_video_path),
             "plan_path": str(render_plan_path),
             "video_codec": codec,
