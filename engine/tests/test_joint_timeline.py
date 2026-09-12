@@ -1360,6 +1360,39 @@ class JointTimelineTests(unittest.TestCase):
         )
         self.assertEqual(len(selected_set.offset_audits), 17)
 
+    def test_decoded_scoring_candidates_do_not_resurrect_midpoint_pose(self) -> None:
+        outgoing = replace(candidate(0, "A", 0.5), pose_embedding=(0.0, 0.0))
+        midpoint_match = replace(candidate(1, "B", 0.6), pose_embedding=(0.0, 0.0))
+        boundary_match = replace(candidate(1, "C", 0.5), pose_embedding=(1.0, 1.0))
+
+        def provide_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
+            # Mirror a decoded provider result: real pose is unavailable at
+            # both cut frames, but their exact structure was measured.
+            boundary_structure = (
+                (1.0, 1.0) if key.incoming.source_id == "B" else (0.0, 0.0)
+            )
+            return option_set(
+                key,
+                authorized={0: 0.0},
+                scoring_candidates_by_offset={
+                    0: (
+                        replace(key.outgoing, exit_pose_embedding=(),
+                                exit_structure_embedding=(0.0, 0.0)),
+                        replace(key.incoming, entry_pose_embedding=(),
+                                entry_structure_embedding=boundary_structure),
+                    ),
+                },
+            )
+
+        result = select_joint_timeline(
+            ((outgoing,), (midpoint_match, boundary_match)),
+            option_provider=provide_options,
+            config=replace(isolated_score_config(), pose_transition_weight=1.0),
+        )
+        self.assertEqual(result.candidates[-1].source_id, "C")
+        self.assertEqual(result.boundary_options[0].frame_offset, 0)
+        self.assertEqual(result.choices[1].transition_score, 0.0)
+
     def test_nonwaivable_boundary_failure_rejects_higher_score_path(self) -> None:
         segments = (
             (candidate(0, "A", 0.8),),

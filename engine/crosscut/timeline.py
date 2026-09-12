@@ -1632,26 +1632,40 @@ def _transition_score(
             score -= config.early_cut_penalty * (
                 config.minimum_hold_segments - previous_run_length
             )
-        previous_pose = previous.exit_pose_embedding or previous.pose_embedding
-        current_pose = current.entry_pose_embedding or current.pose_embedding
+        previous_has_boundary_descriptor = _has_exit_boundary_descriptor(previous)
+        current_has_boundary_descriptor = _has_entry_boundary_descriptor(current)
+        # An observed boundary with a detector miss must remain missing. The
+        # segment midpoint describes a different moment and can otherwise
+        # overturn the exact-frame score used by the joint solver.
+        previous_pose = (
+            previous.exit_pose_embedding
+            if previous_has_boundary_descriptor
+            else previous.pose_embedding
+        )
+        current_pose = (
+            current.entry_pose_embedding
+            if current_has_boundary_descriptor
+            else current.pose_embedding
+        )
         # Never compare an actual landmark vector against the unrelated
         # gradient-HOG space. If either pose model missed, compare the same
         # deterministic structure descriptor used by the previous engine.
         if not previous_pose or not current_pose or len(previous_pose) != len(current_pose):
             previous_structure = (
-                previous.exit_structure_embedding or previous.structure_embedding
+                previous.exit_structure_embedding
+                if previous_has_boundary_descriptor
+                else previous.structure_embedding
             )
             current_structure = (
-                current.entry_structure_embedding or current.structure_embedding
+                current.entry_structure_embedding
+                if current_has_boundary_descriptor
+                else current.structure_embedding
             )
-            if previous_structure and current_structure:
-                previous_pose = previous_structure
-                current_pose = current_structure
+            previous_pose = previous_structure
+            current_pose = current_structure
         score -= config.pose_transition_weight * _normalised_distance(
             previous_pose, current_pose
         )
-        previous_has_boundary_descriptor = _has_exit_boundary_descriptor(previous)
-        current_has_boundary_descriptor = _has_entry_boundary_descriptor(current)
         previous_silhouette = (
             previous.exit_silhouette_embedding
             if previous_has_boundary_descriptor
@@ -1667,8 +1681,12 @@ def _transition_score(
             current_silhouette,
         )
         score -= config.motion_transition_weight * _motion_mismatch(
-            previous.exit_motion or previous.motion,
-            current.entry_motion or current.motion,
+            previous.exit_motion
+            if previous_has_boundary_descriptor
+            else previous.motion,
+            current.entry_motion
+            if current_has_boundary_descriptor
+            else current.motion,
         )
         previous_scale = (
             previous.exit_shot_scale
@@ -1796,8 +1814,16 @@ def _transition_score(
         if face_similarity is not None:
             identity_mismatch = max(0.0, 0.55 - face_similarity) / 0.55
             score -= config.face_identity_transition_weight * identity_mismatch
-        previous_color = previous.exit_color_embedding or previous.color_embedding
-        current_color = current.entry_color_embedding or current.color_embedding
+        previous_color = (
+            previous.exit_color_embedding
+            if previous_has_boundary_descriptor
+            else previous.color_embedding
+        )
+        current_color = (
+            current.entry_color_embedding
+            if current_has_boundary_descriptor
+            else current.color_embedding
+        )
         score -= config.color_transition_weight * _normalised_distance(
             previous_color,
             current_color,

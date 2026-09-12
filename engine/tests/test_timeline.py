@@ -1397,6 +1397,90 @@ class TimelineOptimisationTests(unittest.TestCase):
         self.assertEqual(result.candidates[1].source_id, "matches-exit")
         self.assertAlmostEqual(result.choices[1].transition_score, 0.0)
 
+    def test_missing_boundary_features_do_not_resurrect_midpoint_values(self) -> None:
+        cases = (
+            ("pose_embedding", "pose_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+            ("structure_embedding", "pose_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+            ("motion", "motion_transition_weight", (1.0, 0.0), (-1.0, 0.0)),
+            ("color_embedding", "color_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+        )
+        for feature, weight, matching, different in cases:
+            for changed_side in ("outgoing", "incoming"):
+                with self.subTest(feature=feature, changed_side=changed_side):
+                    outgoing = candidate(
+                        0, "A", 0.5, exit_shot_scale=0.4, **{feature: matching}
+                    )
+                    incoming = candidate(
+                        1, "B", 0.5, entry_shot_scale=0.4, **{feature: matching}
+                    )
+                    settings = continuity_gate_config(**{weight: 1.0})
+                    before = select_timeline([[outgoing], [incoming]], config=settings)
+                    if changed_side == "outgoing":
+                        outgoing = replace(outgoing, **{feature: different})
+                    else:
+                        incoming = replace(incoming, **{feature: different})
+                    after = select_timeline([[outgoing], [incoming]], config=settings)
+                    self.assertEqual(
+                        before.choices[1].transition_score,
+                        after.choices[1].transition_score,
+                    )
+                    self.assertEqual(after.choices[1].transition_score, 0.0)
+
+    def test_boundary_pose_miss_uses_exact_structure_not_matching_midpoint_pose(self) -> None:
+        outgoing = candidate(
+            0, "A", 0.5,
+            pose_embedding=(0.0, 0.0),
+            exit_structure_embedding=(0.0, 0.0),
+        )
+        matches_only_midpoint = candidate(
+            1, "matches-midpoint", 0.6,
+            pose_embedding=(0.0, 0.0),
+            entry_structure_embedding=(1.0, 1.0),
+        )
+        matches_actual_boundary = candidate(
+            1, "matches-boundary", 0.5,
+            pose_embedding=(1.0, 1.0),
+            entry_structure_embedding=(0.0, 0.0),
+        )
+        result = select_timeline(
+            [[outgoing], [matches_only_midpoint, matches_actual_boundary]],
+            config=continuity_gate_config(pose_transition_weight=1.0),
+        )
+        self.assertEqual(result.candidates[1].source_id, "matches-boundary")
+        self.assertEqual(result.choices[1].transition_score, 0.0)
+
+    def test_boundary_structure_fallback_never_pairs_structure_with_pose(self) -> None:
+        outgoing = candidate(
+            0, "A", 0.5,
+            exit_pose_embedding=(1.0, 1.0),
+            structure_embedding=(1.0, 1.0),
+        )
+        incoming = candidate(
+            1, "B", 0.5,
+            entry_structure_embedding=(0.0, 0.0),
+            pose_embedding=(0.0, 0.0),
+        )
+        result = select_timeline(
+            [[outgoing], [incoming]],
+            config=continuity_gate_config(pose_transition_weight=1.0),
+        )
+        self.assertEqual(result.choices[1].transition_score, 0.0)
+
+    def test_legacy_midpoint_features_still_score_without_boundary_descriptors(self) -> None:
+        for feature, weight, matching, different in (
+            ("pose_embedding", "pose_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+            ("structure_embedding", "pose_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+            ("motion", "motion_transition_weight", (1.0, 0.0), (-1.0, 0.0)),
+            ("color_embedding", "color_transition_weight", (0.0, 0.0), (1.0, 1.0)),
+        ):
+            with self.subTest(feature=feature):
+                result = select_timeline(
+                    [[candidate(0, "A", 0.5, **{feature: matching})],
+                     [candidate(1, "B", 0.5, **{feature: different})]],
+                    config=continuity_gate_config(**{weight: 1.0}),
+                )
+                self.assertEqual(result.choices[1].transition_score, -1.0)
+
     def test_person_layout_gate_keeps_same_source_on_formation_jump(self) -> None:
         compact_layout = (0.0, 0.0, 0.0, 0.0)
         displaced_layout = (1.0, 1.0, 1.0, 1.0)
