@@ -37,7 +37,7 @@ All measurement calls use the actual source-local clocks of the render plan.
         if not 0<=compact<len(eligible) or segment.source_index!=eligible[compact]:
             raise ValueError('automatic joint camera selected source differs from render source')
     counts=quantized_segment_frame_counts(segments,fps)
-    samples={};pixel_cache={};rows=[]
+    samples={};pixel_cache={};rows=[];owned_incoming=set()
     solves=registration_cache if registration_cache is not None else {}
     def sample(request,local):
         key=(request,local)
@@ -51,14 +51,17 @@ All measurement calls use the actual source-local clocks of the render plan.
         row=dict(boundary_index=index,applied=False,quality_approval=False)
         rows.append(row)
         pair=tuple(segments[index:index+2])
+        compose_previous=index in owned_incoming
         if pair[0].source_index==pair[1].source_index:
             row['reason']='same_source_boundary';continue
         if effect.frame_count<2 or effect.frame_count>64:
             row['reason']='unsupported_overlap_frame_count';continue
         if any(s.crop is not None or s.pan_crop is not None or s.outgoing_overlap_transform is not None
-               or (s.editorial_transform is not None and any(abs(p.zoom-1)>1e-9 or abs(p.center_x-.5)>1e-9 or abs(p.center_y-.5)>1e-9 or abs(p.roll_degrees)>1e-9 for p in s.editorial_transform.keyframes)) for s in pair):
+               or (s.editorial_transform is not None and not (side==0 and compose_previous)
+                   and any(abs(p.zoom-1)>1e-9 or abs(p.center_x-.5)>1e-9 or abs(p.center_y-.5)>1e-9 or abs(p.roll_degrees)>1e-9 for p in s.editorial_transform.keyframes)) for side,s in enumerate(pair)):
             row['reason']='existing_camera_ownership_preserved';continue
-        pair=tuple(replace(s,editorial_transform=None) for s in pair)
+        pair=tuple(s if side==0 and compose_previous else replace(s,editorial_transform=None)
+                   for side,s in enumerate(pair))
         cut=common_master_start+pair[1].master_start
         native={s.source_index:tuple(sorted({float(t) for span in visual_selection.span_validity[index:index+2]
             for entry in span.sources if entry.eligible_source_index==reverse[s.source_index]
@@ -133,7 +136,8 @@ All measurement calls use the actual source-local clocks of the render plan.
         try:
             a,b,registered=materialize_joint_dissolve_registration(left_segment=pair[0],right_segment=pair[1],
                 left_observations=observations[0],right_observations=observations[1],tracks=tracks,
-                transition=effect,common_master_start=common_master_start,fps=fps,ramp_seconds=settings.ramp_seconds)
+                transition=effect,common_master_start=common_master_start,fps=fps,ramp_seconds=settings.ramp_seconds,
+                incoming_transition=effects[index-1] if compose_previous else None)
         except ValueError as error:
             row.update(reason='camera_composition_unavailable',detail=str(error));continue
         containment=review_joint_dissolve_containment(segments=(a,b),transitions=(registered,),
@@ -146,7 +150,10 @@ All measurement calls use the actual source-local clocks of the render plan.
         if not containment['passed']:
             row['reason']='joint_camera_containment_not_verified';continue
         segments[index:index+2]=(a,b);effects[index]=registered
-        row.update(applied=True,reason='joint_camera_registered_pending_decoded_qa')
+        owned_incoming.add(index+1)
+        row.update(applied=True,reason='joint_camera_registered_pending_decoded_qa',
+            previous_overlap_camera_preserved=compose_previous,
+            nominal_camera_composed=compose_previous)
         if progress_callback:progress_callback(dict(boundary_index=index,applied=True))
     return tuple(segments),tuple(effects),dict(contract='automatic_member_joint_dissolve_v1',
         boundaries=rows,applied_count=sum(r['applied'] for r in rows),source_measurement_queries=len(samples),

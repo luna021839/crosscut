@@ -158,18 +158,63 @@ Both returned tracks use overlap-relative output frame times.
     return tuple(tracks),dict(audit,reason='measured_joint_registration')
 
 
+def compose_joint_dissolve_cameras(incoming, outgoing, *, incoming_frame_count, fps):
+    """Join owned entry/exit cameras without changing either rendered overlap.
+
+    Keep the ordinary identity plateau when the ramps fit. If they intersect,
+    connect the pinned entry and exit states directly instead of imposing an
+    unnecessary zoom-out/zoom-in. The resulting nominal path still needs dense
+    containment and decoded motion QA; composition is not quality approval.
+    """
+    if (incoming.reason != 'joint_dissolve_incoming_ramp_pending_containment_review'
+            or outgoing.reason != 'joint_dissolve_outgoing_ramp_pending_containment_review'
+            or isinstance(incoming_frame_count, bool) or not isinstance(incoming_frame_count, int)
+            or not 2 <= incoming_frame_count <= 64 or isinstance(fps,bool) or not math.isfinite(fps) or fps <= 0):
+        raise ValueError('joint composition requires owned incoming/outgoing cameras')
+    if abs(incoming.final_keyframe.time_seconds-outgoing.final_keyframe.time_seconds)>1e-9:
+        raise ValueError('joint cameras do not share a segment clock')
+    # Include the first pure incoming frame, not just the last blended frame.
+    entry_end=incoming_frame_count/fps
+    exit_start=outgoing.keyframes[-2].time_seconds
+    if entry_end >= exit_start-1e-9:
+        raise ValueError('joint camera pinned overlap intervals collide')
+    if (len(incoming.keyframes)<incoming_frame_count+2 or
+            abs(incoming.keyframes[incoming_frame_count].time_seconds-entry_end)>1e-9):
+        raise ValueError('joint incoming camera does not bind the previous overlap')
+    incoming_ramp_end=incoming.keyframes[incoming_frame_count+1].time_seconds
+    outgoing_ramp_start=outgoing.keyframes[-3].time_seconds
+    if incoming_ramp_end <= outgoing_ramp_start+1e-9:
+        prefix=incoming.keyframes[:incoming_frame_count+2]
+        suffix=outgoing.keyframes[-3:]
+        if abs(incoming_ramp_end-outgoing_ramp_start)<=1e-9:
+            suffix=suffix[1:]
+    else:
+        prefix=incoming.keyframes[:incoming_frame_count+1]
+        suffix=outgoing.keyframes[-2:]
+    return EditorialTransformTrack((*prefix,*suffix),
+        reason='joint_dissolve_composed_ramps_pending_containment_review')
+
+
 def materialize_joint_dissolve_registration(*, left_segment, right_segment,
         left_observations, right_observations, tracks, transition,
-        common_master_start, fps, ramp_seconds=.75):
+        common_master_start, fps, ramp_seconds=.75, incoming_transition=None):
     """Bind measured overlap tracks to the exact source clocks used by render.
 
 The caller must still verify containment over the added nominal ramps and
 review rendered pixels. This is explicitly source-measured, not output-QA
-approval. Existing cameras are preserved by rejecting conflicting ownership.
+approval. Only the immediately previous joint-owned incoming camera may be
+composed, with its exact transition supplied by the automatic stage.
     """
     from .render import TransitionKind, MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY
     if transition.kind is not TransitionKind.FACE_DISSOLVE:
         raise ValueError('joint camera materialization requires a face dissolve')
+    previous_camera=left_segment.editorial_transform
+    if incoming_transition is not None:
+        if (incoming_transition.kind is not TransitionKind.FACE_DISSOLVE or
+                incoming_transition.transform_overlap_authority != MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY or
+                previous_camera is None or previous_camera.reason != 'joint_dissolve_incoming_ramp_pending_containment_review'):
+            raise ValueError('joint composition lacks previous registered transition')
+        left_segment=replace(left_segment,editorial_transform=None)
     if any(s.editorial_transform is not None or s.outgoing_overlap_transform is not None
            or s.crop is not None or s.pan_crop is not None for s in (left_segment,right_segment)):
         raise ValueError('joint camera materialization cannot overwrite an existing camera')
@@ -187,19 +232,24 @@ approval. Existing cameras are preserved by rejecting conflicting ownership.
                 raise ValueError('joint registration does not bind the rendered source clocks')
     duration=count/fps
     if (not math.isfinite(ramp_seconds) or ramp_seconds<=0 or
-        left_segment.duration <= ramp_seconds+2/fps or right_segment.duration<=duration+ramp_seconds):
+        left_segment.duration <= 2/fps or right_segment.duration<=duration):
         raise ValueError('joint registration lacks nominal camera ramp space')
     left_hold=left_segment.duration-2/fps
     first=tracks[0].keyframes[0]
-    left_track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),
-        EditorialTransformKeyframe(left_hold-ramp_seconds,1.),
+    ramp_start=max(0.,left_hold-ramp_seconds)
+    plateau=(EditorialTransformKeyframe(ramp_start,1.),) if ramp_start>0. else ()
+    left_track=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.),*plateau,
         replace(first,time_seconds=left_hold),replace(first,time_seconds=left_segment.duration)),
         reason='joint_dissolve_outgoing_ramp_pending_containment_review')
+    return_time=min(duration+ramp_seconds,right_segment.duration)
+    tail=(EditorialTransformKeyframe(right_segment.duration,1.),) if return_time<right_segment.duration else ()
     right_track=EditorialTransformTrack((*tracks[1].keyframes,
         replace(tracks[1].final_keyframe,time_seconds=duration),
-        EditorialTransformKeyframe(duration+ramp_seconds,1.),
-        EditorialTransformKeyframe(right_segment.duration,1.)),
+        EditorialTransformKeyframe(return_time,1.),*tail),
         reason='joint_dissolve_incoming_ramp_pending_containment_review')
+    if incoming_transition is not None:
+        left_track=compose_joint_dissolve_cameras(previous_camera,left_track,
+            incoming_frame_count=incoming_transition.frame_count,fps=fps)
     return (replace(left_segment,editorial_transform=left_track,outgoing_overlap_transform=tracks[0]),
             replace(right_segment,editorial_transform=right_track),
             replace(transition,transform_overlap_authority=MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY))

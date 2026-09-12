@@ -54,7 +54,8 @@ class AutomaticJointDissolveTests(unittest.TestCase):
             aspect_ratio=AspectRatio.PORTRAIT, output=Path('/tmp/registered.mp4'),
             master_audio_start=inputs['common_master_start'], width=720, height=1280,
             fps=inputs['fps'], member_pose_dissolve_requested=True,
-            member_pose_dissolve_effective=True, member_pose_dissolve_count=1)
+            member_pose_dissolve_effective=True,
+            member_pose_dissolve_count=sum(t.kind is TransitionKind.FACE_DISSOLVE for t in transitions))
 
     def test_automatic_registration_uses_compact_provider_and_exact_source_clocks(self):
         args = self.inputs()
@@ -114,6 +115,91 @@ class AutomaticJointDissolveTests(unittest.TestCase):
         self.assertEqual(segments, args['render_segments'])
         self.assertEqual(audit['boundaries'][0]['reason'], 'existing_camera_ownership_preserved')
         self.assertEqual(self.queries, [])
+
+    def consecutive_inputs(self, duration=3.):
+        args=self.inputs()
+        args['render_segments']=tuple(RenderSegment(s,10.+10*i,duration,i*duration,
+            source_duration=duration*(1.01 if i%2==0 else .99))
+            for i,s in enumerate((3,5,3,5)))
+        args['transitions']=args['transitions']*3
+        args['visual_selection'].source_indices=(0,1,0,1)
+        args['visual_selection'].span_validity=args['visual_selection'].span_validity*2
+        return args
+
+    def test_consecutive_cameras_preserve_previous_overlap_and_full_source_clocks(self):
+        for duration in (3.,1.2,.5):  # disjoint, intersecting, and short nominal ramps
+            with self.subTest(duration=duration):
+                args=self.consecutive_inputs(duration)
+                first_args={**args,'transitions':(args['transitions'][0],RenderTransition(),RenderTransition())}
+                first,first_effects,_=register_automatic_member_dissolves(**first_args)
+                segments,effects,audit=register_automatic_member_dissolves(**args)
+                self.assertEqual(audit['applied_count'],3,audit)
+                self.assertEqual([r['nominal_camera_composed'] for r in audit['boundaries']],
+                                 [False,True,True])
+                self.assertEqual(segments[0],first[0])
+                self.assertEqual(effects[0],first_effects[0])
+                for n in range(8):
+                    self.assertEqual(segments[1].editorial_transform.evaluate(n/30),
+                                     first[1].editorial_transform.evaluate(n/30))
+                for before,after in zip(args['render_segments'],segments):
+                    self.assertEqual(replace(after,editorial_transform=None,outgoing_overlap_transform=None),before)
+                plan=self.plan(args,segments,effects)
+                rebuilt=_boundary_render_plan_from_serialized(json.loads(json.dumps(plan.to_json())))
+                self.assertEqual(rebuilt.segments,segments)
+                # Full nominal shared segment is reviewed, not only the new exit.
+                reviewed=audit['boundaries'][1]['containment']['frames']
+                self.assertTrue(any(r['segment_index']==0 and r['scope']=='nominal'
+                    and r['output_local_seconds']==0. for r in reviewed))
+
+    def test_failed_second_containment_does_not_undo_first_registered_boundary(self):
+        from crosscut.joint_dissolve_registration import review_joint_dissolve_containment
+        args=self.consecutive_inputs()
+        first_args={**args,'transitions':(args['transitions'][0],RenderTransition(),RenderTransition())}
+        first,first_effects,_=register_automatic_member_dissolves(**first_args)
+        calls=[]
+        def review(**kwargs):
+            calls.append(kwargs)
+            return review_joint_dissolve_containment(**kwargs) if len(calls)==1 else {'passed':False}
+        with patch('crosscut.automatic_joint_dissolve.review_joint_dissolve_containment',side_effect=review):
+            segments,effects,audit=register_automatic_member_dissolves(**args)
+        self.assertEqual(audit['applied_count'],1)
+        self.assertEqual(segments,first)
+        self.assertEqual(effects[0],first_effects[0])
+        self.assertEqual(effects[1:],args['transitions'][1:])
+
+    def test_short_composed_camera_does_not_require_zooming_back_to_identity(self):
+        args=self.consecutive_inputs(.5)
+        segments,_,audit=register_automatic_member_dissolves(**args)
+        self.assertEqual(audit['applied_count'],3)
+        track=segments[1].editorial_transform
+        self.assertEqual(len(track.keyframes),10)  # 7 overlap + pure frame + exit hold + end
+        entry=track.evaluate(7/30)
+        exit_state=track.evaluate(.5-2/30)
+        for n in range(8,13):
+            value=track.evaluate(n/30)
+            for field in ('zoom','center_x','center_y'):
+                self.assertGreaterEqual(getattr(value,field),min(getattr(entry,field),getattr(exit_state,field))-1e-9)
+                self.assertLessEqual(getattr(value,field),max(getattr(entry,field),getattr(exit_state,field))+1e-9)
+
+    def test_colliding_pinned_frames_preserve_earlier_boundary_without_demotion(self):
+        args=self.consecutive_inputs(.28)
+        segments,effects,audit=register_automatic_member_dissolves(**args)
+        self.assertTrue(audit['boundaries'][0]['applied'])
+        self.assertFalse(audit['boundaries'][1]['applied'])
+        self.assertEqual(audit['boundaries'][1]['reason'],'camera_composition_unavailable')
+        self.assertIn('pinned overlap intervals collide',audit['boundaries'][1]['detail'])
+        self.assertEqual(effects[1],args['transitions'][1])
+        self.assertIsNone(segments[1].outgoing_overlap_transform)
+
+    def test_incoming_camera_reason_alone_does_not_grant_current_run_ownership(self):
+        args=self.inputs()
+        segments,_,_=register_automatic_member_dissolves(**args)
+        args['render_segments']=(replace(args['render_segments'][0],
+            editorial_transform=segments[1].editorial_transform),args['render_segments'][1])
+        original=args['render_segments']
+        result,_,audit=register_automatic_member_dissolves(**args)
+        self.assertEqual(result,original)
+        self.assertEqual(audit['boundaries'][0]['reason'],'existing_camera_ownership_preserved')
 
     def test_full_plan_frame_allocation_is_passed_to_containment(self):
         args = self.inputs()

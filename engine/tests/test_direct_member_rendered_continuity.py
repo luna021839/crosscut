@@ -713,6 +713,13 @@ class DirectMemberRenderedContinuityTests(unittest.TestCase):
             [3, 7],
         )
         self.assertTrue(boundary["focal_face_reference_guided"])
+        for endpoint in boundary['endpoint_steps']:
+            self.assertFalse(endpoint['target_reference_guided'])
+            self.assertEqual(endpoint['attention_basis'],
+                {'left':'unambiguous_dominant_face_bbox_geometry_only',
+                 'right':'unambiguous_dominant_face_bbox_geometry_only'})
+            self.assertIsNotNone(endpoint['attention_geometry']['left'])
+            self.assertIsNotNone(endpoint['attention_geometry']['right'])
         self.assertGreater(boundary["attention_position_mismatch"], 0.90)
         self.assertEqual(
             result.metrics[
@@ -740,6 +747,19 @@ class DirectMemberRenderedContinuityTests(unittest.TestCase):
             "rendered_effect_endpoint_position_discontinuity",
             result.failure_reasons,
         )
+
+    def test_effect_group_mask_scale_failure_reports_actual_geometry_not_target_claim(self):
+        descriptors={n:_descriptor(position=.3,pose=.2,scale=(.2 if n<7 else .4),
+                                   include_face=False) for n in (3,4,6,7)}
+        result=evaluate_direct_member_rendered_continuity(Path('synthetic-member.mp4'),
+            _effect_plan(),descriptor_provider=_provider(descriptors))
+        self.assertIn('rendered_effect_endpoint_scale_discontinuity',result.failure_reasons)
+        row=result.boundaries[0]['endpoint_steps'][1]
+        self.assertEqual(row['attention_basis'],
+            {'left':'aggregate_human_silhouette','right':'aggregate_human_silhouette'})
+        self.assertFalse(row['target_reference_guided'])
+        self.assertEqual(row['attention_geometry']['left']['bbox_xywh'],[.3,.2,.2,.48])
+        self.assertEqual(row['attention_geometry']['right']['bbox_xywh'],[.3,.2,.4,.48])
 
 
 if __name__ == "__main__":

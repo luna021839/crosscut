@@ -699,6 +699,18 @@ def evaluate_direct_member_rendered_continuity(
             ],
             "attention_position_step": position,
             "attention_scale_step": scale,
+            # Pure-boundary focal authority does not authorize these blended
+            # endpoint descriptors. Persist the actual basis so a group-mask
+            # change cannot be misdiagnosed as a target camera-scale error.
+            "attention_basis": {
+                "left": left.attention.basis if left.attention is not None else None,
+                "right": right.attention.basis if right.attention is not None else None,
+            },
+            "attention_geometry": {
+                "left": _serialized_attention_geometry(left.attention),
+                "right": _serialized_attention_geometry(right.attention),
+            },
+            "target_reference_guided": False,
             "pose_step": pose_step,
             "silhouette_step": silhouette_step,
         }
