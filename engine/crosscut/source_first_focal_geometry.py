@@ -190,10 +190,17 @@ class SourceFirstFocalGeometryProvider:
             right = self._body_sample(self.selector_geometry(incoming_source_index, incoming_seconds))
         # Capture the exact source-native faces selected by this authority.
         faces = []
-        for source, seconds, sample in ((outgoing_source_index, outgoing_seconds, left),
-                (incoming_source_index, incoming_seconds, right)):
+        for source, seconds in ((outgoing_source_index, outgoing_seconds),
+                (incoming_source_index, incoming_seconds)):
+            # Alignment may use a common BODY box on both sides. That does
+            # not erase an independently observed FACE on the visible side.
+            # Conversely, a neighboring face cannot authorize the hidden side.
+            geometry = self.selector_geometry(source, seconds)
             candidates = self.faces._focal_candidates(source, seconds)
-            face = next((c for c in candidates if sample and c.bbox_xywh == sample.bbox_xywh), None)
+            observed = [c for c in candidates
+                if geometry.face_bbox_xywh is not None
+                and c.bbox_xywh == geometry.face_bbox_xywh]
+            face = observed[0] if len(observed) == 1 else None
             faces.append(face)
         self._boundary_references.append((outgoing_source_index, incoming_source_index, *faces))
         return left, right

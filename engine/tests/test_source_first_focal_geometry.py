@@ -74,6 +74,28 @@ class SourceFirstGeometryTests(unittest.TestCase):
         left,right=provider.paired_samples(0,1.,1,1.)
         self.assertEqual((left.face_count,right.face_count),(0,0))
         self.assertEqual(left.alignment_geometry_basis,right.alignment_geometry_basis)
+        capture = provider.focal_boundary_reference_capture()[0]
+        self.assertEqual(capture[:2], (0, 1))
+        self.assertIsNone(capture[2])
+        self.assertEqual(capture[3].bbox_xywh, BOX)
+
+    def test_body_alignment_does_not_promote_neighbor_face_on_hidden_side(self):
+        provider=SourceFirstFocalGeometryProvider.__new__(SourceFirstFocalGeometryProvider)
+        provider.selector_geometry=lambda s,t:geometry(s,body_only=s==1)
+        target=FocalFaceCandidate(BOX,(1.,0.))
+        neighbor=FocalFaceCandidate((.7,.1,.1,.1),(0.,1.))
+        provider.faces=SimpleNamespace(_focal_candidates=lambda s,t:(neighbor,target))
+        provider._boundary_references=[]
+        provider.paired_samples(0,1.,1,1.)
+        self.assertEqual(provider.focal_boundary_reference_capture(),((0,1,target,None),))
+
+    def test_duplicate_observed_face_box_does_not_select_first_identity(self):
+        provider=SourceFirstFocalGeometryProvider.__new__(SourceFirstFocalGeometryProvider)
+        provider.selector_geometry=lambda s,t:geometry(s)
+        provider.faces=SimpleNamespace(_focal_candidates=lambda *a:(
+            FocalFaceCandidate(BOX,(1.,0.)),FocalFaceCandidate(BOX,(0.,1.))))
+        provider._boundary_references=[]
+        provider.paired_samples(0,1.,1,1.)
         self.assertEqual(provider.focal_boundary_reference_capture(),((0,1,None,None),))
 
     def test_missing_target_does_not_use_dominant_descriptor(self):
