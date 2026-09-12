@@ -1396,6 +1396,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     retention["retained_feature_sha256"],
                 )
                 self.assertTrue(retention["feature_dropout_disabled_during_retention"])
+                self.assertTrue(retention["feature_extractor_released_after_retention"])
+                self.assertTrue(retention["feature_extractor_parameters_changed_after_release"])
                 self.assertTrue(
                     retention[
                         "optimizer_state_reset_before_dynamic_head_release"

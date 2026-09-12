@@ -4600,7 +4600,7 @@ def train_production_stage_edit(
                     "warmup_feature_sha256": retained_dynamic_crop_v3_feature_digest,
                     "retained_feature_sha256": retained_feature_digest,
                     "feature_dropout_disabled_during_retention": True,
-                    "feature_extractor_released_after_retention": True,
+                    "feature_extractor_release_required_after_retention": True,
                     "dynamic_head_gradients_zeroed": True,
                     "adamw_parameter_decay_restored": True,
                     "optimizer_reset_required_before_dynamic_head_release": True,
@@ -4907,6 +4907,13 @@ def train_production_stage_edit(
                 )
             dynamic_crop_v3_prior_retention_evidence = {
                 **dynamic_crop_v3_prior_retention_evidence,
+                "feature_extractor_released_after_retention": True,
+                "feature_extractor_parameters_changed_after_release": (
+                    _parameter_tree_sha256({
+                        name: model.base.parameters()[name]
+                        for name in DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES
+                    }) != retained_dynamic_crop_v3_feature_digest
+                ),
                 "retention_optimizer_state_final_step": (
                     finetune_retention_optimizer_state_final_step
                 ),
