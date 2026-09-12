@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import cv2
 
+from .member_bridge_contract import member_bridge_handle_quality_failures
 from .direct_member_transform import (
     DirectMemberBoundaryTransformRepair,
     DirectMemberSourceFrameGeometry,
@@ -1688,6 +1689,25 @@ def _scored_boundary_search_mismatch(
     config: DirectMemberVisualConfig,
 ) -> DirectBoundaryMismatch:
     mismatch = candidate.matrix[outgoing_source_index][incoming_source_index]
+    if mismatch.cinematic_bridge is not None:
+        handle_failures: list[str] = []
+        for label, source_index in (("outgoing", outgoing_source_index),
+                                     ("incoming", incoming_source_index)):
+            samples = (
+                (candidate.incoming_next[source_index], candidate.incoming_future[source_index])
+                if source_index < len(candidate.incoming_next)
+                and source_index < len(candidate.incoming_future) else ()
+            )
+            handle_failures.extend(member_bridge_handle_quality_failures(
+                tuple(sample.descriptor.quality_score if sample.descriptor is not None else None
+                      for sample in samples), label=label))
+        if handle_failures:
+            # These are the exact samples the downstream effect author uses.
+            # A required effect cannot rescue a severe edge when its own
+            # handle is unrenderable; consider another offset/source now.
+            mismatch = replace(mismatch, cinematic_bridge=None,
+                warning_flags=tuple(dict.fromkeys((*mismatch.warning_flags,*handle_failures))),
+                severe_flags=tuple(dict.fromkeys((*mismatch.severe_flags,*handle_failures))))
     penalty = (
         abs(candidate.offset_frames)
         * config.boundary_search_offset_penalty_per_frame

@@ -27,6 +27,8 @@ from typing import Any
 import cv2
 
 from .boundary_repair import BoundaryRepairConfig
+from .boundary_local_camera import build_boundary_local_camera, is_identity
+from .cut_anchored_containment import ContainmentSample, track_around_cut_anchor
 from .face_identity import cosine_similarity, sface_model_asset_status
 from .joint_timeline import (
     AuthorizedBoundaryOption,
@@ -68,14 +70,17 @@ from .visual_boundary_repair import (
     _visual_evidence,
 )
 from .visual_feature_cache import python_symbol_dependency_sha256
-from .visual_score import FrameVisualDescriptor, _VideoSampler, describe_frame
+from .visual_score import (
+    FrameVisualDescriptor, _VideoSampler, describe_frame,
+    _detect_faces, _normalized_face_metadata, _working_frame,
+)
 
 
 JOINT_BOUNDARY_PROVIDER_ANALYSIS_BASIS = (
     "decoded_exact_seventeen_offset_joint_boundary_provider_v2+"
-    "visual_boundary_repair_professional_gates_v4+"
+    "visual_boundary_repair_professional_gates_v4+face_led_spatial_remeasurement_v1+"
     "scalar_only_exact_raw_result_context_proof_v2+"
-    "renderer_exact_full_segment_sface_track_v2+"
+    "renderer_exact_boundary_local_active_handle_track_v3+"
     "immutable_transform_subject_basis_v1+selected_bridge_audit_handoff_v1"
 )
 _SIDE_SAMPLE_RADIUS_FRAMES = 3
@@ -599,6 +604,7 @@ class SegmentTransformPathSample:
     face_similarity_to_previous: float | None
     descriptor: FrameVisualDescriptor | None = field(repr=False)
     face_identity_embedding: tuple[float, ...] = field(repr=False)
+    containment_basis: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.transform, BoundaryTransformState):
@@ -612,6 +618,17 @@ class SegmentTransformPathSample:
             raise ValueError(
                 "segment sample subject_basis disagrees with its transform"
             )
+        if self.containment_basis is not None:
+            if self.containment_basis not in {
+                "observed_cut_anchor", "pixel_flow_plus_observed_geometry",
+                "bounded_pixel_flow_containment",
+            }:
+                raise ValueError("segment sample containment basis is unsupported")
+            if (self.transform.crop_xywh is None or self.subject_basis != "dominant_face"
+                    or self.subject_bbox_xywh is None or self.subject_bbox_coverage is None
+                    or self.face_identity_embedding or self.face_similarity_to_anchor is not None
+                    or self.face_similarity_to_previous is not None):
+                raise ValueError("pixel containment cannot claim recognition or identity pixels")
 
 
 @dataclass(frozen=True, slots=True)
@@ -975,7 +992,7 @@ def _crop_resolved_transforms(
             else crop
         )
         payload = {
-            "contract": "joint-boundary-crop-transform-v2",
+            "contract": "joint-boundary-crop-transform-v3",
             "alignment": (
                 "shared_face_extent_and_screen_center"
                 if matched_faces is not None
@@ -983,7 +1000,8 @@ def _crop_resolved_transforms(
             ),
             "raw_context_identity": raw_context_identity,
             "side": side,
-            "basis": basis,
+            "alignment_basis": basis,
+            "basis": basis if renderer_crop is not None else "full_frame_identity",
             "crop_xywh": list(renderer_crop) if renderer_crop is not None else None,
             "candidate_state_sha256": _candidate_private_state_sha256(candidate),
         }
@@ -991,7 +1009,7 @@ def _crop_resolved_transforms(
             transform_identity=f"crop-transform:{_sha256_json(payload)}",
             crop_xywh=renderer_crop,
             track_id=_track_id(candidate),
-            subject_basis=basis,
+            subject_basis=basis if renderer_crop is not None else "full_frame_identity",
         )
 
     return (
@@ -1124,6 +1142,7 @@ class DecodedBoundaryOptionProvider:
         transformed_descriptor_provider: (
             TransformedDescriptorProvider | None
         ) = None,
+        containment_frame_provider: Callable[[int, float], Any] | None = None,
     ) -> None:
         resolved_sources = tuple(Path(item) for item in sources)
         if len(resolved_sources) < 2:
@@ -1219,6 +1238,8 @@ class DecodedBoundaryOptionProvider:
             )
         if not isinstance(require_persistent_feature_cache, bool):
             raise TypeError("require_persistent_feature_cache must be a boolean")
+        if containment_frame_provider is not None and not callable(containment_frame_provider):
+            raise TypeError("containment_frame_provider must be callable or None")
         if (
             require_persistent_feature_cache
             and feature_derived_cache_directory is None
@@ -1267,6 +1288,10 @@ class DecodedBoundaryOptionProvider:
         self._descriptor_provider = descriptor_provider
         self._face_identity_provider = face_identity_provider
         self._transformed_descriptor_provider = transformed_descriptor_provider
+        self._containment_frame_provider = containment_frame_provider
+        self._containment_captures: dict[int, Any] = {}
+        self._containment_pixels: OrderedDict[tuple[int, object], tuple[Any, Any, str]] = OrderedDict()
+        self._containment_pixel_bytes = 0
         descriptor_backend_identity = (
             f"injected-process-callable:{id(descriptor_provider)}"
             if descriptor_provider is not None
@@ -1480,6 +1505,12 @@ class DecodedBoundaryOptionProvider:
                 "transformed_descriptor_backend_identity": (
                     transformed_descriptor_backend_identity
                 ),
+                "containment_backend_identity": (
+                    f"injected-process-callable:{id(containment_frame_provider)}"
+                    if containment_frame_provider is not None else
+                    ("production-cut-anchored-pixel-handles-v1" if descriptor_provider is None
+                     else "injected-descriptor-strict-sface-v1")
+                ),
                 "direct_persistent_feature_cache_configured": (
                     self.feature_derived_cache_directory is not None
                 ),
@@ -1512,6 +1543,12 @@ class DecodedBoundaryOptionProvider:
             return
         for sampler in self._samplers.values():
             sampler.close()
+        for capture in self._containment_captures.values():
+            capture.release()
+        self._containment_captures.clear()
+        self._containment_pixels.clear()
+        self._containment_pixel_bytes = 0
+        self._containment_frame_provider = None
         self._samplers.clear()
         self.descriptor_cache.discard_source_indices(
             self._cache_source_indices
@@ -2885,47 +2922,147 @@ class DecodedBoundaryOptionProvider:
     ) -> EditorialTransformTrack:
         entry = self._renderer_keyframe(entry_transform, 0.0)
         exit_ = self._renderer_keyframe(exit_transform, duration_seconds)
-        if self._renderer_states_equal(entry, exit_):
-            return EditorialTransformTrack(
-                (entry, exit_),
-                reason="joint_exact_constant_segment_transform_path",
-            )
+        return build_boundary_local_camera(
+            entry=entry, exit=exit_, duration_seconds=duration_seconds,
+            output_fps=self.output_fps,
+            hold_frames=_BOUNDARY_TRANSFORM_HOLD_FRAMES,
+        ).track
 
-        hold_seconds = _BOUNDARY_TRANSFORM_HOLD_FRAMES / self.output_fps
-        has_entry_boundary = candidate.segment_index > 0
-        has_exit_boundary = (
-            candidate.segment_index < self.total_segment_count - 1
+    def _active_crop_has_scene_cut(
+        self, source_index: int, start_master_seconds: float,
+        track: EditorialTransformTrack,
+    ) -> bool:
+        # A neutral middle neither changes pixels nor carries a face identity.
+        # A native source cut inside either active crop handle still invalidates
+        # that handle, including when it falls between sampled frame centers.
+        windows: list[tuple[float, float]] = []
+        for left, right in zip(track.keyframes, track.keyframes[1:]):
+            if is_identity(left) and is_identity(right):
+                continue
+            if windows and abs(windows[-1][1] - left.time_seconds) <= _EPSILON:
+                windows[-1] = (windows[-1][0], right.time_seconds)
+            else:
+                windows.append((left.time_seconds, right.time_seconds))
+        for start, end in windows:
+            low = self._source_time(source_index, start_master_seconds + start)
+            high = self._source_time(source_index, start_master_seconds + end)
+            if any(min(low, high) + _EPSILON < cut < max(low, high) - _EPSILON
+                   for cut in self.scene_cut_times[source_index]):
+                return True
+        return False
+
+    def _cut_containment_pixels(self, source_index: int, seconds: float) -> tuple[Any, Any, str]:
+        """Keep bounded native 960px flow pixels, with the 480px face basis.
+
+        Upscaling the existing 480px descriptor raster cannot restore the eye
+        and hair corners required by strict optical flow. A separate decoder
+        keeps the descriptor reader's seek state and frame cache untouched.
+        Pixel LRU state has no authorization value and is never serialized.
+        """
+        self._assert_required_persistent_cache_available(source_index)
+        identity = (self._sampler(source_index).frame_identity(seconds)
+                    if self._descriptor_provider is None else float(seconds))
+        key = (source_index, identity)
+        if key in self._containment_pixels:
+            self._containment_pixels.move_to_end(key)
+            return self._containment_pixels[key]
+        if self._containment_frame_provider is not None:
+            original = self._containment_frame_provider(source_index, seconds)
+        else:
+            capture = self._containment_captures.get(source_index)
+            if capture is None:
+                capture = cv2.VideoCapture(str(self.sources[source_index]))
+                self._containment_captures[source_index] = capture
+            capture.set(cv2.CAP_PROP_POS_MSEC, identity.canonical_seconds * 1000.)
+            success, original = capture.read()
+            if not success:
+                original = None
+        if original is None:
+            return None, (), "none"
+        frame = _working_frame(original, maximum_width=960)
+        detection_frame = _working_frame(original)
+        faces, backend = _detect_faces(
+            detection_frame, cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY))
+        boxes = tuple(
+            bbox for face in faces if (bbox := _normalized_face_metadata(
+                face, frame_width=detection_frame.shape[1],
+                frame_height=detection_frame.shape[0])[0]) is not None
         )
-        entry_hold_end = hold_seconds if has_entry_boundary else 0.0
-        exit_hold_start = (
-            duration_seconds - hold_seconds
-            if has_exit_boundary
-            else duration_seconds
-        )
-        if entry_hold_end >= exit_hold_start - _EPSILON:
-            raise ValueError(
-                "segment is too short for exact boundary transform holds"
+        self._containment_pixels[key] = (frame, boxes, backend)
+        self._containment_pixel_bytes += frame.nbytes
+        while len(self._containment_pixels) > 64 or self._containment_pixel_bytes > 128 * 1024**2:
+            _, old = self._containment_pixels.popitem(last=False)
+            self._containment_pixel_bytes -= old[0].nbytes
+        return frame, boxes, backend
+
+    def _cut_handle_containment(
+        self, *, source_index: int, start_master_seconds: float,
+        sample_times: Sequence[float], required_master_sample_times: Sequence[float],
+        entry_transform: BoundaryTransformState, exit_transform: BoundaryTransformState,
+        editorial_track: EditorialTransformTrack, descriptor_resolver: DescriptorProvider,
+    ) -> tuple[dict[int, ContainmentSample], str | None]:
+        """Both selector and full proof use the same actually decoded handles.
+
+        No face-recognition cosine is invented for a profile turn. Cross-source
+        boundary recognition remains a separate unchanged gate. This measures
+        only whether the selected face stays inside its short renderer crop.
+        Synthetic descriptor-only callers retain the strict SFace route.
+        """
+        if self._descriptor_provider is not None and self._containment_frame_provider is None:
+            return {}, None
+        groups: list[list[int]] = []
+        for index, master in enumerate(sample_times):
+            if is_identity(editorial_track.evaluate(master - start_master_seconds)):
+                continue
+            if groups and groups[-1][-1] == index - 1:
+                groups[-1].append(index)
+            else:
+                groups.append([index])
+        supported: dict[int, ContainmentSample] = {}
+        for indices in groups:
+            # A short overlapping pair still uses the stricter legacy identity
+            # route until two-anchor overlap containment has an exact proof.
+            if indices[0] == 0 and indices[-1] == len(sample_times) - 1:
+                continue
+            at_entry = indices[0] == 0
+            at_exit = indices[-1] == len(sample_times) - 1
+            if not at_entry and not at_exit:
+                return {}, "segment_active_crop_has_no_cut_anchor"
+            transform = entry_transform if at_entry else exit_transform
+            if transform.subject_basis != "dominant_face":
+                continue
+            near_cut = [
+                i for i in indices if any(abs(sample_times[i] - required) <= _EPSILON
+                                         for required in required_master_sample_times)
+            ]
+            if not near_cut:
+                return {}, "segment_cut_anchor_sample_missing"
+            anchor_index = min(near_cut) if at_entry else max(near_cut)
+            anchor_descriptor = descriptor_resolver(
+                source_index, self._source_time(source_index, sample_times[anchor_index]))
+            if anchor_descriptor is None or anchor_descriptor.primary_face_bbox is None:
+                return {}, "segment_cut_anchor_face_missing"
+            frames, observations = [], []
+            for index in indices:
+                seconds = self._source_time(source_index, sample_times[index])
+                frame, boxes, backend = self._cut_containment_pixels(source_index, seconds)
+                if frame is None:
+                    return {}, "segment_containment_frame_unavailable"
+                if backend != "yunet":
+                    return {}, "segment_containment_face_backend_unavailable"
+                frames.append(frame)
+                observations.append(boxes)
+            trace = track_around_cut_anchor(
+                frames=frames, times=[sample_times[i] for i in indices],
+                face_boxes=observations, anchor_box=anchor_descriptor.primary_face_bbox,
+                anchor_index=indices.index(anchor_index), output_fps=self.output_fps,
             )
-        points: list[EditorialTransformKeyframe] = [entry]
-        if entry_hold_end > _EPSILON:
-            points.append(
-                self._renderer_keyframe(
-                    entry_transform,
-                    entry_hold_end,
-                )
-            )
-        if exit_hold_start < duration_seconds - _EPSILON:
-            points.append(
-                self._renderer_keyframe(
-                    exit_transform,
-                    exit_hold_start,
-                )
-            )
-        points.append(exit_)
-        return EditorialTransformTrack(
-            tuple(points),
-            reason="joint_exact_boundary_hold_segment_transform_path",
-        )
+            if not trace.complete:
+                return {}, "segment_cut_containment_" + str(trace.failure)
+            for observed in trace.samples:
+                global_index = indices[observed.index]
+                supported[global_index] = replace(observed, index=global_index)
+        return supported, None
 
     @staticmethod
     def _bbox_crop_coverage(
@@ -2962,7 +3099,7 @@ class DecodedBoundaryOptionProvider:
         ):
             raise RuntimeError("segment bridge duration disagrees with endpoint clocks")
         base_payload: dict[str, object] = {
-            "contract": "joint-segment-transform-path-proof-v2",
+            "contract": "joint-segment-transform-path-proof-v3",
             "analysis_basis": self.analysis_basis,
             "configuration_identity": self._configuration_identity,
             "context_identity": context_identity,
@@ -3222,12 +3359,7 @@ class DecodedBoundaryOptionProvider:
                 failure_codes=("segment_negative_source_local_time",),
             )
         if track_geometry_required:
-            source_low = min(source_endpoint_times)
-            source_high = max(source_endpoint_times)
-            if any(
-                source_low + _EPSILON < cut < source_high - _EPSILON
-                for cut in self.scene_cut_times[source_index]
-            ):
+            if self._active_crop_has_scene_cut(source_index, start_master_seconds, editorial_track):
                 return outcome(
                     evidence_complete=True,
                     crop_compatible=False,
@@ -3235,10 +3367,19 @@ class DecodedBoundaryOptionProvider:
                     failure_codes=("segment_source_scene_cut_breaks_track",),
                 )
 
+        containment, containment_failure = self._cut_handle_containment(
+            source_index=source_index, start_master_seconds=start_master_seconds,
+            sample_times=sample_times, required_master_sample_times=required_master_sample_times,
+            entry_transform=entry_transform, exit_transform=exit_transform,
+            editorial_track=editorial_track, descriptor_resolver=self._sample_descriptor,
+        )
+        if containment_failure is not None:
+            return outcome(evidence_complete=False, crop_compatible=False,
+                           track_compatible=False, failure_codes=(containment_failure,))
         samples: list[dict[str, object]] = []
         anchor_face_identity: tuple[float, ...] = ()
         previous_face_identity: tuple[float, ...] = ()
-        for master_seconds in sample_times:
+        for sample_index, master_seconds in enumerate(sample_times):
             fraction = (
                 (master_seconds - start_master_seconds)
                 / max(end_master_seconds - start_master_seconds, 1e-9)
@@ -3249,6 +3390,7 @@ class DecodedBoundaryOptionProvider:
                 max(0.0, master_seconds - start_master_seconds)
             )
             sample_crop = self._renderer_crop(renderer_keyframe)
+            sample_geometry_required = sample_crop is not None
             if math.isclose(
                 master_seconds,
                 start_master_seconds,
@@ -3285,9 +3427,12 @@ class DecodedBoundaryOptionProvider:
                     crop_xywh=sample_crop,
                     rotation_degrees=renderer_keyframe.roll_degrees,
                     track_id=entry_transform.track_id,
-                    subject_basis=subject_basis,
+                    subject_basis=subject_basis if sample_geometry_required else "full_frame_identity",
                 )
             sample_subject_basis = sample_transform.subject_basis
+            if not sample_geometry_required:
+                anchor_face_identity = ()
+                previous_face_identity = ()
             if source_seconds < 0.0:
                 transient_samples.append(
                     SegmentTransformPathSample(
@@ -3333,15 +3478,18 @@ class DecodedBoundaryOptionProvider:
                     failure_codes=("segment_descriptor_evidence_incomplete",),
                     samples=samples,
                 )
-            if not track_geometry_required:
+            containment_sample = containment.get(sample_index)
+            if not sample_geometry_required:
                 bbox = None
+            elif containment_sample is not None:
+                bbox = containment_sample.box
             elif sample_subject_basis == "dominant_face":
                 bbox = descriptor.primary_face_bbox
             elif sample_subject_basis == "subject_silhouette":
                 bbox = descriptor.silhouette_bbox_xywh
             else:
                 bbox = descriptor.silhouette_bbox_xywh
-            if track_geometry_required and bbox is None:
+            if sample_geometry_required and bbox is None:
                 transient_samples.append(
                     SegmentTransformPathSample(
                         master_seconds=master_seconds,
@@ -3387,7 +3535,11 @@ class DecodedBoundaryOptionProvider:
             face_identity: tuple[float, ...] = ()
             similarity_to_anchor: float | None = None
             similarity_to_previous: float | None = None
-            if sample_subject_basis == "dominant_face":
+            recognition_required = (
+                sample_geometry_required and sample_subject_basis == "dominant_face"
+                and containment_sample is None
+            )
+            if recognition_required:
                 face_identity = self._sample_face_identity(
                     source_index,
                     source_seconds,
@@ -3418,6 +3570,7 @@ class DecodedBoundaryOptionProvider:
                     face_similarity_to_previous=similarity_to_previous,
                     descriptor=descriptor,
                     face_identity_embedding=face_identity,
+                    containment_basis=containment_sample.basis if containment_sample is not None else None,
                 )
             )
             if coverage is not None and coverage < 0.95 - _EPSILON:
@@ -3428,7 +3581,7 @@ class DecodedBoundaryOptionProvider:
                     failure_codes=("segment_subject_exits_crop_track",),
                     samples=samples,
                 )
-            if sample_subject_basis == "dominant_face" and (
+            if recognition_required and (
                 not face_identity
                 or similarity_to_anchor is None
                 or similarity_to_previous is None
@@ -3442,7 +3595,7 @@ class DecodedBoundaryOptionProvider:
                     ),
                     samples=samples,
                 )
-            if sample_subject_basis == "dominant_face" and (
+            if recognition_required and (
                 similarity_to_anchor
                 < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
                 or similarity_to_previous
@@ -3478,6 +3631,11 @@ class DecodedBoundaryOptionProvider:
                     ),
                     "face_similarity_to_anchor": similarity_to_anchor,
                     "face_similarity_to_previous": similarity_to_previous,
+                    "containment_basis": containment_sample.basis if containment_sample is not None else None,
+                    "consecutive_detector_misses": (
+                        containment_sample.consecutive_detector_misses
+                        if containment_sample is not None else None
+                    ),
                 }
             )
             if face_identity:
@@ -3917,6 +4075,23 @@ class DecodedBoundaryOptionProvider:
                 continue
 
             hard_failures, crop_failures = self._gate_failure_codes(evidence)
+            # Spatial layout is measured in screen coordinates. The very crop
+            # being proposed changes those coordinates, so a face-led repair
+            # must be evaluated on its rendered pixels before spatial rejection.
+            # Pose/side-motion/native-cut/identity failures are not reclassified;
+            # all original spatial thresholds still apply after transformation.
+            spatial_remeasurement_codes = {
+                "person_layout_mismatch", "persisted_layout_mismatch",
+                "silhouette_mismatch", "formation_mismatch",
+            }
+            if (
+                hard_failures
+                and set(hard_failures) <= spatial_remeasurement_codes
+                and outgoing_descriptor.primary_face_bbox is not None
+                and incoming_descriptor.primary_face_bbox is not None
+            ):
+                crop_failures = tuple(sorted(set(crop_failures) | set(hard_failures)))
+                hard_failures = ()
             if hard_failures:
                 audit, record = self._hard_audit(
                     key=key,
@@ -5104,6 +5279,16 @@ class DecodedBoundaryOptionProvider:
                 _SCALAR_BRIDGE_MAXIMUM_ENTRIES_PER_SHARD
             ),
             "implementation_sha256": {
+                "boundary_local_camera_sha256": hashlib.sha256(
+                    Path(__file__).with_name("boundary_local_camera.py").read_bytes()
+                ).hexdigest(),
+                "cut_anchored_containment_sha256": hashlib.sha256(
+                    Path(__file__).with_name("cut_anchored_containment.py").read_bytes()
+                ).hexdigest(),
+                "cut_containment_pixel_flow_ast": python_symbol_dependency_sha256(
+                    Path(__file__).with_name("boundary_subject_alignment.py"),
+                    root_symbols=("_optical_flow_box",),
+                ),
                 "provider_class_ast": python_symbol_dependency_sha256(
                     Path(__file__),
                     root_symbols=("DecodedBoundaryOptionProvider",),
@@ -5443,12 +5628,7 @@ class DecodedBoundaryOptionProvider:
                 failure_codes=("segment_negative_source_local_time",),
             )
         if track_geometry_required:
-            source_low = min(source_endpoint_times)
-            source_high = max(source_endpoint_times)
-            if any(
-                source_low + _EPSILON < cut < source_high - _EPSILON
-                for cut in self.scene_cut_times[source_index]
-            ):
+            if self._active_crop_has_scene_cut(source_index, start_master_seconds, editorial_track):
                 return outcome(
                     evidence_complete=True,
                     crop_compatible=False,
@@ -5456,9 +5636,18 @@ class DecodedBoundaryOptionProvider:
                     failure_codes=("segment_source_scene_cut_breaks_track",),
                 )
 
+        containment, containment_failure = self._cut_handle_containment(
+            source_index=source_index, start_master_seconds=start_master_seconds,
+            sample_times=sample_times, required_master_sample_times=required_master_sample_times,
+            entry_transform=entry_transform, exit_transform=exit_transform,
+            editorial_track=editorial_track, descriptor_resolver=descriptor_resolver,
+        )
+        if containment_failure is not None:
+            return outcome(evidence_complete=False, crop_compatible=False,
+                           track_compatible=False, failure_codes=(containment_failure,))
         anchor_face_identity: tuple[float, ...] = ()
         previous_face_identity: tuple[float, ...] = ()
-        for master_seconds in sample_times:
+        for sample_index, master_seconds in enumerate(sample_times):
             if math.isclose(
                 master_seconds,
                 start_master_seconds,
@@ -5480,6 +5669,11 @@ class DecodedBoundaryOptionProvider:
                 max(0.0, master_seconds - start_master_seconds)
             )
             sample_crop = self._renderer_crop(renderer_keyframe)
+            sample_geometry_required = sample_crop is not None
+            if not sample_geometry_required:
+                sample_subject_basis = "full_frame_identity"
+                anchor_face_identity = ()
+                previous_face_identity = ()
             if source_seconds < 0.0:
                 return outcome(
                     evidence_complete=True,
@@ -5495,15 +5689,18 @@ class DecodedBoundaryOptionProvider:
                     track_compatible=True,
                     failure_codes=("segment_descriptor_evidence_incomplete",),
                 )
-            if not track_geometry_required:
+            containment_sample = containment.get(sample_index)
+            if not sample_geometry_required:
                 bbox = None
+            elif containment_sample is not None:
+                bbox = containment_sample.box
             elif sample_subject_basis == "dominant_face":
                 bbox = descriptor.primary_face_bbox
             elif sample_subject_basis == "subject_silhouette":
                 bbox = descriptor.silhouette_bbox_xywh
             else:
                 bbox = descriptor.silhouette_bbox_xywh
-            if track_geometry_required and bbox is None:
+            if sample_geometry_required and bbox is None:
                 return outcome(
                     evidence_complete=False,
                     crop_compatible=False,
@@ -5540,7 +5737,11 @@ class DecodedBoundaryOptionProvider:
             face_identity: tuple[float, ...] = ()
             similarity_to_anchor: float | None = None
             similarity_to_previous: float | None = None
-            if sample_subject_basis == "dominant_face":
+            recognition_required = (
+                sample_geometry_required and sample_subject_basis == "dominant_face"
+                and containment_sample is None
+            )
+            if recognition_required:
                 face_identity = face_identity_resolver(
                     source_index,
                     source_seconds,
@@ -5559,7 +5760,7 @@ class DecodedBoundaryOptionProvider:
                         previous_face_identity,
                         face_identity,
                     )
-            if sample_subject_basis == "dominant_face" and (
+            if recognition_required and (
                 not face_identity
                 or similarity_to_anchor is None
                 or similarity_to_previous is None
@@ -5572,7 +5773,7 @@ class DecodedBoundaryOptionProvider:
                         "segment_dominant_face_identity_evidence_incomplete",
                     ),
                 )
-            if sample_subject_basis == "dominant_face" and (
+            if recognition_required and (
                 similarity_to_anchor
                 < _MINIMUM_DOMINANT_FACE_TRACK_SIMILARITY
                 or similarity_to_previous

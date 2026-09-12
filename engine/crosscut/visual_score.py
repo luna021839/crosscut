@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 from .face_identity import SFACE_BACKEND, extract_sface_embedding
+from .seek_locality import SeekLocalityReader, probe_constant_frame_clock
 from .pose import (
     FormationPersonDescriptor,
     SubjectGeometryDescriptor,
@@ -4448,6 +4449,21 @@ def _visual_analyzer_fingerprint() -> AnalyzerFingerprint:
             "describe_frame",
         ),
     )
+    # Keep the audited single-component migration contract while binding the
+    # complete new decoder dependency, not just its import alias in this AST.
+    descriptor_implementation_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "contract": "visual-score-with-seek-locality-v1",
+                "descriptor_ast_sha256": descriptor_implementation_digest,
+                "seek_locality_sha256": hashlib.sha256(
+                    Path(__file__).with_name("seek_locality.py").read_bytes()
+                ).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     _VISUAL_ANALYZER_FINGERPRINT = build_analyzer_fingerprint(
         descriptor_schema=(
             "frame_visual_descriptor_v2_numeric_geometry_pose_silhouette_"
@@ -4949,6 +4965,7 @@ class _VideoSampler:
             CanonicalFrameIdentity, tuple[float, ...]
         ] = OrderedDict()
         self.frame_decode_count = 0
+        self._seek_locality: SeekLocalityReader | None = None
         self.persistent_feature_cache: PersistentVisualFeatureCache | None = None
         self._persistent_feature_cache_configured = bool(
             feature_cache_directory is not None
@@ -5049,13 +5066,16 @@ class _VideoSampler:
             # LRU key retains the exact rational request rather than a rounded
             # millisecond.  The persistent key additionally verifies decoded
             # working-frame SHA-256 before reusing numeric features.
-            self.capture.set(
-                cv2.CAP_PROP_POS_MSEC,
-                key.canonical_seconds * 1000.0,
-            )
-            success, frame = self.capture.read()
+            if self._seek_locality is None:
+                # Cold pixel reads alone need a packet-clock probe. Fully warm
+                # persistent descriptor requests never open this decoder path.
+                self._seek_locality = SeekLocalityReader(
+                    self.capture,
+                    clock=probe_constant_frame_clock(self.path),
+                    process_frame=_working_frame,
+                )
             self.frame_decode_count += 1
-            self.cache[key] = _working_frame(frame) if success else None
+            self.cache[key] = self._seek_locality.frame_at(key.canonical_seconds)
             while len(self.cache) > 32:
                 self.cache.popitem(last=False)
         else:
@@ -5278,6 +5298,8 @@ class _VideoSampler:
 
     def close(self) -> None:
         self.capture.release()
+        if self._seek_locality is not None:
+            self._seek_locality.frames.clear()
         self.cache.clear()
         self.frame_digest_cache.clear()
         self.descriptor_cache.clear()
@@ -5307,6 +5329,14 @@ class _VideoSampler:
                 self._persistent_feature_cache_runtime_failure_count
             ),
             "source_frame_decode_count": self.frame_decode_count,
+            "seek_locality": {
+                "initialized": self._seek_locality is not None,
+                "enabled": bool(self._seek_locality and self._seek_locality.enabled),
+                "seek_count": self._seek_locality.seek_count if self._seek_locality else 0,
+                "read_count": self._seek_locality.read_count if self._seek_locality else 0,
+                "pixel_cache_hit_count": self._seek_locality.pixel_cache_hit_count if self._seek_locality else 0,
+                "fallback_count": self._seek_locality.fallback_count if self._seek_locality else 0,
+            },
             "describe_frame_call_count": self.describe_frame_call_count,
             "descriptor_content_cache_hit_count": (
                 self.descriptor_content_cache_hit_count

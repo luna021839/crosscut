@@ -92,6 +92,8 @@ from .direct_member_transition import (
     OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT,
     build_direct_member_pose_dissolve_plan,
 )
+from .member_bridge_contract import RequiredMemberBridgeAuthoringError
+from .member_bridge_recovery import select_authorable_member_path
 from .crop_aware_candidate_rerank import (
     CropAwareCandidateRerankResult,
     rerank_materialized_visual_candidates_for_safe_crops,
@@ -19658,6 +19660,21 @@ def _official_target_fancam_direct_full_frame_segments(
             hard_cut_reason=OFFICIAL_TARGET_FANCAM_DIRECT_FULL_FRAME_POLICY,
             fps=output_fps,
         )
+    except RequiredMemberBridgeAuthoringError as exc:
+        # Keep the chosen partition and exact compact-source edge identities.
+        # The bounded caller can reselect using its existing descriptor provider
+        # instead of aborting the song or converting a required effect to a cut.
+        raise exc.with_path(
+            edges_by_boundary={
+                index: (
+                    boundary_diagnostics[index].selected_cut_master_seconds,
+                    boundary_diagnostics[index].outgoing_eligible_source_index,
+                    boundary_diagnostics[index].incoming_eligible_source_index,
+                )
+                for index in exc.failures
+            },
+            partition_unit_counts=partition_profile.unit_counts,
+        ) from exc
     except (
         AttributeError,
         IndexError,
@@ -34284,6 +34301,8 @@ def analyze(
                 **_visual_feature_cache_arguments(request),
             )
 
+            effect_authoring_failed_edges: list[tuple[float, int, int]] = []
+
             def _select_direct_member_render_path(
                 render_infeasible_transition_edges: Sequence[
                     tuple[float, int, int]
@@ -34299,6 +34318,9 @@ def analyze(
                 ] = (),
                 preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
+                render_infeasible_transition_edges = tuple(dict.fromkeys((
+                    *render_infeasible_transition_edges, *effect_authoring_failed_edges,
+                )))
                 maximum_renderable_source_count = min(
                     len(eligible_indices),
                     len(
@@ -34344,8 +34366,8 @@ def analyze(
                             f"{represented_source_count}개로 다시 푸는 중…"
                         )
                     try:
-                        result = (
-                            _official_target_fancam_direct_full_frame_segments(
+                        result, authoring_recovery = select_authorable_member_path(
+                            lambda retry_edges, retry_partition: _official_target_fancam_direct_full_frame_segments(
                                 timing_draft=timing_draft,
                                 eligible_indices=eligible_indices,
                                 eligible_sources=eligible_direct_sources,
@@ -34384,7 +34406,7 @@ def analyze(
                                 ),
                                 output_fps=29.97,
                                 render_infeasible_transition_edges=(
-                                    render_infeasible_transition_edges
+                                    retry_edges
                                 ),
                                 render_penalized_transition_edges=(
                                     render_penalized_transition_edges
@@ -34399,13 +34421,24 @@ def analyze(
                                     decoded_proxy_rejected_source_paths_by_partition
                                 ),
                                 preferred_partition_unit_counts=(
-                                    preferred_partition_unit_counts
+                                    retry_partition
                                 ),
                                 partition_progress_callback=(
                                     _report_direct_partition_progress
                                 ),
-                            )
+                            ),
+                            rejected_edges=render_infeasible_transition_edges,
+                            preferred_partition_unit_counts=preferred_partition_unit_counts,
+                            progress_callback=lambda event: reporter.log(
+                                "필수 직캠 효과 제작 실패를 컷 선택에 반영 · "
+                                f"{event['attempt']}/{event['maximum_attempts']} · "
+                                f"새 제외 전환 {event['new_rejected_edge_count']}개"
+                            ),
                         )
+                        result[3]["required_effect_authoring_recovery"] = authoring_recovery
+                        for edge in authoring_recovery["rejected_transition_edges"]:
+                            if edge not in effect_authoring_failed_edges:
+                                effect_authoring_failed_edges.append(edge)
                     except DirectMemberVisualSelectionError as exc:
                         final_error = exc
                         diversity_attempts.append(

@@ -21,6 +21,11 @@ from statistics import fmean
 from typing import Any, Sequence
 
 from .direct_member_visual import DirectMemberVisualSelection
+from .member_bridge_contract import (
+    MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY,
+    RequiredMemberBridgeAuthoringError,
+    member_bridge_handle_quality_failures,
+)
 from .render import (
     MEMBER_BLUR_BRIDGE_REASON,
     MEMBER_ZOOM_BRIDGE_REASON,
@@ -91,7 +96,7 @@ class DirectMemberPoseDissolveConfig:
     maximum_handle_entry_shape_jump: float = 0.42
     maximum_motion_endpoint_shape_mismatch: float = 0.38
     minimum_static_shape_strength: float = 0.76
-    minimum_handle_quality_score: float = 0.68
+    minimum_handle_quality_score: float = MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY
     handle_sample_horizon_seconds: float = 0.20
 
     def __post_init__(self) -> None:
@@ -1764,16 +1769,11 @@ def _required_cinematic_bridge_candidate(
             if len(samples) != 2:
                 reasons.append(f"cinematic_bridge_{label}_future_samples_incomplete")
                 continue
+            reasons.extend(member_bridge_handle_quality_failures(
+                tuple(getattr(getattr(sample, "descriptor", None), "quality_score", None)
+                      for sample in samples), label=label,
+                minimum_quality=config.minimum_handle_quality_score))
             for sample in samples:
-                descriptor = getattr(sample, "descriptor", None)
-                if (
-                    descriptor is None
-                    or float(getattr(descriptor, "quality_score", 0.0))
-                    < config.minimum_handle_quality_score
-                ):
-                    reasons.append(
-                        f"cinematic_bridge_{label}_future_quality_too_low"
-                    )
                 sample_master = _finite_float(
                     getattr(sample, "master_seconds", None)
                 )
@@ -2105,16 +2105,7 @@ def build_direct_member_pose_dissolve_plan(
             )
 
     if required_bridge_failures:
-        failure_text = "; ".join(
-            f"boundary {boundary_index}: {','.join(reasons)}"
-            for boundary_index, reasons in sorted(
-                required_bridge_failures.items()
-            )
-        )
-        raise RuntimeError(
-            "required direct member cinematic bridge could not be authored: "
-            + failure_text
-        )
+        raise RequiredMemberBridgeAuthoringError(required_bridge_failures)
 
     if required_bridges:
         safe = [

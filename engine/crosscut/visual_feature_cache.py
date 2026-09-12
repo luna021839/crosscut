@@ -145,6 +145,23 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Verified AV1 decoder locality: 170 real frame payloads and real full
+    # descriptors are byte-identical. The endpoint includes the entire reader
+    # dependency hash; unknown reader/model/runtime changes never migrate.
+    "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "14664ec334ef15c192a496aae269c927d0e11289f882e94217e0632a31a0afde"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "3cdd076cf6c0f001f6d6de4d7228d85d259248e1bddb687c7173690f5bab7d39"
+            ),
+            current_descriptor_digest=(
+                "9f3590797903f8bbb52fd57d992b7d7f93b5992081acb4b2c659c3948dee8834"
+            ),
+        ),
+    ),
     # Exact-pixel request coalescing leaves describe_frame and its numeric
     # output unchanged (96 real half-frame requests compared byte-for-byte).
     # Do not bridge the earlier framing/schema changes: only this predecessor.

@@ -734,13 +734,15 @@ class DirectMemberVisualTests(unittest.TestCase):
 
         def candidate(offset_frames: int, mismatch: DirectBoundaryMismatch):
             matrix = ((severe, mismatch), (severe, severe))
+            handle = SimpleNamespace(descriptor=_descriptor(0.2))
             return _DirectBoundarySearchCandidate(
                 offset_frames=offset_frames,
                 cut_master_seconds=10.0 + offset_frames / 30.0,
                 outgoing=(),
                 outgoing_previous=(),
                 incoming=(),
-                incoming_next=(),
+                incoming_next=(handle, handle),
+                incoming_future=(handle, handle),
                 matrix=matrix,
             )
 

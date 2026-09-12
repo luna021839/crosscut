@@ -3279,7 +3279,7 @@ class DecodedBoundaryOptionProviderTests(unittest.TestCase):
             seconds: float,
             _descriptor_value: FrameVisualDescriptor,
         ) -> tuple[float, ...]:
-            if source == 1 and seconds >= 10.5:
+            if source == 1 and seconds >= 10.25:
                 return (0.0, 1.0)
             return (1.0, 0.0)
 

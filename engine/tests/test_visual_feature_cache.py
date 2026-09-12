@@ -506,19 +506,44 @@ class VisualFeatureCacheTests(unittest.TestCase):
         visual_score_path = (
             Path(__file__).resolve().parents[1] / "crosscut" / "visual_score.py"
         )
-        self.assertEqual(
-            python_symbol_dependency_sha256(
-                visual_score_path,
-                root_symbols=(
-                    "FrameVisualDescriptor",
-                    "_VideoSampler",
-                    "_descriptor_cache_payload",
-                    "_descriptor_from_cache_payload",
-                    "describe_frame",
-                ),
+        descriptor_ast = python_symbol_dependency_sha256(
+            visual_score_path,
+            root_symbols=(
+                "FrameVisualDescriptor",
+                "_VideoSampler",
+                "_descriptor_cache_payload",
+                "_descriptor_from_cache_payload",
+                "describe_frame",
             ),
-            _AUDITED_ACTIVE_DESCRIPTOR_DIGEST,
         )
+        self.assertEqual(
+            descriptor_ast,
+            "52ef779a8e3ff76a93dd2c4c2e9c2db283888acde02c950637e4d41075fab8aa",
+        )
+        # Reader behavior is part of the audited endpoint, even if the import
+        # alias and sampler AST remain unchanged. Older constants above retain
+        # their meaning for explicit predecessor/schema rejection tests.
+        dependency = visual_score_path.with_name("seek_locality.py")
+        combined = hashlib.sha256(json.dumps({
+            "contract": "visual-score-with-seek-locality-v1",
+            "descriptor_ast_sha256": descriptor_ast,
+            "seek_locality_sha256": hashlib.sha256(dependency.read_bytes()).hexdigest(),
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(
+            combined,
+            "9f3590797903f8bbb52fd57d992b7d7f93b5992081acb4b2c659c3948dee8834",
+        )
+
+    def test_seek_locality_endpoint_preserves_audited_predecessors(self) -> None:
+        current = "5e230050f8b6b83a4f208475ebbe0931e8078845cb830eaebd1333bd7f9b9509"
+        closure = _decode_equivalent_analyzer_migration_closure(current)
+        self.assertEqual(tuple(item.legacy_analyzer_digest for item in closure), (
+            _AUDITED_ACTIVE_ANALYZER_DIGEST,
+            "0bb5d3e1ae287ec7b59697727580b219dae5b857f6a0a25d8a55db5d59ec9921",
+        ))
+        self.assertEqual(closure[0].edges[0][1].legacy_descriptor_digest,
+                         _AUDITED_ACTIVE_DESCRIPTOR_DIGEST)
+        self.assertEqual(_decode_equivalent_analyzer_migration_closure("f" * 64), ())
 
     def test_active_schema_does_not_reuse_incomplete_v1_descriptor(self) -> None:
         previous = _analyzer_from_components(
