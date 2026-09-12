@@ -464,6 +464,7 @@ def evaluate_direct_member_rendered_continuity(
     focal_body_model_path: Path | None = None,
     focal_source_cache_arguments: Mapping[str, Any] | None = None,
     body_window_provider=None,
+    effect_endpoint_provider=None,
     focal_body_execution_device: str = 'cpu',
 ) -> DirectMemberRenderedContinuityResult:
     """Evaluate every real hard source switch in the encoded member video."""
@@ -560,6 +561,8 @@ def evaluate_direct_member_rendered_continuity(
                 body_execution_device=focal_body_execution_device,
                 source_cache_arguments=focal_source_cache_arguments)
             body_window_provider = owned_body_provider
+            if effect_endpoint_provider is None:
+                effect_endpoint_provider = owned_body_provider.endpoint_window
         except BaseException:
             owned.close()
             raise
@@ -592,6 +595,7 @@ def evaluate_direct_member_rendered_continuity(
     aggregate_silhouette_diagnostic_only_count = 0
     body_reference_guided_count = 0
     effect_body_reference_guided_count = 0
+    effect_endpoint_target_guided_count = 0
 
     def resolve_body_window(face_window, indices):
         # Keep a complete source-guided face window. Otherwise compare bodies
@@ -623,6 +627,7 @@ def evaluate_direct_member_rendered_continuity(
         nonlocal effect_endpoint_pair_count
         nonlocal effect_endpoint_attention_count
         nonlocal effect_endpoint_pose_count
+        nonlocal effect_endpoint_target_guided_count
         effect_endpoint_pair_count += 1
         left, right = _samples_with_common_attention(
             (left, right),
@@ -630,9 +635,36 @@ def evaluate_direct_member_rendered_continuity(
                 visual_config.minimum_silhouette_confidence
             ),
         )
-        if left.descriptor is None or right.descriptor is None:
+        component_pair=None;component_metrics=None
+        if effect_endpoint_provider is not None:
+            from .rendered_endpoint_component import EndpointComponentPair,incoming_dissolve_weight
+            from .render import FACE_DISSOLVE_ALPHA_CURVE
+            component_pair=effect_endpoint_provider(boundary_index,label)
+            if component_pair is not None:
+                expected_frames=tuple(int(round(s.master_seconds*fps)) for s in (left,right))
+                if (not isinstance(component_pair,EndpointComponentPair)
+                        or component_pair.boundary_index!=boundary_index or component_pair.label!=label
+                        or tuple(f.output_frame for f in component_pair.frames)!=expected_frames
+                        or any(f.source_index!=source_indices[boundary_index+int(label=='effect_exit')]
+                               for f in component_pair.frames)):
+                    raise ValueError('endpoint target components differ from rendered boundary')
+                transition=transitions[boundary_index]
+                count=transition.get('frame_count')
+                if (transition.get('kind')!='face_dissolve' or transition.get('alpha_curve')!=FACE_DISSOLVE_ALPHA_CURVE
+                        or isinstance(count,bool) or not isinstance(count,int) or count<3):
+                    raise ValueError('endpoint target component has an unbound blend curve')
+                weights=(1.,1.) if label=='effect_entry' else (incoming_dissolve_weight(count-1,count),1.)
+                if any(abs(f.component_weight-w)>1e-9 for f,w in zip(component_pair.frames,weights)):
+                    raise ValueError('endpoint component weights differ from renderer')
+                component_metrics=component_pair.metrics()
+        if component_metrics is None and (left.descriptor is None or right.descriptor is None):
             fail("rendered_effect_endpoint_descriptor_missing", boundary_index)
-        position, scale = _attention_mismatch(left.attention, right.attention)
+        aggregate_position,aggregate_scale=_attention_mismatch(left.attention,right.attention)
+        position,scale=aggregate_position,aggregate_scale
+        if component_metrics is not None:
+            position=component_metrics['attention_position_step']
+            scale=component_metrics['attention_scale_step']
+            effect_endpoint_target_guided_count+=1
         if position is None or scale is None:
             fail("rendered_effect_endpoint_attention_missing", boundary_index)
         else:
@@ -656,20 +688,14 @@ def evaluate_direct_member_rendered_continuity(
                 )
         left_descriptor = left.descriptor
         right_descriptor = right.descriptor
-        pose_step: float | None = None
+        pose_step: float | None = component_metrics['pose_step'] if component_metrics is not None else None
         silhouette_step: float | None = None
         if left_descriptor is not None and right_descriptor is not None:
-            pose_step = _embedding_distance(
+            aggregate_pose_step = _embedding_distance(
                 _actual_pose_vector(left_descriptor, visual_config) or (),
                 _actual_pose_vector(right_descriptor, visual_config) or (),
             )
-            if pose_step is not None:
-                effect_endpoint_pose_count += 1
-                if pose_step > settings.maximum_effect_endpoint_pose_step + 1e-9:
-                    fail(
-                        "rendered_effect_endpoint_pose_discontinuity",
-                        boundary_index,
-                    )
+            if component_metrics is None:pose_step=aggregate_pose_step
             silhouette_step = _embedding_distance(
                 left_descriptor.silhouette_embedding
                 if left_descriptor.silhouette_confidence
@@ -681,7 +707,7 @@ def evaluate_direct_member_rendered_continuity(
                 else (),
             )
             if (
-                silhouette_step is not None
+                component_metrics is None and silhouette_step is not None
                 and silhouette_step
                 > settings.maximum_effect_endpoint_silhouette_step + 1e-9
             ):
@@ -689,6 +715,10 @@ def evaluate_direct_member_rendered_continuity(
                     "rendered_effect_endpoint_silhouette_discontinuity",
                     boundary_index,
                 )
+        if pose_step is not None:
+            effect_endpoint_pose_count+=1
+            if pose_step>settings.maximum_effect_endpoint_pose_step+1e-9:
+                fail('rendered_effect_endpoint_pose_discontinuity',boundary_index)
         if pose_step is None and silhouette_step is None:
             fail("rendered_effect_endpoint_shape_evidence_missing", boundary_index)
         return {
@@ -702,15 +732,21 @@ def evaluate_direct_member_rendered_continuity(
             # Pure-boundary focal authority does not authorize these blended
             # endpoint descriptors. Persist the actual basis so a group-mask
             # change cannot be misdiagnosed as a target camera-scale error.
-            "attention_basis": {
+            "attention_basis": ({"left":"source_component_observed_torso_joints",
+                                  "right":"source_component_observed_torso_joints"}
+                                if component_metrics is not None else {
                 "left": left.attention.basis if left.attention is not None else None,
                 "right": right.attention.basis if right.attention is not None else None,
-            },
-            "attention_geometry": {
+            }),
+            "attention_geometry": component_metrics['attention_geometry'] if component_metrics is not None else {
                 "left": _serialized_attention_geometry(left.attention),
                 "right": _serialized_attention_geometry(right.attention),
             },
-            "target_reference_guided": False,
+            "target_reference_guided": component_metrics is not None,
+            "source_component_evidence": component_pair.audit() if component_pair is not None else None,
+            "aggregate_attention_position_step_diagnostic": aggregate_position,
+            "aggregate_attention_scale_step_diagnostic": aggregate_scale,
+            "aggregate_silhouette_diagnostic_only": component_metrics is not None,
             "pose_step": pose_step,
             "silhouette_step": silhouette_step,
         }
@@ -1446,7 +1482,9 @@ def evaluate_direct_member_rendered_continuity(
     metrics = {
         "pose_measurement_basis": ('source_referenced_output_rtmpose_body7'
             if target_pose_authority else 'legacy_full_frame_pose'),
-        "effect_endpoint_step_pose_basis": "legacy_full_frame_step_not_target_specific",
+        "effect_endpoint_step_pose_basis": ("source_component_pose_when_observed_otherwise_legacy_full_frame"
+            if effect_endpoint_target_guided_count else "legacy_full_frame_step_not_target_specific"),
+        "effect_endpoint_target_guided_count": effect_endpoint_target_guided_count,
         "fps": fps,
         "output_frame_count": output_frames,
         "source_switch_boundary_count": source_switch_count,

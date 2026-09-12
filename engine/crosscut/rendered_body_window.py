@@ -88,18 +88,22 @@ class RenderedBodyWindowProvider:
             if (transition['kind'] != 'hard_cut' and
                     output_frame < span.start_frame + transition['frame_count']):
                 return RenderedBodyMeasurement('blended_output_has_no_single_source_owner')
+        return self._measurement_on_clock(output_frame,span,
+            (output_frame-span.start_frame)/self.fps,cache_key=output_frame)
+
+    def _measurement_on_clock(self,output_frame,span,relative_time,*,cache_key):
         source = self._open()
         sampler = source.faces._samplers[span.source_index]
         if sampler is None:
             return RenderedBodyMeasurement('source_frame_unavailable')
         source_frame = _rendered_source_frame_index(span,
-            relative_time=(output_frame - span.start_frame) / self.fps,
+            relative_time=relative_time,
             source_fps=sampler.frame_rate)
         seconds = source_frame / sampler.frame_rate
         # Validates source file identity even when our output measurement is cached.
         geometry = source.selector_geometry(span.source_index, seconds)
-        if output_frame in self._cache:
-            return self._cache[output_frame]
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         if (geometry.person is None or geometry.pose_backend != 'rtmpose_body7'
                 or not geometry.pose_screen_xyc or
                 (geometry.face_bbox_xywh is None and geometry.body_track is None)):
@@ -118,8 +122,36 @@ class RenderedBodyWindowProvider:
             minimum_width=.015, minimum_height=.045, minimum_confidence=.35)[0]
         measured = measure_referenced_output_body(output, reference, people,
             source.encoder, source.pose)
-        self._cache[output_frame] = measured
+        self._cache[cache_key] = measured
         return measured
+
+    def endpoint_window(self,boundary_index,label):
+        from .rendered_endpoint_component import (endpoint_component_clocks,
+            EndpointComponentFrame,EndpointComponentPair)
+        clocks=endpoint_component_clocks(self.spans,self.transitions,boundary_index,label)
+        if clocks is None or any(c[3]<.90 for c in clocks):return None
+        frames=[]
+        for output_frame,span,relative_frames,weight in clocks:
+            source=self._open()
+            sampler=source.faces._samplers[span.source_index]
+            if sampler is None:return None
+            source_frame=_rendered_source_frame_index(span,relative_time=relative_frames/self.fps,
+                source_fps=sampler.frame_rate)
+            native_span=_span_for_frame(self.spans,output_frame)
+            # The neighboring pure frame was usually measured by the ordinary
+            # four-frame boundary QA already. Share that exact output result;
+            # only the near-pure component needs an additional detector pass.
+            pure_clock=(native_span.source_index==span.source_index and
+                output_frame>=native_span.start_frame+native_span.incoming_transition_frames and
+                _rendered_source_frame_index(native_span,
+                    relative_time=(output_frame-native_span.start_frame)/self.fps,
+                    source_fps=sampler.frame_rate)==source_frame)
+            measured=self._measurement_on_clock(output_frame,span,relative_frames/self.fps,
+                cache_key=output_frame if pure_clock else
+                    ('endpoint_component',output_frame,span.source_index,source_frame))
+            frames.append(EndpointComponentFrame(output_frame,span.source_index,source_frame,
+                source_frame/sampler.frame_rate,weight,measured))
+        return EndpointComponentPair(boundary_index,label,tuple(frames))
 
     def __call__(self, frame_indices):
         if len(frame_indices) != 4:

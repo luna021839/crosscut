@@ -9891,6 +9891,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("rendered_focal_geometry.py"),
                 Path(__file__).with_name("rendered_body_reference.py"),
                 Path(__file__).with_name("rendered_body_window.py"),
+                Path(__file__).with_name("rendered_endpoint_component.py"),
                 Path(__file__).with_name("post_render_perceptual_quality.py"),
             )
         }
