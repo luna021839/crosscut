@@ -399,7 +399,12 @@ class DirectMemberDenseFaceProvider:
                 sampler: _VideoSampler | None = None
                 try:
                     sampler = _VideoSampler(source, **sampler_arguments)
-                    _enable_dense_sequential_frame_reads(sampler)
+                    # The sampler's reader owns capture position and its pixel
+                    # window, even while lazily uninitialized. A second wrapper
+                    # that reads capture directly makes the reader detect an
+                    # external seek and permanently disable locality reuse.
+                    if not hasattr(sampler, "_seek_locality"):
+                        _enable_dense_sequential_frame_reads(sampler)
                 except (OSError, TypeError, ValueError, cv2.error):
                     if sampler is not None:
                         sampler.close()
