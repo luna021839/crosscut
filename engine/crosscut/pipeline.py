@@ -9874,6 +9874,9 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("body_pose_2d.py"),
                 Path(__file__).with_name("native_focal_faces.py"),
                 Path(__file__).with_name("rendered_focal_geometry.py"),
+                Path(__file__).with_name("rendered_body_reference.py"),
+                Path(__file__).with_name("rendered_body_window.py"),
+                Path(__file__).with_name("post_render_perceptual_quality.py"),
             )
         }
         from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
@@ -34373,6 +34376,8 @@ def analyze(
             member_rendered_continuity_evaluator = partial(
                 evaluate_direct_member_rendered_continuity,
                 focal_pose_model_path=dense_face_provider.pose.model_path,
+                focal_body_model_path=dense_face_provider.encoder.model_path,
+                focal_source_cache_arguments=_visual_feature_cache_arguments(request),
             )
 
             effect_authoring_failed_edges: list[tuple[float, int, int]] = []

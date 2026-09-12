@@ -461,10 +461,17 @@ def evaluate_direct_member_rendered_continuity(
     ] | None = None,
     focal_pose_model_path: Path | None = None,
     focal_geometry_provider=None,
+    focal_body_model_path: Path | None = None,
+    focal_source_cache_arguments: Mapping[str, Any] | None = None,
+    body_window_provider=None,
 ) -> DirectMemberRenderedContinuityResult:
     """Evaluate every real hard source switch in the encoded member video."""
 
     settings = config or DirectMemberRenderedContinuityConfig()
+    if focal_body_model_path is not None and (
+        focal_pose_model_path is None or body_window_provider is not None
+    ):
+        raise ValueError('owned rendered body authority requires its pose model')
     if focal_pose_model_path is not None and (
         descriptor_provider is not None or focal_geometry_provider is not None
     ):
@@ -490,7 +497,7 @@ def evaluate_direct_member_rendered_continuity(
             raise ValueError("rendered focal references are malformed")
     reference_authority_active = bool(
         focal_reference_candidates_by_boundary_index
-    )
+    ) or focal_body_model_path is not None or body_window_provider is not None
     fps = _finite(render_plan.get("fps"))
     output_frames = _integer(render_plan.get("output_frame_count"))
     segments = _sequence(render_plan.get("segments"), "render segments")
@@ -542,6 +549,19 @@ def evaluate_direct_member_rendered_continuity(
         except BaseException:
             owned.close()
             raise
+    owned_body_provider = None
+    if focal_body_model_path is not None:
+        from .rendered_body_window import RenderedBodyWindowProvider
+        try:
+            owned_body_provider = RenderedBodyWindowProvider(render_plan,
+                owned._sampler.frame_at, body_model_path=focal_body_model_path,
+                pose_model_path=focal_pose_model_path,
+                source_cache_arguments=focal_source_cache_arguments)
+            body_window_provider = owned_body_provider
+        except BaseException:
+            owned.close()
+            raise
+    target_pose_authority = focal_geometry_provider is not None or body_window_provider is not None
     visual_config = replace(
         DirectMemberVisualConfig(),
         sample_frame_step_seconds=1.0 / fps,
@@ -568,6 +588,25 @@ def evaluate_direct_member_rendered_continuity(
     effect_focal_face_correspondence_count = 0
     effect_focal_reference_guided_count = 0
     aggregate_silhouette_diagnostic_only_count = 0
+    body_reference_guided_count = 0
+    effect_body_reference_guided_count = 0
+
+    def resolve_body_window(face_window, indices):
+        # Keep a complete source-guided face window. Otherwise compare bodies
+        # on ALL four frames, never a face area against a torso area.
+        if body_window_provider is None or (face_window is not None and
+                face_window[2] and all(c is not None for c in face_window[0])):
+            return None, []
+        from .rendered_body_reference import RenderedBodyMeasurement
+        values = tuple(body_window_provider(indices))
+        if len(values) != 4 or any(not isinstance(v, RenderedBodyMeasurement) for v in values):
+            raise ValueError('rendered body window must contain four typed measurements')
+        audit = [v.audit() for v in values]
+        for item in audit:
+            item.pop('observed_output_pose_xyc', None)
+        observed = all(v.reason == 'observed' and v.person is not None and v.pose is not None
+                       for v in values)
+        return (values if observed else None), audit
 
     def fail(reason: str, boundary_index: int) -> None:
         failures_by_reason.setdefault(reason, []).append(boundary_index)
@@ -752,14 +791,17 @@ def evaluate_direct_member_rendered_continuity(
                         else ()
                     ),
                 )
-                if focal_geometry_provider is not None and (
-                    focal_reference_candidates_by_boundary_index is None
-                    or boundary_index not in focal_reference_candidates_by_boundary_index
-                ):
-                    fail("rendered_boundary_target_reference_unresolved", boundary_index)
+                pure_body_window, pure_body_audit = resolve_body_window(pure_focal_window,
+                    (max(0, boundary_frame - 2), boundary_frame - 1,
+                     effect_next_frame, min(output_frames - 1, effect_next_frame + 1)))
                 pure_focal_similarity: float | None = None
                 pure_focal_reference_guided = False
-                if pure_focal_window is not None:
+                if pure_body_window is not None:
+                    from .rendered_body_window import body_sample
+                    pure_outgoing = body_sample(entry_previous, pure_body_window[1])
+                    pure_incoming = body_sample(exit_next, pure_body_window[2])
+                    effect_body_reference_guided_count += 1
+                elif pure_focal_window is not None:
                     (
                         pure_focal_candidates,
                         pure_focal_similarity,
@@ -792,6 +834,8 @@ def evaluate_direct_member_rendered_continuity(
                             ),
                         )
                     )
+                if target_pose_authority and not (pure_focal_reference_guided or pure_body_window is not None):
+                    fail("rendered_boundary_target_reference_unresolved", boundary_index)
                 pure_position, pure_scale = _attention_mismatch(
                     pure_outgoing.attention,
                     pure_incoming.attention,
@@ -802,7 +846,7 @@ def evaluate_direct_member_rendered_continuity(
                     and pure_incoming.descriptor is not None
                 ):
                     pure_pose = (focal_pose_shape_mismatch(pure_outgoing.focal_geometry,pure_incoming.focal_geometry)
-                        if focal_geometry_provider is not None else _embedding_distance(
+                        if target_pose_authority else _embedding_distance(
                         _actual_pose_vector(
                             pure_outgoing.descriptor,
                             visual_config,
@@ -874,6 +918,8 @@ def evaluate_direct_member_rendered_continuity(
                         "focal_face_reference_guided": (
                             pure_focal_reference_guided
                         ),
+                        "body_reference_guided": pure_body_window is not None,
+                        "body_reference_measurements": pure_body_audit,
                         "raw_embeddings_persisted": False,
                     }
                 )
@@ -913,13 +959,6 @@ def evaluate_direct_member_rendered_continuity(
             )
             if not descriptors_available:
                 fail("rendered_boundary_descriptor_missing", boundary_index)
-            if focal_geometry_provider is not None and (
-                focal_reference_candidates_by_boundary_index is None
-                or boundary_index not in focal_reference_candidates_by_boundary_index
-            ):
-                # A missing source reference is not permission to identify
-                # an arbitrary matching pair of background performers.
-                fail("rendered_boundary_target_reference_unresolved", boundary_index)
             focal_window = _focal_face_window(
                 provider,
                 frame_indices=(
@@ -954,7 +993,16 @@ def evaluate_direct_member_rendered_continuity(
             )
             focal_similarity: float | None = None
             focal_reference_guided = False
-            if focal_window is not None:
+            body_window, body_audit = resolve_body_window(focal_window,
+                (boundary_frame - 2, boundary_frame - 1, boundary_frame, boundary_frame + 1))
+            body_motion_samples = None
+            if body_window is not None:
+                from .rendered_body_window import body_sample
+                body_motion_samples = tuple(body_sample(s, m) for s, m in zip(samples, body_window, strict=True))
+                endpoint_samples = body_motion_samples[1:3]
+                focal_candidates = (None, None, None, None)
+                body_reference_guided_count += 1
+            elif focal_window is not None:
                 (
                     focal_candidates,
                     focal_similarity,
@@ -986,6 +1034,9 @@ def evaluate_direct_member_rendered_continuity(
                         visual_config.minimum_silhouette_confidence
                     ),
                 )
+            target_reference_guided = focal_reference_guided or body_window is not None
+            if target_pose_authority and not target_reference_guided:
+                fail("rendered_boundary_target_reference_unresolved", boundary_index)
             endpoint_outgoing, endpoint_incoming = endpoint_samples
             position, scale = _attention_mismatch(
                 endpoint_outgoing.attention,
@@ -1029,7 +1080,7 @@ def evaluate_direct_member_rendered_continuity(
                 attention_count += 1
                 position_values.append(position)
                 scale_values.append(scale)
-                if focal_reference_guided:
+                if target_reference_guided:
                     focal_guided_position_values.append(position)
                     focal_guided_scale_values.append(scale)
                 if position > settings.maximum_attention_position_mismatch + 1e-9:
@@ -1046,7 +1097,7 @@ def evaluate_direct_member_rendered_continuity(
                 left_pose = _actual_pose_vector(left, visual_config)
                 right_pose = _actual_pose_vector(right, visual_config)
                 pose_mismatch = (focal_pose_shape_mismatch(endpoint_outgoing.focal_geometry,endpoint_incoming.focal_geometry)
-                    if focal_geometry_provider is not None else _embedding_distance(
+                    if target_pose_authority else _embedding_distance(
                     left_pose or (),
                     right_pose or (),
                 ))
@@ -1077,7 +1128,7 @@ def evaluate_direct_member_rendered_continuity(
                     silhouette_mismatch = (
                         aggregate_silhouette_mismatch
                         if pose_mismatch is None
-                        and not focal_reference_guided
+                        and not target_reference_guided
                         else None
                     )
                 else:
@@ -1104,11 +1155,13 @@ def evaluate_direct_member_rendered_continuity(
             if (
                 pose_mismatch is None
                 and silhouette_mismatch is None
-                and not focal_reference_guided
+                and not target_reference_guided
             ):
                 fail("rendered_boundary_shape_evidence_missing", boundary_index)
 
-            if all(candidate is not None for candidate in focal_candidates):
+            if body_motion_samples is not None:
+                motion_samples = body_motion_samples
+            elif all(candidate is not None for candidate in focal_candidates):
                 motion_samples = tuple(
                     _sample_with_focal_face(sample, candidate, focal_geometry_provider)
                     for sample, candidate in zip(
@@ -1126,7 +1179,7 @@ def evaluate_direct_member_rendered_continuity(
                         visual_config.minimum_silhouette_confidence
                     ),
                 )
-            if focal_geometry_provider is not None:
+            if target_pose_authority:
                 # Missing focal frames must not reactivate whole-frame pose
                 # in the four-frame motion window.
                 motion_samples=tuple(replace(s,focal_geometry=s.focal_geometry or
@@ -1141,7 +1194,7 @@ def evaluate_direct_member_rendered_continuity(
                 output_space_subject_motion_used=True,
             )
             strong_output_subject_motion_gate = bool(
-                focal_reference_guided
+                target_reference_guided
                 and motion.outgoing_subject_motion_magnitude is not None
                 and motion.incoming_subject_motion_magnitude is not None
                 and motion.outgoing_subject_motion_magnitude
@@ -1264,6 +1317,8 @@ def evaluate_direct_member_rendered_continuity(
                     "focal_face_reference_guided": (
                         focal_reference_guided
                     ),
+                    "body_reference_guided": body_window is not None,
+                    "body_reference_measurements": body_audit,
                     "strong_output_subject_motion_gate_applied": (
                         strong_output_subject_motion_gate
                     ),
@@ -1272,8 +1327,12 @@ def evaluate_direct_member_rendered_continuity(
                 }
             )
     finally:
-        if owned is not None:
-            owned.close()
+        try:
+            if owned_body_provider is not None:
+                owned_body_provider.close()
+        finally:
+            if owned is not None:
+                owned.close()
 
     hard_count = hard_switch_count
     source_switch_count = hard_switch_count + effect_switch_count
@@ -1288,6 +1347,10 @@ def evaluate_direct_member_rendered_continuity(
         focal_face_correspondence_count / hard_count
         if hard_count
         else 0.0
+    )
+    target_reference_coverage = (
+        (focal_face_reference_guided_count + body_reference_guided_count) / hard_count
+        if hard_count else 0.0
     )
     if source_switch_count == 0:
         failures_by_reason.setdefault(
@@ -1310,7 +1373,7 @@ def evaluate_direct_member_rendered_continuity(
     if (
         reference_authority_active
         and hard_count > 0
-        and (focal_reference_coverage if focal_geometry_provider is not None
+        and (target_reference_coverage if target_pose_authority
              else focal_authority_coverage) + 1e-9
         < settings.minimum_focal_reference_guided_fraction
     ):
@@ -1368,7 +1431,7 @@ def evaluate_direct_member_rendered_continuity(
     }
     metrics = {
         "pose_measurement_basis": ('source_referenced_output_rtmpose_body7'
-            if focal_geometry_provider is not None else 'legacy_full_frame_pose'),
+            if target_pose_authority else 'legacy_full_frame_pose'),
         "effect_endpoint_step_pose_basis": "legacy_full_frame_step_not_target_specific",
         "fps": fps,
         "output_frame_count": output_frames,
@@ -1386,6 +1449,10 @@ def evaluate_direct_member_rendered_continuity(
         ),
         "focal_face_reference_guided_fraction": focal_reference_coverage,
         "focal_face_authoritative_fraction": focal_authority_coverage,
+        "body_reference_guided_boundary_count": body_reference_guided_count,
+        "effect_body_reference_guided_boundary_count": effect_body_reference_guided_count,
+        "target_reference_guided_fraction": target_reference_coverage,
+        "body_reference_authority_active": body_window_provider is not None,
         "focal_face_authority_basis": (
             "source_bound_reference_or_verified_official_fancam_"
             "cross_output_correspondence"
