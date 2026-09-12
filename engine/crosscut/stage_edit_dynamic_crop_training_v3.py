@@ -18,6 +18,7 @@ from .stage_edit_dynamic_crop_target_v3 import (
 from .stage_edit_dynamic_crop_training import (
     StageEditDynamicCropTrainingCorpusV2,
 )
+from .dynamic_crop_source_frame_binding import SOURCE_FRAME_BINDING_CONTRACT
 
 
 DYNAMIC_CROP_TRAINING_CORPUS_V3_SCHEMA_VERSION = 1
@@ -83,6 +84,10 @@ class StageEditDynamicCropTrainingCorpusV3:
                 "observed_keyframes_moved_or_clamped": False,
                 "exact_renderer_track_revalidated_after_simplification": True,
                 "target_source_id_retained_for_exact_slot_resolution": True,
+                "source_frame_binding_contract": SOURCE_FRAME_BINDING_CONTRACT,
+                "all_original_source_frame_observations_retained": True,
+                "source_frame_binding_is_model_input": False,
+                "geometry_only_heads_reconcile_source_phase": False,
                 "simplification_contract": (
                     DYNAMIC_CROP_V3_SIMPLIFICATION_CONTRACT
                 ),
@@ -169,6 +174,9 @@ def build_stage_edit_dynamic_crop_training_corpus_v3(
         "artifact_count": source.statistics.get("artifact_count"),
         "track_label_count": reference_track_count,
         "original_keyframe_label_count": original_keyframes,
+        "source_frame_observation_count": source.statistics.get("source_frame_observation_count"),
+        "source_frame_mismatch_count": source.statistics.get("source_frame_mismatch_count"),
+        "tracks_requiring_source_frame_reconciliation": source.statistics.get("tracks_requiring_source_frame_reconciliation"),
         "simplified_keyframe_label_count": simplified_keyframes,
         "removed_keyframe_count": original_keyframes - simplified_keyframes,
         "original_keyframe_count_histogram": {

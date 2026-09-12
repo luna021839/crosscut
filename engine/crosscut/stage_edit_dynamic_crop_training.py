@@ -17,6 +17,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from .dynamic_crop_input_verification import verify_dynamic_crop_input_files
+from .dynamic_crop_source_frame_binding import SOURCE_FRAME_BINDING_CONTRACT
 from .reference_attribution import REFERENCE_EVIDENCE_ANALYSIS_BASIS
 from .reference_dynamic_crop_supervision import (
     load_reference_dynamic_crop_supervision,
@@ -158,6 +159,9 @@ class StageEditDynamicCropTrainingCorpusV2:
                 "renderer_undecodable_targets_are_loss_masked": True,
                 "missing_start_keyframes_are_not_synthesized": True,
                 "unsafe_values_are_not_clamped_into_targets": True,
+                "source_frame_binding_contract": SOURCE_FRAME_BINDING_CONTRACT,
+                "source_frame_binding_is_model_input": False,
+                "geometry_only_heads_reconcile_source_phase": False,
             },
             "artifact_paths": list(self.artifact_paths),
             "sequences": [
@@ -206,6 +210,7 @@ def build_stage_edit_dynamic_crop_training_corpus_v2(
     sequences: dict[str, StageEditDynamicCropTargetSequenceV2] = {}
     artifact_paths: list[str] = []
     digest = hashlib.sha256(DYNAMIC_CROP_TRAINING_CORPUS_CONTRACT.encode())
+    digest.update(SOURCE_FRAME_BINDING_CONTRACT.encode())
     total_tracks = 0
     total_keyframes = 0
     total_motion_labels = 0
@@ -214,6 +219,9 @@ def build_stage_edit_dynamic_crop_training_corpus_v2(
     renderer_rejection_reasons: dict[str, int] = {}
     references_with_tracks: set[str] = set()
     songs_with_tracks: set[str] = set()
+    source_frame_observations = 0
+    source_frame_mismatches = 0
+    tracks_requiring_frame_reconciliation = 0
     verified_input_sha256_cache: dict[str, str] = {}
 
     for reference_id, example in sorted(by_reference.items()):
@@ -286,6 +294,12 @@ def build_stage_edit_dynamic_crop_training_corpus_v2(
                 raise ValueError("multiple dynamic crop targets map to one token")
             aligned[token_index] = trajectory
             total_tracks += 1
+            binding = trajectory.source_frame_binding
+            if binding is None:
+                raise AssertionError("artifact adapter lost source-frame provenance")
+            source_frame_observations += len(binding.observations)
+            source_frame_mismatches += sum(delta != 0 for delta in binding.frame_deltas)
+            tracks_requiring_frame_reconciliation += int(binding.requires_source_frame_reconciliation)
             total_keyframes += len(trajectory.keyframes)
             total_motion_labels += int(
                 not trajectory.motion_label_loss_masked
@@ -331,6 +345,9 @@ def build_stage_edit_dynamic_crop_training_corpus_v2(
             sorted(renderer_rejection_reasons.items())
         ),
         "track_label_count": total_tracks,
+        "source_frame_observation_count": source_frame_observations,
+        "source_frame_mismatch_count": source_frame_mismatches,
+        "tracks_requiring_source_frame_reconciliation": tracks_requiring_frame_reconciliation,
         "keyframe_label_count": total_keyframes,
         "motion_label_count": total_motion_labels,
         "reference_count_with_tracks": len(references_with_tracks),

@@ -15,6 +15,10 @@ import math
 from pathlib import Path
 from typing import Any, Mapping
 
+from .dynamic_crop_source_frame_binding import (
+    DynamicCropSourceFrameBinding,
+    source_frame_binding_from_validated_crop_payload,
+)
 from .reference_dynamic_crop_supervision import (
     DYNAMIC_CROP_TARGET_CONTRACT,
     load_reference_dynamic_crop_supervision,
@@ -62,6 +66,7 @@ class StageEditDynamicCropTarget:
     keyframes: tuple[DynamicCropKeyframeTarget, ...]
     artifact_content_sha256: str
     build_fingerprint_sha256: str
+    source_frame_binding: DynamicCropSourceFrameBinding | None = None
 
     @property
     def start_keyframe(self) -> DynamicCropKeyframeTarget:
@@ -78,7 +83,12 @@ class StageEditDynamicCropTarget:
         return None
 
     def to_target_dict(self) -> dict[str, Any]:
-        """Serialize labels only; no reverse-match evidence is included."""
+        """Serialize labels with target-side frame binding, never match scores.
+
+        The binding is not a model feature. It records which source pixels
+        these labels require; existing geometry-only tensorizers do not yet
+        reconcile that source phase and must not be described as doing so.
+        """
 
         return {
             "adapter_contract": ADAPTER_CONTRACT,
@@ -96,6 +106,10 @@ class StageEditDynamicCropTarget:
             "legacy_static_crop_head_target": None,
             "artifact_content_sha256": self.artifact_content_sha256,
             "build_fingerprint_sha256": self.build_fingerprint_sha256,
+            "source_frame_binding": (
+                self.source_frame_binding.to_dict()
+                if self.source_frame_binding is not None else None
+            ),
         }
 
 
@@ -137,6 +151,7 @@ def build_stage_edit_dynamic_crop_target(
         keyframes=keyframes,
         artifact_content_sha256=str(provenance["artifact_content_sha256"]),
         build_fingerprint_sha256=str(provenance["build_fingerprint_sha256"]),
+        source_frame_binding=source_frame_binding_from_validated_crop_payload(value),
     )
 
 

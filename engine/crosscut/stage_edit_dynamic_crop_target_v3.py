@@ -17,6 +17,7 @@ import math
 from typing import Sequence
 
 from .render import EditorialTransformKeyframe, EditorialTransformTrack
+from .dynamic_crop_source_frame_binding import DynamicCropSourceFrameBinding
 from .stage_edit_dynamic_crop_head_v2 import DynamicCropTrajectoryTargetV2
 
 
@@ -77,10 +78,17 @@ class SimplifiedDynamicCropTrajectoryV3:
     maximum_normalized_reconstruction_error: float
     simplification_config_fingerprint: str
     contract: str = DYNAMIC_CROP_V3_SIMPLIFICATION_CONTRACT
+    source_frame_binding: DynamicCropSourceFrameBinding | None = None
 
     def __post_init__(self) -> None:
         if not self.keyframes:
             raise ValueError("simplified dynamic crop trajectory cannot be empty")
+        if self.source_frame_binding is not None:
+            binding = self.source_frame_binding
+            if not isinstance(binding, DynamicCropSourceFrameBinding):
+                raise TypeError("simplified crop source frame binding is invalid")
+            if binding.source_id != self.source_id or len(binding.observations) != self.original_keyframe_count:
+                raise ValueError("simplified crop must retain all original source observations")
         if self.original_keyframe_count < len(self.keyframes):
             raise ValueError("simplification cannot add keyframes")
         if len(self.retained_original_indices) != len(self.keyframes):
@@ -93,6 +101,12 @@ class SimplifiedDynamicCropTrajectoryV3:
             raise ValueError("simplification must retain the observed time-zero sample")
         if self.retained_original_indices[-1] >= self.original_keyframe_count:
             raise ValueError("retained keyframe index is outside the original track")
+        if self.source_frame_binding is not None and any(
+            self.source_frame_binding.observations[index].time_within_shot_seconds
+            != keyframe.time_seconds
+            for index, keyframe in zip(self.retained_original_indices, self.keyframes)
+        ):
+            raise ValueError("simplified crop keyframes differ from their source-frame observations")
         if (
             not math.isfinite(self.maximum_normalized_reconstruction_error)
             or self.maximum_normalized_reconstruction_error < 0.0
@@ -119,6 +133,10 @@ class SimplifiedDynamicCropTrajectoryV3:
     def to_dict(self) -> dict[str, object]:
         return {
             "contract": self.contract,
+            "source_frame_binding": (
+                self.source_frame_binding.to_dict()
+                if self.source_frame_binding is not None else None
+            ),
             "shot_index": self.shot_index,
             "source_id": self.source_id,
             "shot_duration_seconds": self.shot_duration_seconds,
@@ -324,6 +342,7 @@ def simplify_dynamic_crop_trajectory_v3(
         retained_original_indices=tuple(retained),
         maximum_normalized_reconstruction_error=max(errors, default=0.0),
         simplification_config_fingerprint=config.fingerprint,
+        source_frame_binding=target.source_frame_binding,
     )
 
 

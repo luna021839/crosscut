@@ -746,6 +746,9 @@ class ReferenceDynamicCropSupervisionTests(unittest.TestCase):
                 "clock",
                 "source_frame_index",
             )
+            binding = serialized.pop("source_frame_binding")
+            self.assertFalse(binding["model_input"])
+            self.assertEqual(len(binding["observations"]), 4)
             flattened = json.dumps(serialized).lower()
             self.assertTrue(all(name not in flattened for name in forbidden))
 

@@ -30,6 +30,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .render import EditorialTransformKeyframe, EditorialTransformTrack
+from .dynamic_crop_source_frame_binding import DynamicCropSourceFrameBinding
 from .stage_edit_dynamic_crop_adapter import StageEditDynamicCropTarget
 from .stage_edit_transformer import (
     MASKED_SOURCE_LOGIT,
@@ -149,6 +150,8 @@ class DynamicCropTrajectoryTargetV2:
     build_fingerprint_sha256: str
     target_contract: str = DYNAMIC_CROP_V2_TARGET_CONTRACT
 
+    source_frame_binding: DynamicCropSourceFrameBinding | None = None
+
     def __post_init__(self) -> None:
         if isinstance(self.shot_index, bool) or not isinstance(self.shot_index, int):
             raise ValueError("dynamic crop shot index must be an integer")
@@ -208,6 +211,12 @@ class DynamicCropTrajectoryTargetV2:
         object.__setattr__(self, "source_id", source_id)
         object.__setattr__(self, "shot_duration_seconds", duration)
         object.__setattr__(self, "keyframes", keyframes)
+        binding = self.source_frame_binding
+        if binding is not None:
+            if not isinstance(binding, DynamicCropSourceFrameBinding):
+                raise TypeError("dynamic crop source frame binding is invalid")
+            if binding.source_id != source_id or tuple(o.time_within_shot_seconds for o in binding.observations) != tuple(k.time_seconds for k in keyframes):
+                raise ValueError("dynamic crop source frames must bind every original keyframe")
 
     @classmethod
     def from_adapter_target(
@@ -234,6 +243,7 @@ class DynamicCropTrajectoryTargetV2:
             motion_label_loss_masked=value.motion_label_loss_masked,
             artifact_content_sha256=value.artifact_content_sha256,
             build_fingerprint_sha256=value.build_fingerprint_sha256,
+            source_frame_binding=value.source_frame_binding,
         )
 
 
