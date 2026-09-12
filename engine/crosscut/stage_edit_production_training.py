@@ -1745,6 +1745,57 @@ class _BalancedCutWindow:
     label: int
     reference_id: str
     anchor_token_index: int
+    song_id: str
+
+
+class _HierarchicalCutWindowSampler:
+    """Balance songs and references within one cut-label class, not rows."""
+
+    def __init__(self, windows: Sequence[_BalancedCutWindow], *, seed: int):
+        if not windows or len({window.label for window in windows}) != 1:
+            raise ValueError("cut sampler requires one nonempty label class")
+        self.label = windows[0].label
+        if self.label not in (0, 1):
+            raise ValueError("cut sampler label must be binary")
+        nested = {}
+        for window in windows:
+            nested.setdefault(window.song_id, {}).setdefault(window.reference_id, []).append(window)
+        self.songs = _stable_sampler_order(tuple(nested), seed=seed, scope=f"cut:{self.label}:songs")
+        self.references = {
+            song: _stable_sampler_order(tuple(refs), seed=seed, scope=f"cut:{self.label}:{song}:refs")
+            for song, refs in nested.items()
+        }
+        self.windows = {}
+        for song, refs in nested.items():
+            for ref, rows in refs.items():
+                indexed = {row.anchor_token_index: row for row in rows}
+                if len(indexed) != len(rows):
+                    raise ValueError("duplicate cut anchor within reference")
+                order = _stable_sampler_order(tuple(indexed), seed=seed, scope=f"cut:{self.label}:{song}:{ref}:anchors")
+                self.windows[song, ref] = tuple(indexed[index] for index in order)
+        self.song_counts = {song: 0 for song in self.songs}
+        self.reference_counts = {key: 0 for key in self.windows}
+        self.count = 0
+
+    def sample(self) -> _BalancedCutWindow:
+        song = self.songs[self.count % len(self.songs)]
+        refs = self.references[song]
+        ref = refs[self.song_counts[song] % len(refs)]
+        rows = self.windows[song, ref]
+        window = rows[self.reference_counts[song, ref] % len(rows)]
+        self.count += 1
+        self.song_counts[song] += 1
+        self.reference_counts[song, ref] += 1
+        return window
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "sample_count": self.count,
+            "per_song_sampled_counts": dict(sorted(self.song_counts.items())),
+            "per_reference_sampled_counts": {ref: count for (song, ref), count in sorted(self.reference_counts.items())},
+            "per_reference_available_windows": {ref: len(rows) for (song, ref), rows in sorted(self.windows.items())},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -2845,6 +2896,7 @@ def _balanced_cut_windows(
                 label=int(target.cut),
                 reference_id=example.reference_id,
                 anchor_token_index=anchor_index,
+                song_id=example.song_id,
             )
             (positive if window.label else negative).append(window)
     if not positive or not negative:
@@ -3218,6 +3270,12 @@ def train_production_stage_edit(
     active_device = device if device is not None else mx.default_device()
     history: list[dict[str, Any]] = []
     cut_pretraining_history: list[dict[str, Any]] = []
+    cut_pretraining_sampling_evidence: dict[str, Any] = {
+        "contract": "cut_label_then_song_reference_anchor_round_robin_v1",
+        "training_references_only": True,
+        "positive": None,
+        "negative": None,
+    }
     source_pretraining_history: list[dict[str, Any]] = []
     dynamic_crop_v3_prior_pretraining_history: list[dict[str, Any]] = []
     optimizer_steps = 0
@@ -3332,11 +3390,12 @@ def train_production_stage_edit(
             cut_pretrain_loss_and_grad = nn.value_and_grad(
                 model, cut_pretrain_loss
             )
-            chooser = random.Random(seed ^ 0x5A17E)
+            positive_sampler = _HierarchicalCutWindowSampler(positive_windows, seed=seed ^ 0x5A17E)
+            negative_sampler = _HierarchicalCutWindowSampler(negative_windows, seed=seed ^ 0x5A17E)
             for pretrain_step in range(1, cut_pretrain_steps + 1):
                 windows = (
-                    positive_windows[chooser.randrange(len(positive_windows))],
-                    negative_windows[chooser.randrange(len(negative_windows))],
+                    positive_sampler.sample(),
+                    negative_sampler.sample(),
                 )
                 pretrain_batch = tensorize_stage_edit_batch(
                     tuple(window.sequence for window in windows),
@@ -3393,6 +3452,10 @@ def train_production_stage_edit(
                     )
             cut_pretraining_optimizer_state_final_step = int(
                 pretrain_optimizer.state["step"].item()
+            )
+            cut_pretraining_sampling_evidence.update(
+                positive=positive_sampler.diagnostics(),
+                negative=negative_sampler.diagnostics(),
             )
             if (
                 cut_pretraining_optimizer_state_final_step
@@ -4985,6 +5048,7 @@ def train_production_stage_edit(
                     dynamic_crop_v3_prior_sampling_evidence
                 ),
                 "cut_pretraining_history": cut_pretraining_history,
+                "cut_pretraining_sampling": cut_pretraining_sampling_evidence,
                 "source_pretraining_history": source_pretraining_history,
                 "dynamic_crop_v3_prior_pretraining_history": (
                     dynamic_crop_v3_prior_pretraining_history
@@ -5533,6 +5597,7 @@ def train_production_stage_edit(
                 "minimum_step_contract": 500,
                 "validation_labels_consumed": False,
                 "heldout_labels_consumed": False,
+                "sampling": cut_pretraining_sampling_evidence,
             },
             "source_pretraining": {
                 "enabled": bool(source_pretrain_steps),
