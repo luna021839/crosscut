@@ -5027,6 +5027,44 @@ class DirectMemberVisualTests(unittest.TestCase):
             [0.94, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
 
+    def test_brief_partial_interior_obstruction_is_valid_but_costlier(self) -> None:
+        spans = tuple((float(i), float(i+1)) for i in range(6))
+        queries = []
+        def provider(source_index, _source, seconds):
+            queries.append((source_index, seconds))
+            return _descriptor(.20 + source_index*.02,
+                foreground_obstruction_score=.94 if source_index == 0 and .48 < seconds < .52 else 0.)
+        result = select_balanced_direct_member_sources(
+            sources=tuple(Path(f'{i}.mp4') for i in range(3)), canonical_spans=spans,
+            audio_offsets=(0.,0.,0.), descriptor_provider=provider,
+            config=DirectMemberVisualConfig(beam_width=1000),
+        )
+        candidate = result.span_validity[0].sources[0]
+        self.assertTrue(candidate.valid, candidate.rejection_reasons)
+        self.assertEqual(candidate.foreground_obstruction_sample_count, 1)
+        audit = candidate.transient_obstruction_review
+        self.assertIsNotNone(audit)
+        self.assertAlmostEqual(audit['sampled_window_seconds'], .2)
+        self.assertGreater(audit['selection_penalty'], 0.)
+        self.assertFalse(audit['target_identity_or_cut_quality_authorized'])
+        self.assertIn((0,.4), queries)
+        self.assertIn((0,.6), queries)
+
+    def test_single_sparse_hit_cannot_disguise_persistent_obstruction(self) -> None:
+        spans = tuple((float(i), float(i+1)) for i in range(6))
+        def provider(source_index, _source, seconds):
+            return _descriptor(.20 + source_index*.02,
+                foreground_obstruction_score=.94 if source_index == 0 and .39 < seconds < .61 else 0.)
+        result = select_balanced_direct_member_sources(
+            sources=tuple(Path(f'{i}.mp4') for i in range(3)), canonical_spans=spans,
+            audio_offsets=(0.,0.,0.), descriptor_provider=provider,
+            config=DirectMemberVisualConfig(beam_width=1000),
+        )
+        candidate = result.span_validity[0].sources[0]
+        self.assertFalse(candidate.valid)
+        self.assertIsNone(candidate.transient_obstruction_review)
+        self.assertIn('foreground_camera_equipment_or_subject_obstruction', candidate.rejection_reasons)
+
     def test_persistent_entry_overexposure_rejects_but_one_frame_flash_passes(self) -> None:
         spans = tuple((float(index), float(index + 1)) for index in range(6))
 

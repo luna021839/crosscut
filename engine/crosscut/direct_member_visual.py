@@ -875,10 +875,11 @@ class DirectMemberVisualConfig:
                     self.foreground_obstruction_rejection_score
                 ),
                 "foreground_obstruction_policy": (
-                    "hard_reject_any_of_six_temporal_samples_with_"
-                    "dark_edge_connected_camera_equipment_over_subject_"
-                    "or_performance_area"
+                    "penalize_one_bracketed_partial_interior_obstruction_"
+                    "reject_persistent_or_cut_endpoint_obstruction_v2"
                 ),
+                "transient_obstruction_maximum_window_seconds": 0.4,
+                "transient_obstruction_maximum_span_fraction": 0.20,
                 "terminal_broadcast_composite_policy": {
                     "exit_quality_maximum": (
                         self.terminal_composite_exit_quality_maximum
@@ -1186,6 +1187,7 @@ class DirectSpanSourceValidity:
     gray_mean_sample_scores: tuple[float | None, ...]
     highlight_clipping_sample_scores: tuple[float, ...]
     portrait_fancam_lighting_quality_rescue_applied: bool
+    transient_obstruction_review: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1236,6 +1238,10 @@ class DirectSpanSourceValidity:
             ),
             "portrait_fancam_lighting_quality_rescue_applied": (
                 self.portrait_fancam_lighting_quality_rescue_applied
+            ),
+            "transient_obstruction_review": (
+                dict(self.transient_obstruction_review)
+                if self.transient_obstruction_review is not None else None
             ),
             "samples": [sample.to_dict() for sample in self.samples],
             "raw_embeddings_persisted": False,
@@ -3598,6 +3604,53 @@ def _continuous_portrait_fancam_scene_cut_is_transient_artifact(
     return True
 
 
+def _review_transient_partial_obstruction(
+    samples: Sequence[_BoundarySample], *,
+    span_start: float, span_end: float,
+    sample_at: Callable[[float], _BoundarySample],
+    config: DirectMemberVisualConfig,
+) -> dict[str, Any] | None:
+    """Keep a short partial occlusion as a cost, without authorizing a cut.
+
+    The ordinary six probes do not establish duration. Only an isolated
+    interior hit with human evidence is eligible for two additional cheap
+    content probes. Entry/exit occlusion, missing pixels, a fully hidden
+    performer or uncleared flanks remain invalid. No target NN work is added.
+    """
+    if len(samples) != _DIRECT_CONTENT_SAMPLE_COUNT:
+        return None
+    hits = [i for i, s in enumerate(samples) if s.descriptor is not None
+            and s.descriptor.foreground_obstruction_score
+            >= config.foreground_obstruction_rejection_score]
+    if len(hits) != 1 or hits[0] in (0, len(samples)-1):
+        return None
+    center = samples[hits[0]]
+    if not _sample_has_human_evidence(center, config) or _sample_is_blank_or_flat(center, config):
+        return None
+    radius = min(.2, (span_end-span_start)*.1)
+    times = (center.master_seconds-radius, center.master_seconds+radius)
+    if radius <= 0 or times[0] <= samples[0].master_seconds or times[1] >= samples[-1].master_seconds:
+        return None
+    flanks = tuple(sample_at(t) for t in times)
+    if any(s.descriptor is None or not _sample_has_human_evidence(s, config)
+           or _sample_is_blank_or_flat(s, config)
+           or s.descriptor.foreground_obstruction_score >= config.foreground_obstruction_rejection_score
+           or s.descriptor.quality_score < config.minimum_acceptable_quality_score
+           for s in flanks):
+        return None
+    return {
+        "contract": "sampled_bracketed_partial_interior_occlusion_v1",
+        "obstructed_master_seconds": center.master_seconds,
+        "clear_flank_master_seconds": list(times),
+        "sampled_window_seconds": times[1]-times[0],
+        "sampled_window_span_fraction": (times[1]-times[0])/(span_end-span_start),
+        "clear_flank_obstruction_scores": [s.descriptor.foreground_obstruction_score for s in flanks],
+        "selection_penalty": .1,
+        "continuous_duration_measured": False,
+        "target_identity_or_cut_quality_authorized": False,
+    }
+
+
 def _span_source_validity(
     *,
     source_index: int,
@@ -3606,6 +3659,7 @@ def _span_source_validity(
     suppressed_portrait_fancam_scene_cuts: tuple[tuple[float, float], ...],
     continuous_official_portrait_fancam_contract: bool,
     config: DirectMemberVisualConfig,
+    transient_obstruction_review: Mapping[str, Any] | None = None,
 ) -> DirectSpanSourceValidity:
     descriptors = tuple(
         sample.descriptor for sample in samples if sample.descriptor is not None
@@ -3770,7 +3824,7 @@ def _span_source_validity(
         and not portrait_fancam_lighting_quality_rescue
     ):
         reasons.append("persistent_low_visual_quality_or_foreground_obstruction")
-    if obstruction_count:
+    if obstruction_count and transient_obstruction_review is None:
         reasons.append("foreground_camera_equipment_or_subject_obstruction")
     if terminal_composite:
         reasons.append("terminal_broadcast_composite_or_unreported_native_transition")
@@ -3841,6 +3895,7 @@ def _span_source_validity(
         portrait_fancam_lighting_quality_rescue_applied=(
             portrait_fancam_lighting_quality_rescue
         ),
+        transient_obstruction_review=transient_obstruction_review,
     )
 
 
@@ -12014,6 +12069,23 @@ def select_balanced_direct_member_sources(
                         descriptor=descriptor,
                         attention=_attention_geometry(descriptor),
                     ))
+                def content_probe(master_seconds: float) -> _BoundarySample:
+                    nonlocal sample_count, failed_sample_count
+                    local_seconds = _source_local_time(
+                        master_seconds, source_index=source_index,
+                        audio_offsets=offsets, source_timewarps=clocks,
+                    )
+                    descriptor = provider(source_index, source, local_seconds)
+                    sample_count += 1
+                    failed_sample_count += int(descriptor is None)
+                    return _BoundarySample(
+                        master_seconds=master_seconds, source_local_seconds=local_seconds,
+                        descriptor=descriptor, attention=_attention_geometry(descriptor),
+                    )
+                transient_obstruction_review = _review_transient_partial_obstruction(
+                    samples, span_start=span_start, span_end=span_end,
+                    sample_at=content_probe, config=resolved_config,
+                )
                 source_validity.append(
                     _span_source_validity(
                         source_index=source_index,
@@ -12026,6 +12098,7 @@ def select_balanced_direct_member_sources(
                             continuous_official_portrait_fancam_contract
                         ),
                         config=resolved_config,
+                        transient_obstruction_review=transient_obstruction_review,
                     )
                 )
             span_diagnostics.append(
@@ -12166,6 +12239,18 @@ def select_balanced_direct_member_sources(
                     )
                     for left_index in range(source_count)
                 )
+                # A tolerated interior occlusion is not equivalent to clean
+                # footage. Charge each selected span once across every solver
+                # and offset variant; never change its measured cut geometry.
+                def obstruction_penalty(segment: int, source: int) -> float:
+                    audit = span_diagnostics[segment].sources[source].transient_obstruction_review
+                    return float(audit["selection_penalty"]) if audit else 0.0
+                candidate_matrix = tuple(tuple(
+                    replace(mismatch, cost=mismatch.cost
+                        + obstruction_penalty(boundary_index+1, right_index)
+                        + (obstruction_penalty(0, left_index) if boundary_index == 0 else 0.0))
+                    for right_index, mismatch in enumerate(row))
+                    for left_index, row in enumerate(candidate_matrix))
                 if render_penalized_edges:
                     candidate_matrix = tuple(
                         tuple(
