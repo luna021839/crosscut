@@ -11,6 +11,7 @@ from scipy.optimize import minimize
 
 from .direct_member_transform import attention_mismatch, project_box
 from .render import EditorialTransformKeyframe, EditorialTransformTrack
+from .joint_dissolve_pose import paired_overlap_pose_arrays, pose_registration_metrics
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,7 @@ class OverlapFaceObservation:
 
 def fit_joint_dissolve_registration(left, right, *, fps, maximum_zooms,
         maximum_center_shift=.16, maximum_position_mismatch=.08,
-        maximum_scale_mismatch=.06):
+        maximum_scale_mismatch=.06, pose_observations=None):
     """One bounded solve in affine coordinates z*x+t, with viewport constraints.
 
 Registration error is balanced with modest magnification and camera temporal
@@ -65,6 +66,9 @@ Both returned tracks use overlap-relative output frame times.
     sizes=np.sqrt(np.prod(boxes[:,:,2:],axis=-1))
     normalizer=np.maximum(sizes.mean(axis=0),1e-6)
     seed=np.zeros((2,n,3));seed[:,:,0]=1.
+    pose_points,pose_audit=paired_overlap_pose_arrays(pose_observations,(left,right))
+    raw_pose_error=(np.mean(np.sum((pose_points[0]-pose_points[1])**2,axis=-1))
+                    if pose_points is not None else None)
     def unpack(v):return v.reshape(2,n,3)
     def objective(v):
         a=unpack(v);z=a[:,:,0];t=a[:,:,1:]
@@ -72,6 +76,9 @@ Both returned tracks use overlap-relative output frame times.
         scale=sizes*z
         pan=t-(1-z[:,:,None])/2
         registration=500.*np.sum((output[0]-output[1])**2)+10.*np.sum(((scale[0]-scale[1])/normalizer)**2)
+        if pose_points is not None:
+            projected=pose_points*z[:,:,None,None]+t[:,:,None,:]
+            registration+=500.*np.sum(np.mean(np.sum((projected[0]-projected[1])**2,axis=-1),axis=-1))
         preference=.2*np.sum((z-1)**2)+.3*np.sum(pan**2)
         smooth=3.*np.sum(np.diff(a,axis=1)**2)
         if n>2:smooth+=8.*np.sum(np.diff(a,n=2,axis=1)**2)
@@ -90,17 +97,33 @@ Both returned tracks use overlap-relative output frame times.
         return np.concatenate(((maximum_position_mismatch*.42)**2-np.sum((output[0]-output[1])**2,axis=-1),
             ratio*scale[0]-scale[1],ratio*scale[1]-scale[0]))
     bounds=[bound for cap in maximum_zooms for _ in range(n) for bound in ((1.,cap),(-1.,0.),(-1.,0.))]
+    constraints=[{'type':'ineq','fun':inside},{'type':'ineq','fun':registration_limits}]
+    def pose_nonregression(v):
+        a=unpack(v)
+        projected=pose_points*a[:,:,None,:1]+a[:,:,None,1:]
+        return raw_pose_error-np.mean(np.sum((projected[0]-projected[1])**2,axis=-1))
+    if pose_points is not None:
+        constraints.append({'type':'ineq','fun':pose_nonregression})
     result=minimize(objective,seed.ravel(),method='SLSQP',bounds=bounds,
-        constraints=({'type':'ineq','fun':inside},{'type':'ineq','fun':registration_limits}),
+        constraints=tuple(constraints),
         options={'maxiter':150,'ftol':1e-10})
     audit=dict(contract='joint_temporal_dissolve_registration_v1',solver_success=bool(result.success),
         solver_message=str(result.message),iterations=int(result.nit),output_frame_count=n,
         source_indices=[left[0].source_index,right[0].source_index],quality_approval=False,
         time_shift_applied=False,infeasibility_proven=False,raw_observation_count=sum(s.basis=='observed_focal_face' for s in (*left,*right)),
         pixel_tracked_observation_count=sum(s.basis!='observed_focal_face' for s in (*left,*right)))
+    audit['focal_pose_registration']=dict(pose_audit,quality_approval=False)
     if not result.success or not np.isfinite(result.x).all() or inside(result.x).min() < -1e-7:
         return None,dict(audit,reason='joint_solver_no_verified_solution')
     values=unpack(result.x)
+    if pose_points is not None:
+        audit['focal_pose_registration'].update(
+            before=pose_registration_metrics(pose_points,seed),
+            after=pose_registration_metrics(pose_points,values),
+            nonregression_required=True,
+        )
+        if pose_nonregression(result.x) < -1e-9:
+            return None,dict(audit,reason='joint_camera_worsens_focal_pose')
     tracks=[]
     try:
         for side in range(2):
@@ -113,6 +136,14 @@ Both returned tracks use overlap-relative output frame times.
             tracks.append(EditorialTransformTrack(tuple(points),reason='joint_temporal_dissolve_registration_v1'))
     except ValueError:
         return None,dict(audit,reason='joint_transform_renderer_invalid')
+    if pose_points is not None:
+        # Verify the actual renderer tracks after removing floating-point edge
+        # noise, not just the optimizer's pre-materialization affine values.
+        rendered_affine=np.array([[[p.zoom,.5-p.center_x*p.zoom,.5-p.center_y*p.zoom]
+            for p in track.keyframes] for track in tracks])
+        audit['focal_pose_registration']['after']=pose_registration_metrics(pose_points,rendered_affine)
+        if pose_nonregression(rendered_affine.ravel()) < -1e-9:
+            return None,dict(audit,reason='joint_camera_worsens_focal_pose')
     residuals=[]
     for i in range(n):
         projected=[]

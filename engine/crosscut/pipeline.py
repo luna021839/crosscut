@@ -9870,6 +9870,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("direct_member_look.py"),
                 Path(__file__).with_name("automatic_joint_dissolve.py"),
                 Path(__file__).with_name("joint_dissolve_registration.py"),
+                Path(__file__).with_name("joint_dissolve_pose.py"),
                 Path(__file__).with_name("focal_pixel_containment_support.py"),
                 Path(__file__).with_name("rendered_proxy_review.py"),
                 Path(__file__).with_name("render.py"),

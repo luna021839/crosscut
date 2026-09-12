@@ -9,6 +9,7 @@ from .direct_member_transform import map_box_to_portrait_fill
 from .focal_pixel_containment_support import measure_focal_pixel_containment
 from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_dissolve_registration,
     materialize_joint_dissolve_registration,review_joint_dissolve_containment)
+from .joint_dissolve_pose import source_focal_overlap_pose
 from .render import TransitionKind,DIRECT_MEMBER_POSE_DISSOLVE_REASON,quantized_segment_frame_counts
 
 
@@ -105,14 +106,27 @@ All measurement calls use the actual source-local clocks of the render plan.
         limits=tuple(min(settings.maximum_boundary_zoom,geometry_by_request[s.source_index].lossless_zoom_capacity*settings.maximum_boundary_upscale_ratio) for s in pair)
         if min(limits)<1:
             row['reason']='output_exceeds_source_camera_capacity';continue
-        key=hashlib.sha256(repr((observations,fps,limits,settings.maximum_center_shift,
+        pose_observations=None
+        pose_resolver=getattr(focal_provider,'selector_geometry',None)
+        if pose_resolver is not None:
+            # sample() above already resolved these exact source frames in the
+            # shared session; this retrieves their source-focal screen joints.
+            pose_observations=tuple(tuple(source_focal_overlap_pose(
+                pose_resolver(reverse[obs.source_index],obs.source_seconds),
+                source_index=obs.source_index,
+                expected_geometry_source_index=reverse[obs.source_index],
+                master_seconds=obs.master_seconds,source_seconds=obs.source_seconds,
+                frame_geometry=geometry_by_request[obs.source_index])
+                for obs in seq) for seq in observations)
+        key=hashlib.sha256(repr((observations,pose_observations,fps,limits,settings.maximum_center_shift,
             settings.maximum_face_residual_position_mismatch,settings.maximum_face_residual_scale_mismatch)).encode()).hexdigest()
         row['registration_cache_hit']=key in solves
         if key not in solves:
             solves[key]=fit_joint_dissolve_registration(*observations,fps=fps,maximum_zooms=limits,
                 maximum_center_shift=settings.maximum_center_shift,
                 maximum_position_mismatch=settings.maximum_face_residual_position_mismatch,
-                maximum_scale_mismatch=settings.maximum_face_residual_scale_mismatch)
+                maximum_scale_mismatch=settings.maximum_face_residual_scale_mismatch,
+                pose_observations=pose_observations)
         tracks,fit=solves[key];row['registration']=fit
         if tracks is None:
             row['reason']='joint_solver_no_verified_solution';continue

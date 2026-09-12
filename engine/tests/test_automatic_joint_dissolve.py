@@ -172,6 +172,29 @@ class AutomaticJointDissolveTests(unittest.TestCase):
         self.assertEqual(attached, segments)
         self.plan(args, attached, effects)
 
+    def test_automatic_registration_reuses_exact_source_focal_pose(self):
+        from crosscut.focal_selector_geometry import FocalSelectorGeometry
+        from crosscut.pose import FormationPersonDescriptor
+        args = self.inputs()
+        seen = []
+        def geometry(source, local):
+            seen.append((source, local))
+            sample = args['focal_provider'].sample(source, local)
+            body = FormationPersonDescriptor(sample.subject_bbox_xywh, (.5, .46), .9)
+            scale = 1. if source == 0 else .875
+            points = tuple((.5+(.4+.02*j-.5)*scale, .29+(.4+.02*j-.29)*scale, .9)
+                           for j in range(8))
+            return FocalSelectorGeometry(source, local, sample.bbox_xywh, person=body,
+                pose_backend='rtmpose_body7', pose_screen_xyc=points)
+        args['focal_provider'].selector_geometry = geometry
+        _, _, audit = register_automatic_member_dissolves(**args)
+        self.assertEqual(audit['applied_count'], 1, audit)
+        self.assertEqual(len(seen), 14)
+        self.assertEqual({s for s,t in seen}, {0,1})
+        report = audit['boundaries'][0]['registration']['focal_pose_registration']
+        self.assertEqual(report['status'], 'exact_focal_screen_joints')
+        self.assertTrue(report['nonregression_required'])
+
     def test_endpoint_refinement_preserves_moving_overlap_ownership(self):
         from crosscut.direct_member_rendered_proxy import (
             DirectMemberRenderedProxyPreflight, refine_direct_member_camera_plan_from_rendered_proxy,
