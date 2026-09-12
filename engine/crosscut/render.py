@@ -13,6 +13,10 @@ from typing import Iterable
 
 from .ive import AspectRatio
 from .timewarp import TimeWarpMap
+from .render_frame_schedule import (
+    FRAME_SCHEDULE_CONTRACT, VerifiedRenderFrameClock,
+    probe_render_frame_clock, sampler_frame_schedule,
+)
 
 
 RENDER_PLAN_SOURCE_INDEX_DOMAIN = "render_plan_sources_array_index"
@@ -1799,6 +1803,7 @@ def _video_chain(
     fps: float,
     frame_count: int,
     output_label: str,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     playback_pts_scale = timeline_duration / source_duration
     setpts = (
@@ -1810,6 +1815,16 @@ def _video_chain(
         f"[{source_index}:v]trim=start={source_start:.6f}:duration={source_duration:.6f}",
         setpts,
     ]
+    if source_clock is not None:
+        schedule = sampler_frame_schedule(
+            source_start=source_start,
+            source_playback_rate=source_duration / timeline_duration,
+            native_fps=float(source_clock.frame_rate), output_fps=fps,
+            frame_count=frame_count, source_frame_count=source_clock.frame_count,
+            maximum_terminal_hold_frames=math.ceil(fps),
+        )
+        chain = list(schedule.ffmpeg_filters(fps))
+        chain[0] = f"[{source_index}:v]" + chain[0]
     chain.extend(
         _video_post_clock_filters(
             crop=crop,
@@ -1821,7 +1836,7 @@ def _video_chain(
             height=height,
             fps=fps,
             frame_count=frame_count,
-            input_clock_is_canonical=False,
+            input_clock_is_canonical=source_clock is not None,
         )
     )
     return ",".join(chain) + f"[{output_label}]"
@@ -1836,9 +1851,21 @@ def _video_source_clock_chain(
     fps: float,
     frame_count: int,
     output_label: str,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     """Decode and quantize one continuous source interval exactly once."""
 
+    if source_clock is not None:
+        schedule = sampler_frame_schedule(
+            source_start=source_start,
+            source_playback_rate=source_duration / timeline_duration,
+            native_fps=float(source_clock.frame_rate), output_fps=fps,
+            frame_count=frame_count, source_frame_count=source_clock.frame_count,
+            maximum_terminal_hold_frames=math.ceil(fps),
+        )
+        chain = list(schedule.ffmpeg_filters(fps))
+        chain[0] = f"[{source_index}:v]" + chain[0]
+        return ",".join(chain) + f"[{output_label}]"
     playback_pts_scale = timeline_duration / source_duration
     setpts = (
         "setpts=PTS-STARTPTS"
@@ -1865,6 +1892,7 @@ def _dissolve_handle_video_chain(
     height: int,
     fps: float,
     extension_frames: int,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     """Render one separately sought outgoing overlap handle."""
 
@@ -1907,6 +1935,7 @@ def _dissolve_handle_video_chain(
         fps=fps,
         frame_count=extension_frames,
         output_label=f"vh{index}",
+        source_clock=source_clock,
     )
 
 
@@ -1918,6 +1947,7 @@ def _video_filter(
     fps: float,
     frame_count: int,
     extension_frames: int = 0,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     if extension_frames == 0:
         return _video_chain(
@@ -1935,6 +1965,7 @@ def _video_filter(
             fps=fps,
             frame_count=frame_count,
             output_label=f"v{index}",
+            source_clock=source_clock,
         )
 
     # Quantize the nominal shot and its dissolve handle independently.  The
@@ -1955,6 +1986,7 @@ def _video_filter(
         fps=fps,
         frame_count=frame_count,
         output_label=f"vb{index}",
+        source_clock=source_clock,
     )
     handle = _dissolve_handle_video_chain(
         index,
@@ -1963,6 +1995,7 @@ def _video_filter(
         height=height,
         fps=fps,
         extension_frames=extension_frames,
+        source_clock=source_clock,
     )
     return (
         f"{base};\n{handle};\n"
@@ -2362,6 +2395,7 @@ def _shared_clock_video_filter(
     height: int,
     fps: float,
     extension_frames: int,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     """Split one canonical decode clock, then apply segment-local pixels."""
 
@@ -2378,6 +2412,7 @@ def _shared_clock_video_filter(
             fps=fps,
             frame_count=unit.frame_count,
             output_label=clock_label,
+            source_clock=source_clock,
         )
     ]
     split_labels = tuple(
@@ -2436,6 +2471,7 @@ def _shared_clock_video_filter(
                 height=height,
                 fps=fps,
                 extension_frames=extension_frames,
+                source_clock=source_clock,
             )
         )
         parts.append(
@@ -2452,6 +2488,7 @@ def _video_render_unit_filter(
     height: int,
     fps: float,
     extension_frames: int,
+    source_clock: VerifiedRenderFrameClock | None = None,
 ) -> str:
     if unit.coalesced_segment is not None:
         return _video_filter(
@@ -2462,6 +2499,7 @@ def _video_render_unit_filter(
             fps,
             unit.frame_count,
             extension_frames,
+            source_clock=source_clock,
         )
     return _shared_clock_video_filter(
         unit,
@@ -2469,10 +2507,14 @@ def _video_render_unit_filter(
         height=height,
         fps=fps,
         extension_frames=extension_frames,
+        source_clock=source_clock,
     )
 
 
-def build_filter_graph(plan: RenderPlan) -> str:
+def build_filter_graph(
+    plan: RenderPlan,
+    *, source_clocks: dict[int, VerifiedRenderFrameClock] | None = None,
+) -> str:
     frame_counts = segment_frame_counts(plan)
     units = _video_render_units(plan, frame_counts)
     parts = [
@@ -2481,6 +2523,7 @@ def build_filter_graph(plan: RenderPlan) -> str:
             width=plan.width,
             height=plan.height,
             fps=plan.fps,
+            source_clock=(source_clocks or {}).get(unit.segments[0].source_index),
             extension_frames=(
                 plan.transitions[unit.last_segment_index].frame_count
                 if unit.last_segment_index < len(plan.transitions)
@@ -2500,11 +2543,13 @@ def build_filter_graph(plan: RenderPlan) -> str:
         unit = units[unit_index]
         current_label = f"v{unit.first_segment_index}"
         cumulative_frames = unit.frame_count
+        chunk_had_overlap = False
         while (
             unit.last_segment_index < len(plan.transitions)
             and plan.transitions[unit.last_segment_index].kind.uses_overlap
         ):
             transition = plan.transitions[unit.last_segment_index]
+            chunk_had_overlap = True
             next_unit_index = unit_index + 1
             next_unit = units[next_unit_index]
             output_label = f"vx{xfade_index}"
@@ -2531,6 +2576,16 @@ def build_filter_graph(plan: RenderPlan) -> str:
             xfade_index += 1
             unit_index = next_unit_index
             unit = next_unit
+        # xfade's EOF PTS can include one extra overlap endpoint frame. Bind
+        # each chunk to its nominal frame budget before the next hard cut,
+        # rather than correcting only the final concatenated video length.
+        if chunk_had_overlap:
+            chunk_label = f"vchunk{len(chunk_labels)}"
+            parts.append(
+                f"[{current_label}]trim=end_frame={cumulative_frames},"
+                f"setpts=N/({plan.fps:.6f}*TB),settb=AVTB[{chunk_label}]"
+            )
+            current_label = chunk_label
         chunk_labels.append(current_label)
         unit_index += 1
     if len(chunk_labels) == 1:
@@ -2560,6 +2615,7 @@ def render(
     video_maxrate: str = "36M",
     video_buffer_size: str = "48M",
     audio_bitrate: str = "320k",
+    use_verified_frame_schedule: bool = True,
 ) -> str:
     for label, value in (
         ("video_bitrate", video_bitrate),
@@ -2569,6 +2625,17 @@ def render(
     ):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{label} must be a non-empty FFmpeg rate")
+    if not isinstance(use_verified_frame_schedule, bool):
+        raise TypeError("frame schedule mode must be a boolean")
+    source_clocks: dict[int, VerifiedRenderFrameClock] = {}
+    if use_verified_frame_schedule:
+        for index in sorted({segment.source_index for segment in plan.segments}):
+            clock = probe_render_frame_clock(
+                plan.sources[index], ffprobe=str(Path(ffmpeg).with_name("ffprobe")),
+            )
+            if clock is not None:
+                source_clocks[index] = clock
+    filter_graph = build_filter_graph(plan, source_clocks=source_clocks)
     plan.output.parent.mkdir(parents=True, exist_ok=True)
     # Keep the temporary output on the destination volume so the final replace
     # is atomic even when the user renders to an external SSD.
@@ -2577,7 +2644,16 @@ def render(
     ) as temp:
         root = Path(temp)
         filter_path = root / "filter.ffscript"
-        filter_path.write_text(build_filter_graph(plan), encoding="utf-8")
+        filter_path.write_text(filter_graph, encoding="utf-8")
+        clock_evidence = root / "frame-clock.json"
+        clock_evidence.write_text(json.dumps({
+            "contract": FRAME_SCHEDULE_CONTRACT,
+            "enabled": use_verified_frame_schedule,
+            "source_clocks": {str(index): clock.to_dict() for index, clock in source_clocks.items()},
+            "timestamp_fallback_source_indices": sorted({segment.source_index for segment in plan.segments} - source_clocks.keys()),
+            "plan": plan.to_json(), "filter_graph": filter_graph,
+            "quality_approval": False,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary_output = root / f"render{plan.output.suffix or '.mp4'}"
         codecs = (video_codec, "libx264") if video_codec == "h264_videotoolbox" else (video_codec,)
         failures: list[str] = []
@@ -2646,6 +2722,7 @@ def render(
             )
             if completed.returncode == 0:
                 temporary_output.replace(plan.output)
+                clock_evidence.replace(plan.output.with_suffix(plan.output.suffix + ".frame-clock.json"))
                 return codec
             failures.append(f"{codec}: {completed.stderr.strip() or 'unknown FFmpeg error'}")
         raise RuntimeError("video render failed: " + " | ".join(failures))

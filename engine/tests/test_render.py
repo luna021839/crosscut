@@ -799,7 +799,9 @@ class RenderTests(unittest.TestCase):
             plan.to_json()["transitions"][0]["alpha_curve"],  # type: ignore[index]
             "normalized_logistic_sigmoid_k12_v1",
         )
-        self.assertIn("[vx0][vx1]concat=n=2:v=1:a=0[vcat]", graph)
+        self.assertIn("[vx0]trim=end_frame=30,", graph)
+        self.assertIn("[vx1]trim=end_frame=30,", graph)
+        self.assertIn("[vchunk0][vchunk1]concat=n=2:v=1:a=0[vcat]", graph)
         # Nominal shots retain their own quantization; only outgoing shots get
         # a separately-seeked 11-frame canonical-time handle.
         self.assertEqual(graph.count("trim=end_frame=11"), 2)
@@ -915,7 +917,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn("[v0][v1]xfade=", graph)
         self.assertIn("[vx0][v2]xfade=", graph)
         self.assertIn("offset=1.000000000,format=yuv420p[vx1]", graph)
-        self.assertIn("[vx1]null[vcat]", graph)
+        self.assertIn("[vx1]trim=end_frame=45,", graph)
+        self.assertIn("[vchunk0]null[vcat]", graph)
         self.assertEqual(plan.output_frame_count, 45)
 
     def test_dissolve_handle_holds_final_pan_crop_at_exact_source_boundary(self) -> None:
