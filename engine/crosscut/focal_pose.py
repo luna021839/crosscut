@@ -14,11 +14,11 @@ from typing import Sequence
 from .pose import FormationPersonDescriptor
 
 
-def face_associated_upper_body_person(
+def face_associated_person(
     face_bbox_xywh: tuple[float, float, float, float] | None,
     people: Sequence[FormationPersonDescriptor],
 ) -> FormationPersonDescriptor | None:
-    """Return the unique observed body containing the focal face near its head.
+    """Return the unique detected body containing the focal face near its head.
 
 Ambiguity is checked BEFORE looking for available pose points. Otherwise a
 missing observation on the true subject could silently select a background
@@ -55,7 +55,17 @@ performer whose skeleton happens to be available. No model call is made.
             associated.append(person)
     if len(associated) != 1:
         return None
-    person = associated[0]
+    return associated[0]
+
+
+def face_associated_upper_body_person(
+    face_bbox_xywh: tuple[float, float, float, float] | None,
+    people: Sequence[FormationPersonDescriptor],
+) -> FormationPersonDescriptor | None:
+    """Associate first, then require comparable already-observed torso joints."""
+    person = face_associated_person(face_bbox_xywh, people)
+    if person is None:
+        return None
     points = person.upper_body_keypoints_xyc
     if len(points) != 8 or sum(point[2] >= 0.20 for point in points) < 4:
         return None
