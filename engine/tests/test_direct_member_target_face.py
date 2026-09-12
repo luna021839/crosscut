@@ -14,6 +14,25 @@ def _face(x: float, y: float, embedding: tuple[float, ...]):
 
 
 class DirectMemberTargetFaceTests(unittest.TestCase):
+    def test_landmark_eye_scale_is_retained_as_transient_geometry(self) -> None:
+        candidate = FocalFaceCandidate(
+            (0.40, 0.30, 0.12, 0.10),
+            (1.0, 0.0, 0.0),
+            eye_scale=0.045,
+            landmark_scale=0.052,
+        )
+
+        self.assertEqual(candidate.eye_scale, 0.045)
+        self.assertEqual(candidate.landmark_scale, 0.052)
+
+    def test_invalid_landmark_eye_scale_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            FocalFaceCandidate(
+                (0.40, 0.30, 0.12, 0.10),
+                (1.0, 0.0, 0.0),
+                landmark_scale=0.0,
+            )
+
     def test_center_prior_resolves_two_valid_same_identity_pairs(self) -> None:
         target_left = _face(0.40, 0.30, (1.0, 0.0, 0.0))
         target_right = _face(0.44, 0.28, (0.96, 0.10, 0.0))

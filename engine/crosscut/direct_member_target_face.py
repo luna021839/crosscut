@@ -32,6 +32,8 @@ FOCAL_FACE_BASIS = "verified_official_fancam_focal_face_correspondence"
 class FocalFaceCandidate:
     bbox_xywh: tuple[float, float, float, float]
     embedding: tuple[float, ...] = field(repr=False)
+    eye_scale: float | None = None
+    landmark_scale: float | None = None
 
     def __post_init__(self) -> None:
         if len(self.bbox_xywh) != 4 or not self.embedding:
@@ -48,6 +50,16 @@ class FocalFaceCandidate:
             or any(not math.isfinite(float(value)) for value in self.embedding)
         ):
             raise ValueError("focal face candidate values are invalid")
+        if self.eye_scale is not None and (
+            not math.isfinite(float(self.eye_scale))
+            or float(self.eye_scale) <= 0.0
+        ):
+            raise ValueError("focal face eye scale is invalid")
+        if self.landmark_scale is not None and (
+            not math.isfinite(float(self.landmark_scale))
+            or float(self.landmark_scale) <= 0.0
+        ):
+            raise ValueError("focal face landmark scale is invalid")
 
     @property
     def center_xy(self) -> tuple[float, float]:
@@ -61,6 +73,36 @@ class FocalFacePair:
     incoming: FocalFaceCandidate
     cosine_similarity: float
     selection_score: float
+
+
+def _landmark_rms_scale(
+    landmarks_xy: Sequence[tuple[float, float]],
+    *,
+    frame_width: int,
+    frame_height: int,
+) -> float | None:
+    if not landmarks_xy or frame_width <= 0 or frame_height <= 0:
+        return None
+    aspect = frame_width / frame_height
+    points = tuple(
+        (float(x) * aspect, float(y)) for x, y in landmarks_xy
+    )
+    if any(
+        not math.isfinite(value)
+        for point in points
+        for value in point
+    ):
+        return None
+    center_x = sum(point[0] for point in points) / len(points)
+    center_y = sum(point[1] for point in points) / len(points)
+    scale = math.sqrt(
+        sum(
+            (point[0] - center_x) ** 2 + (point[1] - center_y) ** 2
+            for point in points
+        )
+        / len(points)
+    )
+    return scale if scale > 0.0 and math.isfinite(scale) else None
 
 
 def detect_focal_face_candidates(
@@ -81,7 +123,7 @@ def detect_focal_face_candidates(
             bbox,
             landmarks,
             _roll,
-            _eye_scale,
+            eye_scale,
             _geometry,
         ) = _normalized_face_metadata(
             face,
@@ -96,7 +138,22 @@ def detect_focal_face_candidates(
             landmarks_xy=landmarks,
         )
         if embedding:
-            candidates.append(FocalFaceCandidate(bbox, embedding))
+            candidates.append(
+                FocalFaceCandidate(
+                    bbox,
+                    embedding,
+                    eye_scale=(
+                        float(eye_scale)
+                        if eye_scale is not None
+                        else None
+                    ),
+                    landmark_scale=_landmark_rms_scale(
+                        landmarks,
+                        frame_width=working.shape[1],
+                        frame_height=working.shape[0],
+                    ),
+                )
+            )
     return tuple(candidates)
 
 
