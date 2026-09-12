@@ -20,13 +20,22 @@ import math
 from statistics import fmean
 from typing import Any, Sequence
 
-from .direct_member_visual import DirectMemberVisualSelection
+from .direct_member_visual import (
+    DirectMemberVisualSelection, DirectMemberCinematicBridge,
+    FOCAL_POSE_MOTION_BRIDGE_BASIS,
+    verified_focal_pose_motion_bridge,
+)
+from .focal_selector_geometry import (
+    FocalSelectorGeometry, FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_BODY_BASIS,
+    FOCAL_SELECTOR_POSE_BASIS, common_focal_pose_vectors, focal_pose_shape_mismatch,
+)
 from .member_bridge_contract import (
     MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY,
     RequiredMemberBridgeAuthoringError,
     member_bridge_handle_quality_failures,
 )
 from .render import (
+    DIRECT_MEMBER_POSE_DISSOLVE_REASON,
     MEMBER_BLUR_BRIDGE_REASON,
     MEMBER_ZOOM_BRIDGE_REASON,
     RenderSegment,
@@ -41,9 +50,6 @@ OFFICIAL_TARGET_MEMBER_SOURCE_METADATA_CONTRACT = (
 )
 DIRECT_MEMBER_POSE_DISSOLVE_CONTRACT = (
     "official_target_member_exact_endpoint_pose_matched_logistic_dissolve_v1"
-)
-DIRECT_MEMBER_POSE_DISSOLVE_REASON = (
-    "official_target_member_pose_matched_logistic_face_dissolve_v1"
 )
 DIRECT_MEMBER_CINEMATIC_BRIDGE_CONTRACT = (
     "official_target_member_required_cinematic_effect_bridge_v1"
@@ -60,6 +66,10 @@ _CROSS_BASIS_CINEMATIC_BRIDGE_ATTENTION_BASIS = (
 _CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.30
 _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.55
 _CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.65
+_POSE_DISSOLVE_BRIDGE_MAXIMUM_ENDPOINT_SHAPE_MISMATCH = 0.38
+_POSE_DISSOLVE_BRIDGE_MINIMUM_DIRECTION_COSINE = 0.12
+_POSE_DISSOLVE_BRIDGE_MAXIMUM_SPEED_RATIO_MISMATCH = 0.60
+_POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH = 0.34
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.48
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.52
@@ -406,14 +416,16 @@ class DirectMemberPoseDissolvePlan:
             ):
                 raise ValueError("direct member dissolve reason is outside its contract")
             expected_bridge_reason = (
-                MEMBER_ZOOM_BRIDGE_REASON
-                if transition.kind is TransitionKind.MEMBER_ZOOM_BRIDGE
+                DIRECT_MEMBER_POSE_DISSOLVE_REASON
+                if decision.cinematic_bridge_style == "pose_dissolve"
+                else MEMBER_ZOOM_BRIDGE_REASON
+                if decision.cinematic_bridge_style == "zoom_in"
                 else MEMBER_BLUR_BRIDGE_REASON
-                if transition.kind is TransitionKind.MEMBER_BLUR_BRIDGE
+                if decision.cinematic_bridge_style == "horizontal_blur"
                 else None
             )
-            if expected_bridge_reason is not None and (
-                not decision.required_cinematic_bridge
+            if decision.required_cinematic_bridge and (
+                expected_bridge_reason is None
                 or transition.reason != expected_bridge_reason
             ):
                 raise ValueError(
@@ -440,11 +452,7 @@ class DirectMemberPoseDissolvePlan:
     @property
     def cinematic_bridge_count(self) -> int:
         return sum(
-            decision.resolved_transition_kind
-            in {
-                TransitionKind.MEMBER_ZOOM_BRIDGE,
-                TransitionKind.MEMBER_BLUR_BRIDGE,
-            }
+            decision.required_cinematic_bridge
             for decision in self.decisions
         )
 
@@ -521,7 +529,10 @@ class DirectMemberPoseDissolvePlan:
             "selected_dissolve_count": len(selected),
             "selected_dissolves_per_minute": selected_density,
             "hard_cut_count": (
-                len(self.decisions) - len(selected) - len(cinematic_bridges)
+                sum(
+                    item.resolved_transition_kind is TransitionKind.HARD_CUT
+                    for item in self.decisions
+                )
             ),
             "selected_highlight_count": sum(
                 item.highlight_priority for item in selected
@@ -580,7 +591,7 @@ class _RequiredCinematicBridgeCandidate:
     endpoint_attention_scale_mismatch: float | None
     endpoint_pose_mismatch: float
     endpoint_formation_mismatch: float | None
-    endpoint_silhouette_mismatch: float
+    endpoint_silhouette_mismatch: float | None
     outgoing_handle_available_seconds: float
     required_outgoing_handle_seconds: float
     incoming_segment_frame_count: int
@@ -664,6 +675,11 @@ def _attention_mismatch(left: Any, right: Any) -> tuple[float | None, float | No
 
 
 def _attention_basis_pair(left: Any, right: Any) -> str | None:
+    if any(getattr(sample, "focal_geometry", None) is not None for sample in (left, right)):
+        left_basis = _verified_attention_sample_basis(left)
+        right_basis = _verified_attention_sample_basis(right)
+        return left_basis if left_basis == right_basis and left_basis in {
+            FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_BODY_BASIS} else None
     left_basis = getattr(getattr(left, "attention", None), "basis", None)
     right_basis = getattr(getattr(right, "attention", None), "basis", None)
     if left_basis == right_basis == _FACE_ATTENTION_BASIS:
@@ -688,6 +704,17 @@ def _verified_attention_sample_basis(sample: Any) -> str | None:
     descriptor = getattr(sample, "descriptor", None)
     basis = getattr(attention, "basis", None)
     if attention is None or descriptor is None:
+        return None
+    focal = getattr(sample, "focal_geometry", None)
+    if focal is not None:
+        local = _finite_float(getattr(sample, "source_local_seconds", None))
+        if not isinstance(focal, FocalSelectorGeometry) or local is None or abs(focal.source_seconds-local)>1e-9:
+            return None
+        if basis == FOCAL_SELECTOR_FACE_BASIS and focal.face_bbox_xywh is not None:
+            return basis
+        if basis == FOCAL_SELECTOR_BODY_BASIS and focal.person is not None and (
+            focal.face_bbox_xywh is not None or focal.body_track is not None):
+            return basis
         return None
     if basis == _FACE_ATTENTION_BASIS:
         if (
@@ -1549,6 +1576,22 @@ def _required_cinematic_bridge_candidate(
     bridge_base_mismatch = _finite_float(
         getattr(bridge, "base_mismatch", None)
     )
+    focal_bridge = bool(
+        isinstance(bridge, DirectMemberCinematicBridge)
+        and bridge.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS
+        and getattr(mismatch, "pose_basis", None) == FOCAL_SELECTOR_POSE_BASIS
+    )
+    if getattr(bridge, "evidence_basis", None) == FOCAL_POSE_MOTION_BRIDGE_BASIS and not focal_bridge:
+        reasons.append("focal_bridge_typed_pose_authority_missing")
+    if focal_bridge:
+        if not verified_focal_pose_motion_bridge(getattr(mismatch, "motion_connection", None)):
+            reasons.append("focal_bridge_motion_measurements_unverified")
+        focal_pair = tuple(getattr(getattr(diagnostic, name, None), "focal_geometry", None)
+                           for name in ("outgoing_sample", "incoming_sample"))
+        measured = (focal_pose_shape_mismatch(*focal_pair)
+                    if all(isinstance(value, FocalSelectorGeometry) for value in focal_pair) else None)
+        if measured is None or abs(measured-bridge.pose_mismatch)>1e-9:
+            reasons.append("focal_bridge_endpoint_pose_binding_invalid")
     if (
         bridge_pose_mismatch is None
         or bridge_pose_mismatch
@@ -1556,9 +1599,9 @@ def _required_cinematic_bridge_candidate(
     ):
         reasons.append("cinematic_bridge_pose_mismatch_unverified")
     if (
-        bridge_silhouette_mismatch is None
+        not focal_bridge and (bridge_silhouette_mismatch is None
         or bridge_silhouette_mismatch
-        > _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+        > _CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9)
     ):
         reasons.append("cinematic_bridge_silhouette_mismatch_unverified")
     if (
@@ -1575,10 +1618,10 @@ def _required_cinematic_bridge_candidate(
         ):
             reasons.append("cinematic_bridge_nonpriority_pose_mismatch")
         if (
-            bridge_silhouette_mismatch is None
+            not focal_bridge and (bridge_silhouette_mismatch is None
             or bridge_silhouette_mismatch
             > _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
-            + 1e-9
+            + 1e-9)
         ):
             reasons.append("cinematic_bridge_nonpriority_silhouette_mismatch")
         if (
@@ -1626,7 +1669,10 @@ def _required_cinematic_bridge_candidate(
         reasons.append("boundary_source_metadata_disagrees_with_render")
 
     style = getattr(bridge, "style", None)
-    if style == "zoom_in":
+    if style == "pose_dissolve":
+        transition_kind = TransitionKind.FACE_DISSOLVE
+        transition_reason = DIRECT_MEMBER_POSE_DISSOLVE_REASON
+    elif style == "zoom_in":
         transition_kind = TransitionKind.MEMBER_ZOOM_BRIDGE
         transition_reason = MEMBER_ZOOM_BRIDGE_REASON
     elif style == "horizontal_blur":
@@ -1722,6 +1768,45 @@ def _required_cinematic_bridge_candidate(
             )
         ):
             reasons.append("cinematic_bridge_motion_source_clock_invalid")
+    if style == "pose_dissolve":
+        direction_cosine = _finite_float(
+            getattr(motion, "direction_cosine_audit_only", None)
+        )
+        endpoint_shape_mismatch = _finite_float(
+            getattr(motion, "endpoint_pose_shape_mismatch", None)
+        )
+        speed_ratio_mismatch = _finite_float(
+            getattr(motion, "motion_speed_ratio_mismatch", None)
+        )
+        phase_mismatch = _finite_float(
+            getattr(motion, "pose_phase_continuation_mismatch", None)
+        )
+        if not both_moving:
+            reasons.append("pose_dissolve_bridge_requires_both_moving")
+        if (
+            direction_cosine is None
+            or direction_cosine
+            < _POSE_DISSOLVE_BRIDGE_MINIMUM_DIRECTION_COSINE - 1e-9
+        ):
+            reasons.append("pose_dissolve_bridge_direction_unverified")
+        if (
+            endpoint_shape_mismatch is None
+            or endpoint_shape_mismatch
+            > _POSE_DISSOLVE_BRIDGE_MAXIMUM_ENDPOINT_SHAPE_MISMATCH + 1e-9
+        ):
+            reasons.append("pose_dissolve_bridge_endpoint_shape_unverified")
+        if (
+            speed_ratio_mismatch is not None
+            and speed_ratio_mismatch
+            > _POSE_DISSOLVE_BRIDGE_MAXIMUM_SPEED_RATIO_MISMATCH + 1e-9
+        ):
+            reasons.append("pose_dissolve_bridge_speed_discontinuity")
+        if (
+            phase_mismatch is not None
+            and phase_mismatch
+            > _POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH + 1e-9
+        ):
+            reasons.append("pose_dissolve_bridge_phase_discontinuity")
 
     minimum_frames = max(
         3,
@@ -1751,6 +1836,15 @@ def _required_cinematic_bridge_candidate(
     if outgoing_future is None or incoming_future is None:
         reasons.append("cinematic_bridge_future_content_evidence_missing")
     else:
+        exact_outgoing_handle = tuple(
+            getattr(diagnostic, "outgoing_handle_samples", ())
+        )
+        exact_incoming_handle = tuple(
+            getattr(diagnostic, "incoming_handle_samples", ())
+        )
+        exact_handle_bound = bool(
+            len(exact_outgoing_handle) == len(exact_incoming_handle) == 2
+        )
         for label, future, segment in (
             ("outgoing", outgoing_future, outgoing_segment),
             ("incoming", incoming_future, incoming_segment),
@@ -1765,7 +1859,13 @@ def _required_cinematic_bridge_candidate(
                 and not bool(getattr(future, "valid", False))
             ):
                 reasons.append(f"cinematic_bridge_{label}_future_content_invalid")
-            samples = tuple(getattr(future, "samples", ()))[:2]
+            samples = (
+                exact_outgoing_handle
+                if exact_handle_bound and label == "outgoing"
+                else exact_incoming_handle
+                if exact_handle_bound
+                else tuple(getattr(future, "samples", ()))[:2]
+            )
             if len(samples) != 2:
                 reasons.append(f"cinematic_bridge_{label}_future_samples_incomplete")
                 continue
@@ -1824,6 +1924,24 @@ def _required_cinematic_bridge_candidate(
                     f"cinematic_bridge_{label}_crosses_native_source_cut"
                 )
 
+    if focal_bridge:
+        # The full-span screening samples intentionally carry no target pose.
+        # Require the exact, target-bound overlap observations, never borrow
+        # another member's aggregate silhouette/formation to fill that gap.
+        handles = (tuple(getattr(diagnostic, "outgoing_handle_samples", ())),
+                   tuple(getattr(diagnostic, "incoming_handle_samples", ())))
+        if any(len(samples) != 2 for samples in handles):
+            reasons.append("focal_bridge_exact_handle_pose_missing")
+        else:
+            for left, right in zip(*handles):
+                geometry = tuple(getattr(sample, "focal_geometry", None) for sample in (left, right))
+                pose = (focal_pose_shape_mismatch(*geometry)
+                        if all(isinstance(value, FocalSelectorGeometry) for value in geometry) else None)
+                if (_attention_basis_pair(left, right) != attention_basis
+                    or pose is None or pose > config.maximum_future_pose_mismatch + 1e-9
+                    or common_focal_pose_vectors(geometry) is None):
+                    reasons.append("focal_bridge_handle_pose_unverified")
+
     available_handle = (
         eligible_source_durations_seconds[left_source]
         - outgoing_segment.source_end
@@ -1843,7 +1961,7 @@ def _required_cinematic_bridge_candidate(
     assert canonical_master is not None
     assert attention_basis is not None
     assert bridge_pose_mismatch is not None
-    assert bridge_silhouette_mismatch is not None
+    assert focal_bridge or bridge_silhouette_mismatch is not None
     return (
         _RequiredCinematicBridgeCandidate(
             boundary_index=boundary_index,

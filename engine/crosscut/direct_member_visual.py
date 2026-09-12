@@ -61,6 +61,7 @@ _DECODED_PROXY_PENALTY_RADIUS_SECONDS = 0.30
 _DECODED_PROXY_MAXIMUM_ACCUMULATED_EDGE_PENALTY = 8.0
 _DECODED_PROXY_LOCAL_REPAIR_MAXIMUM_TARGET_BOUNDARY_COUNT = 3
 _DECODED_PROXY_LOCAL_REPAIR_SOURCE_DEVIATION_PENALTY = 2.0
+FOCAL_POSE_MOTION_BRIDGE_BASIS = "source_bound_focal_common_joints_motion_v1"
 
 
 _DIRECT_CONTENT_SAMPLE_COUNT = 6
@@ -1283,8 +1284,9 @@ class DirectMemberCinematicBridge:
     incoming_is_landscape: bool
     authorized_severe_flags: tuple[str, ...]
     pose_mismatch: float
-    silhouette_mismatch: float
+    silhouette_mismatch: float | None
     base_mismatch: float
+    evidence_basis: str = "pose_and_aggregate_silhouette_v1"
 
     def __post_init__(self) -> None:
         if self.style not in {"pose_dissolve", "zoom_in", "horizontal_blur"}:
@@ -1304,17 +1306,26 @@ class DirectMemberCinematicBridge:
         )
         if not flags or not flags <= allowed_flags:
             raise ValueError("cinematic bridge severe flags are invalid")
+        focal = self.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS
+        if self.evidence_basis not in {FOCAL_POSE_MOTION_BRIDGE_BASIS, "pose_and_aggregate_silhouette_v1"}:
+            raise ValueError("cinematic bridge evidence basis is invalid")
+        if focal and (self.style != "pose_dissolve" or self.silhouette_mismatch is not None):
+            raise ValueError("focal motion bridge cannot invent an aggregate silhouette")
+        if not focal and self.silhouette_mismatch is None:
+            raise ValueError("legacy cinematic bridge needs silhouette evidence")
         for value in (
             self.pose_mismatch,
-            self.silhouette_mismatch,
             self.base_mismatch,
-        ):
+        ) + (() if self.silhouette_mismatch is None else (self.silhouette_mismatch,)):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError("cinematic bridge mismatch is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "contract": "official_member_pose_safe_effect_bridge_v3",
+            "contract": ("official_member_focal_pose_motion_effect_bridge_v1"
+                         if self.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS
+                         else "official_member_pose_safe_effect_bridge_v3"),
+            "evidence_basis": self.evidence_basis,
             "style": self.style,
             "geometry_scope": (
                 "landscape_involved"
@@ -1415,6 +1426,21 @@ class DirectBoundaryMismatch:
         }
 
 
+def verified_focal_pose_motion_bridge(motion: DirectBoundaryMotionEvidence | None) -> bool:
+    """Shared selector/authoring checks; no aggregate silhouette substitution."""
+    if not isinstance(motion, DirectBoundaryMotionEvidence) or not motion.timestamp_bound_adjacent or not motion.both_moving:
+        return False
+    values = (motion.endpoint_pose_shape_mismatch, motion.direction_cosine_audit_only,
+              motion.motion_speed_ratio_mismatch, motion.pose_phase_continuation_mismatch)
+    return bool(all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in values)
+        and all(0 <= values[index] <= 1 for index in (0, 2, 3)) and -1 <= values[1] <= 1
+        and values[0] <= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_ENDPOINT_SHAPE_MISMATCH + 1e-9
+        and values[1] >= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MINIMUM_DIRECTION_COSINE - 1e-9
+        and values[2] <= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_SPEED_RATIO_MISMATCH + 1e-9
+        and values[3] <= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH + 1e-9)
+
+
 def _cinematic_bridge_from_verified_evidence(
     *,
     severe_flags: Sequence[str],
@@ -1429,6 +1455,7 @@ def _cinematic_bridge_from_verified_evidence(
     timestamp_bound_adjacent: bool,
     transform_repair: DirectMemberBoundaryTransformRepair | None,
     motion_connection: DirectBoundaryMotionEvidence | None = None,
+    focal_pose_window_verified: bool = False,
 ) -> DirectMemberCinematicBridge | None:
     """Authorize an effect-only bridge from scalar pose/body evidence.
 
@@ -1470,6 +1497,11 @@ def _cinematic_bridge_from_verified_evidence(
             + 1e-9
         )
     )
+    focal_motion_bridge = bool(
+        focal_pose_window_verified and actual_pose and motion_pose_dissolve
+        and silhouette_mismatch is None
+        and verified_focal_pose_motion_bridge(motion_connection)
+    )
     allowed_flags = (
         _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_ALLOWED_SEVERE_FLAGS
         if motion_pose_dissolve
@@ -1494,9 +1526,9 @@ def _cinematic_bridge_from_verified_evidence(
         or pose_mismatch is None
         or pose_mismatch
         > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
-        or silhouette_mismatch is None
-        or silhouette_mismatch
-        > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+        or (not focal_motion_bridge and (
+            silhouette_mismatch is None or silhouette_mismatch
+            > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9))
         or base_mismatch
         > _DIRECT_MEMBER_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
         or not flags <= allowed_flags
@@ -1518,8 +1550,8 @@ def _cinematic_bridge_from_verified_evidence(
     if not (outgoing_is_landscape or incoming_is_landscape) and (
         pose_mismatch
         > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
-        or silhouette_mismatch
-        > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9
+        or (not focal_motion_bridge and silhouette_mismatch
+            > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9)
         or base_mismatch
         > _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
     ):
@@ -1536,8 +1568,9 @@ def _cinematic_bridge_from_verified_evidence(
         incoming_is_landscape=incoming_is_landscape,
         authorized_severe_flags=tuple(severe_flags),
         pose_mismatch=float(pose_mismatch),
-        silhouette_mismatch=float(silhouette_mismatch),
+        silhouette_mismatch=(float(silhouette_mismatch) if silhouette_mismatch is not None else None),
         base_mismatch=float(base_mismatch),
+        evidence_basis=(FOCAL_POSE_MOTION_BRIDGE_BASIS if focal_motion_bridge else "pose_and_aggregate_silhouette_v1"),
     )
 
 
@@ -1559,9 +1592,9 @@ def _exceptional_nonpriority_cinematic_bridge(
         bridge is not None
         and bridge.pose_mismatch
         <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH + 1e-9
-        and bridge.silhouette_mismatch
-        <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH
-        + 1e-9
+        and (bridge.evidence_basis == FOCAL_POSE_MOTION_BRIDGE_BASIS
+             or bridge.silhouette_mismatch is not None and bridge.silhouette_mismatch
+             <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH + 1e-9)
         and bridge.base_mismatch
         <= _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_BASE_MISMATCH + 1e-9
     )
@@ -5263,6 +5296,13 @@ def _boundary_mismatch(
         ),
         transform_repair=transform_repair,
         motion_connection=motion_connection,
+        focal_pose_window_verified=bool(
+            focal_mode
+            and all(s is not None and s.focal_geometry is not None for s in
+                    (outgoing_previous, outgoing, incoming, incoming_next))
+            and common_focal_pose_vectors(tuple(s.focal_geometry for s in
+                (outgoing_previous, outgoing, incoming, incoming_next))) is not None
+        ),
     )
     if cinematic_bridge is not None:
         warning_flags.append("cinematic_effect_bridge_required")
