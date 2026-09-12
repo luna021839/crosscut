@@ -1000,7 +1000,7 @@ class StageEditSourcePretrainingTests(unittest.TestCase):
 
 @unittest.skipUnless(mlx_runtime_version() is not None, "MLX is optional")
 class StageEditProductionTrainingSmokeTests(unittest.TestCase):
-    def test_structured_prior_adapter_cannot_modify_value_rows(self) -> None:
+    def test_trajectory_prior_adapter_can_modify_all_renderer_rows(self) -> None:
         dimension = 16
         values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
         initial = {
@@ -1052,7 +1052,7 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
         )
 
         for name in ("context_weight", "source_weight"):
-            self.assertEqual(
+            self.assertNotEqual(
                 initial[name][:values_stop].tolist(),
                 snapshot[name][:values_stop].tolist(),
             )
@@ -1060,7 +1060,7 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 initial[name][values_stop:].tolist(),
                 snapshot[name][values_stop:].tolist(),
             )
-        self.assertEqual(
+        self.assertNotEqual(
             initial["context_bias"][:values_stop].tolist(),
             snapshot["context_bias"][:values_stop].tolist(),
         )
@@ -1268,7 +1268,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 candidate["selected_candidate_origin"]
                 == "trained_prior_candidate"
             )
-            self.assertFalse(
+            self.assertEqual(
+                trained_prior_selected,
                 prior["parameter_invariance"]["context_value_bias_changed"]
             )
             self.assertEqual(
@@ -1291,7 +1292,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 trained_prior_selected,
                 prior["parameter_invariance"]["source_head_changed"],
             )
-            self.assertFalse(
+            self.assertEqual(
+                trained_prior_selected,
                 prior["parameter_invariance"][
                     "context_value_weight_changed"
                 ]
@@ -1302,7 +1304,8 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     "context_structured_weight_changed"
                 ],
             )
-            self.assertFalse(
+            self.assertEqual(
+                trained_prior_selected,
                 prior["parameter_invariance"]["source_value_weight_changed"]
             )
             self.assertEqual(
@@ -1311,7 +1314,7 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                     "source_structured_weight_changed"
                 ],
             )
-            self.assertFalse(
+            self.assertTrue(
                 prior["parameter_invariance"]["value_row_gradients_computed"]
             )
             self.assertTrue(
@@ -1385,6 +1388,14 @@ class StageEditProductionTrainingSmokeTests(unittest.TestCase):
                 self.assertTrue(
                     retention["all_dynamic_head_parameters_byte_identical"]
                 )
+                self.assertTrue(
+                    retention["all_feature_extractor_parameters_byte_identical"]
+                )
+                self.assertEqual(
+                    retention["warmup_feature_sha256"],
+                    retention["retained_feature_sha256"],
+                )
+                self.assertTrue(retention["feature_dropout_disabled_during_retention"])
                 self.assertTrue(
                     retention[
                         "optimizer_state_reset_before_dynamic_head_release"

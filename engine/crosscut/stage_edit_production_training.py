@@ -162,20 +162,24 @@ DYNAMIC_CROP_V3_VALIDATION_SELECTION_CONTRACT = (
 )
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_STEPS = (50, 100, 200, 300, 400, 500)
 DYNAMIC_CROP_V3_PRIOR_CANDIDATE_SELECTION_CONTRACT = (
-    "predeclared_train_only_detached_structured_low_rank_adapter_milestones_"
+    "predeclared_train_only_detached_trajectory_low_rank_adapter_milestones_"
     "existing_exact_validation_structured_metric_gate_highest_score_"
-    "lower_step_tiebreak_initial_head_fallback_v5"
+    "lower_step_tiebreak_initial_head_fallback_v6"
 )
 DYNAMIC_CROP_V3_PRIOR_FEATURE_CONTRACT = (
     "frozen_post_source_pretraining_context_and_exact_source_embedding_v1"
 )
 DYNAMIC_CROP_V3_PRIOR_PARAMETER_SCOPE_CONTRACT = (
-    "only_dynamic_crop_count_time_motion_low_rank_residual_mutable_v3"
+    "only_dynamic_crop_values_count_time_motion_low_rank_residual_mutable_v4"
 )
 DYNAMIC_CROP_V3_PRIOR_PROJECTION_RANK = 16
+DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES = (
+    "context_projection", "source_projection", "input_fusion",
+    "position_embedding", "encoder",
+)
 DYNAMIC_CROP_V3_PRIOR_ADAPTER_CONTRACT = (
     "standardized_fixed_deterministic_random_projection_separate_"
-    "context_source_linear_structured_residual_v2"
+    "context_source_linear_full_trajectory_residual_v3"
 )
 DYNAMIC_CROP_V3_PRIOR_STRUCTURED_SELECTION_CONTRACT = (
     "validation_count_macro_recall_coverage_time_motion_nonregression_v1"
@@ -2136,15 +2140,18 @@ class _DynamicCropV3PriorHeadModule(_DynamicCropV3PriorModuleBase):
 class _DynamicCropV3StructuredPriorAdapterModule(
     _DynamicCropV3PriorModuleBase
 ):
-    """Low-capacity residual for count, time, and motion rows only."""
+    """Train every trajectory row on detached base features before joint fit.
+
+    Freezing value rows at the identity initialization makes the existing
+    noncollapsed-curve selection gate unreachable, regardless of count/time
+    accuracy. The residual must also learn the per-keyframe geometry. It is
+    merged into the original full Transformer heads without changing inference.
+    """
 
     def __init__(self, projection_rank: int) -> None:
         _require_mlx()
         super().__init__()
-        values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
-        structured_dimension = (
-            DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION - values_stop
-        )
+        structured_dimension = DYNAMIC_CROP_V3_RAW_OUTPUT_DIMENSION
         self.context_adapter = nn.Linear(
             projection_rank,
             structured_dimension,
@@ -2307,7 +2314,6 @@ def _dynamic_crop_v3_structured_prior_raw(
     context_embedding: Any,
     source_embedding: Any,
 ) -> Any:
-    values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     base_raw = (
         mx.matmul(initial_snapshot["context_weight"], context_embedding)
         + initial_snapshot["context_bias"]
@@ -2325,12 +2331,7 @@ def _dynamic_crop_v3_structured_prior_raw(
         context_projection,
         source_projection,
     )
-    return mx.concatenate(
-        (
-            base_raw[:values_stop],
-            base_raw[values_stop:] + structured_residual,
-        )
-    )
+    return base_raw + structured_residual
 
 
 def _dynamic_crop_v3_structured_prior_head_snapshot(
@@ -2340,9 +2341,8 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
     source_projection_matrix: Any,
     projection_normalizer: _DynamicCropV3PriorProjectionNormalizer,
 ) -> dict[str, Any]:
-    """Merge the low-rank structured residual into a full renderer head."""
+    """Merge all low-rank trajectory rows into the original renderer heads."""
 
-    values_stop = DYNAMIC_CROP_V3_MAX_KEYFRAMES * 4
     context_delta = mx.matmul(
         module.context_adapter.weight
         / projection_normalizer.context_scale[None, :],
@@ -2367,30 +2367,9 @@ def _dynamic_crop_v3_structured_prior_head_snapshot(
         )
     )
     snapshot = {
-        "context_weight": mx.concatenate(
-            (
-                initial_snapshot["context_weight"][:values_stop],
-                initial_snapshot["context_weight"][values_stop:]
-                + context_delta,
-            ),
-            axis=0,
-        ),
-        "context_bias": mx.concatenate(
-            (
-                initial_snapshot["context_bias"][:values_stop],
-                initial_snapshot["context_bias"][values_stop:]
-                + structured_bias_delta,
-            ),
-            axis=0,
-        ),
-        "source_weight": mx.concatenate(
-            (
-                initial_snapshot["source_weight"][:values_stop],
-                initial_snapshot["source_weight"][values_stop:]
-                + source_delta,
-            ),
-            axis=0,
-        ),
+        "context_weight": initial_snapshot["context_weight"] + context_delta,
+        "context_bias": initial_snapshot["context_bias"] + structured_bias_delta,
+        "source_weight": initial_snapshot["source_weight"] + source_delta,
     }
     mx.eval(*snapshot.values())
     return snapshot
@@ -3281,6 +3260,8 @@ def train_production_stage_edit(
     retained_dynamic_crop_v3_context_weight = None
     retained_dynamic_crop_v3_context_bias = None
     retained_dynamic_crop_v3_source_weight = None
+    retained_dynamic_crop_v3_features = None
+    retained_dynamic_crop_v3_feature_digest = None
     source_pretraining_sampling_evidence: dict[str, Any] = {
         "contract": "deterministic_song_reference_group_round_robin_v1",
         "opening_source_excluded_count": 0,
@@ -4195,9 +4176,6 @@ def train_production_stage_edit(
             after_digests = _dynamic_crop_v3_prior_parameter_digests(model)
             invariant_keys = (
                 "base_parameter_tree_sha256",
-                "context_value_bias_sha256",
-                "context_value_weight_sha256",
-                "source_value_weight_sha256",
             )
             invariant = all(
                 dynamic_crop_v3_prior_before_digests[key]
@@ -4308,12 +4286,24 @@ def train_production_stage_edit(
                 "source_head_gradients_computed": True,
                 "context_weight_gradients_computed": True,
                 "count_time_motion_bias_gradients_computed": True,
-                "value_row_gradients_computed": False,
+                "value_row_gradients_computed": True,
                 "full_head_gradients_computed": False,
                 "structured_low_rank_adapter_gradients_computed": True,
+                "trajectory_value_low_rank_adapter_gradients_computed": True,
                 "base_features_detached_before_prior_optimization": True,
             }
             if retention_authorized:
+                # A fixed affine head does not preserve its predictions when
+                # its input feature extractor changes. Retain that extractor
+                # too, only for the existing finite head-calibration burn-in.
+                base_parameters = model.base.parameters()
+                retained_dynamic_crop_v3_features = {
+                    name: base_parameters[name]
+                    for name in DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES
+                }
+                retained_dynamic_crop_v3_feature_digest = _parameter_tree_sha256(
+                    retained_dynamic_crop_v3_features
+                )
                 batches_per_epoch = finetune_batches_per_epoch
                 dynamic_crop_v3_prior_retention_finetune_steps = (
                     math.ceil(
@@ -4428,6 +4418,7 @@ def train_production_stage_edit(
                     epoch_optimizer_reset_before_steps.append(
                         finetune_optimizer_steps + 1
                     )
+                    retained_dynamic_crop_v3_features = None
                 batch = tensorize_stage_edit_batch(
                     prepare_stage_edit_production_input_sequences(
                         examples, schema=schema
@@ -4457,9 +4448,6 @@ def train_production_stage_edit(
                     if dynamic_crop_v2_enabled
                     else None
                 )
-                loss, gradients = loss_and_grad(
-                    model, batch, supervision, dynamic_supervision
-                )
                 next_finetune_step = finetune_optimizer_steps + 1
                 retain_dynamic_crop_v3_prior = bool(
                     dynamic_crop_v3_prior_candidate_selection
@@ -4469,6 +4457,16 @@ def train_production_stage_edit(
                     is True
                     and next_finetune_step
                     <= dynamic_crop_v3_prior_retention_finetune_steps
+                )
+                if retain_dynamic_crop_v3_prior:
+                    # Match the deterministic frozen features used to fit the
+                    # prior. Prediction heads have no stochastic layers.
+                    for name in (*DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES, "input_dropout"):
+                        getattr(model.base, name).eval()
+                else:
+                    model.train()
+                loss, gradients = loss_and_grad(
+                    model, batch, supervision, dynamic_supervision
                 )
                 if retain_dynamic_crop_v3_prior:
                     if not isinstance(gradients, Mapping):
@@ -4487,6 +4485,11 @@ def train_production_stage_edit(
                         gradients[head_name] = _zero_gradient_tree(
                             gradients[head_name]
                         )
+                    gradients["base"] = dict(gradients["base"])
+                    for name in DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES:
+                        gradients["base"][name] = _zero_gradient_tree(
+                            gradients["base"][name]
+                        )
                 if clipping_supported:
                     gradients, gradient_norm = optim.clip_grad_norm(
                         gradients, gradient_clip_norm
@@ -4495,6 +4498,9 @@ def train_production_stage_edit(
                     gradient_norm = mx.array(float("nan"))
                 optimizer.update(model, gradients)
                 if retain_dynamic_crop_v3_prior:
+                    assert retained_dynamic_crop_v3_features is not None
+                    # AdamW decay can move a parameter despite zero gradients.
+                    model.base.update(retained_dynamic_crop_v3_features)
                     assert retained_dynamic_crop_v3_context_weight is not None
                     assert retained_dynamic_crop_v3_context_bias is not None
                     assert retained_dynamic_crop_v3_source_weight is not None
@@ -4559,10 +4565,20 @@ def train_production_stage_edit(
                     raise RuntimeError(
                         "Dynamic Crop v3 warmup prior drifted before burn-in"
                     )
+                base_parameters = model.base.parameters()
+                retained_feature_digest = _parameter_tree_sha256({
+                    name: base_parameters[name]
+                    for name in DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES
+                })
+                features_identical = (
+                    retained_feature_digest == retained_dynamic_crop_v3_feature_digest
+                )
+                if not features_identical:
+                    raise RuntimeError("Dynamic Crop v3 prior feature extractor drifted")
                 dynamic_crop_v3_prior_retention_evidence = {
                     "contract": (
-                        "warmup_dynamic_heads_byte_retained_until_joint_"
-                        "selection_burn_in_v1"
+                        "warmup_dynamic_heads_and_features_byte_retained_until_"
+                        "joint_selection_burn_in_v2"
                     ),
                     "retention_finetune_step_count": (
                         dynamic_crop_v3_prior_retention_restore_steps
@@ -4579,6 +4595,12 @@ def train_production_stage_edit(
                     "all_dynamic_head_parameters_byte_identical": (
                         heads_identical
                     ),
+                    "all_feature_extractor_parameters_byte_identical": features_identical,
+                    "retained_feature_module_names": list(DYNAMIC_CROP_V3_PRIOR_FEATURE_MODULES),
+                    "warmup_feature_sha256": retained_dynamic_crop_v3_feature_digest,
+                    "retained_feature_sha256": retained_feature_digest,
+                    "feature_dropout_disabled_during_retention": True,
+                    "feature_extractor_released_after_retention": True,
                     "dynamic_head_gradients_zeroed": True,
                     "adamw_parameter_decay_restored": True,
                     "optimizer_reset_required_before_dynamic_head_release": True,
