@@ -235,6 +235,7 @@ from .source_scalar_cache import (
     PersistentSourceScalarCacheStorageUnavailableError,
     source_content_sha256,
 )
+from .direct_member_failure_diagnostics import find_member_infeasibility_relaxation
 from .source_derivative_diversity import (
     PersistentSourceDerivativeDiversityCache,
     SourceDerivativeDiversityResult,
@@ -17940,19 +17941,13 @@ def _select_direct_member_partition_profile(
                     except DirectMemberVisualSelectionError as caught:
                         terminal_hold_error = caught
                         if request_infeasibility_diagnostic:
-                            raw_search = caught.diagnostics.get("search")
-                            raw_solver = (
-                                raw_search.get("solver")
-                                if isinstance(raw_search, Mapping)
-                                else None
+                            retained_diagnostic = find_member_infeasibility_relaxation(
+                                caught.diagnostics
                             )
-                            raw_diagnostic = (
-                                raw_solver.get("infeasibility_relaxation")
-                                if isinstance(raw_solver, Mapping)
-                                else None
-                            )
-                            if isinstance(raw_diagnostic, Mapping):
+                            if retained_diagnostic is not None:
+                                raw_diagnostic, diagnostic_origin = retained_diagnostic
                                 partition_search_cinematic_milp_infeasibility_diagnostic = {
+                                    "diagnostic_origin": diagnostic_origin,
                                     "profile_id": terminal_profile.profile_id,
                                     "partition_signature_sha256": (
                                         terminal_signature
