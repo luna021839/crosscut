@@ -55,13 +55,15 @@ def body_sample(sample, measurement):
 
 class RenderedBodyWindowProvider:
     def __init__(self, render_plan, frame_provider, *, body_model_path,
-                 pose_model_path, source_cache_arguments=None, source_provider=None):
+                 pose_model_path, source_cache_arguments=None, source_provider=None,
+                 body_execution_device='cpu'):
         (self.fps, _, _, self.output_frames, self.sources,
          self.spans) = _parse_plan(render_plan)
         self.transitions = tuple(render_plan['transitions'])
         self.frame_provider = frame_provider
         self.body_model_path = body_model_path
         self.pose_model_path = pose_model_path
+        self.body_execution_device = body_execution_device
         self.source_cache_arguments = dict(source_cache_arguments or {})
         self._source = source_provider
         self._owned = source_provider is None
@@ -72,6 +74,7 @@ class RenderedBodyWindowProvider:
             from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
             self._source = SourceFirstFocalGeometryProvider(self.sources,
                 body_model_path=self.body_model_path, pose_model_path=self.pose_model_path,
+                body_execution_device=self.body_execution_device,
                 **self.source_cache_arguments)
         return self._source
 

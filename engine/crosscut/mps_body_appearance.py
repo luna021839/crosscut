@@ -1,4 +1,4 @@
-"""Optional Apple GPU adapter; not enabled in active production jobs.
+"""Apple GPU adapter for source-first member body inference.
 
 CPU and MPS evidence namespaces must remain separate. The adapter preserves
 the pretrained model, input preprocessing and CPU-normalized output contract.
@@ -17,7 +17,13 @@ class MPSBodyAppearanceEncoder(BodyAppearanceEncoder):
         if not torch.backends.mps.is_available():
             raise RuntimeError('explicit MPS body encoder requires an available Apple GPU')
         with torch.inference_mode(False):
-            native=super()._load().to('mps')
+            try:
+                native=super()._load().to('mps')
+            except BaseException:
+                # The base loader stores its CPU model before device transfer.
+                # A failed transfer must not make a retry silently use that CPU model.
+                self._model=None
+                raise
             class CPUContractForward(torch.nn.Module):
                 def __init__(self):
                     super().__init__();self.native=native

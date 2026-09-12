@@ -9866,6 +9866,9 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("source_first_focal_geometry.py"),
                 Path(__file__).with_name("source_first_model_assets.py"),
                 Path(__file__).with_name("source_first_member_session.py"),
+                Path(__file__).with_name("source_first_execution.py"),
+                Path(__file__).with_name("source_first_published_cache.py"),
+                Path(__file__).with_name("mps_body_appearance.py"),
                 Path(__file__).with_name("focal_selector_geometry.py"),
                 Path(__file__).with_name("focal_reference_consensus.py"),
                 Path(__file__).with_name("focal_body_track.py"),
@@ -9880,6 +9883,9 @@ def _direct_member_dense_render_feedback_binding(
             )
         }
         from .source_first_focal_geometry import SourceFirstFocalGeometryProvider
+        from .source_first_execution import resolve_body_execution_device
+        implementation_sha256['source_first_auto_body_device'] = hashlib.sha256(
+            resolve_body_execution_device('auto').encode()).hexdigest()
         implementation_sha256["source_first_observation_semantics"] = (
             SourceFirstFocalGeometryProvider.observation_fingerprint()
         )
@@ -34377,6 +34383,7 @@ def analyze(
                 evaluate_direct_member_rendered_continuity,
                 focal_pose_model_path=dense_face_provider.pose.model_path,
                 focal_body_model_path=dense_face_provider.encoder.model_path,
+                focal_body_execution_device=dense_face_provider.body_execution_device,
                 focal_source_cache_arguments=_visual_feature_cache_arguments(request),
             )
 

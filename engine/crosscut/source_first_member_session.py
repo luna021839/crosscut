@@ -7,7 +7,7 @@ from .direct_member_visual import _VideoDescriptorProvider
 
 def open_source_first_member_session(sources, *, feature_cache_directory=None,
         feature_derived_cache_directory=None, require_persistent_feature_cache=False,
-        progress_callback=None):
+        progress_callback=None, body_execution_device='auto'):
     if feature_cache_directory is None:
         raise ValueError('source-first member editing requires an explicit source cache')
     assets=ensure_source_first_model_assets(feature_cache_directory)
@@ -15,7 +15,7 @@ def open_source_first_member_session(sources, *, feature_cache_directory=None,
         feature_derived_cache_directory=feature_derived_cache_directory,
         require_persistent_feature_cache=require_persistent_feature_cache)
     focal=SourceFirstFocalGeometryProvider(sources,body_model_path=assets.body_model_path,
-        pose_model_path=assets.pose_model_path,**arguments)
+        pose_model_path=assets.pose_model_path,body_execution_device=body_execution_device,**arguments)
     resolver=focal.selector_geometry
     if progress_callback is not None:
         started=time.monotonic();last=started;queries=0

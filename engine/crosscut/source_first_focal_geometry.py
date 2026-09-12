@@ -24,13 +24,15 @@ from .focal_body_track_provider import SourceLocalFocalBodyProvider
 from .focal_body_track import FocalBodyGeometryCertificate
 from .focal_selector_geometry import FocalSelectorGeometry, FOCAL_SELECTOR_BODY_BASIS
 from .native_focal_faces import NativeFocalFaceProvider
-from .source_first_geometry_cache import SourceFirstGeometryCache
+from .source_first_published_cache import SourceFirstPublishedGeometryCache as SourceFirstGeometryCache
 
 
 class SourceFirstFocalGeometryProvider:
     def __init__(self, sources, *, body_model_path: Path, pose_model_path: Path,
                  feature_cache_directory=None, feature_derived_cache_directory=None,
-                 require_persistent_feature_cache=False):
+                 require_persistent_feature_cache=False, body_execution_device='cpu'):
+        from .source_first_execution import resolve_body_execution_device, body_observation_namespace
+        self.body_execution_device = resolve_body_execution_device(body_execution_device)
         self.sources = tuple(Path(p) for p in sources)
         self._identities = tuple(self._identity(p) for p in self.sources)
         with ExitStack() as cleanup:
@@ -43,12 +45,18 @@ class SourceFirstFocalGeometryProvider:
                 require_persistent_feature_cache=require_persistent_feature_cache)
             cleanup.callback(self.faces.close)
             self.pose = BodyPose2DAnalyzer(pose_model_path)
-            self.encoder = BodyAppearanceEncoder(body_model_path)
+            if self.body_execution_device == 'mps':
+                from .mps_body_appearance import MPSBodyAppearanceEncoder
+                self.encoder = MPSBodyAppearanceEncoder(body_model_path)
+            else:
+                self.encoder = BodyAppearanceEncoder(body_model_path)
             self.bodies = SourceLocalFocalBodyProvider(self.faces, self.encoder, pose_analyzer=self.pose)
             self._cache = OrderedDict()
             self._boundary_references = []
             self._reasons = {}
-            self._persistent = (SourceFirstGeometryCache(feature_cache_directory,self.observation_fingerprint())
+            self.observation_namespace = body_observation_namespace(
+                self.observation_fingerprint(), self.encoder, self.body_execution_device)
+            self._persistent = (SourceFirstGeometryCache(feature_cache_directory,self.observation_namespace)
                 if feature_cache_directory is not None else None)
             cleanup.pop_all()
 
@@ -229,6 +237,8 @@ class SourceFirstFocalGeometryProvider:
 
     def diagnostics(self):
         return {'contract': 'shared_source_first_member_geometry_v1',
+            'body_execution_device': getattr(self, 'body_execution_device', 'cpu'),
+            'observation_namespace': getattr(self, 'observation_namespace', None),
             'observation_cache_count': len(self._cache), 'reasons': dict(self._reasons),
             'body_frame_inference_count': self.bodies.frame_inference_count,
             'body_frame_cache_hit_count': self.bodies.frame_cache_hit_count,

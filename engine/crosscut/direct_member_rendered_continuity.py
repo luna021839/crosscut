@@ -464,6 +464,7 @@ def evaluate_direct_member_rendered_continuity(
     focal_body_model_path: Path | None = None,
     focal_source_cache_arguments: Mapping[str, Any] | None = None,
     body_window_provider=None,
+    focal_body_execution_device: str = 'cpu',
 ) -> DirectMemberRenderedContinuityResult:
     """Evaluate every real hard source switch in the encoded member video."""
 
@@ -556,6 +557,7 @@ def evaluate_direct_member_rendered_continuity(
             owned_body_provider = RenderedBodyWindowProvider(render_plan,
                 owned._sampler.frame_at, body_model_path=focal_body_model_path,
                 pose_model_path=focal_pose_model_path,
+                body_execution_device=focal_body_execution_device,
                 source_cache_arguments=focal_source_cache_arguments)
             body_window_provider = owned_body_provider
         except BaseException:
