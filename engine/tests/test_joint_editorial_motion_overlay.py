@@ -189,9 +189,11 @@ class JointEditorialMotionOverlayTests(unittest.TestCase):
             "provider_neutral_boundary_proof",
             result.plan.segments[1].reasons,
         )
-        self.assertEqual(result.plan.zoom_event_count, 5)
-        self.assertEqual(result.plan.pan_event_count, 2)
-        self.assertEqual(result.plan.roll_event_count, 1)
+        # The provider crop is constant. Its stale event counters must not
+        # become motion evidence; only the one actual pulse is visible.
+        self.assertEqual(result.plan.zoom_event_count, 1)
+        self.assertEqual(result.plan.pan_event_count, 0)
+        self.assertEqual(result.plan.roll_event_count, 0)
         self.assertEqual(result.plan.interior_zoom_pulse_count, 4)
 
     def test_non_tier_d_internal_boundary_rejects_with_exact_noop(self) -> None:
@@ -371,9 +373,9 @@ class JointEditorialMotionOverlayTests(unittest.TestCase):
 
         self.assertEqual(result.applied_pulse_count, 2)
         self.assertEqual(result.applied_segment_indices, (0, 1))
-        self.assertEqual(result.plan.zoom_event_count, 9)
-        self.assertEqual(result.plan.pan_event_count, 4)
-        self.assertEqual(result.plan.roll_event_count, 3)
+        self.assertEqual(result.plan.zoom_event_count, 2)
+        self.assertEqual(result.plan.pan_event_count, 0)
+        self.assertEqual(result.plan.roll_event_count, 0)
         self.assertEqual(result.plan.interior_zoom_pulse_count, 4)
         self.assertEqual(result.to_dict()["applied_zoom_event_count"], 2)
         self.assertEqual(result.to_dict()["applied_pan_event_count"], 0)

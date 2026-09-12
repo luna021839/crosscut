@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from crosscut.joint_boundary_provider import DecodedBoundaryOptionProvider
+from crosscut.group_boundary_grammar_adapter import _validated_transforms
 from crosscut.joint_boundary_provider import (
     BoundaryMaterializationProof,
     JointSelectionMaterializationProof,
@@ -3293,17 +3294,24 @@ class JointVisualCandidateAdapterTests(unittest.TestCase):
                 len(switched_boundaries),
             )
             self.assertEqual(motion.affine_boundary_match_count, 0)
+            transform_evidence = _validated_transforms(
+                plan=item.to_render_plan(output=Path("fixture.mp4")),
+                editorial_motion=motion,
+                eligible_to_request=tuple(range(len(item.candidate_set.sources))),
+                dynamic_crop_version=None,
+                dynamic_crop_motion_v3=None,
+            )
             self.assertEqual(
                 motion.zoom_event_count,
-                len(switched_boundaries),
+                len(transform_evidence.zoom_event_times_seconds),
             )
             self.assertEqual(
                 motion.pan_event_count,
-                int(0 in switched_boundaries),
+                len(transform_evidence.pan_event_times_seconds),
             )
             self.assertEqual(
                 motion.roll_event_count,
-                int(1 in switched_boundaries),
+                len(transform_evidence.roll_event_times_seconds),
             )
             self.assertEqual(
                 motion.accepted_boundary_indices,

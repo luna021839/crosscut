@@ -13,6 +13,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 from .editorial_motion import EditorialMotionPlan
+from .editorial_transform_events import rendered_transform_event_records
 from .professional_montage_grammar import (
     EditorialTransformEvidence,
     IntroducedBoundaryContinuityEvidence,
@@ -1097,77 +1098,7 @@ def _transform_event_records(
     return before any emitted sample produce no event.
     """
 
-    events: list[tuple[float, int]] = []
-    frame_counts = segment_frame_counts(plan)
-    global_frame_start = 0
-    for segment_index, (segment, frame_count) in enumerate(
-        zip(plan.segments, frame_counts, strict=True)
-    ):
-        if segment.editorial_transform is None:
-            global_frame_start += frame_count
-            continue
-        keyframes = _track_keyframe_payload(segment.editorial_transform)
-        sample_times = tuple(
-            frame_index / plan.fps for frame_index in range(frame_count)
-        )
-        sampled_keyframes = tuple(
-            {
-                "time_seconds": local_time,
-                "zoom": evaluated.zoom,
-                "center_x": evaluated.center_x,
-                "center_y": evaluated.center_y,
-                "roll_degrees": evaluated.roll_degrees,
-            }
-            for local_time in sample_times
-            for evaluated in (segment.editorial_transform.evaluate(local_time),)
-        )
-        for keyframe_index, (left, target) in enumerate(
-            zip(keyframes, keyframes[1:]),
-            start=1,
-        ):
-            target_value = _component_value(target, component)
-            left_value = _component_value(left, component)
-            if not _component_active(target, component) or not (
-                _different_component_values(left_value, target_value)
-            ):
-                continue
-            interval_end = (
-                float(keyframes[keyframe_index + 1]["time_seconds"])
-                if keyframe_index + 1 < len(keyframes)
-                else math.inf
-            )
-            left_time = float(left["time_seconds"])
-            for local_frame_index, (local_time, sampled) in enumerate(
-                zip(sample_times, sampled_keyframes, strict=True)
-            ):
-                if local_time <= left_time + _CLOCK_ABS_TOLERANCE:
-                    continue
-                if local_time > interval_end + _CLOCK_ABS_TOLERANCE:
-                    break
-                sampled_value = _component_value(sampled, component)
-                if _component_active(sampled, component) and (
-                    _different_component_values(left_value, sampled_value)
-                ):
-                    events.append(
-                        (
-                            (global_frame_start + local_frame_index) / plan.fps,
-                            segment_index,
-                        )
-                    )
-                    break
-
-        global_frame_start += frame_count
-    ordered: list[tuple[float, int]] = []
-    for value, segment_index in sorted(events):
-        if ordered and math.isclose(
-            value,
-            ordered[-1][0],
-            rel_tol=0.0,
-            abs_tol=_CLOCK_ABS_TOLERANCE,
-        ):
-            continue
-        ordered.append((value, segment_index))
-    return tuple(ordered)
+    return rendered_transform_event_records(plan.segments, plan.fps)[component]
 
 
 def _transform_event_times(plan: RenderPlan, component: str) -> tuple[float, ...]:
@@ -1404,10 +1335,7 @@ def _validated_transforms(
         ) != attached_track_count:
             raise GroupBoundaryGrammarAdapterError("applied transform count mismatch")
 
-    event_records = {
-        component: _transform_event_records(plan, component)
-        for component in ("zoom", "pan", "roll")
-    }
+    event_records = rendered_transform_event_records(plan.segments, plan.fps)
     events = {
         component: tuple(seconds for seconds, _index in records)
         for component, records in event_records.items()

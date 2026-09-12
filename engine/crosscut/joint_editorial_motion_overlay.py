@@ -11,6 +11,7 @@ from .editorial_motion import (
     EditorialMotionPlan,
     EditorialMotionSegment,
 )
+from .editorial_transform_events import rendered_transform_event_records
 from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -502,10 +503,13 @@ def merge_joint_interior_motion_overlay(
             )
             + rejected_group_count
         )
+    events = rendered_transform_event_records(merged_render_segments, output_fps)
     merged_plan = replace(
         provider_plan,
         segments=merged_plan_segments,
-        zoom_event_count=provider_plan.zoom_event_count + applied_count,
+        zoom_event_count=len(events["zoom"]),
+        pan_event_count=len(events["pan"]),
+        roll_event_count=len(events["roll"]),
         interior_zoom_pulse_count=(
             provider_plan.interior_zoom_pulse_count + applied_count
         ),

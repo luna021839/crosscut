@@ -1469,15 +1469,18 @@ def _piecewise_linear_expression(
     return expression
 
 
-def segment_frame_counts(plan: RenderPlan) -> tuple[int, ...]:
-    """Quantize global cut boundaries once so per-cut rounding cannot drift."""
-
+def quantized_segment_frame_counts(
+    segments: Sequence[RenderSegment], fps: float
+) -> tuple[int, ...]:
+    """Shared output clock for rendering and frame-visible motion evidence."""
+    if isinstance(fps, bool) or not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError("output fps must be finite and positive")
     counts: list[int] = []
     cumulative_time = 0.0
     previous_boundary = 0
-    for segment in plan.segments:
+    for segment in segments:
         cumulative_time += segment.duration
-        boundary = int(round(cumulative_time * plan.fps))
+        boundary = int(round(cumulative_time * fps))
         count = boundary - previous_boundary
         if count < 2:
             raise ValueError(
@@ -1485,9 +1488,16 @@ def segment_frame_counts(plan: RenderPlan) -> tuple[int, ...]:
             )
         counts.append(count)
         previous_boundary = boundary
+    return tuple(counts)
+
+
+def segment_frame_counts(plan: RenderPlan) -> tuple[int, ...]:
+    """Quantize global cut boundaries once so per-cut rounding cannot drift."""
+
+    counts = quantized_segment_frame_counts(plan.segments, plan.fps)
     if sum(counts) != plan.output_frame_count:
         raise ValueError("quantized segment frames do not match the output duration")
-    return tuple(counts)
+    return counts
 
 
 def _editorial_transform_filters(

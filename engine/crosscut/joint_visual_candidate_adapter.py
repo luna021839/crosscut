@@ -23,6 +23,7 @@ from typing import Any
 
 from .ive import AspectRatio
 from .editorial_motion import EditorialMotionPlan, EditorialMotionSegment
+from .editorial_transform_events import rendered_transform_event_records
 from .joint_boundary_provider import (
     BoundaryMaterializationProof,
     DecodedBoundaryOptionProvider,
@@ -3080,6 +3081,8 @@ def _transform_effects(
 def _joint_editorial_motion_plan(
     proof_bundle: JointVisualBoundaryProofBundle,
     segments: Sequence[RenderSegment],
+    *,
+    fps: float,
 ) -> EditorialMotionPlan:
     """Expose provider tracks as the sole downstream motion authority."""
 
@@ -3089,9 +3092,6 @@ def _joint_editorial_motion_plan(
         raise ValueError("editorial motion paths and render segments must align")
     accepted: list[int] = []
     natural: list[int] = []
-    zoom_count = 0
-    pan_count = 0
-    roll_count = 0
     for boundary_index, boundary in enumerate(proof_bundle.boundary_proofs):
         outgoing_effects = _transform_effects(boundary.outgoing_transform)
         incoming_effects = _transform_effects(boundary.incoming_transform)
@@ -3105,9 +3105,6 @@ def _joint_editorial_motion_plan(
         )
         if any(effects):
             accepted.append(boundary_index)
-            zoom_count += int(effects[0])
-            pan_count += int(effects[1])
-            roll_count += int(effects[2])
         else:
             natural.append(boundary_index)
     accepted_set = set(accepted)
@@ -3142,12 +3139,13 @@ def _joint_editorial_motion_plan(
                 reasons=tuple(reasons),
             )
         )
+    events = rendered_transform_event_records(render_segments, fps)
     return EditorialMotionPlan(
         segments=tuple(motion_segments),
         boundary_match_count=len(accepted),
-        zoom_event_count=zoom_count,
-        pan_event_count=pan_count,
-        roll_event_count=roll_count,
+        zoom_event_count=len(events["zoom"]),
+        pan_event_count=len(events["pan"]),
+        roll_event_count=len(events["roll"]),
         blocked_dissolve_segment_count=0,
         # The provider proves an exact renderer crop path.  It does not run
         # the separate pixel-feature affine estimator, so reporting these
@@ -3460,6 +3458,7 @@ def _materialize_joint_candidate(
         editorial_motion_plan=_joint_editorial_motion_plan(
             proof_bundle,
             segments,
+            fps=fps,
         ),
         output_fps=fps,
     )
