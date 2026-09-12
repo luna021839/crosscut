@@ -223,6 +223,13 @@ STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT = (
 STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND = (
     "opencv_zoo_mediapipe_pose_2023mar"
 )
+STAGE_EDIT_TEMPORAL_INPUT_MODE = (
+    "source_exact_pose_pair_velocity_and_elapsed_gap_v1"
+)
+# Two raw poses, bounded per-second velocity, interval, two sampling-kind
+# indicators, and an observation bit. These are not legacy schema columns.
+STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION = 184
+STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION = 2
 STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS = frozenset(
     {
         STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT,
@@ -413,12 +420,13 @@ DEFAULT_STAGE_EDIT_SCHEMA = StageEditTokenSchema(
 
 @dataclass(frozen=True, slots=True)
 class StageEditTemporalPoseSidecar:
-    """Source-exact two-sample pose evidence excluded from model tensors.
+    """Source-exact two-sample evidence outside the legacy schema tensors.
 
     The sidecar is serialized and content-hashed with feature snapshots, but
-    it is not named by :class:`StageEditTokenSchema` and is never consumed by
-    ``tensorize_stage_edit_batch``.  This preserves every existing checkpoint
-    dimension and schema fingerprint while allowing post-forward pair audits.
+    it is not named by :class:`StageEditTokenSchema`. Config v3 excludes it;
+    config v4 explicitly derives separate temporal tensors. The serialized
+    ``transformer_tensor_input=False`` remains the immutable legacy-snapshot
+    declaration, not authorization to silently extend an old checkpoint.
     """
 
     embeddings: tuple[tuple[float, ...], tuple[float, ...]]
@@ -671,6 +679,7 @@ class StageEditTransformerConfig:
     cut_logit_mode: str = STAGE_EDIT_CUT_LOGIT_MODE
     transition_authority: str = LEARNED_TRANSITION_AUTHORITY
     dropout: float = 0.0
+    temporal_input_mode: str = "none"
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -688,8 +697,12 @@ class StageEditTransformerConfig:
         )
         if any(int(getattr(self, name)) <= 0 for name in integer_fields):
             raise ValueError("StageEdit model dimensions must be positive")
-        if self.config_version != 3:
+        if self.config_version not in (3, 4):
             raise ValueError(f"unsupported model config {self.config_version}")
+        if (self.config_version, self.temporal_input_mode) not in (
+            (3, "none"), (4, STAGE_EDIT_TEMPORAL_INPUT_MODE)
+        ):
+            raise ValueError("temporal inputs require explicit model config v4")
         if self.source_relation_mode != STAGE_EDIT_SOURCE_RELATION_MODE:
             raise ValueError("unsupported source relational encoder contract")
         if self.cut_logit_mode != STAGE_EDIT_CUT_LOGIT_MODE:
@@ -701,6 +714,18 @@ class StageEditTransformerConfig:
             raise ValueError("dropout must be in [0, 1)")
         if len(self.token_schema_fingerprint) != 64:
             raise ValueError("token schema fingerprint must be SHA-256")
+
+    @property
+    def model_context_input_dimension(self) -> int:
+        return self.context_input_dimension + (
+            STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION if self.config_version == 4 else 0
+        )
+
+    @property
+    def model_source_input_dimension(self) -> int:
+        return self.source_input_dimension + (
+            STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION if self.config_version == 4 else 0
+        )
 
     @classmethod
     def from_schema(
@@ -734,7 +759,11 @@ class StageEditTransformerConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.config_version == 3:
+            # Preserve the exact legacy checkpoint contract fingerprint.
+            payload.pop("temporal_input_mode")
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "StageEditTransformerConfig":
@@ -773,6 +802,25 @@ def production_stage_edit_config(
     )
 
 
+def stage_edit_temporal_input_contract(config: StageEditTransformerConfig) -> dict[str, Any]:
+    """Bind the opt-in train/serve encoder without rewriting old snapshots."""
+    return {
+        "contract": config.temporal_input_mode,
+        "enabled": config.config_version == 4,
+        "model_config_version": config.config_version,
+        "source_dimension": STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION if config.config_version == 4 else 0,
+        "context_dimension": STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION if config.config_version == 4 else 0,
+        "source_layout": "pose0_60,pose1_60,delta_over_dt_plus_abs_delta_60,log1p_interval,current_next,entry_exit,observed",
+        "context_layout": "log1p_previous_token_gap,gap_observed",
+        "first_token_gap": "unknown_in_each_context_window",
+        "absolute_song_time_consumed": False,
+        "future_editorial_decisions_consumed": False,
+        "source_media_lookahead": "exact_sidecar_pair_only_sampling_kind_and_interval_explicit",
+        "missing_pose": "zero_values_observed_bit_zero_no_midpoint_substitution",
+        "legacy_snapshot_content_modified": False,
+    }
+
+
 def stage_edit_source_scoring_contract(
     config: StageEditTransformerConfig,
 ) -> dict[str, Any]:
@@ -788,9 +836,9 @@ def stage_edit_source_scoring_contract(
     unsigned: dict[str, Any] = {
         "contract": STAGE_EDIT_SOURCE_SCORING_CONTRACT,
         "token_schema_fingerprint": config.token_schema_fingerprint,
-        "source_input_dimension": config.source_input_dimension,
+        "source_input_dimension": config.model_source_input_dimension,
         "relational_source_input_dimension": 4
-        * config.source_input_dimension,
+        * config.model_source_input_dimension,
         "source_relation_mode": config.source_relation_mode,
         "maximum_candidate_count": config.max_sources,
         "candidate_representation": [
@@ -809,6 +857,8 @@ def stage_edit_source_scoring_contract(
         "candidate_order_contract": "permutation_equivariant_logits",
         "non_source_head_contract": "candidate_permutation_invariant",
     }
+    if config.config_version == 4:
+        unsigned["temporal_input_contract"] = stage_edit_temporal_input_contract(config)
     encoded = json.dumps(
         unsigned, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -831,7 +881,7 @@ def stage_edit_cut_scoring_contract(
     """
 
     linear_input_dimension = (
-        config.context_input_dimension + 2 * config.source_input_dimension
+        config.model_context_input_dimension + 2 * config.model_source_input_dimension
     )
     unsigned: dict[str, Any] = {
         "contract": STAGE_EDIT_CUT_SCORING_CONTRACT,
@@ -849,6 +899,8 @@ def stage_edit_cut_scoring_contract(
         "transformer_residual_affine_initialization": "exact_zero",
         "candidate_order_contract": "permutation_invariant",
     }
+    if config.config_version == 4:
+        unsigned["temporal_input_contract"] = stage_edit_temporal_input_contract(config)
     encoded = json.dumps(
         unsigned, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -910,8 +962,8 @@ def stage_edit_parameter_count(config: StageEditTransformerConfig) -> int:
         return input_dim * output_dim + (output_dim if bias else 0)
 
     count = 0
-    count += linear(config.context_input_dimension, dim)
-    relational_source_dimension = 4 * config.source_input_dimension
+    count += linear(config.model_context_input_dimension, dim)
+    relational_source_dimension = 4 * config.model_source_input_dimension
     count += linear(relational_source_dimension, dim)
     count += linear(2 * dim, dim)
     count += config.max_sequence_length * dim
@@ -926,7 +978,7 @@ def stage_edit_parameter_count(config: StageEditTransformerConfig) -> int:
     count += linear(dim, dim)  # source key
     count += linear(relational_source_dimension, 1)
     count += linear(
-        config.context_input_dimension + 2 * config.source_input_dimension,
+        config.model_context_input_dimension + 2 * config.model_source_input_dimension,
         1,
     )  # raw-context + hard-gated mean/max linear cut path
     count += linear(dim, 1)  # cut timing
@@ -945,6 +997,9 @@ class StageEditTensorBatch:
     hard_source_gate_mask: Any
     source_ids: tuple[tuple[tuple[str | None, ...], ...], ...]
     sequence_ids: tuple[str, ...]
+    temporal_context_features: Any = None
+    temporal_source_features: Any = None
+    temporal_input_mode: str = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1045,6 +1100,14 @@ def tensorize_stage_edit_batch(
         (batch_size, max_length, config.max_sources), dtype=bool
     )
     hard_gate_mask = np.zeros_like(candidate_mask)
+    temporal_context = np.zeros(
+        (batch_size, max_length, STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION),
+        dtype=np.float32,
+    ) if config.config_version == 4 else None
+    temporal_sources = np.zeros(
+        (batch_size, max_length, config.max_sources, STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION),
+        dtype=np.float32,
+    ) if config.config_version == 4 else None
     ids: list[list[tuple[str | None, ...]]] = []
 
     for batch_index, sequence in enumerate(sequences):
@@ -1056,6 +1119,12 @@ def tensorize_stage_edit_batch(
             timestamp = float(token.master_time_seconds)
             if not math.isfinite(timestamp) or timestamp < previous_time:
                 raise ValueError("master times must be finite and non-decreasing")
+            if temporal_context is not None and time_index > 0:
+                # No absolute song time, future token, or finished-edit history.
+                # A cropped training window has an unknown first-token gap.
+                temporal_context[batch_index, time_index] = (
+                    math.log1p(timestamp - previous_time), 1.0
+                )
             previous_time = timestamp
             if len(token.source_candidates) > config.max_sources:
                 raise ValueError(
@@ -1100,6 +1169,20 @@ def tensorize_stage_edit_batch(
                 hard_gate_mask[batch_index, time_index, source_index] = bool(
                     candidate.available and candidate.hard_gate_passed
                 )
+                if temporal_sources is not None and candidate.temporal_pose_sidecar is not None:
+                    pair = candidate.temporal_pose_sidecar
+                    poses = np.asarray(pair.embeddings, dtype=np.float64)
+                    delta = poses[1] - poses[0]
+                    # delta/(dt+abs(delta)) is bounded velocity without tiny-dt
+                    # overflow. Preserve both raw poses as well as direction.
+                    velocity = delta / (pair.interval_seconds + np.abs(delta))
+                    temporal_sources[batch_index, time_index, source_index] = np.concatenate((
+                        poses.reshape(-1), velocity,
+                        (math.log1p(pair.interval_seconds),
+                         float(pair.sampling_contract == STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT),
+                         float(pair.sampling_contract == STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT),
+                         1.0),
+                    ))
             sequence_ids.append(tuple(slot_ids))
         sequence_ids.extend(
             [tuple([None] * config.max_sources)]
@@ -1117,6 +1200,9 @@ def tensorize_stage_edit_batch(
             hard_source_gate_mask=mx.array(hard_gate_mask),
             source_ids=tuple(tuple(value) for value in ids),
             sequence_ids=tuple(sequence.sequence_id for sequence in sequences),
+            temporal_context_features=(mx.array(temporal_context) if temporal_context is not None else None),
+            temporal_source_features=(mx.array(temporal_sources) if temporal_sources is not None else None),
+            temporal_input_mode=config.temporal_input_mode,
         )
 
 
@@ -1455,8 +1541,8 @@ class StageEditTransformer(_ModuleBase):
         super().__init__()
         self.config = config
         dim = config.model_dimension
-        relational_source_dimension = 4 * config.source_input_dimension
-        self.context_projection = nn.Linear(config.context_input_dimension, dim)
+        relational_source_dimension = 4 * config.model_source_input_dimension
+        self.context_projection = nn.Linear(config.model_context_input_dimension, dim)
         self.source_projection = nn.Linear(relational_source_dimension, dim)
         self.input_fusion = nn.Linear(2 * dim, dim)
         self.position_embedding = nn.Embedding(config.max_sequence_length, dim)
@@ -1473,7 +1559,7 @@ class StageEditTransformer(_ModuleBase):
         self.source_key = nn.Linear(dim, dim)
         self.source_bias = nn.Linear(relational_source_dimension, 1)
         self.cut_linear_baseline = nn.Linear(
-            config.context_input_dimension + 2 * config.source_input_dimension,
+            config.model_context_input_dimension + 2 * config.model_source_input_dimension,
             1,
         )
         self.cut_timing_head = nn.Linear(dim, 1)
@@ -1485,6 +1571,23 @@ class StageEditTransformer(_ModuleBase):
         self.duration_head = nn.Linear(dim, config.duration_bucket_count)
         self.transition_head = nn.Linear(dim, config.transition_count)
         self.crop_head = nn.Linear(dim, 4)
+
+    def _model_inputs(self, batch: StageEditTensorBatch) -> tuple[Any, Any]:
+        if batch.temporal_input_mode != self.config.temporal_input_mode:
+            raise ValueError("batch and model temporal input contracts differ")
+        if self.config.config_version == 3:
+            if batch.temporal_context_features is not None or batch.temporal_source_features is not None:
+                raise ValueError("legacy model cannot consume temporal tensors")
+            return batch.context_features, batch.source_features
+        context, sources = batch.temporal_context_features, batch.temporal_source_features
+        if context is None or sources is None:
+            raise ValueError("temporal model requires explicit temporal tensors")
+        if context.shape != (*batch.context_features.shape[:-1], STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION):
+            raise ValueError("temporal context shape mismatch")
+        if sources.shape != (*batch.source_features.shape[:-1], STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION):
+            raise ValueError("temporal source shape mismatch")
+        return (mx.concatenate((batch.context_features, context), axis=-1),
+                mx.concatenate((batch.source_features, sources), axis=-1))
 
     def _relational_source_features(
         self,
@@ -1500,7 +1603,7 @@ class StageEditTransformer(_ModuleBase):
         All set statistics exclude unavailable or hard-gated candidates.
         """
 
-        raw = batch.source_features
+        _, raw = self._model_inputs(batch)
         weights = effective_mask.astype(raw.dtype)[..., None]
         count = mx.maximum(weights.sum(axis=2), 1.0)
         mean = (raw * weights).sum(axis=2) / count
@@ -1540,7 +1643,8 @@ class StageEditTransformer(_ModuleBase):
         candidate_sum = (source_embeddings * candidate_weights).sum(axis=2)
         denominator = mx.maximum(candidate_weights.sum(axis=2), 1.0)
         pooled_sources = candidate_sum / denominator
-        context = self.context_projection(batch.context_features)
+        context_features, _ = self._model_inputs(batch)
+        context = self.context_projection(context_features)
         hidden = self.input_fusion(mx.concatenate((context, pooled_sources), axis=-1))
         positions = mx.arange(length)
         hidden = hidden + self.position_embedding(positions)[None, :, :]
@@ -1593,7 +1697,7 @@ class StageEditTransformer(_ModuleBase):
     ) -> Any:
         """Return permutation-invariant hard-gated mean/max descriptors."""
 
-        raw = batch.source_features
+        _, raw = self._model_inputs(batch)
         weights = effective_mask.astype(raw.dtype)[..., None]
         count = weights.sum(axis=2)
         mean = (raw * weights).sum(axis=2) / mx.maximum(count, 1.0)
@@ -1615,7 +1719,8 @@ class StageEditTransformer(_ModuleBase):
         """Add a zero-init Transformer residual to the raw linear cut path."""
 
         summary = self._cut_candidate_summary(batch, effective_mask)
-        linear_inputs = mx.concatenate((batch.context_features, summary), axis=-1)
+        context_features, _ = self._model_inputs(batch)
+        linear_inputs = mx.concatenate((context_features, summary), axis=-1)
         baseline = self.cut_linear_baseline(linear_inputs).squeeze(-1)
         residual = self.cut_timing_head(hidden).squeeze(-1)
         return baseline + residual
@@ -3261,6 +3366,10 @@ __all__ = [
     "STAGE_EDIT_POSE_EMBEDDING_FEATURE_NAMES",
     "STAGE_EDIT_IVE_PERFORMER_STATE_FEATURE_NAMES",
     "STAGE_EDIT_TEMPORAL_POSE_PRODUCER_BACKEND",
+    "STAGE_EDIT_TEMPORAL_INPUT_MODE",
+    "STAGE_EDIT_TEMPORAL_SOURCE_DIMENSION",
+    "STAGE_EDIT_TEMPORAL_CONTEXT_DIMENSION",
+    "stage_edit_temporal_input_contract",
     "STAGE_EDIT_TEMPORAL_POSE_SAMPLING_CONTRACTS",
     "STAGE_EDIT_TEMPORAL_POSE_TIMELINE_ENTRY_EXIT_CONTRACT",
     "STAGE_EDIT_TEMPORAL_POSE_VISUAL_CACHE_CURRENT_NEXT_CONTRACT",
