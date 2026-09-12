@@ -29,6 +29,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .stage_edit_training_progress import (
+    training_step_completed, training_epoch_evaluated,
+)
+
 from .stage_edit_dynamic_crop_head_v2 import (
     DYNAMIC_CROP_V2_CHECKPOINT_METADATA_FILENAME,
     DYNAMIC_CROP_V2_CHECKPOINT_WEIGHT_FILENAME,
@@ -3384,6 +3388,11 @@ def train_production_stage_edit(
                     model.parameters(),
                     pretrain_optimizer.state,
                 )
+                training_step_completed(
+                    'cut_pretraining', step=pretrain_step,
+                    optimizer_step=optimizer_steps, loss=float(pretrain_loss.item()),
+                    total_steps=cut_pretrain_steps,
+                )
                 if (
                     pretrain_step == 1
                     or pretrain_step == cut_pretrain_steps
@@ -3492,6 +3501,11 @@ def train_production_stage_edit(
                     gradient_norm,
                     model.parameters(),
                     source_pretrain_optimizer.state,
+                )
+                training_step_completed(
+                    'source_pretraining', step=source_pretrain_step,
+                    optimizer_step=optimizer_steps, loss=float(source_loss.item()),
+                    total_steps=source_pretrain_steps,
                 )
                 source_pretraining_history.append(
                     {
@@ -3748,6 +3762,11 @@ def train_production_stage_edit(
                     *prior_components.values(),
                     prior_adapter.parameters(),
                     prior_optimizer.state,
+                )
+                training_step_completed(
+                    'dynamic_crop_v3_prior', step=prior_step,
+                    optimizer_step=optimizer_steps, loss=float(loss.item()),
+                    total_steps=dynamic_crop_v3_prior_pretrain_steps,
                 )
                 candidate_value_digest = None
                 candidate_head_digest = None
@@ -4495,6 +4514,10 @@ def train_production_stage_edit(
                 optimizer_steps += 1
                 finetune_optimizer_steps += 1
                 mx.eval(loss, gradient_norm, model.parameters(), optimizer.state)
+                training_step_completed(
+                    'joint_finetuning', step=finetune_optimizer_steps,
+                    optimizer_step=optimizer_steps, loss=float(loss.item()), epoch=epoch,
+                )
                 epoch_phase_local_optimizer_steps.append(
                     int(optimizer.state["step"].item())
                 )
@@ -4724,6 +4747,13 @@ def train_production_stage_edit(
                         else None
                     ),
                 }
+            )
+            training_epoch_evaluated(
+                epoch=epoch, optimizer_step=optimizer_steps,
+                training_loss=sum(epoch_losses) / len(epoch_losses),
+                validation_loss=validation_loss,
+                checkpoint_selection_eligible=checkpoint_selection_eligible,
+                validation_improved=bool(improved),
             )
             if improved:
                 assert validation_loss is not None

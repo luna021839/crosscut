@@ -28,6 +28,7 @@ from .professional_montage_policy import (
 )
 from .stage_edit_feature_materializer import StageEditFeatureSnapshot
 from .stage_edit_production_training import train_production_stage_edit
+from .stage_edit_training_progress import configure_training_progress
 from .stage_edit_production_registry import (
     STAGE_EDIT_PRODUCTION_REGISTRY_CONTEXTUAL_BEAM_QA_MANIFEST_CONTRACT,
     _validated_contextual_source_pair_identity,
@@ -527,6 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    configure_training_progress()
     explicit_contract_values = (
         args.model_config_json,
         args.base_loss_contract_json,
