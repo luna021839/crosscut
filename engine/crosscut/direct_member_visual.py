@@ -2607,6 +2607,41 @@ class DirectMemberVisualSelection:
                 "direct member source frame geometry must match source count"
             )
 
+    def obstruction_diagnostics(self) -> dict[str, Any]:
+        """Report selected sparse observations, never an inferred exposure time."""
+        selected = []
+        consecutive = maximum_consecutive = 0
+        for span, source_index in zip(self.span_validity, self.source_indices):
+            review = span.sources[source_index].transient_obstruction_review
+            consecutive = consecutive + 1 if review is not None else 0
+            maximum_consecutive = max(maximum_consecutive, consecutive)
+            if review is not None:
+                selected.append({
+                    "segment_index": span.segment_index,
+                    "source_index": source_index,
+                    "canonical_span_start": span.canonical_master_start,
+                    "canonical_span_end": span.canonical_master_end,
+                    "observation": dict(review),
+                })
+        return {
+            "contract": "selected_sparse_obstruction_observations_v1",
+            "selected_span_count": len(self.source_indices),
+            "selected_tolerated_span_count": len(selected),
+            "selected_tolerated_span_fraction": len(selected) / len(self.source_indices),
+            "maximum_consecutive_tolerated_spans": maximum_consecutive,
+            "selected_selection_penalty": sum(
+                item["observation"]["selection_penalty"] for item in selected
+            ),
+            "sampled_bracket_window_sum_seconds": sum(
+                item["observation"]["sampled_window_seconds"] for item in selected
+            ),
+            "continuous_obstruction_duration_seconds": None,
+            "selected_observations": selected,
+            "measurement_scope": "canonical_content_probes_before_boundary_offset_search",
+            "rendered_output_evaluated": False,
+            "hard_exposure_budget_enforced": False,
+        }
+
     def aggregate_diagnostics(self) -> dict[str, Any]:
         component_names = tuple(
             DirectBoundaryMismatch(
@@ -2659,6 +2694,7 @@ class DirectMemberVisualSelection:
         )
         return {
             "selected_boundary_count": len(self.boundaries),
+            "partial_obstruction": self.obstruction_diagnostics(),
             "selected_cut_count": sum(
                 boundary.cut_applied for boundary in self.boundaries
             ),
@@ -3614,8 +3650,9 @@ def _review_transient_partial_obstruction(
 
     The ordinary six probes do not establish duration. Only an isolated
     interior hit with human evidence is eligible for two additional cheap
-    content probes. Entry/exit occlusion, missing pixels, a fully hidden
-    performer or uncleared flanks remain invalid. No target NN work is added.
+    content probes. Entry/exit occlusion, missing pixels, no human evidence
+    or uncleared flanks remain invalid. Human evidence is not proof that the
+    target, rather than another person, remains visible. No target NN work is added.
     """
     if len(samples) != _DIRECT_CONTENT_SAMPLE_COUNT:
         return None
@@ -3647,6 +3684,7 @@ def _review_transient_partial_obstruction(
         "clear_flank_obstruction_scores": [s.descriptor.foreground_obstruction_score for s in flanks],
         "selection_penalty": .1,
         "continuous_duration_measured": False,
+        "target_visibility_verified": False,
         "target_identity_or_cut_quality_authorized": False,
     }
 

@@ -5060,6 +5060,9 @@ class DirectMemberVisualTests(unittest.TestCase):
         self.assertFalse(audit['target_identity_or_cut_quality_authorized'])
         self.assertIn((0,.4), queries)
         self.assertIn((0,.6), queries)
+        summary = result.to_dict()['aggregate']['partial_obstruction']
+        self.assertEqual(summary['selected_tolerated_span_count'], int(result.source_indices[0] == 0))
+        self.assertIsNone(summary['continuous_obstruction_duration_seconds'])
 
     def test_single_sparse_hit_cannot_disguise_persistent_obstruction(self) -> None:
         spans = tuple((float(i), float(i+1)) for i in range(6))
