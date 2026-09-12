@@ -719,6 +719,9 @@ class RenderSegment:
     # It is expressed as a short smooth ramp and is never used as a second
     # source-global grade.
     boundary_look_track: BoundaryLookTrack | None = None
+    # Separately timed outgoing overlap camera. None preserves legacy final
+    # keyframe hold; explicit tracks start at the source-local segment end.
+    outgoing_overlap_transform: EditorialTransformTrack | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -771,6 +774,10 @@ class RenderSegment:
             > self.duration + 1e-6
         ):
             raise ValueError("group transform keyframes must stay inside the segment")
+        if self.outgoing_overlap_transform is not None and not isinstance(
+            self.outgoing_overlap_transform, EditorialTransformTrack
+        ):
+            raise TypeError("outgoing overlap camera must be an editorial track")
 
     @property
     def effective_source_duration(self) -> float:
@@ -907,6 +914,9 @@ MEMBER_BLUR_BRIDGE_REASON = (
 DIRECT_MEMBER_POSE_DISSOLVE_REASON = (
     "official_target_member_pose_matched_logistic_face_dissolve_v1"
 )
+MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY = (
+    "source_measured_joint_registration_pending_pixel_review_v1"
+)
 MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY = (
     "decoded_hardcut_output_endpoint_match_effect_proxy_revalidation_required_v1"
 )
@@ -968,12 +978,14 @@ class RenderTransition:
         if self.transform_overlap_authority is not None and not (
             self.kind is TransitionKind.FACE_DISSOLVE
             and self.reason == DIRECT_MEMBER_POSE_DISSOLVE_REASON
-            and self.transform_overlap_authority
-            == MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
+            and self.transform_overlap_authority in {
+                MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
+                MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+            }
         ):
             raise ValueError(
-                "transform overlap authority is valid only for a decoded-output "
-                "verified direct-member dissolve"
+                "transform overlap authority is valid only for an explicitly "
+                "reviewed or source-measured direct-member dissolve"
             )
         if self.tier is not None and self.tier not in {"A", "B", "C", "D"}:
             raise ValueError("transition tier must be one of A, B, C, or D")
@@ -1171,6 +1183,31 @@ class RenderPlan:
                 "member cinematic bridge requires complete request metadata"
             )
         counts = segment_frame_counts(self)
+        for index, segment in enumerate(self.segments):
+            handle = segment.outgoing_overlap_transform
+            if handle is None:
+                continue
+            if index >= len(self.transitions) or not self.transitions[index].kind.uses_overlap:
+                raise ValueError("outgoing camera handle needs an overlap transition")
+            transition = self.transitions[index]
+            if transition.transform_overlap_authority not in {
+                MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
+                MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+            }:
+                raise ValueError("outgoing camera handle needs explicit registration authority")
+            if (handle.keyframes[0].time_seconds != 0.0 or
+                handle.final_keyframe.time_seconds > transition.frame_count/self.fps+1e-7 or
+                handle.final_keyframe.time_seconds < (transition.frame_count-1)/self.fps-1e-7):
+                raise ValueError("outgoing camera handle must cover exactly its output frames")
+            if segment.editorial_transform is None:
+                raise ValueError("outgoing camera handle needs a continuous nominal camera")
+            before=segment.editorial_transform.final_keyframe
+            after=handle.keyframes[0]
+            if any(abs(getattr(before,name)-getattr(after,name))>1e-7
+                   for name in ('zoom','center_x','center_y','roll_degrees')):
+                raise ValueError("outgoing camera handle cannot reset the nominal camera")
+            for frame in range(transition.frame_count):
+                handle.evaluate(frame/self.fps)
         for segment, frame_count in zip(self.segments, counts, strict=True):
             if segment.editorial_transform is None:
                 continue
@@ -1182,6 +1219,11 @@ class RenderPlan:
                         "editorial transform is unsafe at an output-frame timestamp"
                     ) from exc
         for index, transition in enumerate(self.transitions):
+            if transition.transform_overlap_authority == MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY and (
+                self.segments[index].outgoing_overlap_transform is None
+                or self.segments[index+1].editorial_transform is None
+            ):
+                raise ValueError("joint registration needs both explicit overlap cameras")
             left_boundary_look = self.segments[index].boundary_look_track
             right_boundary_look = self.segments[index + 1].boundary_look_track
             left_endpoint_identity = (
@@ -1243,8 +1285,10 @@ class RenderPlan:
                     overlap_frame_count=transition.frame_count,
                     fps=self.fps,
                 )
-                and transition.transform_overlap_authority
-                != MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY
+                and transition.transform_overlap_authority not in {
+                    MEMBER_OUTPUT_VERIFIED_TRANSFORM_OVERLAP_AUTHORITY,
+                    MEMBER_SOURCE_MEASURED_JOINT_OVERLAP_AUTHORITY,
+                }
             ):
                 raise ValueError(
                     "overlap transition cannot use an unreviewed editorial transform"
@@ -1312,6 +1356,8 @@ class RenderPlan:
         serialized_segments: list[dict[str, object]] = []
         for segment in self.segments:
             payload = asdict(segment)
+            if segment.outgoing_overlap_transform is None:
+                payload.pop("outgoing_overlap_transform", None)
             serialized_look = payload.get("look_adjustment")
             if (
                 isinstance(serialized_look, dict)
@@ -1903,7 +1949,9 @@ def _dissolve_handle_video_chain(
         crop_width, crop_height = track.fixed_crop_size
         _time, left, top = track.fixed_crop_positions()[-1]
         handle_crop = NormalizedCrop(left, top, crop_width, crop_height)
-    if segment.editorial_transform is not None:
+    if segment.outgoing_overlap_transform is not None:
+        handle_editorial_transform = segment.outgoing_overlap_transform
+    elif segment.editorial_transform is not None:
         final = segment.editorial_transform.final_keyframe
         handle_editorial_transform = EditorialTransformTrack(
             (
