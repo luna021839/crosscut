@@ -4935,6 +4935,16 @@ class _VideoSampler:
         self.descriptor_locator_cache: OrderedDict[
             DescriptorRequestLocator, FrameVisualDescriptor | None
         ] = OrderedDict()
+        # Distinct exact/VFR requests may decode the same image. Keep their
+        # clocks and persistent locators distinct, but infer numeric features
+        # once per identical primary/following pixel pair and analysis options.
+        # This LRU holds immutable descriptors and hashes, never frame pixels.
+        self.descriptor_content_cache: OrderedDict[
+            tuple[str, str | None, bool, bool], FrameVisualDescriptor
+        ] = OrderedDict()
+        self.descriptor_content_cache_hit_count = 0
+        self.descriptor_content_cache_miss_count = 0
+        self.describe_frame_call_count = 0
         self.sface_cache: OrderedDict[
             CanonicalFrameIdentity, tuple[float, ...]
         ] = OrderedDict()
@@ -5140,8 +5150,21 @@ class _VideoSampler:
         if request in self.descriptor_cache:
             self.descriptor_cache.move_to_end(request)
             return self.descriptor_cache[request]
-        descriptor: FrameVisualDescriptor | None = None
-        if persistent is not None:
+        content_key = (
+            request.primary_working_frame_sha256,
+            request.following_working_frame_sha256,
+            include_subject_geometry,
+            include_formation_pose,
+        )
+        descriptor = self.descriptor_content_cache.get(content_key)
+        content_hit = descriptor is not None
+        computed = False
+        if content_hit:
+            self.descriptor_content_cache_hit_count += 1
+            self.descriptor_content_cache.move_to_end(content_key)
+        else:
+            self.descriptor_content_cache_miss_count += 1
+        if descriptor is None and persistent is not None:
             try:
                 cached = persistent.get(request)
             except PersistentVisualFeatureCacheIOError as exc:
@@ -5167,23 +5190,32 @@ class _VideoSampler:
                 describe_arguments["include_subject_geometry"] = False
             if include_formation_pose:
                 describe_arguments["include_formation_pose"] = True
+            self.describe_frame_call_count += 1
             descriptor = describe_frame(frame, **describe_arguments)
-            if persistent is not None and _descriptor_matches_analyzer_runtime(
+            computed = True
+        if (
+            persistent is not None
+            and (computed or content_hit)
+            and _descriptor_matches_analyzer_runtime(
                 descriptor,
                 analyzer=persistent.analyzer,
                 include_subject_geometry=include_subject_geometry,
-            ):
-                try:
-                    persistent.put(
-                        request,
-                        _descriptor_cache_payload(descriptor),
-                    )
-                except PersistentVisualFeatureCacheIOError as exc:
-                    self._handle_persistent_feature_cache_io_error(exc)
-                except (OSError, TypeError, ValueError):
-                    # A cache write can never make a freshly computed
-                    # descriptor unusable for the current analysis.
-                    pass
+            )
+        ):
+            try:
+                # Content reuse still writes the new exact request identity,
+                # so a later process can use its decode-free locator directly.
+                persistent.put(request, _descriptor_cache_payload(descriptor))
+            except PersistentVisualFeatureCacheIOError as exc:
+                self._handle_persistent_feature_cache_io_error(exc)
+            except (OSError, TypeError, ValueError):
+                # A cache write can never make a freshly computed
+                # descriptor unusable for the current analysis.
+                pass
+        self.descriptor_content_cache[content_key] = descriptor
+        self.descriptor_content_cache.move_to_end(content_key)
+        while len(self.descriptor_content_cache) > 128:
+            self.descriptor_content_cache.popitem(last=False)
         self.descriptor_cache[request] = descriptor
         while len(self.descriptor_cache) > 64:
             self.descriptor_cache.popitem(last=False)
@@ -5250,6 +5282,7 @@ class _VideoSampler:
         self.frame_digest_cache.clear()
         self.descriptor_cache.clear()
         self.descriptor_locator_cache.clear()
+        self.descriptor_content_cache.clear()
         # SFace appearance vectors are RAM-only and explicitly dropped as soon
         # as the sampler closes; they never enter PersistentVisualFeatureCache.
         self.sface_cache.clear()
@@ -5274,6 +5307,16 @@ class _VideoSampler:
                 self._persistent_feature_cache_runtime_failure_count
             ),
             "source_frame_decode_count": self.frame_decode_count,
+            "describe_frame_call_count": self.describe_frame_call_count,
+            "descriptor_content_cache_hit_count": (
+                self.descriptor_content_cache_hit_count
+            ),
+            "descriptor_content_cache_miss_count": (
+                self.descriptor_content_cache_miss_count
+            ),
+            "descriptor_content_cache_entry_count": (
+                len(self.descriptor_content_cache)
+            ),
             "decode_free_hit_count": 0,
             "decode_free_legacy_hit_count": 0,
             "local_paths_exposed": False,

@@ -59,7 +59,7 @@ _AUDITED_CURRENT_ANALYZER_DIGEST = (
     "072871c33ea2610cd30f4210b7cc80a35e418ca7c563a4c10ce39ca2e5b52173"
 )
 _AUDITED_ACTIVE_ANALYZER_DIGEST = (
-    "76f6b6eb0f9b6356c29950f4952613932644c999259e4139d9b34adfa2e2e692"
+    "14664ec334ef15c192a496aae269c927d0e11289f882e94217e0632a31a0afde"
 )
 _AUDITED_LEGACY_DESCRIPTOR_DIGEST = (
     "245edba6559b94d4855f676c3edc957994137fc42d2d2da0e3e0eb9f752a61c0"
@@ -80,7 +80,7 @@ _AUDITED_CURRENT_DESCRIPTOR_DIGEST = (
     "512bf2d767f5ca035f986f0e4e7b4693bb93e5aff828308537e0d8d795204c1e"
 )
 _AUDITED_ACTIVE_DESCRIPTOR_DIGEST = (
-    "e0429bd3e1f6f54d1a82a535953950f7f12fd0c426a266b42fdd619985076319"
+    "3cdd076cf6c0f001f6d6de4d7228d85d259248e1bddb687c7173690f5bab7d39"
 )
 
 
@@ -547,6 +547,46 @@ class VisualFeatureCacheTests(unittest.TestCase):
 
             self.assertIsNone(warm.get_by_locator(request.locator))
             self.assertEqual(warm.diagnostics()["decode_free_legacy_hit_count"], 0)
+
+    def test_content_reuse_migration_keeps_exact_previous_v2_records(self) -> None:
+        components = _audited_active_analyzer_components()
+        components["code_sha256"]["visual_score_descriptor_ast_v1"] = (
+            "fe78347f24e895c2cc0ce57e7490706c46b9dd9ae08a3c87871a120838121ebd"
+        )
+        previous = _analyzer_from_components(components)
+        active = _analyzer_from_components(_audited_active_analyzer_components())
+        self.assertEqual(previous.digest, "0bb5d3e1ae287ec7b59697727580b219dae5b857f6a0a25d8a55db5d59ec9921")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content-v2")
+            request = _request()
+            cold = PersistentVisualFeatureCache(source_cache_directory=root / "cache", source_path=source, analyzer=previous)
+            self.assertTrue(cold.put(request, {"value": 1.0}))
+            warm = PersistentVisualFeatureCache(source_cache_directory=root / "cache", source_path=source, analyzer=active)
+            self.assertEqual(warm.get_by_locator(request.locator), {"value": 1.0})
+            self.assertEqual(warm.diagnostics()["decode_free_legacy_hit_count"], 1)
+
+    def test_content_hit_persists_each_exact_locator_for_decode_free_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source-content")
+            with patch("crosscut.visual_score.cv2.VideoCapture", side_effect=lambda path: _FakeCapture(path)), patch(
+                "crosscut.visual_score._visual_analyzer_fingerprint", return_value=_analyzer()
+            ), patch("crosscut.visual_score.describe_frame", return_value=_descriptor()) as describe:
+                cold = _VideoSampler(source, feature_cache_directory=root / "cache")
+                first = cold.feature_descriptor_at(1.0)
+                second = cold.feature_descriptor_at(1.001)
+                self.assertEqual(cold.describe_frame_call_count, 1)
+                self.assertEqual(cold.persistent_feature_cache_diagnostics()["write_count"], 2)
+                cold.close()
+                warm = _VideoSampler(source, feature_cache_directory=root / "cache")
+                self.assertEqual(warm.feature_descriptor_at(1.0), first)
+                self.assertEqual(warm.feature_descriptor_at(1.001), second)
+                self.assertEqual(warm.frame_decode_count, 0)
+                warm.close()
+            self.assertEqual(describe.call_count, 1)
 
     def test_symbol_dependency_fingerprint_binds_helper_body_and_constant(
         self,

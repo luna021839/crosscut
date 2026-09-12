@@ -145,6 +145,23 @@ _DECODE_EQUIVALENT_ANALYZER_MIGRATIONS: Mapping[
     str,
     tuple[_DecodeEquivalentAnalyzerMigration, ...],
 ] = {
+    # Exact-pixel request coalescing leaves describe_frame and its numeric
+    # output unchanged (96 real half-frame requests compared byte-for-byte).
+    # Do not bridge the earlier framing/schema changes: only this predecessor.
+    "14664ec334ef15c192a496aae269c927d0e11289f882e94217e0632a31a0afde": (
+        _DecodeEquivalentAnalyzerMigration(
+            legacy_analyzer_digest=(
+                "0bb5d3e1ae287ec7b59697727580b219dae5b857f6a0a25d8a55db5d59ec9921"
+            ),
+            descriptor_component_name="visual_score_descriptor_ast_v1",
+            legacy_descriptor_digest=(
+                "fe78347f24e895c2cc0ce57e7490706c46b9dd9ae08a3c87871a120838121ebd"
+            ),
+            current_descriptor_digest=(
+                "3cdd076cf6c0f001f6d6de4d7228d85d259248e1bddb687c7173690f5bab7d39"
+            ),
+        ),
+    ),
     "072871c33ea2610cd30f4210b7cc80a35e418ca7c563a4c10ce39ca2e5b52173": (
         _DecodeEquivalentAnalyzerMigration(
             legacy_analyzer_digest=(
