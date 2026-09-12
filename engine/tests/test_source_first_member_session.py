@@ -25,7 +25,7 @@ class SharedMemberSessionTests(unittest.TestCase):
              patch('crosscut.source_first_member_session._VideoDescriptorProvider',side_effect=OSError('SSD')):
             assets.return_value=SimpleNamespace(body_model_path=Path('body'),pose_model_path=Path('pose'))
             with self.assertRaises(OSError):open_source_first_member_session((),feature_cache_directory=Path('external'))
-            focal.return_value.close.assert_called_once()
+            focal.return_value._source_first_unresolved_memo.original_close.assert_called_once()
 
     def test_missing_explicit_cache_never_creates_home_fallback(self):
         with patch('crosscut.source_first_member_session.ensure_source_first_model_assets') as assets:
