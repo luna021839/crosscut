@@ -332,8 +332,11 @@ from .lazy_splice_feasibility_graph import (
 )
 from .joint_boundary_provider import (
     DecodedBoundaryOptionProvider,
-    ProgressDecodedBoundaryOptionProvider,
 )
+from .joint_observation_reuse import (
+    JointObservationBank, ReusingDecodedBoundaryOptionProvider,
+)
+from .decoded_proxy_diagnostic import FailedProxyDiagnosticStore
 from .joint_runtime_progress import (
     JointSelectionRuntime,
     joint_candidate_terminal_payload,
@@ -22861,6 +22864,7 @@ def _review_complete_group_candidates(
     candidates: Sequence[_GroupRenderCandidateBundle],
     *,
     scratch_directory: Path,
+    diagnostic_sink: FailedProxyDiagnosticStore | None = None,
     maximum_review_count: int = 8,
     minimum_required_candidate_count: int = 8,
     perform_final_candidate_ranking: bool = True,
@@ -22988,6 +22992,7 @@ def _review_complete_group_candidates(
     return review_rendered_candidates(
         rendered,
         scratch_directory=Path(scratch_directory),
+        diagnostic_sink=diagnostic_sink,
         maximum_review_count=maximum_review_count,
         minimum_required_candidate_count=minimum_required_candidate_count,
         render_review=render_review,
@@ -27403,6 +27408,9 @@ def analyze(
     timeline_interchange_paths: tuple[Path, ...] = ()
     timestamp = datetime.now(UTC)
     base_filename = f"IVE-{_safe_slug(request.song)}-{timestamp.strftime('%Y%m%d-%H%M%S')}"
+    failed_proxy_diagnostics = FailedProxyDiagnosticStore(
+        request.output_directory / "decoded-review-diagnostics"
+    )
     group_ready = len(eligible_indices) >= 2 and rhythm_analysis is not None
     if (
         stage_edit_generation_preflight is not None
@@ -27869,6 +27877,7 @@ def analyze(
                 None
             )
             boundary_descriptor_cache = BoundaryDescriptorCache()
+            joint_observation_bank = JointObservationBank()
             if (
                 request.source_mode is SourceMode.AUTOMATIC
                 and review_rendered_proxies
@@ -28124,7 +28133,8 @@ def analyze(
                         tuple[JointMaterializedVisualCandidate, ...],
                     ]:
                         def provider_factory() -> DecodedBoundaryOptionProvider:
-                            return ProgressDecodedBoundaryOptionProvider(
+                            return ReusingDecodedBoundaryOptionProvider(
+                                observation_bank=joint_observation_bank,
                                 sources=tuple(
                                     request.sources[index]
                                     for index in eligible_indices
@@ -29751,6 +29761,7 @@ def analyze(
                     single_selection = _review_complete_group_candidates(
                         (bundle,),
                         scratch_directory=request.output_directory,
+                        diagnostic_sink=failed_proxy_diagnostics,
                         maximum_review_count=1,
                         minimum_required_candidate_count=1,
                         perform_final_candidate_ranking=False,

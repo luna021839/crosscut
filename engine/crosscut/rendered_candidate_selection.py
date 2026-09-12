@@ -1,6 +1,7 @@
 """Sequentially render and rank multiple complete edit candidates.
 
-Only one 480p proxy exists at a time.  This is both a storage guarantee and a
+Only one working 480p proxy exists at a time. An optional diagnostic sink may
+retain one completed failed proxy separately. This is a storage guarantee and a
 correctness boundary: the ranking consumes decoded production-render output,
 not timeline metadata.  Candidate payloads stay in memory so the selected
 timeline and all of its derived plans can be committed atomically by the
@@ -1116,6 +1117,7 @@ def review_rendered_candidates(
     maximum_review_count: int = 8,
     minimum_required_candidate_count: int = 8,
     render_review: RenderReviewFunction = render_and_review_proxy,
+    diagnostic_sink: Callable[[Path, RenderPlan, Mapping[str, Any]], Mapping[str, Any]] | None = None,
     progress_callback: Callable[[int, int, int], None] | None = None,
     professional_reference_profile: ProfessionalReferenceProfile | None = None,
     professional_reference_cadence_profile: (
@@ -1161,6 +1163,7 @@ def review_rendered_candidates(
                 candidate,
                 scratch_directory=scratch_directory,
                 render_review=render_review,
+                diagnostic_sink=diagnostic_sink,
             )
         )
     return select_rendered_candidate_reviews(
@@ -1180,6 +1183,7 @@ def render_one_candidate_review(
     *,
     scratch_directory: Path,
     render_review: RenderReviewFunction = render_and_review_proxy,
+    diagnostic_sink: Callable[[Path, RenderPlan, Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> RenderedCandidateReview:
     """Render and decode-review exactly one candidate with bounded storage."""
 
@@ -1206,6 +1210,17 @@ def render_one_candidate_review(
                 proxy_path,
             )
             payload = deepcopy(review.payload)
+            if diagnostic_sink is not None:
+                try:
+                    payload["diagnostic_retention"] = dict(
+                        diagnostic_sink(proxy_path, candidate.render_plan, payload)
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    # Retention failure cannot replace the actual QA verdict.
+                    payload["diagnostic_retention"] = {
+                        "retained": False, "error": f"{type(exc).__name__}: {exc}",
+                        "final_media_authority": False,
+                    }
             proxy = payload.get("proxy")
             if isinstance(proxy, dict):
                 proxy["path"] = None

@@ -54,6 +54,7 @@ class JointSelectionRuntime:
         self._started = clock()
 
     def snapshot(self) -> dict[str, Any]:
+        bank = getattr(self.provider, "_observation_bank", None)
         return {
             "contract": "joint_selection_runtime_v1",
             "batch_index": self.batch_index,
@@ -67,6 +68,7 @@ class JointSelectionRuntime:
                 for label, name in _PERSISTENT_COUNTERS.items()
             },
             "final_media_authority": False,
+            "observation_reuse": bank.diagnostics() if bank is not None else None,
         }
 
 
