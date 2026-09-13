@@ -9855,6 +9855,8 @@ def _direct_member_dense_render_feedback_binding(
             path.name: source_content_sha256(path)
             for path in (
                 Path(__file__).with_name("direct_member_visual.py"),
+                Path(__file__).with_name("member_bridge_contract.py"),
+                Path(__file__).with_name("direct_member_transition.py"),
                 Path(__file__).with_name(
                     "direct_member_editorial_motion.py"
                 ),

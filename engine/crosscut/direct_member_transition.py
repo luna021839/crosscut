@@ -24,6 +24,7 @@ from .direct_member_visual import (
     DirectMemberVisualSelection, DirectMemberCinematicBridge,
     FOCAL_POSE_MOTION_BRIDGE_BASIS,
     verified_focal_pose_motion_bridge,
+    verified_focal_pose_dissolve_spacing,
 )
 from .focal_selector_geometry import (
     FocalSelectorGeometry, FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_BODY_BASIS,
@@ -33,6 +34,9 @@ from .member_bridge_contract import (
     MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY,
     RequiredMemberBridgeAuthoringError,
     member_bridge_handle_quality_failures,
+    required_member_bridge_spacing_seconds,
+    MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS,
+    MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
 )
 from .render import (
     DIRECT_MEMBER_POSE_DISSOLVE_REASON,
@@ -73,7 +77,7 @@ _POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH = 0.34
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_SILHOUETTE_MISMATCH = 0.48
 _NONPRIORITY_CINEMATIC_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.52
-_CINEMATIC_BRIDGE_MINIMUM_EVENT_SPACING_SECONDS = 3.0
+_CINEMATIC_BRIDGE_MINIMUM_EVENT_SPACING_SECONDS = MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +90,7 @@ class DirectMemberPoseDissolveConfig:
     target_dissolves_per_minute: float = 5.2
     maximum_boundary_fraction: float = 0.36
     minimum_boundary_gap: int = 1
-    minimum_event_spacing_seconds: float = 1.60
+    minimum_event_spacing_seconds: float = MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS
     minimum_endpoint_evidence_component_count: int = 3
     minimum_endpoint_shape_component_count: int = 2
     minimum_motion_endpoint_component_count: int = 2
@@ -211,6 +215,13 @@ class DirectMemberPoseDissolveConfig:
             "maximum_boundary_fraction": self.maximum_boundary_fraction,
             "minimum_boundary_gap": self.minimum_boundary_gap,
             "minimum_event_spacing_seconds": self.minimum_event_spacing_seconds,
+            "required_bridge_spacing": {
+                "generic_minimum_seconds": MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS,
+                "verified_focal_pose_minimum_seconds": required_member_bridge_spacing_seconds(
+                    True, True, pose_minimum_seconds=self.minimum_event_spacing_seconds),
+                "both_events_require_source_focal_articulation": True,
+                "exact_materialized_cut_times_checked": True,
+            },
             "minimum_endpoint_evidence_component_count": (
                 self.minimum_endpoint_evidence_component_count
             ),
@@ -596,6 +607,7 @@ class _RequiredCinematicBridgeCandidate:
     required_outgoing_handle_seconds: float
     incoming_segment_frame_count: int
     transition_frame_count: int
+    verified_focal_articulation: bool = False
 
 
 def _finite_float(value: Any) -> float | None:
@@ -1967,6 +1979,7 @@ def _required_cinematic_bridge_candidate(
             boundary_index=boundary_index,
             canonical_master_seconds=canonical_master,
             style=str(style),
+            verified_focal_articulation=verified_focal_pose_dissolve_spacing(mismatch),
             transition_kind=transition_kind,
             transition_reason=transition_reason,
             highlight_priority=highlight_priority,
@@ -2216,7 +2229,9 @@ def build_direct_member_pose_dissolve_plan(
         if (
             current.canonical_master_seconds
             - previous.canonical_master_seconds
-            < _CINEMATIC_BRIDGE_MINIMUM_EVENT_SPACING_SECONDS - 1e-9
+            < required_member_bridge_spacing_seconds(
+                previous.verified_focal_articulation, current.verified_focal_articulation,
+                pose_minimum_seconds=settings.minimum_event_spacing_seconds) - 1e-9
         ):
             required_bridge_failures[current.boundary_index] = (
                 "cinematic_bridge_required_event_spacing_too_short",

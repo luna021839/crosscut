@@ -28,7 +28,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 import cv2
 
-from .member_bridge_contract import member_bridge_handle_quality_failures
+from .member_bridge_contract import (
+    member_bridge_handle_quality_failures, required_member_bridge_spacing_seconds,
+    MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS,
+    MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
+)
 from .focal_selector_geometry import (
     FOCAL_SELECTOR_FACE_BASIS, FOCAL_SELECTOR_POSE_BASIS, FOCAL_SELECTOR_BODY_BASIS,
     FOCAL_MEMBER_MINIMUM_SUBJECT_VISIBLE_FRACTION,
@@ -98,7 +102,7 @@ _DIRECT_MEMBER_PORTRAIT_BRIDGE_MAXIMUM_BASE_MISMATCH = 0.56
 _DIRECT_MEMBER_PORTRAIT_BRIDGE_MINIMUM_BUDGET = 4
 _DIRECT_MEMBER_PORTRAIT_BRIDGE_SECONDS_PER_BUDGET = 10.0
 _DIRECT_MEMBER_LANDSCAPE_BRIDGE_BUDGET_PER_SOURCE = 2
-_DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS = 3.0
+_DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS = MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_COST_PENALTY = 8.0
 _DIRECT_MEMBER_CINEMATIC_BRIDGE_NONPRIORITY_COST_PENALTY = 4.0
 _DIRECT_MEMBER_NONPRIORITY_BRIDGE_MAXIMUM_POSE_MISMATCH = 0.22
@@ -1452,6 +1456,17 @@ def verified_focal_pose_motion_bridge(motion: DirectBoundaryMotionEvidence | Non
         and values[3] <= _DIRECT_MEMBER_POSE_DISSOLVE_BRIDGE_MAXIMUM_PHASE_MISMATCH + 1e-9)
 
 
+def verified_focal_pose_dissolve_spacing(mismatch: DirectBoundaryMismatch) -> bool:
+    """Only articulated, source-focal dissolves may use ordinary dissolve cadence."""
+    bridge = getattr(mismatch, "cinematic_bridge", None)
+    motion = getattr(mismatch, "motion_connection", None)
+    return bool(bridge is not None and getattr(bridge, "style", None) == "pose_dissolve"
+        and getattr(bridge, "evidence_basis", None) == FOCAL_POSE_MOTION_BRIDGE_BASIS
+        and isinstance(motion, DirectBoundaryMotionEvidence)
+        and motion.motion_basis == "focal_common_joint_articulation_v1"
+        and verified_focal_pose_motion_bridge(motion))
+
+
 def _cinematic_bridge_from_verified_evidence(
     *,
     severe_flags: Sequence[str],
@@ -1979,6 +1994,26 @@ def _joint_boundary_search_assignment(
             )
         variables_by_boundary.append(indices)
 
+    # A local offset can turn a nominally separated pair into an unrenderable
+    # one. Constrain actual selected clocks here, before handle/dense/render
+    # work, for single-state, greedy, fallback and MILP routes alike.
+    spacing_conflicts = []
+    effect_states = sorted(((i, b, c, m) for i, (b, _, c, m) in enumerate(flat)
+                            if m.cinematic_bridge is not None),
+                           key=lambda value: value[2].cut_master_seconds)
+    for index, (left_var, left_boundary, left_candidate, left_mismatch) in enumerate(effect_states):
+        for right_var, right_boundary, right_candidate, right_mismatch in effect_states[index + 1:]:
+            separation = right_candidate.cut_master_seconds - left_candidate.cut_master_seconds
+            if separation >= MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS - 1e-9:
+                break
+            if left_boundary == right_boundary:
+                continue
+            minimum = required_member_bridge_spacing_seconds(
+                verified_focal_pose_dissolve_spacing(left_mismatch),
+                verified_focal_pose_dissolve_spacing(right_mismatch))
+            if separation < minimum - 1e-9:
+                spacing_conflicts.append((left_var, right_var))
+
     base_durations = tuple(float(end) - float(start) for start, end in spans)
     base_source_durations = tuple(
         sum(
@@ -1998,6 +2033,7 @@ def _joint_boundary_search_assignment(
             "source_duration_minimums_seconds": list(source_duration_minimums),
             "source_duration_maximums_seconds": list(source_duration_maximums),
             "maximum_same_source_run_seconds": maximum_same_source_run_seconds,
+            "required_effect_spacing_conflict_count": len(spacing_conflicts),
             "admissible_states_by_boundary": [
                 [
                     {
@@ -2019,6 +2055,13 @@ def _joint_boundary_search_assignment(
             tuple[_DirectBoundarySearchCandidate, DirectBoundaryMismatch]
         ],
     ) -> bool:
+        events = [(candidate.cut_master_seconds, mismatch) for candidate, mismatch in selected
+                  if mismatch.cinematic_bridge is not None]
+        if any(right_time - left_time < required_member_bridge_spacing_seconds(
+                verified_focal_pose_dissolve_spacing(left),
+                verified_focal_pose_dissolve_spacing(right)) - 1e-9
+                for (left_time, left), (right_time, right) in zip(events, events[1:])):
+            return False
         durations = _boundary_adjusted_span_durations(
             spans,
             tuple(item[0] for item in selected),
@@ -2155,6 +2198,8 @@ def _joint_boundary_search_assignment(
                         1.0,
                         1.0,
                     )
+                for left_var, right_var in spacing_conflicts:
+                    add_constraint(((left_var, 1.), (right_var, 1.)), 0., 1.)
                 for source_index in range(source_count):
                     terms = []
                     for variable, (
@@ -2330,6 +2375,8 @@ def _joint_boundary_search_assignment(
                 default=0,
             ),
             "duration_constraints_jointly_enforced": True,
+            "required_effect_spacing_jointly_enforced": True,
+            "required_effect_spacing_conflict_count": len(spacing_conflicts),
             "same_source_run_constraints_jointly_enforced": True,
             "maximum_same_source_run_seconds": (
                 maximum_same_source_run_seconds
@@ -9237,6 +9284,8 @@ def _heterogeneous_cinematic_visual_path(
             "minimum_bridge_separation_seconds": (
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
             ),
+            "verified_focal_pose_dissolve_minimum_seconds": MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
+            "exact_local_cut_spacing_revalidation_required": True,
         },
         "all_sources_minimum_usage_preserved": not flexible_subset_usage,
         "short_proof_all_source_single_span_minimum_applied": (
@@ -10061,12 +10110,20 @@ def _heterogeneous_cinematic_visual_path(
                 for boundary_index in (left_boundary, right_boundary)
                 for edge_index in bridge_edges_by_boundary[boundary_index]
             )
-            add_constraint(
-                pair,
-                0.0,
-                1.0,
-                family="bridge_spacing",
-            )
+            if separation_seconds < MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS - 1e-9:
+                add_constraint(pair, 0.0, 1.0, family="bridge_spacing")
+            else:
+                # A short shared shot can join two verified pose dissolves.
+                # Any blur/zoom/legacy or unverified event retains 3 seconds.
+                for restricted, other in ((left_boundary, right_boundary), (right_boundary, left_boundary)):
+                    generic = tuple((edge_base + edge_index, 1.0)
+                        for edge_index in bridge_edges_by_boundary[restricted]
+                        if not verified_focal_pose_dissolve_spacing(
+                            matrices[restricted][edge_specs[edge_index][1]][edge_specs[edge_index][2]]))
+                    if generic:
+                        add_constraint(generic + tuple((edge_base + edge_index, 1.0)
+                            for edge_index in bridge_edges_by_boundary[other]),
+                            0.0, 1.0, family="bridge_spacing")
 
     matrix = coo_array(
         (
@@ -10858,7 +10915,9 @@ def _heterogeneous_cinematic_visual_path(
         boundary_master_offsets[right]
         - boundary_master_offsets[left]
         + 1e-9
-        < _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
+        < required_member_bridge_spacing_seconds(
+            verified_focal_pose_dissolve_spacing(matrices[left][path[left]][path[left + 1]]),
+            verified_focal_pose_dissolve_spacing(matrices[right][path[right]][path[right + 1]]))
         for left, right in zip(bridge_indices, bridge_indices[1:])
     ):
         audit_failures.append("cinematic_bridge_spacing_missed")
@@ -11039,6 +11098,8 @@ def _heterogeneous_cinematic_visual_path(
             "minimum_cinematic_bridge_separation_seconds": (
                 _DIRECT_MEMBER_CINEMATIC_BRIDGE_MINIMUM_SECONDS
             ),
+            "verified_focal_pose_dissolve_minimum_seconds": MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
+            "exact_local_cut_spacing_revalidation_required": True,
             "cinematic_bridge_hard_cut_authorized": False,
             "required_transition_effect": require_cinematic_bridge,
             "all_sources_used": all(count > 0 for count in counts),

@@ -12,6 +12,24 @@ from typing import Mapping, Sequence
 
 
 MINIMUM_MEMBER_BRIDGE_HANDLE_QUALITY = 0.68
+MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS = 3.0
+# The established ordinary pose-dissolve cadence, not a new generic effect
+# allowance. Both events must have independently verified focal articulation.
+MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS = 1.60
+
+
+def required_member_bridge_spacing_seconds(
+    left_verified_focal_pose: bool, right_verified_focal_pose: bool, *,
+    pose_minimum_seconds: float = MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS,
+) -> float:
+    if not isinstance(left_verified_focal_pose, bool) or not isinstance(right_verified_focal_pose, bool):
+        raise TypeError('effect spacing needs explicit verified-motion classifications')
+    if (isinstance(pose_minimum_seconds, bool) or not isinstance(pose_minimum_seconds, (int, float))
+            or not math.isfinite(pose_minimum_seconds) or pose_minimum_seconds <= 0):
+        raise ValueError('pose effect spacing must be finite and positive')
+    if left_verified_focal_pose and right_verified_focal_pose:
+        return max(MINIMUM_FOCAL_POSE_DISSOLVE_SPACING_SECONDS, pose_minimum_seconds)
+    return MINIMUM_REQUIRED_MEMBER_BRIDGE_SPACING_SECONDS
 
 
 def member_bridge_handle_quality_failures(
