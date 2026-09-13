@@ -108,6 +108,7 @@ def native_frame_clocks_for_output(
     plan: RenderPlan,
     source_clocks: Mapping[int, VerifiedRenderFrameClock],
     output_frame_indices,
+    *, allow_pure_frames_in_overlap_plan: bool = False,
 ) -> dict[int, RenderedBoundaryNativeFrame]:
     """Locate requested pure hard-cut output frames on the real sampler clock.
 
@@ -117,22 +118,28 @@ def native_frame_clocks_for_output(
     """
     if not isinstance(plan, RenderPlan):
         raise TypeError('native frame inspection requires a RenderPlan')
-    if any(transition.kind.uses_overlap for transition in plan.transitions):
+    if (not allow_pure_frames_in_overlap_plan
+            and any(transition.kind.uses_overlap for transition in plan.transitions)):
         raise ValueError('overlap pixels require a composited boundary clock')
     indices = tuple(output_frame_indices)
     if any(type(i) is not int or not 0 <= i < plan.output_frame_count for i in indices):
         raise ValueError('requested output frame is outside the render plan')
     wanted = set(indices)
     counts = segment_frame_counts(plan)
+    boundary = 0
+    for index, transition in enumerate(plan.transitions):
+        boundary += counts[index]
+        if transition.kind.uses_overlap and any(boundary <= i < boundary + transition.frame_count for i in wanted):
+            raise ValueError('requested overlap pixels have no single native reference')
     cursor = 0
     result = {}
     for unit in _video_render_units(plan, counts):
         first, last = unit.segments[0], unit.segments[-1]
-        clock = source_clocks.get(first.source_index)
-        if not isinstance(clock, VerifiedRenderFrameClock):
-            raise ValueError(f'source {first.source_index} has no verified native clock')
         selected = sorted(i for i in wanted if cursor <= i < cursor + unit.frame_count)
         if selected:
+            clock = source_clocks.get(first.source_index)
+            if not isinstance(clock, VerifiedRenderFrameClock):
+                raise ValueError(f'source {first.source_index} has no verified native clock')
             rate = (unit.coalesced_segment.source_playback_rate
                     if unit.coalesced_segment is not None else
                     (last.source_end - first.source_start) / sum(s.duration for s in unit.segments))

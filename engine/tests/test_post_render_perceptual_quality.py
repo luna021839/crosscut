@@ -540,7 +540,7 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
             # substitution unambiguously different at every retention sample.
             video_filter = (
                 "nullsrc=size=320x180:rate=30:duration=4,"
-                "geq=lum='if(eq(mod(floor(N/2),2),0),"
+                "geq=lum='if(eq(mod(floor((N+1)/2),2),0),"
                 "if(between(X,16,104)*between(Y,16,164),235,16),"
                 "if(between(X,216,304)*between(Y,16,164),235,16))':"
                 "cb=128:cr=128"
@@ -588,8 +588,10 @@ class PostRenderPerceptualQualityTests(unittest.TestCase):
             plan = json.loads(json.dumps(render_plan.to_json()))
             span = _parse_plan(plan)[5][0]
 
-            # trim=start=0.010000 first retains source frame 1, then resets its
-            # PTS to zero.  Absolute-time rounding would incorrectly choose 30.
+            # Legacy timestamp trim starts at frame 1. The current verified
+            # sampler instead starts at frame 0; the render sidecar tells QA
+            # which clock was actually used. Shift the fixture's two-frame
+            # geometry phase so its sampled even ticks straddle a change.
             self.assertEqual(
                 _rendered_source_frame_index(
                     span,

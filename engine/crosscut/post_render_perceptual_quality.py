@@ -904,6 +904,20 @@ def evaluate_post_render_perceptual_quality(
         for frame_indices in planned_retention_candidates.values()
         for frame_index in frame_indices
     }
+    from .render_reference_clock import load_render_reference_clock
+    try:
+        reference_clock = load_render_reference_clock(video_path, plan, retention_output_indices)
+    except (OSError, ValueError, TypeError) as exc:
+        issues.add("perceptual_render_source_clock_invalid", "fail",
+            "Recorded render clock could not be rebound to the exact current plan and media.",
+            path="perceptual_quality.source_clock", value=str(exc))
+        return _payload(settings, metrics, issues)
+    metrics["source_reference_clock"] = {
+        "basis": "render_sidecar_reverified_native_clock" if reference_clock is not None else "legacy_no_render_clock_sidecar",
+        "verified_reference_count": len(reference_clock.frames) if reference_clock is not None else 0,
+        "timestamp_fallback_sources": list(reference_clock.timestamp_fallback_sources) if reference_clock is not None else [],
+        "quality_approval": False,
+    }
     retention_output_structures: dict[int, np.ndarray] = {}
 
     capture = capture_factory(str(Path(video_path)))
@@ -1370,11 +1384,15 @@ def evaluate_post_render_perceptual_quality(
                 for output_index in indices:
                     span = _span_for_frame(spans, output_index)
                     relative_time = (output_index - span.start_frame) / fps
-                    source_frame_index = _rendered_source_frame_index(
-                        span,
-                        relative_time=relative_time,
-                        source_fps=source_fps,
-                    )
+                    native_reference = reference_clock.frames.get(output_index) if reference_clock is not None else None
+                    if native_reference is not None:
+                        if (native_reference.source_index != source_index
+                                or not math.isclose(source_fps, reference_clock.source_fps[source_index], rel_tol=1e-6)):
+                            raise ValueError("decoded source metadata differs from the recorded renderer clock")
+                        source_frame_index = native_reference.native_frame_index
+                    else:
+                        source_frame_index = _rendered_source_frame_index(
+                            span, relative_time=relative_time, source_fps=source_fps)
                     source_capture.set(
                         cv2.CAP_PROP_POS_FRAMES,
                         source_frame_index,
@@ -1564,6 +1582,8 @@ def evaluate_post_render_perceptual_quality(
     ]
     metrics["exact_source_retention"] = {
         "mapping_basis": (
+            "render_sidecar_reverified_native_sampling_with_explicit_timestamp_fallback"
+            if reference_clock is not None else
             "ffmpeg_trim_first_frame_at_or_after_six_decimal_source_start_"
             "plus_segment_relative_time_times_source_playback_rate"
         ),
