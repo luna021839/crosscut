@@ -56,7 +56,7 @@ from .stage_edit_dynamic_crop_motion_authority_v3 import (
 RENDERED_MONTAGE_GRAMMAR_ANALYSIS_BASIS = (
     "rendered_selected_plan_exact_phrase_and_section_anchor_formation_"
     "role_conditioned_duration_chorus_cadence_close_burst_and_"
-    "interior_geometry_grammar_v6"
+    "interior_geometry_grammar_v7"
 )
 EXACT_STAGE_EDIT_SHOT_CLOCK_CONTRACT = (
     "serialized_inference_token_section_and_phrase_progress_per_selected_shot_v1"
@@ -1037,15 +1037,13 @@ def _proxy_geometry_shot_class(
             framing_face = (count, float(scale) * 0.42)
     if framing_face is not None:
         face_count, height = framing_face
-        # The production provider's bbox is the uniquely dominant face,
-        # unlike framing_face_scale (largest height without identity). Small
-        # background faces cannot override that observed close-up. A scale
-        # alone still cannot promote an ambiguous four-face composition.
-        if (
-            (face_count < 4 or parsed is not None)
-            and height >= config.minimum_closeup_proxy_face_height_fraction
-        ):
+        # Physical framing and identity are separate observations. Multiple
+        # large faces can be a tight composition without a unique focal bbox.
+        # Counts must not overwrite a decoded size measurement as "wide".
+        if height >= config.minimum_closeup_proxy_face_height_fraction:
             return "close"
+        if height >= config.minimum_nonwide_proxy_face_height_fraction:
+            return "medium"
     raw_formation = geometry.get("formation_boxes_xywh")
     reported_people = geometry.get("detected_person_count")
     if (
@@ -1086,10 +1084,7 @@ def _proxy_geometry_shot_class(
     if framing_face is not None:
         face_count, height = framing_face
         # Reuse visual_score's face thresholds exactly.
-        if (
-            face_count >= 4
-            or height < config.minimum_nonwide_proxy_face_height_fraction
-        ):
+        if height < config.minimum_nonwide_proxy_face_height_fraction:
             return "wide"
         if height < config.minimum_closeup_proxy_face_height_fraction:
             return "medium"
@@ -2033,9 +2028,10 @@ def _review_segment_interior_geometry(
         "classification_policy": {
             "basis": (
                 "decoded_face_then_person_formation_then_silhouette_"
-                "shot_geometry_hierarchy_v3"
+                "shot_geometry_hierarchy_v4"
             ),
-            "four_or_more_faces_without_dominant_close_face_is_wide": True,
+            "measured_face_size_precedes_person_count": True,
+            "framing_class_does_not_assign_identity": True,
             "minimum_nonwide_face_height_fraction": (
                 config.minimum_nonwide_proxy_face_height_fraction
             ),

@@ -518,7 +518,7 @@ class VisualFeatureCacheTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptor_ast,
-            "52ef779a8e3ff76a93dd2c4c2e9c2db283888acde02c950637e4d41075fab8aa",
+            "6eb90fbd314354695712960108f5eb9448546272ac9595f502185cae08c6e763",
         )
         # Reader behavior is part of the audited endpoint, even if the import
         # alias and sampler AST remain unchanged. Older constants above retain
@@ -531,8 +531,15 @@ class VisualFeatureCacheTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(
             combined,
-            "14ec585b0d692c05498594a529632dca6c89be35fcba77ac9b67999c64da1d5f",
+            "d19d38dd50805b619e036a4faeeeb44e0190c2543ed09565c79bb684913011a3",
         )
+
+    def test_measured_face_scale_numeric_change_has_no_equivalent_migration(self):
+        # This revision changes actual descriptor values. Older decoder-only
+        # equivalence edges must not relabel those old measurements as current.
+        from crosscut.visual_score import _visual_analyzer_fingerprint
+        self.assertEqual(_decode_equivalent_analyzer_migration_closure(
+            _visual_analyzer_fingerprint().digest), ())
 
     def test_h264_locality_exact_forward_migration_preserves_records(self) -> None:
         previous_components = _audited_active_analyzer_components()

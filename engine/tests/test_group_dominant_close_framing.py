@@ -55,14 +55,14 @@ class GroupDominantCloseFramingTests(unittest.TestCase):
             _DetectedFace((float(index * 70), 20.0, 64.0, 72.0))
             for index in range(4)
         ])
-        self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
+        self.assertEqual(descriptor.shot_type, ShotType.CLOSE_UP)
         self.assertIsNone(output.face_bbox_xywh)
-        self.assertEqual(classification, "wide")
+        self.assertEqual(classification, "close")
 
     def test_existing_area_dominance_gate_is_not_lowered(self):
         # Below the existing 1.8x area ratio is still ambiguous, even though
         # the largest face alone is above the close-up height threshold.
-        for ratio, expected in ((1.79, "wide"), (1.81, "close")):
+        for ratio, identity_present in ((1.79, False), (1.81, True)):
             with self.subTest(ratio=ratio):
                 foreground = _DetectedFace((120.0, 20.0, 64.0, 72.0))
                 runner = _DetectedFace((20.0, 20.0, 64.0, 72.0 / ratio))
@@ -71,12 +71,9 @@ class GroupDominantCloseFramingTests(unittest.TestCase):
                     _DetectedFace((250.0, 50.0, 12.0, 20.0)),
                     _DetectedFace((280.0, 50.0, 12.0, 20.0)),
                 ])
-                self.assertEqual(classification, expected)
-                self.assertEqual(output.face_bbox_xywh is not None, expected == "close")
-                self.assertEqual(
-                    descriptor.shot_type,
-                    ShotType.CLOSE_UP if expected == "close" else ShotType.GROUP_WIDE,
-                )
+                self.assertEqual(classification, "close")
+                self.assertEqual(output.face_bbox_xywh is not None, identity_present)
+                self.assertEqual(descriptor.shot_type, ShotType.CLOSE_UP)
 
     def test_dominance_does_not_promote_small_face_to_close(self):
         descriptor, _, classification = self._observe([
@@ -86,11 +83,25 @@ class GroupDominantCloseFramingTests(unittest.TestCase):
         self.assertNotEqual(descriptor.shot_type, ShotType.CLOSE_UP)
         self.assertNotEqual(classification, "close")
 
-    def test_large_scale_without_unique_bbox_cannot_override_four_faces(self):
+    def test_measured_large_scale_describes_framing_without_assigning_identity(self):
         self.assertEqual(_proxy_geometry_shot_class({
             "face_count": 4,
             "face_bbox_xywh": None,
             "face_backend": "yunet",
             "shot_scale_basis": "dominant_face_height",
             "framing_face_scale": .95,
-        }, RenderedMontageGrammarConfig()), "wide")
+        }, RenderedMontageGrammarConfig()), "close")
+
+    def test_background_detection_count_cannot_create_scale_or_shot_jumps(self):
+        from crosscut.visual_score import describe_boundary_side_stability
+        foreground = _DetectedFace((120., 20., 50., 54.))
+        # Similar-size neighboring faces deliberately keep identity ambiguous.
+        neighbors = [_DetectedFace((float(i * 65), 22., 48., 52.)) for i in range(3)]
+        observations = [self._observe([foreground, *neighbors[:count]])[0] for count in (2,3,2)]
+        self.assertEqual([d.shot_type for d in observations], [ShotType.CLOSE_UP]*3)
+        self.assertTrue(all(d.primary_face_bbox is None for d in observations))
+        self.assertEqual([d.shot_scale for d in observations], [54./180./.42]*3)
+        for left, right in zip(observations,observations[1:]):
+            stability = describe_boundary_side_stability(left,right,sample_span_seconds=.1)
+            self.assertEqual(stability.scale_delta, 0.)
+            self.assertEqual(stability.shot_type_mismatch, 0.)

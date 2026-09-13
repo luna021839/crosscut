@@ -1696,7 +1696,7 @@ class VisualScoreTests(unittest.TestCase):
         self.assertEqual(descriptor.shot_type, ShotType.CLOSE_UP)
         self.assertEqual(descriptor.shot_scale_basis, "dominant_face_height")
 
-    def test_small_partial_face_does_not_demote_multi_person_formation(self) -> None:
+    def test_measured_medium_face_is_not_overwritten_by_person_count(self) -> None:
         frame = np.full((180, 320, 3), 118, dtype=np.uint8)
         subject = SubjectGeometryDescriptor(
             detected_person_count=3,
@@ -1716,8 +1716,9 @@ class VisualScoreTests(unittest.TestCase):
         ):
             descriptor = describe_frame(frame)
 
-        self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
-        self.assertEqual(descriptor.shot_scale_basis, "aggregate_formation_people")
+        self.assertEqual(descriptor.shot_type, ShotType.MEDIUM)
+        self.assertAlmostEqual(descriptor.shot_scale, 24.0 / 180.0 / .42)
+        self.assertEqual(descriptor.shot_scale_basis, "dominant_face_height")
 
     def test_missing_face_and_body_geometry_is_explicit_unknown_not_observed_wide(self) -> None:
         frame = np.full((180, 320, 3), 118, dtype=np.uint8)
@@ -1789,7 +1790,8 @@ class VisualScoreTests(unittest.TestCase):
                         )
                         self.assertEqual(descriptor.shot_type, ShotType.MEDIUM)
                         self.assertEqual(
-                            descriptor.shot_scale_basis, "cropped_foreground_group",
+                            descriptor.shot_scale_basis,
+                            "dominant_face_height" if faces else "cropped_foreground_group",
                         )
                         self.assertGreaterEqual(descriptor.shot_scale, 0.28)
                         self.assertLess(descriptor.shot_scale, 0.52)
@@ -1806,11 +1808,14 @@ class VisualScoreTests(unittest.TestCase):
             "neighbor_not_edge_fragment": ((0.09, 0.26, 0.18, 0.74), (0.28, 0.22, 0.44, 0.78), fragments[1]),
         }
         for name, boxes in variants.items():
-            for faces in ((), ((0.43, 0.26, 0.10, 0.10),)):
+            # Keep this a genuinely small face below the existing .22 scale
+            # threshold; the old .10 height was an observed medium-size face.
+            for faces in ((), ((0.43, 0.26, 0.10, 0.08),)):
                 with self.subTest(variant=name, faces=bool(faces)):
                     descriptor = self._describe_cropped_group_fixture(boxes, faces=faces)
                     self.assertEqual(descriptor.shot_type, ShotType.GROUP_WIDE)
-                    self.assertEqual(descriptor.shot_scale_basis, "aggregate_formation_people")
+                    self.assertEqual(descriptor.shot_scale_basis,
+                                     "dominant_face_height" if faces else "aggregate_formation_people")
 
     def test_cropped_group_keeps_existing_large_face_closeup_authority(self) -> None:
         boxes = ((0.0, 0.26, 0.22, 0.74), (0.28, 0.22, 0.44, 0.78), (0.82, 0.42, 0.18, 0.58))

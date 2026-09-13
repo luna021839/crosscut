@@ -4245,30 +4245,24 @@ def describe_frame(
             shot_scale_basis = "unknown_no_subject_geometry"
 
     if face_count:
-        # Background faces do not turn a genuinely dominant close face into
-        # a formation wide. _dominant_face already requires 1.8x runner-up
-        # area; four equally sized faces still do not satisfy this override.
-        if shot_scale >= 0.52 and (face_count < 4 or dominant_face is not None):
+        # Framing is a size observation, not an identity/face-count decision.
+        # A fourth detected background face must not replace a measured large
+        # face with the fabricated 0.21 aggregate-wide scale. In real continuous
+        # footage that produced close -> wide -> close jumps in three frames.
+        # Ambiguous primary identity stays ambiguous in primary_face_bbox and
+        # the unchanged identity/pose gates; a close label grants no identity.
+        if shot_scale >= 0.52:
             shot_type = ShotType.CLOSE_UP
+        elif shot_scale >= 0.22:
+            shot_type = ShotType.MEDIUM
         elif cropped_group_scale is not None:
-            shot_scale = max(min(shot_scale, 0.50), cropped_group_scale)
+            # A tiny detected background face need not describe the cropped
+            # foreground torso. This separate measured body fallback remains.
+            shot_scale = max(shot_scale, cropped_group_scale)
             shot_type = ShotType.MEDIUM
             shot_scale_basis = "cropped_foreground_group"
-        elif len(subject.formation_people) >= 3:
-            heights = sorted(
-                float(person.bbox_xywh[3])
-                for person in subject.formation_people
-            )
-            shot_scale = min(
-                0.21,
-                max(0.08, heights[len(heights) // 2] * 0.30),
-            )
+        else:
             shot_type = ShotType.GROUP_WIDE
-            shot_scale_basis = "aggregate_formation_people"
-        elif face_count >= 4 or shot_scale < 0.22:
-            shot_type = ShotType.GROUP_WIDE
-        elif shot_scale < 0.52:
-            shot_type = ShotType.MEDIUM
     return FrameVisualDescriptor(
         quality_score=quality,
         composition_score=composition,
