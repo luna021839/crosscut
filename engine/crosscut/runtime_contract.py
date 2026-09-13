@@ -12,6 +12,7 @@ from typing import Any
 MINIMUM_PYTHON_VERSION = (3, 11)
 MINIMUM_NUMPY_VERSION = (2, 0)
 MINIMUM_OPENCV_VERSION = (4, 10)
+MINIMUM_TENSORFLOW_VERSION = (2, 20)
 TRACKER_SELECTION_ORDER = ("CSRT", "KCF", "MIL")
 
 
@@ -130,10 +131,12 @@ def runtime_contract_report() -> dict[str, Any]:
     }
     numpy_status = _module_status("numpy", MINIMUM_NUMPY_VERSION)
     opencv_status = _module_status("cv2", MINIMUM_OPENCV_VERSION)
+    native_scene_status = _module_status("tensorflow", MINIMUM_TENSORFLOW_VERSION)
     base_ready = bool(
         python_ready
         and numpy_status["version_ready"]
         and opencv_status["version_ready"]
+        and native_scene_status["version_ready"]
     )
 
     tracker_backends: tuple[str, ...] = ()
@@ -166,6 +169,7 @@ def runtime_contract_report() -> dict[str, Any]:
         "python": python_status,
         "numpy": numpy_status,
         "opencv": opencv_status,
+        "native_camera_cut_runtime": native_scene_status,
         "base_runtime_ready": base_ready,
         "member_anchor_tracking": tracker_status,
         "stage_edit_generation": _stage_edit_generation_status(),

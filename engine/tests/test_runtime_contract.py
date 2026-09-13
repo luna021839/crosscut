@@ -17,6 +17,12 @@ def _module(version: str, *, ready: bool = True) -> dict[str, object]:
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Unit runtime checks must not discover machine-installed model bundles.
+        probe = patch("crosscut.runtime_contract._stage_edit_generation_status", return_value={})
+        probe.start()
+        self.addCleanup(probe.stop)
+
     def test_numeric_minimum_versions_are_not_lexicographic(self) -> None:
         self.assertTrue(version_at_least("2.0.0", (2, 0)))
         self.assertTrue(version_at_least("4.10.0-dev", (4, 10)))
@@ -34,6 +40,7 @@ class RuntimeContractTests(unittest.TestCase):
         module_status.side_effect = (
             _module("2.2.0"),
             _module("4.10.0"),
+            _module("2.20.0"),
         )
 
         report = runtime_contract_report()
@@ -62,6 +69,7 @@ class RuntimeContractTests(unittest.TestCase):
         module_status.side_effect = (
             _module("1.26.4", ready=False),
             _module("4.10.0"),
+            _module("2.20.0"),
         )
 
         report = runtime_contract_report()
@@ -92,6 +100,7 @@ class RuntimeContractTests(unittest.TestCase):
         module_status.side_effect = (
             _module("2.2.0"),
             _module("4.10.0"),
+            _module("2.20.0"),
         )
 
         report = runtime_contract_report()
@@ -107,6 +116,14 @@ class RuntimeContractTests(unittest.TestCase):
             "fail_closed_no_silent_visual_fallback",
             learned["requested_failure_policy"],
         )
+
+    @patch("crosscut.runtime_contract._module_status")
+    def test_missing_pretrained_cut_runtime_is_detected_before_analysis(self, module_status):
+        module_status.side_effect = (_module("2.2.0"), _module("4.10.0"), _module("0", ready=False))
+        report = runtime_contract_report()
+        self.assertFalse(report["base_runtime_ready"])
+        self.assertFalse(report["mode_readiness"]["group"])
+        self.assertFalse(report["native_camera_cut_runtime"]["version_ready"])
 
 
 if __name__ == "__main__":

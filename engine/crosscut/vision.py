@@ -414,8 +414,20 @@ def detect_scene_changes_in_video_cached(
     sample_every: int = 1,
     source_cache_directory: Path | None = None,
     derived_cache_directory: Path | None = None,
+    backend: str = "legacy",
 ) -> tuple[tuple[SceneChange, ...], dict[str, Any]]:
     """Reuse completed per-source scene scans and recompute on any mismatch."""
+
+    if backend == "transnet_v2":
+        if sample_every != 1:
+            raise ValueError("pretrained camera-cut detection requires every native frame")
+        from .native_scene_model import detect_native_scene_changes_cached
+        return detect_native_scene_changes_cached(
+            Path(path), source_cache_directory=source_cache_directory,
+            derived_cache_directory=derived_cache_directory,
+        )
+    if backend != "legacy":
+        raise ValueError("unknown camera-cut detector backend")
 
     settings = config or SceneDetectionConfig()
     if source_cache_directory is None and derived_cache_directory is None:

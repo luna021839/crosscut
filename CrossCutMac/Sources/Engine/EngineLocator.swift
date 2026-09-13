@@ -77,6 +77,15 @@ enum EngineLocator {
 
         let engineDirectory = engineURL.deletingLastPathComponent()
         candidates.append(engineDirectory.appendingPathComponent(".venv/bin/python3"))
+        #if DEBUG
+        // A bundled debug engine still uses the workspace's selected runtime.
+        let workspace = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        candidates.append(workspace.appendingPathComponent("engine/.venv/bin/python3"))
+        #endif
         candidates.append(
             URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3")
         )

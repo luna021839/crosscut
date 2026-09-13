@@ -26999,7 +26999,8 @@ def analyze(
         changes, scene_cache_diagnostics = detect_scene_changes_in_video_cached(
             source,
             config=scene_config,
-            sample_every=2,
+            sample_every=1,
+            backend="transnet_v2",
             source_cache_directory=request.source_cache_directory,
             derived_cache_directory=(
                 request.visual_feature_derived_cache_directory
@@ -27012,20 +27013,7 @@ def analyze(
                 "source_index": index,
                 "source": str(source),
                 "frame_rate": frame_rate,
-                "detection_policy": {
-                    "analysis_basis": (
-                        "ive_attributed_component_gated_hard_cut_detector_v2"
-                    ),
-                    "combined_threshold": scene_config.threshold,
-                    "minimum_frame_difference": (
-                        scene_config.minimum_frame_difference
-                    ),
-                    "minimum_histogram_distance": (
-                        scene_config.minimum_histogram_distance
-                    ),
-                    "minimum_gap_frames": scene_config.min_gap_frames,
-                    "sample_every_source_frames": 2,
-                },
+                "detection_policy": scene_cache_diagnostics["detection_policy"],
                 "persistent_scalar_cache": scene_cache_diagnostics,
                 "changes": [
                     {
