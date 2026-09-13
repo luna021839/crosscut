@@ -9872,6 +9872,7 @@ def _direct_member_dense_render_feedback_binding(
                 Path(__file__).with_name("direct_member_look.py"),
                 Path(__file__).with_name("automatic_joint_dissolve.py"),
                 Path(__file__).with_name("member_joint_camera_preflight.py"),
+                Path(__file__).with_name("member_camera_search_feedback.py"),
                 Path(__file__).with_name("joint_dissolve_registration.py"),
                 Path(__file__).with_name("joint_dissolve_pose.py"),
                 Path(__file__).with_name("focal_pixel_containment_support.py"),
@@ -15769,6 +15770,7 @@ def _select_direct_member_partition_profile(
     render_penalized_transition_edges: Sequence[
         tuple[float, int, int, float]
     ] = (),
+    joint_camera_failed_proposals: Sequence[tuple[float, int, int, float]] = (),
     decoded_proxy_preferred_source_path: Sequence[int] | None = None,
     decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
     forbidden_source_paths_by_partition_unit_counts: Mapping[
@@ -16369,6 +16371,7 @@ def _select_direct_member_partition_profile(
                     render_penalized_transition_edges=(
                         render_penalized_transition_edges
                     ),
+                    joint_camera_failed_proposals=joint_camera_failed_proposals,
                     decoded_proxy_preferred_source_path=(
                         decoded_proxy_preferred_source_path
                         if decoded_proxy_preferred_source_path is not None
@@ -19237,6 +19240,7 @@ def _official_target_fancam_direct_full_frame_segments(
     render_penalized_transition_edges: Sequence[
         tuple[float, int, int, float]
     ] = (),
+    joint_camera_failed_proposals: Sequence[tuple[float, int, int, float]] = (),
     decoded_proxy_preferred_source_path: Sequence[int] | None = None,
     decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
     forbidden_source_paths_by_partition_unit_counts: Mapping[
@@ -19340,6 +19344,7 @@ def _official_target_fancam_direct_full_frame_segments(
             render_penalized_transition_edges=(
                 render_penalized_transition_edges
             ),
+            joint_camera_failed_proposals=joint_camera_failed_proposals,
             decoded_proxy_preferred_source_path=(
                 decoded_proxy_preferred_source_path
             ),
@@ -34459,13 +34464,6 @@ def analyze(
                 ] = (),
                 preferred_partition_unit_counts: Sequence[int] | None = None,
             ):
-                ranked_camera_edges = {tuple(edge[:3]): tuple(edge)
-                                       for edge in render_penalized_transition_edges}
-                for edge in joint_camera_ranking_penalties.values():
-                    old_edge = ranked_camera_edges.get(edge[:3])
-                    if old_edge is None or old_edge[3] < edge[3]:
-                        ranked_camera_edges[edge[:3]] = edge
-                render_penalized_transition_edges = tuple(ranked_camera_edges.values())
                 render_infeasible_transition_edges = tuple(dict.fromkeys((
                     *render_infeasible_transition_edges, *effect_authoring_failed_edges,
                 )))
@@ -34559,6 +34557,7 @@ def analyze(
                                 render_penalized_transition_edges=(
                                     render_penalized_transition_edges
                                 ),
+                                joint_camera_failed_proposals=tuple(joint_camera_ranking_penalties.values()),
                                 decoded_proxy_preferred_source_path=(
                                     decoded_proxy_preferred_source_path
                                 ),
@@ -35585,14 +35584,15 @@ def analyze(
                                 target_member=request.target_member.value, reporter=reporter,
                                 eligible_indices=eligible_indices,
                             ) from error
-                        # Soft, run-local costs: an unmeasured ramp is not proof
-                        # that this source or neighboring cut cannot be used.
+                        # Exact, run-local costs plus interleaved frame search;
+                        # never spread camera uncertainty over decoded-QA's
+                        # 0.30-second neighborhood or persist it as pixel QA.
                         for edge in joint_camera_preflight_report['ranking_penalties']:
                             edge = tuple(edge)
                             joint_camera_ranking_penalties[edge[:3]] = edge
                         reporter.log(
                             "필수 포즈 전환의 카메라 미적용 · 프록시 인코딩 생략 · "
-                            "소스 제외나 하드컷 강등 없이 같은 분할에서 경로 재선택"
+                            "실패 시점만 감점하고 해당 경계의 생략된 프레임 후보 탐색"
                         )
                         try:
                             (segments, member_transitions, direct_segment_details,

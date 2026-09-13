@@ -11763,6 +11763,7 @@ def select_balanced_direct_member_sources(
     render_penalized_transition_edges: Sequence[
         tuple[float, int, int, float]
     ] = (),
+    joint_camera_failed_proposals: Sequence[tuple[float, int, int, float]] = (),
     forbidden_source_paths: Sequence[Sequence[int]] = (),
     decoded_proxy_preferred_source_path: Sequence[int] | None = None,
     decoded_proxy_repair_target_boundary_indices: Sequence[int] = (),
@@ -11808,6 +11809,10 @@ def select_balanced_direct_member_sources(
     feedback.  Unlike a camera-solve failure, a visually poor decoded edge is
     still renderable, so its bounded finite cost may steer the path without
     disconnecting an otherwise viable source graph.
+    ``joint_camera_failed_proposals`` is separate run-local camera feedback:
+    costs apply at the exact failed clock only. At that boundary, interleaved
+    frames omitted by the coarse search are measured within the SAME window.
+    No camera failure is promoted to source exclusion or decoded-QA evidence.
     ``forbidden_source_paths`` contains exact source sequences already rendered
     and rejected under this same musical partition.  Each no-good constraint
     excludes only the complete repeated sequence; its individual sources and
@@ -11824,6 +11829,8 @@ def select_balanced_direct_member_sources(
     song callers omit it and retain mandatory all-source coverage.
     """
 
+    from .member_camera_search_feedback import MemberCameraSearchFeedback
+    camera_feedback = MemberCameraSearchFeedback(tuple(joint_camera_failed_proposals))
     resolved_sources = tuple(Path(source) for source in sources)
     if not isinstance(continuous_official_portrait_fancam_contract, bool):
         raise TypeError(
@@ -12164,6 +12171,10 @@ def select_balanced_direct_member_sources(
     )
     if len(set(render_penalized_keys)) != len(render_penalized_keys):
         raise ValueError("render-penalized transition edges must be unique")
+    if any(cut < spans[0][0]-1e-9 or cut > spans[-1][1]+1e-9
+           or left >= source_count or right >= source_count
+           for cut, left, right, _ in camera_feedback.proposals):
+        raise ValueError('camera feedback is outside the selected source/time domain')
     quotas = (
         _balanced_quotas(len(spans), source_count, quota_order)
         if represented_source_count == source_count
@@ -12441,7 +12452,10 @@ def select_balanced_direct_member_sources(
         for boundary_index in range(len(spans) - 1):
             canonical_boundary = spans[boundary_index][1]
             candidates: list[_DirectBoundarySearchCandidate] = []
-            for offset_frames in frame_offsets:
+            local_frame_offsets = camera_feedback.frame_offsets(
+                canonical_cut=canonical_boundary, ordinary_offsets=frame_offsets,
+                frame_step=resolved_config.sample_frame_step_seconds)
+            for offset_frames in local_frame_offsets:
                 boundary = (
                     canonical_boundary
                     + offset_frames
@@ -12596,6 +12610,11 @@ def select_balanced_direct_member_sources(
                         + (obstruction_penalty(0, left_index) if boundary_index == 0 else 0.0))
                     for right_index, mismatch in enumerate(row))
                     for left_index, row in enumerate(candidate_matrix))
+                if camera_feedback.proposals:
+                    candidate_matrix = tuple(tuple(replace(mismatch,
+                        cost=mismatch.cost+camera_feedback.penalty(boundary, left_index, right_index))
+                        for right_index, mismatch in enumerate(row))
+                        for left_index, row in enumerate(candidate_matrix))
                 if render_penalized_edges:
                     candidate_matrix = tuple(
                         tuple(
@@ -13690,6 +13709,16 @@ def select_balanced_direct_member_sources(
                 "finite_cost_preference_without_graph_disconnection"
             ),
             "visual_thresholds_relaxed": False,
+        },
+        "joint_camera_candidate_feedback": {
+            "contract": "exact_camera_cost_local_frame_refinement_v1",
+            "failed_proposal_count": len(camera_feedback.proposals),
+            "refined_boundary_indices": [index for index, candidates in enumerate(boundary_search_candidates)
+                if len(candidates) > len(frame_offsets)],
+            "exact_clock_tolerance_seconds": 1e-7,
+            "search_window_expanded": False,
+            "source_exclusion_authorized": False,
+            "decoded_quality_approval": False,
         },
         "decoded_proxy_local_path_repair": {
             "enabled": bool(preferred_proxy_path),
