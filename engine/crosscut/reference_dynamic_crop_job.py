@@ -25,7 +25,7 @@ from pathlib import Path
 import re
 import sys
 import threading
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import reference_dynamic_crop_supervision as _dynamic_crop_module
 from .dynamic_crop_input_verification import verify_dynamic_crop_input_files
@@ -46,6 +46,7 @@ from .reference_dynamic_crop_supervision import (
     validate_reference_dynamic_crop_supervision_payload,
 )
 from .reference_evidence_builder import ReferenceSourceClock
+from .reference_frame_decode_cache import SequentialReferenceFrameCache
 
 
 SCHEMA_VERSION = 1
@@ -199,6 +200,7 @@ def _build_reference_dynamic_crop_supervision_job_safe(
     request: ReferenceDynamicCropSupervisionRequest,
     *,
     config: ReferenceDynamicCropSupervisionConfig,
+    frame_cache: SequentialReferenceFrameCache | None = None,
 ) -> ReferenceDynamicCropSupervisionArtifact:
     """Call the public generator with a narrow rejected-audit JSON adapter.
 
@@ -223,7 +225,8 @@ def _build_reference_dynamic_crop_supervision_job_safe(
             estimator_with_json_safe_rejected_audit
         )
         try:
-            return build_reference_dynamic_crop_supervision(request, config=config)
+            cache_arguments = {"frame_cache": frame_cache} if frame_cache is not None else {}
+            return build_reference_dynamic_crop_supervision(request, config=config, **cache_arguments)
         finally:
             _dynamic_crop_module._estimate_sample = estimator
 
@@ -589,7 +592,15 @@ def _generator_module_sha256() -> str:
     source = getattr(_dynamic_crop_module, "__file__", None)
     if not source:
         raise ReferenceDynamicCropJobError("cannot locate dynamic crop generator source")
-    return _file_sha256(Path(source).resolve())
+    module_path = Path(source).resolve()
+    # The new no-op hypothesis is executable label-generation logic, not only
+    # an import name. Never resume an old artifact after that helper changes.
+    return _canonical_json_sha256({
+        "contract": "dynamic_crop_generator_and_estimator_dependencies_v2",
+        "modules": {name: _file_sha256(module_path.with_name(name)) for name in (
+            module_path.name, "reference_crop_supervision.py", "reference_identity_crop.py",
+        )},
+    })
 
 
 def _caller_provenance(
@@ -1101,6 +1112,24 @@ def run_reference_dynamic_crop_job(
     shot_indices: Mapping[str, Sequence[int]] | None = None,
     config: ReferenceDynamicCropSupervisionConfig | None = None,
     dry_run: bool = False,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None = None,
+) -> DynamicCropJobResult:
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("dynamic crop progress callback must be callable")
+    with SequentialReferenceFrameCache() as frame_cache:
+        return _run_reference_dynamic_crop_job(
+            pairs, output_directory=output_directory, reference_ids=reference_ids,
+            shot_indices=shot_indices, config=config, dry_run=dry_run, frame_cache=frame_cache,
+            progress_callback=progress_callback,
+        )
+
+
+def _run_reference_dynamic_crop_job(
+    pairs: Sequence[DynamicCropReferencePair], *, output_directory: Path,
+    reference_ids: Sequence[str], shot_indices: Mapping[str, Sequence[int]] | None,
+    config: ReferenceDynamicCropSupervisionConfig | None, dry_run: bool,
+    frame_cache: SequentialReferenceFrameCache,
+    progress_callback: Callable[[Mapping[str, Any]], None] | None,
 ) -> DynamicCropJobResult:
     """Plan or materialize exact crop-v2 artifacts for retained shots."""
 
@@ -1154,7 +1183,7 @@ def run_reference_dynamic_crop_job(
         else:
             request = _expected_request(pair, shot=shot, caller=caller)
             artifact = _build_reference_dynamic_crop_supervision_job_safe(
-                request, config=settings
+                request, config=settings, frame_cache=frame_cache,
             )
             _validate_expected_artifact(
                 artifact.payload,
@@ -1197,6 +1226,13 @@ def run_reference_dynamic_crop_job(
                     artifact=artifact,
                 )
             )
+        if progress_callback is not None:
+            progress_callback({
+                "reference_id": pair.spec.reference_id, "shot_index": int(shot["shot_index"]),
+                "completed_shots": len(plan), "total_shots": len(selected),
+                "status": status, "eligible": artifact.eligible if artifact is not None else None,
+                "decoder": frame_cache.diagnostics(),
+            })
     if dry_run:
         return DynamicCropJobResult(
             dry_run=True,

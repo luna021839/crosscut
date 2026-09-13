@@ -43,7 +43,12 @@ from .reference_crop_supervision import (
     _media_info,
 )
 from .reference_evidence_builder import ReferenceSourceClock
+from .reference_identity_crop import (
+    IDENTITY_OBSERVATION_POLICY, recover_verified_identity_sample,
+    validate_identity_observation,
+)
 from .reference_match import ReferenceMatchConfig, decode_target_frames_sequential
+from .reference_frame_decode_cache import SequentialReferenceFrameCache
 from .render import (
     EditorialTransformKeyframe,
     EditorialTransformTrack,
@@ -132,8 +137,11 @@ class ReferenceDynamicCropSupervisionConfig:
     dynamic_zoom_range_threshold: float = 0.008
     dynamic_center_range_threshold: float = 0.005
     dynamic_roll_range_threshold_degrees: float = 0.20
+    retain_verified_identity_observations: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.retain_verified_identity_observations) is not bool:
+            raise TypeError("retain_verified_identity_observations must be boolean")
         if not isinstance(self.frame_estimator, ReferenceCropSupervisionConfig):
             raise TypeError("frame_estimator must be ReferenceCropSupervisionConfig")
         radius = self.local_visual_search_radius_frames
@@ -155,6 +163,10 @@ class ReferenceDynamicCropSupervisionConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "frame_estimator": self.frame_estimator.to_dict(),
+            "verified_identity_observation_policy": (
+                dict(IDENTITY_OBSERVATION_POLICY)
+                if self.retain_verified_identity_observations else None
+            ),
             "local_visual_search_radius_frames": (
                 self.local_visual_search_radius_frames
             ),
@@ -737,6 +749,7 @@ def build_reference_dynamic_crop_supervision(
     request: ReferenceDynamicCropSupervisionRequest,
     *,
     config: ReferenceDynamicCropSupervisionConfig | None = None,
+    frame_cache: SequentialReferenceFrameCache | None = None,
 ) -> ReferenceDynamicCropSupervisionArtifact:
     """Build a variable-keyframe crop-v2 target without mutating crop-v1."""
 
@@ -851,12 +864,15 @@ def build_reference_dynamic_crop_supervision(
     # One forward-only union decode per media keeps frame numbers exact and
     # avoids H.264 random-seek/B-frame ambiguity.  A crop-v2 batch job can
     # further union these sets across every shot from the same source.
-    reference_batch = decode_target_frames_sequential(
+    if frame_cache is not None and not isinstance(frame_cache, SequentialReferenceFrameCache):
+        raise TypeError("dynamic crop frame cache must be a verified sequential cache")
+    decode_frames = frame_cache.decode if frame_cache is not None else decode_target_frames_sequential
+    reference_batch = decode_frames(
         request.reference_media_path,
         reference_target_indices,
         config=decode_config,
     )
-    source_batch = decode_target_frames_sequential(
+    source_batch = decode_frames(
         request.source_media_path,
         source_target_indices,
         config=decode_config,
@@ -1039,6 +1055,12 @@ def build_reference_dynamic_crop_supervision(
                     source_frame,
                     settings.frame_estimator,
                 )
+                if transform is None and settings.retain_verified_identity_observations:
+                    identity = recover_verified_identity_sample(
+                        reference_frame, source_frame, rejection, diagnostics)
+                    if identity is not None:
+                        transform, diagnostics = identity
+                        rejection = None
             except (ValueError, RuntimeError) as exc:
                 reviews.append(
                     {
@@ -1341,6 +1363,12 @@ def validate_reference_dynamic_crop_supervision_payload(
         raise ValueError("unsupported dynamic crop analysis basis")
     if value.get("namespace") != DYNAMIC_CROP_NAMESPACE:
         raise ValueError("dynamic crop namespace is invalid")
+    configuration = value.get("configuration", {})
+    if not isinstance(configuration, Mapping):
+        raise ValueError("dynamic crop configuration must be an object")
+    identity_policy = configuration.get("verified_identity_observation_policy")
+    if identity_policy is not None and identity_policy != IDENTITY_OBSERVATION_POLICY:
+        raise ValueError("unsupported verified identity observation policy")
     target_contract = value.get("target_contract")
     if (
         not isinstance(target_contract, Mapping)
@@ -1442,6 +1470,17 @@ def validate_reference_dynamic_crop_supervision_payload(
                         "dynamic crop shot-start keyframe lacks real observation provenance"
                     )
             _renderer_keyframe(time_within_shot_seconds=timestamp, transform=keyframe)
+            audit = sample.get("audit", {})
+            if not isinstance(audit, Mapping):
+                raise ValueError("dynamic crop observation audit must be an object")
+            search = audit.get("local_visual_search", {})
+            if not isinstance(search, Mapping):
+                raise ValueError("dynamic crop local search must be an object")
+            for candidate in search.get("candidates", ()):
+                if not isinstance(candidate, Mapping):
+                    raise ValueError("dynamic crop local candidate must be an object")
+                if candidate.get("source_frame_index") == keyframe.get("source_frame_index"):
+                    validate_identity_observation(candidate.get("diagnostics", {}), keyframe, identity_policy)
             accepted_from_samples.append(keyframe)
         else:
             if keyframe is not None or not isinstance(sample.get("rejection_reason"), str):

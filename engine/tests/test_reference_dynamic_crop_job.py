@@ -218,9 +218,15 @@ class ReferenceDynamicCropJobTests(unittest.TestCase):
             root = Path(directory)
             pair = _bound_pair(root)
             output = root / "crop-v3-output"
+            progress=[]
             first = run_reference_dynamic_crop_job(
-                (pair,), output_directory=output, config=_config()
+                (pair,), output_directory=output, config=_config(), progress_callback=progress.append,
             )
+            self.assertEqual(len(progress),1)
+            self.assertEqual(progress[0]['completed_shots'],1)
+            self.assertEqual(progress[0]['total_shots'],1)
+            self.assertEqual(progress[0]['decoder']['random_seeks'],0)
+            self.assertFalse(progress[0]['decoder']['persisted_pixels'])
 
             self.assertEqual(first.built_count, 1)
             self.assertEqual(first.resumed_count, 0)
