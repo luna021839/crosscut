@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .ive import AspectRatio
 from .timewarp import TimeWarpMap
@@ -2664,6 +2664,7 @@ def render(
     video_buffer_size: str = "48M",
     audio_bitrate: str = "320k",
     use_verified_frame_schedule: bool = True,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> str:
     for label, value in (
         ("video_bitrate", video_bitrate),
@@ -2762,12 +2763,12 @@ def render(
                     str(temporary_output),
                 )
             )
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            if progress_callback is None:
+                completed = subprocess.run(command,check=False,capture_output=True,text=True)
+            else:
+                from .render_process import run_observed_render
+                completed = run_observed_render(command,stderr_path=root/'encoder-stderr.log',
+                    progress_callback=progress_callback)
             if completed.returncode == 0:
                 temporary_output.replace(plan.output)
                 clock_evidence.replace(plan.output.with_suffix(plan.output.suffix + ".frame-clock.json"))

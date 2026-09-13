@@ -33966,7 +33966,8 @@ def analyze(
                 )
         write_plan(plan, render_plan_path)
         reporter.status("연속 기준 음원으로 교차편집 영상을 합성하는 중…")
-        codec = render(plan)
+        from .render_process import render_log_callback
+        codec = render(plan,progress_callback=render_log_callback(reporter,total_frames=plan.output_frame_count))
         timeline_interchange_paths = write_timeline_interchange_bundle(
             plan,
             output_directory=request.output_directory,
@@ -37455,7 +37456,8 @@ def analyze(
             reporter.status(
                 f"{request.target_member.value} 멤버 교차직캠을 합성하는 중…"
             )
-            codec = render(plan)
+            from .render_process import render_log_callback
+            codec = render(plan,progress_callback=render_log_callback(reporter,total_frames=plan.output_frame_count))
             timeline_interchange_paths = write_timeline_interchange_bundle(
                 plan,
                 output_directory=request.output_directory,

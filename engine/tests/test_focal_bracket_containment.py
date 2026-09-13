@@ -79,5 +79,35 @@ class FocalBracketContainmentTests(unittest.TestCase):
         self.assertFalse(rows[0]['face_detection_claimed'])
         self.assertFalse(rows[0]['cross_source_pose_authority'])
 
+    def test_source_or_clock_mismatched_support_is_not_reused(self):
+        camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1),EditorialTransformKeyframe(1.,1.1)))
+        for provider in (lambda s,t:support(s+1,t), lambda s,t:support(s,t+.01)):
+            review=review_joint_dissolve_containment(segments=(RenderSegment(0,10.,1.,0.,editorial_transform=camera),),
+                transitions=(),source_geometries={0:direct_member_source_frame_geometry((1080,1920),output_size=(1080,1920))},
+                geometry_provider=lambda *a:None,bracketed_body_containment_provider=provider,fps=30.)
+            self.assertFalse(review['passed'])
+            self.assertFalse(any(r['reason']=='bracketed_observed_body_containment' for r in review['frames']))
+
+    def test_visible_body_does_not_excuse_cropped_upper_body(self):
+        camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.2,.5,.58),EditorialTransformKeyframe(1.,1.2,.5,.58)))
+        review=review_joint_dissolve_containment(segments=(RenderSegment(0,10.,1.,0.,editorial_transform=camera),),
+            transitions=(),source_geometries={0:direct_member_source_frame_geometry((1080,1920),output_size=(1080,1920))},
+            geometry_provider=lambda *a:None,bracketed_body_containment_provider=lambda s,t:support(s,t),fps=30.)
+        rows=[r for r in review['frames'] if r['reason']=='bracketed_observed_body_containment']
+        self.assertTrue(rows)
+        self.assertTrue(all(r['body_visible_fraction']>.72 for r in rows))
+        self.assertTrue(all(r['upper_body_visible_fraction']<.98 and not r['passed'] for r in rows))
+        self.assertFalse(review['passed'])
+
+    def test_rotated_camera_does_not_use_unrotated_bracket_bounds(self):
+        camera=EditorialTransformTrack((EditorialTransformKeyframe(0.,1.1,roll_degrees=.5),EditorialTransformKeyframe(1.,1.1,roll_degrees=.5)))
+        calls=[]
+        def provider(s,t):calls.append((s,t));return support(s,t)
+        review=review_joint_dissolve_containment(segments=(RenderSegment(0,10.,1.,0.,editorial_transform=camera),),
+            transitions=(),source_geometries={0:direct_member_source_frame_geometry((1080,1920),output_size=(1080,1920))},
+            geometry_provider=lambda *a:None,bracketed_body_containment_provider=provider,fps=30.)
+        self.assertFalse(review['passed'])
+        self.assertEqual(calls,[])
+
 
 if __name__=='__main__':unittest.main()
