@@ -1,8 +1,9 @@
 """Joint time-varying registration of two source-bound overlap trajectories.
 
-This solver never detects or identifies a face and never fills missing boxes.
-Inputs must be observed or separately verified by short pixel tracking. It
-solves both viewport transforms together, retaining the actual choreography.
+This solver never detects or identifies a face and never fills missing faces.
+Inputs are observed faces, separately pixel-verified faces, or extents of the
+same observed focal joints. These evidence bases are never mixed. It solves
+both viewport transforms together, retaining the actual choreography.
 """
 from dataclasses import dataclass, replace
 import math
@@ -35,6 +36,57 @@ class OverlapFaceObservation:
             raise ValueError('overlap observation is outside its source frame')
 
 
+@dataclass(frozen=True)
+class OverlapPoseAnchorObservation:
+    """Extent of the same measured joint IDs, explicitly not a face box."""
+    source_index: int
+    master_seconds: float
+    source_seconds: float
+    box: tuple[float, float, float, float]
+    common_joint_indices: tuple[int, ...]
+    basis: str = 'observed_focal_common_joint_extent'
+
+    def __post_init__(self):
+        # Shared scalar/viewport validation does not turn this into face evidence.
+        OverlapFaceObservation(self.source_index, self.master_seconds, self.source_seconds, self.box)
+        if (self.basis != 'observed_focal_common_joint_extent'
+                or len(self.common_joint_indices) < 4
+                or tuple(sorted(set(self.common_joint_indices))) != self.common_joint_indices
+                or any(isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < 8
+                       for i in self.common_joint_indices)):
+            raise ValueError('pose anchor needs the same measured joint IDs')
+
+
+def joint_pose_anchor_observations(pose_observations):
+    """Build anatomical extents only with exact focal poses on every frame.
+
+    The source-focal provider, not an anonymous detector or this solver, owns
+    target identity. No face is inferred, and missing joints are not filled.
+    """
+    if pose_observations is None or len(pose_observations) != 2:
+        return None, dict(status='exact_pose_missing', common_joint_indices=[])
+    if (not pose_observations[0] or len(pose_observations[0]) != len(pose_observations[1])
+            or any(p is None for seq in pose_observations for p in seq)):
+        return None, dict(status='exact_pose_missing', common_joint_indices=[])
+    points, audit = paired_overlap_pose_arrays(pose_observations, pose_observations)
+    if points is None:
+        return None, audit
+    indices = tuple(audit['common_joint_indices'])
+    sequences = []
+    for side, seq in enumerate(pose_observations):
+        anchors = []
+        for frame, pose in enumerate(seq):
+            low = points[side, frame].min(axis=0)
+            size = points[side, frame].max(axis=0) - low
+            if min(size) <= 1e-6:
+                return None, dict(audit, status='degenerate_common_joint_extent')
+            anchors.append(OverlapPoseAnchorObservation(pose.source_index,
+                pose.master_seconds, pose.source_seconds,
+                tuple(float(v) for v in (*low, *size)), indices))
+        sequences.append(tuple(anchors))
+    return tuple(sequences), dict(audit, face_detection_claimed=False)
+
+
 def fit_joint_dissolve_registration(left, right, *, fps, maximum_zooms,
         maximum_center_shift=.16, maximum_position_mismatch=.08,
         maximum_scale_mismatch=.06, pose_observations=None):
@@ -51,8 +103,15 @@ Both returned tracks use overlap-relative output frame times.
             or not 0<maximum_center_shift<=.25
             or not 0<maximum_position_mismatch<=1 or not 0<maximum_scale_mismatch<=1):
         raise ValueError('joint overlap dimensions or limits are invalid')
-    if any(not isinstance(s,OverlapFaceObservation) for s in (*left,*right)):
+    if any(not isinstance(s,(OverlapFaceObservation,OverlapPoseAnchorObservation)) for s in (*left,*right)):
         raise TypeError('joint overlap needs typed source-bound observations')
+    pose_anchored = isinstance(left[0], OverlapPoseAnchorObservation)
+    if any(isinstance(s, OverlapPoseAnchorObservation) != pose_anchored for s in (*left,*right)):
+        raise ValueError('joint overlap cannot mix face and anatomical extent bases')
+    if pose_anchored:
+        expected, _ = joint_pose_anchor_observations(pose_observations)
+        if expected != (left, right):
+            raise ValueError('pose anchors must derive from these exact common joints')
     if left[0].source_index==right[0].source_index:
         raise ValueError('joint overlap must connect different sources')
     start=left[0].master_seconds
@@ -111,7 +170,9 @@ Both returned tracks use overlap-relative output frame times.
         solver_message=str(result.message),iterations=int(result.nit),output_frame_count=n,
         source_indices=[left[0].source_index,right[0].source_index],quality_approval=False,
         time_shift_applied=False,infeasibility_proven=False,raw_observation_count=sum(s.basis=='observed_focal_face' for s in (*left,*right)),
-        pixel_tracked_observation_count=sum(s.basis!='observed_focal_face' for s in (*left,*right)))
+        pixel_tracked_observation_count=sum(s.basis=='bidirectionally_tracked_focal_face' for s in (*left,*right)),
+        pose_anchor_observation_count=sum(isinstance(s,OverlapPoseAnchorObservation) for s in (*left,*right)),
+        registration_basis='observed_focal_common_joint_extent' if pose_anchored else 'focal_face')
     audit['focal_pose_registration']=dict(pose_audit,quality_approval=False)
     if not result.success or not np.isfinite(result.x).all() or inside(result.x).min() < -1e-7:
         return None,dict(audit,reason='joint_solver_no_verified_solution')

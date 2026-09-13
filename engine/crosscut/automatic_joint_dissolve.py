@@ -8,7 +8,8 @@ from .direct_member_target_face import FOCAL_FACE_BASIS
 from .direct_member_transform import map_box_to_portrait_fill
 from .focal_pixel_containment_support import measure_focal_pixel_containment
 from .joint_dissolve_registration import (OverlapFaceObservation,fit_joint_dissolve_registration,
-    materialize_joint_dissolve_registration,review_joint_dissolve_containment,shorten_joint_incoming_return)
+    materialize_joint_dissolve_registration,review_joint_dissolve_containment,shorten_joint_incoming_return,
+    joint_pose_anchor_observations)
 from .joint_dissolve_pose import source_focal_overlap_pose
 from .render import TransitionKind,DIRECT_MEMBER_POSE_DISSOLVE_REASON,quantized_segment_frame_counts
 
@@ -67,6 +68,11 @@ All measurement calls use the actual source-local clocks of the render plan.
             for entry in span.sources if entry.eligible_source_index==reverse[s.source_index]
             for t in entry.native_scene_cut_source_seconds})) for s in pair}
         rates={s.source_index:s.source_playback_rate for s in pair}
+        if any(any((s.source_end if side==0 else s.source_start)<t<=
+                   (s.source_end if side==0 else s.source_start)
+                   +(effect.frame_count-1)/fps*s.source_playback_rate
+                   for t in native[s.source_index]) for side,s in enumerate(pair)):
+            row['reason']='native_cut_in_overlap';continue
         def pixels(request,local):
             key=(request,local,rates[request],native[request])
             if key in pixel_cache:return pixel_cache[key]
@@ -104,14 +110,32 @@ All measurement calls use the actual source-local clocks of the render plan.
                     failure='focal_face_outside_portrait_fill';break
             if failure:break
             observations.append(tuple(seq))
+        pose_resolver=getattr(focal_provider,'selector_geometry',None)
+        pose_observations=None
+        if failure == 'focal_overlap_not_measured' and pose_resolver is not None:
+            # A turned/occluded face is not an absent tracked performer. Keep
+            # every exact target joint and use ONE common anatomical basis on
+            # both sides; never mix a face box with a body box or invent a face.
+            pose_observations=tuple(tuple(source_focal_overlap_pose(
+                pose_resolver(reverse[segment.source_index],local),
+                source_index=segment.source_index,
+                expected_geometry_source_index=reverse[segment.source_index],
+                master_seconds=cut+n/fps,source_seconds=local,
+                frame_geometry=geometry_by_request[segment.source_index])
+                for n,local in enumerate(tuple(
+                    (segment.source_end if side==0 else segment.source_start)
+                    +n/fps*segment.source_playback_rate for n in range(effect.frame_count))))
+                for side,segment in enumerate(pair))
+            anchors,anchor_audit=joint_pose_anchor_observations(pose_observations)
+            row['pose_anchor_observations']=anchor_audit
+            if anchors is not None:
+                observations=anchors;failure=None
         if failure:
             row['reason']=failure;continue
         limits=tuple(min(settings.maximum_boundary_zoom,geometry_by_request[s.source_index].lossless_zoom_capacity*settings.maximum_boundary_upscale_ratio) for s in pair)
         if min(limits)<1:
             row['reason']='output_exceeds_source_camera_capacity';continue
-        pose_observations=None
-        pose_resolver=getattr(focal_provider,'selector_geometry',None)
-        if pose_resolver is not None:
+        if pose_resolver is not None and pose_observations is None:
             # sample() above already resolved these exact source frames in the
             # shared session; this retrieves their source-focal screen joints.
             pose_observations=tuple(tuple(source_focal_overlap_pose(
