@@ -44,6 +44,42 @@ def identity(seconds):
 
 
 class JointContainmentReaderTests(unittest.TestCase):
+    def test_production_native_reader_reuses_adjacent_frames_per_source(self):
+        captures = (NativeCapture(), NativeCapture())
+        captures[1].native = 255 - captures[1].native
+        with make_provider() as provider, \
+                patch.object(provider, '_sampler', return_value=SimpleNamespace(frame_identity=identity)), \
+                patch('crosscut.joint_boundary_provider.cv2.VideoCapture', side_effect=captures), \
+                patch('crosscut.joint_boundary_provider.probe_constant_frame_clock', create=True,
+                      return_value=ConstantFrameClock(Fraction(30), 300)) as probe, \
+                patch('crosscut.joint_boundary_provider._detect_faces', return_value=((), 'test')):
+            for frame_index in range(30, 43):
+                for source_index in (0, 1):
+                    frame, _, _ = provider._cut_containment_pixels(source_index, frame_index / 30.)
+                    np.testing.assert_array_equal(frame, _working_frame(
+                        captures[source_index].native, maximum_width=960))
+            self.assertEqual([len(c.seek_calls) for c in captures], [1, 1])
+            self.assertEqual(probe.call_count, 2)
+            for reader in provider._containment_readers.values():
+                self.assertEqual(reader.maximum_cached_frames, 1)
+                self.assertLessEqual(len(reader.frames), 1)
+        self.assertEqual([c.releases for c in captures], [1, 1])
+        self.assertFalse(provider._containment_readers)
+
+    def test_unverified_clock_keeps_original_timestamp_seeks(self):
+        capture = NativeCapture()
+        with make_provider() as provider, \
+                patch.object(provider, '_sampler', return_value=SimpleNamespace(frame_identity=identity)), \
+                patch('crosscut.joint_boundary_provider.cv2.VideoCapture', return_value=capture), \
+                patch('crosscut.joint_boundary_provider.probe_constant_frame_clock', create=True,
+                      return_value=None), \
+                patch('crosscut.joint_boundary_provider._detect_faces', return_value=((), 'test')):
+            requests = (1.123456, 1.156789, 1.190122)
+            for seconds in requests:
+                provider._cut_containment_pixels(0, seconds)
+            self.assertEqual(capture.seek_calls,
+                [identity(t).canonical_seconds * 1000. for t in requests])
+
     def test_native_flow_and_detection_are_independent_resizes(self):
         capture = NativeCapture()
         with make_provider() as provider, \

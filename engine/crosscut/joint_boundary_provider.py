@@ -56,6 +56,7 @@ from .source_scalar_cache import (
     PersistentSourceScalarCache,
     PersistentSourceScalarCacheStorageUnavailableError,
 )
+from .seek_locality import SeekLocalityReader, probe_constant_frame_clock
 from .timeline import TimelineCandidate
 from .timewarp import TimeWarpMap
 from .visual_boundary_repair import (
@@ -1290,6 +1291,7 @@ class DecodedBoundaryOptionProvider:
         self._transformed_descriptor_provider = transformed_descriptor_provider
         self._containment_frame_provider = containment_frame_provider
         self._containment_captures: dict[int, Any] = {}
+        self._containment_readers: dict[int, SeekLocalityReader] = {}
         self._containment_pixels: OrderedDict[tuple[int, object], tuple[Any, Any, str]] = OrderedDict()
         self._containment_pixel_bytes = 0
         descriptor_backend_identity = (
@@ -1547,6 +1549,7 @@ class DecodedBoundaryOptionProvider:
         for capture in self._containment_captures.values():
             capture.release()
         self._containment_captures.clear()
+        self._containment_readers.clear()
         self._containment_pixels.clear()
         self._containment_pixel_bytes = 0
         self._containment_frame_provider = None
@@ -2964,6 +2967,10 @@ class DecodedBoundaryOptionProvider:
         Upscaling the existing 480px descriptor raster cannot restore the eye
         and hair corners required by strict optical flow. A separate decoder
         keeps the descriptor reader's seek state and frame cache untouched.
+        A verified constant-frame clock permits adjacent native reads without
+        seeking for every frame. Retain only one native raster per source;
+        both working rasters must still resize that original independently.
+        Unknown or inconsistent clocks keep ordinary timestamp seeking.
         Pixel LRU state has no authorization value and is never serialized.
         """
         self._assert_required_persistent_cache_available(source_index)
@@ -2980,10 +2987,16 @@ class DecodedBoundaryOptionProvider:
             if capture is None:
                 capture = cv2.VideoCapture(str(self.sources[source_index]))
                 self._containment_captures[source_index] = capture
-            capture.set(cv2.CAP_PROP_POS_MSEC, identity.canonical_seconds * 1000.)
-            success, original = capture.read()
-            if not success:
-                original = None
+            reader = self._containment_readers.get(source_index)
+            if reader is None:
+                reader = SeekLocalityReader(
+                    capture,
+                    clock=probe_constant_frame_clock(self.sources[source_index]),
+                    process_frame=lambda frame: frame,
+                    maximum_cached_frames=1,
+                )
+                self._containment_readers[source_index] = reader
+            original = reader.frame_at(identity.canonical_seconds)
         if original is None:
             return None, (), "none"
         frame = _working_frame(original, maximum_width=960)
