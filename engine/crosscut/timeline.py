@@ -47,6 +47,7 @@ class NoCompleteTimelinePath(ValueError):
         reason_code: str,
         segment_index: int | None = None,
         rejection_counts: Mapping[str, int] | None = None,
+        rejection_details: Mapping[str, int] | None = None,
         profile_failures: Sequence[
             tuple[str, "NoCompleteTimelinePath"]
         ] = (),
@@ -55,6 +56,9 @@ class NoCompleteTimelinePath(ValueError):
         self.reason_code = reason_code
         self.segment_index = segment_index
         self.rejection_counts = dict(sorted((rejection_counts or {}).items()))
+        # Diagnostic causes are separate from edge counts and must never alter
+        # exhaustion classification, repair budgets, scores or admission.
+        self.rejection_details = dict(sorted((rejection_details or {}).items()))
         failures = tuple(profile_failures)
         if any(
             not isinstance(profile, str)
@@ -83,6 +87,8 @@ class NoCompleteTimelinePath(ValueError):
                 }
                 for profile, failure in self.profile_failures
             ]
+        if self.rejection_details:
+            payload["rejection_details"] = dict(self.rejection_details)
         return payload
 
 

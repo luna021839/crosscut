@@ -32,6 +32,7 @@ from .timeline import (
     TimelineMode,
     TimelineResult,
     _candidate_emission,
+    _cross_source_transition_rejection_reasons,
     _normalise_segments,
     _resolved_preferred_sources,
     _transition_score,
@@ -2077,6 +2078,8 @@ def _select_joint_timeline_candidates_core(
     ] = {}
     rejection_counts = selection_audit.rejection_counts
     layer_rejection_counts: dict[str, int] = {}
+    layer_rejection_details: dict[str, int] = {}
+    transition_rejection_detail_cache: dict[int, tuple[str, ...]] = {}
     total_boundary_layers = max(0, len(segments) - 1)
     retained_result_limit = maximum_results + len(
         _forbidden_complete_paths
@@ -2121,6 +2124,11 @@ def _select_joint_timeline_candidates_core(
         layer_rejection_counts[reason] = (
             layer_rejection_counts.get(reason, 0) + 1
         )
+
+    def detail(stage: str, reasons: Sequence[str]) -> None:
+        for reason in reasons:
+            key = stage + "/" + reason
+            layer_rejection_details[key] = layer_rejection_details.get(key, 0) + 1
 
     def locate_options(key: BoundaryMeasurementKey) -> BoundaryOptionSet:
         cached = option_cache.get(key)
@@ -2638,6 +2646,7 @@ def _select_joint_timeline_candidates_core(
 
     for segment_position in range(1, len(segments)):
         layer_rejection_counts = {}
+        layer_rejection_details = {}
         previous_segment = segments[segment_position - 1]
         current_segment = segments[segment_position]
         current_streams: dict[_JointState, list[_JointNodeStream]] = {}
@@ -2753,6 +2762,15 @@ def _select_joint_timeline_candidates_core(
                     )
                     if transition is None:
                         reject("boundary_option_timeline_hard_gate")
+                        if id(option) not in transition_rejection_detail_cache:
+                            transition_rejection_detail_cache[id(option)] = (
+                                _cross_source_transition_rejection_reasons(
+                                    option.scoring_outgoing,
+                                    option.scoring_incoming,
+                                    settings,
+                                )
+                            )
+                        detail("timeline", transition_rejection_detail_cache[id(option)])
                         continue
                     base_transition_score, shot_run = transition
                     bridge_evidence: _SharedBridgeEvidence | None = None
@@ -2782,9 +2800,11 @@ def _select_joint_timeline_candidates_core(
                         )
                         if bridge_evidence.evidence_incomplete:
                             reject("bridge_evidence_incomplete")
+                            detail("bridge_incomplete", bridge_evidence.failure_codes)
                             continue
                         if bridge_evidence.hard_incompatible:
                             reject("bridge_hard_incompatible")
+                            detail("bridge_incompatible", bridge_evidence.failure_codes)
                             continue
                     extensions.append(
                         _Extension(
@@ -2983,6 +3003,7 @@ def _select_joint_timeline_candidates_core(
                 reason_code=reason_code,
                 segment_index=current_segment[0].segment_index,
                 rejection_counts=layer_rejection_counts,
+                rejection_details=layer_rejection_details,
             )
         frontier = current_layer
         report_progress("boundary_layer_complete", segment_position)
